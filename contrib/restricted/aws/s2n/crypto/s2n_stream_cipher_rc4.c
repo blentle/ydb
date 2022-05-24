@@ -16,6 +16,7 @@
 #include <openssl/rc4.h>
 
 #include "crypto/s2n_cipher.h"
+#include "crypto/s2n_fips.h"
 #include "crypto/s2n_openssl.h"
 
 #include "utils/s2n_safety.h"
@@ -23,15 +24,19 @@
 
 static uint8_t s2n_stream_cipher_rc4_available()
 {
-    return (EVP_rc4() ? 1 : 0);
+    if (s2n_is_in_fips_mode()) {
+        return 0;
+    } else {
+        return (EVP_rc4() ? 1 : 0);
+    }
 }
 
 static int s2n_stream_cipher_rc4_encrypt(struct s2n_session_key *key, struct s2n_blob *in, struct s2n_blob *out)
 {
-    gte_check(out->size, in->size);
+    POSIX_ENSURE_GTE(out->size, in->size);
 
     int len = out->size;
-    GUARD_OSSL(EVP_EncryptUpdate(key->evp_cipher_ctx, out->data, &len, in->data, in->size), S2N_ERR_ENCRYPT);
+    POSIX_GUARD_OSSL(EVP_EncryptUpdate(key->evp_cipher_ctx, out->data, &len, in->data, in->size), S2N_ERR_ENCRYPT);
 
     S2N_ERROR_IF(len != in->size, S2N_ERR_ENCRYPT);
 
@@ -40,10 +45,10 @@ static int s2n_stream_cipher_rc4_encrypt(struct s2n_session_key *key, struct s2n
 
 static int s2n_stream_cipher_rc4_decrypt(struct s2n_session_key *key, struct s2n_blob *in, struct s2n_blob *out)
 {
-    gte_check(out->size, in->size);
+    POSIX_ENSURE_GTE(out->size, in->size);
 
     int len = out->size;
-    GUARD_OSSL(EVP_DecryptUpdate(key->evp_cipher_ctx, out->data, &len, in->data, in->size), S2N_ERR_ENCRYPT);
+    POSIX_GUARD_OSSL(EVP_DecryptUpdate(key->evp_cipher_ctx, out->data, &len, in->data, in->size), S2N_ERR_ENCRYPT);
 
     S2N_ERROR_IF(len != in->size, S2N_ERR_ENCRYPT);
 
@@ -52,16 +57,16 @@ static int s2n_stream_cipher_rc4_decrypt(struct s2n_session_key *key, struct s2n
 
 static int s2n_stream_cipher_rc4_set_encryption_key(struct s2n_session_key *key, struct s2n_blob *in)
 {
-    eq_check(in->size, 16);
-    GUARD_OSSL(EVP_EncryptInit_ex(key->evp_cipher_ctx, EVP_rc4(), NULL, in->data, NULL), S2N_ERR_KEY_INIT);
+    POSIX_ENSURE_EQ(in->size, 16);
+    POSIX_GUARD_OSSL(EVP_EncryptInit_ex(key->evp_cipher_ctx, EVP_rc4(), NULL, in->data, NULL), S2N_ERR_KEY_INIT);
 
     return 0;
 }
 
 static int s2n_stream_cipher_rc4_set_decryption_key(struct s2n_session_key *key, struct s2n_blob *in)
 {
-    eq_check(in->size, 16);
-    GUARD_OSSL(EVP_DecryptInit_ex(key->evp_cipher_ctx, EVP_rc4(), NULL, in->data, NULL), S2N_ERR_KEY_INIT);
+    POSIX_ENSURE_EQ(in->size, 16);
+    POSIX_GUARD_OSSL(EVP_DecryptInit_ex(key->evp_cipher_ctx, EVP_rc4(), NULL, in->data, NULL), S2N_ERR_KEY_INIT);
 
     return 0;
 }

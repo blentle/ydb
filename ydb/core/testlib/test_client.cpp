@@ -218,6 +218,7 @@ namespace Tests {
             Runtime->GetAppData(nodeIdx).DomainsConfig.MergeFrom(Settings->AppConfig.GetDomainsConfig());
             Runtime->GetAppData(nodeIdx).PersQueueGetReadSessionsInfoWorkerFactory = Settings->PersQueueGetReadSessionsInfoWorkerFactory.get();
             Runtime->GetAppData(nodeIdx).DataStreamsAuthFactory = Settings->DataStreamsAuthFactory.get();
+            Runtime->GetAppData(nodeIdx).PersQueueMirrorReaderFactory = Settings->PersQueueMirrorReaderFactory.get();
 
             SetupConfigurators(nodeIdx);
             SetupProxies(nodeIdx);
@@ -364,17 +365,17 @@ namespace Tests {
     void TServer::CreateBootstrapTablets() {
         const ui32 domainId = Settings->Domain;
         Y_VERIFY(TDomainsInfo::MakeTxAllocatorIDFixed(domainId, 1) == ChangeStateStorage(TxAllocator, domainId));
-        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(TxAllocator, domainId), TTabletTypes::TX_ALLOCATOR), &CreateTxAllocator);
+        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(TxAllocator, domainId), TTabletTypes::TxAllocator), &CreateTxAllocator);
         Y_VERIFY(TDomainsInfo::MakeTxCoordinatorIDFixed(domainId, 1) == ChangeStateStorage(Coordinator, domainId));
-        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(Coordinator, domainId), TTabletTypes::FLAT_TX_COORDINATOR), &CreateFlatTxCoordinator);
+        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(Coordinator, domainId), TTabletTypes::Coordinator), &CreateFlatTxCoordinator);
         Y_VERIFY(TDomainsInfo::MakeTxMediatorIDFixed(domainId, 1) == ChangeStateStorage(Mediator, domainId));
-        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(Mediator, domainId), TTabletTypes::TX_MEDIATOR), &CreateTxMediator);
-        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(SchemeRoot, domainId), TTabletTypes::FLAT_SCHEMESHARD), &CreateFlatTxSchemeShard);
-        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(Hive, domainId), TTabletTypes::FLAT_HIVE), &CreateDefaultHive);
-        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(MakeBSControllerID(domainId), TTabletTypes::FLAT_BS_CONTROLLER), &CreateFlatBsController);
-        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(MakeTenantSlotBrokerID(domainId), TTabletTypes::TENANT_SLOT_BROKER), &NTenantSlotBroker::CreateTenantSlotBroker);
+        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(Mediator, domainId), TTabletTypes::Mediator), &CreateTxMediator);
+        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(SchemeRoot, domainId), TTabletTypes::SchemeShard), &CreateFlatTxSchemeShard);
+        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(Hive, domainId), TTabletTypes::Hive), &CreateDefaultHive);
+        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(MakeBSControllerID(domainId), TTabletTypes::BSController), &CreateFlatBsController);
+        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(MakeTenantSlotBrokerID(domainId), TTabletTypes::TenantSlotBroker), &NTenantSlotBroker::CreateTenantSlotBroker);
         if (Settings->EnableConsole)
-            CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(MakeConsoleID(domainId), TTabletTypes::CONSOLE), &NConsole::CreateConsole);
+            CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(MakeConsoleID(domainId), TTabletTypes::Console), &NConsole::CreateConsole);
     }
 
     void TServer::SetupStorage() {
@@ -496,59 +497,59 @@ namespace Tests {
     }
 
     void TServer::SetupLocalConfig(TLocalConfig &localConfig, const NKikimr::TAppData &appData) {
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.Dummy] =
+        localConfig.TabletClassInfo[TTabletTypes::Dummy] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &CreateFlatDummyTablet, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.DataShard] =
+        localConfig.TabletClassInfo[TTabletTypes::DataShard] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &CreateDataShard, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.KeyValue] =
+        localConfig.TabletClassInfo[TTabletTypes::KeyValue] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &CreateKeyValueFlat, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.ColumnShard] =
+        localConfig.TabletClassInfo[TTabletTypes::ColumnShard] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &CreateColumnShard, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.PersQueue] =
+        localConfig.TabletClassInfo[TTabletTypes::PersQueue] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &CreatePersQueue, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.PersQueueReadBalancer] =
+        localConfig.TabletClassInfo[TTabletTypes::PersQueueReadBalancer] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &CreatePersQueueReadBalancer, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.Coordinator] =
+        localConfig.TabletClassInfo[TTabletTypes::Coordinator] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &CreateFlatTxCoordinator, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.Mediator] =
+        localConfig.TabletClassInfo[TTabletTypes::Mediator] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &CreateTxMediator, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.Kesus] =
+        localConfig.TabletClassInfo[TTabletTypes::Kesus] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &NKesus::CreateKesusTablet, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.SchemeShard] =
+        localConfig.TabletClassInfo[TTabletTypes::SchemeShard] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &CreateFlatTxSchemeShard, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.Hive] =
+        localConfig.TabletClassInfo[TTabletTypes::Hive] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &CreateDefaultHive, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.SysViewProcessor] =
+        localConfig.TabletClassInfo[TTabletTypes::SysViewProcessor] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &NSysView::CreateSysViewProcessorForTests, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.SequenceShard] =
+        localConfig.TabletClassInfo[TTabletTypes::SequenceShard] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &NSequenceShard::CreateSequenceShard, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
-        localConfig.TabletClassInfo[appData.DefaultTabletTypes.ReplicationController] =
+        localConfig.TabletClassInfo[TTabletTypes::ReplicationController] =
             TLocalConfig::TTabletClassInfo(new TTabletSetupInfo(
                 &NReplication::CreateController, TMailboxType::Revolving, appData.UserPoolId,
                 TMailboxType::Revolving, appData.SystemPoolId));
@@ -857,8 +858,8 @@ namespace Tests {
         if (!Runtime)
             ythrow TWithBackTrace<yexception>() << "Server is redirected";
 
-        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(DummyTablet1, Settings->Domain), TTabletTypes::TX_DUMMY), &CreateFlatDummyTablet);
-        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(DummyTablet2, Settings->Domain), TTabletTypes::TX_DUMMY), &CreateFlatDummyTablet);
+        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(DummyTablet1, Settings->Domain), TTabletTypes::Dummy), &CreateFlatDummyTablet);
+        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(DummyTablet2, Settings->Domain), TTabletTypes::Dummy), &CreateFlatDummyTablet);
     }
 
     TTestActorRuntime* TServer::GetRuntime() const {
@@ -883,10 +884,6 @@ namespace Tests {
     }
 
     TServer::~TServer() {
-        if (Runtime->GetAppData().Mon) {
-            Runtime->GetAppData().Mon->Stop();
-        }
-
         if (GRpcServer) {
             GRpcServer->Stop();
         }

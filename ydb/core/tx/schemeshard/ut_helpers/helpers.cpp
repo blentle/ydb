@@ -294,6 +294,33 @@ namespace NSchemeShardUT_Private {
         return record.DebugString();
     }
 
+    THolder<NSchemeCache::TSchemeCacheNavigate> Navigate(TTestActorRuntime& runtime, const TString& path,
+            NSchemeCache::TSchemeCacheNavigate::EOp op)
+    {
+        using TNavigate = NSchemeCache::TSchemeCacheNavigate;
+        using TEvRequest = TEvTxProxySchemeCache::TEvNavigateKeySet;
+        using TEvResponse = TEvTxProxySchemeCache::TEvNavigateKeySetResult;
+
+        const auto sender = runtime.AllocateEdgeActor();
+        auto request = MakeHolder<TNavigate>();
+        auto& entry = request->ResultSet.emplace_back();
+        entry.Path = SplitPath(path);
+        entry.RequestType = TNavigate::TEntry::ERequestType::ByPath;
+        entry.Operation = op;
+        entry.ShowPrivatePath = true;
+        runtime.Send(new IEventHandle(MakeSchemeCacheID(), sender, new TEvRequest(request.Release())));
+
+        auto ev = runtime.GrabEdgeEventRethrow<TEvResponse>(sender);
+        UNIT_ASSERT(ev);
+        UNIT_ASSERT(ev->Get());
+
+        auto* response = ev->Get()->Request.Release();
+        UNIT_ASSERT(response);
+        UNIT_ASSERT_VALUES_EQUAL(response->ResultSet.size(), 1);
+
+        return THolder(response);
+    }
+
     TEvSchemeShard::TEvModifySchemeTransaction* CopyTableRequest(ui64 txId, const TString& dstPath, const TString& dstName, const TString& srcFullName, TApplyIf applyIf) {
         auto evTx = new TEvSchemeShard::TEvModifySchemeTransaction(txId, TTestTxConfig::SchemeShard);
         auto transaction = evTx->Record.AddTransaction();
@@ -482,7 +509,7 @@ namespace NSchemeShardUT_Private {
 
     // Backup
     template <>
-    auto CreateTransaction(const TString& parentPath, const TString& tableName, const TApplyIf& applyIf,
+    auto CreateTransaction(const TString& parentPath, const TString& scheme, const TApplyIf& applyIf,
             NKikimrSchemeOp::EOperationType type, TModifySchemeFunc<NKikimrSchemeOp::TBackupTask> func)
     {
         NKikimrSchemeOp::TModifyScheme tx;
@@ -492,17 +519,28 @@ namespace NSchemeShardUT_Private {
         SetApplyIf(tx, applyIf);
 
         auto task = std::apply(func, std::tie(tx));
+        const bool ok = google::protobuf::TextFormat::ParseFromString(scheme, task);
 
-        task->SetTableName(tableName);
-        auto& settings = *task->MutableYTSettings();
+        if (!ok || task->HasYTSettings()) {
+            const auto ytProxy = GetEnv("YT_PROXY");
+            UNIT_ASSERT(ytProxy);
 
-        TString ytHost;
-        TMaybe<ui16> ytPort;
-        Split(GetEnv("YT_PROXY"), ':', ytHost, ytPort);
+            if (!task->HasTableName()) {
+                task->SetTableName(scheme);
+            }
 
-        settings.SetHost(ytHost);
-        settings.SetPort(ytPort.GetOrElse(80));
-        settings.SetTablePattern("<append=true>//tmp/table");
+            TString ytHost;
+            TMaybe<ui16> ytPort;
+            Split(ytProxy, ':', ytHost, ytPort);
+
+            auto& settings = *task->MutableYTSettings();
+            settings.SetHost(ytHost);
+            settings.SetPort(ytPort.GetOrElse(80));
+
+            if (!settings.HasTablePattern()) {
+                settings.SetTablePattern("<append=true>//tmp/table");
+            }
+        }
 
         return tx;
     }
@@ -722,7 +760,8 @@ namespace NSchemeShardUT_Private {
     GENERIC_HELPERS(DropTableIndex, NKikimrSchemeOp::EOperationType::ESchemeOpDropIndex, &NKikimrSchemeOp::TModifyScheme::MutableDropIndex)
 
     // backup & restore
-    GENERIC_HELPERS(BackupTable, NKikimrSchemeOp::EOperationType::ESchemeOpBackup, &NKikimrSchemeOp::TModifyScheme::MutableBackup)
+    GENERIC_HELPERS(Backup, NKikimrSchemeOp::EOperationType::ESchemeOpBackup, &NKikimrSchemeOp::TModifyScheme::MutableBackup)
+    GENERIC_HELPERS(BackupToYt, NKikimrSchemeOp::EOperationType::ESchemeOpBackup, &NKikimrSchemeOp::TModifyScheme::MutableBackup)
     GENERIC_HELPERS(Restore, NKikimrSchemeOp::EOperationType::ESchemeOpRestore, &NKikimrSchemeOp::TModifyScheme::MutableRestore)
 
     // cdc stream

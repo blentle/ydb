@@ -394,16 +394,23 @@ public:
         bool parseOk = ParseFromStringNoSizeLimit(config, tabletConfig);
         Y_VERIFY(parseOk);
 
-        ui64 throughput = ((ui64)partitionsToCreate) * config.GetPartitionConfig().GetWriteSpeedInBytesPerSecond();
-        ui64 storage = throughput * config.GetPartitionConfig().GetLifetimeSeconds();
-        ui64 storageToReserve = storage;
+        const ui64 throughput = ((ui64)partitionsToCreate) *
+                                config.GetPartitionConfig().GetWriteSpeedInBytesPerSecond();
+        const ui64 storage = [&config, &throughput]() {
+            if (config.GetPartitionConfig().HasStorageLimitBytes()) {
+                return config.GetPartitionConfig().GetStorageLimitBytes();
+            } else {
+                return throughput * config.GetPartitionConfig().GetLifetimeSeconds();
+            }
+        }();
+
         {
             NSchemeShard::TPath::TChecker checks = dstPath.Check();
             checks
                 .ShardsLimit(shardsToCreate)
                 .PathShardsLimit(shardsToCreate)
                 .PQPartitionsLimit(partitionsToCreate)
-                .PQReservedStorageLimit(storageToReserve);
+                .PQReservedStorageLimit(storage);
 
             if (!checks) {
                 TString explain = TStringBuilder() << "dst path fail checks"
@@ -476,7 +483,7 @@ public:
 
         ApplySharding(OperationId.GetTxId(), pathId, pqGroup, txState, tabletChannelsBinding, pqChannelsBinding, context.SS);
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
 
         for (auto& shard : pqGroup->Shards) {
             auto shardIdx = shard.first;
@@ -540,7 +547,7 @@ public:
         dstPath.DomainInfo()->IncPathsInside();
         dstPath.DomainInfo()->AddInternalShards(txState);
         dstPath.DomainInfo()->IncPQPartitionsInside(partitionsToCreate);
-        dstPath.DomainInfo()->IncPQReservedStorage(storageToReserve);
+        dstPath.DomainInfo()->IncPQReservedStorage(storage);
 
         context.SS->TabletCounters->Simple()[COUNTER_STREAM_RESERVED_THROUGHPUT].Add(throughput);
         context.SS->TabletCounters->Simple()[COUNTER_STREAM_RESERVED_STORAGE].Add(storage);

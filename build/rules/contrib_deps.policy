@@ -38,6 +38,7 @@ ALLOW contrib/python/python-magic -> library/python/symbols/libmagic
 ALLOW contrib/python/typecode -> library/python/symbols/libmagic
 ALLOW contrib/tools/jdk/test -> devtools/ya/yalibrary/tools
 ALLOW contrib/libs/clang12/tools/extra/clang-tidy/tool -> library/cpp/clang_tidy
+ALLOW contrib/libs/clang14/tools/extra/clang-tidy/tool -> library/cpp/clang_tidy
 ALLOW contrib/libs/inja -> library/cpp/scheme
 ALLOW contrib/libs/geos/capi/ctypes -> library/python/ctypes
 ALLOW contrib/libs/leveldb -> library/cpp/deprecated/mapped_file
@@ -51,9 +52,10 @@ ALLOW contrib/python/opensfm -> library/cpp/vl_feat
 ALLOW contrib/python/Wand/ImageMagick -> library/python/symbols/registry
 ALLOW contrib/nginx/modules/nginx-rtmp-module -> library/cpp/json
 ALLOW contrib/python/gino -> library/python/pyscopg2
-ALLOW contrib/python/psycopg2/tests -> mail/devpack
+ALLOW contrib/python/psycopg2/py2/tests -> mail/devpack
+ALLOW contrib/python/psycopg2/py3/tests -> mail/devpack
 ALLOW contrib/python/asn1crypto -> library/python/symbols/crypto
-ALLOW contrib/python/win_unicode_console -> library/python/symbols/win_unicode_console
+ALLOW contrib/python/win-unicode-console -> library/python/symbols/win_unicode_console
 ALLOW contrib/python/pycryptodome -> library/python/symbols/registry
 
 ALLOW contrib/tests/python -> library/python/fs

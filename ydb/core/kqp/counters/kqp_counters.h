@@ -2,7 +2,6 @@
 
 #include "kqp_db_counters.h"
 
-#include <library/cpp/actors/helpers/mon_histogram_helper.h>
 #include <library/cpp/monlib/metrics/histogram_collector.h>
 
 #include <ydb/core/util/concurrent_rw_hash.h>
@@ -180,6 +179,7 @@ protected:
     NMonitoring::TDynamicCounters::TCounterPtr SessionActorsClosedError;
     NMonitoring::TDynamicCounters::TCounterPtr SessionActorsClosedRequest;
     NMonitoring::TDynamicCounters::TCounterPtr ActiveSessionActors;
+    NMonitoring::THistogramPtr SessionActorCleanupLatency;
 
     // Transactions
     NMonitoring::TDynamicCounters::TCounterPtr TxCreated;

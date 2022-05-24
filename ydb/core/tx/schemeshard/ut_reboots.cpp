@@ -43,6 +43,44 @@ Y_UNIT_TEST_SUITE(IntermediateDirsReboots) {
         });
     }
 
+    Y_UNIT_TEST(CreateTableWithIntermediateDirsAndRejectInSolomon) {
+        const TString validScheme = R"(
+            Name: "Valid/x/y/z"
+            PartitionCount: 2
+        )";
+        const TString invalidScheme = R"(
+            Name: "Invalid/a/b/c"
+            PartitionCount: 2
+            ChannelProfileId: 30
+        )";
+
+        const auto validStatus = NKikimrScheme::StatusAccepted;
+        const auto invalidStatus = NKikimrScheme::StatusInvalidParameter;
+
+        CreateWithIntermediateDirs([&](TTestActorRuntime& runtime, ui64 txId, const TString& root, bool valid) {
+            TestCreateSolomon(runtime, txId, root, valid ? validScheme : invalidScheme, {valid ? validStatus : invalidStatus});
+        });
+    }
+
+    Y_UNIT_TEST(CreateTableWithIntermediateDirsAndRejectInTable) {
+        const TString validScheme = R"(
+            Name: "Valid/x/y/z/table_name"
+            Columns { Name: "RowId" Type: "Uint64" }
+            KeyColumnNames: ["RowId"]
+        )";
+        const TString invalidScheme = R"(
+            Name: "Invalid/a/b/c/table_name"
+            Columns { Name: "RowId" Type: "Uint64" }
+            KeyColumnNames: ["RowId_Invalid"]
+        )";
+        const auto validStatus = NKikimrScheme::StatusAccepted;
+        const auto invalidStatus = NKikimrScheme::StatusSchemeError;
+
+        CreateWithIntermediateDirs([&](TTestActorRuntime& runtime, ui64 txId, const TString& root, bool valid) {
+            TestCreateTable(runtime, txId, root, valid ? validScheme : invalidScheme, {valid ? validStatus : invalidStatus});
+        });
+    }
+
     Y_UNIT_TEST(CreateKesusWithIntermediateDirs) {
         const TString validScheme = R"(
             Name: "Valid/x/y/z"
@@ -104,21 +142,6 @@ Y_UNIT_TEST_SUITE(IntermediateDirsReboots) {
                 Name: "x/y/z"
                 PartitionCount: 2
             )");
-        });
-    }
-
-    Y_UNIT_TEST(CreateDirWithIntermediateDirsForceDropMiddle) {
-        TTestWithReboots t;
-        t.Run([&](TTestActorRuntime& runtime, bool& activeZone) {
-            AsyncMkDir(runtime, ++t.TxId, "/MyRoot", "x/y/z");
-            TestForceDropUnsafe(runtime, ++t.TxId, 4, TVector<NKikimrScheme::EStatus>{NKikimrScheme::StatusMultipleModifications});
-            t.TestEnv->TestWaitNotification(runtime, {t.TxId - 1, t.TxId});
-
-            {
-                TInactiveZone inactive(activeZone);
-                TestDescribeResult(DescribePath(runtime, "/MyRoot/x/y/z"),
-                                   {NLs::PathExist});
-            }
         });
     }
 

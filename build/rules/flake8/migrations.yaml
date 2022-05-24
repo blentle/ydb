@@ -325,7 +325,6 @@ migrations:
     - health/yamd/libs/utils
     - health/yamd/libs/utils/parsers
     - infra/awacs/vendor/awacs/pire/ut
-    - infra/callisto/controllers/viewer/lib2
     - infra/cqudp/src
     - infra/cqudp/src/eggs
     - infra/deploy/tools/yd_migrate/lib
@@ -368,7 +367,6 @@ migrations:
     - mail/yasm/lib/calendar/alerts
     - mail/yasm/lib/calendar/panels
     - mapreduce/yt/tools/du-yt
-    - maps/analyzer/pylibs/watchman_api/lib
     - maps/automotive/proxy/config_generator
     - maps/automotive/remote_access/autotests/tests/data_types
     - maps/b2bgeo/mvrp_solver/backend/tests_lib
@@ -726,7 +724,6 @@ migrations:
     - voicetech/asr/tools/asr_analyzer/lib
     - voicetech/common/voicetable/bin/filter_text
     - voicetech/common/voicetable/checks/bin/general_voicetable_check
-    - voicetech/infra/gdpr_proxy/service
     - voicetech/tts/vh/utils
     - weather/workers/warnings/general
     - yabs/analytics/anomaly_analyzer/src
@@ -798,7 +795,6 @@ migrations:
     - yweb/antispam/ytgr/viewer
     - yweb/blender/newsletter/unused_formulas
     - yweb/blender/scripts/blender_viewer/conveyor_experiments/utils
-    - yweb/blender/scripts/nirvana/jobs/calc_workflow_num_with_filters
     - yweb/blender/scripts/nirvana/jobs/join_features
     - yweb/blender/scripts/nirvana/jobs/train_sbs_model/utils
     - yweb/blogs/parsers/test
@@ -851,7 +847,6 @@ migrations:
     - ads/autobudget/metrics/example_monitoring
     - ads/libs/py_mapreduce/yabs-mapreduce-modules/py-modules/yabs/tabtools
     - ads/ml_engine/learn/result/local_extended_fstr/lib
-    - ads/pytorch/lib/online_learning/production/processors/tsar_processor/lib
     - ads/quality/apc_check_py
     - ads/quality/embedding/tsar_tensor/ft_pool/lib
     - ads/quality/ltp/libs/build_pool
@@ -895,7 +890,6 @@ migrations:
     - dict/mt/g2p/asr/graph
     - dict/ontodb/onto_lib/sources/wikidata
     - dict/ontodb/proto/direct/ut
-    - dict/ontodb/utils/export_src_codes
     - direct/infra/direct_zkcli
     - direct/infra/dt-dump-b2yt-data
     - district/logbroker_consumers/lib
@@ -990,7 +984,6 @@ migrations:
     - music/tools/download-info
     - passport/backend/library/distprim
     - passport/backend/library/distprim/threading
-    - passport/backend/meltingpot/utils
     - plus/gift/gift
     - plus/gift/gift/admin
     - quality/ab_testing/cofe/projects/zalogin
@@ -1017,7 +1010,6 @@ migrations:
     - robot/quality/samovar_conveyour/tools/get_samples
     - robot/quality/sendlink_conveyour/tools/max_rank_acceptance
     - robot/research/eval_nirvana_graph
-    - rt-research/multik/tools/jupyter
     - rtmapreduce/tests/recipes/rtmr_processing_recipe
     - saas/tools/devops/check_backup
     - saas/tools/devops/lib23
@@ -1137,17 +1129,12 @@ migrations:
     - ads/watchman/contrib/flask-restplus-patched
     - ads/watchman/contrib/flask-restplus-patched/flask_restplus_patched
     - alice/analytics/utils/marty/run_nirvana_instance
-    - cloud/ai/speechkit/stt/tests/data_pipeline/join
     - cv/short2long/nirvana/lib
     - devtools/signer/signer
     - dict/ontodb/cmpy/lib
-    - dict/ontodb/isa/libshorttext/converter/stemmer
-    - dict/ontodb/report/common
-    - dict/ontodb/utils/export_src_codes
     - edadeal/analytics/scripts/CashbackReport/CashbackReportLib
     - edadeal/analytics/scripts/CashbackReport/CashbackReportLib/CashbackReportLib
     - extsearch/geo/recommender/runtime/config/generation
-    - mail/freezing_tests/active_users_aggregation
     - market/seo/offer_base
     - mediapers/feature_machine/nirvana/script_runner
     - mlp/mail/aspam/nirvana_operations/conveyor/build_prod_graph/inbound
@@ -1166,19 +1153,6 @@ migrations:
     - travel/avia/avia_api/avia/settings
     - travel/avia/avia_api/avia/v1/schemas
     - travel/avia/avia_api/tests
-    - voicetech/asr/cloud_engine/cli/nirvana/aggregate_kenlm_outputs
-    - voicetech/asr/cloud_engine/cli/nirvana/aggregate_subword_lm_outputs
-    - voicetech/asr/cloud_engine/cli/nirvana/build_lm
-    - voicetech/asr/cloud_engine/cli/nirvana/make_kenlm_lingware
-    - voicetech/asr/cloud_engine/cli/nirvana/make_subword_lm_lingware
-    - voicetech/asr/cloud_engine/cli/nirvana/merge_lingwares
-    - voicetech/asr/cloud_engine/cli/nirvana/select_best_kenlm
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/build_freq_table
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/build_mixture_model
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/build_model
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/fit_lambda
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/fit_vocabulary
-    - voicetech/asr/tools/language_model/tests/test_linear_merge
     - yabs/outdoor/viewer/back/logic
   F401:
     ignore:
@@ -1393,7 +1367,6 @@ migrations:
     - sprav/tycoon/nirvana/mail/sync_subscriptions/lib
     - statbox/qb2
     - statbox/statkey/jam/actions
-    - statbox/statkey/jam/jobs/key_reports/desktop_retention
     - statbox/statkey/jam/jobs/tech_report/event_money_stat
     - statbox/statkey/jam/libs
     - tools/mkdocs_builder/lib
@@ -1403,11 +1376,6 @@ migrations:
     - travel/avia/shared_flights/data_importer
     - travel/library/python/sender
     - vcs/svn/migrations
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/build_freq_table
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/build_mixture_model
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/build_model
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/fit_lambda
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/fit_vocabulary
     - voicetech/asr/markup/lib
     - voicetech/asr/pipeline/train
     - voicetech/asr/tools/question/make_train_from_vt
@@ -1476,19 +1444,14 @@ migrations:
     - ads/nirvana/xfactor-yt
     - ads/tools/mx_feature_remapper
     - alice/analytics/utils/marty/run_nirvana_instance
-    - cloud/ai/speechkit/stt/tests/data_pipeline/join
     - devtools/signer/signer
     - dict/lm/sources/lib/launcher
-    - dict/ontodb/isa/libshorttext/converter/stemmer
-    - dict/ontodb/report/common
-    - dict/ontodb/utils/export_src_codes
     - dj/nirvana/nirvana_make
     - edadeal/analytics/scripts/CashbackReport/CashbackReportLib
     - edadeal/analytics/scripts/CashbackReport/CashbackReportLib/CashbackReportLib
     - extsearch/geo/recommender/runtime/config/generation
     - library/python/cyson
     - library/python/cyson/cyson
-    - mail/freezing_tests/active_users_aggregation
     - market/seo/offer_base
     - mediapers/feature_machine/nirvana/script_runner
     - mlp/mail/aspam/nirvana_operations/conveyor/build_prod_graph/inbound
@@ -1517,19 +1480,6 @@ migrations:
     - travel/avia/avia_api/tests
     - vcs/svn/flat
     - vcs/svn/hooks/test
-    - voicetech/asr/cloud_engine/cli/nirvana/aggregate_kenlm_outputs
-    - voicetech/asr/cloud_engine/cli/nirvana/aggregate_subword_lm_outputs
-    - voicetech/asr/cloud_engine/cli/nirvana/build_lm
-    - voicetech/asr/cloud_engine/cli/nirvana/make_kenlm_lingware
-    - voicetech/asr/cloud_engine/cli/nirvana/make_subword_lm_lingware
-    - voicetech/asr/cloud_engine/cli/nirvana/merge_lingwares
-    - voicetech/asr/cloud_engine/cli/nirvana/select_best_kenlm
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/build_freq_table
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/build_mixture_model
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/build_model
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/fit_lambda
-    - voicetech/asr/core/lib/subword_ngram_lm/nirvana/fit_vocabulary
-    - voicetech/asr/tools/language_model/tests/test_linear_merge
     - yweb/tellurium/tools/store_history_to_yt
     - yweb/tellurium/ui
   no_lint:
@@ -1636,8 +1586,6 @@ migrations:
     - aurora/library/Pyro4
     - aurora/library/serpent
     - balancer/production/x/yasm_errors_collector
-    - billing/agency_rewards/tests_platform/common
-    - billing/agency_rewards/tests_platform/generators
     - billing/balance
     - billing/balance_utils
     - billing/bcl/src
@@ -1890,7 +1838,6 @@ migrations:
     - infra/wall-e/sdk
     - infra/walle/server/tests/lib
     - infra/ya_salt/vendor/salt
-    - infra/yp/monitoring/tmp_account_monitoring
     - infra/yp_quota_distributor/app
     - intranet/audit/src
     - intranet/crt
@@ -1976,7 +1923,6 @@ migrations:
     - mapreduce/yt/python
     - maps/contrib/pylibs/googlemaps
     - maps/contrib/pylibs/mox
-    - maps/goods/contrib/pylibs/xlrd
     - maps/pylibs/utils/lib
     - maps/pymod/yandex/maps/test_utils
     - maps/renderer/designs_config/libs/pymod
@@ -2085,7 +2031,6 @@ migrations:
     - noc/aioalexandria
     - noc/annlib/contrib/valkit
     - noc/checkist/clients/python/swagger_client
-    - noc/hbf-server
     - noc/soft_pingers
     - noc/yanet/yanetagent
     - ofd/notifier/server/blueprints/monitoring
@@ -2103,7 +2048,6 @@ migrations:
     - passport/backend/core/yasms/test
     - passport/backend/library/historydbloader
     - passport/backend/logbroker_client/core
-    - passport/backend/meltingpot/core/meltingpot
     - passport/backend/configs/golovan
     - passport/backend/contrib/cassandra
     - passport/backend/contrib/django_contrib_comments
@@ -2723,7 +2667,6 @@ migrations:
     - voicetech/bio/pybio/train/tf_patched_models
     - voicetech/bio/tf_future
     - voicetech/common/kaldi_features_lib/python-package/kaldi_features
-    - voicetech/infra/gdpr_proxy/gdpr-filter
     - voicetech/infra/lingwarefactory/yaldi-apply-soundset
     - voicetech/infra/qa/speechbase-voiceproxy-logsv3-cleanup
     - voicetech/infra/qa/uniproxy-logs-gen-params
@@ -2807,6 +2750,7 @@ migrations:
     - yt/odin/tests/data/checks/with_data
     - yt/odin/tests/data/checks/with_invalid_return_value
     - yt/odin/tests/data/checks/with_options
+    - yt/python/contrib/prettytable
     - yt/python/contrib/python-argcomplete
     - yt/python/contrib/python-backports.ssl_match_hostname
     - yt/python/contrib/python-certifi
@@ -2817,7 +2761,13 @@ migrations:
     - yt/python/contrib/python-requests
     - yt/python/contrib/python-six
     - yt/python/contrib/python-urllib3
-    - yt/python/yt
+    - yt/python/yt/clickhouse
+    - yt/python/yt/flask_helpers
+    - yt/python/yt/operations_archive
+    - yt/python/yt/packages
+    - yt/python/yt/tools
+    - yt/python/yt/transfer_manager
+    - yt/python/yt/wire_format
     - yt/yt/experiments/dyntables_stress_test
     - yweb/antimalware/visual_html_parser/yandex-search-antivirus-discovery
     - yweb/antiporno/bert/development/python/lib/google_bert
@@ -2957,7 +2907,6 @@ migrations:
     - antiadblock/cryprox/tests/functional
     - antiadblock/postgres_local/tests
     - april/mediaplan/mediaplan/forecaster/migrations
-    - billing/agency_rewards/tests
     - bindings/java/abt/abt-native/android/tests
     - build/scripts
     - cloud/ai/speechkit/stt/tests/data/model
@@ -3488,7 +3437,6 @@ migrations:
     - quality/mapreduce/tests/common
     - ads/factor_check/features/tests
     - quality/user_sessions/createlib/qb3/parser/local_yt_test_example_proto_v2
-    - billing/agency_rewards/tests_platform
     - dict/mystem/tests
     - infra/walle/server/tests
     - market/forecaster/lite

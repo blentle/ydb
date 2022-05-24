@@ -122,6 +122,7 @@ enum ETypeAnnotationFlags {
     TypeHasOptional = 0x100,
     TypeHasManyValues = 0x200,
     TypeHasBareYson = 0x400,
+    TypeHasNestedOptional = 0x800,
 };
 
 const ui64 TypeHashMagic = 0x10000;
@@ -209,6 +210,10 @@ public:
 
     bool HasOptional() const {
         return (GetFlags() & TypeHasOptional) != 0;
+    }
+
+    bool HasNestedOptional() const {
+        return (GetFlags() & TypeHasNestedOptional) != 0;
     }
 
     bool HasOptionalOrNull() const {
@@ -764,6 +769,9 @@ public:
         if (itemType->GetKind() == ETypeAnnotationKind::Data &&
             itemType->Cast<TDataExprType>()->GetSlot() == NUdf::EDataSlot::Yson) {
             ret = ret & ~TypeHasBareYson;
+        }
+        if (itemType->IsOptionalOrNull()) {
+            ret |= TypeHasNestedOptional;
         }
 
         return ret;
@@ -1421,7 +1429,7 @@ public:
         Result = std::move(result);
     }
 
-    bool IsCallable(const TStringBuf& name) const {
+    bool IsCallable(const std::string_view& name) const {
         ENSURE_NOT_DELETED
         return Type() == TExprNode::Callable && Content() == name;
     }
@@ -1452,9 +1460,14 @@ public:
         return Type() == TExprNode::World;
     }
 
-    bool IsAtom(const TStringBuf& content) const {
+    bool IsAtom(const std::string_view& content) const {
         ENSURE_NOT_DELETED
         return Type() == TExprNode::Atom && Content() == content;
+    }
+
+    bool IsAtom(const std::initializer_list<std::string_view>& names) const {
+        ENSURE_NOT_DELETED
+        return Type() == TExprNode::Atom && names.end() != std::find(names.begin(), names.end(), Content());
     }
 
     bool IsList() const {

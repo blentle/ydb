@@ -37,8 +37,6 @@ namespace NKikimrServices {
     constexpr ui32 KQP_COMPUTE = 535;
 };
 
-const TString LogPrefix = "PQ sink. ";
-
 #define SINK_LOG_T(s) \
     LOG_TRACE_S(*NActors::TlsActivationContext, NKikimrServices::KQP_COMPUTE, LogPrefix << s)
 #define SINK_LOG_D(s) \
@@ -92,7 +90,7 @@ class TDqPqWriteActor : public NActors::TActor<TDqPqWriteActor>, public IDqCompu
 public:
     TDqPqWriteActor(
         ui64 outputIndex,
-        const TString& txId,
+        const TTxId& txId,
         NPq::NProto::TDqPqTopicSink&& sinkParams,
         NYdb::TDriver driver,
         std::shared_ptr<NYdb::ICredentialsProviderFactory> credentialsProviderFactory,
@@ -105,6 +103,7 @@ public:
         , Driver(std::move(driver))
         , CredentialsProviderFactory(credentialsProviderFactory)
         , Callbacks(callbacks)
+        , LogPrefix(TStringBuilder() << "TxId: " << TxId << ", PQ sink. ")
         , FreeSpace(freeSpace)
         , PersQueueClient(Driver, GetPersQueueClientSettings())
     { }
@@ -138,7 +137,7 @@ public:
 
             TString data(dataCol.AsStringRef());
 
-            LWPROBE(PqWriteDataToSend, TxId, SinkParams.GetTopicPath(), data);
+            LWPROBE(PqWriteDataToSend, TString(TStringBuilder() << TxId), SinkParams.GetTopicPath(), data);
             SINK_LOG_T("Received data for sending: " << data);
 
             const auto messageSize = GetItemSize(data);
@@ -154,7 +153,7 @@ public:
 
         if (checkpoint) {
             if (Buffer.empty()) {
-                Callbacks->OnSinkStateSaved(BuildState(), OutputIndex, *checkpoint);
+                Callbacks->OnAsyncOutputStateSaved(BuildState(), OutputIndex, *checkpoint);
             } else {
                 DeferredCheckpoints.emplace(NextSeqNo + Buffer.size() - 1, *checkpoint);
             }
@@ -274,7 +273,7 @@ private:
             if (issues) {
                 WriteSession->Close(TDuration::Zero());
                 WriteSession.reset();
-                Callbacks->OnSinkError(OutputIndex, *issues, true);
+                Callbacks->OnAsyncOutputError(OutputIndex, *issues, true);
                 break;
             }
 
@@ -309,8 +308,7 @@ private:
     void Fail(TString message) {
         TIssues issues;
         issues.AddIssue(message);
-        Callbacks->OnSinkError(OutputIndex, issues, true);
-        return;
+        Callbacks->OnAsyncOutputError(OutputIndex, issues, true);
     }
 
     struct TPQEventProcessor {
@@ -341,7 +339,7 @@ private:
 
                 if (!Self.DeferredCheckpoints.empty() && std::get<0>(Self.DeferredCheckpoints.front()) == it->SeqNo) {
                     Self.ConfirmedSeqNo = it->SeqNo;
-                    Self.Callbacks->OnSinkStateSaved(Self.BuildState(), Self.OutputIndex, std::get<1>(Self.DeferredCheckpoints.front()));
+                    Self.Callbacks->OnAsyncOutputStateSaved(Self.BuildState(), Self.OutputIndex, std::get<1>(Self.DeferredCheckpoints.front()));
                     Self.DeferredCheckpoints.pop();
                 }
             }
@@ -367,11 +365,12 @@ private:
 
 private:
     const ui64 OutputIndex;
-    const TString TxId;
+    const TTxId TxId;
     const NPq::NProto::TDqPqTopicSink SinkParams;
     NYdb::TDriver Driver;
     std::shared_ptr<NYdb::ICredentialsProviderFactory> CredentialsProviderFactory;
     IDqComputeActorAsyncOutput::ICallbacks* const Callbacks;
+    const TString LogPrefix;
     i64 FreeSpace = 0;
 
     NYdb::NPersQueue::TPersQueueClient PersQueueClient;
@@ -404,7 +403,7 @@ std::pair<IDqComputeActorAsyncOutput*, NActors::IActor*> CreateDqPqWriteActor(
 
     TDqPqWriteActor* actor = new TDqPqWriteActor(
         outputIndex,
-        std::holds_alternative<ui64>(txId) ? ToString(txId) : std::get<TString>(txId),
+        txId,
         std::move(settings),
         std::move(driver),
         CreateCredentialsProviderFactoryForStructuredToken(credentialsFactory, token, addBearerToToken),

@@ -623,14 +623,15 @@ public:
     typedef TRuntimeNode (TProgramBuilder::*ProcessFunctionMethod)(TRuntimeNode, const TUnaryLambda&);
     typedef TRuntimeNode (TProgramBuilder::*NarrowFunctionMethod)(TRuntimeNode, const TNarrowLambda&);
 
-    TRuntimeNode PgConst(TPgType* pgType, const std::string_view& value);
+    TRuntimeNode PgConst(TPgType* pgType, const std::string_view& value, TRuntimeNode typeMod = {});
     TRuntimeNode PgResolvedCall(bool useContext, const std::string_view& name, ui32 id,
         const TArrayRef<const TRuntimeNode>& args, TType* returnType);
-    TRuntimeNode PgCast(TRuntimeNode input, TType* returnType);
+    TRuntimeNode PgCast(TRuntimeNode input, TType* returnType, TRuntimeNode typeMod = {});
     TRuntimeNode FromPg(TRuntimeNode input, TType* returnType);
     TRuntimeNode ToPg(TRuntimeNode input, TType* returnType);
     TRuntimeNode WithContext(TRuntimeNode input, const std::string_view& contextType);
     TRuntimeNode PgInternal0(TType* returnType);
+    TRuntimeNode PgArray(const TArrayRef<const TRuntimeNode>& args, TType* returnType);
 
 protected:
     TRuntimeNode Invoke(const std::string_view& funcName, TType* resultType, const TArrayRef<const TRuntimeNode>& args);

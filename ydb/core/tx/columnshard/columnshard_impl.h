@@ -158,7 +158,7 @@ class TColumnShard
     }
 
     void IncCounter(NColumnShard::EPercentileCounters counter, const TDuration& latency) const {
-        TabletCounters->Percentile()[counter].IncrementFor(latency.MilliSeconds());
+        TabletCounters->Percentile()[counter].IncrementFor(latency.MicroSeconds());
     }
 
 protected:
@@ -443,7 +443,7 @@ private:
     std::unique_ptr<TEvPrivate::TEvWriteIndex> SetupCleanup();
 
     void UpdateBlobMangerCounters();
-    void UpdateInsertTableCounters();
+    void UpdateInsertTableCounters(bool updateCommitted = true);
     void UpdateIndexCounters();
     void UpdateResourceMetrics(const TUsage& usage);
 

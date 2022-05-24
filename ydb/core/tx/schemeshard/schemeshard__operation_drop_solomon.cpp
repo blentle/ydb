@@ -79,7 +79,7 @@ public:
         TPathId pathId = txState->TargetPathId;
         TPathElement::TPtr path = context.SS->PathsById.at(pathId);
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
 
         auto pathes = context.SS->ListSubThee(pathId, context.Ctx);
         Y_VERIFY(pathes.size() == 1);
@@ -93,10 +93,12 @@ public:
         ++parentDir->DirAlterVersion;
         context.SS->PersistPathDirAlterVersion(db, parentDir);
         context.SS->ClearDescribePathCaches(parentDir);
-        context.OnComplete.PublishToSchemeBoard(OperationId, parentDir->PathId);
-
         context.SS->ClearDescribePathCaches(path);
-        context.OnComplete.PublishToSchemeBoard(OperationId, pathId);
+
+        if (!context.SS->DisablePublicationsOfDropping) {
+            context.OnComplete.PublishToSchemeBoard(OperationId, parentDir->PathId);
+            context.OnComplete.PublishToSchemeBoard(OperationId, pathId);
+        }
 
         context.SS->ChangeTxState(db, OperationId, TTxState::ProposedDeleteParts);
         return true;
@@ -234,7 +236,7 @@ public:
 
         auto solomon = context.SS->SolomonVolumes.at(path.Base()->PathId);
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
 
         for (auto& part : solomon->Partitions) {
             auto shardIdx = part.first;
@@ -258,10 +260,12 @@ public:
         ++parentDir.Base()->DirAlterVersion;
         context.SS->PersistPathDirAlterVersion(db, parentDir.Base());
         context.SS->ClearDescribePathCaches(parentDir.Base());
-        context.OnComplete.PublishToSchemeBoard(OperationId, parentDir.Base()->PathId);
-
         context.SS->ClearDescribePathCaches(path.Base());
-        context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
+
+        if (!context.SS->DisablePublicationsOfDropping) {
+            context.OnComplete.PublishToSchemeBoard(OperationId, parentDir.Base()->PathId);
+            context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
+        }
 
         State = NextState();
         SetState(SelectStateFunc(State));

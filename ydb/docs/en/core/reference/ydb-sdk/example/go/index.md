@@ -51,8 +51,8 @@ db, err := ydb.Open(
   dsn,
 //  yc.WithInternalCA(), // using Yandex.Cloud certificates
   ydb.WithAccessTokenCredentials(token), // token-based authentication
-//  ydb.WithAnonimousCredentials(token), // anonymous authentication (for example, in docker ydb)
-//  yc.WithMetadataCredentials(token), // authentication from inside a VM in Yandex.Cloud or a function in Yandex Functions
+//  ydb.WithAnonymousCredentials(), // anonymous authentication (for example, in docker ydb)
+//  yc.WithMetadataCredentials(ctx), // authentication from inside a VM in Yandex.Cloud or a function in Yandex Functions
 //  yc.WithServiceAccountKeyFileCredentials("~/.ydb/sa.json"), // authentication in Yandex.Cloud using a service account file
 //  environ.WithEnvironCredentials(ctx), // authentication using environment variables
 )
@@ -155,9 +155,6 @@ err := db.Table().Do(
       `,
       table.NewQueryParameters(
         table.ValueParam("$seriesID", types.Uint64Value(1)), // substitution in the query condition
-      ),
-      options.WithQueryCachePolicy(
-        options.WithQueryCachePolicyKeepInCache(), // enabling the server cache of compiled queries
       ),
     )
     if err != nil {

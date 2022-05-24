@@ -4,6 +4,7 @@
 
 #include <util/generic/string.h>
 #include <util/generic/strbuf.h>
+#include <util/generic/typetraits.h>
 #include <utility>
 
 template <class It>
@@ -86,7 +87,11 @@ struct TStripImpl {
         auto e = from.end();
 
         if (StripRange(b, e, criterion)) {
-            to = T(b, e - b);
+            if constexpr (::TIsTemplateBaseOf<std::basic_string_view, T>::value) {
+                to = T(b, e - b);
+            } else {
+                to.assign(b, e - b);
+            }
 
             return true;
         }
@@ -186,6 +191,11 @@ static inline bool Strip(const TString& from, TString& to) {
 inline TString& StripInPlace(TString& s) {
     Strip(s, s);
     return s;
+}
+
+template <typename T>
+inline void StripInPlace(T& s) {
+    StripString(s, s);
 }
 
 /// Returns a copy of the given string with removed leading and trailing spaces.

@@ -11,6 +11,9 @@
 #include <ydb/library/yql/parser/pg_catalog/catalog.h>
 
 namespace NYql {
+
+bool ParsePgIntervalModifier(const TString& str, i32& ret);
+
 namespace NTypeAnnImpl {
 
 IGraphTransformer::TStatus PgStarWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
@@ -731,11 +734,15 @@ IGraphTransformer::TStatus PgAnonWindowWrapper(const TExprNode::TPtr& input, TEx
 
 IGraphTransformer::TStatus PgConstWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
     Y_UNUSED(output);
-    if (!EnsureArgsCount(*input, 2, ctx.Expr)) {
+    if (!EnsureMinArgsCount(*input, 2, ctx.Expr)) {
         return IGraphTransformer::TStatus::Error;
     }
 
-    if (!EnsureTypePg(input->Tail(), ctx.Expr)) {
+    if (!EnsureMaxArgsCount(*input, 3, ctx.Expr)) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    if (!EnsureTypePg(*input->Child(1), ctx.Expr)) {
         return IGraphTransformer::TStatus::Error;
     }
 
@@ -744,7 +751,27 @@ IGraphTransformer::TStatus PgConstWrapper(const TExprNode::TPtr& input, TExprNod
         return IGraphTransformer::TStatus::Error;
     }
 
-    input->SetTypeAnn(input->Tail().GetTypeAnn()->Cast<TTypeExprType>()->GetType());
+    if (input->ChildrenSize() >= 3) {
+        auto type = input->Child(2)->GetTypeAnn();
+        ui32 typeModType;
+        bool convertToPg;
+        if (!ExtractPgType(type, typeModType, convertToPg, input->Child(2)->Pos(), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (convertToPg) {
+            input->ChildRef(2) = ctx.Expr.NewCallable(input->Child(2)->Pos(), "ToPg", { input->ChildPtr(2) });
+            return IGraphTransformer::TStatus::Repeat;
+        }
+
+        if (typeModType != NPg::LookupType("int4").TypeId) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                TStringBuilder() << "Expected pg int4 as typemod, but got " << NPg::LookupType(typeModType).Name));
+            return IGraphTransformer::TStatus::Error;
+        }
+    }
+
+    input->SetTypeAnn(input->Child(1)->GetTypeAnn()->Cast<TTypeExprType>()->GetType());
     return IGraphTransformer::TStatus::Ok;
 }
 
@@ -761,7 +788,11 @@ IGraphTransformer::TStatus PgInternal0Wrapper(const TExprNode::TPtr& input, TExp
 
 IGraphTransformer::TStatus PgCastWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
     Y_UNUSED(output);
-    if (!EnsureArgsCount(*input, 2, ctx.Expr)) {
+    if (!EnsureMinArgsCount(*input, 2, ctx.Expr)) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    if (!EnsureMaxArgsCount(*input, 3, ctx.Expr)) {
         return IGraphTransformer::TStatus::Error;
     }
 
@@ -777,15 +808,60 @@ IGraphTransformer::TStatus PgCastWrapper(const TExprNode::TPtr& input, TExprNode
         return IGraphTransformer::TStatus::Repeat;
     }
 
-    if (!EnsureTypePg(input->Tail(), ctx.Expr)) {
+    if (!EnsureTypePg(*input->Child(1), ctx.Expr)) {
         return IGraphTransformer::TStatus::Error;
     }
-    auto targetTypeId = input->Tail().GetTypeAnn()->Cast<TTypeExprType>()->GetType()->Cast<TPgExprType>()->GetId();
+    auto targetTypeId = input->Child(1)->GetTypeAnn()->Cast<TTypeExprType>()->GetType()->Cast<TPgExprType>()->GetId();
 
     if (inputTypeId != 0 && inputTypeId != targetTypeId) {
-        if (NPg::LookupType(inputTypeId).Category != 'S' &&
-            NPg::LookupType(targetTypeId).Category != 'S') {
-            Y_UNUSED(NPg::LookupCast(inputTypeId, targetTypeId));
+        bool fail = false;
+        const auto& inputDesc = NPg::LookupType(inputTypeId);
+        const auto& targetDesc = NPg::LookupType(targetTypeId);
+        const bool isInputArray = (inputDesc.TypeId == inputDesc.ArrayTypeId);
+        const bool isTargetArray = (targetDesc.TypeId == targetDesc.ArrayTypeId);
+        if ((isInputArray && !isTargetArray && targetDesc.Category != 'S')
+            || (!isInputArray && isTargetArray && inputDesc.Category != 'S')) {
+            fail = true;
+        } else if (inputDesc.Category != 'S' && targetDesc.Category != 'S') {
+            auto elemInput = inputTypeId;
+            if (isInputArray) {
+                elemInput = inputDesc.ElementTypeId;
+            }
+
+            auto elemTarget = targetTypeId;
+            if (isTargetArray) {
+                elemTarget = targetDesc.ElementTypeId;
+            }
+
+            if (!NPg::HasCast(elemInput, elemTarget)) {
+                fail = true;
+            }
+        }
+
+        if (fail) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                TStringBuilder() << "Cannot cast type " << inputDesc.Name << " into type " << targetDesc.Name));
+            return IGraphTransformer::TStatus::Error;
+        }
+    }
+
+    if (input->ChildrenSize() >= 3) {
+        auto type = input->Child(2)->GetTypeAnn();
+        ui32 typeModType;
+        bool convertToPg;
+        if (!ExtractPgType(type, typeModType, convertToPg, input->Child(2)->Pos(), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (convertToPg) {
+            input->ChildRef(2) = ctx.Expr.NewCallable(input->Child(2)->Pos(), "ToPg", { input->ChildPtr(2) });
+            return IGraphTransformer::TStatus::Repeat;
+        }
+
+        if (typeModType != NPg::LookupType("int4").TypeId) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                TStringBuilder() << "Expected pg int4 as typemod, but got " << NPg::LookupType(typeModType).Name));
+            return IGraphTransformer::TStatus::Error;
         }
     }
 
@@ -2501,6 +2577,166 @@ IGraphTransformer::TStatus PgBoolOpWrapper(const TExprNode::TPtr& input, TExprNo
     }
 
     auto result = ctx.Expr.MakeType<TPgExprType>(boolId);
+    input->SetTypeAnn(result);
+    return IGraphTransformer::TStatus::Ok;
+}
+
+IGraphTransformer::TStatus PgArrayWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+    Y_UNUSED(output);
+    if (!EnsureMinArgsCount(*input, 1, ctx.Expr)) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    TVector<ui32> argTypes;
+    bool needRetype = false;
+    for (ui32 i = 0; i < input->ChildrenSize(); ++i) {
+        auto type = input->Child(i)->GetTypeAnn();
+        ui32 argType;
+        bool convertToPg;
+        if (!ExtractPgType(type, argType, convertToPg, input->Child(i)->Pos(), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (convertToPg) {
+            input->ChildRef(i) = ctx.Expr.NewCallable(input->Child(i)->Pos(), "ToPg", { input->ChildPtr(i) });
+            needRetype = true;
+        }
+
+        argTypes.push_back(argType);
+    }
+
+    if (needRetype) {
+        return IGraphTransformer::TStatus::Repeat;
+    }
+
+    auto elemType = argTypes.front();
+    for (ui32 i = 1; i < argTypes.size(); ++i) {
+        if (elemType == 0) {
+            elemType = argTypes[i];
+        } else if (argTypes[i] != 0 && argTypes[i] != elemType) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                TStringBuilder() << "Mismatch of array type elements: " <<
+                    NPg::LookupType(elemType).Name << " and " << NPg::LookupType(argTypes[i]).Name));
+            return IGraphTransformer::TStatus::Error;
+        }
+    }
+
+    if (!elemType) {
+        elemType = NPg::LookupType("text").TypeId;
+    }
+
+    const auto& typeInfo = NPg::LookupType(elemType);
+    auto result = ctx.Expr.MakeType<TPgExprType>(typeInfo.ArrayTypeId);
+    input->SetTypeAnn(result);
+    return IGraphTransformer::TStatus::Ok;
+}
+
+IGraphTransformer::TStatus PgTypeModWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+    if (!EnsureMinArgsCount(*input, 2, ctx.Expr)) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    if (!EnsureTypePg(*input->Child(0), ctx.Expr)) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    auto pgType = input->Child(0)->GetTypeAnn()->Cast<TTypeExprType>()->GetType()->Cast<TPgExprType>();
+    const auto& typeDesc = NPg::LookupType(pgType->GetId());
+    if (!typeDesc.TypeModInFuncId) {
+        ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+            TStringBuilder() << "No modifiers for type: " << pgType->GetName()));
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    TVector<TString> mods;
+    for (ui32 i = 1; i < input->ChildrenSize(); ++i) {
+        if (!EnsureAtom(*input->Child(i), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        mods.push_back(TString(input->Child(i)->Content()));
+    }
+
+    if (pgType->GetName() == "interval") {
+        if (mods.size() != 1) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()), "Exactly one modidifer is expected for pginterval"));
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        i32 value;
+        if (!ParsePgIntervalModifier(mods[0], value)) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                TStringBuilder() << "Unsupported modifier for pginterval: " << mods[0]));
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        mods[0] = ToString(value);
+    }
+
+    TExprNode::TListType args;
+    for (const auto& mod : mods) {
+        args.push_back(ctx.Expr.Builder(input->Pos())
+            .Callable("PgConst")
+                .Atom(0, mod)
+                .Callable(1, "PgType")
+                    .Atom(0, "cstring")
+                .Seal()
+            .Seal()
+            .Build());
+    }
+
+    auto arr = ctx.Expr.NewCallable(input->Pos(), "PgArray", std::move(args));
+    output = ctx.Expr.Builder(input->Pos())
+        .Callable("PgCall")
+            .Atom(0, NPg::LookupProc(typeDesc.TypeModInFuncId, { 0 }).Name)
+            .Add(1, arr)
+        .Seal()
+        .Build();
+
+    return IGraphTransformer::TStatus::Repeat;
+}
+
+IGraphTransformer::TStatus PgLikeWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+    Y_UNUSED(output);
+    if (!EnsureArgsCount(*input, 2, ctx.Expr)) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    TVector<ui32> argTypes;
+    bool needRetype = false;
+    for (ui32 i = 0; i < input->ChildrenSize(); ++i) {
+        auto type = input->Child(i)->GetTypeAnn();
+        ui32 argType;
+        bool convertToPg;
+        if (!ExtractPgType(type, argType, convertToPg, input->Child(i)->Pos(), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (convertToPg) {
+            input->ChildRef(i) = ctx.Expr.NewCallable(input->Child(i)->Pos(), "ToPg", { input->ChildPtr(i) });
+            needRetype = true;
+        }
+
+        argTypes.push_back(argType);
+    }
+
+    if (needRetype) {
+        return IGraphTransformer::TStatus::Repeat;
+    }
+
+    for (ui32 i = 0; i < argTypes.size(); ++i) {
+        if (!argTypes[i]) {
+            continue;
+        }
+
+        if (argTypes[i] != NPg::LookupType("text").TypeId) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                TStringBuilder() << "Expected pg text, but got " << NPg::LookupType(argTypes[i]).Name));
+            return IGraphTransformer::TStatus::Error;
+        }
+    }
+
+    auto result = ctx.Expr.MakeType<TPgExprType>(NPg::LookupType("bool").TypeId);
     input->SetTypeAnn(result);
     return IGraphTransformer::TStatus::Ok;
 }

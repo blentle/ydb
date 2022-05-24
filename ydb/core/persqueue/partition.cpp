@@ -428,6 +428,9 @@ void TPartition::FillReadFromTimestamps(const NKikimrPQ::TPQTabletConfig& config
             userInfo.UserActs.push_back(event.Release());
             userInfo.Session = "";
             userInfo.Offset = 0;
+            if (userInfo.Important) {
+                userInfo.Offset = StartOffset;
+            }
             userInfo.Step = userInfo.Generation = 0;
         }
         hasReadRule.erase(consumer);
@@ -1035,7 +1038,7 @@ void TPartition::HandleWakeup(const TActorContext& ctx) {
         WriteTimestampEstimate = now;
 
     THolder <TEvKeyValue::TEvRequest> request = MakeHolder<TEvKeyValue::TEvRequest>();
-    bool haveChanges = DropOldStuff(request.Get(), false, ctx);
+    bool haveChanges = CleanUp(request.Get(), false, ctx);
     if (DiskIsFull) {
         AddCheckDiskRequest(request.Get(), Config.GetPartitionConfig().GetNumChannels());
         haveChanges = true;
@@ -1070,29 +1073,30 @@ void TPartition::AddMetaKey(TEvKeyValue::TEvRequest* request) {
 
 }
 
-bool TPartition::DropOldStuff(TEvKeyValue::TEvRequest* request, bool hasWrites, const TActorContext& ctx) {
-    bool haveChanges = false;
-    if (DropOldData(request, hasWrites, ctx))
-        haveChanges = true;
-    LOG_DEBUG(ctx, NKikimrServices::PERSQUEUE, TStringBuilder() << "Have " << request->Record.CmdDeleteRangeSize() << " items to delete old stuff");
-    if (SourceIdStorage.DropOldSourceIds(request, ctx.Now(), StartOffset, Partition, Config.GetPartitionConfig())) {
-        haveChanges = true;
+bool TPartition::CleanUp(TEvKeyValue::TEvRequest* request, bool hasWrites, const TActorContext& ctx) {
+    bool haveChanges = CleanUpBlobs(request, hasWrites, ctx);
+    LOG_DEBUG(ctx, NKikimrServices::PERSQUEUE, TStringBuilder() << "Have " <<
+              request->Record.CmdDeleteRangeSize() << " items to delete old stuff");
+
+    haveChanges |= SourceIdStorage.DropOldSourceIds(request, ctx.Now(), StartOffset, Partition,
+                                                    Config.GetPartitionConfig());
+    if (haveChanges) {
         SourceIdStorage.MarkOwnersForDeletedSourceId(Owners);
     }
-    LOG_DEBUG(ctx, NKikimrServices::PERSQUEUE, TStringBuilder() << "Have " << request->Record.CmdDeleteRangeSize() << " items to delete all stuff");
+    LOG_DEBUG(ctx, NKikimrServices::PERSQUEUE, TStringBuilder() << "Have " <<
+              request->Record.CmdDeleteRangeSize() << " items to delete all stuff");
     LOG_TRACE(ctx, NKikimrServices::PERSQUEUE, TStringBuilder() << "Delete command " << request->ToString());
+
     return haveChanges;
 }
 
-
-bool TPartition::DropOldData(TEvKeyValue::TEvRequest *request, bool hasWrites, const TActorContext& ctx) {
-    if (StartOffset == EndOffset)
-        return false;
-    if (DataKeysBody.size() <= 1)
+bool TPartition::CleanUpBlobs(TEvKeyValue::TEvRequest *request, bool hasWrites, const TActorContext& ctx) {
+    if (StartOffset == EndOffset || DataKeysBody.size() <= 1)
         return false;
 
+    const auto& partConfig = Config.GetPartitionConfig();
     ui64 minOffset = EndOffset;
-    for (const auto& importantClientId : Config.GetPartitionConfig().GetImportantClientId()) {
+    for (const auto& importantClientId : partConfig.GetImportantClientId()) {
         TUserInfo* userInfo = UsersInfoStorage.GetIfExists(importantClientId);
         ui64 curOffset = StartOffset;
         if (userInfo && userInfo->Offset >= 0) //-1 means no offset
@@ -1103,29 +1107,48 @@ bool TPartition::DropOldData(TEvKeyValue::TEvRequest *request, bool hasWrites, c
     bool hasDrop = false;
     ui64 endOffset = StartOffset;
 
-    if (DataKeysBody.size() > 1) {
+    const std::optional<ui64> storageLimit = partConfig.HasStorageLimitBytes()
+        ? std::optional<ui64>{partConfig.GetStorageLimitBytes()} : std::nullopt;
+    const TDuration lifetimeLimit{TDuration::Seconds(partConfig.GetLifetimeSeconds())};
 
-        while (DataKeysBody.size() > 1 && ctx.Now() >= DataKeysBody.front().Timestamp + TDuration::Seconds(Config.GetPartitionConfig().GetLifetimeSeconds())
-                && (minOffset > DataKeysBody[1].Key.GetOffset() || minOffset == DataKeysBody[1].Key.GetOffset() && DataKeysBody[1].Key.GetPartNo() == 0)) {//all offsets from blob[0] are readed, and don't delete last blob
+    if (DataKeysBody.size() > 1) {
+        auto retentionCondition = [&]() -> bool {
+            const auto bodySize = BodySize - DataKeysBody.front().Size;
+            const bool timeRetention = (ctx.Now() >= (DataKeysBody.front().Timestamp + lifetimeLimit));
+            return storageLimit.has_value()
+                ? ((bodySize >= *storageLimit) || timeRetention)
+                : timeRetention;
+        };
+
+        while (DataKeysBody.size() > 1 &&
+               retentionCondition() &&
+               (minOffset > DataKeysBody[1].Key.GetOffset() ||
+                (minOffset == DataKeysBody[1].Key.GetOffset() &&
+                 DataKeysBody[1].Key.GetPartNo() == 0))) { // all offsets from blob[0] are readed, and don't delete last blob
             BodySize -= DataKeysBody.front().Size;
 
             DataKeysBody.pop_front();
-            if (!GapOffsets.empty() && !DataKeysBody.empty() && DataKeysBody.front().Key.GetOffset() == GapOffsets.front().second) {
+            if (!GapOffsets.empty() && DataKeysBody.front().Key.GetOffset() == GapOffsets.front().second) {
                 GapSize -= GapOffsets.front().second - GapOffsets.front().first;
                 GapOffsets.pop_front();
             }
             hasDrop = true;
         }
+
         Y_VERIFY(!DataKeysBody.empty());
 
         endOffset = DataKeysBody.front().Key.GetOffset();
-        if (DataKeysBody.front().Key.GetPartNo() > 0) ++endOffset;
-
+        if (DataKeysBody.front().Key.GetPartNo() > 0) {
+            ++endOffset;
+        }
     }
 
     TDataKey lastKey = HeadKeys.empty() ? DataKeysBody.back() : HeadKeys.back();
 
-    if (!hasWrites && ctx.Now() >= lastKey.Timestamp + TDuration::Seconds(Config.GetPartitionConfig().GetLifetimeSeconds()) && minOffset == EndOffset && false) { // disable drop of all data
+    if (!hasWrites &&
+        ctx.Now() >= lastKey.Timestamp + lifetimeLimit &&
+        minOffset == EndOffset &&
+        false) { // disable drop of all data
         Y_VERIFY(!HeadKeys.empty() || !DataKeysBody.empty());
 
         Y_VERIFY(CompactedKeys.empty());
@@ -1215,9 +1238,7 @@ void TPartition::Handle(TEvPQ::TEvMirrorerCounters::TPtr& ev, const TActorContex
 
 void TPartition::Handle(NReadSpeedLimiterEvents::TEvCounters::TPtr& ev, const TActorContext& /*ctx*/) {
     auto userInfo = UsersInfoStorage.GetIfExists(ev->Get()->User);
-    Y_VERIFY(userInfo);
-    if (userInfo) {
-        Y_VERIFY(userInfo->ReadSpeedLimiter);
+    if (userInfo && userInfo->ReadSpeedLimiter) {
         auto diff = ev->Get()->Counters.MakeDiffForAggr(userInfo->ReadSpeedLimiter->Baseline);
         Counters.Populate(*diff.Get());
         ev->Get()->Counters.RememberCurrentStateAsBaseline(userInfo->ReadSpeedLimiter->Baseline);
@@ -2893,7 +2914,7 @@ void TPartition::ReadTimestampForOffset(const TString& user, TUserInfo& userInfo
     );
 
     if (ReadingTimestamp) {
-        UpdateUserInfoTimestamp.push_back(user);
+        UpdateUserInfoTimestamp.push_back(std::make_pair(user, userInfo.ReadRuleGeneration));
         return;
     }
     if (userInfo.Offset < (i64)StartOffset) {
@@ -2927,7 +2948,7 @@ void TPartition::ReadTimestampForOffset(const TString& user, TUserInfo& userInfo
     ReadingForUserReadRuleGeneration = userInfo.ReadRuleGeneration;
 
     for (const auto& user : UpdateUserInfoTimestamp) {
-        Y_VERIFY(user != ReadingForUser);
+        Y_VERIFY(user.first != ReadingForUser || user.second != ReadingForUserReadRuleGeneration);
     }
 
     LOG_DEBUG_S(
@@ -2961,6 +2982,12 @@ void TPartition::Handle(TEvPQ::TEvProxyResponse::TPtr& ev, const TActorContext& 
     ReadingTimestamp = false;
     auto userInfo = UsersInfoStorage.GetIfExists(ReadingForUser);
     if (!userInfo || userInfo->ReadRuleGeneration != ReadingForUserReadRuleGeneration) {
+        LOG_INFO_S(
+            ctx, NKikimrServices::PERSQUEUE,
+            "Topic '" << TopicConverter->GetClientsideName() << "' partition " << Partition
+                << " user " << ReadingForUser << " readTimeStamp for other generation or no client info at all"
+    );
+
         ProcessTimestampRead(ctx);
         return;
     }
@@ -2996,7 +3023,7 @@ void TPartition::Handle(TEvPQ::TEvProxyResponse::TPtr& ev, const TActorContext& 
                 userInfo->ReadCreateTimestamp = userInfo->CreateTimestamp;
             }
         } else {
-            UpdateUserInfoTimestamp.push_back(ReadingForUser);
+            UpdateUserInfoTimestamp.push_back(std::make_pair(ReadingForUser, ReadingForUserReadRuleGeneration));
             userInfo->ReadScheduled = true;
         }
         Counters.Cumulative()[COUNTER_PQ_WRITE_TIMESTAMP_ERROR].Increment(1);
@@ -3010,10 +3037,11 @@ void TPartition::ProcessTimestampRead(const TActorContext& ctx) {
     ReadingForOffset = 0;
     ReadingForUserReadRuleGeneration = 0;
     while (!ReadingTimestamp && !UpdateUserInfoTimestamp.empty()) {
-        TString user = UpdateUserInfoTimestamp.front();
+        TString user = UpdateUserInfoTimestamp.front().first;
+        ui64 readRuleGeneration = UpdateUserInfoTimestamp.front().second;
         UpdateUserInfoTimestamp.pop_front();
         auto userInfo = UsersInfoStorage.GetIfExists(user);
-        if (!userInfo || !userInfo->ReadScheduled)
+        if (!userInfo || !userInfo->ReadScheduled || userInfo->ReadRuleGeneration != readRuleGeneration)
             continue;
         userInfo->ReadScheduled = false;
         if (userInfo->Offset == (i64)EndOffset)
@@ -3034,7 +3062,6 @@ void TPartition::Handle(TEvPQ::TEvError::TPtr& ev, const TActorContext& ctx)
         return;
     }
     Y_VERIFY(userInfo->ReadScheduled);
-    userInfo->ReadScheduled = false;
     Y_VERIFY(ReadingForUser != "");
 
     LOG_ERROR_S(
@@ -3043,8 +3070,7 @@ void TPartition::Handle(TEvPQ::TEvError::TPtr& ev, const TActorContext& ctx)
                 << " user " << ReadingForUser << " readTimeStamp error: " << ev->Get()->Error
     );
 
-    UpdateUserInfoTimestamp.push_back(ReadingForUser);
-    userInfo->ReadScheduled = true;
+    UpdateUserInfoTimestamp.push_back(std::make_pair(ReadingForUser, ReadingForUserReadRuleGeneration));
 
     ProcessTimestampRead(ctx);
 }
@@ -3540,6 +3566,10 @@ void TPartition::HandleSetOffsetResponse(NKikimrClient::TResponse& response, con
         userInfo->Session = "";
         userInfo->Generation = userInfo->Step = 0;
         userInfo->Offset = 0;
+        userInfo->ReadScheduled = false;
+        if (userInfo->Important) {
+            userInfo->Offset = StartOffset;
+        }
     } else {
         if (setSession || dropSession) {
             offset = userInfo->Offset;
@@ -4702,7 +4732,7 @@ void TPartition::HandleWrites(const TActorContext& ctx)
     } else {
         haveData = ProcessWrites(request.Get(), ctx);
     }
-    bool haveDrop = DropOldStuff(request.Get(), haveData, ctx);
+    bool haveDrop = CleanUp(request.Get(), haveData, ctx);
 
     ProcessReserveRequests(ctx);
 

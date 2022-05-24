@@ -58,7 +58,8 @@ public:
         ui64 Weeded = 0;
         ui64 Sieved = 0;
         ui64 NoKey = 0;         /* Examined TPart without the key */
-        ui64 Invisible = 0;     /* Skipped invisible versions */
+
+        TIteratorStats Stats;
     };
 
     explicit TTable(TEpoch);
@@ -126,15 +127,24 @@ public:
 
     TVector<TIntrusiveConstPtr<TMemTable>> GetMemTables() const noexcept;
 
-    TAutoPtr<TTableIt> Iterate(TRawVals key, TTagsRef tags, IPages* env, ESeek, TRowVersion snapshot) const noexcept;
-    TAutoPtr<TTableReverseIt> IterateReverse(TRawVals key, TTagsRef tags, IPages* env, ESeek, TRowVersion snapshot) const noexcept;
-    TReady Select(TRawVals key, TTagsRef tags, IPages* env, TRowState& row,
-                   ui64 flg, TRowVersion snapshot, TDeque<TPartSimpleIt>& tempIterators) const noexcept;
+    TAutoPtr<TTableIt> Iterate(TRawVals key, TTagsRef tags, IPages* env, ESeek,
+            TRowVersion snapshot,
+            const ITransactionMapPtr& visible = nullptr,
+            const ITransactionObserverPtr& observer = nullptr) const noexcept;
+    TAutoPtr<TTableReverseIt> IterateReverse(TRawVals key, TTagsRef tags, IPages* env, ESeek,
+            TRowVersion snapshot,
+            const ITransactionMapPtr& visible = nullptr,
+            const ITransactionObserverPtr& observer = nullptr) const noexcept;
+    EReady Select(TRawVals key, TTagsRef tags, IPages* env, TRowState& row,
+                  ui64 flg, TRowVersion snapshot, TDeque<TPartSimpleIt>& tempIterators,
+                  TSelectStats& stats,
+                  const ITransactionMapPtr& visible = nullptr,
+                  const ITransactionObserverPtr& observer = nullptr) const noexcept;
 
-    TReady Precharge(TRawVals minKey, TRawVals maxKey, TTagsRef tags,
-                   IPages* env, ui64 flg,
-                   ui64 itemsLimit, ui64 bytesLimit,
-                   EDirection direction, TRowVersion snapshot) const;
+    EReady Precharge(TRawVals minKey, TRawVals maxKey, TTagsRef tags,
+                     IPages* env, ui64 flg,
+                     ui64 itemsLimit, ui64 bytesLimit,
+                     EDirection direction, TRowVersion snapshot, TSelectStats& stats) const;
 
     void Update(ERowOp, TRawVals key, TOpsRef, TArrayRef<TMemGlob> apart, TRowVersion rowVersion);
 
@@ -301,7 +311,7 @@ private:
 
     THashSet<ui64> CheckTransactions;
     THashMap<ui64, TOpenTransaction> OpenTransactions;
-    TTransactionMap<TRowVersion> CommittedTransactions;
+    TTransactionMap CommittedTransactions;
     TTransactionSet RemovedTransactions;
 };
 

@@ -203,6 +203,8 @@ void TKqpCountersBase::Init() {
     SessionActorsClosedError = KqpGroup->GetCounter("SessionActors/ClosedError", true);
     SessionActorsClosedRequest = KqpGroup->GetCounter("SessionActors/ClosedRequest", true);
     ActiveSessionActors = KqpGroup->GetCounter("SessionActors/Active", false);
+    SessionActorCleanupLatency = KqpGroup->GetHistogram(
+        "SessionActors/CleanupLatencyMs", NMonitoring::ExponentialHistogram(10, 2, 1));
 
     SessionBalancerCV = KqpGroup->GetCounter("SessionBalancer/CV", false);
     SessionBalancerShutdowns = KqpGroup->GetCounter("SessionBalancer/Shutdown", true);
@@ -452,7 +454,6 @@ void TKqpCountersBase::ReportWorkerFinished(TDuration lifeSpan) {
     YdbSessionsActiveCount->Dec();
 }
 
-
 void TKqpCountersBase::ReportWorkerCleanupLatency(TDuration cleanupTime) {
     WorkerCleanupLatency->Collect(cleanupTime.MilliSeconds());
 }
@@ -489,6 +490,10 @@ void TKqpCountersBase::ReportSessionActorFinished(TDuration lifeSpan) {
     SessionActorLifeSpan->Collect(lifeSpan.MilliSeconds());
     ActiveSessionActors->Dec();
     YdbSessionsActiveCount->Dec();
+}
+
+void TKqpCountersBase::ReportSessionActorCleanupLatency(TDuration cleanupTime) {
+    SessionActorCleanupLatency->Collect(cleanupTime.MilliSeconds());
 }
 
 void TKqpCountersBase::ReportSessionActorClosedError() {
@@ -589,16 +594,6 @@ TKqpDbCounters::TKqpDbCounters(const NMonitoring::TDynamicCounterPtr& externalGr
 }
 
 template <typename T>
-void SaveHistogram(T& histogram, int index, const NMon::THistogramCounterHelper& helper) {
-    auto* buckets = histogram[index].MutableBuckets();
-    auto count = helper.GetBucketCount();
-    buckets->Resize(count, 0);
-    for (size_t i = 0; i < count; ++i) {
-        (*buckets)[i] = helper.GetBucketValue(i);
-    }
-}
-
-template <typename T>
 void SaveHistogram(T& histogram, int index, const NMonitoring::THistogramPtr& hgram) {
     auto* buckets = histogram[index].MutableBuckets();
     auto snapshot = hgram->Snapshot();
@@ -631,16 +626,6 @@ void TKqpDbCounters::ToProto(NKikimr::NSysView::TDbServiceCounters& counters) {
     DB_KQP_SIMPLE_COUNTERS_MAP(SAVE_SIMPLE_COUNTER)
     DB_KQP_CUMULATIVE_COUNTERS_MAP(SAVE_CUMULATIVE_COUNTER)
     DB_KQP_HISTOGRAM_COUNTERS_MAP(SAVE_HISTOGRAM_COUNTER)
-}
-
-template <typename T>
-void LoadHistogram(T& histogram, int index, NMon::THistogramCounterHelper& helper) {
-    auto* buckets = histogram[index].MutableBuckets();
-    auto count = helper.GetBucketCount();
-    buckets->Resize(count, 0);
-    for (size_t i = 0; i < count; ++i) {
-        helper.SetBucketValue(i, (*buckets)[i]);
-    }
 }
 
 template <typename T>
@@ -1015,6 +1000,13 @@ void TKqpCounters::ReportSessionActorFinished(TKqpDbCountersPtr dbCounters, TDur
     TKqpCountersBase::ReportSessionActorFinished(lifeSpan);
     if (dbCounters) {
         dbCounters->ReportSessionActorFinished(lifeSpan);
+    }
+}
+
+void TKqpCounters::ReportSessionActorCleanupLatency(TKqpDbCountersPtr dbCounters, TDuration cleanupTime) {
+    TKqpCountersBase::ReportSessionActorCleanupLatency(cleanupTime);
+    if (dbCounters) {
+        dbCounters->ReportSessionActorCleanupLatency(cleanupTime);
     }
 }
 

@@ -181,7 +181,7 @@ public:
         TPathId pathId = txState->TargetPathId;
         TPathElement::TPtr path = context.SS->PathsById.at(pathId);
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
 
         path->StepCreated = step;
         context.SS->PersistCreateStep(db, pathId, step);
@@ -482,11 +482,17 @@ public:
         auto schema = Transaction.GetCreateTable();
         const bool omitFollowers = schema.GetOmitFollowers();
         const bool isBackup = schema.GetIsBackup();
+
         PrepareScheme(&schema, name, srcTableInfo, context);
+        schema.SetIsBackup(isBackup);
+
         if (omitFollowers) {
             schema.MutablePartitionConfig()->AddFollowerGroups()->Clear();
         }
-        schema.SetIsBackup(isBackup);
+
+        if (isBackup) {
+            schema.ClearTTLSettings();
+        }
 
         NKikimrSchemeOp::TPartitionConfig compilationPartitionConfig;
         if (!TPartitionConfigMerger::ApplyChanges(compilationPartitionConfig, srcTableInfo->PartitionConfig(), schema.GetPartitionConfig(), AppData(), errStr)
@@ -540,6 +546,7 @@ public:
             }
         }
 
+        auto guard = context.DbGuard();
         TPathId allocatedPathId = context.SS->AllocatePathId();
         context.MemChanges.GrabNewPath(context.SS, allocatedPathId);
         context.MemChanges.GrabPath(context.SS, parent.Base()->PathId);

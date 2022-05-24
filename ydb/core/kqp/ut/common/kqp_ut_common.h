@@ -74,6 +74,7 @@ TVector<NKikimrKqp::TKqpSetting> SyntaxV1Settings();
 
 struct TKikimrSettings: public TTestFeatureFlagsHolder<TKikimrSettings> {
     NKikimrConfig::TAppConfig AppConfig;
+    NKikimrPQ::TPQConfig PQConfig;
     TVector<NKikimrKqp::TKqpSetting> KqpSettings;
     TString AuthToken;
     TString DomainRoot = KikimrDefaultUtDomainRoot;
@@ -82,8 +83,15 @@ struct TKikimrSettings: public TTestFeatureFlagsHolder<TKikimrSettings> {
     TDuration KeepSnapshotTimeout = TDuration::Zero();
     IOutputStream* LogStream = nullptr;
 
+    TKikimrSettings()
+    {
+        // default value for tests, can be overwritten by SetFeatureFlags()
+        this->SetEnableKqpSessionActor(false);
+    }
+
     TKikimrSettings& SetAppConfig(const NKikimrConfig::TAppConfig& value) { AppConfig = value; return *this; }
     TKikimrSettings& SetFeatureFlags(const NKikimrConfig::TFeatureFlags& value) { FeatureFlags = value; return *this; }
+    TKikimrSettings& SetPQConfig(const NKikimrPQ::TPQConfig& value) { PQConfig = value; return *this; };
     TKikimrSettings& SetKqpSettings(const TVector<NKikimrKqp::TKqpSetting>& value) { KqpSettings = value; return *this; }
     TKikimrSettings& SetAuthToken(const TString& value) { AuthToken = value; return *this; }
     TKikimrSettings& SetDomainRoot(const TString& value) { DomainRoot = value; return *this; }
@@ -91,7 +99,6 @@ struct TKikimrSettings: public TTestFeatureFlagsHolder<TKikimrSettings> {
     TKikimrSettings& SetWithSampleTables(bool value) { WithSampleTables = value; return *this; }
     TKikimrSettings& SetKeepSnapshotTimeout(TDuration value) { KeepSnapshotTimeout = value; return *this; }
     TKikimrSettings& SetLogStream(IOutputStream* follower) { LogStream = follower; return *this; };
-
 };
 
 class TKikimrRunner {
@@ -150,6 +157,17 @@ private:
     NYdb::TDriverConfig DriverConfig;
     THolder<NYdb::TDriver> Driver;
 };
+
+inline TKikimrRunner KikimrRunnerEnableSessionActor(bool enable, TVector<NKikimrKqp::TKqpSetting> kqpSettings = {},
+    const NKikimrConfig::TAppConfig& appConfig = {})
+{
+    auto settings = TKikimrSettings()
+        .SetAppConfig(appConfig)
+        .SetEnableKqpSessionActor(enable)
+        .SetKqpSettings(kqpSettings);
+
+    return TKikimrRunner{settings};
+}
 
 struct TCollectedStreamResult {
     TString ResultSetYson;
@@ -226,6 +244,7 @@ TString StreamResultToYson(NYdb::NTable::TTablePartIterator& it);
 ui32 CountPlanNodesByKv(const NJson::TJsonValue& plan, const TString& key, const TString& value);
 NJson::TJsonValue FindPlanNodeByKv(const NJson::TJsonValue& plan, const TString& key, const TString& value);
 
+TString ReadTableToYson(NYdb::NTable::TSession session, const TString& table);
 TString ReadTablePartToYson(NYdb::NTable::TSession session, const TString& table);
 
 inline void AssertSuccessResult(const NYdb::TStatus& result) {

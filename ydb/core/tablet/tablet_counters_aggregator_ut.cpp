@@ -251,7 +251,7 @@ Y_UNIT_TEST_SUITE(TTabletCountersAggregator) {
         std::unique_ptr<TTabletCountersBase> AppCountersBaseline;
 
     public:
-        static constexpr TTabletTypes::EType TabletType = TTabletTypes::FLAT_DATASHARD;
+        static constexpr TTabletTypes::EType TabletType = TTabletTypes::DataShard;
 
         static constexpr TTabletPercentileCounter::TRangeDef RangeDefs1[] = {
             {0,   "0"}
@@ -752,6 +752,9 @@ Y_UNIT_TEST_SUITE(TTabletLabeledCountersAggregator) {
         TTestBasicRuntime runtime(1);
 
         runtime.Initialize(TAppPrepare().Unwrap());
+        // NOTE(shmel1k@): KIKIMR-14221
+        runtime.GetAppData().PQConfig.SetTopicsAreFirstClassCitizen(false);
+
         TActorId edge = runtime.AllocateEdgeActor();
 
         IActor* aggregator = CreateClusterLabeledCountersAggregatorActor(edge, TTabletTypes::PersQueue, 3, "rt3.*--*,cons*/*/rt.*--*", 3);

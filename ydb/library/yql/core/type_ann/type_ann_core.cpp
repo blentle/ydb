@@ -6983,6 +6983,17 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
             if (!EnsureComputableType(input->Child(2)->Pos(), *callableType, ctx.Expr)) {
                 return IGraphTransformer::TStatus::Error;
             }
+            bool hasNestedOptional = callableType->HasNestedOptional();
+            if (!hasNestedOptional) {
+                for (const TCallableExprType::TArgumentInfo& arg : callableType->GetArguments()) {
+                    hasNestedOptional |= arg.Type->HasNestedOptional();
+                }
+            }
+            if (hasNestedOptional) {
+                ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                                         TStringBuilder() << "Nested optionals are unsupported in script UDF"));
+                return IGraphTransformer::TStatus::Error;
+            }
         }
 
         // script body
@@ -11271,6 +11282,11 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["PgAggregationTraitsTuple"] = &PgAggregationTraitsWrapper;
         Functions["PgWindowTraitsTuple"] = &PgAggregationTraitsWrapper;
         Functions["PgInternal0"] = &PgInternal0Wrapper;
+        Functions["PgArray"] = &PgArrayWrapper;
+        Functions["PgTypeMod"] = &PgTypeModWrapper;
+        Functions["PgLike"] = &PgLikeWrapper;
+        Functions["PgILike"] = &PgLikeWrapper;
+
         Functions["AutoDemuxList"] = &AutoDemuxListWrapper;
         Functions["AggrCountInit"] = &AggrCountInitWrapper;
         Functions["AggrCountUpdate"] = &AggrCountUpdateWrapper;

@@ -85,6 +85,17 @@ struct TInsertedData {
     ui32 BlobSize() const { return BlobId.BlobSize(); }
 };
 
+struct TCommittedBlob {
+    TUnifiedBlobId BlobId;
+    ui64 PlanStep{0};
+    ui64 TxId{0};
+
+    /// It uses trick then we place key wtih planStep:txId in container and find them later by BlobId only.
+    /// So hash() and equality should depend on BlobId only.
+    bool operator == (const TCommittedBlob& key) const { return BlobId == key.BlobId; }
+    ui64 Hash() const noexcept { return BlobId.Hash(); }
+};
+
 class IDbWrapper;
 
 /// Use one table for inserted and commited blobs:
@@ -109,9 +120,10 @@ public:
     void EraseInserted(IDbWrapper& dbTable, const TInsertedData& key);
     void EraseCommitted(IDbWrapper& dbTable, const TInsertedData& key);
     void EraseAborted(IDbWrapper& dbTable, const TInsertedData& key);
-    TVector<TUnifiedBlobId> Read(ui64 pathId, ui64 plan, ui64 txId) const;
+    std::vector<TCommittedBlob> Read(ui64 pathId, ui64 plan, ui64 txId) const;
     bool Load(IDbWrapper& dbTable, const TInstant& loadTime);
-    void GetCounters(TCounters& prepared, TCounters& committed) const;
+    TCounters GetCountersPrepared() const;
+    TCounters GetCountersCommitted() const;
 
     size_t InsertedSize() const { return Inserted.size(); }
     const THashMap<ui64, TSet<TInsertedData>>& GetCommitted() const { return CommittedByPathId; }
@@ -128,3 +140,10 @@ private:
 };
 
 }
+
+template <>
+struct THash<NKikimr::NOlap::TCommittedBlob> {
+    inline size_t operator() (const NKikimr::NOlap::TCommittedBlob& key) const {
+        return key.Hash();
+    }
+};

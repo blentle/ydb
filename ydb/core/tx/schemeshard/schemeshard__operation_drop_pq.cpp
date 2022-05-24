@@ -59,7 +59,7 @@ public:
         context.OnComplete.UnbindMsgFromPipe(OperationId, tabletId, idx);
 
         if (txState->ShardsInProgress.empty()) {
-            NIceDb::TNiceDb db(context.Txc.DB);
+            NIceDb::TNiceDb db(context.GetDB());
             context.SS->ChangeTxState(db, OperationId, TTxState::DeleteParts);
             context.OnComplete.ActivateTx(OperationId);
             return true;
@@ -108,7 +108,7 @@ public:
         txState->UpdateShardsInProgress(TTxState::DropParts);
 
         if (!haveWork) {
-            NIceDb::TNiceDb db(context.Txc.DB);
+            NIceDb::TNiceDb db(context.GetDB());
             context.SS->ChangeTxState(db, OperationId, TTxState::DeleteParts);
             context.OnComplete.ActivateTx(OperationId);
             return true;
@@ -150,7 +150,7 @@ public:
             context.OnComplete.DeleteShard(shard.Idx);
         }
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
         context.SS->ChangeTxState(db, OperationId, TTxState::Propose);
         context.OnComplete.ActivateTx(OperationId);
         return true;
@@ -192,7 +192,7 @@ public:
         auto path = context.SS->PathsById.at(pathId);
         auto parentDir = context.SS->PathsById.at(path->ParentPathId);
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
 
         Y_VERIFY(!path->Dropped());
         path->SetDropped(step, OperationId.GetTxId());
@@ -238,10 +238,12 @@ public:
         ++parentDir->DirAlterVersion;
         context.SS->PersistPathDirAlterVersion(db, parentDir);
         context.SS->ClearDescribePathCaches(parentDir);
-        context.OnComplete.PublishToSchemeBoard(OperationId, parentDir->PathId);
-
         context.SS->ClearDescribePathCaches(path);
-        context.OnComplete.PublishToSchemeBoard(OperationId, pathId);
+
+        if (!context.SS->DisablePublicationsOfDropping) {
+            context.OnComplete.PublishToSchemeBoard(OperationId, parentDir->PathId);
+            context.OnComplete.PublishToSchemeBoard(OperationId, pathId);
+        }
 
         context.SS->ChangeTxState(db, OperationId, TTxState::Done);
         context.OnComplete.ActivateTx(OperationId);
@@ -472,7 +474,7 @@ public:
         // Dirty hack: drop step must not be zero because 0 is treated as "hasn't been dropped"
         txState.MinStep = TStepId(1);
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
         SetPQShards(pqGroup, txState, context);
         SetPQBalancer(pqGroup, txState, context);
 
@@ -491,10 +493,12 @@ public:
         ++parentDir.Base()->DirAlterVersion;
         context.SS->PersistPathDirAlterVersion(db, parentDir.Base());
         context.SS->ClearDescribePathCaches(parentDir.Base());
-        context.OnComplete.PublishToSchemeBoard(OperationId, parentDir.Base()->PathId);
-
         context.SS->ClearDescribePathCaches(path.Base());
-        context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
+
+        if (!context.SS->DisablePublicationsOfDropping) {
+            context.OnComplete.PublishToSchemeBoard(OperationId, parentDir.Base()->PathId);
+            context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
+        }
 
         State = NextState();
         SetState(SelectStateFunc(State));

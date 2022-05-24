@@ -41,7 +41,7 @@ public:
             context.OnComplete.DeleteShard(shard.Idx);
         }
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
         context.SS->ChangeTxState(db, OperationId, TTxState::Propose);
         return true;
     }
@@ -81,7 +81,7 @@ public:
         auto path = context.SS->PathsById.at(pathId);
         auto parentDir = context.SS->PathsById.at(path->ParentPathId);
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
 
         Y_VERIFY(!path->Dropped());
         path->SetDropped(step, OperationId.GetTxId());
@@ -113,10 +113,12 @@ public:
         ++parentDir->DirAlterVersion;
         context.SS->PersistPathDirAlterVersion(db, parentDir);
         context.SS->ClearDescribePathCaches(parentDir);
-        context.OnComplete.PublishToSchemeBoard(OperationId, parentDir->PathId);
-
         context.SS->ClearDescribePathCaches(path);
-        context.OnComplete.PublishToSchemeBoard(OperationId, pathId);
+
+        if (!context.SS->DisablePublicationsOfDropping) {
+            context.OnComplete.PublishToSchemeBoard(OperationId, parentDir->PathId);
+            context.OnComplete.PublishToSchemeBoard(OperationId, pathId);
+        }
 
         context.OnComplete.DoneOperation(OperationId);
 
@@ -253,7 +255,7 @@ public:
         txState.MinStep = TStepId(1);
         txState.State = TTxState::DeleteParts;
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
 
         TBlockStoreVolumeInfo::TPtr volume = context.SS->BlockStoreVolumes.at(path.Base()->PathId);
         Y_VERIFY(volume);
@@ -286,10 +288,12 @@ public:
         ++parentDir.Base()->DirAlterVersion;
         context.SS->PersistPathDirAlterVersion(db, parentDir.Base());
         context.SS->ClearDescribePathCaches(parentDir.Base());
-        context.OnComplete.PublishToSchemeBoard(OperationId, parentDir.Base()->PathId);
-
         context.SS->ClearDescribePathCaches(path.Base());
-        context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
+
+        if (!context.SS->DisablePublicationsOfDropping) {
+            context.OnComplete.PublishToSchemeBoard(OperationId, parentDir.Base()->PathId);
+            context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
+        }
 
         State = NextState();
         SetState(SelectStateFunc(State));

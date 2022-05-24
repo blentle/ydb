@@ -60,7 +60,7 @@ For development purposes we test that YDB could be built and run under latest ve
 ## Getting Started
 
 1. Install YDB using [pre-built executables](https://ydb.tech/en/docs/getting_started/self_hosted/ydb_local), [build it from source](BUILD.md) or [use Docker container](https://ydb.tech/en/docs/getting_started/self_hosted/ydb_docker).
-1. Install [command line interace](https://ydb.tech/en/docs/getting_started/cli) tool to work with scheme and run queries.
+1. Install [command line interface](https://ydb.tech/en/docs/getting_started/cli) tool to work with scheme and run queries.
 1. Start [local cluster](https://ydb.tech/en/docs/getting_started/self_hosted/ydb_local) or container and run [YQL query](https://ydb.tech/en/docs/yql/reference/) via [YDB CLI](https://ydb.tech/en/docs/getting_started/cli).
 1. Access [Embedded UI](https://ydb.tech/en/docs/maintenance/embedded_monitoring/) via browser for schema navigation, query execution and other database development related tasks.
 1. Run available [example application](https://ydb.tech/en/docs/reference/ydb-sdk/example/go/).
@@ -79,11 +79,9 @@ For development purposes we test that YDB could be built and run under latest ve
 
 We are glad to welcome new contributors!
 
-1. Please read [contributor's guide](CONTRIBUTING).
-2. We can accept your work to YDB after you have read contributor's license agreement (aka CLA).
+1. Please read [contributor's guide](CONTRIBUTING.md).
+2. We can accept your work to YDB after you have signed contributor's license agreement (aka CLA).
 3. Please don't forget to add a note to your pull request, that you agree to the terms of the CLA.
-
-More information can be found in [CONTRIBUTING](CONTRIBUTING) file.
 
 ## Success Stories
 

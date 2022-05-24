@@ -811,6 +811,70 @@ public:
                 } else if (name == "dropIndex") {
                     auto nameNode = action.Value().Cast<TCoAtom>();
                     alterTableRequest.add_drop_indexes(TString(nameNode.Value()));
+                } else if (name == "addChangefeed") {
+                    auto listNode = action.Value().Cast<TExprList>();
+                    auto add_changefeed = alterTableRequest.add_add_changefeeds();
+                    for (size_t i = 0; i < listNode.Size(); ++i) {
+                        auto item = listNode.Item(i);
+                        auto columnTuple = item.Cast<TExprList>();
+                        auto nameNode = columnTuple.Item(0).Cast<TCoAtom>();
+                        auto name = TString(nameNode.Value());
+                        if (name == "name") {
+                            add_changefeed->set_name(TString(columnTuple.Item(1).Cast<TCoAtom>().Value()));
+                        } else if (name == "settings") {
+                            for (const auto& setting : columnTuple.Item(1).Cast<TCoNameValueTupleList>()) {
+                                auto name = setting.Name().Value();
+                                if (name == "mode") {
+                                    auto mode = TString(
+                                        setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Value()
+                                    );
+
+                                    if (to_lower(mode) == "keys_only") {
+                                        add_changefeed->set_mode(Ydb::Table::ChangefeedMode::MODE_KEYS_ONLY);
+                                    } else if (to_lower(mode) == "updates") {
+                                        add_changefeed->set_mode(Ydb::Table::ChangefeedMode::MODE_UPDATES);
+                                    } else if (to_lower(mode) == "new_image") {
+                                        add_changefeed->set_mode(Ydb::Table::ChangefeedMode::MODE_NEW_IMAGE);
+                                    } else if (to_lower(mode) == "old_image") {
+                                        add_changefeed->set_mode(Ydb::Table::ChangefeedMode::MODE_OLD_IMAGE);
+                                    } else if (to_lower(mode) == "new_and_old_images") {
+                                        add_changefeed->set_mode(Ydb::Table::ChangefeedMode::MODE_NEW_AND_OLD_IMAGES);
+                                    } else {
+                                        ctx.AddError(TIssue(ctx.GetPosition(setting.Name().Pos()),
+                                            TStringBuilder() << "Unknown changefeed mode: " << mode));
+                                        return SyncError();
+                                    }
+                                } else if (name == "format") {
+                                    auto format = TString(
+                                        setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Value()
+                                    );
+
+                                    if (to_lower(format) == "json") {
+                                        add_changefeed->set_format(Ydb::Table::ChangefeedFormat::FORMAT_JSON);
+                                    } else {
+                                        ctx.AddError(TIssue(ctx.GetPosition(setting.Name().Pos()),
+                                            TStringBuilder() << "Unknown changefeed format: " << format));
+                                        return SyncError();
+                                    }
+                                } else if (name == "local") {
+                                    // nop
+                                } else {
+                                    ctx.AddError(TIssue(ctx.GetPosition(setting.Name().Pos()),
+                                        TStringBuilder() << "Unknown changefeed setting: " << name));
+                                    return SyncError();
+                                }
+                            }
+                        } else if (name == "state") {
+                            YQL_ENSURE(!columnTuple.Item(1).Maybe<TCoAtom>());
+                        } else {
+                            ctx.AddError(TIssue(ctx.GetPosition(nameNode.Pos()),
+                                TStringBuilder() << "Unknown add changefeed setting: " << name));
+                            return SyncError();
+                        }
+                    }
+                } else if (name == "dropChangefeed") {
+                    auto nameNode = action.Value().Cast<TCoAtom>();
+                    alterTableRequest.add_drop_changefeeds(TString(nameNode.Value()));
                 } else {
                     ctx.AddError(TIssue(ctx.GetPosition(action.Name().Pos()),
                         TStringBuilder() << "Unknown alter table action: " << name));
@@ -1052,7 +1116,7 @@ private:
             node.Ptr()->SetResult(ctx.NewAtom(node.Pos(), ToString(resultId)));
 
             if (finalizeFunc) {
-                finalizeFunc(node, result, ctx);
+                finalizeFunc(node, insertResult.first->second, ctx);
             }
 
             return std::make_pair(IGraphTransformer::TStatus::Ok, TAsyncTransformCallbackFuture());
@@ -1101,10 +1165,12 @@ private:
 
         for (const auto& op : tableOps) {
             auto table = op.GetTable();
+            auto operation = (TYdbOperation)op.GetOperation();
             const auto& desc = SessionCtx->Tables().GetTable(cluster, table);
             YQL_ENSURE(desc.Metadata);
-            tableInfo.push_back(NKqpProto::TKqpTableInfo());
-            TableDescriptionToTableInfo(desc, &tableInfo.back());
+            size_t size = tableInfo.size();
+            TableDescriptionToTableInfo(desc, operation, tableInfo);
+            Y_VERIFY(size + 1 == tableInfo.size());
         }
 
         if (!SessionCtx->HasTx()) {

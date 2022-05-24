@@ -9,6 +9,7 @@
 #include <ydb/library/yql/public/udf/udf_value_builder.h>
 #include <ydb/library/yql/minikql/invoke_builtins/mkql_builtins.h>
 #include <ydb/library/yql/utils/yql_panic.h>
+#include <ydb/library/yql/udfs/common/re2/re2_udf.cpp>
 
 namespace NKikimr {
 namespace NKqp {
@@ -54,6 +55,7 @@ NMiniKQL::IFunctionRegistry* UdfFrFactory(const NScheme::TTypeRegistry& typeRegi
     Y_UNUSED(typeRegistry);
     auto funcRegistry = NMiniKQL::CreateFunctionRegistry(NMiniKQL::CreateBuiltinRegistry())->Clone();
     funcRegistry->AddModule("", "TestUdfs", new TTestUdfsModule());
+    funcRegistry->AddModule("re2_path", "Re2", new TRe2Module<true>());
     return funcRegistry.Release();
 }
 
@@ -97,7 +99,7 @@ TKikimrRunner::TKikimrRunner(const TKikimrSettings& settings) {
 
     effectiveKqpSettings.insert(effectiveKqpSettings.end(), settings.KqpSettings.begin(), settings.KqpSettings.end());
 
-    ServerSettings.Reset(MakeHolder<Tests::TServerSettings>(mbusPort));
+    ServerSettings.Reset(MakeHolder<Tests::TServerSettings>(mbusPort, NKikimrProto::TAuthConfig(), settings.PQConfig));
     ServerSettings->SetDomainName(settings.DomainRoot);
     ServerSettings->SetKqpSettings(effectiveKqpSettings);
     ServerSettings->SetAppConfig(settings.AppConfig);
@@ -715,6 +717,14 @@ TCollectedStreamResult CollectStreamResult(NYdb::NExperimental::TStreamPartItera
 
 TCollectedStreamResult CollectStreamResult(NYdb::NTable::TScanQueryPartIterator& it) {
     return CollectStreamResultImpl(it);
+}
+
+TString ReadTableToYson(NYdb::NTable::TSession session, const TString& table) {
+    TReadTableSettings settings;
+    settings.Ordered(true);
+    auto it = session.ReadTable(table, settings).GetValueSync();
+    UNIT_ASSERT(it.IsSuccess());
+    return StreamResultToYson(it);
 }
 
 TString ReadTablePartToYson(NYdb::NTable::TSession session, const TString& table) {

@@ -11,13 +11,11 @@
 
 namespace NKikimr::NGRpcProxy::V1 {
 
-#define DEFAULT_PARTITION_SPEED 1048576 // 1Mb
-
-    constexpr i32 MAX_READ_RULES_COUNT = 3000;
-
     constexpr TStringBuf GRPCS_ENDPOINT_PREFIX = "grpcs://";
-    static const i64 DEFAULT_MAX_DATABASE_MESSAGEGROUP_SEQNO_RETENTION_PERIOD = 16*24*60*60*1000;
-
+    constexpr i64 DEFAULT_MAX_DATABASE_MESSAGEGROUP_SEQNO_RETENTION_PERIOD_MS =
+        TDuration::Days(16).MilliSeconds();
+    constexpr ui64 DEFAULT_PARTITION_SPEED = 1_MB;
+    constexpr i32 MAX_READ_RULES_COUNT = 3000;
     constexpr i32 MAX_SUPPORTED_CODECS_COUNT = 100;
 
     TClientServiceTypes GetSupportedClientServiceTypes(const TActorContext& ctx) {
@@ -176,8 +174,9 @@ namespace NKikimr::NGRpcProxy::V1 {
         return "";
     }
 
-    bool CheckReadRulesConfig(const NKikimrPQ::TPQTabletConfig& config, const TClientServiceTypes& supportedClientServiceTypes,
-                                TString& error) {
+    bool CheckReadRulesConfig(const NKikimrPQ::TPQTabletConfig& config,
+                              const TClientServiceTypes& supportedClientServiceTypes,
+                              TString& error) {
 
         if (config.GetReadRules().size() > MAX_READ_RULES_COUNT) {
             error = TStringBuilder() << "read rules count cannot be more than "
@@ -218,9 +217,13 @@ namespace NKikimr::NGRpcProxy::V1 {
         return res;
     }
 
-    Ydb::StatusIds::StatusCode FillProposeRequestImpl(const TString& name, const Ydb::PersQueue::V1::TopicSettings& settings,
-                                                      NKikimrSchemeOp::TModifyScheme& modifyScheme, const TActorContext& ctx, bool alter, TString& error)
-    {
+    Ydb::StatusIds::StatusCode FillProposeRequestImpl(
+            const TString& name, const Ydb::PersQueue::V1::TopicSettings& settings,
+            NKikimrSchemeOp::TModifyScheme& modifyScheme, const TActorContext& ctx,
+            bool alter, TString& error, const TString& path, const TString& database, const TString& localDc
+    ) {
+        const auto& pqConfig = AppData(ctx)->PQConfig;
+
         modifyScheme.SetOperationType(alter ? NKikimrSchemeOp::EOperationType::ESchemeOpAlterPersQueueGroup : NKikimrSchemeOp::EOperationType::ESchemeOpCreatePersQueueGroup);
 
         auto pqDescr = alter ? modifyScheme.MutableAlterPersQueueGroup() : modifyScheme.MutableCreatePersQueueGroup();
@@ -268,6 +271,8 @@ namespace NKikimr::NGRpcProxy::V1 {
                 }
             } else if (pair.first == "_abc_slug") {
                 config->SetAbcSlug(pair.second);
+            }  else if (pair.first == "_federation_account") {
+                config->SetFederationAccount(pair.second);
             } else if (pair.first == "_abc_id") {
                 try {
                     config->SetAbcId(!FromString<ui32>(pair.second));
@@ -281,16 +286,33 @@ namespace NKikimr::NGRpcProxy::V1 {
             }
         }
         bool local = !settings.client_write_disabled();
-        config->SetLocalDC(local);
-        config->SetDC(NPersQueue::GetDC(name));
+
+        auto topicPath = NKikimr::JoinPath({modifyScheme.GetWorkingDir(), name});
+        if (!pqConfig.GetTopicsAreFirstClassCitizen()) {
+            auto converter = NPersQueue::TTopicNameConverter::ForFederation(
+                    pqConfig.GetRoot(), pqConfig.GetTestDatabaseRoot(), name, path, database, local, localDc,
+                    config->GetFederationAccount()
+            );
+
+            if (!converter->IsValid()) {
+                error = TStringBuilder() << "Bad topic: " << converter->GetReason();
+                return Ydb::StatusIds::BAD_REQUEST;
+            }
+            config->SetLocalDC(local);
+            config->SetDC(converter->GetCluster());
+            config->SetProducer(converter->GetLegacyProducer());
+            config->SetTopic(converter->GetLegacyLogtype());
+            config->SetIdent(converter->GetLegacyProducer());
+        }
+
         config->SetTopicName(name);
-        config->SetTopicPath(NKikimr::JoinPath({modifyScheme.GetWorkingDir(), name}));
-        config->SetProducer(NPersQueue::GetProducer(name));
-        config->SetTopic(LegacySubstr(NPersQueue::GetRealTopic(name), config->GetProducer().size() + 2));
-        config->SetIdent(config->GetProducer());
+        config->SetTopicPath(topicPath);
+
+        //Sets legacy 'logtype'.
+
         auto partConfig = config->MutablePartitionConfig();
 
-        const auto& channelProfiles = AppData(ctx)->PQConfig.GetChannelProfiles();
+        const auto& channelProfiles = pqConfig.GetChannelProfiles();
         if (channelProfiles.size() > 2) {
             partConfig->SetNumChannels(channelProfiles.size() - 2); // channels 0,1 are reserved in tablet
             partConfig->MutableExplicitChannelProfiles()->CopyFrom(channelProfiles);
@@ -302,18 +324,44 @@ namespace NKikimr::NGRpcProxy::V1 {
         partConfig->SetMaxSizeInPartition(settings.max_partition_storage_size() ? settings.max_partition_storage_size() : Max<i64>());
         partConfig->SetMaxCountInPartition(Max<i32>());
 
-        if (settings.retention_period_ms() <= 0) {
-            error = TStringBuilder() << "retention_period_ms must be positive, provided " << settings.retention_period_ms();
-            return Ydb::StatusIds::BAD_REQUEST;
+        switch (settings.retention_case()) {
+            case Ydb::PersQueue::V1::TopicSettings::kRetentionPeriodMs: {
+                if (settings.retention_period_ms() <= 0) {
+                    error = TStringBuilder() << "retention_period_ms must be positive, provided " <<
+                        settings.retention_period_ms();
+                    return Ydb::StatusIds::BAD_REQUEST;
+                }
+                partConfig->SetLifetimeSeconds(Max(settings.retention_period_ms() / 1000ll, 1ll));
+            }
+            break;
+
+            case Ydb::PersQueue::V1::TopicSettings::kRetentionStorageBytes: {
+                if (settings.retention_storage_bytes() <= 0) {
+                    error = TStringBuilder() << "retention_storage_bytes must be positive, provided " <<
+                        settings.retention_storage_bytes();
+                    return Ydb::StatusIds::BAD_REQUEST;
+                }
+                partConfig->SetStorageLimitBytes(settings.retention_storage_bytes());
+            }
+            break;
+
+            default: {
+                error = TStringBuilder() << "retention_storage_bytes or retention_period_ms should be set";
+                return Ydb::StatusIds::BAD_REQUEST;
+            }
         }
-        partConfig->SetLifetimeSeconds(settings.retention_period_ms() > 999 ? settings.retention_period_ms() / 1000 : 1);
 
         if (settings.message_group_seqno_retention_period_ms() > 0 && settings.message_group_seqno_retention_period_ms() < settings.retention_period_ms()) {
             error = TStringBuilder() << "message_group_seqno_retention_period_ms (provided " << settings.message_group_seqno_retention_period_ms() << ") must be more then retention_period_ms (provided " << settings.retention_period_ms() << ")";
             return Ydb::StatusIds::BAD_REQUEST;
         }
-        if (settings.message_group_seqno_retention_period_ms() > DEFAULT_MAX_DATABASE_MESSAGEGROUP_SEQNO_RETENTION_PERIOD) {
-            error = TStringBuilder() << "message_group_seqno_retention_period_ms (provided " << settings.message_group_seqno_retention_period_ms() << ") must be less then default limit for database " << DEFAULT_MAX_DATABASE_MESSAGEGROUP_SEQNO_RETENTION_PERIOD;
+        if (settings.message_group_seqno_retention_period_ms() >
+            DEFAULT_MAX_DATABASE_MESSAGEGROUP_SEQNO_RETENTION_PERIOD_MS) {
+            error = TStringBuilder() <<
+                "message_group_seqno_retention_period_ms (provided " <<
+                settings.message_group_seqno_retention_period_ms() <<
+                ") must be less then default limit for database " <<
+                DEFAULT_MAX_DATABASE_MESSAGEGROUP_SEQNO_RETENTION_PERIOD_MS;
             return Ydb::StatusIds::BAD_REQUEST;
         }
         if (settings.message_group_seqno_retention_period_ms() < 0) {
@@ -404,6 +452,9 @@ namespace NKikimr::NGRpcProxy::V1 {
         }
         if (settings.has_remote_mirror_rule()) {
             auto mirrorFrom = partConfig->MutableMirrorFrom();
+            if (!local) {
+                mirrorFrom->SetSyncWriteTime(true);
+            }
             {
                 TString endpoint = settings.remote_mirror_rule().endpoint();
                 if (endpoint.StartsWith(GRPCS_ENDPOINT_PREFIX)) {

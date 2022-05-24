@@ -1,12 +1,16 @@
 #include "datashard_ut_common.h"
+#include "datashard_ut_common_kqp.h"
 #include "datashard_active_transaction.h"
 
 #include <ydb/core/formats/factory.h>
 #include <ydb/core/tx/tx_proxy/proxy.h>
 
+#include <ydb/core/kqp/ut/common/kqp_ut_common.h> // Y_UNIT_TEST_(TWIN|QUAD)
+
 namespace NKikimr {
 
 using namespace NKikimr::NDataShard;
+using namespace NKikimr::NDataShard::NKqpHelpers;
 using namespace NSchemeShard;
 using namespace Tests;
 
@@ -968,6 +972,501 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             "key = 1, value = 1\n"
             "key = 2, value = 2\n"
             "key = 3, value = 3\n");
+    }
+
+    Y_UNIT_TEST_TWIN(MvccSnapshotTailCleanup, UseNewEngine) {
+        TPortManager pm;
+        TServerSettings::TControls controls;
+        controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
+        controls.MutableDataShardControls()->SetUnprotectedMvccSnapshotReads(1);
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableMvcc(true)
+            .SetEnableMvccSnapshotReads(true)
+            .SetEnableKqpSessionActor(UseNewEngine)
+            .SetKeepSnapshotTimeout(TDuration::Seconds(2))
+            .SetControls(controls);
+
+        Tests::TServer::TPtr server = new TServer(serverSettings);
+        auto &runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+
+        runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
+        runtime.SetLogPriority(NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+
+        InitRoot(server, sender);
+
+        TDisableDataShardLogBatching disableDataShardLogBatching;
+        CreateShardedTable(server, sender, "/Root", "table-1", 1);
+
+        ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1)"));
+
+        SimulateSleep(server, TDuration::Seconds(1));
+
+        auto beginSnapshotRequest = [&](TString& sessionId, TString& txId, const TString& query) -> TString {
+            auto reqSender = runtime.AllocateEdgeActor();
+            sessionId = CreateSession(runtime, reqSender);
+            auto ev = ExecRequest(runtime, reqSender, MakeBeginRequest(sessionId, query));
+            auto& response = ev->Get()->Record.GetRef();
+            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+            txId = response.GetResponse().GetTxMeta().id();
+            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        };
+
+        auto continueSnapshotRequest = [&](const TString& sessionId, const TString& txId, const TString& query) -> TString {
+            auto reqSender = runtime.AllocateEdgeActor();
+            auto ev = ExecRequest(runtime, reqSender, MakeContinueRequest(sessionId, txId, query));
+            auto& response = ev->Get()->Record.GetRef();
+            if (response.GetYdbStatus() != Ydb::StatusIds::SUCCESS) {
+                return TStringBuilder() << "ERROR: " << response.GetYdbStatus();
+            }
+            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        };
+
+        auto execSnapshotRequest = [&](const TString& query) -> TString {
+            auto reqSender = runtime.AllocateEdgeActor();
+            TString sessionId, txId;
+            TString result = beginSnapshotRequest(sessionId, txId, query);
+            CloseSession(runtime, reqSender, sessionId);
+            return result;
+        };
+
+        // Start with a snapshot read that persists necessary flags and advances edges for the first time
+        UNIT_ASSERT_VALUES_EQUAL(
+            execSnapshotRequest(Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                ORDER BY key
+                )")),
+            "Struct { "
+            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+            "} Struct { Bool: false }");
+        SimulateSleep(runtime, TDuration::Seconds(2));
+
+        // Create a new snapshot, it should still observe the same state
+        TString sessionId, txId;
+        UNIT_ASSERT_VALUES_EQUAL(
+            beginSnapshotRequest(sessionId, txId, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                ORDER BY key
+                )")),
+            "Struct { "
+            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+            "} Struct { Bool: false }");
+
+        // Insert a new row and wait for result, this will roll over into a new step
+        ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 2)"));
+
+        bool failed = false;
+        for (int i = 0; i < 5; ++i) {
+            // Idle cleanup is roughly every 15 seconds
+            runtime.SimulateSleep(TDuration::Seconds(15));
+            auto result = continueSnapshotRequest(sessionId, txId, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                ORDER BY key
+                )"));
+            if (result.StartsWith("ERROR:")) {
+                Cerr << "... got expected failure: " << result << Endl;
+                failed = true;
+                break;
+            }
+            UNIT_ASSERT_VALUES_EQUAL(
+                result,
+                "Struct { "
+                "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+                "} Struct { Bool: false }");
+        }
+
+        UNIT_ASSERT_C(failed, "Snapshot was not cleaned up");
+    }
+
+    Y_UNIT_TEST_TWIN(MvccSnapshotAndSplit, UseNewEngine) {
+        TPortManager pm;
+        TServerSettings::TControls controls;
+        controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
+        controls.MutableDataShardControls()->SetUnprotectedMvccSnapshotReads(1);
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableMvcc(true)
+            .SetEnableMvccSnapshotReads(true)
+            .SetEnableKqpSessionActor(UseNewEngine)
+            .SetControls(controls);
+
+        Tests::TServer::TPtr server = new TServer(serverSettings);
+        auto &runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+
+        runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
+        runtime.SetLogPriority(NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+
+        InitRoot(server, sender);
+
+        TDisableDataShardLogBatching disableDataShardLogBatching;
+        CreateShardedTable(server, sender, "/Root", "table-1", 1);
+
+        ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1)"));
+
+        SimulateSleep(server, TDuration::Seconds(1));
+
+        auto execSimpleRequest = [&](const TString& query) -> TString {
+            auto reqSender = runtime.AllocateEdgeActor();
+            auto ev = ExecRequest(runtime, reqSender, MakeSimpleRequest(query));
+            auto& response = ev->Get()->Record.GetRef();
+            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        };
+
+        auto beginSnapshotRequest = [&](TString& sessionId, TString& txId, const TString& query) -> TString {
+            auto reqSender = runtime.AllocateEdgeActor();
+            sessionId = CreateSession(runtime, reqSender);
+            auto ev = ExecRequest(runtime, reqSender, MakeBeginRequest(sessionId, query));
+            auto& response = ev->Get()->Record.GetRef();
+            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+            txId = response.GetResponse().GetTxMeta().id();
+            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        };
+
+        auto continueSnapshotRequest = [&](const TString& sessionId, const TString& txId, const TString& query) -> TString {
+            auto reqSender = runtime.AllocateEdgeActor();
+            auto ev = ExecRequest(runtime, reqSender, MakeContinueRequest(sessionId, txId, query));
+            auto& response = ev->Get()->Record.GetRef();
+            if (response.GetYdbStatus() != Ydb::StatusIds::SUCCESS) {
+                return TStringBuilder() << "ERROR: " << response.GetYdbStatus();
+            }
+            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        };
+
+        auto execSnapshotRequest = [&](const TString& query) -> TString {
+            auto reqSender = runtime.AllocateEdgeActor();
+            TString sessionId, txId;
+            TString result = beginSnapshotRequest(sessionId, txId, query);
+            CloseSession(runtime, reqSender, sessionId);
+            return result;
+        };
+
+        auto waitFor = [&](const auto& condition, const TString& description) {
+            if (!condition()) {
+                Cerr << "... waiting for " << description << Endl;
+                TDispatchOptions options;
+                options.CustomFinalCondition = [&]() {
+                    return condition();
+                };
+                runtime.DispatchEvents(options);
+                UNIT_ASSERT_C(condition(), "... failed to wait for " << description);
+            }
+        };
+
+        // Start with a snapshot read that persists necessary flags and advances edges for the first time
+        UNIT_ASSERT_VALUES_EQUAL(
+            execSnapshotRequest(Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                ORDER BY key
+                )")),
+            "Struct { "
+            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+            "} Struct { Bool: false }");
+        SimulateSleep(runtime, TDuration::Seconds(2));
+
+        bool captureSplit = true;
+        bool captureTimecast = false;
+        TVector<THolder<IEventHandle>> capturedSplit;
+        TVector<THolder<IEventHandle>> capturedTimecast;
+        auto captureEvents = [&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle> &ev) -> auto {
+            switch (ev->GetTypeRewrite()) {
+                case TEvDataShard::TEvSplit::EventType: {
+                    if (captureSplit) {
+                        Cerr << "... captured TEvSplit" << Endl;
+                        capturedSplit.emplace_back(ev.Release());
+                        return TTestActorRuntime::EEventAction::DROP;
+                    }
+                    break;
+                }
+                case TEvMediatorTimecast::EvUpdate: {
+                    auto update = ev->Get<TEvMediatorTimecast::TEvUpdate>();
+                    auto lastStep = update->Record.GetTimeBarrier();
+                    if (captureTimecast) {
+                        Cerr << "... captured TEvUpdate with step " << lastStep << Endl;
+                        capturedTimecast.emplace_back(ev.Release());
+                        return TTestActorRuntime::EEventAction::DROP;
+                    } else {
+                        Cerr << "... observed TEvUpdate with step " << lastStep << Endl;
+                    }
+                    break;
+                }
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        };
+        auto prevObserverFunc = runtime.SetObserverFunc(captureEvents);
+
+        // Split would fail otherwise :(
+        SetSplitMergePartCountLimit(server->GetRuntime(), -1);
+
+        // Start splitting table into two shards
+        auto senderSplit = runtime.AllocateEdgeActor();
+        auto tablets = GetTableShards(server, senderSplit, "/Root/table-1");
+        auto splitTxId = AsyncSplitTable(server, senderSplit, "/Root/table-1", tablets.at(0), 4);
+
+        // Wait until schemeshard wants to split the source shard
+        waitFor([&]{ return capturedSplit.size() > 0; }, "captured split");
+
+        // Create a new snapshot and verify initial state
+        // This snapshot must be lightweight and must not advance any edges
+        TString sessionId, txId;
+        UNIT_ASSERT_VALUES_EQUAL(
+            beginSnapshotRequest(sessionId, txId, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                ORDER BY key
+                )")),
+            "Struct { "
+            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+            "} Struct { Bool: false }");
+
+        // Finish the split
+        captureSplit = false;
+        captureTimecast = true;
+        for (auto& ev : capturedSplit) {
+            runtime.Send(ev.Release(), 0, true);
+        }
+        WaitTxNotification(server, senderSplit, splitTxId);
+
+        // Send an immediate write after the finished split
+        // In a buggy case it starts executing despite a blocked timecast
+        auto senderImmediateWrite = runtime.AllocateEdgeActor();
+        SendRequest(runtime, senderImmediateWrite, MakeSimpleRequest(Q_(R"(
+            UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 2)
+            )")));
+
+        // We sleep a little so datashard commits changes in buggy case
+        SimulateSleep(runtime, TDuration::MicroSeconds(1));
+
+        // Unblock timecast, so datashard time can finally catch up
+        captureTimecast = false;
+
+        // Wait for the commit result
+        {
+            auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(senderImmediateWrite);
+            auto& response = ev->Get()->Record.GetRef();
+            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+        }
+
+        // Snapshot must not have been damaged by the write above
+        UNIT_ASSERT_VALUES_EQUAL(
+            continueSnapshotRequest(sessionId, txId, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                ORDER BY key
+                )")),
+            "Struct { "
+            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+            "} Struct { Bool: false }");
+
+        // But new immediate read must observe all writes we have performed
+        UNIT_ASSERT_VALUES_EQUAL(
+            execSimpleRequest(Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                WHERE key in (1, 2, 3)
+                ORDER BY key
+                )")),
+            "Struct { "
+            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
+            "} Struct { Bool: false }");
+    }
+
+    Y_UNIT_TEST_TWIN(MvccSnapshotReadWithLongPlanQueue, UseNewEngine) {
+        TPortManager pm;
+        TServerSettings::TControls controls;
+        controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
+        controls.MutableDataShardControls()->SetUnprotectedMvccSnapshotReads(1);
+
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableMvcc(true)
+            .SetEnableMvccSnapshotReads(true)
+            .SetEnableKqpSessionActor(UseNewEngine)
+            .SetControls(controls);
+
+        Tests::TServer::TPtr server = new TServer(serverSettings);
+        auto &runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+
+        runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
+        runtime.SetLogPriority(NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+
+        InitRoot(server, sender);
+
+        TDisableDataShardLogBatching disableDataShardLogBatching;
+        CreateShardedTable(server, sender, "/Root", "table-1", 1);
+        CreateShardedTable(server, sender, "/Root", "table-2", 1);
+
+        ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1)"));
+        ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (1, 1)"));
+
+        SimulateSleep(server, TDuration::Seconds(1));
+
+        auto beginSnapshotRequest = [&](TString& sessionId, TString& txId, const TString& query) -> TString {
+            auto reqSender = runtime.AllocateEdgeActor();
+            sessionId = CreateSession(runtime, reqSender);
+            auto ev = ExecRequest(runtime, reqSender, MakeBeginRequest(sessionId, query));
+            auto& response = ev->Get()->Record.GetRef();
+            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+            txId = response.GetResponse().GetTxMeta().id();
+            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        };
+
+        auto continueSnapshotRequest = [&](const TString& sessionId, const TString& txId, const TString& query) -> TString {
+            auto reqSender = runtime.AllocateEdgeActor();
+            auto ev = ExecRequest(runtime, reqSender, MakeContinueRequest(sessionId, txId, query));
+            auto& response = ev->Get()->Record.GetRef();
+            if (response.GetYdbStatus() != Ydb::StatusIds::SUCCESS) {
+                return TStringBuilder() << "ERROR: " << response.GetYdbStatus();
+            }
+            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        };
+
+        // Prime table1 with a snapshot read
+        {
+            TString sessionId, txId;
+            UNIT_ASSERT_VALUES_EQUAL(
+                beginSnapshotRequest(sessionId, txId, Q_(R"(
+                    SELECT key, value FROM `/Root/table-1`
+                    WHERE key in (1, 2, 3)
+                    ORDER BY key
+                    )")),
+                "Struct { "
+                "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+                "} Struct { Bool: false }");
+        }
+
+        // Arrange for a distributed tx stuck at readset exchange
+        auto senderBlocker = runtime.AllocateEdgeActor();
+        TString sessionIdBlocker = CreateSession(runtime, senderBlocker);
+        TString txIdBlocker;
+        {
+            auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionIdBlocker, Q_(R"(
+                SELECT * FROM `/Root/table-1`
+                UNION ALL
+                SELECT * FROM `/Root/table-2`)")));
+            auto& response = ev->Get()->Record.GetRef();
+            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+            txIdBlocker = response.GetResponse().GetTxMeta().id();
+            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+        }
+
+        auto waitFor = [&](const auto& condition, const TString& description) {
+            if (!condition()) {
+                Cerr << "... waiting for " << description << Endl;
+                TDispatchOptions options;
+                options.CustomFinalCondition = [&]() {
+                    return condition();
+                };
+                runtime.DispatchEvents(options);
+                UNIT_ASSERT_C(condition(), "... failed to wait for " << description);
+            }
+        };
+
+        // Observe all received plan step messages
+        size_t observedPlanSteps = 0;
+        size_t observedPlanStepTxs = 0;
+        // Capture and block all readset messages
+        TVector<THolder<IEventHandle>> readSets;
+        auto captureRS = [&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) -> auto {
+            switch (ev->GetTypeRewrite()) {
+                case TEvTxProcessing::TEvPlanStep::EventType: {
+                    const auto* msg = ev->Get<TEvTxProcessing::TEvPlanStep>();
+                    Cerr << "... observed TEvPlanStep" << Endl;
+                    observedPlanSteps++;
+                    observedPlanStepTxs += msg->Record.TransactionsSize();
+                    break;
+                }
+                case TEvTxProcessing::TEvReadSet::EventType: {
+                    Cerr << "... captured TEvReadSet" << Endl;
+                    readSets.push_back(THolder(ev.Release()));
+                    return TTestActorRuntime::EEventAction::DROP;
+                }
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        };
+        auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
+
+        // Send a commit request, it would block on readset exchange
+        SendRequest(runtime, senderBlocker, MakeCommitRequest(sessionIdBlocker, txIdBlocker, Q_(R"(
+            UPSERT INTO `/Root/table-1` (key, value) VALUES (99, 99);
+            UPSERT INTO `/Root/table-2` (key, value) VALUES (99, 99))")));
+
+        waitFor([&] { return readSets.size() >= 2; }, "2 blocked readsets");
+
+        UNIT_ASSERT_VALUES_EQUAL(observedPlanStepTxs, 2);
+
+        // Sanity check: non-conflicting immediate write will succeed
+        ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 2)"));
+
+        // Start creating many persistent snapshots, overflowing plan queue (20 x 1000ms = 20 seconds)
+        observedPlanSteps = 0;
+        observedPlanStepTxs = 0;
+        TActorId senderCreateSnapshot = runtime.AllocateEdgeActor();
+        for (int i = 0; i < 10; ++i) {
+            SimulateSleep(runtime, TDuration::MilliSeconds(1000));
+            SendCreateVolatileSnapshot(runtime, senderCreateSnapshot, { "/Root/table-1" }, TDuration::Minutes(10));
+        }
+
+        waitFor([&] { return observedPlanStepTxs >= 10; }, "10 planned transactions");
+
+        // Start reading from a snapshot, we would see 2 committed rows and mark all active transactions
+        TString sessionId, txId;
+        UNIT_ASSERT_VALUES_EQUAL(
+            beginSnapshotRequest(sessionId, txId, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                WHERE key in (1, 2, 3)
+                ORDER BY key
+                )")),
+            "Struct { "
+            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
+            "} Struct { Bool: false }");
+
+        // Now schedule creation of 10 more snapshots
+        for (int i = 0; i < 10; ++i) {
+            SimulateSleep(runtime, TDuration::MilliSeconds(1000));
+            SendCreateVolatileSnapshot(runtime, senderCreateSnapshot, { "/Root/table-1" }, TDuration::Minutes(10));
+        }
+
+        waitFor([&] { return observedPlanStepTxs >= 20; }, "20 planned transactions");
+
+        // Start reading from a fresh snapshot, we should still observe 2 committed rows, and won't mark anything new
+        UNIT_ASSERT_VALUES_EQUAL(
+            beginSnapshotRequest(sessionId, txId, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                WHERE key in (1, 2, 3)
+                ORDER BY key
+                )")),
+            "Struct { "
+            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
+            "} Struct { Bool: false }");
+
+        // Insert one more row, in a buggy case it would be assigned a version below the snapshot
+        ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 3)"));
+
+        // Read from snapshot again, unless buggy it should not be corrupted
+        UNIT_ASSERT_VALUES_EQUAL(
+            continueSnapshotRequest(sessionId, txId, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                WHERE key in (1, 2, 3)
+                ORDER BY key
+                )")),
+            "Struct { "
+            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
+            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
+            "} Struct { Bool: false }");
     }
 
 }

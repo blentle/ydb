@@ -3,9 +3,12 @@
 #include <util/datetime/base.h>
 
 #include <ydb/library/yql/dq/actors/protos/dq_status_codes.pb.h>
+#include <ydb/library/yql/public/issue/yql_issue_message.h>
 #include <ydb/public/api/protos/yq.pb.h>
 
 #include <ydb/core/yq/libs/control_plane_storage/events/events.h>
+
+#include <library/cpp/protobuf/interop/cast.h>
 
 namespace NYq {
 
@@ -956,7 +959,13 @@ public:
 
     std::unique_ptr<TEvControlPlaneStorage::TEvWriteResultDataRequest> Build()
     {
-        return std::make_unique<TEvControlPlaneStorage::TEvWriteResultDataRequest>(ResultId, ResultSetId, StartRowId, Deadline, ResultSet);
+        auto request = std::make_unique<TEvControlPlaneStorage::TEvWriteResultDataRequest>();
+        request->Request.mutable_result_id()->set_value(ResultId);
+        *request->Request.mutable_result_set() = ResultSet;
+        request->Request.set_result_set_id(ResultSetId);
+        request->Request.set_offset(StartRowId);
+        *request->Request.mutable_deadline() = NProtoInterop::CastToProto(Deadline);
+        return request;
     }
 };
 
@@ -968,9 +977,13 @@ class TGetTaskBuilder {
 public:
     TGetTaskBuilder()
     {
-        SetOwner("owner");
+        SetOwner(DefaultOwner());
         SetHostName("localhost");
         SetTenantName("/root/tenant");
+    }
+
+    static TString DefaultOwner() {
+        return "owner";
     }
 
     TGetTaskBuilder& SetOwner(const TString& owner)
@@ -993,7 +1006,11 @@ public:
 
     std::unique_ptr<TEvControlPlaneStorage::TEvGetTaskRequest> Build()
     {
-        return std::make_unique<TEvControlPlaneStorage::TEvGetTaskRequest>(Owner, HostName, TenantName);
+        auto request = std::make_unique<TEvControlPlaneStorage::TEvGetTaskRequest>();
+        request->Request.set_tenant(TenantName);
+        request->Request.set_owner_id(Owner);
+        request->Request.set_host(HostName);
+        return request;
     }
 };
 
@@ -1155,22 +1172,61 @@ public:
 
     std::unique_ptr<TEvControlPlaneStorage::TEvPingTaskRequest> Build()
     {
-        auto request = std::make_unique<TEvControlPlaneStorage::TEvPingTaskRequest>(TenantName, CloudId, Scope, QueryId, Owner, Deadline, ResultId);
-        request->Status = Status;
-        request->Issues = Issues;
-        request->TransientIssues = TransientIssues;
-        request->Statistics = Statistics;
-        request->ResultSetMetas = ResultSetMetas;
-        request->Ast = Ast;
-        request->Plan = Plan;
-        request->StartedAt = StartedAt;
-        request->FinishedAt = FinishedAt;
-        request->ResignQuery = ResignQuery;
-        request->StatusCode = StatusCode;
-        request->CreatedTopicConsumers = CreatedTopicConsumers;
-        request->DqGraphs = DqGraphs;
-        request->DqGraphIndex = DqGraphIndex;
-        return request;
+        Yq::Private::PingTaskRequest request;
+        request.set_owner_id(Owner);
+        request.mutable_query_id()->set_value(QueryId);
+        request.mutable_result_id()->set_value(ResultId);
+        if (Status) {
+            request.set_status(*Status);
+        }
+        request.set_status_code(StatusCode);
+        if (Issues) {
+            NYql::IssuesToMessage(*Issues, request.mutable_issues());
+        }
+        if (TransientIssues) {
+            NYql::IssuesToMessage(*TransientIssues, request.mutable_transient_issues());
+        }
+        if (Statistics) {
+            request.set_statistics(*Statistics);
+        }
+        if (ResultSetMetas) {
+            for (const auto& meta : *ResultSetMetas) {
+                *request.add_result_set_meta() = meta;
+            }
+        }
+        for (const auto& dqGraph : DqGraphs) {
+            request.add_dq_graph(dqGraph);
+        }
+        request.set_dq_graph_index(DqGraphIndex);
+        if (Ast) {
+            request.set_ast(*Ast);
+        }
+        if (Plan) {
+            request.set_plan(*Plan);
+        }
+        request.set_resign_query(ResignQuery);
+        for (const auto& consumer : CreatedTopicConsumers) {
+            auto& cons = *request.add_created_topic_consumers();
+            cons.set_database_id(consumer.DatabaseId);
+            cons.set_database(consumer.Database);
+            cons.set_topic_path(consumer.TopicPath);
+            cons.set_consumer_name(consumer.ConsumerName);
+            cons.set_cluster_endpoint(consumer.ClusterEndpoint);
+            cons.set_use_ssl(consumer.UseSsl);
+            cons.set_token_name(consumer.TokenName);
+            cons.set_add_bearer_to_token(consumer.AddBearerToToken);
+        }
+        request.set_tenant(TenantName);
+        request.set_scope(Scope);
+        *request.mutable_deadline() = NProtoInterop::CastToProto(Deadline);
+        if (StartedAt) {
+            *request.mutable_started_at() = NProtoInterop::CastToProto(*StartedAt);
+        }
+        if (FinishedAt) {
+            *request.mutable_finished_at() = NProtoInterop::CastToProto(*FinishedAt);
+        }
+
+        return std::make_unique<TEvControlPlaneStorage::TEvPingTaskRequest>(std::move(request));
     }
 };
 

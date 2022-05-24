@@ -155,19 +155,18 @@ bool TInsertTable::Load(IDbWrapper& dbTable, const TInstant& loadTime) {
     return dbTable.Load(Inserted, CommittedByPathId, Aborted, loadTime);
 }
 
-/// @note It must be stable
-TVector<TUnifiedBlobId> TInsertTable::Read(ui64 pathId, ui64 plan, ui64 txId) const {
+std::vector<TCommittedBlob> TInsertTable::Read(ui64 pathId, ui64 plan, ui64 txId) const {
     const auto* committed = CommittedByPathId.FindPtr(pathId);
-
-    if (!committed)
+    if (!committed) {
         return {};
+    }
 
-    TVector<TUnifiedBlobId> ret;
-    ret.reserve(committed->size() / 2);
+    std::vector<TCommittedBlob> ret;
+    ret.reserve(committed->size());
 
     for (auto& data : *committed) {
         if (snapLessOrEqual(data.ShardOrPlan, data.WriteTxId, plan, txId)) {
-            ret.push_back(data.BlobId);
+            ret.emplace_back(TCommittedBlob{data.BlobId, data.ShardOrPlan, data.WriteTxId});
         }
     }
 
@@ -182,20 +181,24 @@ void TInsertTable::SetOverloaded(ui64 pathId, bool overload) {
     }
 }
 
-void TInsertTable::GetCounters(TCounters& prepared, TCounters& committed) const {
-    prepared = TCounters();
+TInsertTable::TCounters TInsertTable::GetCountersPrepared() const {
+    TCounters prepared;
     prepared.Rows = Inserted.size();
     for (auto& [_, data] : Inserted) {
         prepared.Bytes += data.BlobSize();
     }
+    return prepared;
+}
 
-    committed = TCounters();
+TInsertTable::TCounters TInsertTable::GetCountersCommitted() const {
+    TCounters committed;
     for (auto& [_, set] : CommittedByPathId) {
         committed.Rows += set.size();
         for (auto& data : set) {
             committed.Bytes += data.BlobSize();
         }
     }
+    return committed;
 }
 
 }

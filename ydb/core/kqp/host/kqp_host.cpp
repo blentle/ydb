@@ -1459,6 +1459,7 @@ private:
                 settings.PathPrefix = tablePathPrefix;
             }
             settings.EndOfQueryCommit = sqlAutoCommit;
+            settings.Flags.insert("DisableEmitStartsWith");
 
             ui16 actualSyntaxVersion = 0;
             astRes = NSQLTranslation::SqlToYql(query, settings, nullptr, &actualSyntaxVersion);
@@ -1647,12 +1648,18 @@ private:
 
         auto query = std::make_unique<NKikimrKqp::TPreparedQuery>();
         auto engine = maybeTx->Get()->DeferredEffects.GetEngine();
+
+        if (engine.has_value()) {
+            bool newEngine = *engine == TKqpTransactionInfo::EEngine::NewEngine;
+            YQL_ENSURE(!settings.UseNewEngine.Defined() || *settings.UseNewEngine == newEngine);
+        } else if (SessionCtx->Config().HasKqpForceNewEngine()) {
+            engine = TKqpTransactionInfo::EEngine::NewEngine;
+        }
+
         if (engine.has_value() && *engine == TKqpTransactionInfo::EEngine::NewEngine) {
-            YQL_ENSURE(settings.UseNewEngine.Defined() && *settings.UseNewEngine);
             query->SetVersion(NKikimrKqp::TPreparedQuery::VERSION_PHYSICAL_V1);
             query->MutablePhysicalQuery()->SetType(NKqpProto::TKqpPhyQuery::TYPE_DATA);
         } else {
-            YQL_ENSURE(!settings.UseNewEngine.Defined() || !*settings.UseNewEngine);
             query->SetVersion(NKikimrKqp::TPreparedQuery::VERSION_V1);
             query->AddKqls();
         }
@@ -1670,15 +1677,20 @@ private:
 
         auto query = std::make_unique<NKikimrKqp::TPreparedQuery>();
         auto settings1 = settings;
-
         auto engine = tx->DeferredEffects.GetEngine();
+
+        if (engine.has_value()) {
+            bool newEngine = *engine == TKqpTransactionInfo::EEngine::NewEngine;
+            YQL_ENSURE(!settings.UseNewEngine.Defined() || *settings.UseNewEngine == newEngine);
+        } else if (SessionCtx->Config().HasKqpForceNewEngine()) {
+            engine = TKqpTransactionInfo::EEngine::NewEngine;
+        }
+
         if (engine.has_value() && *engine == TKqpTransactionInfo::EEngine::NewEngine) {
-            YQL_ENSURE(!settings.UseNewEngine.Defined() || *settings.UseNewEngine == true);
             settings1.UseNewEngine = true;
             query->SetVersion(NKikimrKqp::TPreparedQuery::VERSION_PHYSICAL_V1);
             query->MutablePhysicalQuery()->SetType(NKqpProto::TKqpPhyQuery::TYPE_DATA);
         } else {
-            YQL_ENSURE(!settings.UseNewEngine.Defined() || *settings.UseNewEngine == false);
             settings1.UseNewEngine = false;
             query->SetVersion(NKikimrKqp::TPreparedQuery::VERSION_V1);
             query->AddKqls();
@@ -1702,12 +1714,18 @@ private:
 
         auto query = std::make_unique<NKikimrKqp::TPreparedQuery>();
         auto engine = maybeTx->Get()->DeferredEffects.GetEngine();
+
+        if (engine.has_value()) {
+            bool newEngine = *engine == TKqpTransactionInfo::EEngine::NewEngine;
+            YQL_ENSURE(!settings.UseNewEngine.Defined() || *settings.UseNewEngine == newEngine);
+        } else if (SessionCtx->Config().HasKqpForceNewEngine()) {
+            engine = TKqpTransactionInfo::EEngine::NewEngine;
+        }
+
         if (engine.has_value() && *engine == TKqpTransactionInfo::EEngine::NewEngine) {
-            YQL_ENSURE(settings.UseNewEngine.Defined() && *settings.UseNewEngine);
             query->SetVersion(NKikimrKqp::TPreparedQuery::VERSION_PHYSICAL_V1);
             query->MutablePhysicalQuery()->SetType(NKqpProto::TKqpPhyQuery::TYPE_DATA);
         } else {
-            YQL_ENSURE(!settings.UseNewEngine.Defined() || !*settings.UseNewEngine);
             query->SetVersion(NKikimrKqp::TPreparedQuery::VERSION_V1);
             query->AddKqls();
         }

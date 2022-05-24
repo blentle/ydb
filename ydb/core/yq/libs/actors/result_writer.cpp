@@ -42,14 +42,20 @@ public:
         const TResultId& resultId,
         const TVector<TString>& columns,
         const TString& traceId,
-        const TInstant& deadline)
+        const TInstant& deadline,
+        ui64 resultBytesLimit)
         : ExecuterId(executerId)
         , ResultBuilder(MakeHolder<TProtoBuilder>(resultType, columns))
         , ResultId({resultId})
         , TraceId(traceId)
         , Deadline(deadline)
+        , ResultBytesLimit(resultBytesLimit)
         , InternalServiceId(MakeInternalServiceActorId())
-    { }
+    { 
+        if (!ResultBytesLimit) {
+            ResultBytesLimit = 20_MB;
+        }
+    }
 
     static constexpr char ActorName[] = "YQ_RESULT_WRITER";
 
@@ -77,7 +83,7 @@ private:
     }
 
     void OnUndelivered(NActors::TEvents::TEvUndelivered::TPtr&, const NActors::TActorContext& ) {
-        auto req = MakeHolder<TEvDqFailure>(NYql::NDqProto::StatusIds::UNAVAILABLE, TIssue("Undelivered").SetCode(NYql::DEFAULT_ERROR, TSeverityIds::S_ERROR), true, /*needFallback=*/false);
+        auto req = MakeHolder<TEvDqFailure>(NYql::NDqProto::StatusIds::UNAVAILABLE, TIssue("Undelivered").SetCode(NYql::DEFAULT_ERROR, TSeverityIds::S_ERROR));
         Send(ExecuterId, req.Release());
         HasError = true;
     }
@@ -122,7 +128,7 @@ private:
         auto it = Requests.find(ev->Get()->Result.request_id());
         if (it == Requests.end()) {
             HasError = true;
-            auto req = MakeHolder<TEvDqFailure>(NYql::NDqProto::StatusIds::INTERNAL_ERROR, TIssue("Unknown RequestId").SetCode(NYql::DEFAULT_ERROR, TSeverityIds::S_ERROR), /*retriable=*/ false, /*needFallback=*/false);
+            auto req = MakeHolder<TEvDqFailure>(NYql::NDqProto::StatusIds::BAD_REQUEST, TIssue("Unknown RequestId").SetCode(NYql::DEFAULT_ERROR, TSeverityIds::S_ERROR));
             Send(ExecuterId, req.Release());
             return;
         }
@@ -214,9 +220,9 @@ private:
         FreeSpace -= data.GetRaw().size();
         OccupiedSpace += data.GetRaw().size();
 
-        if (OccupiedSpace > SpaceLimitPerQuery) {
+        if (OccupiedSpace > ResultBytesLimit) {
             TIssues issues;
-            issues.AddIssue(TStringBuilder() << "Can not write results with size > " << SpaceLimitPerQuery / (1024 * 1024) << "_MB");
+            issues.AddIssue(TStringBuilder() << "Can not write results with size > " << ResultBytesLimit << " byte(s)");
             SendIssuesAndSetErrorFlag(issues);
             return;
         }
@@ -277,8 +283,7 @@ private:
             }
         } catch (...) {
             LOG_E(CurrentExceptionMessage());
-            auto req = MakeHolder<TEvDqFailure>(NYql::NDqProto::StatusIds::INTERNAL_ERROR, TIssue("Internal error on data write").SetCode(NYql::DEFAULT_ERROR, TSeverityIds::S_ERROR), /*retriable=*/ false,
-                /*needFallback=*/false);
+            auto req = MakeHolder<TEvDqFailure>(NYql::NDqProto::StatusIds::INTERNAL_ERROR, TIssue("Internal error on data write").SetCode(NYql::DEFAULT_ERROR, TSeverityIds::S_ERROR));
             Send(ExecuterId, req.Release());
             HasError = true;
         }
@@ -315,7 +320,7 @@ private:
     bool HasError = false;
     bool Finished = false;
     NYql::TIssues Issues;
-    ui64 SpaceLimitPerQuery = 20_MB;
+    ui64 ResultBytesLimit;
     ui64 OccupiedSpace = 0;
 
     TVector<Yq::Private::WriteTaskResultRequest> ResultChunks;
@@ -330,9 +335,10 @@ NActors::IActor* CreateResultWriter(
     const TResultId& resultId,
     const TVector<TString>& columns,
     const TString& traceId,
-    const TInstant& deadline)
+    const TInstant& deadline,
+    ui64 resultBytesLimit)
 {
-    return new TResultWriter(executerId, resultType, resultId, columns, traceId, deadline);
+    return new TResultWriter(executerId, resultType, resultId, columns, traceId, deadline, resultBytesLimit);
 }
 
 } // namespace NYq

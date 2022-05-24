@@ -82,11 +82,15 @@ public:
     TSplitSnapshotContext(ui64 txId, TVector<ui32> &&tables,
                           TRowVersion completeEdge = TRowVersion::Min(),
                           TRowVersion incompleteEdge = TRowVersion::Min(),
-                          TRowVersion lowWatermark = TRowVersion::Min())
+                          TRowVersion immediateWriteEdge = TRowVersion::Min(),
+                          TRowVersion lowWatermark = TRowVersion::Min(),
+                          bool performedUnprotectedReads = false)
         : TxId(txId)
         , CompleteEdge(completeEdge)
         , IncompleteEdge(incompleteEdge)
+        , ImmediateWriteEdge(immediateWriteEdge)
         , LowWatermark(lowWatermark)
+        , PerformedUnprotectedReads(performedUnprotectedReads)
         , Tables(tables)
     {}
 
@@ -97,7 +101,9 @@ public:
     ui64 TxId;
     TRowVersion CompleteEdge;
     TRowVersion IncompleteEdge;
+    TRowVersion ImmediateWriteEdge;
     TRowVersion LowWatermark;
+    bool PerformedUnprotectedReads;
 
 private:
     TVector<ui32> Tables;
@@ -1021,6 +1027,7 @@ class TDataShard
     void HandleByReplicationSourceOffsetsServer(STATEFN_SIG);
 
     void DoPeriodicTasks(const TActorContext &ctx);
+    void DoPeriodicTasks(TEvPrivate::TEvPeriodicWakeup::TPtr&, const TActorContext &ctx);
 
     TDuration GetDataTxCompleteLag()
     {
@@ -1256,6 +1263,14 @@ public:
 
     ui64 GetBackupReadAheadHiOverride() const {
         return BackupReadAheadHi;
+    }
+
+    ui64 GetTtlReadAheadLoOverride() const {
+        return TtlReadAheadLo;
+    }
+
+    ui64 GetTtlReadAheadHiOverride() const {
+        return TtlReadAheadHi;
     }
 
     bool GetEnablePrioritizedMvccSnapshotReads() const {
@@ -1958,6 +1973,7 @@ private:
     ui64 CurrentSchemeShardId; // TabletID of SchemeShard wich manages the path right now
     ui64 LastKnownMediator;
     bool RegistrationSended;
+    bool PeriodicWakeupPending = false;
     std::unique_ptr<NKikimrSubDomains::TProcessingParams> ProcessingParams;
     TSchemeOpSeqNo LastSchemeOpSeqNo;
     TInstant LastDbStatsUpdateTime;
@@ -2083,6 +2099,9 @@ private:
 
     TControlWrapper BackupReadAheadLo;
     TControlWrapper BackupReadAheadHi;
+
+    TControlWrapper TtlReadAheadLo;
+    TControlWrapper TtlReadAheadHi;
 
     TControlWrapper EnablePrioritizedMvccSnapshotReads;
     TControlWrapper EnableUnprotectedMvccSnapshotReads;
@@ -2325,7 +2344,7 @@ protected:
             HFunc(TEvDataShard::TEvDiscardVolatileSnapshotRequest, Handle);
             HFuncTraced(TEvDataShard::TEvBuildIndexCreateRequest, Handle);
             HFunc(TEvPrivate::TEvAsyncJobComplete, Handle);
-            CFunc(TEvPrivate::EvPeriodicWakeup, DoPeriodicTasks);
+            HFunc(TEvPrivate::TEvPeriodicWakeup, DoPeriodicTasks);
             HFunc(TEvents::TEvUndelivered, Handle);
             IgnoreFunc(TEvInterconnect::TEvNodeConnected);
             HFunc(TEvInterconnect::TEvNodeDisconnected, Handle);

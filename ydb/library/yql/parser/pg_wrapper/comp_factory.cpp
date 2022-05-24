@@ -26,6 +26,10 @@ extern "C" {
 #include "catalog/pg_collation_d.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "utils/array.h"
+#include "utils/arrayaccess.h"
+#include "utils/lsyscache.h"
+#include "utils/datetime.h"
 #include "nodes/execnodes.h"
 #include "executor/executor.h"
 #include "lib/stringinfo.h"
@@ -42,7 +46,7 @@ extern "C" {
 #undef INFO
 #undef NOTICE
 #undef WARNING
-#undef ERROR
+//#undef ERROR
 #undef FATAL
 #undef PANIC
 #undef open
@@ -238,15 +242,21 @@ inline ui32 MakeTypeIOParam(const NPg::TTypeDesc& desc) {
 class TPgConst : public TMutableComputationNode<TPgConst> {
     typedef TMutableComputationNode<TPgConst> TBaseComputation;
 public:
-    TPgConst(TComputationMutables& mutables, ui32 typeId, const std::string_view& value)
+    TPgConst(TComputationMutables& mutables, ui32 typeId, const std::string_view& value, IComputationNode* typeMod)
         : TBaseComputation(mutables)
         , TypeId(typeId)
         , Value(value)
+        , TypeMod(typeMod)
         , TypeDesc(NPg::LookupType(TypeId))
     {
         Zero(FInfo);
-        Y_ENSURE(TypeDesc.InFuncId);
-        fmgr_info(TypeDesc.InFuncId, &FInfo);
+        ui32 inFuncId = TypeDesc.InFuncId;
+        if (TypeDesc.TypeId == TypeDesc.ArrayTypeId) {
+            inFuncId = NPg::LookupProc("array_in", { 0,0,0 }).ProcId;
+        }
+
+        Y_ENSURE(inFuncId);
+        fmgr_info(inFuncId, &FInfo);
         Y_ENSURE(!FInfo.fn_retset);
         Y_ENSURE(FInfo.fn_addr);
         Y_ENSURE(FInfo.fn_nargs >=1 && FInfo.fn_nargs <= 3);
@@ -254,6 +264,11 @@ public:
     }
 
     NUdf::TUnboxedValuePod DoCalculate(TComputationContext& compCtx) const {
+        i32 typeMod = -1;
+        if (TypeMod) {
+            typeMod = DatumGetInt32(ScalarDatumFromPod(TypeMod->GetValue(compCtx)));
+        }
+
         LOCAL_FCINFO(callInfo, 3);
         Zero(*callInfo);
         FmgrInfo copyFmgrInfo = FInfo;
@@ -263,7 +278,7 @@ public:
         callInfo->isnull = false;
         callInfo->args[0] = { (Datum)Value.c_str(), false };
         callInfo->args[1] = { ObjectIdGetDatum(TypeIOParam), false };
-        callInfo->args[2] = { Int32GetDatum(-1), false };
+        callInfo->args[2] = { Int32GetDatum(typeMod), false };
 
         TPAllocScope call;
         PG_TRY();
@@ -286,10 +301,14 @@ public:
 
 private:
     void RegisterDependencies() const final {
+        if (TypeMod) {
+            DependsOn(TypeMod);
+        }
     }
 
     const ui32 TypeId;
     const TString Value;
+    IComputationNode* const TypeMod;
     const NPg::TTypeDesc TypeDesc;
     FmgrInfo FInfo;
     ui32 TypeIOParam;
@@ -418,10 +437,6 @@ public:
             auto argType = ArgTypes[i];
             if (argType->IsPg()) {
                 type = static_cast<TPgType*>(argType)->GetTypeId();
-            } else if (!argType->IsNull()) {
-                bool isOptional;
-                auto dataType = UnpackOptionalData(argType, isOptional);
-                type = *ConvertToPgType(*dataType->GetDataSlot());
             } else {
                 // keep original description for nulls
                 type = ProcDesc.ArgTypes[i];
@@ -688,14 +703,19 @@ public:
 class TPgCast : public TMutableComputationNode<TPgCast> {
     typedef TMutableComputationNode<TPgCast> TBaseComputation;
 public:
-    TPgCast(TComputationMutables& mutables, ui32 sourceId, ui32 targetId, IComputationNode* arg)
+    TPgCast(TComputationMutables& mutables, ui32 sourceId, ui32 targetId, IComputationNode* arg, IComputationNode* typeMod)
         : TBaseComputation(mutables)
         , StateIndex(mutables.CurValueIndex++)
         , SourceId(sourceId)
         , TargetId(targetId)
         , Arg(arg)
+        , TypeMod(typeMod)
         , SourceTypeDesc(SourceId ? NPg::LookupType(SourceId) : NPg::TTypeDesc())
         , TargetTypeDesc(NPg::LookupType(targetId))
+        , IsSourceArray(SourceId && SourceTypeDesc.TypeId == SourceTypeDesc.ArrayTypeId)
+        , IsTargetArray(TargetTypeDesc.TypeId == TargetTypeDesc.ArrayTypeId)
+        , SourceElemDesc(SourceId ? NPg::LookupType(IsSourceArray ? SourceTypeDesc.ElementTypeId : SourceTypeDesc.TypeId) : NPg::TTypeDesc())
+        , TargetElemDesc(NPg::LookupType(IsTargetArray ? TargetTypeDesc.ElementTypeId : TargetTypeDesc.TypeId))
     {
         TypeIOParam = MakeTypeIOParam(TargetTypeDesc);
 
@@ -707,15 +727,28 @@ public:
 
         ui32 funcId;
         ui32 funcId2 = 0;
-        if (!NPg::HasCast(SourceId, TargetId)) {
-            if (SourceTypeDesc.Category == 'S') {
-                funcId = TargetTypeDesc.InFuncId;
+        if (!NPg::HasCast(SourceElemDesc.TypeId, TargetElemDesc.TypeId)) {
+            if (SourceElemDesc.Category == 'S') {
+                ArrayCast = IsSourceArray;
+                if (!IsTargetArray || IsSourceArray) {
+                    funcId = TargetElemDesc.InFuncId;
+                } else {
+                    funcId = NPg::LookupProc("array_in", { 0,0,0 }).ProcId;
+                }
             } else {
                 Y_ENSURE(TargetTypeDesc.Category == 'S');
-                funcId = SourceTypeDesc.OutFuncId;
+                ArrayCast = IsTargetArray;
+                if (!IsSourceArray || IsTargetArray) {
+                    funcId = SourceElemDesc.OutFuncId;
+                } else {
+                    funcId = NPg::LookupProc("array_out", { 0 }).ProcId;
+                }
             }
         } else {
-            const auto& cast = NPg::LookupCast(SourceId, TargetId);
+            Y_ENSURE(IsSourceArray == IsTargetArray);
+            ArrayCast = IsSourceArray;
+
+            const auto& cast = NPg::LookupCast(SourceElemDesc.TypeId, TargetElemDesc.TypeId);
             switch (cast.Method) {
                 case NPg::ECastMethod::Binary:
                     return;
@@ -725,8 +758,8 @@ public:
                     break;
                 }
                 case NPg::ECastMethod::InOut: {
-                    funcId = SourceTypeDesc.OutFuncId;
-                    funcId2 = TargetTypeDesc.InFuncId;
+                    funcId = SourceElemDesc.OutFuncId;
+                    funcId2 = TargetElemDesc.InFuncId;
                     break;
                 }
             }
@@ -739,7 +772,7 @@ public:
         Y_ENSURE(FInfo1.fn_nargs >= 1 && FInfo1.fn_nargs <= 3);
         Func1Lookup = NPg::LookupProc(funcId);
         Y_ENSURE(Func1Lookup.ArgTypes.size() >= 1 && Func1Lookup.ArgTypes.size() <= 3);
-        if (Func1Lookup.ArgTypes[0] == CSTRINGOID && SourceTypeDesc.Category == 'S') {
+        if (Func1Lookup.ArgTypes[0] == CSTRINGOID && SourceElemDesc.Category == 'S') {
             ConvertArgToCString = true;
         }
 
@@ -754,7 +787,7 @@ public:
         }
 
         if (!funcId2) {
-            if (Func1Lookup.ResultType == CSTRINGOID && TargetTypeDesc.Category == 'S') {
+            if (Func1Lookup.ResultType == CSTRINGOID && TargetElemDesc.Category == 'S') {
                 ConvertResFromCString = true;
             }
         } else {
@@ -763,7 +796,7 @@ public:
                 ConvertResFromCString = true;
             }
 
-            if (Func2Lookup.ResultType == CSTRINGOID && TargetTypeDesc.Category == 'S') {
+            if (Func2Lookup.ResultType == CSTRINGOID && TargetElemDesc.Category == 'S') {
                 ConvertResFromCString2 = true;
             }
         }
@@ -771,90 +804,81 @@ public:
 
     NUdf::TUnboxedValuePod DoCalculate(TComputationContext& compCtx) const {
         auto value = Arg->GetValue(compCtx);
-        if (!value || !FInfo1.fn_addr) {
+        if (!value) {
             return value.Release();
+        }
+
+        i32 typeMod = -1;
+        if (TypeMod) {
+            typeMod = DatumGetInt32(ScalarDatumFromPod(TypeMod->GetValue(compCtx)));
+        }
+
+        if (!FInfo1.fn_addr) {
+            // binary compatible
+            if (!ArrayCast) {
+                return value.Release();
+            } else {
+                // clone array with new target type in the header
+                auto datum = PointerDatumFromPod(value);
+                ArrayType* arr = DatumGetArrayTypePCopy(datum);
+                ARR_ELEMTYPE(arr) = TargetElemDesc.TypeId;
+                return PointerDatumToPod(PointerGetDatum(arr));
+            }
         }
 
         TPAllocScope call;
         auto& state = GetState(compCtx);
-        auto& callInfo1 = state.CallInfo1.Ref();
-        callInfo1.isnull = false;
-        NullableDatum argDatum = { SourceTypeDesc.PassByValue ?
-            ScalarDatumFromPod(value) :
-            PointerDatumFromPod(value), false };
-        if (ConvertArgToCString) {
-            argDatum.value = (Datum)MakeCString(GetVarBuf((const text*)argDatum.value));
+        if (ArrayCast) {
+            auto arr = (ArrayType*)DatumGetPointer(PointerDatumFromPod(value));
+            auto ndim = ARR_NDIM(arr);
+            auto dims = ARR_DIMS(arr);
+            auto lb = ARR_LBOUND(arr);
+            auto nitems = ArrayGetNItems(ndim, dims);
+
+            Datum* elems = (Datum*)MKQLAllocWithSize(nitems * sizeof(Datum));
             Y_DEFER {
-                pfree((void*)argDatum.value);
+                MKQLFreeWithSize(elems, nitems * sizeof(Datum));
             };
-        }
 
-        callInfo1.args[0] = argDatum;
-        callInfo1.args[1] = { ObjectIdGetDatum(TypeIOParam), false };
-        callInfo1.args[2] = { Int32GetDatum(-1), false };
+            bool* nulls = (bool*)MKQLAllocWithSize(nitems);
+            Y_DEFER{
+                MKQLFreeWithSize(nulls, nitems);
+            };
 
-        void* freeMem = nullptr;
-        void* freeMem2 = nullptr;
-        Y_DEFER {
-            if (freeMem) {
-                pfree(freeMem);
-            }
-
-            if (freeMem2) {
-                pfree(freeMem2);
-            }
-        };
-
-        PG_TRY();
-        {
-            auto ret = FInfo1.fn_addr(&callInfo1);
-            if (callInfo1.isnull) {
-                return NUdf::TUnboxedValuePod();
-            }
-
-            if (ConvertResFromCString) {
-                freeMem = (void*)ret;
-                ret = (Datum)MakeVar((const char*)ret);
-            }
-
-            if (FInfo2.fn_addr) {
-                auto& callInfo2 = state.CallInfo1.Ref();
-                callInfo2.isnull = false;
-                NullableDatum argDatum2 = { ret, false };
-                callInfo2.args[0] = argDatum2;
-
-                auto ret2 = FInfo2.fn_addr(&callInfo2);
-                pfree((void*)ret);
-
-                if (callInfo2.isnull) {
-                    return NUdf::TUnboxedValuePod();
+            array_iter iter;
+            array_iter_setup(&iter, (AnyArrayType*)arr);
+            for (ui32 i = 0; i < nitems; ++i) {
+                bool isNull;
+                auto datum = array_iter_next(&iter, &isNull, i, SourceElemDesc.TypeLen,
+                    SourceElemDesc.PassByValue, SourceElemDesc.TypeAlign);
+                if (isNull) {
+                    nulls[i] = true;
+                    continue;
+                } else {
+                    nulls[i] = false;
+                    elems[i] = ConvertDatum(datum, state, typeMod);
                 }
-
-                ret = ret2;
             }
 
-            if (ConvertResFromCString2) {
-                freeMem2 = (void*)ret;
-                ret = (Datum)MakeVar((const char*)ret);
-            }
+            auto ret = construct_md_array(elems, nulls, ndim, dims, lb, TargetElemDesc.TypeId,
+                TargetElemDesc.TypeLen, TargetElemDesc.PassByValue, TargetElemDesc.TypeAlign);
 
+            return PointerDatumToPod(PointerGetDatum(ret));
+        } else {
+            auto datum = SourceTypeDesc.PassByValue ?
+                ScalarDatumFromPod(value) :
+                PointerDatumFromPod(value);
+            auto ret = ConvertDatum(datum, state, typeMod);
             return TargetTypeDesc.PassByValue ? ScalarDatumToPod(ret) : PointerDatumToPod(ret);
         }
-        PG_CATCH();
-        {
-            auto error_data = CopyErrorData();
-            TStringBuilder errMsg;
-            errMsg << "Error in cast, reason: " << error_data->message;
-            FreeErrorData(error_data);
-            FlushErrorState();
-            UdfTerminate(errMsg.c_str());
-        }
-        PG_END_TRY();
     }
 
 private:
     void RegisterDependencies() const final {
         DependsOn(Arg);
+        if (TypeMod) {
+            DependsOn(TypeMod);
+        }
     }
 
     struct TState : public TComputationValue<TState> {
@@ -877,19 +901,93 @@ private:
         return *static_cast<TState*>(result.AsBoxed().Get());
     }
 
+    Datum ConvertDatum(Datum datum, TState& state, i32 typeMod) const {
+        auto& callInfo1 = state.CallInfo1.Ref();
+        callInfo1.isnull = false;
+        NullableDatum argDatum = { datum, false };
+        if (ConvertArgToCString) {
+            argDatum.value = (Datum)MakeCString(GetVarBuf((const text*)argDatum.value));
+            Y_DEFER{
+                pfree((void*)argDatum.value);
+            };
+        }
+
+        callInfo1.args[0] = argDatum;
+        callInfo1.args[1] = { ObjectIdGetDatum(TypeIOParam), false };
+        callInfo1.args[2] = { Int32GetDatum(typeMod), false };
+
+        void* freeMem = nullptr;
+        void* freeMem2 = nullptr;
+        Y_DEFER{
+            if (freeMem) {
+                pfree(freeMem);
+            }
+
+            if (freeMem2) {
+                pfree(freeMem2);
+            }
+        };
+
+        PG_TRY();
+        {
+            auto ret = FInfo1.fn_addr(&callInfo1);
+            Y_ENSURE(!callInfo1.isnull);
+
+            if (ConvertResFromCString) {
+                freeMem = (void*)ret;
+                ret = (Datum)MakeVar((const char*)ret);
+            }
+
+            if (FInfo2.fn_addr) {
+                auto& callInfo2 = state.CallInfo1.Ref();
+                callInfo2.isnull = false;
+                NullableDatum argDatum2 = { ret, false };
+                callInfo2.args[0] = argDatum2;
+
+                auto ret2 = FInfo2.fn_addr(&callInfo2);
+                pfree((void*)ret);
+
+                Y_ENSURE(!callInfo2.isnull);
+                ret = ret2;
+            }
+
+            if (ConvertResFromCString2) {
+                freeMem2 = (void*)ret;
+                ret = (Datum)MakeVar((const char*)ret);
+            }
+
+            return ret;
+        }
+        PG_CATCH();
+        {
+            auto error_data = CopyErrorData();
+            TStringBuilder errMsg;
+            errMsg << "Error in cast, reason: " << error_data->message;
+            FreeErrorData(error_data);
+            FlushErrorState();
+            UdfTerminate(errMsg.c_str());
+        }
+        PG_END_TRY();
+    }
 
     const ui32 StateIndex;
     const ui32 SourceId;
     const ui32 TargetId;
     IComputationNode* const Arg;
+    IComputationNode* const TypeMod;
     const NPg::TTypeDesc SourceTypeDesc;
     const NPg::TTypeDesc TargetTypeDesc;
+    const bool IsSourceArray;
+    const bool IsTargetArray;
+    const NPg::TTypeDesc SourceElemDesc;
+    const NPg::TTypeDesc TargetElemDesc;
     FmgrInfo FInfo1, FInfo2;
     NPg::TProcDesc Func1Lookup, Func2Lookup;
     bool ConvertArgToCString = false;
     bool ConvertResFromCString = false;
     bool ConvertResFromCString2 = false;
     ui32 TypeIOParam = 0;
+    bool ArrayCast = false;
 };
 
 template <NUdf::EDataSlot Slot, bool IsCString>
@@ -992,6 +1090,279 @@ private:
     IComputationNode* const Arg;
 };
 
+class TPgArray : public TMutableComputationNode<TPgArray> {
+    typedef TMutableComputationNode<TPgArray> TBaseComputation;
+public:
+    TPgArray(TComputationMutables& mutables, TComputationNodePtrVector&& argNodes, const TVector<TType*>&& argTypes, ui32 arrayType)
+        : TBaseComputation(mutables)
+        , ArgNodes(std::move(argNodes))
+        , ArgTypes(std::move(argTypes))
+        , ArrayTypeDesc(NPg::LookupType(arrayType))
+        , ElemTypeDesc(NPg::LookupType(ArrayTypeDesc.ElementTypeId))
+    {
+        ArgDescs.resize(ArgNodes.size());
+        for (ui32 i = 0; i < ArgNodes.size(); ++i) {
+            if (!ArgTypes[i]->IsNull()) {
+                auto type = static_cast<TPgType*>(ArgTypes[i])->GetTypeId();
+                ArgDescs[i] = NPg::LookupType(type);
+                if (ArgDescs[i].TypeId == ArgDescs[i].ArrayTypeId) {
+                    MultiDims = true;
+                }
+            }
+        }
+    }
+
+    NUdf::TUnboxedValuePod DoCalculate(TComputationContext& compCtx) const {
+        TUnboxedValueVector args;
+        ui32 nelems = ArgNodes.size();
+        args.reserve(nelems);
+        for (ui32 i = 0; i < nelems; ++i) {
+            auto value = ArgNodes[i]->GetValue(compCtx);
+            args.push_back(value);
+        }
+
+        Datum* dvalues = (Datum*)MKQLAllocWithSize(nelems * sizeof(Datum));
+        Y_DEFER {
+            MKQLFreeWithSize(dvalues, nelems * sizeof(Datum));
+        };
+
+        bool *dnulls = (bool*)MKQLAllocWithSize(nelems);
+        Y_DEFER {
+            MKQLFreeWithSize(dnulls, nelems);
+        };
+
+        TPAllocScope call;
+        for (ui32 i = 0; i < nelems; ++i) {
+            const auto& value = args[i];
+            if (value) {
+                dnulls[i] = false;
+                
+                dvalues[i] = ArgDescs[i].PassByValue ?
+                    ScalarDatumFromPod(value) :
+                    PointerDatumFromPod(value);
+            } else {
+                dnulls[i] = true;
+            }
+        }
+
+        PG_TRY();
+        {
+            int ndims = 0;
+            int dims[MAXDIM];
+            int lbs[MAXDIM];
+            if (!MultiDims) {
+                // 1D array
+                ndims = 1;
+                dims[0] = nelems;
+                lbs[0] = 1;
+
+                auto result = construct_md_array(dvalues, dnulls, ndims, dims, lbs,
+                    ElemTypeDesc.TypeId,
+                    ElemTypeDesc.TypeLen,
+                    ElemTypeDesc.PassByValue,
+                    ElemTypeDesc.TypeAlign);
+                return PointerDatumToPod(PointerGetDatum(result));
+            }
+            else {
+                /* Must be nested array expressions */
+                auto element_type = ElemTypeDesc.TypeId;
+                int nbytes = 0;
+                int nitems = 0;
+                int outer_nelems = 0;
+                int elem_ndims = 0;
+                int *elem_dims = NULL;
+                int *elem_lbs = NULL;
+
+                bool firstone = true;
+                bool havenulls = false;
+                bool haveempty = false;
+                char **subdata;
+                bits8 **subbitmaps;
+                int *subbytes;
+                int *subnitems;
+                int32 dataoffset;
+                char *dat;
+                int iitem;
+
+                subdata = (char **)palloc(nelems * sizeof(char *));
+                subbitmaps = (bits8 **)palloc(nelems * sizeof(bits8 *));
+                subbytes = (int *)palloc(nelems * sizeof(int));
+                subnitems = (int *)palloc(nelems * sizeof(int));
+
+                /* loop through and get data area from each element */
+                for (int elemoff = 0; elemoff < nelems; elemoff++)
+                {
+                    Datum arraydatum;
+                    bool eisnull;
+                    ArrayType *array;
+                    int this_ndims;
+
+                    arraydatum = dvalues[elemoff];
+                    eisnull = dnulls[elemoff];
+
+                    /* temporarily ignore null subarrays */
+                    if (eisnull)
+                    {
+                        haveempty = true;
+                        continue;
+                    }
+
+                    array = DatumGetArrayTypeP(arraydatum);
+
+                    /* run-time double-check on element type */
+                    if (element_type != ARR_ELEMTYPE(array))
+                        ereport(ERROR,
+                        (errcode(ERRCODE_DATATYPE_MISMATCH),
+                            errmsg("cannot merge incompatible arrays"),
+                            errdetail("Array with element type %s cannot be "
+                                "included in ARRAY construct with element type %s.",
+                                format_type_be(ARR_ELEMTYPE(array)),
+                                format_type_be(element_type))));
+
+                    this_ndims = ARR_NDIM(array);
+                    /* temporarily ignore zero-dimensional subarrays */
+                    if (this_ndims <= 0)
+                    {
+                        haveempty = true;
+                        continue;
+                    }
+
+                    if (firstone)
+                    {
+                        /* Get sub-array details from first member */
+                        elem_ndims = this_ndims;
+                        ndims = elem_ndims + 1;
+                        if (ndims <= 0 || ndims > MAXDIM)
+                            ereport(ERROR,
+                            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                                errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)",
+                                    ndims, MAXDIM)));
+
+                        elem_dims = (int *)palloc(elem_ndims * sizeof(int));
+                        memcpy(elem_dims, ARR_DIMS(array), elem_ndims * sizeof(int));
+                        elem_lbs = (int *)palloc(elem_ndims * sizeof(int));
+                        memcpy(elem_lbs, ARR_LBOUND(array), elem_ndims * sizeof(int));
+
+                        firstone = false;
+                    }
+                    else
+                    {
+                        /* Check other sub-arrays are compatible */
+                        if (elem_ndims != this_ndims ||
+                            memcmp(elem_dims, ARR_DIMS(array),
+                                elem_ndims * sizeof(int)) != 0 ||
+                            memcmp(elem_lbs, ARR_LBOUND(array),
+                                elem_ndims * sizeof(int)) != 0)
+                            ereport(ERROR,
+                            (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                                errmsg("multidimensional arrays must have array "
+                                    "expressions with matching dimensions")));
+                    }
+
+                    subdata[outer_nelems] = ARR_DATA_PTR(array);
+                    subbitmaps[outer_nelems] = ARR_NULLBITMAP(array);
+                    subbytes[outer_nelems] = ARR_SIZE(array) - ARR_DATA_OFFSET(array);
+                    nbytes += subbytes[outer_nelems];
+                    subnitems[outer_nelems] = ArrayGetNItems(this_ndims,
+                        ARR_DIMS(array));
+                    nitems += subnitems[outer_nelems];
+                    havenulls |= ARR_HASNULL(array);
+                    outer_nelems++;
+                }
+
+                /*
+                 * If all items were null or empty arrays, return an empty array;
+                 * otherwise, if some were and some weren't, raise error.  (Note: we
+                 * must special-case this somehow to avoid trying to generate a 1-D
+                 * array formed from empty arrays.  It's not ideal...)
+                 */
+                if (haveempty)
+                {
+                    if (ndims == 0) /* didn't find any nonempty array */
+                    {
+                        return PointerDatumToPod(PointerGetDatum(construct_empty_array(element_type)));
+                    }
+                    ereport(ERROR,
+                        (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                            errmsg("multidimensional arrays must have array "
+                                "expressions with matching dimensions")));
+                }
+
+                /* setup for multi-D array */
+                dims[0] = outer_nelems;
+                lbs[0] = 1;
+                for (int i = 1; i < ndims; i++)
+                {
+                    dims[i] = elem_dims[i - 1];
+                    lbs[i] = elem_lbs[i - 1];
+                }
+
+                /* check for subscript overflow */
+                (void)ArrayGetNItems(ndims, dims);
+                ArrayCheckBounds(ndims, dims, lbs);
+
+                if (havenulls)
+                {
+                    dataoffset = ARR_OVERHEAD_WITHNULLS(ndims, nitems);
+                    nbytes += dataoffset;
+                }
+                else
+                {
+                    dataoffset = 0; /* marker for no null bitmap */
+                    nbytes += ARR_OVERHEAD_NONULLS(ndims);
+                }
+
+                ArrayType* result = (ArrayType *)palloc(nbytes);
+                SET_VARSIZE(result, nbytes);
+                result->ndim = ndims;
+                result->dataoffset = dataoffset;
+                result->elemtype = element_type;
+                memcpy(ARR_DIMS(result), dims, ndims * sizeof(int));
+                memcpy(ARR_LBOUND(result), lbs, ndims * sizeof(int));
+
+                dat = ARR_DATA_PTR(result);
+                iitem = 0;
+                for (int i = 0; i < outer_nelems; i++)
+                {
+                    memcpy(dat, subdata[i], subbytes[i]);
+                    dat += subbytes[i];
+                    if (havenulls)
+                        array_bitmap_copy(ARR_NULLBITMAP(result), iitem,
+                            subbitmaps[i], 0,
+                            subnitems[i]);
+                    iitem += subnitems[i];
+                }
+
+                return PointerDatumToPod(PointerGetDatum(result));
+            }
+        }
+        PG_CATCH();
+        {
+            auto error_data = CopyErrorData();
+            TStringBuilder errMsg;
+            errMsg << "Error in PgArray, reason: " << error_data->message;
+            FreeErrorData(error_data);
+            FlushErrorState();
+            UdfTerminate(errMsg.c_str());
+        }
+        PG_END_TRY();
+    }
+
+private:
+    void RegisterDependencies() const final {
+        for (auto arg : ArgNodes) {
+            DependsOn(arg);
+        }
+    }
+
+    TComputationNodePtrVector ArgNodes;
+    TVector<TType*> ArgTypes;
+    const NPg::TTypeDesc& ArrayTypeDesc;
+    const NPg::TTypeDesc& ElemTypeDesc;
+    TVector<NPg::TTypeDesc> ArgDescs;
+    bool MultiDims = false;
+};
+
 TComputationNodeFactory GetPgFactory() {
     return [] (TCallable& callable, const TComputationNodeFactoryContext& ctx) -> IComputationNode* {
             TStringBuf name = callable.GetType()->GetName();
@@ -1000,7 +1371,12 @@ TComputationNodeFactory GetPgFactory() {
                 const auto valueData = AS_VALUE(TDataLiteral, callable.GetInput(1));
                 ui32 typeId = typeIdData->AsValue().Get<ui32>();
                 auto value = valueData->AsValue().AsStringRef();
-                return new TPgConst(ctx.Mutables, typeId, value);
+                IComputationNode* typeMod = nullptr;
+                if (callable.GetInputsCount() >= 3) {
+                    typeMod = LocateNode(ctx.NodeLocator, callable, 2);
+                }
+
+                return new TPgConst(ctx.Mutables, typeId, value, typeMod);
             }
 
             if (name == "PgInternal0") {
@@ -1039,17 +1415,17 @@ TComputationNodeFactory GetPgFactory() {
                 auto inputType = callable.GetInput(0).GetStaticType();
                 ui32 sourceId = 0;
                 if (!inputType->IsNull()) {
-                    if (inputType->IsData() || inputType->IsOptional()) {
-                        bool isOptional;
-                        sourceId = *ConvertToPgType(*UnpackOptionalData(inputType, isOptional)->GetDataSlot());
-                    } else {
-                        sourceId = AS_TYPE(TPgType, inputType)->GetTypeId();
-                    }
+                    sourceId = AS_TYPE(TPgType, inputType)->GetTypeId();
                 }
 
                 auto returnType = callable.GetType()->GetReturnType();
                 auto targetId = AS_TYPE(TPgType, returnType)->GetTypeId();
-                return new TPgCast(ctx.Mutables, sourceId, targetId, arg);
+                IComputationNode* typeMod = nullptr;
+                if (callable.GetInputsCount() >= 2) {
+                    typeMod = LocateNode(ctx.NodeLocator, callable, 1);
+                }
+
+                return new TPgCast(ctx.Mutables, sourceId, targetId, arg, typeMod);
             }
 
             if (name == "FromPg") {
@@ -1105,6 +1481,19 @@ TComputationNodeFactory GetPgFactory() {
                 default:
                     ythrow yexception() << "Unsupported type: " << NPg::LookupType(targetId).Name;
                 }
+            }
+
+            if (name == "PgArray") {
+                TComputationNodePtrVector argNodes;
+                TVector<TType*> argTypes;
+                for (ui32 i = 0; i < callable.GetInputsCount(); ++i) {
+                    argNodes.emplace_back(LocateNode(ctx.NodeLocator, callable, i));
+                    argTypes.emplace_back(callable.GetInput(i).GetStaticType());
+                }
+
+                auto returnType = callable.GetType()->GetReturnType();
+                auto arrayTypeId = AS_TYPE(TPgType, returnType)->GetTypeId();
+                return new TPgArray(ctx.Mutables, std::move(argNodes), std::move(argTypes), arrayTypeId);
             }
 
             return nullptr;
@@ -1169,10 +1558,15 @@ void WriteYsonValueInTableFormatPg(TOutputBuf& buf, TPgType* type, const NUdf::T
     default:
         TPAllocScope call;
         const auto& typeInfo = NPg::LookupType(type->GetTypeId());
+        auto sendFuncId = typeInfo.SendFuncId;
+        if (typeInfo.TypeId == typeInfo.ArrayTypeId) {
+            sendFuncId = NPg::LookupProc("array_send", { 0 }).ProcId;
+        }
+
         FmgrInfo finfo;
         Zero(finfo);
-        Y_ENSURE(typeInfo.SendFuncId);
-        fmgr_info(typeInfo.SendFuncId, &finfo);
+        Y_ENSURE(sendFuncId);
+        fmgr_info(sendFuncId, &finfo);
         Y_ENSURE(!finfo.fn_retset);
         Y_ENSURE(finfo.fn_addr);
         Y_ENSURE(finfo.fn_nargs == 1);
@@ -1243,10 +1637,15 @@ void WriteYsonValuePg(TYsonResultWriter& writer, const NUdf::TUnboxedValuePod& v
     default:
         TPAllocScope call;
         const auto& typeInfo = NPg::LookupType(type->GetTypeId());
+        auto outFuncId = typeInfo.OutFuncId;
+        if (typeInfo.TypeId == typeInfo.ArrayTypeId) {
+            outFuncId = NPg::LookupProc("array_out", { 0 }).ProcId;
+        }
+
         FmgrInfo finfo;
         Zero(finfo);
-        Y_ENSURE(typeInfo.OutFuncId);
-        fmgr_info(typeInfo.OutFuncId, &finfo);
+        Y_ENSURE(outFuncId);
+        fmgr_info(outFuncId, &finfo);
         Y_ENSURE(!finfo.fn_retset);
         Y_ENSURE(finfo.fn_addr);
         Y_ENSURE(finfo.fn_nargs == 1);
@@ -1257,11 +1656,11 @@ void WriteYsonValuePg(TYsonResultWriter& writer, const NUdf::TUnboxedValuePod& v
         callInfo->fncollation = DEFAULT_COLLATION_OID;
         callInfo->isnull = false;
         callInfo->args[0] = { typeInfo.PassByValue ?
-            ScalarDatumFromPod(value):
+            ScalarDatumFromPod(value) :
             PointerDatumFromPod(value), false };
         auto str = (char*)finfo.fn_addr(callInfo);
         Y_ENSURE(!callInfo->isnull);
-        Y_DEFER {
+        Y_DEFER{
             pfree(str);
         };
 
@@ -1334,10 +1733,15 @@ NUdf::TUnboxedValue ReadYsonValuePg(TPgType* type, char cmd, TInputBuf& buf) {
 
         const auto& typeInfo = NPg::LookupType(type->GetTypeId());
         auto typeIOParam = MakeTypeIOParam(typeInfo);
+        auto receiveFuncId = typeInfo.ReceiveFuncId;
+        if (typeInfo.TypeId == typeInfo.ArrayTypeId) {
+            receiveFuncId = NPg::LookupProc("array_recv", { 0,0,0 }).ProcId;
+        }
+
         FmgrInfo finfo;
         Zero(finfo);
-        Y_ENSURE(typeInfo.ReceiveFuncId);
-        fmgr_info(typeInfo.ReceiveFuncId, &finfo);
+        Y_ENSURE(receiveFuncId);
+        fmgr_info(receiveFuncId, &finfo);
         Y_ENSURE(!finfo.fn_retset);
         Y_ENSURE(finfo.fn_addr);
         Y_ENSURE(finfo.fn_nargs >= 1 && finfo.fn_nargs <= 3);
@@ -1453,10 +1857,15 @@ NKikimr::NUdf::TUnboxedValue ReadSkiffPg(NKikimr::NMiniKQL::TPgType* type, NComm
 
         const auto& typeInfo = NPg::LookupType(type->GetTypeId());
         auto typeIOParam = MakeTypeIOParam(typeInfo);
+        auto receiveFuncId = typeInfo.ReceiveFuncId;
+        if (typeInfo.TypeId == typeInfo.ArrayTypeId) {
+            receiveFuncId = NPg::LookupProc("array_recv", { 0,0,0 }).ProcId;
+        }
+
         FmgrInfo finfo;
         Zero(finfo);
-        Y_ENSURE(typeInfo.ReceiveFuncId);
-        fmgr_info(typeInfo.ReceiveFuncId, &finfo);
+        Y_ENSURE(receiveFuncId);
+        fmgr_info(receiveFuncId, &finfo);
         Y_ENSURE(!finfo.fn_retset);
         Y_ENSURE(finfo.fn_addr);
         Y_ENSURE(finfo.fn_nargs >= 1 && finfo.fn_nargs <= 3);
@@ -1535,10 +1944,15 @@ void WriteSkiffPg(NKikimr::NMiniKQL::TPgType* type, const NKikimr::NUdf::TUnboxe
     default:
         TPAllocScope call;
         const auto& typeInfo = NPg::LookupType(type->GetTypeId());
+        auto sendFuncId = typeInfo.SendFuncId;
+        if (typeInfo.TypeId == typeInfo.ArrayTypeId) {
+            sendFuncId = NPg::LookupProc("array_send", { 0 }).ProcId;
+        }
+
         FmgrInfo finfo;
         Zero(finfo);
-        Y_ENSURE(typeInfo.SendFuncId);
-        fmgr_info(typeInfo.SendFuncId, &finfo);
+        Y_ENSURE(sendFuncId);
+        fmgr_info(sendFuncId, &finfo);
         Y_ENSURE(!finfo.fn_retset);
         Y_ENSURE(finfo.fn_addr);
         Y_ENSURE(finfo.fn_nargs == 1);
@@ -1622,6 +2036,41 @@ TMaybe<NUdf::EDataSlot> ConvertFromPgType(ui32 typeId) {
     return Nothing();
 }
 
+bool ParsePgIntervalModifier(const TString& str, i32& ret) {
+    auto ustr = to_upper(str);
+    if (ustr == "YEAR") {
+        ret = INTERVAL_MASK(YEAR);
+    } else if (ustr == "MONTH") {
+        ret = INTERVAL_MASK(YEAR);
+    } else if (ustr == "DAY") {
+        ret = INTERVAL_MASK(DAY);
+    } else if (ustr == "HOUR") {
+        ret = INTERVAL_MASK(HOUR);
+    } else if (ustr == "MINUTE") {
+        ret = INTERVAL_MASK(MINUTE);
+    } else if (ustr == "SECOND") {
+        ret = INTERVAL_MASK(SECOND);
+    } else if (ustr == "YEAR TO MONTH") {
+        ret = INTERVAL_MASK(YEAR) | INTERVAL_MASK(MONTH);
+    } else if (ustr == "DAY TO HOUR") {
+        ret = INTERVAL_MASK(DAY) | INTERVAL_MASK(HOUR);
+    } else if (ustr == "DAY TO MINUTE") {
+        ret = INTERVAL_MASK(DAY) | INTERVAL_MASK(HOUR) | INTERVAL_MASK(MINUTE);
+    } else if (ustr == "DAY TO SECOND") {
+        ret = INTERVAL_MASK(DAY) | INTERVAL_MASK(HOUR) | INTERVAL_MASK(MINUTE) | INTERVAL_MASK(SECOND);
+    } else if (ustr == "HOUR TO MINUTE") {
+        ret = INTERVAL_MASK(HOUR) | INTERVAL_MASK(MINUTE);
+    } else if (ustr == "HOUR TO SECOND") {
+        ret = INTERVAL_MASK(HOUR) | INTERVAL_MASK(MINUTE) | INTERVAL_MASK(SECOND);
+    } else if (ustr == "MINUTE TO SECOND") {
+        ret = INTERVAL_MASK(MINUTE) | INTERVAL_MASK(SECOND);
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
 } // NYql
 
 namespace NKikimr {
@@ -1688,10 +2137,15 @@ void PGPackImpl(bool stable, const TPgType* type, const NUdf::TUnboxedValuePod& 
     default:
         TPAllocScope call;
         const auto& typeInfo = NPg::LookupType(type->GetTypeId());
+        auto sendFuncId = typeInfo.SendFuncId;
+        if (typeInfo.TypeId == typeInfo.ArrayTypeId) {
+            sendFuncId = NPg::LookupProc("array_send", { 0 }).ProcId;
+        }
+
         FmgrInfo finfo;
         Zero(finfo);
-        Y_ENSURE(typeInfo.SendFuncId);
-        fmgr_info(typeInfo.SendFuncId, &finfo);
+        Y_ENSURE(sendFuncId);
+        fmgr_info(sendFuncId, &finfo);
         Y_ENSURE(!finfo.fn_retset);
         Y_ENSURE(finfo.fn_addr);
         Y_ENSURE(finfo.fn_nargs == 1);
@@ -1774,10 +2228,15 @@ NUdf::TUnboxedValue PGUnpackImpl(const TPgType* type, TStringBuf& buf) {
 
         const auto& typeInfo = NPg::LookupType(type->GetTypeId());
         auto typeIOParam = MakeTypeIOParam(typeInfo);
+        auto receiveFuncId = typeInfo.ReceiveFuncId;
+        if (typeInfo.TypeId == typeInfo.ArrayTypeId) {
+            receiveFuncId = NPg::LookupProc("array_recv", { 0,0,0 }).ProcId;
+        }
+
         FmgrInfo finfo;
         Zero(finfo);
-        Y_ENSURE(typeInfo.ReceiveFuncId);
-        fmgr_info(typeInfo.ReceiveFuncId, &finfo);
+        Y_ENSURE(receiveFuncId);
+        fmgr_info(receiveFuncId, &finfo);
         Y_ENSURE(!finfo.fn_retset);
         Y_ENSURE(finfo.fn_addr);
         Y_ENSURE(finfo.fn_nargs >= 1 && finfo.fn_nargs <= 3);
@@ -1846,10 +2305,15 @@ void EncodePresortPGValue(TPgType* type, const NUdf::TUnboxedValue& value, TVect
     default:
         TPAllocScope call;
         const auto& typeInfo = NPg::LookupType(type->GetTypeId());
+        auto sendFuncId = typeInfo.SendFuncId;
+        if (typeInfo.TypeId == typeInfo.ArrayTypeId) {
+            sendFuncId = NPg::LookupProc("array_send", { 0 }).ProcId;
+        }
+
         FmgrInfo finfo;
         Zero(finfo);
-        Y_ENSURE(typeInfo.SendFuncId);
-        fmgr_info(typeInfo.SendFuncId, &finfo);
+        Y_ENSURE(sendFuncId);
+        fmgr_info(sendFuncId, &finfo);
         Y_ENSURE(!finfo.fn_retset);
         Y_ENSURE(finfo.fn_addr);
         Y_ENSURE(finfo.fn_nargs == 1);
@@ -1927,10 +2391,15 @@ NUdf::TUnboxedValue DecodePresortPGValue(TPgType* type, TStringBuf& input, TVect
 
         const auto& typeInfo = NPg::LookupType(type->GetTypeId());
         auto typeIOParam = MakeTypeIOParam(typeInfo);
+        auto receiveFuncId = typeInfo.ReceiveFuncId;
+        if (typeInfo.TypeId == typeInfo.ArrayTypeId) {
+            receiveFuncId = NPg::LookupProc("array_recv", { 0,0,0 }).ProcId;
+        }
+
         FmgrInfo finfo;
         Zero(finfo);
-        Y_ENSURE(typeInfo.ReceiveFuncId);
-        fmgr_info(typeInfo.ReceiveFuncId, &finfo);
+        Y_ENSURE(receiveFuncId);
+        fmgr_info(receiveFuncId, &finfo);
         Y_ENSURE(!finfo.fn_retset);
         Y_ENSURE(finfo.fn_addr);
         Y_ENSURE(finfo.fn_nargs >= 1 && finfo.fn_nargs <= 3);
@@ -2226,6 +2695,36 @@ void yql_canonize_float4(float4* x) {
 extern void yql_canonize_float8(float8* x) {
     if (NYql::NeedCanonizeFp) {
         NYql::CanonizeFpBits<double>(x);
+    }
+}
+
+void get_type_io_data(Oid typid,
+    IOFuncSelector which_func,
+    int16 *typlen,
+    bool *typbyval,
+    char *typalign,
+    char *typdelim,
+    Oid *typioparam,
+    Oid *func) {
+    const auto& typeDesc = NYql::NPg::LookupType(typid);
+    *typlen = typeDesc.TypeLen;
+    *typbyval = typeDesc.PassByValue;
+    *typalign = typeDesc.TypeAlign;
+    *typdelim = typeDesc.TypeDelim;
+    *typioparam = NYql::MakeTypeIOParam(typeDesc);
+    switch (which_func) {
+    case IOFunc_input:
+        *func = typeDesc.InFuncId;
+        break;
+    case IOFunc_output:
+        *func = typeDesc.OutFuncId;
+        break;
+    case IOFunc_receive:
+        *func = typeDesc.ReceiveFuncId;
+        break;
+    case IOFunc_send:
+        *func = typeDesc.SendFuncId;
+        break;
     }
 }
 

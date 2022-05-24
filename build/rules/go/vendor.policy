@@ -137,6 +137,7 @@ ALLOW .* -> vendor/github.com/aws/aws-sdk-go/service/ec2
 ALLOW .* -> vendor/github.com/aws/aws-sdk-go/service/route53
 ALLOW .* -> vendor/github.com/aws/aws-sdk-go/service/kinesis
 ALLOW .* -> vendor/github.com/aws/aws-sdk-go/service/sts
+ALLOW .* -> vendor/github.com/aws/aws-sdk-go/service/iam
 
 # TOML parser/encoder with reflection
 ALLOW .* -> vendor/github.com/BurntSushi/toml
@@ -185,7 +186,7 @@ ALLOW .* -> vendor/github.com/DATA-DOG/godog
 ALLOW .* -> vendor/github.com/davecgh/go-spew/spew
 
 # CONTRIB-425 implementation of JSON Web Tokens (JWT)
-ALLOW .* -> vendor/github.com/golang-jwt/jwt
+ALLOW .* -> vendor/github.com/golang-jwt/jwt/v4
 
 # Docker API client
 # docker tests depends on broken package: gotest.tools
@@ -420,7 +421,13 @@ ALLOW .* -> vendor/golang.org/x/xerrors
 # golang.org/x/sys required for SO_REUSEPORT, for example
 ALLOW .* -> vendor/golang.org/x/sys
 
+# modules
 ALLOW .* -> vendor/golang.org/x/mod
+
+# exp generics
+ALLOW .* -> vendor/golang.org/x/exp/slices
+ALLOW .* -> vendor/golang.org/x/exp/maps
+ALLOW .* -> vendor/golang.org/x/exp/constraints
 
 # basic LDAP v3 functionality for the GO programming language
 ALLOW .* -> vendor/gopkg.in/ldap.v3
@@ -632,9 +639,6 @@ ALLOW .* -> vendor/gopkg.in/tucnak/telebot.v2
 # CONTRIB-1726 helpers for working with protobuf field masks
 ALLOW .* -> vendor/github.com/mennanov/fieldmask-utils
 
-# CONTRIB-1810 Fast directory traversal for Golang
-ALLOW .* -> vendor/github.com/karrick/godirwalk
-
 # CONTRIB-1864 Zstandard (zstd) data compression algorithm
 ALLOW .* -> vendor/github.com/klauspost/compress/zstd
 
@@ -730,11 +734,6 @@ ALLOW .* -> vendor/github.com/insomniacslk/dhcp
 
 # CONTRIB-2094
 ALLOW .* -> vendor/github.com/osrg/gobgp
-
-#
-# CONTRIB-2097 QUIC(HTTP/3) implementation library
-#
-ALLOW .* -> vendor/github.com/lucas-clemente/quic-go
 
 # CONTRIB-2111 distributed lock on redis
 ALLOW .* -> vendor/github.com/go-redsync/redsync/v4
@@ -908,6 +907,18 @@ ALLOW .* -> vendor/github.com/gocql/gocql
 
 # CONTRIB-2524
 ALLOW .* -> vendor/github.com/ryanrolds/sqlclosecheck
+
+# CONTRIB-2546
+ALLOW .* -> vendor/github.com/ncruces/go-proxied
+
+# CONTRIB-2568
+DENY .* -> vendor/github.com/distribution/distribution/v3/registry/storage/driver
+DENY .* -> vendor/github.com/distribution/distribution/v3/cmd
+ALLOW .* -> vendor/github.com/distribution/distribution/v3
+ALLOW .* -> vendor/github.com/distribution/distribution/v3/registry/storage/driver/base
+ALLOW .* -> vendor/github.com/distribution/distribution/v3/registry/storage/driver/factory
+ALLOW .* -> vendor/github.com/distribution/distribution/v3/registry/storage/driver/inmemory
+ALLOW .* -> vendor/github.com/distribution/distribution/v3/registry/storage/driver/testsuites
 
 #
 # Tools
@@ -1084,6 +1095,9 @@ ALLOW infra/infractl/.* -> vendor/gopkg.in/yaml.v3
 # CONTRIB-2489
 ALLOW infra/infractl/.* -> vendor/github.com/ghodss/yaml
 
+# CONTRIB-2572
+ALLOW infra/infractl/.* -> vendor/github.com/magiconair/properties
+
 # CONTRIB-2445
 ALLOW psp -> vendor/github.com/zimmski/go-mutesting
 
@@ -1103,15 +1117,43 @@ ALLOW .* -> vendor/github.com/fatih/color
 # CONTRIB-2519
 ALLOW .* -> vendor/github.com/nathan-osman/go-sunrise
 
+# CONTRIB-2529
+ALLOW .* -> vendor/github.com/rivo/tview
+
 # CONTRIB-2541
 ALLOW noc/traffic/dns/.* -> vendor/github.com/gin-gonic/gin
 
 # CONTRIB-2542
 ALLOW noc/traffic/dns/.* -> vendor/github.com/gin-contrib/gzip
 
+# CONTRIB-1735
+ALLOW .* -> vendor/gonum.org/v1/gonum
+DENY .* -> vendor/gonum.org/v1/gonum;test
+DENY .* -> vendor/gonum.org/v1/plot;test
+DENY .* -> vendor/gonum.org/v1/netlib;test
 
+# CONTRIB-2548
+ALLOW .* -> vendor/github.com/yandex-cloud/go-sdk
+ALLOW .* -> vendor/github.com/yandex-cloud/go-genproto
+
+
+# CONTRIB-2537
+ALLOW infra/awacs/.* -> vendor/github.com/anttsov/curator
+
+# CONTRIB-2558
+ALLOW .* -> vendor/github.com/go-logr/zapr
 #
 # This section is for EXCEPTIONS. Add new rule above, not here.
 #
+
+# CONTRIB-2562
+DENY .* -> vendor/github.com/elastic/go-elasticsearch/v7;test
+ALLOW * -> vendor/github.com/elastic/go-elasticsearch/v7
+
+# CONTRIB-2564
+DENY .* -> vendor/github.com/olivere/elastic/v7;test
+DENY .* -> vendor/github.com/smartystreets/go-aws-auth;test
+DENY .* -> vendor/github.com/smartystreets/gunit;test
+ALLOW .* -> vendor/github.com/olivere/elastic/v7
 
 DENY .* -> vendor/

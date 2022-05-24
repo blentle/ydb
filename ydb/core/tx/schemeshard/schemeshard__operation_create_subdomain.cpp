@@ -284,7 +284,7 @@ public:
         newNode->UserAttrs->AlterData = userAttrs;
         newNode->DirAlterVersion = 1;
 
-        NIceDb::TNiceDb db(context.Txc.DB);
+        NIceDb::TNiceDb db(context.GetDB());
 
         context.SS->PersistPath(db, newNode->PathId);
         context.SS->ApplyAndPersistUserAttrs(db, newNode->PathId);
@@ -313,8 +313,8 @@ public:
             alter->AddStoragePool(pool);
         }
 
-        DeclareShards(txState, OperationId.GetTxId(), newNode->PathId, settings.GetCoordinators(), TTabletTypes::FLAT_TX_COORDINATOR, channelBindings, context.SS);
-        DeclareShards(txState, OperationId.GetTxId(), newNode->PathId, settings.GetMediators(), TTabletTypes::TX_MEDIATOR, channelBindings, context.SS);
+        DeclareShards(txState, OperationId.GetTxId(), newNode->PathId, settings.GetCoordinators(), TTabletTypes::Coordinator, channelBindings, context.SS);
+        DeclareShards(txState, OperationId.GetTxId(), newNode->PathId, settings.GetMediators(), TTabletTypes::Mediator, channelBindings, context.SS);
 
         for (auto& shard: txState.Shards) {
             alter->AddPrivateShard(shard.Idx);

@@ -72,9 +72,10 @@ public:
     }
 
     TKqpScanComputeActor(const NKikimrKqp::TKqpSnapshot& snapshot, const TActorId& executerId, ui64 txId,
-        NDqProto::TDqTask&& task, IDqSourceActorFactory::TPtr sourceActorFactory, IDqSinkFactory::TPtr sinkFactory,
+        NDqProto::TDqTask&& task, IDqSourceFactory::TPtr sourceFactory, IDqSinkFactory::TPtr sinkFactory, IDqOutputTransformFactory::TPtr transformFactory,
+        const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
         const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits, TIntrusivePtr<TKqpCounters> counters)
-        : TBase(executerId, txId, std::move(task), std::move(sourceActorFactory), std::move(sinkFactory), settings, memoryLimits)
+        : TBase(executerId, txId, std::move(task), std::move(sourceFactory), std::move(sinkFactory), std::move(transformFactory), functionRegistry, settings, memoryLimits)
         , ComputeCtx(settings.StatsMode)
         , Snapshot(snapshot)
         , Counters(counters)
@@ -953,32 +954,28 @@ private:
     }
 
 private:
-    struct TScanFreeSpace : public IDestructable {
-        ui64 FreeSpace = 0;
-    };
-
-    THolder<IDestructable> GetSourcesState() override {
-        if (ScanData) {
-            auto state = MakeHolder<TScanFreeSpace>();
-            state->FreeSpace = GetMemoryLimits().ScanBufferSize > ScanData->GetStoredBytes()
+    ui64 CalculateFreeSpace() const {
+        return GetMemoryLimits().ScanBufferSize > ScanData->GetStoredBytes()
                 ? GetMemoryLimits().ScanBufferSize - ScanData->GetStoredBytes()
                 : 0ul;
-            return state;
-        }
-        return nullptr;
     }
 
-    void PollSources(THolder<IDestructable> prev) override {
-        if (!prev || !ScanData || Shards.empty()) {
+    std::any GetSourcesState() override {
+        if (ScanData) {
+            return CalculateFreeSpace();
+        }
+        return {};
+    }
+
+    void PollSources(std::any prev) override {
+        if (!prev.has_value() || !ScanData || Shards.empty()) {
             return;
         }
 
         auto& state = Shards.front();
 
-        ui64 freeSpace = GetMemoryLimits().ScanBufferSize > ScanData->GetStoredBytes()
-            ? GetMemoryLimits().ScanBufferSize - ScanData->GetStoredBytes()
-            : 0ul;
-        ui64 prevFreeSpace = static_cast<TScanFreeSpace*>(prev.Get())->FreeSpace;
+        const ui64 freeSpace = CalculateFreeSpace();
+        const ui64 prevFreeSpace = std::any_cast<ui64>(prev);
 
         CA_LOG_T("Scan over tablet " << state.TabletId << " finished: " << ScanData->IsFinished()
             << ", prevFreeSpace: " << prevFreeSpace << ", freeSpace: " << freeSpace << ", peer: " << state.ActorId);
@@ -1130,11 +1127,12 @@ private:
 } // anonymous namespace
 
 IActor* CreateKqpScanComputeActor(const NKikimrKqp::TKqpSnapshot& snapshot, const TActorId& executerId, ui64 txId,
-    NDqProto::TDqTask&& task, IDqSourceActorFactory::TPtr sourceActorFactory, IDqSinkFactory::TPtr sinkFactory,
+    NDqProto::TDqTask&& task, IDqSourceFactory::TPtr sourceFactory, IDqSinkFactory::TPtr sinkFactory, IDqOutputTransformFactory::TPtr transformFactory,
+    const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
     const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits, TIntrusivePtr<TKqpCounters> counters)
 {
-    return new TKqpScanComputeActor(snapshot, executerId, txId, std::move(task), std::move(sourceActorFactory), std::move(sinkFactory),
-        settings, memoryLimits, counters);
+    return new TKqpScanComputeActor(snapshot, executerId, txId, std::move(task), std::move(sourceFactory), std::move(sinkFactory), std::move(transformFactory),
+        functionRegistry, settings, memoryLimits, counters);
 }
 
 } // namespace NKqp

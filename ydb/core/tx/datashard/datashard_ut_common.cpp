@@ -67,8 +67,8 @@ TTester::TTester(ESchema schema, const TOptions& opts)
     Sender = Runtime.AllocateEdgeActor();
 
     // Schemeshard is only used to receive notifications
-    CreateTestBootstrapper(Runtime, CreateTestTabletInfo(FAKE_SCHEMESHARD_TABLET_ID, TTabletTypes::FLAT_SCHEMESHARD), &CreateFlatTxSchemeShard);
-    CreateTestBootstrapper(Runtime, CreateTestTabletInfo(FAKE_TX_ALLOCATOR_TABLET_ID, TTabletTypes::TX_ALLOCATOR), &CreateTxAllocator);
+    CreateTestBootstrapper(Runtime, CreateTestTabletInfo(FAKE_SCHEMESHARD_TABLET_ID, TTabletTypes::SchemeShard), &CreateFlatTxSchemeShard);
+    CreateTestBootstrapper(Runtime, CreateTestTabletInfo(FAKE_TX_ALLOCATOR_TABLET_ID, TTabletTypes::TxAllocator), &CreateTxAllocator);
     CreateSchema(schema, opts);
 }
 
@@ -86,8 +86,8 @@ TTester::TTester(ESchema schema, const TString& dispatchName, std::function<void
     DispatchName = dispatchName;
 
     // Schemeshard is only used to receive notifications
-    CreateTestBootstrapper(Runtime, CreateTestTabletInfo(FAKE_SCHEMESHARD_TABLET_ID, TTabletTypes::FLAT_SCHEMESHARD), &CreateFlatTxSchemeShard);
-    CreateTestBootstrapper(Runtime, CreateTestTabletInfo(FAKE_TX_ALLOCATOR_TABLET_ID, TTabletTypes::TX_ALLOCATOR), &CreateTxAllocator);
+    CreateTestBootstrapper(Runtime, CreateTestTabletInfo(FAKE_SCHEMESHARD_TABLET_ID, TTabletTypes::SchemeShard), &CreateFlatTxSchemeShard);
+    CreateTestBootstrapper(Runtime, CreateTestTabletInfo(FAKE_TX_ALLOCATOR_TABLET_ID, TTabletTypes::TxAllocator), &CreateTxAllocator);
     CreateSchema(schema, opts);
 }
 
@@ -148,7 +148,7 @@ TTester::TKeyResolver TTester::GetKeyResolver() const {
 }
 
 void TTester::CreateDataShard(TFakeMiniKQLProxy& proxy, ui64 tabletId, const TString& schemeText, bool withRegister) {
-    TActorId actorId = CreateTestBootstrapper(Runtime, CreateTestTabletInfo(tabletId, TTabletTypes::FLAT_DATASHARD),
+    TActorId actorId = CreateTestBootstrapper(Runtime, CreateTestTabletInfo(tabletId, TTabletTypes::DataShard),
         &::NKikimr::CreateDataShard);
     Y_UNUSED(actorId);
 
@@ -1313,25 +1313,25 @@ NTable::TRowVersionRanges GetRemovedRowVersions(
     return ev->Get()->RemovedRowVersions;
 }
 
-TRowVersion CreateVolatileSnapshot(
-        Tests::TServer::TPtr server,
+void SendCreateVolatileSnapshot(
+        TTestActorRuntime& runtime,
+        const TActorId& sender,
         const TVector<TString>& tables,
         TDuration timeout)
 {
-    auto& runtime = *server->GetRuntime();
-
-    TActorId sender = runtime.AllocateEdgeActor();
-
-    {
-        auto request = MakeHolder<TEvTxUserProxy::TEvProposeTransaction>();
-        auto* tx = request->Record.MutableTransaction()->MutableCreateVolatileSnapshot();
-        for (const auto& path : tables) {
-            tx->AddTables()->SetTablePath(path);
-        }
-        tx->SetTimeoutMs(timeout.MilliSeconds());
-        runtime.Send(new IEventHandle(MakeTxProxyID(), sender, request.Release()));
+    auto request = MakeHolder<TEvTxUserProxy::TEvProposeTransaction>();
+    auto* tx = request->Record.MutableTransaction()->MutableCreateVolatileSnapshot();
+    for (const auto& path : tables) {
+        tx->AddTables()->SetTablePath(path);
     }
+    tx->SetTimeoutMs(timeout.MilliSeconds());
+    runtime.Send(new IEventHandle(MakeTxProxyID(), sender, request.Release()));
+}
 
+TRowVersion GrabCreateVolatileSnapshotResult(
+        TTestActorRuntime& runtime,
+        const TActorId& sender)
+{
     auto ev = runtime.GrabEdgeEventRethrow<TEvTxUserProxy::TEvProposeTransactionStatus>(sender);
     const auto& record = ev->Get()->Record;
     auto status = static_cast<TEvTxUserProxy::TEvProposeTransactionStatus::EStatus>(record.GetStatus());
@@ -1344,6 +1344,20 @@ TRowVersion CreateVolatileSnapshot(
         "Unexpected step " << step << " and txId " << txId);
 
     return { step, txId };
+}
+
+TRowVersion CreateVolatileSnapshot(
+        Tests::TServer::TPtr server,
+        const TVector<TString>& tables,
+        TDuration timeout)
+{
+    auto& runtime = *server->GetRuntime();
+
+    TActorId sender = runtime.AllocateEdgeActor();
+
+    SendCreateVolatileSnapshot(runtime, sender, tables, timeout);
+
+    return GrabCreateVolatileSnapshotResult(runtime, sender);
 }
 
 bool RefreshVolatileSnapshot(

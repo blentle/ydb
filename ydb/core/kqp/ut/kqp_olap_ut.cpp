@@ -399,10 +399,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         };
     }
 
-    Y_UNIT_TEST(SimpleQueryOlap) {
+    Y_UNIT_TEST_TWIN(SimpleQueryOlap, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         // EnableDebugLogging(kikimr);
@@ -431,10 +432,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(SimpleLookupOlap) {
+    Y_UNIT_TEST_TWIN(SimpleLookupOlap, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         // EnableDebugLogging(kikimr);
@@ -462,10 +464,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(SimpleRangeOlap) {
+    Y_UNIT_TEST_TWIN(SimpleRangeOlap, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         // EnableDebugLogging(kikimr);
@@ -494,10 +497,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(CompositeRangeOlap) {
+    Y_UNIT_TEST_TWIN(CompositeRangeOlap, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         // EnableDebugLogging(kikimr);
@@ -653,10 +657,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         session.Close();
     }
 
-    Y_UNIT_TEST(QueryOltpAndOlap) {
+    Y_UNIT_TEST_TWIN(QueryOltpAndOlap, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         // EnableDebugLogging(kikimr);
@@ -686,10 +691,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(EmptyRange) {
+    Y_UNIT_TEST_TWIN(EmptyRange, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         CreateTestOlapTable(kikimr);
@@ -709,10 +715,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         CompareYson(StreamResultToYson(it), "[]");
     }
 
-    Y_UNIT_TEST(Aggregation) {
+    Y_UNIT_TEST_TWIN(Aggregation, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         // EnableDebugLogging(kikimr);
@@ -783,13 +790,14 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(PushdownFilter) {
+    Y_UNIT_TEST_TWIN(PushdownFilter, UseSessionActor) {
         static bool enableLog = false;
 
         auto doTest = [](std::optional<bool> viaSettings, std::optional<bool> viaPragma, bool pushdownPresent) {
             auto settings = TKikimrSettings()
                 .SetWithSampleTables(false)
-                .SetEnableOlapSchemaOperations(true);
+                .SetEnableOlapSchemaOperations(true)
+                .SetEnableKqpSessionActor(UseSessionActor);
 
             if (enableLog) {
                 Cerr << "Run test:" << Endl;
@@ -882,10 +890,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(PKDescScan) {
+    Y_UNIT_TEST_TWIN(PKDescScan, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         TStreamExecScanQuerySettings scanSettings;
@@ -948,10 +957,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         CompareYson(expectedYson, ysonResult);
     }
 
-    Y_UNIT_TEST(ExtractRanges) {
+    Y_UNIT_TEST_TWIN(ExtractRanges, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         CreateTestOlapTable(kikimr);
@@ -976,10 +986,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(ExtractRangesReverse) {
+    Y_UNIT_TEST_TWIN(ExtractRangesReverse, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         CreateTestOlapTable(kikimr);
@@ -1006,11 +1017,12 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(PredicatePushdown) {
+    Y_UNIT_TEST_TWIN(PredicatePushdown, UseSessionActor) {
         constexpr bool logQueries = false;
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         TStreamExecScanQuerySettings scanSettings;
@@ -1018,9 +1030,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
         CreateTestOlapTable(kikimr);
         WriteTestData(kikimr, "/Root/olapStore/olapTable", 10000, 3000000, 5);
+        EnableDebugLogging(kikimr);
 
         auto tableClient = kikimr.GetTableClient();
 
+        // TODO: Add support for DqPhyPrecompute push-down: Cast((2+2) as Uint64)
         std::vector<TString> testData = {
             R"(`resource_id` = `uid`)",
             R"(`resource_id` = "10001")",
@@ -1037,7 +1051,14 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             R"((`level`, `uid`, `resource_id`) > (Int32("1"), "uid_3000001", "10001"))",
             R"((`level`, `uid`, `resource_id`) > (Int32("1"), "uid_3000000", "10001"))",
             R"((`level`, `uid`, `resource_id`) < (Int32("1"), "uid_3000002", "10001"))",
-            R"((`level`, `uid`, `resource_id`) >= (Int32("2"), "uid_3000000", "10001"))",
+            R"((`level`, `uid`, `resource_id`) >= (Int32("2"), "uid_3000001", "10001"))",
+            R"((`level`, `uid`, `resource_id`) >= (Int32("1"), "uid_3000002", "10001"))",
+            R"((`level`, `uid`, `resource_id`) >= (Int32("1"), "uid_3000001", "10002"))",
+            R"((`level`, `uid`, `resource_id`) >= (Int32("1"), "uid_3000001", "10001"))",
+            R"((`level`, `uid`, `resource_id`) <= (Int32("2"), "uid_3000001", "10001"))",
+            R"((`level`, `uid`, `resource_id`) <= (Int32("1"), "uid_3000002", "10001"))",
+            R"((`level`, `uid`, `resource_id`) <= (Int32("1"), "uid_3000001", "10002"))",
+            R"((`level`, `uid`, `resource_id`) <= (Int32("1"), "uid_3000001", "10001"))",
             R"((`level`, `uid`, `resource_id`) != (Int32("1"), "uid_3000001", "10001"))",
             R"((`level`, `uid`, `resource_id`) != (Int32("0"), "uid_3000001", "10011"))",
             R"(`level` = 0 OR `level` = 2 OR `level` = 1)",
@@ -1045,8 +1066,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             R"(`level` = 0 OR `uid` = "uid_3000003")",
             R"(`level` = 0 AND `uid` = "uid_3000003")",
             R"(`level` = 0 AND `uid` = "uid_3000000")",
-            // Timestamp will be removed by predicate extraction now.
-            R"(`timestamp` >= CAST(3000001 AS Timestamp) AND `level` > 3)",
+            R"(`timestamp` >= CAST(3000001u AS Timestamp) AND `level` > 3)",
             R"((`level`, `uid`) > (Int32("2"), "uid_3000004") OR (`level`, `uid`) < (Int32("1"), "uid_3000002"))",
             R"(Int32("3") > `level`)",
             R"((Int32("1"), "uid_3000001", "10001") = (`level`, `uid`, `resource_id`))",
@@ -1057,12 +1077,17 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             R"(`level` IS NOT NULL)",
             R"((`level`, `uid`) > (Int32("1"), NULL))",
             R"((`level`, `uid`) != (Int32("1"), NULL))",
-            //R"((`timestamp`, `level`) >= (CAST(3000001 AS Timestamp), 3))",
+            R"(`level` >= CAST("2" As Int32))",
+            R"(CAST("2" As Int32) >= `level`)",
+            R"(`timestamp` >= CAST(3000001u AS Timestamp))",
+            R"((`timestamp`, `level`) >= (CAST(3000001u AS Timestamp), 3))",
         };
 
         std::vector<TString> testDataNoPush = {
             R"(`level` != NULL)",
             R"(`level` > NULL)",
+            R"(`timestamp` >= CAST(3000001 AS Timestamp))",
+            R"(`level` >= CAST("2" As Uint32))",
         };
 
         auto buildQuery = [](const TString& predicate, bool pushEnabled) {
@@ -1073,7 +1098,8 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             if (pushEnabled) {
                 qBuilder << R"(PRAGMA Kikimr.KqpPushOlapProcess = "true";)" << Endl;
             }
-
+            
+            qBuilder << R"(PRAGMA Kikimr.OptEnablePredicateExtract = "false";)" << Endl;
             qBuilder << "SELECT `timestamp` FROM `/Root/olapStore/olapTable` WHERE ";
             qBuilder << predicate;
             qBuilder << " ORDER BY `timestamp`";
@@ -1085,10 +1111,14 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             auto normalQuery = buildQuery(predicate, false);
             auto pushQuery = buildQuery(predicate, true);
 
+            Cerr << "--- Run normal query ---\n";
+            Cerr << normalQuery << Endl;
             auto it = tableClient.StreamExecuteScanQuery(normalQuery).GetValueSync();
             UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
             auto goodResult = CollectStreamResult(it);
 
+            Cerr << "--- Run pushed down query ---\n";
+            Cerr << pushQuery << Endl;
             it = tableClient.StreamExecuteScanQuery(pushQuery).GetValueSync();
             UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
             auto pushResult = CollectStreamResult(it);
@@ -1129,10 +1159,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(StatsSysView) {
+    Y_UNIT_TEST_TWIN(StatsSysView, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
         static ui32 numKinds = 5;
 
@@ -1171,10 +1202,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             0.3*0.9*100*1000); // >= 90% of 100K inserted rows
     }
 
-    Y_UNIT_TEST(StatsSysViewTable) {
+    Y_UNIT_TEST_TWIN(StatsSysViewTable, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
         static ui32 numKinds = 5;
 
@@ -1233,10 +1265,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(StatsSysViewColumns) {
+    Y_UNIT_TEST_TWIN(StatsSysViewColumns, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
         static ui32 numKinds = 5;
 
@@ -1294,10 +1327,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(StatsSysViewRanges) {
+    Y_UNIT_TEST_TWIN(StatsSysViewRanges, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
         static ui32 numKinds = 5;
 
@@ -1380,10 +1414,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(StatsSysViewFilter) {
+    Y_UNIT_TEST_TWIN(StatsSysViewFilter, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         CreateTestOlapTable(kikimr);
@@ -1454,10 +1489,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(StatsSysViewAggregation) {
+    Y_UNIT_TEST_TWIN(StatsSysViewAggregation, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
         static ui32 numKinds = 5;
 
@@ -1631,11 +1667,12 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(PredicatePushdownWithParameters) {
+    Y_UNIT_TEST_TWIN(PredicatePushdownWithParameters, UseSessionActor) {
         constexpr bool logQueries = true;
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         TStreamExecScanQuerySettings scanSettings;
@@ -1716,10 +1753,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         UNIT_ASSERT(readRange.IsDefined());
     }
 
-    Y_UNIT_TEST(PredicatePushdownParameterTypesValidation) {
+    Y_UNIT_TEST_TWIN(PredicatePushdownParameterTypesValidation, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         TStreamExecScanQuerySettings scanSettings;
@@ -1773,10 +1811,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     }
 
-    Y_UNIT_TEST(PredicatePushdownCastErrors) {
+    Y_UNIT_TEST_TWIN(PredicatePushdownCastErrors, UseSessionActor) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
-            .SetEnableOlapSchemaOperations(true);
+            .SetEnableOlapSchemaOperations(true)
+            .SetEnableKqpSessionActor(UseSessionActor);
         TKikimrRunner kikimr(settings);
 
         TStreamExecScanQuerySettings scanSettings;

@@ -15,9 +15,12 @@ target_link_libraries(ydb-core-mon PUBLIC
   cpp-lwtrace-mon
   cpp-string_utils-url
   ydb-core-base
+  ydb-core-protos
   ydb-library-aclib
 )
 target_sources(ydb-core-mon PRIVATE
+  ${CMAKE_SOURCE_DIR}/ydb/core/mon/async_http_mon.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/mon/mon.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/mon/sync_http_mon.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/mon/crossref.cpp
 )

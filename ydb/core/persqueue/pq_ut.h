@@ -99,7 +99,7 @@ struct TTestContext {
 
 
     TTestContext() {
-        TabletType = TTabletTypes::PERSQUEUE;
+        TabletType = TTabletTypes::PersQueue;
         TabletId = MakeTabletID(0, 0, 1);
         TabletIds.push_back(TabletId);
 
@@ -148,11 +148,19 @@ struct TTestContext {
         TDispatchOptions options;
         options.FinalEvents.push_back(TDispatchOptions::TFinalEventCondition(TEvTablet::EvBoot));
         Runtime->GetAppData(0).PQConfig.SetEnabled(true);
+        // NOTE(shmel1k@): KIKIMR-14221
+        Runtime->GetAppData(0).PQConfig.SetTopicsAreFirstClassCitizen(false);
+        Runtime->GetAppData(0).PQConfig.SetRequireCredentialsInNewProtocol(false);
+        Runtime->GetAppData(0).PQConfig.SetClusterTablePath("/Root/PQ/Config/V2/Cluster");
+        Runtime->GetAppData(0).PQConfig.SetVersionTablePath("/Root/PQ/Config/V2/Versions");
+        Runtime->GetAppData(0).PQConfig.SetTopicsAreFirstClassCitizen(false);
+        Runtime->GetAppData(0).PQConfig.SetRoot("/Root/PQ");
+        Runtime->GetAppData(0).PQConfig.MutableQuotingConfig()->SetEnableQuoting(false);
 
         Runtime->DispatchEvents(options);
 
         CreateTestBootstrapper(*Runtime,
-            CreateTestTabletInfo(BalancerTabletId, TTabletTypes::PERSQUEUE_READ_BALANCER, TErasureType::ErasureNone),
+            CreateTestTabletInfo(BalancerTabletId, TTabletTypes::PersQueueReadBalancer, TErasureType::ErasureNone),
             &CreatePersQueueReadBalancer);
 
         options.FinalEvents.push_back(TDispatchOptions::TFinalEventCondition(TEvTablet::EvBoot));
@@ -179,7 +187,7 @@ struct TTestContext {
         Runtime->DispatchEvents(options);
 
         CreateTestBootstrapper(*Runtime,
-            CreateTestTabletInfo(BalancerTabletId, TTabletTypes::PERSQUEUE_READ_BALANCER, TErasureType::ErasureNone),
+            CreateTestTabletInfo(BalancerTabletId, TTabletTypes::PersQueueReadBalancer, TErasureType::ErasureNone),
             &CreatePersQueueReadBalancer);
 
         options.FinalEvents.push_back(TDispatchOptions::TFinalEventCondition(TEvTablet::EvBoot));
@@ -213,7 +221,20 @@ struct TFinalizer {
 // SINGLE COMMAND TEST FUNCTIONS
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void PQTabletPrepare(ui32 mcip, ui64 msip, ui32 deleteTime, const TVector<std::pair<TString, bool>>& users, TTestContext& tc, int partitions = 2, ui32 lw = 6_MB, bool localDC = true, ui64 ts = 0, ui64 sidMaxCount = 0, ui32 specVersion = 0) {
+void PQTabletPrepare(
+    ui32 mcip,
+    ui64 msip,
+    ui32 deleteTime,
+    const TVector<std::pair<TString, bool>>& users,
+    TTestContext& tc,
+    int partitions = 2,
+    ui32 lw = 6_MB,
+    bool localDC = true,
+    ui64 ts = 0,
+    ui64 sidMaxCount = 0,
+    ui32 specVersion = 0,
+    i32 storageLimitBytes = 0
+ ) {
     TAutoPtr<IEventHandle> handle;
     static int version = 0;
     if (specVersion) {
@@ -232,7 +253,13 @@ void PQTabletPrepare(ui32 mcip, ui64 msip, ui32 deleteTime, const TVector<std::p
             request->Record.MutableTabletConfig()->SetCacheSize(10_MB);
             request->Record.SetTxId(12345);
             auto tabletConfig = request->Record.MutableTabletConfig();
-            tabletConfig->SetTopicName("rt3.dc1--topic");
+            if (tc.Runtime->GetAppData().PQConfig.GetTopicsAreFirstClassCitizen()) {
+                tabletConfig->SetTopicName("topic");
+                tabletConfig->SetTopicPath(tc.Runtime->GetAppData().PQConfig.GetDatabase() + "/topic");
+            } else {
+                tabletConfig->SetTopicName("rt3.dc1--topic");
+                tabletConfig->SetTopicPath("/Root/PQ/rt3.dc1--topic");
+            }
             tabletConfig->SetTopic("topic");
             tabletConfig->SetVersion(version);
             tabletConfig->SetLocalDC(localDC);
@@ -241,7 +268,11 @@ void PQTabletPrepare(ui32 mcip, ui64 msip, ui32 deleteTime, const TVector<std::p
             auto config = tabletConfig->MutablePartitionConfig();
             config->SetMaxCountInPartition(mcip);
             config->SetMaxSizeInPartition(msip);
-            config->SetLifetimeSeconds(deleteTime);
+            if (storageLimitBytes > 0) {
+                config->SetStorageLimitBytes(storageLimitBytes);
+            } else {
+                config->SetLifetimeSeconds(deleteTime);
+            }
             config->SetSourceIdLifetimeSeconds(1*60*60);
             if (sidMaxCount > 0)
                 config->SetSourceIdMaxCounts(sidMaxCount);
@@ -250,7 +281,7 @@ void PQTabletPrepare(ui32 mcip, ui64 msip, ui32 deleteTime, const TVector<std::p
 
             for (auto& u : users) {
                 if (u.second)
-                config->AddImportantClientId(u.first);
+                    config->AddImportantClientId(u.first);
                 if (u.first != "user")
                     tabletConfig->AddReadRules(u.first);
             }
@@ -360,7 +391,8 @@ void PQGetPartInfo(ui64 startOffset, ui64 endOffset, TTestContext& tc) {
             result = tc.Runtime->GrabEdgeEvent<TEvPersQueue::TEvOffsetsResponse>(handle);
             UNIT_ASSERT(result);
 
-            if (result->Record.PartResultSize() == 0 || result->Record.GetPartResult(0).GetErrorCode() == NPersQueue::NErrorCode::INITIALIZING) {
+            if (result->Record.PartResultSize() == 0 ||
+                result->Record.GetPartResult(0).GetErrorCode() == NPersQueue::NErrorCode::INITIALIZING) {
                 tc.Runtime->DispatchEvents();   // Dispatch events so that initialization can make progress
                 retriesLeft = 3;
                 continue;
@@ -650,13 +682,17 @@ void CmdWrite(const ui32 partition, const TString& sourceId, const TVector<std::
             }
 
             if (error) {
-                UNIT_ASSERT(result->Record.GetErrorCode() == NPersQueue::NErrorCode::WRITE_ERROR_PARTITION_IS_FULL ||
-                            result->Record.GetErrorCode() == NPersQueue::NErrorCode::BAD_REQUEST || result->Record.GetErrorCode() == NPersQueue::NErrorCode::WRONG_COOKIE);
+                UNIT_ASSERT(
+                    result->Record.GetErrorCode() == NPersQueue::NErrorCode::WRITE_ERROR_PARTITION_IS_FULL ||
+                    result->Record.GetErrorCode() == NPersQueue::NErrorCode::BAD_REQUEST ||
+                    result->Record.GetErrorCode() == NPersQueue::NErrorCode::WRONG_COOKIE
+                );
                 break;
             } else {
-                UNIT_ASSERT_EQUAL(result->Record.GetErrorCode(), NPersQueue::NErrorCode::OK);
+                Cerr << result->Record.GetErrorReason();
+                UNIT_ASSERT_VALUES_EQUAL((ui32)result->Record.GetErrorCode(), (ui32)NPersQueue::NErrorCode::OK);
             }
-            UNIT_ASSERT(result->Record.GetPartitionResponse().CmdWriteResultSize() == data.size());
+            UNIT_ASSERT_VALUES_EQUAL(result->Record.GetPartitionResponse().CmdWriteResultSize(), data.size());
 
             for (ui32 i = 0; i < data.size(); ++i) {
                 UNIT_ASSERT(result->Record.GetPartitionResponse().GetCmdWriteResult(i).HasAlreadyWritten());
