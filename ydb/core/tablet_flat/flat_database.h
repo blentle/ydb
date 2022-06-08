@@ -115,6 +115,11 @@ public:
     void CommitTx(ui32 table, ui64 txId, TRowVersion rowVersion = TRowVersion::Min());
 
     /**
+     * Returns true when table has an open transaction that is not committed or removed yet
+     */
+    bool HasOpenTx(ui32 table, ui64 txId) const;
+
+    /**
      * Remove row versions [lower, upper) from the given table
      *
      * Once committed this cannot be undone. This is a hint to the underlying
@@ -159,6 +164,8 @@ public:
     TAutoPtr<TSubset> Subset(ui32 table, TArrayRef<const TLogoBlobID> bundle, TEpoch before) const;
     TAutoPtr<TSubset> Subset(ui32 table, TEpoch before, TRawVals from, TRawVals to) const;
     TAutoPtr<TSubset> ScanSnapshot(ui32 table, TRowVersion snapshot = TRowVersion::Max());
+
+    bool HasBorrowed(ui32 table, ui64 selfTabletId) const;
 
     TBundleSlicesMap LookupSlices(ui32 table, TArrayRef<const TLogoBlobID> bundles) const;
     void ReplaceSlices(ui32 table, TBundleSlicesMap slices);

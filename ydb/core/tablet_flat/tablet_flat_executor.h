@@ -528,6 +528,12 @@ namespace NFlatExecutorSetup {
         virtual ui64 CompactTable(ui32 tableId) = 0;
         virtual bool CompactTables() = 0;
 
+        // Signal executor that it's ok to compact borrowed data in the given
+        // table even if there's no local modifications. Useful after finishing
+        // snapshot transfer on datashard split/merge so any mvcc data and/or
+        // erases can be compacted normally.
+        virtual void AllowBorrowedGarbageCompaction(ui32 tableId) = 0;
+
         virtual void RenderHtmlPage(NMon::TEvRemoteHttpInfo::TPtr&) const = 0;
         virtual void RenderHtmlCounters(NMon::TEvRemoteHttpInfo::TPtr&) const = 0;
         virtual void RenderHtmlDb(NMon::TEvRemoteHttpInfo::TPtr &ev, const TActorContext &ctx) const = 0;
@@ -541,6 +547,8 @@ namespace NFlatExecutorSetup {
         // Returns parts owned by this tablet and borrowed by other tablets
         virtual THashMap<TLogoBlobID, TVector<ui64>> GetBorrowedParts() const = 0;
         virtual bool HasLoanedParts() const = 0;
+
+        virtual bool HasBorrowed(ui32 table, ui64 selfTabletId) const = 0;
 
         // This method lets executor know about new yellow channels
         virtual void OnYellowChannels(TVector<ui32> yellowMoveChannels, TVector<ui32> yellowStopChannels) = 0;

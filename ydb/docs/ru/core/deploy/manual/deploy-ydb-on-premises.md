@@ -61,15 +61,16 @@ sudo partx --u /dev/nvme0n1
 Если вы планируете использовать более одного диска на каждом сервере - укажите для каждого свой уникальный лейбл вместо `ydb_disk_ssd_01`. Эти диски необходимо будет использовать в конфигурационных файлах далее.
 
 Скачайте и распакуйте архив с исполняемым файлом `ydbd` и необходимыми для работы YDB библиотеками:
+
 ```bash
 curl https://binaries.ydb.tech/ydbd-main-linux-amd64.tar.gz | tar -xz
 ```
+
 Создайте директории для запуска:
+
 ```bash
-mkdir -p /opt/ydb
-chown ydb:ydb /opt/ydb
-mkdir /opt/ydb/bin
-mkdir /opt/ydb/cfg
+sudo mkdir -p /opt/ydb/bin /opt/ydb/cfg /opt/ydb/lib
+sudo chown -R ydb:ydb /opt/ydb
 ```
 
 3. Скопируйте бинарник, библиотеки и конфигурационный файл в соответствующие директории:
@@ -214,7 +215,7 @@ LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/ydb/lib /opt/ydb/bin/ydbd admin database /
   cd /opt/ydb
   export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/ydb/lib
   /opt/ydbd/bin/ydbd server --grpc-port 2136 --ic-port 19002 --mon-port 8766 --yaml-config  /opt/ydb/cfg/config.yaml \
-  --tenant /Root/testdb --node-broker --node-broker --node-broker
+  --tenant /Root/testdb --node-broker node1.ydb.tech:2135 --node-broker node2.ydb.tech:2135 --node-broker node3.ydb.tech:2135
   ```
   Запустите дополнительные динноды на других серверах для обеспечения доступности базы данных. 
 

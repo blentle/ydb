@@ -628,6 +628,8 @@ public:
     ui64 CompactTable(ui32 tableId) override;
     bool CompactTables() override;
 
+    void AllowBorrowedGarbageCompaction(ui32 tableId) override;
+
     void FollowerAttached() override;
     void FollowerSyncComplete() override;
     void FollowerGcApplied(ui32 step, TDuration followerSyncDelay) override;
@@ -646,6 +648,8 @@ public:
 
     THashMap<TLogoBlobID, TVector<ui64>> GetBorrowedParts() const override;
     bool HasLoanedParts() const override;
+
+    bool HasBorrowed(ui32 table, ui64 selfTabletId) const override;
 
     const TExecutorStats& GetStats() const override;
     NMetrics::TResourceMetrics* GetResourceMetrics() const override;

@@ -138,6 +138,7 @@ ALLOW .* -> vendor/github.com/aws/aws-sdk-go/service/route53
 ALLOW .* -> vendor/github.com/aws/aws-sdk-go/service/kinesis
 ALLOW .* -> vendor/github.com/aws/aws-sdk-go/service/sts
 ALLOW .* -> vendor/github.com/aws/aws-sdk-go/service/iam
+ALLOW .* -> vendor/github.com/aws/aws-sdk-go/service/ram
 
 # TOML parser/encoder with reflection
 ALLOW .* -> vendor/github.com/BurntSushi/toml
@@ -172,6 +173,9 @@ ALLOW .* -> vendor/github.com/coreos/go-systemd/v22/journal
 
 # systemd dbus
 ALLOW .* -> vendor/github.com/coreos/go-systemd/v22/dbus
+
+# CONTRIB-2577
+ALLOW .* -> vendor/github.com/coreos/go-systemd/daemon
 
 # mocking for database/sql
 ALLOW .* -> vendor/github.com/DATA-DOG/go-sqlmock
@@ -627,6 +631,9 @@ ALLOW .* -> vendor/github.com/soniah/gosnmp
 # CONTRIB-1686 markdown parser
 ALLOW .* -> vendor/github.com/yuin/goldmark
 
+# Created after version bump. It is currently (may 2022) experimental and requires googleapis testing dependency.
+DENY .* -> vendor/github.com/spf13/afero/gcsfs
+
 # CONTRIB-1681 A FileSystem Abstraction System for Go
 ALLOW .* -> vendor/github.com/spf13/afero
 
@@ -644,9 +651,6 @@ ALLOW .* -> vendor/github.com/klauspost/compress/zstd
 
 # CONTRIB-1865 Decorated Syntax Tree for Go AST
 ALLOW .* -> vendor/github.com/dave/dst
-
-# CONTRIB-1874 Parse and demux MPEG Transport Streams
-ALLOW .* -> vendor/github.com/asticode/go-astits
 
 # CONTRIB-1896 Fast, portable, non-Turing complete expression evaluation with gradual typing
 ALLOW .* -> vendor/github.com/google/cel-go
@@ -920,6 +924,9 @@ ALLOW .* -> vendor/github.com/distribution/distribution/v3/registry/storage/driv
 ALLOW .* -> vendor/github.com/distribution/distribution/v3/registry/storage/driver/inmemory
 ALLOW .* -> vendor/github.com/distribution/distribution/v3/registry/storage/driver/testsuites
 
+# CONTRIB-2578 JSONRPC client
+ALLOW .* -> vendor/github.com/ybbus/jsonrpc/v3
+
 #
 # Tools
 #
@@ -1140,8 +1147,18 @@ ALLOW .* -> vendor/github.com/yandex-cloud/go-genproto
 # CONTRIB-2537
 ALLOW infra/awacs/.* -> vendor/github.com/anttsov/curator
 
+# CONTRIB-2579
+ALLOW .* -> vendor/github.com/mastercard/oauth1-signer-go
+
 # CONTRIB-2558
 ALLOW .* -> vendor/github.com/go-logr/zapr
+
+# CONTRIB-2576
+DENY pay/.* -> vendor/gopkg.in/square/go-jose.v2/jose-util
+DENY pay/.* -> vendor/gopkg.in/square/go-jose.v2/jwk-keygen
+DENY pay/.* -> vendor/gopkg.in/square/go-jose.v2/cryptosigner
+ALLOW pay/.* -> vendor/gopkg.in/square/go-jose.v2
+
 #
 # This section is for EXCEPTIONS. Add new rule above, not here.
 #

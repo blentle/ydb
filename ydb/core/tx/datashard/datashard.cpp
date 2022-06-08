@@ -144,6 +144,7 @@ TDataShard::TDataShard(const TActorId &tablet, TTabletStorageInfo *info)
     , TtlReadAheadHi(0, 0, 128*1024*1024)
     , EnablePrioritizedMvccSnapshotReads(1, 0, 1)
     , EnableUnprotectedMvccSnapshotReads(1, 0, 1)
+    , EnableLockedWrites(0, 0, 1)
     , EnableLeaderLeases(1, 0, 1)
     , MinLeaderLeaseDurationUs(250000, 1000, 5000000)
     , DataShardSysTables(InitDataShardSysTables(this))
@@ -314,6 +315,7 @@ void TDataShard::IcbRegister() {
 
         appData->Icb->RegisterSharedControl(EnablePrioritizedMvccSnapshotReads, "DataShardControls.PrioritizedMvccSnapshotReads");
         appData->Icb->RegisterSharedControl(EnableUnprotectedMvccSnapshotReads, "DataShardControls.UnprotectedMvccSnapshotReads");
+        appData->Icb->RegisterSharedControl(EnableLockedWrites, "DataShardControls.EnableLockedWrites");
 
         appData->Icb->RegisterSharedControl(EnableLeaderLeases, "DataShardControls.EnableLeaderLeases");
         appData->Icb->RegisterSharedControl(MinLeaderLeaseDurationUs, "DataShardControls.MinLeaderLeaseDurationUs");
@@ -379,6 +381,15 @@ void TDataShard::SwitchToWork(const TActorContext &ctx) {
     Become(&TThis::StateWork);
     LOG_INFO_S(ctx, NKikimrServices::TX_DATASHARD, "Switched to work state "
          << DatashardStateName(State) << " tabletId " << TabletID());
+
+    if (State == TShardState::Ready && DstSplitDescription) {
+        // This shard was created as a result of split/merge (and not e.g. copy table)
+        // Signal executor that it should compact borrowed garbage even if this
+        // shard has no private data.
+        for (const auto& pr : TableInfos) {
+            Executor()->AllowBorrowedGarbageCompaction(pr.second->LocalTid);
+        }
+    }
 
     // Cleanup any removed snapshots from the previous generation
     Execute(new TTxCleanupRemovedSnapshots(this), ctx);

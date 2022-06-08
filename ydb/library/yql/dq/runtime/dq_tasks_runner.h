@@ -7,7 +7,7 @@
 #include <ydb/library/yql/dq/runtime/dq_input_channel.h>
 #include <ydb/library/yql/dq/runtime/dq_output_channel.h>
 #include <ydb/library/yql/dq/runtime/dq_output_consumer.h>
-#include <ydb/library/yql/dq/runtime/dq_source.h>
+#include <ydb/library/yql/dq/runtime/dq_async_input.h>
 
 #include <ydb/library/yql/minikql/mkql_alloc.h>
 #include <ydb/library/yql/minikql/mkql_function_registry.h>
@@ -298,9 +298,10 @@ public:
     virtual bool HasEffects() const = 0;
 
     virtual IDqInputChannel::TPtr GetInputChannel(ui64 channelId) = 0;
-    virtual IDqSource::TPtr GetSource(ui64 inputIndex) = 0;
+    virtual IDqAsyncInputBuffer::TPtr GetSource(ui64 inputIndex) = 0;
     virtual IDqOutputChannel::TPtr GetOutputChannel(ui64 channelId) = 0;
     virtual IDqAsyncOutputBuffer::TPtr GetSink(ui64 outputIndex) = 0;
+    virtual std::pair<NUdf::TUnboxedValue, IDqAsyncInputBuffer::TPtr> GetInputTransform(ui64 inputIndex) = 0;
     virtual std::pair<IDqAsyncOutputBuffer::TPtr, IDqOutputConsumer::TPtr> GetOutputTransform(ui64 outputIndex) = 0;
 
     // if memoryLimit = Nothing()  then don't set memory limit, use existing one (if any)

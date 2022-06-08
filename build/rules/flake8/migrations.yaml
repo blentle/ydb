@@ -381,11 +381,7 @@ migrations:
     - maps/pylibs/monitoring/tests
     - maps/renderer/tilesgen/tools/lib
     - maps/renderer/tools/download_release
-    - maps/routing/router/regression/gen-stopwatch-ammo
-    - maps/routing/router/scripts/gen-ammo
     - maps/routing/versus/lib
-    - maps/tools/matcher_quality/routes_to_geoms
-    - maps/tools/package_releaser/lib
     - maps/tools/tanker-build/translate_messages
     - maps/wikimap/mapspro/libs/python/pymod
     - maps/wikimap/mapspro/libs/python/pymod/yandex/maps/wiki
@@ -924,7 +920,6 @@ migrations:
     - infra/host-cpu-metrics/host_metrics
     - infra/porto/api_py
     - infra/qyp/vmproxy/tests
-    - infra/shawshank/tests
     - infra/skybit
     - infra/skybit/src
     - infra/yp_dns/tools/handle_duplicate_records/lib
@@ -950,7 +945,6 @@ migrations:
     - maps/infra/apiteka/config_uploader/tests
     - maps/infra/sedem/cli/tests/release
     - maps/infra/sedem/cli/tests/release/utils
-    - maps/tools/matcher_quality/routes_to_geoms
     - maps_adv/common/shared_mock/tests
     - market/mobile_validator/mt/env
     - market/sre/services/cema-proxy/lib
@@ -976,7 +970,6 @@ migrations:
     - modadvert/libs/http
     - modadvert/libs/laas/workers/domain_threats
     - modadvert/libs/laas/workers/features_from_href
-    - modadvert/libs/utils/dictutils/ut
     - modadvert/programs/cv_app/libs
     - modadvert/tools/accept_campaigns
     - mssngr/botfarm/src/bot
@@ -991,7 +984,6 @@ migrations:
     - quality/functionality/chats/feedback/src/feedback/api
     - quality/functionality/chats/feedback/src/feedback/api/v1
     - quality/functionality/rtx/server/plugin
-    - quality/functionality/snippets/rkn_filter
     - quality/functionality/turbo/analytics/quality/cms_report
     - quality/functionality/turbo/analytics/quality/samplers/cms_sampler
     - quality/functionality/turbo/autoparser/flags_postprocess/tests/medium
@@ -1075,7 +1067,6 @@ migrations:
     - voicetech/infra/uniproxy/tests/session
     - voicetech/infra/voice_ext_mon/bin
     - voicetech/spotter/selection_for_annotation/bin
-    - voicetech/spotter/train/lib
     - weather/workers/warnings/push
     - yabs/analytics/anomaly_analyzer/src
     - yabs/analytics/new_traffic_generation/src
@@ -1256,7 +1247,6 @@ migrations:
     - market/mobile_validator/mt
     - market/seo/tools/postgres_local/recipe
     - market/yamarec/yamarec/yamarec1
-    - mds/nscfg/server
     - metrika/admin/python/cms/agent/lib
     - metrika/core/monitoring/clickhouse-table-structure-check
     - metrika/core/programs/mobile_yt_to_yc_export
@@ -1332,7 +1322,6 @@ migrations:
     - sandbox/projects/mail/Load/FuritaShooting
     - sandbox/projects/mail/Load/LizaShooting
     - sandbox/projects/mail/Load/MobileApiShooting
-    - sandbox/projects/mail/Load/QuinnShooting
     - sandbox/projects/mail/Load/WebApiShooting
     - sandbox/projects/mail/RotateMailNotifyRules
     - sandbox/projects/marty
@@ -1406,7 +1395,6 @@ migrations:
     - yabs/sbyt/ytstatcollector/advmachine/tests
     - yabs/server/cs/test/cs_import/yt_banner_with_history
     - yabs/server/libs/py_db_cluster
-    - yabs/server/test/ft/BSSERVER-13878
     - yabs/server/test/ft/BSSERVER-14107
     - yabs/server/test/ft/BSSERVER-14309
     - yabs/server/test/ft/BSSERVER-2495
@@ -1926,7 +1914,6 @@ migrations:
     - maps/pylibs/utils/lib
     - maps/pymod/yandex/maps/test_utils
     - maps/renderer/designs_config/libs/pymod
-    - maps/routing/router/regression/gen-stopwatch-ammo-mt
     - maps/streetview/backoffice/lib
     - maps/streetview/backoffice/tools/cut_images_yt
     - maps/streetview/backoffice/tools/detect_session_privacy
@@ -1981,7 +1968,6 @@ migrations:
     - mds/mastermind/minion
     - mds/mastermind/monolith
     - mds/mastermind/scheduler
-    - mds/nscfg/lib
     - metrika/admin/python/cms/frontend/base
     - metrika/core/programs/mobile_startup_admin/base
     - metrika/pylib/auth
@@ -2328,8 +2314,6 @@ migrations:
     - sandbox/projects/common
     - sandbox/projects/cornholio
     - sandbox/projects/devtools/ChangesDetector
-    - sandbox/projects/direct/DirectDeploy
-    - sandbox/projects/direct/tanker_translations
     - sandbox/projects/direct_internal_analytics
     - sandbox/projects/distbuild
     - sandbox/projects/dj
@@ -2530,8 +2514,6 @@ migrations:
     - search/resonance/tester/tools/viewer
     - search/sawmill/services
     - search/sawmill/sqla/sawmill
-    - search/stoker/services
-    - search/stoker/sqla/stoker
     - search/tools/devops/apphost/find_bad_backends
     - search/tools/devops/libs
     - search/tools/devops/overcommit
@@ -2690,7 +2672,6 @@ migrations:
     - yabs/cache-proxy/plugin/proxy_b2b/templates
     - yabs/libs/ua_traits/orig/pymodules
     - yabs/qa/b2b_utils/bsserver_b2b/engine/external_logs
-    - yabs/qa/bsinfo
     - yabs/qa/oneshots/inna-kudelkina/BSDEV-75160/create_new_templates
     - yabs/qa/oneshots/inna-kudelkina/BSDEV-75160/test_681_684_697_725_json_templates
     - yabs/qa/oneshots/inna-kudelkina/BSDEV-75160/test_add_callouts_to_681_684_697_725_json_templates
@@ -2730,9 +2711,6 @@ migrations:
     - yql/tools/yqltornado
     - yt/admin/acl_dumper/src
     - yt/admin/brahmagupta/src/brahmagupta_api
-    - yt/admin/core
-    - yt/admin/perf_scraper/src
-    - yt/admin/perf_scraper/vendor/supervise
     - yt/admin/shiva/services
     - yt/admin/ytcfgen/vendor/pyinotify/python2
     - yt/cron/balance_bundles
@@ -2874,8 +2852,6 @@ migrations:
     - ads/libs/py_mapreduce/yabs-mapreduce-modules/test_pt/functional_skiff
     - ads/libs/py_matrixnet/ut
     - ads/libs/py_ml_factors/fat/test_mappers
-    - ads/libs/py_ml_factors/fat/test_preprocessors_first_batch
-    - ads/libs/py_ml_factors/fat/test_preprocessors_second_batch
     - ads/libs/py_vw_lib/ut
     - ads/libs/test_yt/example/run
     - ads/libs/yql/ft
@@ -2951,7 +2927,6 @@ migrations:
     - dict/tools/unicode_test/tests
     - dict/tools/untransliter/tests
     - dict/word2vec/tools/convert_model/tests
-    - dj/lib/shard2/yt_prepare/ut/run_test
     - dj/tools/rthub_profiles/profile_update_triggers/profile_update_trigger_rtmr/tests
     - entity/ontodb/robot/tests/integration
     - entity/ontodb/tasks/watson_converter/lib/ut
@@ -3016,7 +2991,6 @@ migrations:
     - mail/xiva/mobile/tests-system
     - mapreduce/library/native2streaming/tests/tests
     - mapreduce/yt/tests
-    - maps/fastcgi/meta/bin/tests
     - maps/libs/tile/pymod-tests
     - maps/wikimap/mapspro/tools/topology_fixer/tests
     - market/contrib/python/BitTorrent
@@ -3268,7 +3242,6 @@ migrations:
     - yql/tests/jdbc
     - yql/tests/multi_process
     - yt/admin/drive_monitor/tests/unit
-    - yt/admin/perf_scraper/tests
     - yt/odin/tests/suites
     - yweb/antimalware/libs/yttools/py/tests
     - yweb/antiporno/pyutil/draft/simple_yt/tests
@@ -3465,7 +3438,6 @@ migrations:
     - ads/libs/py_mapreduce/yabs-mapreduce-modules/t
     - ads/libs/py_mapreduce/yabs-mapreduce-modules/test_pt
     - ads/sandbox_scripts/visibility_stats/fat
-    - ads/pytorch/lib/online_learning/production/model_folder/medium_ut
     - ads/pytorch/ads_pytorch_integration_test
     - ads/nirvana/online_learning/prepare_factorization_table/tsar_preprocessor/ut
     - ads/nirvana/automl/pipelines/mlmarines/medium_ut

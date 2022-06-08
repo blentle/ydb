@@ -1448,6 +1448,10 @@ TExecutor::TLeaseCommit* TExecutor::EnsureReadOnlyLease(TMonotonic at) {
         lease = &LeaseCommits.emplace_back(commit->Step, ts, ts + LeaseDuration);
 
         CommitManager->Commit(commit);
+
+        if (LogicSnap->MayFlush(false)) {
+            MakeLogSnapshot();
+        }
     }
 
     return lease;
@@ -2943,6 +2947,10 @@ THolder<TScanSnapshot> TExecutor::PrepareScanSnapshot(ui32 table, const NTable::
     GcLogic->HoldBarrier(barrier->Step);
     CompactionLogic->UpdateLogUsage(LogicRedo->GrabLogUsage());
 
+    if (LogicSnap->MayFlush(false)) {
+        MakeLogSnapshot();
+    }
+
     return THolder<TScanSnapshot>(new TScanSnapshot{table, std::move(barrier), subset, snapshot});
 }
 
@@ -3708,6 +3716,12 @@ bool TExecutor::CompactTables() {
     }
 }
 
+void TExecutor::AllowBorrowedGarbageCompaction(ui32 tableId) {
+    if (CompactionLogic) {
+        return CompactionLogic->AllowBorrowedGarbageCompaction(tableId);
+    }
+}
+
 STFUNC(TExecutor::StateInit) {
     Y_UNUSED(ev);
     Y_UNUSED(ctx);
@@ -3804,6 +3818,11 @@ bool TExecutor::HasLoanedParts() const {
     if (BorrowLogic)
         return BorrowLogic->HasLoanedParts();
     return false;
+}
+
+bool TExecutor::HasBorrowed(ui32 table, ui64 selfTabletId) const {
+    Y_VERIFY_S(Database, "Checking borrowers of table# " << table << " for tablet# " << selfTabletId);
+    return Database->HasBorrowed(table, selfTabletId);
 }
 
 const TExecutorStats& TExecutor::GetStats() const {
@@ -4451,6 +4470,10 @@ void TExecutor::Handle(TEvPrivate::TEvActivateCompactionChanges::TPtr& ev, const
 
     for (auto& logicResult : CompactionLogic->ApplyChanges()) {
         CommitCompactionChanges(logicResult.Table, logicResult.Changes, logicResult.Strategy);
+    }
+
+    if (LogicSnap->MayFlush(false)) {
+        MakeLogSnapshot();
     }
 }
 

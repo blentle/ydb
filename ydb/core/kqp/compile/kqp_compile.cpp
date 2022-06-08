@@ -268,6 +268,10 @@ void FillReadRanges(const TReader& read, const TKikimrTableMetadata&, TProto& re
         }
     }
 
+    if constexpr (std::is_same_v<TProto, NKqpProto::TKqpPhyOpReadOlapRanges>) {
+        readProto.SetSorted(settings.Sorted);
+    }
+
     readProto.SetReverse(settings.Reverse);
 }
 
@@ -424,7 +428,7 @@ public:
         auto ops = TableOperationsToProto(tableOps, ctx);
         for (auto& op : ops) {
             const auto tableName = op.GetTable();
-            auto operation = (TYdbOperation)op.GetOperation();
+            auto operation = static_cast<TYdbOperation>(op.GetOperation());
 
             *queryProto.AddTableOps() = std::move(op);
 

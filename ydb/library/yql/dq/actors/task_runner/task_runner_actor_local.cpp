@@ -113,6 +113,7 @@ private:
     }
 
     void PassAway() override {
+        TaskRunner = nullptr;
         if (MemoryQuota) {
             MemoryQuota->TryReleaseQuota();
         }
@@ -196,7 +197,6 @@ private:
                     std::move(inputChannelFreeSpace),
                     std::move(sourcesFreeSpace),
                     {},
-                    {},
                     MemoryQuota ? *MemoryQuota->GetProfileStats() : TDqMemoryQuota::TProfileStats(),
                     MemoryQuota ? MemoryQuota->GetMkqlMemoryLimit() : 0,
                     std::move(mkqlProgramState),
@@ -245,7 +245,7 @@ private:
                 ev->Cookie));
     }
 
-    void SourcePush(
+    void AsyncInputPush(
         ui64 cookie,
         ui64 index,
         NKikimr::NMiniKQL::TUnboxedValueVector&& batch,
@@ -262,7 +262,7 @@ private:
             new IEventHandle(
                 ParentId,
                 SelfId(),
-                new TEvSourcePushFinished(index),
+                new TEvAsyncInputPushFinished(index),
                 /*flags=*/0,
                 cookie));
     }

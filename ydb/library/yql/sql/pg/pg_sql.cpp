@@ -155,6 +155,14 @@ public:
         TString Scope;
     };
 
+    struct TView {
+        TString Name;
+        TVector<TString> ColNames;
+        TAstNode* Source = nullptr;
+    };
+
+    using TViews = THashMap<TString, TView>;
+
     TConverter(TAstParseResult& astParseResult, const NSQLTranslation::TTranslationSettings& settings)
         : AstParseResult(astParseResult)
         , Settings(settings)
@@ -194,6 +202,11 @@ public:
            }
         }
 
+        if (!Views.empty()) {
+            AddError("Not all views have been dropped");
+            return nullptr;
+        }
+
         Statements.push_back(L(A("let"), A("world"), L(A("CommitAll!"),
             A("world"))));
         Statements.push_back(L(A("return"), A("world")));
@@ -208,6 +221,10 @@ public:
             return ParseSelectStmt(CAST_NODE(SelectStmt, node), false) != nullptr;
         case T_InsertStmt:
             return ParseInsertStmt(CAST_NODE(InsertStmt, node)) != nullptr;
+        case T_ViewStmt:
+            return ParseViewStmt(CAST_NODE(ViewStmt, node)) != nullptr;
+        case T_DropStmt:
+            return ParseDropStmt(CAST_NODE(DropStmt, node)) != nullptr;
         default:
             NodeNotImplemented(value, node);
             return false;
@@ -757,6 +774,113 @@ public:
         return Statements.back();
     }
 
+    [[nodiscard]]
+    TAstNode* ParseViewStmt(const ViewStmt* value) {
+        if (ListLength(value->options) > 0) {
+            AddError("Create view: not supported options");
+            return nullptr;
+        }
+
+        TView view;
+        if (StrLength(value->view->catalogname) > 0) {
+            AddError("catalogname is not supported");
+            return nullptr;
+        }
+
+        if (StrLength(value->view->schemaname) > 0) {
+            AddError("schemaname is not supported");
+            return nullptr;
+        }
+
+        if (StrLength(value->view->relname) == 0) {
+            AddError("relname should be specified");
+            return nullptr;
+        }
+
+        view.Name = value->view->relname;
+        if (value->view->alias) {
+            AddError("alias is not supported");
+            return nullptr;
+        }
+
+        if (ListLength(value->aliases) == 0) {
+            AddError("expected at least one target column");
+            return nullptr;
+        }
+
+        for (int i = 0; i < ListLength(value->aliases); ++i) {
+            auto node = ListNodeNth(value->aliases, i);
+            if (NodeTag(node) != T_String) {
+                NodeNotImplemented(value, node);
+                return nullptr;
+            }
+
+            view.ColNames.push_back(StrVal(node));
+        }
+
+        if (value->withCheckOption != NO_CHECK_OPTION) {
+            AddError("Create view: not supported options");
+            return nullptr;
+        }
+
+
+        view.Source = ParseSelectStmt(CAST_NODE(SelectStmt, value->query), true);
+        if (!view.Source) {
+            return nullptr;
+        }
+
+        auto it = Views.find(view.Name);
+        if (it != Views.end() && !value->replace) {
+            AddError(TStringBuilder() << "View already exists: '" << view.Name << "'");
+            return nullptr;
+        }
+
+        Views[view.Name] = view;
+        return Statements.back();
+    }
+
+    [[nodiscard]]
+    TAstNode* ParseDropStmt(const DropStmt* value) {
+        if (value->removeType != OBJECT_VIEW) {
+            AddError("Not supported object type for DROP");
+            return nullptr;
+        }
+
+        // behavior and concurrent don't matter here
+        for (int i = 0; i < ListLength(value->objects); ++i)  {
+            auto object = ListNodeNth(value->objects, i);
+            if (NodeTag(object) != T_List) {
+                NodeNotImplemented(value, object);
+                return nullptr;
+            }
+
+            auto lst = CAST_NODE(List, object);
+            if (ListLength(lst) != 1) {
+                AddError("Expected view name");
+                return nullptr;
+            }
+
+            auto nameNode = ListNodeNth(lst, 0);
+            if (NodeTag(nameNode) != T_String) {
+                NodeNotImplemented(value, nameNode);
+                return nullptr;
+            }
+
+            auto name = StrVal(nameNode);
+            auto it = Views.find(name);
+            if (!value->missing_ok && it == Views.end()) {
+                AddError(TStringBuilder() << "View not found: '" << name << "'");
+                return nullptr;
+            }
+
+            if (it != Views.end()) {
+                Views.erase(it);
+            }
+        }
+
+        return Statements.back();
+    }
+
     TFromDesc ParseFromClause(const Node* node) {
         switch (NodeTag(node)) {
         case T_RangeVar:
@@ -843,14 +967,20 @@ public:
             return {};
         }
 
-        if (StrLength(value->schemaname) == 0) {
-            AddError("schemaname should be specified");
-            return {};
-        }
-
         if (StrLength(value->relname) == 0) {
             AddError("relname should be specified");
             return {};
+        }
+
+        const TView* view = nullptr;
+        if (StrLength(value->schemaname) == 0) {
+            auto it = Views.find(value->relname);
+            if (it == Views.end()) {
+                AddError(TStringBuilder() << "View not found: '" << value->relname << "'");
+                return {};
+            }
+
+            view = &it->second;
         }
 
         TString alias;
@@ -859,6 +989,10 @@ public:
             if (!ParseAlias(value->alias, alias, colnames)) {
                 return {};
             }
+        }
+
+        if (view) {
+            return { view->Source, alias, colnames.empty() ? view->ColNames : colnames, false };
         }
 
         auto p = Settings.ClusterMapping.FindPtr(value->schemaname);
@@ -1089,6 +1223,9 @@ public:
         case T_A_ArrayExpr: {
             return ParseAArrayExpr(CAST_NODE(A_ArrayExpr, node), settings);
         }
+        case T_SubLink: {
+            return ParseSubLinkExpr(CAST_NODE(SubLink, node), settings);
+        }
         default:
             NodeNotImplemented(node);
             return nullptr;
@@ -1131,6 +1268,65 @@ public:
         return VL(args.data(), args.size());
     }
 
+    TAstNode* ParseSubLinkExpr(const SubLink* value, const TExprSettings& settings) {
+        TString linkType;
+        TString operName;
+        switch (value->subLinkType) {
+        case EXISTS_SUBLINK:
+            linkType = "exists";
+            break;
+        case ALL_SUBLINK:
+            linkType = "all";
+            operName = "=";
+            break;
+        case ANY_SUBLINK:
+            linkType = "any";
+            operName = "=";
+            break;
+        case EXPR_SUBLINK:
+            linkType = "expr";
+            break;
+        default:
+            AddError(TStringBuilder() << "SublinkExpr: unsupported link type: " << (int)value->subLinkType);
+            return nullptr;
+        }
+
+        if (ListLength(value->operName) > 1) {
+            AddError("SubLink: unsuppoted opername");
+            return nullptr;
+        } else if (ListLength(value->operName) == 1) {
+            auto nameNode = ListNodeNth(value->operName, 0);
+            if (NodeTag(nameNode) != T_String) {
+                NodeNotImplemented(value, nameNode);
+                return nullptr;
+            }
+
+            operName = StrVal(nameNode);
+        }
+
+        TAstNode* rowTest;
+        if (value->testexpr) {
+            TExprSettings settings;
+            settings.AllowColumns = true;
+            settings.Scope = "SUBLINK TEST";
+            auto test = ParseExpr(value->testexpr, settings);
+            if (!test) {
+                return nullptr;
+            }
+
+            rowTest = L(A("lambda"), QL(A("value")), L(A("PgOp"), QAX(operName), test, A("value")));
+        } else {
+            rowTest = L(A("Void"));
+        }
+
+        auto select = ParseSelectStmt(CAST_NODE(SelectStmt, value->subselect), true);
+        if (!select) {
+            return nullptr;
+        }
+
+        return L(A("PgSubLink"), QA(linkType), L(A("Void")), L(A("Void")), rowTest, L(A("lambda"), QL(), select));
+    }
+
     TAstNode* ParseFuncCall(const FuncCall* value, const TExprSettings& settings) {
         if (ListLength(value->agg_order) > 0) {
             AddError("FuncCall: unsupported agg_order");
@@ -1144,11 +1340,6 @@ public:
 
         if (value->agg_within_group) {
             AddError("FuncCall: unsupported agg_within_group");
-            return nullptr;
-        }
-
-        if (value->agg_distinct) {
-            AddError("FuncCall: unsupported agg_distinct");
             return nullptr;
         }
 
@@ -1240,6 +1431,17 @@ public:
             args.push_back(window);
         }
 
+        TVector<TAstNode*> callSettings;
+        if (value->agg_distinct) {
+            if (!isAggregateFunc) {
+                AddError("FuncCall: agg_distinct must be set only for aggregate functions");
+                return nullptr;
+            }
+
+            callSettings.push_back(QL(QA("distinct")));
+        }
+
+        args.push_back(QVL(callSettings.data(), callSettings.size()));
         if (value->agg_star) {
             if (name != "count") {
                 AddError("FuncCall: * is expected only in count function");
@@ -1357,7 +1559,7 @@ public:
                         args.push_back(L(A("PgConst"), QAX(s), L(A("PgType"), QA("cstring"))));
                     }
 
-                    typeMod = L(A("PgCall"), QA(procDesc.Name), VL(args.data(), args.size()));
+                    typeMod = L(A("PgCall"), QA(procDesc.Name), QL(), VL(args.data(), args.size()));
                 }
 
                 return L(A("PgCast"), input, L(A("PgType"), QAX(finalType)), typeMod);
@@ -1827,6 +2029,59 @@ public:
         return ret;
     }
 
+    TAstNode* ParseAExprIn(const A_Expr* value, const TExprSettings& settings) {
+        if (ListLength(value->name) != 1) {
+            AddError(TStringBuilder() << "Unsupported count of names: " << ListLength(value->name));
+            return nullptr;
+        }
+
+        auto nameNode = ListNodeNth(value->name, 0);
+        if (NodeTag(nameNode) != T_String) {
+            NodeNotImplemented(value, nameNode);
+            return nullptr;
+        }
+
+        auto op = StrVal(nameNode);
+        if (op != "=" && op != "<>") {
+            AddError(TStringBuilder() << "Unsupported operation: " << op);
+            return nullptr;
+        }
+
+        if (!value->lexpr || !value->rexpr) {
+            AddError("Missing operands");
+            return nullptr;
+        }
+
+        auto lhs = ParseExpr(value->lexpr, settings);
+        if (!lhs) {
+            return nullptr;
+        }
+
+        if (NodeTag(value->rexpr) != T_List) {
+            NodeNotImplemented(value, value->rexpr);
+            return nullptr;
+        }
+
+        auto lst = CAST_NODE(List, value->rexpr);
+        TVector<TAstNode*> listItems;
+        listItems.push_back(A("AsList"));
+        for (int item = 0; item < ListLength(lst); ++item) {
+            auto cell = ParseExpr(ListNodeNth(lst, item), settings);
+            if (!cell) {
+                return nullptr;
+            }
+
+            listItems.push_back(cell);
+        }
+
+        auto ret = L(A("PgIn"), lhs, VL(listItems.data(), listItems.size()));
+        if (op[0] == '<') {
+            ret = L(A("PgNot"), ret);
+        }
+
+        return ret;
+    }
+
     TAstNode* ParseAExprBetween(const A_Expr* value, const TExprSettings& settings) {
         if (!value->lexpr || !value->rexpr) {
             AddError("Missing operands");
@@ -1854,41 +2109,32 @@ public:
             return nullptr;
         }
 
-        if (IsIn({ AEXPR_BETWEEN_SYM, AEXPR_NOT_BETWEEN_SYM }, value->kind)) {
-            auto minmax = L(A("If"),
-                L(A("Coalesce"),
-                    L(A("FromPg"),
-                        L(A("PgOp"), QA("<"), rbhs, rehs)
-                    ),
-                    L(A("Bool"), QA("false"))
-                ), QL(rbhs, rehs), QL(rehs, rbhs)
-            );
-
-            rbhs = L(A("Nth"), minmax, QA("0"));
-            rehs = L(A("Nth"), minmax, QA("1"));
+        A_Expr_Kind kind = value->kind;
+        bool inverse = false;
+        if (kind == AEXPR_NOT_BETWEEN) {
+            inverse = true;
+            kind = AEXPR_BETWEEN;
+        } else if (kind == AEXPR_NOT_BETWEEN_SYM) {
+            inverse = true;
+            kind = AEXPR_BETWEEN_SYM;
         }
 
-        switch (value->kind) {
+        TAstNode* ret;
+        switch (kind) {
         case AEXPR_BETWEEN:
-            [[fallthrough]];
         case AEXPR_BETWEEN_SYM:
-        {
-            auto gte = L(A("PgOp"), QA(">="), lhs, rbhs);
-            auto lte = L(A("PgOp"), QA("<="), lhs, rehs);
-            return L(A("PgAnd"), gte, lte);
-        }
-        case AEXPR_NOT_BETWEEN:
-            [[fallthrough]];
-        case AEXPR_NOT_BETWEEN_SYM:
-        {
-            auto lt = L(A("PgOp"), QA("<"), lhs, rbhs);
-            auto gt = L(A("PgOp"), QA(">"), lhs, rehs);
-            return L(A("PgOr"), lt, gt);
-        }
+            ret = L(A(kind == AEXPR_BETWEEN ? "PgBetween" : "PgBetweenSym"), lhs, rbhs, rehs);
+            break;
         default:
             AddError(TStringBuilder() << "BETWEEN kind unsupported value: " << (int)value->kind);
             return nullptr;
         }
+
+        if (inverse) {
+            ret = L(A("PgNot"), ret);
+        }
+
+        return ret;
     }
 
     TAstNode* ParseAExpr(const A_Expr* value, const TExprSettings& settings) {
@@ -1898,6 +2144,8 @@ public:
         case AEXPR_LIKE:
         case AEXPR_ILIKE:
             return ParseAExprLike(value, settings, value->kind == AEXPR_ILIKE);
+        case AEXPR_IN:
+            return ParseAExprIn(value, settings);
         case AEXPR_BETWEEN:
         case AEXPR_NOT_BETWEEN:
         case AEXPR_BETWEEN_SYM:
@@ -2022,6 +2270,7 @@ private:
     bool DqEngineForce = false;
     TVector<TAstNode*> Statements;
     ui32 ReadIndex = 0;
+    TViews Views;
 };
 
 NYql::TAstParseResult PGToYql(const TString& query, const NSQLTranslation::TTranslationSettings& settings) {

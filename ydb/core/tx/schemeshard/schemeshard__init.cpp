@@ -1915,6 +1915,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
         THashMap<TPathId, TShardIdx> nbsVolumeShards; // pathId -> shardIdx
         THashMap<TPathId, TShardIdx> fileStoreShards; // pathId -> shardIdx
         THashMap<TPathId, TShardIdx> kesusShards; // pathId -> shardIdx
+        THashMap<TPathId, TShardIdx> blobDepotShards;
         THashMap<TPathId, TVector<TShardIdx>> olapColumnShards;
         {
             TShardsRows shards;
@@ -1965,6 +1966,9 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         break;
                     case ETabletType::ColumnShard:
                         olapColumnShards[shard.PathId].push_back(idx);
+                        break;
+                    case ETabletType::BlobDepot:
+                        blobDepotShards.emplace(shard.PathId, idx);
                         break;
                     default:
                         break;
@@ -3743,6 +3747,9 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 Self->TabletCounters->Simple()[COUNTER_REPLICATION_CONTROLLER_COUNT].Add(1);
                 domainInfo->AddReplicationController(shardIdx);
                 break;
+            case ETabletType::BlobDepot:
+                Self->TabletCounters->Simple()[COUNTER_BLOB_DEPOT_COUNT].Add(1);
+                break;
             default:
                 Y_FAIL_S("dont know how to interpret tablet type"
                          << ", type id: " << (ui32)si.second.TabletType
@@ -4526,6 +4533,39 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 Y_VERIFY_S(Self->Replications.contains(pathId),
                     "Cannot load alter for replication " << pathId);
                 Self->Replications[pathId]->AlterData = alterData;
+
+                if (!rowset.Next()) {
+                    return false;
+                }
+            }
+        }
+
+        // Read blob depots
+        {
+            using T = Schema::BlobDepots;
+
+            auto rowset = db.Table<T>().Select();
+            if (!rowset.IsReady()) {
+                return false;
+            }
+
+            while (!rowset.EndOfSet()) {
+                const TPathId pathId = Self->MakeLocalId(rowset.GetValue<T::PathId>());
+                const ui64 alterVersion = rowset.GetValue<T::AlterVersion>();
+                NKikimrSchemeOp::TBlobDepotDescription description;
+                const bool success = description.ParseFromString(rowset.GetValue<T::Description>());
+                Y_VERIFY(success);
+
+                auto blobDepot = MakeIntrusive<TBlobDepotInfo>(alterVersion, description);
+                Self->BlobDepots[pathId] = blobDepot;
+                Self->IncrementPathDbRefCount(pathId);
+
+                if (const auto it = blobDepotShards.find(pathId); it != blobDepotShards.end()) {
+                    blobDepot->BlobDepotShardIdx = it->second;
+                    if (const auto jt = Self->ShardInfos.find(it->second); jt != Self->ShardInfos.end()) {
+                        blobDepot->BlobDepotTabletId = jt->second.TabletID;
+                    }
+                }
 
                 if (!rowset.Next()) {
                     return false;

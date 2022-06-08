@@ -64,6 +64,10 @@
             "description": "Run ymake",
             "visible": false
         },
+        "yexport": {
+            "description": "Run yexport",
+            "visible": false
+        },
         "maven_import_sandbox_uploader": {
             "description": "Sandbox uploader for maven-import cmd",
             "visible": false
@@ -985,8 +989,8 @@
                 "type": "msvc",
                 "match_root": "MSVC",
                 "werror_mode": "compiler_specific",
-                "c_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 c $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/x86/cl.exe",
-                "cxx_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 cxx $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/x86/cl.exe",
+                "c_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} ${input;hide:\"build/scripts/process_command_files.py\"} ${input;hide:\"build/scripts/process_whole_archive_option.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 c $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/x86/cl.exe",
+                "cxx_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} ${input;hide:\"build/scripts/process_command_files.py\"} ${input;hide:\"build/scripts/process_whole_archive_option.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 cxx $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/x86/cl.exe",
                 "cxx_std": "c++latest",
                 "version": "2019",
                 "wine": "yes"
@@ -1019,8 +1023,8 @@
                 "type": "msvc",
                 "match_root": "MSVC",
                 "werror_mode": "compiler_specific",
-                "c_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 c $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/x64/cl.exe",
-                "cxx_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 cxx $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/x64/cl.exe",
+                "c_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} ${input;hide:\"build/scripts/process_command_files.py\"} ${input;hide:\"build/scripts/process_whole_archive_option.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 c $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/x64/cl.exe",
+                "cxx_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} ${input;hide:\"build/scripts/process_command_files.py\"} ${input;hide:\"build/scripts/process_whole_archive_option.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 cxx $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/x64/cl.exe",
                 "cxx_std": "c++latest",
                 "version": "2019",
                 "wine": "yes"
@@ -1054,8 +1058,8 @@
                 "type": "msvc",
                 "match_root": "MSVC",
                 "werror_mode": "compiler_specific",
-                "c_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 c $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/arm/cl.exe",
-                "cxx_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 cxx $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/arm/cl.exe",
+                "c_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} ${input;hide:\"build/scripts/process_command_files.py\"} ${input;hide:\"build/scripts/process_whole_archive_option.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 c $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/arm/cl.exe",
+                "cxx_compiler": "${YMAKE_PYTHON} ${input:\"build/scripts/run_msvc_wine.py\"} ${input;hide:\"build/scripts/process_command_files.py\"} ${input;hide:\"build/scripts/process_whole_archive_option.py\"} $(WINE_TOOL-sbr:1093314933)/bin/wine64 -v140 cxx $WINE_ENV ${ARCADIA_ROOT} ${ARCADIA_BUILD_ROOT} $(MSVC)/bin/Hostx64/arm/cl.exe",
                 "cxx_std": "c++latest",
                 "version": "2019",
                 "wine": "yes"
@@ -1172,6 +1176,22 @@
                     "host": {
                         "os": "LINUX",
                         "arch": "ppc64le"
+                    },
+                    "default": true
+                }
+            ]
+        },
+        "yexport": {
+            "tools": {
+                "yexport": {
+                    "bottle": "yexport",
+                    "executable": "yexport"
+                }
+            },
+            "platforms": [
+                {
+                    "host": {
+                        "os": "LINUX"
                     },
                     "default": true
                 }
@@ -3416,6 +3436,12 @@
                 {
                     "host": {
                         "os": "LINUX"
+                    },
+                    "default": true
+                },
+                {
+                    "host": {
+                        "os": "DARWIN"
                     },
                     "default": true
                 }
@@ -6520,14 +6546,25 @@
         },
         "ymake": {
             "formula": {
-                "sandbox_id": [
-                    1317122657
-                ],
+                "sandbox_id": [1332093905],
                 "match": "ymake"
             },
             "executable": {
                 "ymake": [
                     "ymake"
+                ]
+            }
+        },
+        "yexport": {
+            "formula": {
+                "sandbox_id": [
+                    1327400889
+                ],
+                "match": "yexport"
+            },
+            "executable": {
+                "yexport": [
+                    "yexport"
                 ]
             }
         },
@@ -6578,7 +6615,7 @@
         "arc": {
             "formula": {
                 "sandbox_id": [
-                    1310730821
+                    1327291879
                 ],
                 "match": "arc"
             },
@@ -6613,9 +6650,9 @@
         "mockgen": {
             "formula": {
                 "sandbox_id": [
-                    742810450,
-                    742810460,
-                    742810456
+                    1330972277,
+                    1330972268,
+                    1330972252
                 ],
                 "match": "mockgen"
             },
@@ -6628,7 +6665,7 @@
         "swagger": {
             "formula": {
                 "sandbox_id": [
-                    1002355733
+                    1325945221
                 ],
                 "match": "swagger"
             },
@@ -7560,7 +7597,7 @@
             "formula": {
                 "sandbox_id": [
                     1294905624,
-                    1318308136
+                    1322364102
                 ],
                 "match": "GDB"
             },
@@ -7659,7 +7696,7 @@
         "yp-util": {
             "formula": {
                 "sandbox_id": [
-                    1317957493
+                    1331188297
                 ],
                 "match": "yp-util"
             },
@@ -7672,7 +7709,7 @@
         "yp": {
             "formula": {
                 "sandbox_id": [
-                    1317957780
+                    1331195990
                 ],
                 "match": "YP"
             },
@@ -7710,7 +7747,7 @@
         },
         "infractl": {
             "formula": {
-                "sandbox_id": 1317813073,
+                "sandbox_id": 1329886488,
                 "match": "infractl"
             },
             "executable": {
@@ -8041,7 +8078,7 @@
         },
         "horadric": {
             "formula": {
-                "sandbox_id": 1318846019,
+                "sandbox_id": 1334391279,
                 "match": "horadric"
             },
             "executable": {
@@ -8184,7 +8221,7 @@
         },
         "apphost": {
             "formula": {
-                "sandbox_id": 1318844870,
+                "sandbox_id": 1334389093,
                 "match": "app_host_launcher"
             },
             "executable": {
@@ -8617,8 +8654,8 @@
         "sedem": {
             "formula": {
                 "sandbox_id": [
-                    1314698916,
-                    1314698920
+                    1319416201,
+                    1319416204
                 ],
                 "match": "bin/sedem"
             },
@@ -8841,7 +8878,7 @@
         },
         "bigb_request": {
             "formula": {
-                "sandbox_id": 1318844758,
+                "sandbox_id": 1334390049,
                 "match": "bb_requester"
             },
             "executable": {
@@ -8852,7 +8889,7 @@
         },
         "bigb_hitlog_analyser": {
             "formula": {
-                "sandbox_id": 1318844730,
+                "sandbox_id": 1334390453,
                 "match": "hitlog_analyser"
             },
             "executable": {
@@ -8874,7 +8911,7 @@
         },
         "bigb_bb_cluster_analyzer": {
             "formula": {
-                "sandbox_id": 1318844743,
+                "sandbox_id": 1334391247,
                 "match": "bb_cluster_analyzer"
             },
             "executable": {
@@ -8920,7 +8957,7 @@
         },
         "caesar_yt_sync": {
             "formula": {
-                "sandbox_id": 1318847467,
+                "sandbox_id": 1334390586,
                 "match": "yt_sync"
             },
             "executable": {
@@ -8931,7 +8968,7 @@
         },
         "caesar_lookup_profile": {
             "formula": {
-                "sandbox_id": 1318844748,
+                "sandbox_id": 1334389100,
                 "match": "lookup_profile"
             },
             "executable": {
@@ -8942,7 +8979,7 @@
         },
         "exp_stats": {
             "formula": {
-                "sandbox_id": 1317663787,
+                "sandbox_id": 1334390514,
                 "match": "exp_stats"
             },
             "executable": {
@@ -8953,7 +8990,7 @@
         },
         "lama": {
             "formula": {
-                "sandbox_id": 1310882343,
+                "sandbox_id": 1324222468,
                 "match": "lama"
             },
             "executable": {
@@ -8986,7 +9023,7 @@
         },
         "caesar_profile_size_analyzer": {
             "formula": {
-                "sandbox_id": 1318844861,
+                "sandbox_id": 1334391177,
                 "match": "profile_size_analyzer"
             },
             "executable": {
@@ -8997,7 +9034,7 @@
         },
         "nds32le-elf-mculib-v5f": {
             "formula": {
-                "sandbox_id": 1261704938,
+                "sandbox_id": 1326305174,
                 "match": "nds32le-elf-mculib-v5f"
             },
             "executable": {

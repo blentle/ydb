@@ -690,7 +690,7 @@ message TFeatureFlags {
     optional bool EnableTtlOnAsyncIndexedTables = 55 [default = true];
     optional bool EnableBulkUpsertToAsyncIndexedTables = 56 [default = false];
     optional bool EnableNodeBrokerSingleDomainMode = 57 [default = false];
-    optional bool EnableKqpSessionActor = 58 [default = false];
+    optional bool EnableKqpSessionActor = 58 [default = true];
     // Dangerous settings we don't want in the public api unless required
     optional bool EnablePublicApiExternalBlobs = 59 [default = false];
     optional bool EnablePublicApiKeepInMemory = 60 [default = false];
@@ -1233,6 +1233,12 @@ message TImmediateControlsConfig {
             MinValue: 0,
             MaxValue: 134217728,
             DefaultValue: 0 }];
+
+        optional uint64 EnableLockedWrites = 14 [(ControlOptions) = {
+            Description: "Enables experimental persistent locked writes",
+            MinValue: 0,
+            MaxValue: 1,
+            DefaultValue: 0 }];
     }
 
     message TTxLimitControls {
@@ -1445,7 +1451,16 @@ message TCompactionConfig {
         optional bool CompactSinglePartedShards = 10 [default = false];
     }
 
+    message TBorrowedCompactionConfig {
+        optional double MaxRate = 1 [default = 0]; // unlimitted
+        optional uint64 InflightLimit = 2 [default = 10]; // TODO: consider more?
+
+        // After this interval we will try to restart
+        optional uint64 TimeoutSeconds = 3 [default = 15];
+    }
+
     optional TBackgroundCompactionConfig BackgroundCompactionConfig = 1;
+    optional TBorrowedCompactionConfig BorrowedCompactionConfig = 2;
 }
 
 // This message is used to upload custom service configs

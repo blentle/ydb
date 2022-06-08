@@ -92,18 +92,23 @@ struct TKqpCleanupCtx {
     ui64 AbortedTransactionsCount = 0;
     ui64 TransactionsToBeAborted = 0;
     std::vector<IKqpGateway::TExecPhysicalRequest> ExecuterAbortRequests;
+    bool IsWaitingForWorkerToClose = false;
     bool Final = false;
     TInstant Start = TInstant::Now();
 };
 
-EKikimrStatsMode GetStatsModeInt(const NKikimrKqp::TQueryRequest& queryRequest, EKikimrStatsMode minMode) {
-    switch (queryRequest.GetStatsMode()) {
-        case NYql::NDqProto::DQ_STATS_MODE_BASIC:
+EKikimrStatsMode GetStatsModeInt(const NKikimrKqp::TQueryRequest& queryRequest) {
+    switch (queryRequest.GetCollectStats()) {
+        case Ydb::Table::QueryStatsCollection::STATS_COLLECTION_NONE:
+            return EKikimrStatsMode::None;
+        case Ydb::Table::QueryStatsCollection::STATS_COLLECTION_BASIC:
             return EKikimrStatsMode::Basic;
-        case NYql::NDqProto::DQ_STATS_MODE_PROFILE:
+        case Ydb::Table::QueryStatsCollection::STATS_COLLECTION_FULL:
+            return EKikimrStatsMode::Full;
+        case Ydb::Table::QueryStatsCollection::STATS_COLLECTION_PROFILE:
             return EKikimrStatsMode::Profile;
         default:
-            return std::max(EKikimrStatsMode::None, minMode);
+            return EKikimrStatsMode::None;
     }
 }
 
@@ -176,15 +181,15 @@ public:
         QueryState = std::make_unique<TKqpQueryState>();
     }
 
-    template<class T>
-    void ForwardRequest(T& ev) {
+    void ForwardRequest(TEvKqp::TEvQueryRequest::TPtr& ev) {
         if (!WorkerId) {
-            std::unique_ptr<IActor> workerActor(CreateKqpWorkerActor(Owner, SessionId, KqpSettings, Settings,
+            std::unique_ptr<IActor> workerActor(CreateKqpWorkerActor(SelfId(), SessionId, KqpSettings, Settings,
                     ModuleResolverState, Counters));
             WorkerId = RegisterWithSameMailbox(workerActor.release());
         }
         TlsActivationContext->Send(new IEventHandle(*WorkerId, SelfId(), ev->Release().Release(), ev->Flags, ev->Cookie,
                     nullptr, std::move(ev->TraceId)));
+        Become(&TKqpSessionActor::ExecuteState);
     }
 
     void ForwardResponse(TEvKqp::TEvQueryResponse::TPtr& ev) {
@@ -292,8 +297,8 @@ public:
         if (ShutdownState && ShutdownState->SoftTimeoutReached()) {
             // we reached the soft timeout, so at this point we don't allow to accept new queries for session.
             LOG_N(TKqpRequestInfo("", SessionId)
-                    << "System shutdown requested: soft timeout reached, no queries can be accepted. Closing session.");
-            ReplyQueryError(requestInfo, Ydb::StatusIds::BAD_SESSION, "Session is under shutdown");
+                << "System shutdown requested: soft timeout reached, no queries can be accepted. Closing session.");
+            ReplyProcessError(ev->Sender, proxyRequestId, Ydb::StatusIds::BAD_SESSION, "Session is under shutdown");
             FinalCleanup();
             return;
         }
@@ -443,7 +448,7 @@ public:
         YQL_ENSURE(compileResult->PreparedQuery);
         const ui32 compiledVersion = compileResult->PreparedQuery->GetVersion();
         YQL_ENSURE(compiledVersion == NKikimrKqp::TPreparedQuery::VERSION_PHYSICAL_V1,
-                "Invalid compiled version: " << compiledVersion);
+            "SessionActor can not execute OldEngine requests (invalid compiled version: " << compiledVersion << ")");
 
         QueryState->CompileResult = compileResult;
         QueryState->CompileStats.Swap(&ev->Get()->Stats);
@@ -629,7 +634,9 @@ public:
                     break;
                }
                case Ydb::Table::TransactionControl::TX_SELECTOR_NOT_SET:
-                   YQL_ENSURE(false);
+                    ythrow TRequestFail(requestInfo, Ydb::StatusIds::BAD_REQUEST)
+                        << "wrong TxControl: tx_selector must be set";
+                    break;
             }
         } else {
             QueryState->TxCtx = MakeIntrusive<TKqpTransactionContext>(false);
@@ -706,7 +713,7 @@ public:
                 request.CancelAfter = cancelAt - now;
             }
 
-            EKikimrStatsMode statsMode = GetStatsModeInt(queryState->Request, EKikimrStatsMode::Basic);
+            EKikimrStatsMode statsMode = GetStatsModeInt(queryState->Request);
             request.StatsMode = GetStatsMode(statsMode);
 
             request.Snapshot = queryState->TxCtx->GetSnapshot();
@@ -732,7 +739,7 @@ public:
             request.Timeout = TDuration::MilliSeconds(1);
         }
         request.MaxComputeActors = Config->_KqpMaxComputeActors.Get().GetRef();
-        EKikimrStatsMode statsMode = GetStatsModeInt(queryState->Request, EKikimrStatsMode::Basic);
+        EKikimrStatsMode statsMode = GetStatsModeInt(queryState->Request);
         request.StatsMode = GetStatsMode(statsMode);
         request.DisableLlvmForUdfStages = Config->DisableLlvmForUdfStages();
         request.LlvmEnabled = Config->GetEnableLlvm() != EOptionalFlag::Disabled;
@@ -1251,7 +1258,7 @@ public:
             );
         }
 
-        bool reportStats = (GetStatsModeInt(queryRequest, EKikimrStatsMode::None) != EKikimrStatsMode::None);
+        bool reportStats = (GetStatsModeInt(queryRequest) != EKikimrStatsMode::None);
         if (reportStats) {
             FillQueryProfile(*stats, *response);
             response->SetQueryPlan(SerializeAnalyzePlan(*stats));
@@ -1434,6 +1441,17 @@ public:
         Cleanup(IsFatalError(record->GetYdbStatus()));
     }
 
+    void ReplyProcessError(const TActorId& sender, ui64 proxyRequestId, Ydb::StatusIds::StatusCode ydbStatus,
+            const TString& message)
+    {
+        LOG_W(TKqpRequestInfo("", SessionId) << "Reply process error, msg: " << message);
+
+        auto response = TEvKqp::TEvProcessResponse::Error(ydbStatus, message);
+
+        //AddTrailingInfo(response->Record);
+        Send(sender, response.Release(), 0, proxyRequestId);
+    }
+
     void ReplyBusy(TEvKqp::TEvQueryRequest::TPtr& ev) {
 
         auto& event = ev->Get()->Record;
@@ -1445,13 +1463,7 @@ public:
             ? Ydb::StatusIds::SESSION_BUSY
             : Ydb::StatusIds::PRECONDITION_FAILED;
 
-        TString message = "Pending previous query completion";
-        LOG_W(requestInfo << " " << message);
-
-        auto response = TEvKqp::TEvProcessResponse::Error(busyStatus, message);
-
-        //AddTrailingInfo(response->Record);
-        Send(ev->Sender, response.Release(), 0, proxyRequestId);
+        ReplyProcessError(ev->Sender, proxyRequestId, busyStatus, "Pending previous query completion");
     }
 
     static bool IsFatalError(const Ydb::StatusIds::StatusCode status) {
@@ -1660,9 +1672,20 @@ public:
             ExplicitTransactions.Clear();
         }
 
-        if (TransactionsToBeAborted.size()) {
+        if (WorkerId) {
+            auto ev = std::make_unique<TEvKqp::TEvCloseSessionRequest>();
+            ev->Record.MutableRequest()->SetSessionId(SessionId);
+            Send(*WorkerId, ev.release());
+            WorkerId.reset();
+
             YQL_ENSURE(!CleanupCtx);
             CleanupCtx.reset(new TKqpCleanupCtx);
+            CleanupCtx->IsWaitingForWorkerToClose = true;
+        }
+
+        if (TransactionsToBeAborted.size()) {
+            if (!CleanupCtx)
+                CleanupCtx.reset(new TKqpCleanupCtx);
             CleanupCtx->Final = isFinal;
             CleanupCtx->AbortedTransactionsCount = 0;
             CleanupCtx->TransactionsToBeAborted = TransactionsToBeAborted.size();
@@ -1676,6 +1699,13 @@ public:
             Become(&TKqpSessionActor::CleanupState);
         } else {
             EndCleanup(isFinal);
+        }
+    }
+
+    void HandleCleanup(TEvKqp::TEvCloseSessionResponse::TPtr&) {
+        CleanupCtx->IsWaitingForWorkerToClose = false;
+        if (CleanupCtx->AbortedTransactionsCount == CleanupCtx->TransactionsToBeAborted) {
+            EndCleanup(CleanupCtx->Final);
         }
     }
 
@@ -1695,7 +1725,8 @@ public:
             auto& txCtx = TransactionsToBeAborted[CleanupCtx->AbortedTransactionsCount];
             SendRollbackRequest(txCtx.Get());
         } else {
-            EndCleanup(CleanupCtx->Final);
+            if (!CleanupCtx->IsWaitingForWorkerToClose)
+                EndCleanup(CleanupCtx->Final);
         }
     }
 
@@ -1784,8 +1815,6 @@ public:
                 hFunc(TEvKqp::TEvCloseSessionRequest, HandleReady);
                 hFunc(TEvKqp::TEvInitiateSessionShutdown, Handle);
                 hFunc(TEvKqp::TEvContinueShutdown, Handle);
-
-                hFunc(TEvKqp::TEvQueryResponse, ForwardResponse);
             default:
                 UnexpectedEvent("ReadyState", ev);
             }
@@ -1835,6 +1864,9 @@ public:
                 hFunc(TEvKqp::TEvInitiateSessionShutdown, Handle);
                 hFunc(TEvKqp::TEvContinueShutdown, Handle);
                 hFunc(TEvKqp::TEvIdleTimeout, HandleNoop);
+
+                // always come from WorkerActor
+                hFunc(TEvKqp::TEvQueryResponse, ForwardResponse);
             default:
                 UnexpectedEvent("ExecuteState", ev);
             }
@@ -1859,6 +1891,9 @@ public:
                 hFunc(TEvKqp::TEvInitiateSessionShutdown, Handle);
                 hFunc(TEvKqp::TEvContinueShutdown, Handle);
                 hFunc(TEvKqp::TEvIdleTimeout, HandleNoop);
+
+                // always come from WorkerActor
+                hFunc(TEvKqp::TEvCloseSessionResponse, HandleCleanup);
             default:
                 UnexpectedEvent("CleanupState", ev);
             }
@@ -1866,6 +1901,7 @@ public:
             InternalError(ex.what());
         }
     }
+
 private:
     void UnexpectedEvent(const TString& state, TAutoPtr<NActors::IEventHandle>& ev) {
         InternalError(TStringBuilder() << "TKqpSessionActor in state " << state << " recieve unexpected event " <<

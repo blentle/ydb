@@ -81,6 +81,8 @@ public:
     TAutoPtr<TSubset> ScanSnapshot(TRowVersion snapshot = TRowVersion::Max()) noexcept;
     TAutoPtr<TSubset> Unwrap() noexcept; /* full Subset(..) + final Replace(..) */
 
+    bool HasBorrowed(ui64 selfTabletId) const noexcept;
+
     /**
      * Returns current slices for bundles
      *
@@ -151,6 +153,11 @@ public:
     void UpdateTx(ERowOp, TRawVals key, TOpsRef, TArrayRef<TMemGlob> apart, ui64 txId);
     void CommitTx(ui64 txId, TRowVersion rowVersion);
     void RemoveTx(ui64 txId);
+
+    /**
+     * Returns true when table has an open transaction that is not committed or removed yet
+     */
+    bool HasOpenTx(ui64 txId) const;
 
     TPartView GetPartView(const TLogoBlobID &bundle) const
     {

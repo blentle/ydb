@@ -33,10 +33,10 @@ public:
     }
 
     TKqpComputeActor(const TActorId& executerId, ui64 txId, NDqProto::TDqTask&& task,
-        IDqSourceFactory::TPtr sourceFactory, IDqSinkFactory::TPtr sinkFactory, IDqOutputTransformFactory::TPtr transformFactory,
+        IDqAsyncIoFactory::TPtr asyncIoFactory,
         const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
         const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits)
-        : TBase(executerId, txId, std::move(task), std::move(sourceFactory), std::move(sinkFactory), std::move(transformFactory), functionRegistry, settings, memoryLimits, /* ownMemoryQuota = */ true, /* passExceptions = */ true)
+        : TBase(executerId, txId, std::move(task), std::move(asyncIoFactory), functionRegistry, settings, memoryLimits, /* ownMemoryQuota = */ true, /* passExceptions = */ true)
         , ComputeCtx(settings.StatsMode)
     {
         if (GetTask().GetMeta().Is<NKikimrTxDataShard::TKqpTransaction::TScanTaskMeta>()) {
@@ -89,9 +89,8 @@ public:
         }
 
         TSmallVec<NMiniKQL::TKqpScanComputeContext::TColumn> columns;
-        TSerializedTableRange* rangeRef = nullptr;
 
-        TSerializedTableRange coveringRange;
+        TVector<TSerializedTableRange> ranges;
         if (Meta) {
             YQL_ENSURE(ComputeCtx.GetTableScans().empty());
 
@@ -107,30 +106,16 @@ public:
             }
 
             const auto& protoRanges = Meta->GetReads()[0].GetKeyRanges();
-            if (protoRanges.size() == 1) {
-                coveringRange.Load(protoRanges[0]);
-                if (!protoRanges[0].HasTo()) {
-                    coveringRange.To = coveringRange.From;
-                    coveringRange.FromInclusive = coveringRange.ToInclusive = true;
-                }
-            } else {
-                // TODO: FIX IT, verify here?
-                auto from = TSerializedTableRange(*protoRanges.begin());
-                auto to = TSerializedTableRange(*protoRanges.rbegin());
-                coveringRange.From = from.From;
-                coveringRange.FromInclusive = from.FromInclusive;
-                coveringRange.To = protoRanges.rbegin()->HasTo() ? to.To : to.From;
-                coveringRange.ToInclusive = protoRanges.rbegin()->HasTo() ? to.ToInclusive : true;
+            for (auto& range : protoRanges) {
+                ranges.emplace_back(range);
             }
-
-            rangeRef = &coveringRange;
         }
 
         if (ScanData) {
             ScanData->TaskId = GetTask().GetId();
             ScanData->TableReader = CreateKqpTableReader(*ScanData);
 
-            auto scanActor = NSysView::CreateSystemViewScan(SelfId(), 0, ScanData->TableId, rangeRef->ToTableRange(), columns);
+            auto scanActor = NSysView::CreateSystemViewScan(SelfId(), 0, ScanData->TableId, ranges, columns);
 
             if (!scanActor) {
                 InternalError(TIssuesIds::DEFAULT_ERROR, TStringBuilder()
@@ -318,12 +303,12 @@ private:
 } // anonymous namespace
 
 IActor* CreateKqpComputeActor(const TActorId& executerId, ui64 txId, NDqProto::TDqTask&& task,
-    IDqSourceFactory::TPtr sourceFactory, IDqSinkFactory::TPtr sinkFactory, IDqOutputTransformFactory::TPtr transformFactory,
+    IDqAsyncIoFactory::TPtr asyncIoFactory,
     const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
     const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits)
 {
-    return new TKqpComputeActor(executerId, txId, std::move(task), std::move(sourceFactory),
-        std::move(sinkFactory), std::move(transformFactory), functionRegistry, settings, memoryLimits);
+    return new TKqpComputeActor(executerId, txId, std::move(task), std::move(asyncIoFactory),
+        functionRegistry, settings, memoryLimits);
 }
 
 } // namespace NKqp

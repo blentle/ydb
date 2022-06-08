@@ -74,10 +74,8 @@ curl https://binaries.ydb.tech/ydbd-main-linux-amd64.tar.gz | tar -xz
 Create directories to run:
 
 ```bash
-mkdir -p /opt/ydb
-chown ydb:ydb /opt/ydb
-mkdir /opt/ydb/bin
-mkdir /opt/ydb/cfg
+sudo mkdir -p /opt/ydb/bin /opt/ydb/cfg /opt/ydb/lib
+sudo chown -R ydb:ydb /opt/ydb
 ```
 
 3. Copy the binary file, libraries, and configuration file to the appropriate directories:
@@ -231,8 +229,8 @@ LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/ydb/lib ; /opt/ydb/bin/ydbd admin database
   sudo su - ydb
   cd /opt/ydb
   export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/ydb/lib
-  /opt/ydbd/bin/ydbd server --grpc-port 2136 --ic-port 19002 --mon-port 8766 --yaml-config /opt/ydb/cfg/config.yaml \
-  --tenant /Root/testdb --node-broker --node-broker --node-broker
+  /opt/ydb/bin/ydbd server --grpc-port 2136 --ic-port 19002 --mon-port 8766 --yaml-config /opt/ydb/cfg/config.yaml \
+  --tenant /Root/testdb --node-broker node1.ydb.tech:2135 --node-broker node2.ydb.tech:2135 --node-broker node3.ydb.tech:2135
   ```
 
   Run additional dynamic nodes on other servers to ensure database availability.

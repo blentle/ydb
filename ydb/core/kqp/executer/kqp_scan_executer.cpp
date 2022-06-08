@@ -401,26 +401,54 @@ private:
         }
     };
 
-    void BuildDatashardScanTasks(TStageInfo& stageInfo, const NMiniKQL::THolderFactory& holderFactory,
+    static ui32 GetMaxTasksPerNodeEstimate(TStageInfo& stageInfo) {
+        // TODO: take into account number of active scans on node
+        const auto& stage = GetStage(stageInfo);
+        bool heavyProgram = stage.GetProgram().GetSettings().GetHasSort() ||
+                            stage.GetProgram().GetSettings().GetHasMapJoin();
+
+        if (heavyProgram) {
+            return 4;
+        } else {
+            return 16;
+        }
+    }
+
+    TTask& AssignTaskToShard(
+        TStageInfo& stageInfo, ui64 shardId,
+        THashMap<ui64, std::vector<ui64>>& nodeTasks,
+        THashMap<ui64, ui64>& assignedShardsCount,
+        bool sorted)
+    {
+        ui64 nodeId = ShardIdToNodeId.at(shardId);
+        if (stageInfo.Meta.IsOlap() && sorted) {
+            auto& task = TasksGraph.AddTask(stageInfo);
+            task.Meta.NodeId = nodeId;
+            return task;
+        }
+
+        auto& tasks = nodeTasks[nodeId];
+        auto& cnt = assignedShardsCount[nodeId];
+
+        const ui32 maxScansPerNode = GetMaxTasksPerNodeEstimate(stageInfo);
+        if (cnt < maxScansPerNode) {
+            auto& task = TasksGraph.AddTask(stageInfo);
+            task.Meta.NodeId = nodeId;
+            tasks.push_back(task.Id);
+            ++cnt;
+            return task;
+        } else {
+            ui64 taskIdx = cnt % maxScansPerNode;
+            ++cnt;
+            return TasksGraph.GetTask(tasks[taskIdx]);
+        }
+    }
+
+    void BuildScanTasks(TStageInfo& stageInfo, const NMiniKQL::THolderFactory& holderFactory,
         const NMiniKQL::TTypeEnvironment& typeEnv)
     {
-        Y_VERIFY_DEBUG(stageInfo.Meta.IsDatashard());
-
-        THashMap<ui64, TVector<ui64>> nodeTasks; // nodeId -> [taskId]
-
-        auto getNodeTask = [&](ui64 nodeId, ui32 taskIdx) -> TTask& {
-            auto& tasks = nodeTasks[nodeId];
-
-            if (taskIdx < tasks.size()) {
-                return TasksGraph.GetTask(tasks[taskIdx]);
-            } else {
-                Y_ASSERT(taskIdx == tasks.size());
-                auto& task = TasksGraph.AddTask(stageInfo);
-                task.Meta.NodeId = nodeId;
-                tasks.emplace_back(task.Id);
-                return task;
-            }
-        };
+        THashMap<ui64, std::vector<ui64>> nodeTasks;
+        THashMap<ui64, ui64> assignedShardsCount;
 
         auto& stage = GetStage(stageInfo);
 
@@ -431,25 +459,11 @@ private:
             Y_VERIFY_DEBUG(stageInfo.Meta.TablePath == op.GetTable().GetPath());
 
             auto columns = BuildKqpColumns(op, table);
-            THashMap<ui64, TShardInfo> partitions;
-
-            switch (op.GetTypeCase()) {
-                case NKqpProto::TKqpPhyTableOperation::kReadRanges:
-                    partitions = PrunePartitions(TableKeys, op.GetReadRanges(), stageInfo, holderFactory, typeEnv);
-                    break;
-                case NKqpProto::TKqpPhyTableOperation::kReadRange:
-                    partitions = PrunePartitions(TableKeys, op.GetReadRange(), stageInfo, holderFactory, typeEnv);
-                    break;
-                case NKqpProto::TKqpPhyTableOperation::kLookup:
-                    partitions = PrunePartitions(TableKeys, op.GetLookup(), stageInfo, holderFactory, typeEnv);
-                    break;
-                default:
-                    YQL_ENSURE(false, "Unexpected table scan operation: " << (ui32) op.GetTypeCase());
-                    break;
-            }
+            THashMap<ui64, TShardInfo> partitions = PrunePartitions(TableKeys, op, stageInfo, holderFactory, typeEnv);
 
             bool reverse = false;
             ui64 itemsLimit = 0;
+            bool sorted = true;
             TString itemsLimitParamName;
             NDqProto::TData itemsLimitBytes;
             NKikimr::NMiniKQL::TType* itemsLimitType = nullptr;
@@ -464,20 +478,17 @@ private:
 
                 stageInfo.Meta.SkipNullKeys.assign(op.GetReadRange().GetSkipNullKeys().begin(),
                                                    op.GetReadRange().GetSkipNullKeys().end());
+            } else if (op.GetTypeCase() == NKqpProto::TKqpPhyTableOperation::kReadOlapRange) {
+                sorted = op.GetReadOlapRange().GetSorted();
+                reverse = op.GetReadOlapRange().GetReverse();
+                ExtractItemsLimit(stageInfo, op.GetReadOlapRange().GetItemsLimit(), holderFactory, typeEnv,
+                    itemsLimit, itemsLimitParamName, itemsLimitBytes, itemsLimitType);
             }
-
-            // TODO: take into account number of active scans on node
-            bool heavyProgram = stage.GetProgram().GetSettings().GetHasSort() ||
-                                stage.GetProgram().GetSettings().GetHasMapJoin();
-            const ui32 maxScansPerNode = heavyProgram ? 4 : 16;
-            THashMap<ui64, ui32> nTasksOnNodes; // nodeId -> tasks count
 
             for (auto& [shardId, shardInfo] : partitions) {
                 YQL_ENSURE(!shardInfo.KeyWriteRanges);
 
-                ui64 nodeId = ShardIdToNodeId.at(shardId);
-                ui32 nTasksOnNode = nTasksOnNodes[nodeId]++;
-                auto& task = getNodeTask(nodeId, nTasksOnNode % maxScansPerNode);
+                auto& task = AssignTaskToShard(stageInfo, shardId, nodeTasks, assignedShardsCount, sorted);
 
                 for (auto& [name, value] : shardInfo.Params) {
                     auto ret = task.Meta.Params.emplace(name, std::move(value));
@@ -499,7 +510,12 @@ private:
                     task.Meta.ParamTypes.emplace(itemsLimitParamName, itemsLimitType);
                 }
 
-                FillReadInfo(task.Meta, itemsLimit, reverse, TMaybe<::NKqpProto::TKqpPhyOpReadOlapRanges>());
+                if (op.GetTypeCase() == NKqpProto::TKqpPhyTableOperation::kReadOlapRange) {
+                    const auto& readRange = op.GetReadOlapRange();
+                    FillReadInfo(task.Meta, itemsLimit, reverse, readRange);
+                } else {
+                    FillReadInfo(task.Meta, itemsLimit, reverse, TMaybe<::NKqpProto::TKqpPhyOpReadOlapRanges>());
+                }
 
                 if (!task.Meta.Reads) {
                     task.Meta.Reads.ConstructInPlace();
@@ -545,118 +561,6 @@ private:
                     << ", meta: " << task.Meta.ToString(keyTypes, *AppData()->TypeRegistry));
             }
         }
-    }
-
-    // Returns the list of ColumnShards that can store rows from the specified range
-    // NOTE: Unlike OLTP tables that store data in DataShards, data in OLAP tables is not range
-    // partitioned and multiple ColumnShards store data from the same key range
-    THashMap<ui64, TShardInfo> ListColumnshadsForRange(const TKqpTableKeys& tableKeys,
-        const NKqpProto::TKqpPhyOpReadOlapRanges& readRanges, const TStageInfo& stageInfo,
-        const NMiniKQL::THolderFactory& holderFactory, const NMiniKQL::TTypeEnvironment& typeEnv)
-    {
-        const auto* table = tableKeys.FindTablePtr(stageInfo.Meta.TableId);
-        YQL_ENSURE(table);
-        YQL_ENSURE(table->TableKind == ETableKind::Olap);
-        YQL_ENSURE(stageInfo.Meta.TableKind == ETableKind::Olap);
-
-        const auto& keyColumnTypes = table->KeyColumnTypes;
-        auto ranges = FillReadRanges(keyColumnTypes, readRanges, stageInfo, holderFactory, typeEnv);
-
-        THashMap<ui64, TShardInfo> shardInfoMap;
-        for (const auto& partition :  stageInfo.Meta.ShardKey->Partitions) {
-            auto& shardInfo = shardInfoMap[partition.ShardId];
-
-            YQL_ENSURE(!shardInfo.KeyReadRanges);
-            shardInfo.KeyReadRanges.ConstructInPlace();
-            shardInfo.KeyReadRanges->CopyFrom(ranges);
-        }
-
-        return shardInfoMap;
-    }
-
-    // Creates scan tasks for reading OLAP table range
-    void BuildColumnshardScanTasks(TStageInfo& stageInfo, const NMiniKQL::THolderFactory& holderFactory,
-        const NMiniKQL::TTypeEnvironment& typeEnv)
-    {
-        YQL_ENSURE(stageInfo.Meta.TableKind == ETableKind::Olap);
-        auto& stage = GetStage(stageInfo);
-
-        const auto& table = TableKeys.GetTable(stageInfo.Meta.TableId);
-        const auto& keyTypes = table.KeyColumnTypes;
-
-        TMap<ui64, TKeyDesc::TPartitionRangeInfo> shard2range;
-        for (const auto& part: stageInfo.Meta.ShardKey->Partitions) {
-            shard2range[part.ShardId] = part.Range.GetRef();
-        }
-
-        ui64 taskCount = 0;
-
-        for (auto& op : stage.GetTableOps()) {
-            Y_VERIFY_DEBUG(stageInfo.Meta.TablePath == op.GetTable().GetPath());
-
-            auto columns = BuildKqpColumns(op, table);
-
-            YQL_ENSURE(
-                op.GetTypeCase() == NKqpProto::TKqpPhyTableOperation::kReadOlapRange,
-                "Unexpected OLAP table scan operation: " << (ui32) op.GetTypeCase()
-            );
-
-            const auto& readRange = op.GetReadOlapRange();
-
-            auto allShards = ListColumnshadsForRange(TableKeys, readRange, stageInfo, holderFactory, typeEnv);
-
-            bool reverse = readRange.GetReverse();
-            ui64 itemsLimit = 0;
-            TString itemsLimitParamName;
-            NDqProto::TData itemsLimitBytes;
-            NKikimr::NMiniKQL::TType* itemsLimitType;
-
-            ExtractItemsLimit(stageInfo, op.GetReadOlapRange().GetItemsLimit(), holderFactory, typeEnv,
-                itemsLimit, itemsLimitParamName, itemsLimitBytes, itemsLimitType);
-
-            for (auto& [shardId, shardInfo] : allShards) {
-                YQL_ENSURE(!shardInfo.KeyWriteRanges);
-
-                if (shardInfo.KeyReadRanges->GetRanges().empty()) {
-                    continue;
-                }
-
-                ui64 nodeId = ShardIdToNodeId.at(shardId);
-                auto& task = TasksGraph.AddTask(stageInfo);
-                task.Meta.NodeId = nodeId;
-                ++taskCount;
-
-                for (auto& [name, value] : shardInfo.Params) {
-                    auto ret = task.Meta.Params.emplace(name, std::move(value));
-                    YQL_ENSURE(ret.second);
-                    auto typeIterator = shardInfo.ParamTypes.find(name);
-                    YQL_ENSURE(typeIterator != shardInfo.ParamTypes.end());
-                    auto retType = task.Meta.ParamTypes.emplace(name, typeIterator->second);
-                    YQL_ENSURE(retType.second);
-                }
-
-                TTaskMeta::TShardReadInfo readInfo = {
-                    .Ranges = std::move(*shardInfo.KeyReadRanges),
-                    .Columns = columns,
-                    .ShardId = shardId,
-                };
-
-                FillReadInfo(task.Meta, itemsLimit, reverse, readRange);
-
-                if (itemsLimitParamName) {
-                    task.Meta.Params.emplace(itemsLimitParamName, itemsLimitBytes);
-                    task.Meta.ParamTypes.emplace(itemsLimitParamName, itemsLimitType);
-                }
-
-                task.Meta.Reads.ConstructInPlace();
-                task.Meta.Reads->emplace_back(std::move(readInfo));
-
-                LOG_D("Stage " << stageInfo.Id << " create columnshard scan task at node: " << nodeId
-                    << ", meta: " << task.Meta.ToString(keyTypes, *AppData()->TypeRegistry));
-            }
-        }
-
-        LOG_D("Stage " << stageInfo.Id << " will be executed using " << taskCount << " tasks.");
     }
 
     void BuildComputeTasks(TStageInfo& stageInfo) {
@@ -736,10 +640,8 @@ private:
                 BuildComputeTasks(stageInfo);
             } else if (stageInfo.Meta.IsSysView()) {
                 BuildSysViewScanTasks(stageInfo, holderFactory, typeEnv);
-            } else if (stageInfo.Meta.IsOlap()) {
-                BuildColumnshardScanTasks(stageInfo, holderFactory, typeEnv);
-            } else if (stageInfo.Meta.IsDatashard()) {
-                BuildDatashardScanTasks(stageInfo, holderFactory, typeEnv);
+            } else if (stageInfo.Meta.IsOlap() || stageInfo.Meta.IsDatashard()) {
+                BuildScanTasks(stageInfo, holderFactory, typeEnv);
             } else {
                 YQL_ENSURE(false, "Unexpected stage type " << (int) stageInfo.Meta.TableKind);
             }
@@ -832,6 +734,7 @@ private:
                 if (!task.Meta.Reads->empty()) {
                     protoTaskMeta.SetReverse(task.Meta.ReadInfo.Reverse);
                     protoTaskMeta.SetItemsLimit(task.Meta.ReadInfo.ItemsLimit);
+                    protoTaskMeta.SetSorted(task.Meta.ReadInfo.Sorted);
 
                     if (tableInfo.TableKind == ETableKind::Olap) {
                         auto* olapProgram = protoTaskMeta.MutableOlapProgram();
@@ -952,7 +855,7 @@ private:
             Stats->FinishTs = TInstant::Now();
             Stats->Finish();
 
-            if (Request.StatsMode == NYql::NDqProto::DQ_STATS_MODE_PROFILE) {
+            if (CollectFullStats(Request.StatsMode)) {
                 const auto& tx = Request.Transactions[0].Body;
                 auto planWithStats = AddExecStatsToTxPlan(tx->GetPlan(), response.GetResult().GetStats());
                 response.MutableResult()->MutableStats()->AddTxPlansWithStats(planWithStats);

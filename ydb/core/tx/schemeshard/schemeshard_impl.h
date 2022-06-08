@@ -99,6 +99,30 @@ private:
         TSchemeShard* Self;
     };
 
+    using TBorrowedCompactionQueue = NOperationQueue::TOperationQueueWithTimer<
+        TShardIdx,
+        TFifoQueue<TShardIdx>,
+        TEvPrivate::EvRunBorrowedCompaction,
+        NKikimrServices::FLAT_TX_SCHEMESHARD>;
+
+    class TBorrowedCompactionStarter : public TBorrowedCompactionQueue::IStarter {
+    public:
+        TBorrowedCompactionStarter(TSchemeShard* self)
+            : Self(self)
+        { }
+
+        NOperationQueue::EStartStatus StartOperation(const TShardIdx& shardIdx) override {
+            return Self->StartBorrowedCompaction(shardIdx);
+        }
+
+        void OnTimeout(const TShardIdx& shardIdx) override {
+            Self->OnBorrowedCompactionTimeout(shardIdx);
+        }
+
+    private:
+        TSchemeShard* Self;
+    };
+
 public:
     static constexpr ui32 DefaultPQTabletPartitionsCount = 1;
     static constexpr ui32 MaxPQTabletPartitionsCount = 1000;
@@ -158,6 +182,7 @@ public:
     THashMap<TPathId, TCdcStreamInfo::TPtr> CdcStreams;
     THashMap<TPathId, TSequenceInfo::TPtr> Sequences;
     THashMap<TPathId, TReplicationInfo::TPtr> Replications;
+    THashMap<TPathId, TBlobDepotInfo::TPtr> BlobDepots;
 
     THashMap<TPathId, TTxId> TablesWithSnaphots;
     THashMap<TTxId, TSet<TPathId>> SnapshotTables;
@@ -207,6 +232,13 @@ public:
 
     TCompactionStarter CompactionStarter;
     TCompactionQueue* CompactionQueue = nullptr;
+
+    TBorrowedCompactionStarter BorrowedCompactionStarter;
+    TBorrowedCompactionQueue* BorrowedCompactionQueue = nullptr;
+
+    // shardIdx -> clientId
+    THashMap<TShardIdx, TActorId> RunningBorrowedCompactions;
+
     THashSet<TShardIdx> ShardsWithBorrowed; // shards have parts from another shards
     THashSet<TShardIdx> ShardsWithLoaned;   // shards have parts loaned to another shards
     bool EnableBackgroundCompaction = false;
@@ -298,10 +330,19 @@ public:
     void ApplyConsoleConfigs(const NKikimrConfig::TAppConfig& appConfig, const TActorContext& ctx);
     void ApplyConsoleConfigs(const NKikimrConfig::TFeatureFlags& featureFlags, const TActorContext& ctx);
 
-    void ConfigureCompactionQueue(
+    void ConfigureCompactionQueues(
+        const NKikimrConfig::TCompactionConfig& config,
+        const TActorContext &ctx);
+
+    void ConfigureBackgroundCompactionQueue(
         const NKikimrConfig::TCompactionConfig::TBackgroundCompactionConfig& config,
         const TActorContext &ctx);
-    void StartStopCompactionQueue();
+
+    void ConfigureBorrowedCompactionQueue(
+        const NKikimrConfig::TCompactionConfig::TBorrowedCompactionConfig& config,
+        const TActorContext &ctx);
+
+    void StartStopCompactionQueues();
 
     bool ApplyStorageConfig(const TStoragePools& storagePools,
                             const NKikimrSchemeOp::TStorageConfig& storageConfig,
@@ -464,7 +505,7 @@ public:
     void PersistTable(NIceDb::TNiceDb &db, const TPathId pathId);
     void PersistChannelsBinding(NIceDb::TNiceDb& db, const TShardIdx shardId, const TChannelsBindings& bindedChannels);
     void PersistTablePartitioning(NIceDb::TNiceDb &db, const TPathId pathId, const TTableInfo::TPtr tableInfo);
-    void DeleteTablePartitioning(NIceDb::TNiceDb& db, const TPathId tableId, const TTableInfo::TPtr tableInfo);
+    void PersistTablePartitioningDeletion(NIceDb::TNiceDb& db, const TPathId tableId, const TTableInfo::TPtr tableInfo);
     void PersistTablePartitionCondErase(NIceDb::TNiceDb& db, const TPathId& pathId, ui64 id, const TTableInfo::TPtr tableInfo);
     void PersistTablePartitionStats(NIceDb::TNiceDb& db, const TPathId& tableId, ui64 partitionId, const TTableInfo::TPartitionStats& stats);
     void PersistTablePartitionStats(NIceDb::TNiceDb& db, const TPathId& tableId, const TShardIdx& shardIdx, const TTableInfo::TPtr tableInfo);
@@ -579,6 +620,9 @@ public:
     void PersistReplicationAlter(NIceDb::TNiceDb& db, TPathId pathId, const TReplicationInfo& replicationInfo);
     void PersistReplicationAlterRemove(NIceDb::TNiceDb& db, TPathId pathId);
 
+    // BlobDepot
+    void PersistBlobDepot(NIceDb::TNiceDb& db, TPathId pathId, const TBlobDepotInfo& blobDepotInfo);
+
     void PersistAddTableShardPartitionConfig(NIceDb::TNiceDb& db, TShardIdx shardIdx, const NKikimrSchemeOp::TPartitionConfig& config);
 
     void PersistPublishingPath(NIceDb::TNiceDb& db, TTxId txId, TPathId pathId, ui64 version);
@@ -640,9 +684,12 @@ public:
     void ScheduleCleanDroppedPaths();
     void Handle(TEvPrivate::TEvCleanDroppedPaths::TPtr& ev, const TActorContext& ctx);
 
-    void EnqueueCompaction(const TShardIdx& shardIdx, const TTableInfo::TPartitionStats& stats);
-    void UpdateCompaction(const TShardIdx& shardIdx, const TTableInfo::TPartitionStats& stats);
-    void RemoveCompaction(const TShardIdx& shardIdx);
+    void EnqueueBackgroundCompaction(const TShardIdx& shardIdx, const TTableInfo::TPartitionStats& stats);
+    void UpdateBackgroundCompaction(const TShardIdx& shardIdx, const TTableInfo::TPartitionStats& stats);
+    void RemoveBackgroundCompaction(const TShardIdx& shardIdx);
+
+    void EnqueueBorrowedCompaction(const TShardIdx& shardIdx);
+    void RemoveBorrowedCompaction(const TShardIdx& shardIdx);
 
     void UpdateShardMetrics(const TShardIdx& shardIdx, const TTableInfo::TPartitionStats& newStats);
     void RemoveShardMetrics(const TShardIdx& shardIdx);
@@ -652,6 +699,11 @@ public:
     NOperationQueue::EStartStatus StartBackgroundCompaction(const TShardCompactionInfo& info);
     void OnBackgroundCompactionTimeout(const TShardCompactionInfo& info);
     void UpdateBackgroundCompactionQueueMetrics();
+
+    NOperationQueue::EStartStatus StartBorrowedCompaction(const TShardIdx& shardIdx);
+    void OnBorrowedCompactionTimeout(const TShardIdx& shardIdx);
+    void BorrowedCompactionHandleDisconnect(TTabletId tabletId, const TActorId& clientId);
+    void UpdateBorrowedCompactionQueueMetrics();
 
     struct TTxCleanDroppedSubDomains;
     NTabletFlatExecutor::ITransaction* CreateTxCleanDroppedSubDomains();
@@ -766,6 +818,7 @@ public:
     void DescribeSequence(const TPathId& pathId, const TString& name, TSequenceInfo::TPtr info, NKikimrSchemeOp::TSequenceDescription& desc);
     void DescribeReplication(const TPathId& pathId, const TString& name, NKikimrSchemeOp::TReplicationDescription& desc);
     void DescribeReplication(const TPathId& pathId, const TString& name, TReplicationInfo::TPtr info, NKikimrSchemeOp::TReplicationDescription& desc);
+    void DescribeBlobDepot(const TPathId& pathId, const TString& name, NKikimrSchemeOp::TBlobDepotDescription& desc);
     static void FillTableBoundaries(const TTableInfo::TPtr tableInfo, google::protobuf::RepeatedPtrField<NKikimrSchemeOp::TSplitBoundary>& boundaries);
 
     void Handle(TEvSchemeShard::TEvInitRootShard::TPtr &ev, const TActorContext &ctx);
@@ -804,6 +857,7 @@ public:
     void Handle(TEvDataShard::TEvSchemaChanged::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvDataShard::TEvStateChanged::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvPersQueue::TEvUpdateConfigResponse::TPtr &ev, const TActorContext &ctx);
+    void Handle(TEvBlobDepot::TEvApplyConfigResult::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvSubDomain::TEvConfigureStatus::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvBlockStore::TEvUpdateVolumeConfigResponse::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvFileStore::TEvUpdateConfigResponse::TPtr& ev, const TActorContext& ctx);
@@ -817,6 +871,7 @@ public:
     void Handle(TEvSchemeShard::TEvMigrateSchemeShardResult::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvMigrateSchemeShardResponse::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvCompactTableResult::TPtr &ev, const TActorContext &ctx);
+    void Handle(TEvDataShard::TEvCompactBorrowedResult::TPtr &ev, const TActorContext &ctx);
 
     void Handle(TEvSchemeShard::TEvSyncTenantSchemeShard::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvSchemeShard::TEvUpdateTenantSchemeShard::TPtr& ev, const TActorContext& ctx);

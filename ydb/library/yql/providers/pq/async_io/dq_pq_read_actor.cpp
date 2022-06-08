@@ -2,7 +2,7 @@
 #include "probes.h"
 
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor_async_io_factory.h>
-#include <ydb/library/yql/dq/actors/compute/dq_compute_actor_sources.h>
+#include <ydb/library/yql/dq/actors/compute/dq_compute_actor_async_io.h>
 #include <ydb/library/yql/dq/actors/protos/dq_events.pb.h>
 #include <ydb/library/yql/dq/common/dq_common.h>
 #include <ydb/library/yql/dq/proto/dq_checkpoint.pb.h>
@@ -111,7 +111,7 @@ public:
         , CredentialsProviderFactory(std::move(credentialsProviderFactory))
         , SourceParams(std::move(sourceParams))
         , ReadParams(std::move(readParams))
-        , StartingMessageTimestamp(TInstant::Now())
+        , StartingMessageTimestamp(TInstant::MilliSeconds(TInstant::Now().MilliSeconds())) // this field is serialized as milliseconds, so drop microseconds part to be consistent with storage
         , ComputeActorId(computeActorId)
     {
         Y_UNUSED(HolderFactory);
@@ -311,6 +311,11 @@ private:
                 LWPROBE(PqReadDataReceived, TString(TStringBuilder() << Self.TxId), Self.SourceParams.GetTopicPath(), data);
                 SRC_LOG_T("Data received: " << message.DebugString(true));
 
+                if (message.GetWriteTime() < Self.StartingMessageTimestamp) {
+                    SRC_LOG_D("Skip data. StartingMessageTimestamp: " << Self.StartingMessageTimestamp << ". Write time: " << message.GetWriteTime());
+                    continue;
+                }
+
                 Batch.emplace_back(NKikimr::NMiniKQL::MakeString(NUdf::TStringRef(data.Data(), data.Size())));
                 UsedSpace += data.Size();
             }
@@ -410,11 +415,11 @@ std::pair<IDqComputeActorAsyncInput*, NActors::IActor*> CreateDqPqReadActor(
     return {actor, actor};
 }
 
-void RegisterDqPqReadActorFactory(TDqSourceFactory& factory, NYdb::TDriver driver, ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory, bool rangesMode) {
-    factory.Register<NPq::NProto::TDqPqTopicSource>("PqSource",
+void RegisterDqPqReadActorFactory(TDqAsyncIoFactory& factory, NYdb::TDriver driver, ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory, bool rangesMode) {
+    factory.RegisterSource<NPq::NProto::TDqPqTopicSource>("PqSource",
         [driver = std::move(driver), credentialsFactory = std::move(credentialsFactory), rangesMode](
             NPq::NProto::TDqPqTopicSource&& settings,
-            IDqSourceFactory::TArguments&& args)
+            IDqAsyncIoFactory::TSourceArguments&& args)
     {
         NLwTraceMonPage::ProbeRegistry().AddProbesList(LWTRACE_GET_PROBES(DQ_PQ_PROVIDER));
         return CreateDqPqReadActor(

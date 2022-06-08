@@ -30,6 +30,7 @@
 #include <ydb/library/yql/providers/common/schema/mkql/yql_mkql_schema.h>
 #include <ydb/library/yql/utils/yql_panic.h>
 
+#include <ydb/library/yql/providers/s3/compressors/factory.h>
 #include <ydb/library/yql/providers/s3/proto/range.pb.h>
 #include <ydb/library/yql/providers/common/provider/yql_provider_names.h>
 
@@ -70,6 +71,11 @@ struct TEvPrivate {
         TEvReadResult(IHTTPGateway::TContent&& result, size_t pathInd = 0U): Result(std::move(result)), PathIndex(pathInd) {}
         IHTTPGateway::TContent Result;
         const size_t PathIndex;
+    };
+
+    struct TEvDataPart : public TEventLocal<TEvDataPart, EvReadResult> {
+        TEvDataPart(IHTTPGateway::TCountedContent&& data) : Result(std::move(data)) {}
+        IHTTPGateway::TCountedContent Result;
     };
 
     struct TEvReadFinished : public TEventLocal<TEvReadFinished, EvReadFinished> {};
@@ -281,7 +287,7 @@ private:
     class TReadBufferFromStream : public NDB::ReadBuffer {
     public:
         TReadBufferFromStream(TS3ReadCoroImpl* coro)
-            : NDB::ReadBuffer(nullptr, 0ULL), Coro(coro), Value(TString())
+            : NDB::ReadBuffer(nullptr, 0ULL), Coro(coro)
         {}
     private:
         bool nextImpl() final {
@@ -294,18 +300,18 @@ private:
         }
 
         TS3ReadCoroImpl *const Coro;
-        IHTTPGateway::TContent Value;
+        TString Value;
     };
 public:
     TS3ReadCoroImpl(ui64 inputIndex, const NActors::TActorId& sourceActorId, const NActors::TActorId& computeActorId, const TReadSpec::TPtr& readSpec)
         : TActorCoroImpl(256_KB), InputIndex(inputIndex), ReadSpec(readSpec), SourceActorId(sourceActorId), ComputeActorId(computeActorId)
     {}
 
-    bool Next(IHTTPGateway::TContent& value) {
+    bool Next(TString& value) {
         if (Finished)
             return false;
 
-        const auto ev = WaitForSpecificEvent<TEvPrivate::TEvReadResult, TEvPrivate::TEvReadError, TEvPrivate::TEvReadFinished>();
+        const auto ev = WaitForSpecificEvent<TEvPrivate::TEvDataPart, TEvPrivate::TEvReadError, TEvPrivate::TEvReadFinished>();
         switch (const auto etype = ev->GetTypeRewrite()) {
             case TEvPrivate::TEvReadFinished::EventType:
                 Finished = true;
@@ -313,8 +319,8 @@ public:
             case TEvPrivate::TEvReadError::EventType:
                 Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, ev->Get<TEvPrivate::TEvReadError>()->Error, true));
                 return false;
-            case TEvPrivate::TEvReadResult::EventType:
-                value = std::move(ev->Get<TEvPrivate::TEvReadResult>()->Result);
+            case TEvPrivate::TEvDataPart::EventType:
+                value = ev->Get<TEvPrivate::TEvDataPart>()->Result.Extract();
                 Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvNewAsyncInputDataArrived(InputIndex));
                 return true;
             default:
@@ -324,7 +330,9 @@ public:
 private:
     void Run() final try {
         TReadBufferFromStream buffer(this);
-        NDB::InputStreamFromInputFormat stream(NDB::FormatFactory::instance().getInputFormat(ReadSpec->Format, buffer, NDB::Block(ReadSpec->Columns), nullptr, 1_MB, ReadSpec->Settings));
+        const auto decompress(MakeDecompressor(buffer, ReadSpec->Compression));
+        YQL_ENSURE(ReadSpec->Compression.empty() == !decompress, "Unsupported " <<ReadSpec->Compression << " compression.");
+        NDB::InputStreamFromInputFormat stream(NDB::FormatFactory::instance().getInputFormat(ReadSpec->Format, decompress ? *decompress : buffer, NDB::Block(ReadSpec->Columns), nullptr, 1_MB, ReadSpec->Settings));
 
         while (auto block = stream.read())
             Send(SourceActorId, new TEvPrivate::TEvNextBlock(block));
@@ -380,10 +388,10 @@ public:
         , RetryStuff(std::make_shared<TRetryStuff>(std::move(gateway), url + path, headers, retryConfig, expectedSize))
     {}
 private:
-    static void OnNewData(TActorSystem* actorSystem, const TActorId& self, const TActorId& parent, const TRetryStuff::TPtr& retryStuff, IHTTPGateway::TContent&& data) {
+    static void OnNewData(TActorSystem* actorSystem, const TActorId& self, const TActorId& parent, const TRetryStuff::TPtr& retryStuff, IHTTPGateway::TCountedContent&& data) {
         retryStuff->Offset += data.size();
         retryStuff->RetryParams.Reset();
-        actorSystem->Send(new IEventHandle(self, parent, new TEvPrivate::TEvReadResult(std::move(data))));
+        actorSystem->Send(new IEventHandle(self, parent, new TEvPrivate::TEvDataPart(std::move(data))));
     }
 
     static void OnDownloadFinished(TActorSystem* actorSystem, const TActorId& self, const TActorId& parent, const TRetryStuff::TPtr& retryStuff, std::optional<TIssues> result) {
@@ -648,14 +656,16 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
             readSpec->Compression = it->second;
 
 #define SUPPORTED_FLAGS(xx) \
-        xx(skip_unknown_fields) \
-        xx(import_nested_json) \
-        xx(with_names_use_header) \
-        xx(null_as_default) \
+        xx(skip_unknown_fields, true) \
+        xx(import_nested_json, true) \
+        xx(with_names_use_header, true) \
+        xx(null_as_default, true) \
 
-#define SET_FLAG(flag) \
+#define SET_FLAG(flag, def) \
         if (const auto it = settings.find(#flag); settings.cend() != it) \
-            readSpec->Settings.flag = FromString<bool>(it->second);
+            readSpec->Settings.flag = FromString<bool>(it->second); \
+        else \
+            readSpec->Settings.flag = def;
 
         SUPPORTED_FLAGS(SET_FLAG)
 

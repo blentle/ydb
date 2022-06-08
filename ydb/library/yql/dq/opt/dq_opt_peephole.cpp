@@ -3,10 +3,12 @@
 #include <ydb/library/yql/core/yql_join.h>
 #include <ydb/library/yql/core/yql_opt_utils.h>
 #include <ydb/library/yql/core/yql_expr_type_annotation.h>
+#include <ydb/library/yql/core/yql_expr_optimize.h>
 
 #include <ydb/library/yql/utils/log/log.h>
 
 #include <util/generic/size_literals.h>
+#include <util/generic/bitmap.h>
 
 namespace NYql::NDq {
 
@@ -236,9 +238,12 @@ TExprBase DqPeepholeRewriteMapJoin(const TExprBase& node, TExprContext& ctx) {
         const auto keyTypeRight = itemTypeRight->FindItemType(rightKeyColumnNodes[i]->Content());
         bool optKey = false;
         keyTypes[i] = JoinDryKeyType(keyTypeLeft, keyTypeRight, optKey, ctx);
-        keyTypesLeft[i] = optKey ? ctx.MakeType<TOptionalExprType>(keyTypes[i]) : keyTypes[i];
-        if (!keyTypes[i])
+        if (!keyTypes[i]) {
             keyTypes.clear();
+            keyTypesLeft.clear();
+            break;
+        }
+        keyTypesLeft[i] = optKey ? ctx.MakeType<TOptionalExprType>(keyTypes[i]) : keyTypes[i];
     }
 
     auto leftInput = ctx.NewCallable(mapJoin.LeftInput().Pos(), "ToFlow", {mapJoin.LeftInput().Ptr()});
@@ -253,7 +258,7 @@ TExprBase DqPeepholeRewriteMapJoin(const TExprBase& node, TExprContext& ctx) {
         return TExprBase(ctx.Builder(pos)
             .Callable("Map")
                 .Add(0, std::move(leftInput))
-                .Lambda(0)
+                .Lambda(1)
                     .Param("row")
                     .Callable("AsStruct")
                         .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
@@ -609,6 +614,56 @@ NNodes::TExprBase DqPeepholeRewriteReplicate(const NNodes::TExprBase& node, TExp
             .Add(branches)
             .Build()
         .Done();
+}
+
+NNodes::TExprBase DqPeepholeDropUnusedInputs(const NNodes::TExprBase& node, TExprContext& ctx) {
+    if (!node.Maybe<TDqStageBase>()) {
+        return node;
+    }
+
+    auto stage = node.Cast<TDqStageBase>();
+
+    auto isArgumentUsed = [](const TExprNode::TPtr& node, const TExprNode* argument) {
+        return !!FindNode(node,
+            [](const TExprNode::TPtr& node) {
+                return !TDqStageBase::Match(node.Get()) && !TDqPhyPrecompute::Match(node.Get());
+            },
+            [argument](const TExprNode::TPtr& node) {
+                return node.Get() == argument;
+            });
+    };
+
+    TDynBitMap unusedInputs;
+    for (ui64 i = 0; i < stage.Inputs().Size(); ++i) {
+        if (!isArgumentUsed(stage.Program().Body().Ptr(), stage.Program().Args().Arg(i).Raw())) {
+            unusedInputs.Set(i);
+        }
+    }
+
+    if (unusedInputs.Empty()) {
+        return node;
+    }
+
+    TExprNode::TListType newInputs;
+    TExprNode::TListType newArgs;
+    TNodeOnNodeOwnedMap replaces;
+
+    for (ui64 i = 0; i < stage.Inputs().Size(); ++i) {
+        if (!unusedInputs.Test(i)) {
+            newInputs.push_back(stage.Inputs().Item(i).Ptr());
+            auto arg = stage.Program().Args().Arg(i).Raw();
+            newArgs.push_back(ctx.NewArgument(arg->Pos(), arg->Content()));
+            replaces[arg] = newArgs.back();
+        }
+    }
+
+    auto children = node.Ref().ChildrenList();
+    children[TDqStageBase::idx_Inputs] = ctx.NewList(stage.Inputs().Pos(), std::move(newInputs));
+    children[TDqStageBase::idx_Program] = ctx.NewLambda(stage.Program().Pos(),
+        ctx.NewArguments(stage.Program().Args().Pos(), std::move(newArgs)),
+        ctx.ReplaceNodes(stage.Program().Body().Ptr(), replaces));
+
+    return NNodes::TExprBase(ctx.ChangeChildren(node.Ref(), std::move(children)));
 }
 
 } // namespace NYql::NDq

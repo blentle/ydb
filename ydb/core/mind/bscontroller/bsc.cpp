@@ -7,20 +7,13 @@ namespace NKikimr {
 
 TString TGroupID::ToString() const {
     TStringStream str;
-    str << "{TGroupID ConfigurationType# "
-        << (ConfigurationType() == GroupConfigurationTypeStatic ? "Static" : "Dynamic");
-    str << " AvailabilityDomainID# " << AvailabilityDomainID();
+    str << "{TGroupID ConfigurationType# ";
+    switch (ConfigurationType()) {
+        case EGroupConfigurationType::Static: str << "Static"; break;
+        case EGroupConfigurationType::Dynamic: str << "Dynamic"; break;
+        case EGroupConfigurationType::Virtual: str << "Virtual"; break;
+    }
     str << " GroupLocalID# " << GroupLocalID();
-    str << "}";
-    return str.Str();
-}
-
-TString TPDiskID::ToString() const {
-    TStringStream str;
-    str << "{TPDiskID ConfigurationType# "
-    << (ConfigurationType() == GroupConfigurationTypeStatic ? "Static" : "Dynamic");
-    str << " AvailabilityDomainID# " << AvailabilityDomainID();
-    str << " PDiskLocalID# " << PDiskLocalID();
     str << "}";
     return str.Str();
 }
@@ -177,6 +170,12 @@ void TBlobStorageController::Handle(TEvents::TEvPoisonPill::TPtr&) {
             TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
         }
     }
+    for (const auto& [id, info] : GroupMap) {
+        if (auto& actorId = info->VirtualGroupSetupMachineId) {
+            TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
+            actorId = {};
+        }
+    }
     TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, Tablet(), SelfId(), nullptr, 0));
 }
 
@@ -327,6 +326,7 @@ ui32 TBlobStorageController::GetEventPriority(IEventHandle *ev) {
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kSetPDiskSpaceMarginPromille:
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kUpdateSettings:
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kReassignGroupDisk:
+                    case NKikimrBlobStorage::TConfigRequest::TCommand::kAllocateVirtualGroup:
                         return 2; // read-write commands go with higher priority as they are needed to keep cluster intact
 
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kReadHostConfig:

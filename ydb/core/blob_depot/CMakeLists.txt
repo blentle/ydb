@@ -12,6 +12,7 @@ target_link_libraries(ydb-core-blob_depot PUBLIC
   contrib-libs-cxxsupp
   yutil
   ydb-core-tablet_flat
+  ydb-core-protos
 )
 target_sources(ydb-core-blob_depot PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/blob_depot/blob_depot.cpp

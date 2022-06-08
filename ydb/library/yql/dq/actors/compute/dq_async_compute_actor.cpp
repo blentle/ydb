@@ -29,11 +29,11 @@ public:
     static constexpr char ActorName[] = "DQ_COMPUTE_ACTOR";
 
     TDqAsyncComputeActor(const TActorId& executerId, const TTxId& txId, NDqProto::TDqTask&& task,
-        IDqSourceFactory::TPtr sourceFactory, IDqSinkFactory::TPtr sinkFactory, IDqOutputTransformFactory::TPtr transformFactory,
+        IDqAsyncIoFactory::TPtr asyncIoFactory,
         const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
         const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits,
         const NTaskRunnerActor::ITaskRunnerActorFactory::TPtr& taskRunnerActorFactory)
-        : TBase(executerId, txId, std::move(task), std::move(sourceFactory), std::move(sinkFactory), std::move(transformFactory), functionRegistry, settings, memoryLimits, /* ownMemoryQuota = */ false)
+        : TBase(executerId, txId, std::move(task), std::move(asyncIoFactory), functionRegistry, settings, memoryLimits, /* ownMemoryQuota = */ false)
         , TaskRunnerActorFactory(taskRunnerActorFactory)
         , ReadyToCheckpointFlag(false)
         , SentStatsRequest(false)
@@ -82,7 +82,7 @@ private:
     STFUNC(StateFuncBase) {
         switch (ev->GetTypeRewrite()) {
             HFunc(NTaskRunnerActor::TEvTaskRunFinished, OnRunFinished);
-            HFunc(NTaskRunnerActor::TEvSourcePushFinished, OnSourcePushFinished);
+            HFunc(NTaskRunnerActor::TEvAsyncInputPushFinished, OnAsyncInputPushFinished);
             HFunc(NTaskRunnerActor::TEvChannelPopFinished, OnPopFinished);
             HFunc(NTaskRunnerActor::TEvTaskRunnerCreateFinished, OnTaskRunnerCreated);
             HFunc(NTaskRunnerActor::TEvContinueRun, OnContinueRun); // push finished
@@ -218,7 +218,7 @@ private:
         DoExecute();
     }
 
-    void SourcePush(NKikimr::NMiniKQL::TUnboxedValueVector&& batch, TSourceInfo& source, i64 space, bool finished) override {
+    void AsyncInputPush(NKikimr::NMiniKQL::TUnboxedValueVector&& batch, TAsyncInputInfoBase& source, i64 space, bool finished) override {
         if (space <= 0) {
             return;
         }
@@ -226,7 +226,7 @@ private:
         ProcessSourcesState.Inflight ++;
         source.PushStarted = true;
         source.Finished = finished;
-        TaskRunnerActor->SourcePush(Cookie++, source.Index, std::move(batch), space, finished);
+        TaskRunnerActor->AsyncInputPush(Cookie++, source.Index, std::move(batch), space, finished);
     }
 
     void TakeInputChannelData(NDqProto::TChannelData&& channelData, bool ack) override {
@@ -276,7 +276,7 @@ private:
     }
 
     void DoExecuteImpl() override {
-        PollSourceActors();
+        PollAsyncInput();
         if (ProcessSourcesState.Inflight == 0) {
             auto req = GetCheckpointRequest();
             CA_LOG_D("DoExecuteImpl: " << (bool) req);
@@ -295,7 +295,7 @@ private:
         return inputChannel->FreeSpace;
     }
 
-    i64 SourceFreeSpace(TSourceInfo& source) override {
+    i64 AsyncIoFreeSpace(TAsyncInputInfoBase& source) override {
         return source.FreeSpace;
     }
 
@@ -318,7 +318,7 @@ private:
         const auto& holderFactory = ev->Get()->HolderFactory;
 
         TypeEnv = const_cast<NKikimr::NMiniKQL::TTypeEnvironment*>(&typeEnv);
-        FillChannelMaps(holderFactory, typeEnv, secureParams, taskParams);
+        FillIoMaps(holderFactory, typeEnv, secureParams, taskParams);
 
         {
             // say "Hello" to executer
@@ -385,7 +385,7 @@ private:
         }
     }
 
-    void OnSourcePushFinished(NTaskRunnerActor::TEvSourcePushFinished::TPtr& ev, const NActors::TActorContext& ) {
+    void OnAsyncInputPushFinished(NTaskRunnerActor::TEvAsyncInputPushFinished::TPtr& ev, const NActors::TActorContext& ) {
         auto it = SourcesMap.find(ev->Get()->Index);
         Y_VERIFY(it != SourcesMap.end());
         auto& source = it->second;
@@ -393,7 +393,7 @@ private:
         // source.FreeSpace = ev->Get()->FreeSpace; TODO:XXX get freespace on run
         ProcessSourcesState.Inflight--;
         if (ProcessSourcesState.Inflight == 0) {
-            CA_LOG_D("send TEvContinueRun on OnSourcePushFinished");
+            CA_LOG_D("send TEvContinueRun on OnAsyncInputPushFinished");
             this->Send(TaskRunnerActorId, new NTaskRunnerActor::TEvContinueRun());
         }
     }
@@ -493,8 +493,13 @@ private:
         ProcessOutputsState.Inflight --;
         ProcessOutputsState.HasDataToSend |= !sinkInfo.Finished;
 
-        auto guard = BindAllocator();
-        sinkInfo.AsyncOutput->SendData(std::move(batch), size, std::move(checkpoint), finished);
+        {
+            auto guard = BindAllocator();
+            NKikimr::NMiniKQL::TUnboxedValueVector data = std::move(batch);
+            sinkInfo.AsyncOutput->SendData(std::move(data), size, std::move(checkpoint), finished);
+        }
+
+        Y_VERIFY(batch.empty());
         CA_LOG_D("sink " << outputIndex << ": sent " << dataSize << " bytes of data and " << checkpointSize << " bytes of checkpoint barrier");
 
         CA_LOG_D("Drain sink " << outputIndex
@@ -573,13 +578,13 @@ private:
 
 
 IActor* CreateDqAsyncComputeActor(const TActorId& executerId, const TTxId& txId, NYql::NDqProto::TDqTask&& task,
-    IDqSourceFactory::TPtr sourceFactory, IDqSinkFactory::TPtr sinkFactory, IDqOutputTransformFactory::TPtr transformFactory,
+    IDqAsyncIoFactory::TPtr asyncIoFactory,
     const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
     const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits,
     const NTaskRunnerActor::ITaskRunnerActorFactory::TPtr& taskRunnerActorFactory)
 {
-    return new TDqAsyncComputeActor(executerId, txId, std::move(task), std::move(sourceFactory),
-        std::move(sinkFactory), std::move(transformFactory), functionRegistry, settings, memoryLimits, taskRunnerActorFactory);
+    return new TDqAsyncComputeActor(executerId, txId, std::move(task), std::move(asyncIoFactory),
+        functionRegistry, settings, memoryLimits, taskRunnerActorFactory);
 }
 
 } // namespace NDq

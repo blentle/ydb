@@ -254,6 +254,11 @@ void TDatabase::CommitTx(ui32 table, ui64 txId, TRowVersion rowVersion)
     Redo->EvCommitTx(table, txId, rowVersion);
 }
 
+bool TDatabase::HasOpenTx(ui32 table, ui64 txId) const
+{
+    return Require(table)->HasOpenTx(txId);
+}
+
 void TDatabase::RemoveRowVersions(ui32 table, const TRowVersion& lower, const TRowVersion& upper)
 {
     if (Y_LIKELY(lower < upper)) {
@@ -402,6 +407,11 @@ TAutoPtr<TSubset> TDatabase::Subset(ui32 table, TEpoch before, TRawVals from, TR
 TAutoPtr<TSubset> TDatabase::ScanSnapshot(ui32 table, TRowVersion snapshot)
 {
     return Require(table)->ScanSnapshot(snapshot);
+}
+
+bool TDatabase::HasBorrowed(ui32 table, ui64 selfTabletId) const
+{
+    return Require(table)->HasBorrowed(selfTabletId);
 }
 
 TBundleSlicesMap TDatabase::LookupSlices(ui32 table, TArrayRef<const TLogoBlobID> bundles) const

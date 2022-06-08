@@ -1,7 +1,7 @@
 #include "dq_solomon_write_actor.h"
 #include "metrics_encoder.h"
 
-#include <ydb/library/yql/dq/actors/compute/dq_compute_actor_async_output.h>
+#include <ydb/library/yql/dq/actors/compute/dq_compute_actor_async_io.h>
 #include <ydb/library/yql/dq/actors/protos/dq_events.pb.h>
 #include <ydb/library/yql/dq/proto/dq_checkpoint.pb.h>
 
@@ -58,6 +58,15 @@ namespace {
 
 const ui64 MaxMetricsPerRequest = 1000; // Max allowed count is 10000
 const ui64 MaxRequestsInflight = 3;
+
+auto RetryPolicy = NYql::NDq::THttpSenderRetryPolicy::GetExponentialBackoffPolicy(
+    [](const NHttp::TEvHttpProxy::TEvHttpIncomingResponse* resp){
+        if (resp->Response->Status == "401") {
+            return ERetryErrorClass::NoRetry;
+        }
+
+        return ERetryErrorClass::ShortRetry;
+    });
 
 struct TDqSolomonWriteParams {
     NSo::NProto::TDqSolomonShard Shard;
@@ -357,7 +366,7 @@ private:
             const NHttp::THttpOutgoingRequestPtr httpRequest = BuildSolomonRequest(metricsToSend.Data);
 
             const size_t bodySize = metricsToSend.Data.size();
-            const TActorId httpSenderId = Register(CreateHttpSenderActor(SelfId(), HttpProxyId));
+            const TActorId httpSenderId = Register(CreateHttpSenderActor(SelfId(), HttpProxyId, RetryPolicy));
             Send(httpSenderId, new NHttp::TEvHttpProxy::TEvHttpOutgoingRequest(httpRequest), /*flags=*/0, Cookie);
             SINK_LOG_D("Sent " << metricsToSend.MetricsCount << " metrics with size of " << metricsToSend.Data.size() << " bytes to solomon");
 
@@ -491,11 +500,11 @@ std::pair<NYql::NDq::IDqComputeActorAsyncOutput*, NActors::IActor*> CreateDqSolo
     return {actor, actor};
 }
 
-void RegisterDQSolomonWriteActorFactory(TDqSinkFactory& factory, ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory) {
-    factory.Register<NSo::NProto::TDqSolomonShard>("SolomonSink",
+void RegisterDQSolomonWriteActorFactory(TDqAsyncIoFactory& factory, ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory) {
+    factory.RegisterSink<NSo::NProto::TDqSolomonShard>("SolomonSink",
         [credentialsFactory](
             NYql::NSo::NProto::TDqSolomonShard&& settings,
-            IDqSinkFactory::TArguments&& args)
+            IDqAsyncIoFactory::TSinkArguments&& args)
         {
             auto counters = MakeIntrusive<NMonitoring::TDynamicCounters>();
 

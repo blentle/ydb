@@ -44,12 +44,16 @@ struct TSettings {
     TControlWrapper CacheDataAfterIndexing;
     TControlWrapper CacheDataAfterCompaction;
     TControlWrapper MaxSmallBlobSize;
+    TControlWrapper OverloadTxInFly;
+    TControlWrapper OverloadWritesInFly;
 
     TSettings()
         : BlobWriteGrouppingEnabled(1, 0, 1)
         , CacheDataAfterIndexing(1, 0, 1)
         , CacheDataAfterCompaction(1, 0, 1)
         , MaxSmallBlobSize(0, 0, 8000000)
+        , OverloadTxInFly(1000, 0, 10000)
+        , OverloadWritesInFly(1000, 0, 10000)
     {}
 
     void RegisterControls(TControlBoard& icb) {
@@ -57,6 +61,8 @@ struct TSettings {
         icb.RegisterSharedControl(CacheDataAfterIndexing, "ColumnShardControls.CacheDataAfterIndexing");
         icb.RegisterSharedControl(CacheDataAfterCompaction, "ColumnShardControls.CacheDataAfterCompaction");
         icb.RegisterSharedControl(MaxSmallBlobSize, "ColumnShardControls.MaxSmallBlobSize");
+        icb.RegisterSharedControl(OverloadTxInFly, "ColumnShardControls.OverloadTxInFly");
+        icb.RegisterSharedControl(OverloadWritesInFly, "ColumnShardControls.OverloadWritesInFly");
     }
 };
 
@@ -340,6 +346,7 @@ private:
     ui64 LastPlannedTxId = 0;
     ui64 LastCompactedGranule = 0;
     ui64 LastExportNo = 0;
+    ui64 WritesInFly = 0;
 
     TIntrusivePtr<TMediatorTimecastEntry> MediatorTimeCastEntry;
     bool MediatorTimeCastRegistered = false;
@@ -401,10 +408,17 @@ private:
     ui64 GetAllowedStep() const;
     bool HaveOutdatedTxs() const;
 
+    bool ShardOverloaded() const {
+        ui64 txLimit = Settings.OverloadTxInFly;
+        ui64 writesLimit = Settings.OverloadWritesInFly;
+        return (txLimit && Executor()->GetStats().TxInFly > txLimit) ||
+           (writesLimit && WritesInFly > writesLimit);
+    }
+
     TWriteId GetLongTxWrite(NIceDb::TNiceDb& db, const NLongTxService::TLongTxId& longTxId);
     void AddLongTxWrite(TWriteId writeId, ui64 txId);
     void LoadLongTxWrite(TWriteId writeId, const NLongTxService::TLongTxId& longTxId);
-    void RemoveLongTxWrite(NIceDb::TNiceDb& db, TWriteId writeId, ui64 txId = 0);
+    bool RemoveLongTxWrite(NIceDb::TNiceDb& db, TWriteId writeId, ui64 txId = 0);
     bool RemoveTx(NTable::TDatabase& database, ui64 txId);
 
     void EnqueueProgressTx();
@@ -443,7 +457,7 @@ private:
     std::unique_ptr<TEvPrivate::TEvWriteIndex> SetupCleanup();
 
     void UpdateBlobMangerCounters();
-    void UpdateInsertTableCounters(bool updateCommitted = true);
+    void UpdateInsertTableCounters();
     void UpdateIndexCounters();
     void UpdateResourceMetrics(const TUsage& usage);
 

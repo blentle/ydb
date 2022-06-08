@@ -28,6 +28,7 @@ target_link_libraries(providers-s3-actors PUBLIC
   dq-actors-compute
   providers-common-http_gateway
   providers-s3-proto
+  providers-s3-compressors
   clickhouse_client_udf
 )
 target_sources(providers-s3-actors PRIVATE

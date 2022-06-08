@@ -1086,7 +1086,7 @@ private:
             auto profile = config->Profile.Get(cluster);
             if (profile && *profile) {
                 // Do not disable profiling if it was enabled at request level
-                settings.StatsMode = EKikimrStatsMode::Profile;
+                settings.StatsMode = EKikimrStatsMode::Full;
             }
 
             asyncResult = runFunc(settings);
@@ -1165,12 +1165,10 @@ private:
 
         for (const auto& op : tableOps) {
             auto table = op.GetTable();
-            auto operation = (TYdbOperation)op.GetOperation();
+            auto operation = static_cast<TYdbOperation>(op.GetOperation());
             const auto& desc = SessionCtx->Tables().GetTable(cluster, table);
             YQL_ENSURE(desc.Metadata);
-            size_t size = tableInfo.size();
             TableDescriptionToTableInfo(desc, operation, tableInfo);
-            Y_VERIFY(size + 1 == tableInfo.size());
         }
 
         if (!SessionCtx->HasTx()) {
