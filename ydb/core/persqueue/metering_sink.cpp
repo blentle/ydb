@@ -6,7 +6,7 @@
 
 namespace NKikimr::NPQ {
 
-ui32 TMeteringSink::MeteringCounter_{0};
+std::atomic<ui64> TMeteringSink::MeteringCounter_{0};
 
 bool TMeteringSink::Create(TInstant now, const TMeteringSink::TParameters& p,
                            const TSet<EMeteringJson>& whichToFlush,
@@ -68,6 +68,7 @@ TString TMeteringSink::GetMeteringJson(const TString& metricBillingId, const TSt
                                       const THashMap<TString, ui64>& tags,
                                       const TString& quantityUnit, ui64 quantity,
                                       TInstant start, TInstant end, TInstant now) {
+    MeteringCounter_.fetch_add(1);
     TStringStream output;
     NJson::TJsonWriter writer(&output, false);
 
@@ -80,7 +81,7 @@ TString TMeteringSink::GetMeteringJson(const TString& metricBillingId, const TSt
                  "-" << Parameters_.YdbDatabaseId <<
                  "-" << Parameters_.TabletId <<
                  "-" << start.MilliSeconds() <<
-                 "-" << (++MeteringCounter_));
+                 "-" << MeteringCounter_.load());
     writer.Write("schema", schemeName);
 
     writer.OpenMap("tags");
@@ -151,7 +152,7 @@ void TMeteringSink::Flush(TInstant now, bool force) {
                 {"shard_enhanced_consumers_throughput", Parameters_.ConsumersThroughput},
                 {"reserved_storage_bytes", Parameters_.ReservedSpace}
             };
-            auto interval = TInstant::Hours(LastFlush_[whichOne].Hours() + 1);
+            auto interval = TInstant::Hours(LastFlush_[whichOne].Hours()) + Parameters_.FlushLimit;
             while (interval < now) {
                 const auto metricsJson = GetMeteringJson(
                     name, schema, tags, "second",
@@ -159,7 +160,7 @@ void TMeteringSink::Flush(TInstant now, bool force) {
                     LastFlush_[whichOne], interval, now);
                 LastFlush_[whichOne] = interval;
                 FlushFunction_(metricsJson);
-                interval += TDuration::Hours(1);
+                interval += Parameters_.FlushLimit;
             }
             if (LastFlush_[whichOne] < now) {
                 const auto metricsJson = GetMeteringJson(
@@ -182,7 +183,7 @@ void TMeteringSink::Flush(TInstant now, bool force) {
             const THashMap<TString, ui64> tags = {
                 {"reserved_throughput_bps", Parameters_.WriteQuota},
             };
-            auto interval = TInstant::Hours(LastFlush_[whichOne].Hours() + 1);
+            auto interval = TInstant::Hours(LastFlush_[whichOne].Hours()) + Parameters_.FlushLimit;
             while (interval < now) {
                 const auto metricsJson = GetMeteringJson(
                     name, schema, tags, "second",
@@ -190,7 +191,7 @@ void TMeteringSink::Flush(TInstant now, bool force) {
                     LastFlush_[whichOne], interval, now);
                 LastFlush_[whichOne] = interval;
                 FlushFunction_(metricsJson);
-                interval += TDuration::Hours(1);
+                interval += Parameters_.FlushLimit;
             }
             if (LastFlush_[whichOne] < now) {
                 const auto metricsJson = GetMeteringJson(
@@ -210,7 +211,7 @@ void TMeteringSink::Flush(TInstant now, bool force) {
             }
             const TString name = "yds.reserved_resources";
             const TString schema = "yds.storage.reserved.v1";
-            auto interval = TInstant::Hours(LastFlush_[whichOne].Hours() + 1);
+            auto interval = TInstant::Hours(LastFlush_[whichOne].Hours()) + Parameters_.FlushLimit;
             while (interval < now) {
                 const auto metricsJson = GetMeteringJson(
                     name, schema, {}, "mbyte*second",
@@ -219,7 +220,7 @@ void TMeteringSink::Flush(TInstant now, bool force) {
                     LastFlush_[whichOne], interval, now);
                 LastFlush_[whichOne] = interval;
                 FlushFunction_(metricsJson);
-                interval += TDuration::Hours(1);
+                interval += Parameters_.FlushLimit;
             }
             if (LastFlush_[whichOne] < now) {
                 const auto metricsJson = GetMeteringJson(
@@ -239,8 +240,8 @@ void TMeteringSink::Flush(TInstant now, bool force) {
     }
 }
 
-ui32 TMeteringSink::GetMeteringCounter() const {
-    return MeteringCounter_;
+ui64 TMeteringSink::GetMeteringCounter() const {
+    return MeteringCounter_.load();
 }
 
 bool TMeteringSink::IsTimeToFlush(TInstant now, TInstant last) const {

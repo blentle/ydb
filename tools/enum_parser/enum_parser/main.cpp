@@ -246,7 +246,15 @@ void GenerateEnum(
     out << "    using TNameBufsBase = ::NEnumSerializationRuntime::TEnumDescription<" << name << ">;\n\n";
 
     // Initialization data
-    defineConstArray("    ", "TNameBufsBase::TEnumStringPair", "NAMES_INITIALIZATION_PAIRS", nameInitializerPairs);
+    {
+        out << "    static constexpr const std::array<TNameBufsBase::TEnumStringPair, " << nameInitializerPairs.size() << "> NAMES_INITIALIZATION_PAIRS_PAYLOAD = ::NEnumSerializationRuntime::TryStableSortKeys(";
+        out << "std::array<TNameBufsBase::TEnumStringPair, " << nameInitializerPairs.size() << ">{{\n";
+        for (const auto& it : nameInitializerPairs) {
+            out << "        " << it << ",\n";
+        }
+        out << "    }});\n";
+        out << "    " << "static constexpr const TArrayRef<const TNameBufsBase::TEnumStringPair> " << "NAMES_INITIALIZATION_PAIRS{NAMES_INITIALIZATION_PAIRS_PAYLOAD};\n\n";
+    }
     {
         StableSortBy(valueInitializerPairsUnsorted, [](const auto& pair) -> const TString& { return pair.second; });
         TVector<TString> valueInitializerPairs(Reserve(valueInitializerPairsUnsorted.size()));
@@ -302,6 +310,9 @@ void GenerateEnum(
     // outer ToString
     if (headerOutPtr) {
         (*headerOutPtr) << "const TString& ToString(" << name << ");\n";
+        (*headerOutPtr) << "Y_FORCE_INLINE TStringBuf ToStringBuf(" << name << " e) {\n";
+        (*headerOutPtr) << "    return ::NEnumSerializationRuntime::ToStringBuf<" << name << ">(e);\n";
+        (*headerOutPtr) << "}\n";
     }
     out << "const TString& ToString(" << name << " x) {\n";
     out << "    const " << nsNameBufsClass << "& names = " << nsNameBufsClass << "::Instance();\n";
@@ -344,6 +355,12 @@ void GenerateEnum(
 
     // specializations for NEnumSerializationRuntime function family
     out << "namespace NEnumSerializationRuntime {\n";
+    // template<> ToStringBuf
+    out << "    template<>\n";
+    out << "    TStringBuf ToStringBuf<" << name << ">(" << name << " e) {\n";
+    out << "        return ::NEnumSerializationRuntime::DispatchToStringBufFn<" << nsNameBufsClass << ">(e);\n";
+    out << "    }\n\n";
+
     // template<> GetEnumAllValues
     out << "    template<>\n";
     out << "    TMappedArrayView<" << name <<"> GetEnumAllValuesImpl<" << name << ">() {\n";

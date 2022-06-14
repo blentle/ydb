@@ -22,11 +22,12 @@ bool IsDebugLogEnabled(const TActorSystem* actorSystem) {
 class TDqAsyncComputeActor : public TDqComputeActorBase<TDqAsyncComputeActor>
                        , public NTaskRunnerActor::ITaskRunnerActor::ICallbacks
 {
-
     using TBase = TDqComputeActorBase<TDqAsyncComputeActor>;
 
 public:
     static constexpr char ActorName[] = "DQ_COMPUTE_ACTOR";
+
+    static constexpr bool HasAsyncTaskRunner = true;
 
     TDqAsyncComputeActor(const TActorId& executerId, const TTxId& txId, NDqProto::TDqTask&& task,
         IDqAsyncIoFactory::TPtr asyncIoFactory,
@@ -92,6 +93,8 @@ private:
             default:
                 TDqComputeActorBase<TDqAsyncComputeActor>::StateFuncBase(ev, ctx);
         };
+
+        ReportEventElapsedTime();
     };
 
     void OnStateRequest(TEvDqCompute::TEvStateRequest::TPtr& ev) {
@@ -548,8 +551,8 @@ private:
         Checkpoints->AfterStateLoading(std::move(ev->Get()->Error));
     }
 
-    NKikimr::NMiniKQL::TTypeEnvironment* TypeEnv;
-    NTaskRunnerActor::ITaskRunnerActor* TaskRunnerActor;
+    NKikimr::NMiniKQL::TTypeEnvironment* TypeEnv = nullptr;
+    NTaskRunnerActor::ITaskRunnerActor* TaskRunnerActor = nullptr;
     NActors::TActorId TaskRunnerActorId;
     NTaskRunnerActor::ITaskRunnerActorFactory::TPtr TaskRunnerActorFactory;
 

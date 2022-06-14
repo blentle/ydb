@@ -24,9 +24,9 @@ target_link_libraries(yabseil-cpp-tstring-y_absl-hash PUBLIC
   yabseil-cpp-tstring-y_absl-numeric
   yabseil-cpp-tstring-y_absl-strings
   ystrings-internal-absl_strings_internal
+  abseil-cpp-tstring-y_absl-types
   yabsl-types-bad_optional_access
   yabsl-types-bad_variant_access
-  abseil-cpp-tstring-y_absl-types
   y_absl-types-internal
 )
 target_sources(yabseil-cpp-tstring-y_absl-hash PRIVATE

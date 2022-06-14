@@ -35,8 +35,8 @@ target_link_libraries(ycontainer-internal-raw_hash_set PUBLIC
   yabseil-cpp-tstring-y_absl-time
   yabsl-time-civil_time
   yabsl-time-time_zone
-  yabsl-types-bad_optional_access
   abseil-cpp-tstring-y_absl-types
+  yabsl-types-bad_optional_access
 )
 target_sources(ycontainer-internal-raw_hash_set PRIVATE
   ${CMAKE_SOURCE_DIR}/contrib/restricted/abseil-cpp-tstring/y_absl/container/internal/raw_hash_set.cc

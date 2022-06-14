@@ -95,6 +95,8 @@ protected:
         RlNoResourceTag = 102,
     };
 
+    static constexpr bool HasAsyncTaskRunner = false;
+
 public:
     void Bootstrap() {
         try {
@@ -188,7 +190,7 @@ protected:
 
     void ReportEventElapsedTime() {
         if (BasicStats) {
-            ui64 elapsedMicros = NActors::TlsActivationContext->GetCurrentEventTicksAsSeconds() * 1'000'000;
+            ui64 elapsedMicros = NActors::TlsActivationContext->GetCurrentEventTicksAsSeconds() * 1'000'000ull;
             BasicStats->CpuTime += TDuration::MicroSeconds(elapsedMicros);
         }
     }
@@ -472,15 +474,16 @@ protected:
 
         {
             // free MKQL memory then destroy TaskRunner and Allocator
-            auto guard = BindAllocator();
+            if (auto guard = MaybeBindAllocator()) {
 #define CLEANUP(what) decltype(what) what##_; what.swap(what##_);
-            CLEANUP(InputChannelsMap);
-            CLEANUP(SourcesMap);
-            CLEANUP(InputTransformsMap);
-            CLEANUP(OutputChannelsMap);
-            CLEANUP(SinksMap);
-            CLEANUP(OutputTransformsMap);
+                CLEANUP(InputChannelsMap);
+                CLEANUP(SourcesMap);
+                CLEANUP(InputTransformsMap);
+                CLEANUP(OutputChannelsMap);
+                CLEANUP(SinksMap);
+                CLEANUP(OutputTransformsMap);
 #undef CLEANUP
+            }
         }
 
         this->PassAway();
@@ -1537,6 +1540,11 @@ public:
         if (auto* taskStats = GetTaskRunnerStats()) {
             auto* protoTask = dst->AddTasks();
             FillTaskRunnerStats(Task.GetId(), Task.GetStageId(), *taskStats, protoTask, (bool) GetProfileStats());
+
+            // More accurate cpu time counter:
+            if (TDerived::HasAsyncTaskRunner) {
+                protoTask->SetCpuTimeUs(BasicStats->CpuTime.MicroSeconds() + taskStats->ComputeCpuTime.MicroSeconds() + taskStats->BuildCpuTime.MicroSeconds());
+            }
 
             for (auto& [outputIndex, sinkInfo] : SinksMap) {
                 if (auto* sinkStats = GetSinkStats(outputIndex, sinkInfo)) {

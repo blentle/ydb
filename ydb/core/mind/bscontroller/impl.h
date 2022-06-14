@@ -516,6 +516,9 @@ public:
 
         TActorId VirtualGroupSetupMachineId;
 
+        // nodes waiting for this group to become listable
+        THashSet<TNodeId> WaitingNodes;
+
         // group's geometry; it doesn't ever change since the group is created
         const ui32 NumFailRealms = 0;
         const ui32 NumFailDomainsPerFailRealm = 0;
@@ -641,6 +644,12 @@ public:
             Y_VERIFY(VDisksInGroup.size() == Topology->GetTotalVDisksNum());
         }
 
+        bool Listable() const {
+            return !VirtualGroupState
+                || *VirtualGroupState == NKikimrBlobStorage::EVirtualGroupState::WORKING
+                || *VirtualGroupState == NKikimrBlobStorage::EVirtualGroupState::CREATE_FAILED;
+        }
+
         void ClearVDisksInGroup() {
             std::fill(VDisksInGroup.begin(), VDisksInGroup.end(), nullptr);
         }
@@ -670,17 +679,17 @@ public:
             return values;
         }
 
-        TPDiskCategory::EDeviceType GetCommonDeviceType() const {
+        NPDisk::EDeviceType GetCommonDeviceType() const {
             if (VDisksInGroup) {
-                const TPDiskCategory::EDeviceType type = VDisksInGroup.front()->PDisk->Kind.Type();
+                const NPDisk::EDeviceType type = VDisksInGroup.front()->PDisk->Kind.Type();
                 for (const TVSlotInfo *vslot : VDisksInGroup) {
                     if (type != vslot->PDisk->Kind.Type()) {
-                        return TPDiskCategory::DEVICE_TYPE_UNKNOWN;
+                        return NPDisk::DEVICE_TYPE_UNKNOWN;
                     }
                 }
                 return type;
             } else {
-                return TPDiskCategory::DEVICE_TYPE_UNKNOWN;
+                return NPDisk::DEVICE_TYPE_UNKNOWN;
             }
         }
 
@@ -798,6 +807,7 @@ public:
         TInstant LastDisconnectTimestamp;
         // in-mem only
         std::map<TString, NPDisk::TDriveData> KnownDrives;
+        THashSet<TGroupId> WaitingForGroups;
 
         template<typename T>
         static void Apply(TBlobStorageController* /*controller*/, T&& callback) {
@@ -1257,7 +1267,7 @@ public:
         TMaybe<Table::Guid::Type> Guid;
         Table::LifeStage::Type LifeStage = NKikimrBlobStorage::TDriveLifeStage::UNKNOWN;
         Table::Kind::Type Kind = 0;
-        Table::PDiskType::Type PDiskType = PDiskTypeToPDiskType(TPDiskCategory::DEVICE_TYPE_UNKNOWN);
+        Table::PDiskType::Type PDiskType = PDiskTypeToPDiskType(NPDisk::DEVICE_TYPE_UNKNOWN);
         TMaybe<Table::PDiskConfig::Type> PDiskConfig;
 
         TDriveSerialInfo() = default;
@@ -1589,7 +1599,8 @@ private:
     TDeque<TAutoPtr<IEventHandle>> InitQueue;
     THashMap<Schema::Group::Owner::Type, Schema::Group::ID::Type> OwnerIdIdxToGroup;
 
-    void ReadGroups(TSet<ui32>& groupIDsToRead, bool discard, TEvBlobStorage::TEvControllerNodeServiceSetUpdate *result);
+    void ReadGroups(TSet<ui32>& groupIDsToRead, bool discard, TEvBlobStorage::TEvControllerNodeServiceSetUpdate *result,
+            TNodeId nodeId);
 
     void ReadPDisk(const TPDiskId& pdiskId, const TPDiskInfo& pdisk,
             TEvBlobStorage::TEvControllerNodeServiceSetUpdate *result,

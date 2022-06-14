@@ -14,16 +14,19 @@ target_include_directories(yabsl-strings-cord PUBLIC
 target_link_libraries(yabsl-strings-cord PUBLIC
   contrib-libs-cxxsupp
   yutil
+  abseil-cpp-tstring-y_absl-algorithm
   yabseil-cpp-tstring-y_absl-base
   ybase-internal-low_level_alloc
   ybase-internal-raw_logging
   ybase-internal-spinlock_wait
   ybase-internal-throw_delegate
   yabsl-base-log_severity
+  abseil-cpp-tstring-y_absl-container
   yabseil-cpp-tstring-y_absl-debugging
   yabsl-debugging-stacktrace
   yabsl-debugging-symbolize
   yabseil-cpp-tstring-y_absl-demangle
+  abseil-cpp-tstring-y_absl-functional
   yabseil-cpp-tstring-y_absl-numeric
   yprofiling-internal-exponential_biased
   yabseil-cpp-tstring-y_absl-strings
@@ -37,11 +40,8 @@ target_link_libraries(yabsl-strings-cord PUBLIC
   yabseil-cpp-tstring-y_absl-time
   yabsl-time-civil_time
   yabsl-time-time_zone
-  yabsl-types-bad_optional_access
-  abseil-cpp-tstring-y_absl-algorithm
-  abseil-cpp-tstring-y_absl-container
-  abseil-cpp-tstring-y_absl-functional
   abseil-cpp-tstring-y_absl-types
+  yabsl-types-bad_optional_access
   abseil-cpp-tstring-y_absl-utility
 )
 target_sources(yabsl-strings-cord PRIVATE
