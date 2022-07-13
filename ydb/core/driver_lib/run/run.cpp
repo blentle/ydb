@@ -98,6 +98,7 @@
 #include <ydb/services/ydb/ydb_logstore.h>
 #include <ydb/services/persqueue_cluster_discovery/grpc_service.h>
 #include <ydb/services/persqueue_v1/persqueue.h>
+#include <ydb/services/persqueue_v1/topic.h>
 #include <ydb/services/rate_limiter/grpc_service.h>
 #include <ydb/services/discovery/grpc_service.h>
 #include <ydb/services/local_discovery/grpc_service.h>
@@ -321,7 +322,7 @@ public:
 
 TKikimrRunner::TKikimrRunner(std::shared_ptr<TModuleFactories> factories)
     : ModuleFactories(std::move(factories))
-    , Counters(MakeIntrusive<NMonitoring::TDynamicCounters>())
+    , Counters(MakeIntrusive<::NMonitoring::TDynamicCounters>())
     , PollerThreads(new NInterconnect::TPollerThreads)
 {
 }
@@ -520,9 +521,11 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
         names["yql_internal"] = &hasYqlInternal;
         bool hasPQ = services.empty();
         names["pq"] = &hasPQ;
-        bool hasPQv1 = false;
+        bool hasPQv1 = services.empty();
         names["pqv1"] = &hasPQv1;
-        bool hasPQCD = false;
+        bool hasTopic = false;
+        names["topic"] = &hasTopic;
+        bool hasPQCD = services.empty();
         names["pqcd"] = &hasPQCD;
         bool hasS3Internal = false;
         names["s3_internal"] = &hasS3Internal;
@@ -686,6 +689,10 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
 
         if (hasPQv1) {
             server.AddService(new NGRpcService::V1::TGRpcPersQueueService(ActorSystem.Get(), Counters, NMsgBusProxy::CreatePersQueueMetaCacheV2Id(), grpcRequestProxyId));
+        }
+
+        if (hasPQv1 || hasTopic) {
+            server.AddService(new NGRpcService::V1::TGRpcTopicService(ActorSystem.Get(), Counters, NMsgBusProxy::CreatePersQueueMetaCacheV2Id(), grpcRequestProxyId));
         }
 
         if (hasPQCD) {

@@ -584,7 +584,7 @@ bool TColumnEngineForLogs::Load(IDbWrapper& db, const THashSet<ui64>& pathsToDro
         }
     }
 
-    UpdateOverloaded(Granules, {});
+    UpdateOverloaded(Granules);
 
     Y_VERIFY(!(LastPortion >> 63), "near to int overflow");
     Y_VERIFY(!(LastGranule >> 63), "near to int overflow");
@@ -771,13 +771,18 @@ std::shared_ptr<TColumnEngineChanges> TColumnEngineForLogs::StartCleanup(const T
     return changes;
 }
 
-std::shared_ptr<TColumnEngineChanges> TColumnEngineForLogs::StartTtl(const THashMap<ui64, TTiersInfo>& pathTtls) {
+std::shared_ptr<TColumnEngineChanges> TColumnEngineForLogs::StartTtl(const THashMap<ui64, TTiersInfo>& pathTtls,
+                                                                     ui64 maxEvictBytes) {
     if (pathTtls.empty()) {
         return {};
     }
 
     TSnapshot fakeSnapshot = {1, 1}; // TODO: better snapshot
     auto changes = std::make_shared<TChanges>(TColumnEngineChanges::TTL, fakeSnapshot);
+    ui64 evicttionSize = 0;
+    bool allowEviction = true;
+    ui64 dropBlobs = 0;
+    bool allowDrop = true;
 
     for (auto& [pathId, ttl] : pathTtls) {
         if (!PathGranules.count(pathId)) {
@@ -800,19 +805,24 @@ std::shared_ptr<TColumnEngineChanges> TColumnEngineForLogs::StartTtl(const THash
                     continue;
                 }
 
+                allowEviction = (evicttionSize <= maxEvictBytes);
+                allowDrop = (dropBlobs <= TCompactionLimits::MAX_BLOBS_TO_DELETE);
+
                 if (auto max = info.MaxValue(ttlColumnId)) {
                     bool keep = false;
                     for (auto& border : ttl.TierBorders) {
                         if (NArrow::ScalarLess(*border.ToTimestamp(), *max)) {
                             keep = true;
-                            if (info.TierName != border.TierName) {
+                            if (allowEviction && info.TierName != border.TierName) {
+                                evicttionSize += info.BlobsSizes().first;
                                 changes->PortionsToEvict.emplace_back(info, border.TierName);
                             }
                             break;
                         }
                     }
-                    if (!keep) {
+                    if (!keep && allowDrop) {
                         Y_VERIFY(!NArrow::ScalarLess(*ttl.TierBorders.back().ToTimestamp(), *max));
+                        dropBlobs += info.NumRecords();
                         changes->PortionsToDrop.push_back(info);
                     }
                 }
@@ -825,6 +835,9 @@ std::shared_ptr<TColumnEngineChanges> TColumnEngineForLogs::StartTtl(const THash
         return {};
     }
 
+    if (!allowEviction || !allowDrop) {
+        changes->NeedRepeat = true;
+    }
     return changes;
 }
 
@@ -853,8 +866,7 @@ TVector<TVector<std::pair<ui64, ui64>>> TColumnEngineForLogs::EmptyGranuleTracks
     return emptyGranules;
 }
 
-void TColumnEngineForLogs::UpdateOverloaded(const THashMap<ui64, std::shared_ptr<TGranuleMeta>>& granules,
-                                            const TChanges::TSrcGranule& splitted) {
+void TColumnEngineForLogs::UpdateOverloaded(const THashMap<ui64, std::shared_ptr<TGranuleMeta>>& granules) {
     for (auto [granule, spg] : granules) {
         if (!spg) {
             spg = Granules[granule];
@@ -876,16 +888,6 @@ void TColumnEngineForLogs::UpdateOverloaded(const THashMap<ui64, std::shared_ptr
             granules.erase(granule);
             if (granules.empty()) {
                 PathsGranulesOverloaded.erase(pathId);
-            }
-        }
-    }
-
-    if (splitted.Granule) {
-        if (PathsGranulesOverloaded.count(splitted.PathId)) {
-            auto& granules = PathsGranulesOverloaded[splitted.PathId];
-            granules.erase(splitted.Granule);
-            if (granules.empty()) {
-                PathsGranulesOverloaded.erase(splitted.PathId);
             }
         }
     }
@@ -968,15 +970,21 @@ bool TColumnEngineForLogs::ApplyChanges(IDbWrapper& db, std::shared_ptr<TColumnE
         }
     }
 
-    /// @warning Update overload info (only if tx would be applyed)
-    if (changes->IsInsert() || (changes->IsCompaction() && changes->CompactionInfo->InGranule)) {
+    // Update overloaded granules (only if tx would be applyed)
+    if (changes->IsInsert() || changes->IsCompaction() || changes->IsCleanup()) {
         THashMap<ui64, std::shared_ptr<TGranuleMeta>> granules;
-        for (auto& portionInfo : changes->AppendedPortions) {
-            granules[portionInfo.Granule()] = {};
+        if (changes->IsCleanup()) {
+            for (auto& portionInfo : changes->PortionsToDrop) {
+                granules[portionInfo.Granule()] = {};
+            }
+        } else if (changes->IsCompaction() && !changes->CompactionInfo->InGranule) {
+            granules[changes->SrcGranule.Granule] = {};
+        } else {
+            for (auto& portionInfo : changes->AppendedPortions) {
+                granules[portionInfo.Granule()] = {};
+            }
         }
-        UpdateOverloaded(granules, {});
-    } else if (changes->IsCompaction() && !changes->CompactionInfo->InGranule) {
-        UpdateOverloaded({}, changes->SrcGranule);
+        UpdateOverloaded(granules);
     }
     return true;
 }

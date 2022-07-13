@@ -587,6 +587,11 @@ TStatus AnnotateDqCnHashShuffle(const TExprNode::TPtr& input, TExprContext& ctx)
                 TStringBuilder() << "Missing key column: " << column->Content()));
             return TStatus::Error;
         }
+        if (const auto ty = structType->FindItemType(column->Content()); !ty->IsHashable()) {
+            ctx.AddError(TIssue(ctx.GetPosition(column->Pos()),
+                TStringBuilder() << "Non-hashable key column: " << column->Content()));
+            return TStatus::Error;
+        }
     }
 
     input->SetTypeAnn(outputType);
@@ -683,10 +688,10 @@ TStatus AnnotateDqReplicate(const TExprNode::TPtr& input, TExprContext& ctx) {
         if (!lambda->GetTypeAnn()) {
             return TStatus::Repeat;
         }
-        if (!EnsureFlowType(lambda->Pos(), *lambda->GetTypeAnn(), ctx)) {
+        const TTypeAnnotationNode* lambdaItemType = nullptr;
+        if (!EnsureNewSeqType<false, false>(*lambda, ctx, &lambdaItemType)) {
             return TStatus::Error;
         }
-        auto lambdaItemType = lambda->GetTypeAnn()->Cast<TFlowExprType>()->GetItemType();
         if (!EnsurePersistableType(lambda->Pos(), *lambdaItemType, ctx)) {
             return TStatus::Error;
         }

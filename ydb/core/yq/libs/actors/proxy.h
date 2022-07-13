@@ -14,7 +14,7 @@
 #include <ydb/library/yql/providers/dq/worker_manager/interface/counters.h>
 #include <ydb/library/yql/providers/dq/actors/proto_builder.h>
 #include <ydb/library/yql/providers/common/http_gateway/yql_http_gateway.h>
-#include <ydb/library/yql/providers/pq/cm_client/interface/client.h>
+#include <ydb/library/yql/providers/pq/cm_client/client.h>
 
 #include <library/cpp/actors/core/actorsystem.h>
 #include <library/cpp/time_provider/time_provider.h>
@@ -49,7 +49,7 @@ NActors::IActor* CreatePendingFetcher(
     NYql::ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory,
     NYql::IHTTPGateway::TPtr s3Gateway,
     ::NPq::NConfigurationManager::IConnections::TPtr pqCmConnections,
-    const NMonitoring::TDynamicCounterPtr& clientCounters,
+    const ::NMonitoring::TDynamicCounterPtr& clientCounters,
     const TString& tenantName
     );
 

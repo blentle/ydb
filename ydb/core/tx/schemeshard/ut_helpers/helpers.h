@@ -151,10 +151,10 @@ namespace NSchemeShardUT_Private {
     DROP_BY_PATH_ID_HELPERS(DropOlapStore);
 
     // olap table
-    GENERIC_HELPERS(CreateOlapTable);
-    GENERIC_HELPERS(AlterOlapTable);
-    GENERIC_HELPERS(DropOlapTable);
-    DROP_BY_PATH_ID_HELPERS(DropOlapTable);
+    GENERIC_HELPERS(CreateColumnTable);
+    GENERIC_HELPERS(AlterColumnTable);
+    GENERIC_HELPERS(DropColumnTable);
+    DROP_BY_PATH_ID_HELPERS(DropColumnTable);
 
     // sequence
     GENERIC_HELPERS(CreateSequence);
@@ -247,6 +247,12 @@ namespace NSchemeShardUT_Private {
     void AsyncMoveTable(TTestActorRuntime& runtime, ui64 txId, const TString& srcPath, const TString& dstPath, ui64 schemeShard = TTestTxConfig::SchemeShard);
     void TestMoveTable(TTestActorRuntime& runtime, ui64 txId, const TString& srcMove, const TString& dstMove, const TVector<TEvSchemeShard::EStatus>& expectedResults = {NKikimrScheme::StatusAccepted});
     void TestMoveTable(TTestActorRuntime& runtime, ui64 schemeShard, ui64 txId, const TString& srcMove, const TString& dstMove, const TVector<TEvSchemeShard::EStatus>& expectedResults = {NKikimrScheme::StatusAccepted});
+
+    // move index
+    TEvTx* MoveIndexRequest(ui64 txId, const TString& tablePath, const TString& srcPath, const TString& dstPath, bool allowOverwrite, ui64 schemeShard = TTestTxConfig::SchemeShard, const TApplyIf& applyIf = {});
+    void AsyncMoveIndex(TTestActorRuntime& runtime, ui64 txId, const TString& tablePath, const TString& srcPath, const TString& dstPath, bool allowOverwrite, ui64 schemeShard = TTestTxConfig::SchemeShard);
+    void TestMoveIndex(TTestActorRuntime& runtime, ui64 txId, const TString& tablePath, const TString& srcMove, const TString& dstMove, bool allowOverwrite, const TVector<TEvSchemeShard::EStatus>& expectedResults = {NKikimrScheme::StatusAccepted});
+    void TestMoveIndex(TTestActorRuntime& runtime, ui64 schemeShard, ui64 txId, const TString& tablePath, const TString& srcMove, const TString& dstMove, bool allowOverwrite, const TVector<TEvSchemeShard::EStatus>& expectedResults = {NKikimrScheme::StatusAccepted});
 
     // locks
     TEvTx* LockRequest(ui64 txId, const TString &parentPath, const TString& name);
@@ -440,7 +446,7 @@ namespace NSchemeShardUT_Private {
             TVector<NScheme::TTypeId> KeyColumnTypes;
             TVector<TBorder> Partitioning;
 
-            void ResolveKey(const TTableRange& range, TVector<TKeyDesc::TPartitionInfo>& partitions) const;
+            std::shared_ptr<const TVector<TKeyDesc::TPartitionInfo>> ResolveKey(const TTableRange& range) const;
         };
 
         void FillTablePartitioningInfo();
@@ -450,7 +456,7 @@ namespace NSchemeShardUT_Private {
                 FillTablePartitioningInfo();
             }
 
-            TablePartitioningInfo.ResolveKey(dbKey.Range, dbKey.Partitions);
+            dbKey.Partitioning = TablePartitioningInfo.ResolveKey(dbKey.Range);
             dbKey.Status = TKeyDesc::EStatus::Ok;
         }
 

@@ -19,6 +19,7 @@
 #include <ydb/core/tx/coordinator/coordinator_impl.h>
 #include <ydb/core/tx/datashard/datashard.h>
 #include <ydb/core/tx/long_tx_service/public/events.h>
+#include <ydb/core/tx/long_tx_service/public/lock_handle.h>
 #include <ydb/core/tx/tx_proxy/proxy.h>
 
 #include <ydb/library/yql/dq/runtime/dq_columns_resolve.h>
@@ -30,6 +31,7 @@ namespace NKqp {
 
 using namespace NYql;
 using namespace NYql::NDq;
+using namespace NLongTxService;
 
 namespace {
 
@@ -1182,6 +1184,7 @@ private:
 
         if (lockTxId) {
             dataTransaction.SetLockTxId(*lockTxId);
+            dataTransaction.SetLockNodeId(SelfId().NodeId());
         }
 
         for (auto& task : dataTransaction.GetKqpTransaction().GetTasks()) {
@@ -1570,10 +1573,10 @@ private:
         if (auto locksMap = ExtractLocks(Request.Locks); !locksMap.empty()) {
             YQL_ENSURE(Request.ValidateLocks || Request.EraseLocks);
             auto locksOp = Request.ValidateLocks && Request.EraseLocks
-                ? NKikimrTxDataShard::TKqpLocks::ValidateAndErase
+                ? NKikimrTxDataShard::TKqpLocks::Commit
                 : (Request.ValidateLocks
                         ? NKikimrTxDataShard::TKqpLocks::Validate
-                        : NKikimrTxDataShard::TKqpLocks::Erase);
+                        : NKikimrTxDataShard::TKqpLocks::Rollback);
 
             TSet<ui64> taskShardIds;
             if (Request.ValidateLocks) {
@@ -1616,6 +1619,7 @@ private:
         auto lockTxId = Request.AcquireLocksTxId;
         if (lockTxId.Defined() && *lockTxId == 0) {
             lockTxId = TxId;
+            LockHandle = TLockHandle(TxId, TActivationContext::ActorSystem());
         }
 
         // first, start compute tasks
@@ -1707,6 +1711,9 @@ private:
         }
 
         if (!Locks.empty()) {
+            if (LockHandle) {
+                ResponseEv->LockHandle = std::move(LockHandle);
+            }
             BuildLocks(*response.MutableResult()->MutableLocks(), Locks);
         }
 
@@ -1752,6 +1759,11 @@ private:
         Counters->TxProxyMon->TxExecuteTimeHgram->Collect(totalTime.MilliSeconds());
 
         Send(MakePipePeNodeCacheID(false), new TEvPipeCache::TEvUnlink(0));
+
+        if (UseFollowers) {
+            Send(MakePipePeNodeCacheID(true), new TEvPipeCache::TEvUnlink(0));
+        }
+
         TBase::PassAway();
     }
 
@@ -1844,6 +1856,9 @@ private:
     // Temporary storage during snapshot acquisition
     TVector<NDqProto::TDqTask> ComputeTasks;
     THashMap<ui64, NKikimrTxDataShard::TKqpTransaction> DatashardTxs;
+
+    // Lock handle for a newly acquired lock
+    TLockHandle LockHandle;
 };
 
 } // namespace

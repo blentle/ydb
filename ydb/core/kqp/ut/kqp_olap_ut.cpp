@@ -7,72 +7,151 @@
 #include <contrib/libs/apache/arrow/cpp/src/arrow/api.h>
 #include <contrib/libs/apache/arrow/cpp/src/arrow/ipc/writer.h>
 
+#include <ydb/core/kqp/executer/kqp_executer.h>
+#include <ydb/core/tx/datashard/datashard.h>
+#include <ydb/core/tx/datashard/datashard_ut_common_kqp.h>
+#include <ydb/core/tx/datashard/datashard_ut_common.h>
+#include <ydb/core/grpc_services/local_rpc/local_rpc.h>
+#include <ydb/core/grpc_services/base/base.h>
+#include <ydb/core/tx/tx_proxy/proxy.h>
+#include <ydb/core/tx/schemeshard/schemeshard.h>
+#include <ydb/core/testlib/test_client.h>
+#include <ydb/core/testlib/tablet_helpers.h>
+#include <util/system/sanitizers.h>
+
+
 namespace NKikimr {
 namespace NKqp {
 
+using namespace NKikimr::NDataShard::NKqpHelpers;
+using namespace NSchemeShard;
+using namespace NActors;
 using namespace NYdb;
 using namespace NYdb::NTable;
 using namespace NYdb::NScheme;
 
+using TEvBulkUpsertRequest = NGRpcService::TGrpcRequestOperationCall<Ydb::Table::BulkUpsertRequest,
+    Ydb::Table::BulkUpsertResponse>;
+
 Y_UNIT_TEST_SUITE(KqpOlap) {
-    void EnableDebugLogging(TKikimrRunner& kikimr) {
-        // kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::FLAT_TX_SCHEMESHARD, NActors::NLog::PRI_DEBUG);
-        // kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::TX_PROXY_SCHEME_CACHE, NActors::NLog::PRI_DEBUG);
-        // kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::SCHEME_BOARD_REPLICA, NActors::NLog::PRI_DEBUG);
-        // kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::TX_PROXY, NActors::NLog::PRI_DEBUG);
-        // kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_EXECUTER, NActors::NLog::PRI_DEBUG);
-        kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_COMPUTE, NActors::NLog::PRI_DEBUG);
-        kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_GATEWAY, NActors::NLog::PRI_DEBUG);
-        kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_RESOURCE_MANAGER, NActors::NLog::PRI_DEBUG);
-        kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::LONG_TX_SERVICE, NActors::NLog::PRI_DEBUG);
-        kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::TX_COLUMNSHARD, NActors::NLog::PRI_DEBUG);
-        kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::TX_COLUMNSHARD_SCAN, NActors::NLog::PRI_DEBUG);
-        kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::TX_OLAPSHARD, NActors::NLog::PRI_DEBUG);
-        kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::TX_DATASHARD, NActors::NLog::PRI_DEBUG);
-        kikimr.GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::BLOB_CACHE, NActors::NLog::PRI_DEBUG);
+    void EnableDebugLogging(NActors::TTestActorRuntime* runtime) {
+        //runtime->SetLogPriority(NKikimrServices::FLAT_TX_SCHEMESHARD, NActors::NLog::PRI_DEBUG);
+        // runtime->SetLogPriority(NKikimrServices::TX_PROXY_SCHEME_CACHE, NActors::NLog::PRI_DEBUG);
+        // runtime->SetLogPriority(NKikimrServices::SCHEME_BOARD_REPLICA, NActors::NLog::PRI_DEBUG);
+        // runtime->SetLogPriority(NKikimrServices::TX_PROXY, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::KQP_EXECUTER, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::KQP_COMPUTE, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::KQP_GATEWAY, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::KQP_RESOURCE_MANAGER, NActors::NLog::PRI_DEBUG);
+        //runtime->SetLogPriority(NKikimrServices::LONG_TX_SERVICE, NActors::NLog::PRI_DEBUG);
+        //runtime->SetLogPriority(NKikimrServices::TX_COLUMNSHARD, NActors::NLog::PRI_TRACE);
+        //runtime->SetLogPriority(NKikimrServices::TX_COLUMNSHARD_SCAN, NActors::NLog::PRI_DEBUG);
+        //runtime->SetLogPriority(NKikimrServices::TX_OLAPSHARD, NActors::NLog::PRI_DEBUG);
+        //runtime->SetLogPriority(NKikimrServices::TX_DATASHARD, NActors::NLog::PRI_DEBUG);
+        //runtime->SetLogPriority(NKikimrServices::BLOB_CACHE, NActors::NLog::PRI_DEBUG);
+        //runtime->SetLogPriority(NKikimrServices::GRPC_SERVER, NActors::NLog::PRI_DEBUG);
     }
 
-    void CreateTestOlapTable(TKikimrRunner& kikimr, TString tableName = "olapTable") {
-        auto& legacyClient = kikimr.GetTestClient();
+    void EnableDebugLogging(TKikimrRunner& kikimr) {
+        EnableDebugLogging(kikimr.GetTestServer().GetRuntime());
+    }
 
-        legacyClient.CreateOlapStore("/Root", R"(
-                                     Name: "olapStore"
-                                     ColumnShardCount: 4
-                                     SchemaPresets {
-                                         Name: "default"
-                                         Schema {
-                                             Columns { Name: "timestamp" Type: "Timestamp" }
-                                             #Columns { Name: "resource_type" Type: "Utf8" }
-                                             Columns { Name: "resource_id" Type: "Utf8" }
-                                             Columns { Name: "uid" Type: "Utf8" }
-                                             Columns { Name: "level" Type: "Int32" }
-                                             Columns { Name: "message" Type: "Utf8" }
-                                             #Columns { Name: "json_payload" Type: "Json" }
-                                             #Columns { Name: "ingested_at" Type: "Timestamp" }
-                                             #Columns { Name: "saved_at" Type: "Timestamp" }
-                                             #Columns { Name: "request_id" Type: "Utf8" }
-                                             KeyColumnNames: "timestamp"
-                                             Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
-                                         }
-                                     }
-                                     )");
-        legacyClient.CreateOlapTable("/Root/olapStore", Sprintf(R"(
+    void WaitForSchemeOperation(Tests::TServer& server, TActorId sender, ui64 txId) {
+        auto &runtime = *server.GetRuntime();
+        auto &settings = server.GetSettings();
+        auto request = MakeHolder<NSchemeShard::TEvSchemeShard::TEvNotifyTxCompletion>();
+        request->Record.SetTxId(txId);
+        auto tid = Tests::ChangeStateStorage(Tests::SchemeRoot, settings.Domain);
+        runtime.SendToPipe(tid, sender, request.Release(), 0, GetPipeConfigWithRetries());
+        runtime.GrabEdgeEventRethrow<TEvSchemeShard::TEvNotifyTxCompletionResult>(sender);
+    }
+
+    void CreateTestOlapStore(Tests::TServer& server, TActorId sender, TString scheme) {
+        NKikimrSchemeOp::TColumnStoreDescription store;
+        UNIT_ASSERT(::google::protobuf::TextFormat::ParseFromString(scheme, &store));
+
+        auto request = std::make_unique<TEvTxUserProxy::TEvProposeTransaction>();
+        request->Record.SetExecTimeoutPeriod(Max<ui64>());
+        auto* op = request->Record.MutableTransaction()->MutableModifyScheme();
+        op->SetOperationType(NKikimrSchemeOp::EOperationType::ESchemeOpCreateColumnStore);
+        op->SetWorkingDir("/Root");
+        op->MutableCreateColumnStore()->CopyFrom(store);
+
+        server.GetRuntime()->Send(new IEventHandle(MakeTxProxyID(), sender, request.release()));
+        auto ev = server.GetRuntime()->GrabEdgeEventRethrow<TEvTxUserProxy::TEvProposeTransactionStatus>(sender);
+        ui64 txId = ev->Get()->Record.GetTxId();
+        WaitForSchemeOperation(server, sender, txId);
+    }
+
+    void CreateTestOlapTable(Tests::TServer& server, TActorId sender, TString storeName, TString scheme) {
+        NKikimrSchemeOp::TColumnTableDescription table;
+        UNIT_ASSERT(::google::protobuf::TextFormat::ParseFromString(scheme, &table));
+        auto request = std::make_unique<TEvTxUserProxy::TEvProposeTransaction>();
+        request->Record.SetExecTimeoutPeriod(Max<ui64>());
+        auto* op = request->Record.MutableTransaction()->MutableModifyScheme();
+        op->SetOperationType(NKikimrSchemeOp::EOperationType::ESchemeOpCreateColumnTable);
+        op->SetWorkingDir("/Root/" + storeName);
+        op->MutableCreateColumnTable()->CopyFrom(table);
+
+        server.GetRuntime()->Send(new IEventHandle(MakeTxProxyID(), sender, request.release()));
+        auto ev = server.GetRuntime()->GrabEdgeEventRethrow<TEvTxUserProxy::TEvProposeTransactionStatus>(sender);
+        ui64 txId = ev->Get()->Record.GetTxId();
+        WaitForSchemeOperation(server, sender, txId);
+    }
+
+    void CreateTestOlapTable(Tests::TServer& server, TString tableName = "olapTable", TString storeName = "olapStore",
+                             ui32 storeShardsCount = 4, ui32 tableShardsCount = 3,
+                             TString shardingFunction = "HASH_FUNCTION_CLOUD_LOGS") {
+        TActorId sender = server.GetRuntime()->AllocateEdgeActor();
+        CreateTestOlapStore(server, sender, Sprintf(R"(
+             Name: "%s"
+             ColumnShardCount: %d
+             SchemaPresets {
+                 Name: "default"
+                 Schema {
+                     Columns { Name: "timestamp" Type: "Timestamp" }
+                     #Columns { Name: "resource_type" Type: "Utf8" }
+                     Columns { Name: "resource_id" Type: "Utf8" }
+                     Columns { Name: "uid" Type: "Utf8" }
+                     Columns { Name: "level" Type: "Int32" }
+                     Columns { Name: "message" Type: "Utf8" }
+                     #Columns { Name: "json_payload" Type: "Json" }
+                     #Columns { Name: "ingested_at" Type: "Timestamp" }
+                     #Columns { Name: "saved_at" Type: "Timestamp" }
+                     #Columns { Name: "request_id" Type: "Utf8" }
+                     KeyColumnNames: "timestamp"
+                     Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
+                 }
+             }
+        )", storeName.c_str(), storeShardsCount));
+
+        TString shardingColumns = "[\"timestamp\", \"uid\"]";
+        if (shardingFunction != "HASH_FUNCTION_CLOUD_LOGS") {
+            shardingColumns = "[\"uid\"]";
+        }
+
+        CreateTestOlapTable(server, sender, storeName, Sprintf(R"(
             Name: "%s"
-            ColumnShardCount: 3
+            ColumnShardCount: %d
             Sharding {
                 HashSharding {
-                    Function: HASH_FUNCTION_CLOUD_LOGS
-                    Columns: ["timestamp", "uid"]
+                    Function: %s
+                    Columns: %s
                 }
-            })", tableName.c_str()));
-
-        legacyClient.Ls("/Root");
-        legacyClient.Ls("/Root/olapStore");
-        legacyClient.Ls("/Root/olapStore/" + tableName);
+            })", tableName.c_str(), tableShardsCount, shardingFunction.c_str(), shardingColumns.c_str()));
     }
 
-    std::shared_ptr<arrow::RecordBatch> TestArrowBatch(ui64 pathIdBegin, ui64 tsBegin, size_t rowCount) {
-        auto schema = std::make_shared<arrow::Schema>(
+
+    void CreateTestOlapTable(TKikimrRunner& kikimr, TString tableName = "olapTable", TString storeName = "olapStore",
+                             ui32 storeShardsCount = 4, ui32 tableShardsCount = 3,
+                             TString shardingFunction = "HASH_FUNCTION_CLOUD_LOGS") {
+
+        CreateTestOlapTable(kikimr.GetTestServer(), tableName, storeName, storeShardsCount, tableShardsCount,
+                            shardingFunction);
+    }
+
+    std::shared_ptr<arrow::Schema> GetArrowSchema() {
+        return std::make_shared<arrow::Schema>(
             std::vector<std::shared_ptr<arrow::Field>>{
                 arrow::field("timestamp", arrow::timestamp(arrow::TimeUnit::TimeUnit::MICRO)),
                 arrow::field("resource_id", arrow::utf8()),
@@ -80,6 +159,10 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 arrow::field("level", arrow::int32()),
                 arrow::field("message", arrow::utf8())
             });
+    }
+
+    std::shared_ptr<arrow::RecordBatch> TestArrowBatch(ui64 pathIdBegin, ui64 tsBegin, size_t rowCount) {
+        std::shared_ptr<arrow::Schema> schema = GetArrowSchema();
 
         arrow::TimestampBuilder b1(arrow::timestamp(arrow::TimeUnit::TimeUnit::MICRO), arrow::default_memory_pool());
         arrow::StringBuilder b2;
@@ -144,6 +227,34 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
         NLongTx::TLongTxCommitResult resCommitTx = client.CommitTx(txId).GetValueSync();
         UNIT_ASSERT_VALUES_EQUAL_C(resCommitTx.Status().GetStatus(), EStatus::SUCCESS, resCommitTx.Status().GetIssues().ToString());
+    }
+
+    void SendDataViaActorSystem(NActors::TTestActorRuntime* runtime, TString testTable, ui64 pathIdBegin, ui64 tsBegin, size_t rowCount) {
+        std::shared_ptr<arrow::Schema> schema = GetArrowSchema();
+        TString serializedSchema = NArrow::SerializeSchema(*schema);
+        Y_VERIFY(serializedSchema);
+
+        auto batch = TestBlob(pathIdBegin, tsBegin, rowCount);
+        Y_VERIFY(batch);
+
+        Ydb::Table::BulkUpsertRequest request;
+        request.mutable_arrow_batch_settings()->set_schema(serializedSchema);
+        request.set_data(batch);
+        request.set_table(testTable);
+
+        size_t responses = 0;
+        auto future = NRpcService::DoLocalRpc<TEvBulkUpsertRequest>(std::move(request), "", "", runtime->GetActorSystem(0));
+        future.Subscribe([&](const NThreading::TFuture<Ydb::Table::BulkUpsertResponse> f) mutable {
+            ++responses;
+            UNIT_ASSERT_VALUES_EQUAL(f.GetValueSync().operation().status(), Ydb::StatusIds::SUCCESS);
+        });
+
+        TDispatchOptions options;
+        options.CustomFinalCondition = [&]() {
+            return responses >= 1;
+        };
+
+        runtime->DispatchEvents(options);
     }
 
     TVector<THashMap<TString, NYdb::TValue>> CollectRows(NYdb::NTable::TScanQueryPartIterator& it) {
@@ -303,7 +414,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                                      }
         )");
 
-        legacyClient.CreateOlapTable("/Root/olapStore", R"(
+        legacyClient.CreateColumnTable("/Root/olapStore", R"(
             Name: "OlapParametersTable"
             ColumnShardCount: 1
         )");
@@ -1108,7 +1219,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             if (pushEnabled) {
                 qBuilder << R"(PRAGMA Kikimr.KqpPushOlapProcess = "true";)" << Endl;
             }
-            
+
             qBuilder << R"(PRAGMA Kikimr.OptEnablePredicateExtract = "false";)" << Endl;
             qBuilder << "SELECT `timestamp` FROM `/Root/olapStore/olapTable` WHERE ";
             qBuilder << predicate;
@@ -1273,6 +1384,172 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
             UNIT_ASSERT_VALUES_EQUAL(rows.size(), 0);
         }
+    }
+
+    Y_UNIT_TEST_TWIN(ManyColumnShards, UseSessionActor) {
+        TPortManager tp;
+        ui16 mbusport = tp.GetPort(2134);
+        auto settings = Tests::TServerSettings(mbusport)
+            .SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetNodeCount(2);
+
+        Tests::TServer::TPtr server = new Tests::TServer(settings);
+
+        server->GetRuntime()->GetAppData().FeatureFlags.SetEnableKqpScanQueryMultipleOlapShardsReads(true);
+        server->GetRuntime()->GetAppData().FeatureFlags.SetEnableOlapSchemaOperationsForTest(true);
+
+        auto runtime = server->GetRuntime();
+        auto sender = runtime->AllocateEdgeActor();
+
+        InitRoot(server, sender);
+        EnableDebugLogging(runtime);
+
+        ui32 numShards = NSan::PlainOrUnderSanitizer(1000, 10);
+        ui32 numIterations = NSan::PlainOrUnderSanitizer(50, 10);
+        CreateTestOlapTable(*server, "largeOlapTable", "largeOlapStore", numShards, numShards);
+        ui32 insertRows = 0;
+        for(ui64 i = 0; i < numIterations; ++i) {
+            SendDataViaActorSystem(runtime, "/Root/largeOlapStore/largeOlapTable", 0, 1000000 + i*1000000, 2000);
+            insertRows += 2000;
+        }
+
+        ui64 result = 0;
+        auto captureEvents = [&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle> &ev) -> auto {
+            switch (ev->GetTypeRewrite()) {
+                case NKqp::TKqpExecuterEvents::EvShardsResolveStatus: {
+
+                    auto* msg = ev->Get<NKqp::TEvKqpExecuter::TEvShardsResolveStatus>();
+                    for (auto& [shardId, nodeId]: msg->ShardNodes) {
+                        Cerr << "-- nodeId: " << nodeId << Endl;
+                        nodeId = runtime->GetNodeId(0);
+                    }
+                    break;
+                }
+
+                case NKqp::TKqpExecuterEvents::EvStreamData: {
+                    auto& record = ev->Get<NKqp::TEvKqpExecuter::TEvStreamData>()->Record;
+
+                    Cerr << (TStringBuilder() << "-- EvStreamData: " << record.AsJSON() << Endl);
+                    Cerr.Flush();
+
+                    Y_ASSERT(record.GetResultSet().rows().size() == 1);
+                    Y_ASSERT(record.GetResultSet().rows().at(0).items().size() == 1);
+                    result = record.GetResultSet().rows().at(0).items().at(0).uint64_value();
+
+                    auto resp = MakeHolder<NKqp::TEvKqpExecuter::TEvStreamDataAck>();
+                    resp->Record.SetEnough(false);
+                    resp->Record.SetSeqNo(ev->Get<NKqp::TEvKqpExecuter::TEvStreamData>()->Record.GetSeqNo());
+                    resp->Record.SetFreeSpace(100);
+                    runtime->Send(new IEventHandle(ev->Sender, sender, resp.Release()));
+                    return TTestActorRuntime::EEventAction::DROP;
+                }
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        };
+
+        runtime->SetObserverFunc(captureEvents);
+        auto streamSender = runtime->AllocateEdgeActor();
+        SendRequest(*runtime, streamSender, MakeStreamRequest(streamSender, "SELECT COUNT(*) FROM `/Root/largeOlapStore/largeOlapTable`;", false));
+        auto ev = runtime->GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(streamSender);
+        UNIT_ASSERT_VALUES_EQUAL(result, insertRows);
+    }
+
+    Y_UNIT_TEST_TWIN(ManyColumnShardsWithRestarts, UseSessionActor) {
+        TPortManager tp;
+        ui16 mbusport = tp.GetPort(2134);
+        auto settings = Tests::TServerSettings(mbusport)
+            .SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetNodeCount(2);
+
+        Tests::TServer::TPtr server = new Tests::TServer(settings);
+
+        server->GetRuntime()->GetAppData().FeatureFlags.SetEnableKqpScanQueryMultipleOlapShardsReads(true);
+        server->GetRuntime()->GetAppData().FeatureFlags.SetEnableOlapSchemaOperationsForTest(true);
+
+        auto runtime = server->GetRuntime();
+        auto sender = runtime->AllocateEdgeActor();
+
+        InitRoot(server, sender);
+        EnableDebugLogging(runtime);
+
+        ui32 numShards = NSan::PlainOrUnderSanitizer(100, 10);
+        ui32 numIterations = NSan::PlainOrUnderSanitizer(100, 10);
+        CreateTestOlapTable(*server, "largeOlapTable", "largeOlapStore", numShards, numShards);
+        ui32 insertRows = 0;
+
+        for(ui64 i = 0; i < numIterations; ++i) {
+            SendDataViaActorSystem(runtime, "/Root/largeOlapStore/largeOlapTable", 0, 1000000 + i*1000000, 2000);
+            insertRows += 2000;
+        }
+
+        ui64 result = 0;
+        THashSet<TActorId> columnShardScans;
+        bool prevIsFinished = false;
+
+        auto captureEvents = [&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle> &ev) -> auto {
+            switch (ev->GetTypeRewrite()) {
+                case NKqp::TKqpExecuterEvents::EvShardsResolveStatus: {
+
+                    auto* msg = ev->Get<NKqp::TEvKqpExecuter::TEvShardsResolveStatus>();
+                    for (auto& [shardId, nodeId]: msg->ShardNodes) {
+                        Cerr << "-- nodeId: " << nodeId << Endl;
+                        nodeId = runtime->GetNodeId(0);
+                    }
+                    break;
+                }
+
+                case NKqp::TKqpExecuterEvents::EvStreamData: {
+                    auto& record = ev->Get<NKqp::TEvKqpExecuter::TEvStreamData>()->Record;
+
+                    Cerr << (TStringBuilder() << "-- EvStreamData: " << record.AsJSON() << Endl);
+                    Cerr.Flush();
+
+                    Y_ASSERT(record.GetResultSet().rows().size() == 1);
+                    Y_ASSERT(record.GetResultSet().rows().at(0).items().size() == 1);
+                    result = record.GetResultSet().rows().at(0).items().at(0).uint64_value();
+
+                    auto resp = MakeHolder<NKqp::TEvKqpExecuter::TEvStreamDataAck>();
+                    resp->Record.SetEnough(false);
+                    resp->Record.SetSeqNo(ev->Get<NKqp::TEvKqpExecuter::TEvStreamData>()->Record.GetSeqNo());
+                    resp->Record.SetFreeSpace(100);
+                    runtime->Send(new IEventHandle(ev->Sender, sender, resp.Release()));
+                    return TTestActorRuntime::EEventAction::DROP;
+                }
+
+                case NKqp::TKqpComputeEvents::EvScanData: {
+                    auto [it, success] = columnShardScans.emplace(ev->Sender);
+                    auto* msg = ev->Get<NKqp::TEvKqpCompute::TEvScanData>();
+                    if (success) {
+                        // first scan response.
+                        prevIsFinished = msg->Finished;
+                        return TTestActorRuntime::EEventAction::PROCESS;
+                    } else {
+                        if (prevIsFinished) {
+                            Cerr << (TStringBuilder() << "-- EvScanData from " << ev->Sender << ": hijack event");
+                            Cerr.Flush();
+                            auto resp = std::make_unique<NKqp::TEvKqpCompute::TEvScanError>(msg->Generation);
+                            runtime->Send(new IEventHandle(ev->Recipient, ev->Sender, resp.release()));
+                        } else {
+                            prevIsFinished = msg->Finished;
+                        }
+                        return TTestActorRuntime::EEventAction::PROCESS;
+                    }
+                    break;
+                }
+
+                default:
+                    break;
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        };
+
+        runtime->SetObserverFunc(captureEvents);
+        auto streamSender = runtime->AllocateEdgeActor();
+        SendRequest(*runtime, streamSender, MakeStreamRequest(streamSender, "SELECT COUNT(*) FROM `/Root/largeOlapStore/largeOlapTable`;", false));
+        auto ev = runtime->GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(streamSender);
+        UNIT_ASSERT_VALUES_EQUAL(result, insertRows);
     }
 
     Y_UNIT_TEST_TWIN(StatsSysViewColumns, UseSessionActor) {

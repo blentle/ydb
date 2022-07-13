@@ -52,6 +52,7 @@ struct TSchemaOperation {
         ETypeCreateCdcStream = 13,
         ETypeAlterCdcStream = 14,
         ETypeDropCdcStream = 15,
+        ETypeMoveIndex = 16,
 
         ETypeUnknown = Max<ui32>()
     };
@@ -103,6 +104,7 @@ struct TSchemaOperation {
     bool IsFinalizeBuildIndex() const { return Type == ETypeFinalizeBuildIndex; }
     bool IsDropIndexNotice() const { return Type == ETypeDropIndexNotice; }
     bool IsMove() const { return Type == ETypeMoveTable; }
+    bool IsMoveIndex() const { return Type == ETypeMoveIndex; }
     bool IsCreateCdcStream() const { return Type == ETypeCreateCdcStream; }
     bool IsAlterCdcStream() const { return Type == ETypeAlterCdcStream; }
     bool IsDropCdcStream() const { return Type == ETypeDropCdcStream; }
@@ -136,6 +138,7 @@ public:
     const TString& Body() const { return TxBody; }
 
     ui64 LockTxId() const { return Tx.GetLockTxId(); }
+    ui32 LockNodeId() const { return Tx.GetLockNodeId(); }
     ui64 ProgramSize() const { return Tx.GetMiniKQL().size(); }
     bool Immediate() const { return Tx.GetImmediate(); }
     bool ReadOnly() const { return Tx.GetReadOnly(); }
@@ -501,6 +504,13 @@ public:
     {
         if (DataTx)
             return DataTx->LockTxId();
+        return 0;
+    }
+
+    ui32 LockNodeId() const override
+    {
+        if (DataTx)
+            return DataTx->LockNodeId();
         return 0;
     }
 

@@ -125,7 +125,7 @@ public:
         ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory,
         IHTTPGateway::TPtr s3Gateway,
         ::NPq::NConfigurationManager::IConnections::TPtr pqCmConnections,
-        const NMonitoring::TDynamicCounterPtr& clientCounters,
+        const ::NMonitoring::TDynamicCounterPtr& clientCounters,
         const TString& tenantName
         )
         : YqSharedResources(yqSharedResources)
@@ -143,7 +143,6 @@ public:
         , CredentialsFactory(credentialsFactory)
         , S3Gateway(s3Gateway)
         , PqCmConnections(std::move(pqCmConnections))
-        , Guid(CreateGuidAsString())
         , ClientCounters(clientCounters)
         , TenantName(tenantName)
         , InternalServiceId(MakeInternalServiceActorId())
@@ -159,16 +158,14 @@ public:
         NActors::IActor::PassAway();
     }
 
-    void Bootstrap(const TActorContext& ctx) {
+    void Bootstrap() {
         Become(&TPendingFetcher::StateFunc);
-
-        Y_UNUSED(ctx);
-
         DatabaseResolver = Register(CreateDatabaseResolver(MakeYqlAnalyticsHttpProxyId(), CredentialsFactory));
         Send(SelfId(), new NActors::TEvents::TEvWakeup());
 
-        LOG_I("STARTED");
-        LogScope.ConstructInPlace(NActors::TActivationContext::ActorSystem(), NKikimrServices::YQL_PROXY, Guid);
+        TString guidActor = CreateGuidAsString();
+        LOG_I("STARTED " + guidActor);
+        LogScope.ConstructInPlace(NActors::TActivationContext::ActorSystem(), NKikimrServices::YQL_PROXY, guidActor);
     }
 
 private:
@@ -242,9 +239,10 @@ private:
     }
 
     void GetPendingTask() {
-        LOG_D("Request Private::GetTask" << ", Owner: " << Guid << ", Host: " << HostName() << ", Tenant: " << TenantName);
+        OwnerId = CreateGuidAsString();
+        LOG_D("Request Private::GetTask" << ", Owner: " << OwnerId << ", Host: " << HostName() << ", Tenant: " << TenantName);
         Yq::Private::GetTaskRequest request;
-        request.set_owner_id(Guid);
+        request.set_owner_id(OwnerId);
         request.set_host(HostName());
         request.set_tenant(TenantName);
         Send(InternalServiceId, new TEvInternalService::TEvGetTaskRequest(request));
@@ -308,7 +306,7 @@ private:
             PrivateApiConfig, GatewaysConfig, PingerConfig,
             task.text(), task.scope(), task.user_token(),
             DatabaseResolver, queryId,
-            task.user_id(), Guid, task.generation(),
+            task.user_id(), OwnerId, task.generation(),
             VectorFromProto(task.connection()),
             VectorFromProto(task.binding()),
             CredentialsFactory,
@@ -374,14 +372,14 @@ private:
     const IHTTPGateway::TPtr S3Gateway;
     const ::NPq::NConfigurationManager::IConnections::TPtr PqCmConnections;
 
-    const TString Guid; //OwnerId
-    const NMonitoring::TDynamicCounterPtr ClientCounters;
+    TString OwnerId;
+    const ::NMonitoring::TDynamicCounterPtr ClientCounters;
 
     TMaybe<NYql::NLog::TScopedBackend<NYql::NDq::TYqlLogScope>> LogScope;
 
     struct TQueryCountersInfo {
-        NMonitoring::TDynamicCounterPtr RootCountersParent;
-        NMonitoring::TDynamicCounterPtr PublicCountersParent;
+        ::NMonitoring::TDynamicCounterPtr RootCountersParent;
+        ::NMonitoring::TDynamicCounterPtr PublicCountersParent;
         TActorId RunActorId;
     };
 
@@ -408,7 +406,7 @@ NActors::IActor* CreatePendingFetcher(
     ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory,
     IHTTPGateway::TPtr s3Gateway,
     ::NPq::NConfigurationManager::IConnections::TPtr pqCmConnections,
-    const NMonitoring::TDynamicCounterPtr& clientCounters,
+    const ::NMonitoring::TDynamicCounterPtr& clientCounters,
     const TString& tenantName)
 {
     return new TPendingFetcher(

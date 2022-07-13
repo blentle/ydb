@@ -17,7 +17,7 @@ namespace V1 {
 static const ui32 PersQueueWriteSessionsMaxCount = 1000000;
 static const ui32 PersQueueReadSessionsMaxCount = 100000;
 
-TGRpcPersQueueService::TGRpcPersQueueService(NActors::TActorSystem *system, TIntrusivePtr<NMonitoring::TDynamicCounters> counters, const NActors::TActorId& schemeCache,const NActors::TActorId& grpcRequestProxy)
+TGRpcPersQueueService::TGRpcPersQueueService(NActors::TActorSystem *system, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters, const NActors::TActorId& schemeCache,const NActors::TActorId& grpcRequestProxy)
     : ActorSystem(system)
     , Counters(counters)
     , SchemeCache(schemeCache)
@@ -87,26 +87,6 @@ void TGRpcPersQueueService::SetupIncomingRequests(NGrpc::TLoggerPtr logger) {
                         ActorSystem->Send(GRpcRequestProxy, new NKikimr::NGRpcService::TEvStreamPQWriteRequest(context));
                     },
                     *ActorSystem, "PersQueueService/CreateWriteSession", getCounterBlock("persistent_queue", "WriteSession", true, true), nullptr
-                );
-    }
-
-    {
-        using TBiRequest = Ydb::PersQueue::V1::StreamingReadClientMessage;
-
-        using TBiResponse = Ydb::PersQueue::V1::StreamingReadServerMessage;
-
-        using TStreamGRpcRequest = NGRpcServer::TGRpcStreamingRequest<
-                    TBiRequest,
-                    TBiResponse,
-                    TGRpcPersQueueService,
-                    NKikimrServices::GRPC_SERVER>;
-
-
-        TStreamGRpcRequest::Start(this, this->GetService(), CQ, &Ydb::PersQueue::V1::PersQueueService::AsyncService::RequestStreamingRead,
-                    [this](TIntrusivePtr<TStreamGRpcRequest::IContext> context) {
-                        ActorSystem->Send(GRpcRequestProxy, new NKikimr::NGRpcService::TEvStreamPQReadRequest(context));
-                    },
-                    *ActorSystem, "PersQueueService/CreateReadSession", getCounterBlock("persistent_queue", "ReadSession", true, true), nullptr
                 );
     }
 

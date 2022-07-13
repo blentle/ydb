@@ -18,7 +18,7 @@ namespace NKqp {
 using namespace NYql;
 
 
-NMonitoring::TDynamicCounterPtr TKqpCountersBase::GetQueryReplayCounters() const {
+::NMonitoring::TDynamicCounterPtr TKqpCountersBase::GetQueryReplayCounters() const {
     return QueryReplayGroup;
 }
 
@@ -206,8 +206,8 @@ void TKqpCountersBase::Init() {
     SessionActorCleanupLatency = KqpGroup->GetHistogram(
         "SessionActors/CleanupLatencyMs", NMonitoring::ExponentialHistogram(10, 2, 1));
 
-    SessionBalancerCV = KqpGroup->GetCounter("SessionBalancer/CV", false);
     SessionBalancerShutdowns = KqpGroup->GetCounter("SessionBalancer/Shutdown", true);
+    SessionGracefulShutdownHit = KqpGroup->GetCounter("SessionBalancer/GracefulHit", true);
 
     /* Transactions */
     TxCreated = KqpGroup->GetCounter("Transactions/Created", true);
@@ -268,6 +268,10 @@ void TKqpCountersBase::ReportQueryType(NKikimrKqp::EQueryType type) {
 
 void TKqpCountersBase::ReportSessionShutdownRequest() {
     SessionBalancerShutdowns->Inc();
+}
+
+void TKqpCountersBase::ReportSessionGracefulShutdownHit() {
+    SessionGracefulShutdownHit->Inc();
 }
 
 void TKqpCountersBase::ReportCreateSession(ui64 requestSize) {
@@ -575,15 +579,15 @@ void TKqpCountersBase::ReportRecompileRequestGet() {
 
 
 TKqpDbCounters::TKqpDbCounters() {
-    Counters = new NMonitoring::TDynamicCounters();
+    Counters = new ::NMonitoring::TDynamicCounters();
     KqpGroup = Counters->GetSubgroup("group", "kqp");
     YdbGroup = Counters->GetSubgroup("group", "ydb");
 
     Init();
 }
 
-TKqpDbCounters::TKqpDbCounters(const NMonitoring::TDynamicCounterPtr& externalGroup,
-    const NMonitoring::TDynamicCounterPtr& internalGroup)
+TKqpDbCounters::TKqpDbCounters(const ::NMonitoring::TDynamicCounterPtr& externalGroup,
+    const ::NMonitoring::TDynamicCounterPtr& internalGroup)
 {
     Counters = internalGroup;
     KqpGroup = Counters;
@@ -709,7 +713,7 @@ void TKqpCounters::UpdateTxCounters(const TKqpTransactionInfo& txInfo,
     byKind->Queries->Collect(txInfo.QueriesCount);
 }
 
-TKqpCounters::TKqpCounters(const NMonitoring::TDynamicCounterPtr& counters, const TActorContext* ctx)
+TKqpCounters::TKqpCounters(const ::NMonitoring::TDynamicCounterPtr& counters, const TActorContext* ctx)
     : AllocCounters(counters, "kqp")
 {
     Counters = counters;
@@ -788,7 +792,7 @@ TKqpCounters::TKqpCounters(const NMonitoring::TDynamicCounterPtr& counters, cons
         "NE/ScanTxTotalTimeMs", NMonitoring::ExponentialHistogram(20, 2, 1));
 }
 
-NMonitoring::TDynamicCounterPtr TKqpCounters::GetQueryReplayCounters() const {
+::NMonitoring::TDynamicCounterPtr TKqpCounters::GetQueryReplayCounters() const {
     return QueryReplayGroup;
 }
 
@@ -805,6 +809,14 @@ void TKqpCounters::ReportSessionShutdownRequest(TKqpDbCountersPtr dbCounters) {
     if (dbCounters) {
         dbCounters->ReportSessionShutdownRequest();
     }
+}
+
+void TKqpCounters::ReportSessionGracefulShutdownHit(TKqpDbCountersPtr dbCounters) {
+    TKqpCountersBase::ReportSessionGracefulShutdownHit();
+    if (dbCounters) {
+        dbCounters->ReportSessionGracefulShutdownHit();
+    }
+
 }
 
 void TKqpCounters::ReportCreateSession(TKqpDbCountersPtr dbCounters, ui64 requestSize) {
@@ -1160,11 +1172,11 @@ void TKqpCounters::ReportNewEngineCompatibleQueryStats(NKikimrKqp::EQueryAction 
     }
 }
 
-const NMonitoring::TDynamicCounters::TCounterPtr TKqpCounters::RecompileRequestGet() const {
+const ::NMonitoring::TDynamicCounters::TCounterPtr TKqpCounters::RecompileRequestGet() const {
     return TKqpCountersBase::CompileRequestsRecompile;
 }
 
-NMonitoring::TDynamicCounters::TCounterPtr TKqpCounters::GetQueryTypeCounter(
+::NMonitoring::TDynamicCounters::TCounterPtr TKqpCounters::GetQueryTypeCounter(
     NKikimrKqp::EQueryType queryType)
 {
     return QueryTypes[queryType];

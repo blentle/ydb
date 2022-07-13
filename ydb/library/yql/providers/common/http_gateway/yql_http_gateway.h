@@ -21,9 +21,11 @@ public:
 
     virtual ~IHTTPGateway() = default;
 
+    // Makes http gateways.
+    // Throws on error.
     static TPtr Make(
         const THttpGatewayConfig* httpGatewaysCfg = nullptr,
-        NMonitoring::TDynamicCounterPtr counters = MakeIntrusive<NMonitoring::TDynamicCounters>());
+        ::NMonitoring::TDynamicCounterPtr counters = MakeIntrusive<::NMonitoring::TDynamicCounters>());
 
     class TContentBase : protected TString {
     protected:
@@ -59,9 +61,17 @@ public:
         long HttpResponseCode;
     };
 
+    using THeaders = TSmallVec<TString>;
     using TResult = std::variant<TContent, TIssues>;
     using TOnResult = std::function<void(TResult&&)>;
-    using THeaders = TSmallVec<TString>;
+
+    virtual void Upload(
+        TString url,
+        THeaders headers,
+        TString body,
+        TOnResult callback,
+        bool put = false,
+        IRetryPolicy</*http response code*/long>::TPtr RetryPolicy = IRetryPolicy<long>::GetNoRetryPolicy()) = 0;
 
     virtual void Download(
         TString url,

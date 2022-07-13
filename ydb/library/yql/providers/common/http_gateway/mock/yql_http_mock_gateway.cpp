@@ -43,11 +43,13 @@ public:
         return std::move(ret);
     }
 
+    void Upload(TString, THeaders, TString, TOnResult, bool, IRetryPolicy<long>::TPtr) {}
+
     void Download(
             TString url,
-            IHTTPGateway::THeaders headers,
+            THeaders headers,
             std::size_t expectedSize,
-            IHTTPGateway::TOnResult callback,
+            TOnResult callback,
             TString data,
             IRetryPolicy<long>::TPtr retryPolicy)
     {
@@ -69,10 +71,10 @@ public:
 
      virtual void Download(
             TString ,
-            IHTTPGateway::THeaders ,
+            THeaders ,
             std::size_t ,
-            IHTTPGateway::TOnNewDataPart ,
-            IHTTPGateway::TOnDownloadFinish ) {
+            TOnNewDataPart ,
+            TOnDownloadFinish ) {
     }
 
     void AddDefaultResponse(TDataDefaultResponse response) {
@@ -81,7 +83,7 @@ public:
 
     void AddDownloadResponse(
             TString url,
-            IHTTPGateway::THeaders headers,
+            THeaders headers,
             TString data,
             TDataResponse response) {
 

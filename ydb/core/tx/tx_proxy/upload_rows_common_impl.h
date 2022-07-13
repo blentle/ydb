@@ -152,6 +152,7 @@ protected:
 
     bool WriteToTableShadow = false;
     bool AllowWriteToPrivateTable = false;
+    bool DiskQuotaExceeded = false;
 
     std::shared_ptr<arrow::RecordBatch> Batch;
     float RuCost = 0.0;
@@ -161,7 +162,7 @@ public:
         return DerivedActivityType;
     }
 
-    explicit TUploadRowsBase(TDuration timeout = TDuration::Max())
+    explicit TUploadRowsBase(TDuration timeout = TDuration::Max(), bool diskQuotaExceeded = false)
         : TBase()
         , SchemeCache(MakeSchemeCacheID())
         , LeaderPipeCache(MakePipePeNodeCacheID(false))
@@ -169,6 +170,7 @@ public:
         , WaitingResolveReply(false)
         , Finished(false)
         , Status(Ydb::StatusIds::SUCCESS)
+        , DiskQuotaExceeded(diskQuotaExceeded)
     {}
 
     void Bootstrap(const NActors::TActorContext& ctx) {
@@ -464,7 +466,9 @@ private:
         const NSchemeCache::TSchemeCacheNavigate& request = *ev->Get()->Request;
 
         Y_VERIFY(request.ResultSet.size() == 1);
-        switch (request.ResultSet.front().Status) {
+        const NSchemeCache::TSchemeCacheNavigate::TEntry& entry = request.ResultSet.front();
+
+        switch (entry.Status) {
             case NSchemeCache::TSchemeCacheNavigate::EStatus::Ok:
                 break;
             case NSchemeCache::TSchemeCacheNavigate::EStatus::LookupError:
@@ -481,17 +485,23 @@ private:
                 return ReplyWithError(Ydb::StatusIds::GENERIC_ERROR, Sprintf("Unknown error on table '%s'", GetTable().c_str()), ctx);
         }
 
-        TableKind = request.ResultSet.front().Kind;
-        bool isOlapTable = (TableKind == NSchemeCache::TSchemeCacheNavigate::KindOlapTable);
+        TableKind = entry.Kind;
+        bool isColumnTable = (TableKind == NSchemeCache::TSchemeCacheNavigate::KindColumnTable);
 
-        if (request.ResultSet.front().TableId.IsSystemView()) {
+        if (entry.TableId.IsSystemView()) {
             return ReplyWithError(Ydb::StatusIds::SCHEME_ERROR,
                 Sprintf("Table '%s' is a system view. Bulk upsert is not supported.", GetTable().c_str()), ctx);
         }
 
+        // TODO: fast fail for all tables?
+        if (isColumnTable && DiskQuotaExceeded) {
+            return ReplyWithError(Ydb::StatusIds::UNAVAILABLE,
+                "Cannot perform writes: database is out of disk space", ctx);
+        }
+
         ResolveNamesResult.reset(ev->Get()->Request.Release());
 
-        bool makeYdbSchema = isOlapTable || (GetSourceType() != EUploadSource::ProtoValues);
+        bool makeYdbSchema = isColumnTable || (GetSourceType() != EUploadSource::ProtoValues);
         TString errorMessage;
         if (!BuildSchema(ctx, errorMessage, makeYdbSchema)) {
             return ReplyWithError(Ydb::StatusIds::SCHEME_ERROR, errorMessage, ctx);
@@ -504,7 +514,7 @@ private:
                     return ReplyWithError(Ydb::StatusIds::BAD_REQUEST, errorMessage, ctx);
                 }
 
-                if (isOlapTable) {
+                if (isColumnTable) {
                     // TUploadRowsRPCPublic::ExtractBatch() - converted JsonDocument, DynNumbers, ...
                     if (!ExtractBatch(errorMessage)) {
                         return ReplyWithError(Ydb::StatusIds::BAD_REQUEST, errorMessage, ctx);
@@ -517,7 +527,7 @@ private:
             case EUploadSource::ArrowBatch:
             case EUploadSource::CSV:
             {
-                if (isOlapTable) {
+                if (isColumnTable) {
                     // TUploadColumnsRPCPublic::ExtractBatch() - NOT converted JsonDocument, DynNumbers, ...
                     if (!ExtractBatch(errorMessage)) {
                         return ReplyWithError(Ydb::StatusIds::BAD_REQUEST, errorMessage, ctx);
@@ -557,15 +567,15 @@ private:
 
         if (TableKind == NSchemeCache::TSchemeCacheNavigate::KindTable) {
             ResolveShards(ctx);
-        } else if (isOlapTable) {
-            WriteToOlapTable(ctx);
+        } else if (isColumnTable) {
+            WriteToColumnTable(ctx);
         } else {
             return ReplyWithError(Ydb::StatusIds::SCHEME_ERROR,
                 Sprintf("Table '%s': Bulk upsert is not supported for this table kind.", GetTable().c_str()), ctx);
         }
     }
 
-    void WriteToOlapTable(const NActors::TActorContext& ctx) {
+    void WriteToColumnTable(const NActors::TActorContext& ctx) {
         TString accessCheckError;
         if (!CheckAccess(accessCheckError)) {
             return ReplyWithError(Ydb::StatusIds::UNAUTHORIZED, accessCheckError, ctx);
@@ -663,17 +673,17 @@ private:
 
         auto& entry = ResolveNamesResult->ResultSet[0];
 
-        if (entry.Kind != NSchemeCache::TSchemeCacheNavigate::KindOlapTable) {
+        if (entry.Kind != NSchemeCache::TSchemeCacheNavigate::KindColumnTable) {
             ReplyWithError(Ydb::StatusIds::SCHEME_ERROR, "The specified path is not an olap table", ctx);
             return {};
         }
 
-        if (!entry.OlapTableInfo || !entry.OlapTableInfo->Description.HasSchema()) {
+        if (!entry.ColumnTableInfo || !entry.ColumnTableInfo->Description.HasSchema()) {
             ReplyWithError(Ydb::StatusIds::SCHEME_ERROR, "Olap table expected", ctx);
             return {};
         }
 
-        const auto& description = entry.OlapTableInfo->Description;
+        const auto& description = entry.ColumnTableInfo->Description;
         const auto& schema = description.GetSchema();
 
 #if 1 // TODO: do we need this restriction?
@@ -862,7 +872,8 @@ private:
             return JoinVectorIntoString(shards, ", ");
         };
 
-        LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Range shards: " << getShardsString(GetKeyRange()->Partitions));
+        LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Range shards: "
+            << getShardsString(GetKeyRange()->GetPartitions()));
 
         MakeShardRequests(ctx);
     }
@@ -870,13 +881,13 @@ private:
     void MakeShardRequests(const NActors::TActorContext& ctx) {
         const auto* keyRange = GetKeyRange();
 
-        Y_VERIFY(!keyRange->Partitions.empty());
+        Y_VERIFY(!keyRange->GetPartitions().empty());
 
         // Group rows by shard id
-        TVector<std::unique_ptr<TEvDataShard::TEvUploadRowsRequest>> shardRequests(keyRange->Partitions.size());
+        TVector<std::unique_ptr<TEvDataShard::TEvUploadRowsRequest>> shardRequests(keyRange->GetPartitions().size());
         for (const auto& keyValue : GetRows()) {
             // Find partition for the key
-            auto it = std::lower_bound(keyRange->Partitions.begin(), keyRange->Partitions.end(), keyValue.first.GetCells(),
+            auto it = std::lower_bound(keyRange->GetPartitions().begin(), keyRange->GetPartitions().end(), keyValue.first.GetCells(),
                 [this](const auto &partition, const auto& key) {
                     const auto& range = *partition.Range;
                     const int cmp = CompareBorders<true, false>(range.EndKeyPrefix.GetCells(), key,
@@ -885,7 +896,7 @@ private:
                     return (cmp < 0);
                 });
 
-            size_t shardIdx = it - keyRange->Partitions.begin();
+            size_t shardIdx = it - keyRange->GetPartitions().begin();
 
             TEvDataShard::TEvUploadRowsRequest* ev = shardRequests[shardIdx].get();
             if (!ev) {
@@ -915,7 +926,7 @@ private:
             if (!shardRequests[idx])
                 continue;
 
-            TTabletId shardId = keyRange->Partitions[idx].ShardId;
+            TTabletId shardId = keyRange->GetPartitions()[idx].ShardId;
 
             LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Sending request to shards " << shardId);
 

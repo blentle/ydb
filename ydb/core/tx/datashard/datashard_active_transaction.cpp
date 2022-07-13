@@ -46,7 +46,7 @@ TValidatedDataTx::TValidatedDataTx(TDataShard *self,
              "One of the fields should be set: MiniKQL, ReadTableTransaction, KqpTransaction");
 
     if (Tx.GetLockTxId())
-        EngineBay.SetLockTxId(Tx.GetLockTxId());
+        EngineBay.SetLockTxId(Tx.GetLockTxId(), Tx.GetLockNodeId());
 
     if (Tx.GetImmediate())
         EngineBay.SetIsImmediateTx();
@@ -286,8 +286,14 @@ bool TValidatedDataTx::CheckCancelled() {
 void TValidatedDataTx::ReleaseTxData() {
     TxBody = "";
     auto lock = Tx.GetLockTxId();
+    auto lockNode = Tx.GetLockNodeId();
     Tx.Clear();
-    Tx.SetLockTxId(lock);
+    if (lock) {
+        Tx.SetLockTxId(lock);
+    }
+    if (lockNode) {
+        Tx.SetLockNodeId(lockNode);
+    }
     EngineBay.DestroyEngine();
     IsReleased = true;
 
@@ -428,7 +434,8 @@ bool TActiveTransaction::BuildSchemeTx()
         + (ui32)SchemeTx->HasMoveTable()
         + (ui32)SchemeTx->HasCreateCdcStreamNotice()
         + (ui32)SchemeTx->HasAlterCdcStreamNotice()
-        + (ui32)SchemeTx->HasDropCdcStreamNotice();
+        + (ui32)SchemeTx->HasDropCdcStreamNotice()
+        + (ui32)SchemeTx->HasMoveIndex();
     if (count != 1)
         return false;
 
@@ -462,6 +469,8 @@ bool TActiveTransaction::BuildSchemeTx()
         SchemeTxType = TSchemaOperation::ETypeAlterCdcStream;
     else if (SchemeTx->HasDropCdcStreamNotice())
         SchemeTxType = TSchemaOperation::ETypeDropCdcStream;
+    else if (SchemeTx->HasMoveIndex())
+        SchemeTxType = TSchemaOperation::ETypeMoveIndex;
     else
         SchemeTxType = TSchemaOperation::ETypeUnknown;
 
@@ -859,6 +868,7 @@ void TActiveTransaction::BuildExecutionPlan(bool loaded)
         plan.push_back(EExecutionUnitKind::FinalizeBuildIndex);
         plan.push_back(EExecutionUnitKind::DropIndexNotice);
         plan.push_back(EExecutionUnitKind::MoveTable);
+        plan.push_back(EExecutionUnitKind::MoveIndex);
         plan.push_back(EExecutionUnitKind::CreateCdcStream);
         plan.push_back(EExecutionUnitKind::AlterCdcStream);
         plan.push_back(EExecutionUnitKind::DropCdcStream);

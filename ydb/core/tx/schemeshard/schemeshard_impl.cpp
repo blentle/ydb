@@ -67,6 +67,11 @@ void TSchemeShard::ActivateAfterInitialization(const TActorContext& ctx,
     LoginProvider.Audience = TPath::Init(subDomainPathId, this).PathString();
     domainPtr->UpdateSecurityState(LoginProvider.GetSecurityState());
 
+    TTabletId sysViewProcessorId = domainPtr->GetTenantSysViewProcessorID();
+    auto evInit = MakeHolder<NSysView::TEvSysView::TEvInitPartitionStatsCollector>(
+        GetDomainKey(subDomainPathId), sysViewProcessorId ? sysViewProcessorId.GetValue() : 0);
+    Send(SysPartitionStatsCollector, evInit.Release());
+
     Execute(CreateTxInitPopulator(std::move(delayPublications)), ctx);
 
     if (tablesToClean) {
@@ -977,13 +982,13 @@ bool TSchemeShard::TabletResolveChannelsDetails(ui32 profileId, const TChannelPr
     return true;
 }
 
-TPathId TSchemeShard::ResolveDomainId(TPathId pathId) const {
+TPathId TSchemeShard::ResolvePathIdForDomain(TPathId pathId) const {
     Y_VERIFY(pathId != InvalidPathId);
     Y_VERIFY(PathsById.contains(pathId));
-    return ResolveDomainId(PathsById.at(pathId));
+    return ResolvePathIdForDomain(PathsById.at(pathId));
 }
 
-TPathId TSchemeShard::ResolveDomainId(TPathElement::TPtr pathEl) const {
+TPathId TSchemeShard::ResolvePathIdForDomain(TPathElement::TPtr pathEl) const {
     TPathId domainId = pathEl->IsDomainRoot()
             ? pathEl->PathId
             : pathEl->DomainPathId;
@@ -998,18 +1003,24 @@ TSubDomainInfo::TPtr TSchemeShard::ResolveDomainInfo(TPathId pathId) const {
 }
 
 TSubDomainInfo::TPtr TSchemeShard::ResolveDomainInfo(TPathElement::TPtr pathEl) const {
-    TPathId domainId = ResolveDomainId(pathEl);
+    TPathId domainId = ResolvePathIdForDomain(pathEl);
     Y_VERIFY(SubDomains.contains(domainId));
     auto info = SubDomains.at(domainId);
     Y_VERIFY(info);
     return info;
 }
 
+TPathId TSchemeShard::GetDomainKey(TPathElement::TPtr pathEl) const {
+    auto pathIdForDomain = ResolvePathIdForDomain(pathEl);
+    TPathElement::TPtr domainPathElement = PathsById.at(pathIdForDomain);
+    Y_VERIFY(domainPathElement);
+    return domainPathElement->IsRoot() ? ParentDomainId : pathIdForDomain;
+}
+
 TPathId TSchemeShard::GetDomainKey(TPathId pathId) const {
-    auto domainId = ResolveDomainId(pathId);
-    TPathElement::TPtr domainElement = PathsById.at(domainId);
-    Y_VERIFY(domainElement);
-    return domainElement->IsRoot() ? ParentDomainId : domainId;
+    Y_VERIFY(pathId != InvalidPathId);
+    Y_VERIFY(PathsById.contains(pathId));
+    return GetDomainKey(PathsById.at(pathId));
 }
 
 const NKikimrSubDomains::TProcessingParams &TSchemeShard::SelectProcessingPrarams(TPathId id) const {
@@ -1249,7 +1260,7 @@ TPathElement::EPathState TSchemeShard::CalcPathState(TTxState::ETxType txType, T
     case TTxState::TxCreateRtmrVolume:
     case TTxState::TxCreateTableIndex:
     case TTxState::TxCreateOlapStore:
-    case TTxState::TxCreateOlapTable:
+    case TTxState::TxCreateColumnTable:
     case TTxState::TxCreateCdcStream:
     case TTxState::TxCreateSequence:
     case TTxState::TxCreateReplication:
@@ -1271,7 +1282,7 @@ TPathElement::EPathState TSchemeShard::CalcPathState(TTxState::ETxType txType, T
     case TTxState::TxAlterSolomonVolume:
     case TTxState::TxDropTableIndexAtMainTable:
     case TTxState::TxAlterOlapStore:
-    case TTxState::TxAlterOlapTable:
+    case TTxState::TxAlterColumnTable:
     case TTxState::TxAlterCdcStream:
     case TTxState::TxAlterCdcStreamAtTable:
     case TTxState::TxCreateCdcStreamAtTable:
@@ -1279,6 +1290,7 @@ TPathElement::EPathState TSchemeShard::CalcPathState(TTxState::ETxType txType, T
     case TTxState::TxAlterSequence:
     case TTxState::TxAlterReplication:
     case TTxState::TxAlterBlobDepot:
+    case TTxState::TxUpdateMainTableOnIndexMove:
         return TPathElement::EPathState::EPathStateAlter;
     case TTxState::TxDropTable:
     case TTxState::TxDropPQGroup:
@@ -1292,7 +1304,7 @@ TPathElement::EPathState TSchemeShard::CalcPathState(TTxState::ETxType txType, T
     case TTxState::TxDropSolomonVolume:
     case TTxState::TxDropTableIndex:
     case TTxState::TxDropOlapStore:
-    case TTxState::TxDropOlapTable:
+    case TTxState::TxDropColumnTable:
     case TTxState::TxDropCdcStream:
     case TTxState::TxDropSequence:
     case TTxState::TxDropReplication:
@@ -2114,7 +2126,7 @@ void TSchemeShard::PersistTablePartitionCondErase(NIceDb::TNiceDb& db, const TPa
     }
 }
 
-void TSchemeShard::PersistTablePartitionStats(NIceDb::TNiceDb& db, const TPathId& tableId, ui64 partitionId, const TTableInfo::TPartitionStats& stats) {
+void TSchemeShard::PersistTablePartitionStats(NIceDb::TNiceDb& db, const TPathId& tableId, ui64 partitionId, const TPartitionStats& stats) {
     if (!AppData()->FeatureFlags.GetEnablePersistentPartitionStats()) {
         return;
     }
@@ -2917,7 +2929,7 @@ void TSchemeShard::PersistOlapStoreAlterRemove(NIceDb::TNiceDb& db, TPathId path
     PersistOlapStoreRemove(db, pathId, true);
 }
 
-void TSchemeShard::PersistOlapTable(NIceDb::TNiceDb& db, TPathId pathId, const TOlapTableInfo& tableInfo, bool isAlter)
+void TSchemeShard::PersistColumnTable(NIceDb::TNiceDb& db, TPathId pathId, const TColumnTableInfo& tableInfo, bool isAlter)
 {
     Y_VERIFY(IsLocalId(pathId));
 
@@ -2927,62 +2939,62 @@ void TSchemeShard::PersistOlapTable(NIceDb::TNiceDb& db, TPathId pathId, const T
     Y_VERIFY(tableInfo.Sharding.SerializeToString(&serializedSharding));
 
     if (isAlter) {
-        db.Table<Schema::OlapTablesAlters>().Key(pathId.LocalPathId).Update(
-            NIceDb::TUpdate<Schema::OlapTablesAlters::AlterVersion>(tableInfo.AlterVersion),
-            NIceDb::TUpdate<Schema::OlapTablesAlters::Description>(serialized),
-            NIceDb::TUpdate<Schema::OlapTablesAlters::Sharding>(serializedSharding));
+        db.Table<Schema::ColumnTablesAlters>().Key(pathId.LocalPathId).Update(
+            NIceDb::TUpdate<Schema::ColumnTablesAlters::AlterVersion>(tableInfo.AlterVersion),
+            NIceDb::TUpdate<Schema::ColumnTablesAlters::Description>(serialized),
+            NIceDb::TUpdate<Schema::ColumnTablesAlters::Sharding>(serializedSharding));
         if (tableInfo.AlterBody) {
             TString serializedAlterBody;
             Y_VERIFY(tableInfo.AlterBody->SerializeToString(&serializedAlterBody));
-            db.Table<Schema::OlapTablesAlters>().Key(pathId.LocalPathId).Update(
-                NIceDb::TUpdate<Schema::OlapTablesAlters::AlterBody>(serializedAlterBody));
+            db.Table<Schema::ColumnTablesAlters>().Key(pathId.LocalPathId).Update(
+                NIceDb::TUpdate<Schema::ColumnTablesAlters::AlterBody>(serializedAlterBody));
         }
     } else {
-        db.Table<Schema::OlapTables>().Key(pathId.LocalPathId).Update(
-            NIceDb::TUpdate<Schema::OlapTables::AlterVersion>(tableInfo.AlterVersion),
-            NIceDb::TUpdate<Schema::OlapTables::Description>(serialized),
-            NIceDb::TUpdate<Schema::OlapTables::Sharding>(serializedSharding));
+        db.Table<Schema::ColumnTables>().Key(pathId.LocalPathId).Update(
+            NIceDb::TUpdate<Schema::ColumnTables::AlterVersion>(tableInfo.AlterVersion),
+            NIceDb::TUpdate<Schema::ColumnTables::Description>(serialized),
+            NIceDb::TUpdate<Schema::ColumnTables::Sharding>(serializedSharding));
     }
 }
 
-void TSchemeShard::PersistOlapTableRemove(NIceDb::TNiceDb& db, TPathId pathId, bool isAlter)
+void TSchemeShard::PersistColumnTableRemove(NIceDb::TNiceDb& db, TPathId pathId, bool isAlter)
 {
     Y_VERIFY(IsLocalId(pathId));
 
     if (isAlter) {
-        db.Table<Schema::OlapTablesAlters>().Key(pathId.LocalPathId).Delete();
+        db.Table<Schema::ColumnTablesAlters>().Key(pathId.LocalPathId).Delete();
         return;
     }
 
-    if (!OlapTables.contains(pathId)) {
+    if (!ColumnTables.contains(pathId)) {
         return;
     }
 
-    auto tableInfo = OlapTables.at(pathId);
+    auto tableInfo = ColumnTables.at(pathId);
     if (tableInfo->AlterData) {
-        PersistOlapTableAlterRemove(db, pathId);
+        PersistColumnTableAlterRemove(db, pathId);
     }
 
     // Unlink table from olap store
     if (OlapStores.contains(tableInfo->OlapStorePathId)) {
         auto storeInfo = OlapStores.at(tableInfo->OlapStorePathId);
-        storeInfo->OlapTablesUnderOperation.erase(pathId);
-        storeInfo->OlapTables.erase(pathId);
+        storeInfo->ColumnTablesUnderOperation.erase(pathId);
+        storeInfo->ColumnTables.erase(pathId);
     }
 
-    db.Table<Schema::OlapTables>().Key(pathId.LocalPathId).Delete();
-    OlapTables.erase(pathId);
+    db.Table<Schema::ColumnTables>().Key(pathId.LocalPathId).Delete();
+    ColumnTables.erase(pathId);
     DecrementPathDbRefCount(pathId);
 }
 
-void TSchemeShard::PersistOlapTableAlter(NIceDb::TNiceDb& db, TPathId pathId, const TOlapTableInfo& tableInfo)
+void TSchemeShard::PersistColumnTableAlter(NIceDb::TNiceDb& db, TPathId pathId, const TColumnTableInfo& tableInfo)
 {
-    PersistOlapTable(db, pathId, tableInfo, true);
+    PersistColumnTable(db, pathId, tableInfo, true);
 }
 
-void TSchemeShard::PersistOlapTableAlterRemove(NIceDb::TNiceDb& db, TPathId pathId)
+void TSchemeShard::PersistColumnTableAlterRemove(NIceDb::TNiceDb& db, TPathId pathId)
 {
-    PersistOlapTableRemove(db, pathId, true);
+    PersistColumnTableRemove(db, pathId, true);
 }
 
 void TSchemeShard::PersistSequence(NIceDb::TNiceDb& db, TPathId pathId, const TSequenceInfo& sequenceInfo)
@@ -3282,9 +3294,9 @@ void TSchemeShard::PersistRemoveTable(NIceDb::TNiceDb& db, TPathId pathId, const
     }
 
     if (!tableInfo->IsBackup && !tableInfo->IsShardsStatsDetached()) {
-        auto subDomainId = ResolveDomainId(pathId);
+        auto subDomainId = ResolvePathIdForDomain(pathId);
         auto subDomainInfo = ResolveDomainInfo(pathId);
-        subDomainInfo->AggrDiskSpaceUsage(this, TTableInfo::TPartitionStats(), tableInfo->GetStats().Aggregated);
+        subDomainInfo->AggrDiskSpaceUsage(this, TPartitionStats(), tableInfo->GetStats().Aggregated);
         if (subDomainInfo->CheckDiskSpaceQuotas(this)) {
             PersistSubDomainState(db, subDomainId, *subDomainInfo);
             // Publish is done in a separate transaction, so we may call this directly
@@ -3576,9 +3588,9 @@ NKikimrSchemeOp::TPathVersion TSchemeShard::GetPathVersion(const TPath& path) co
                 generalVersion += result.GetColumnStoreVersion();
                 break;
             case NKikimrSchemeOp::EPathType::EPathTypeColumnTable: {
-                Y_VERIFY_S(OlapTables.contains(pathId),
+                Y_VERIFY_S(ColumnTables.contains(pathId),
                            "no olap table with id: " << pathId << ", at schemeshard: " << SelfTabletId());
-                auto tableInfo = OlapTables.at(pathId);
+                auto tableInfo = ColumnTables.at(pathId);
 
                 result.SetColumnTableVersion(tableInfo->AlterVersion);
                 generalVersion += result.GetColumnTableVersion();
@@ -3600,15 +3612,6 @@ NKikimrSchemeOp::TPathVersion TSchemeShard::GetPathVersion(const TPath& path) co
                 if (tableInfo->Description.HasTtlSettings()) {
                     result.SetColumnTableTtlSettingsVersion(tableInfo->Description.GetTtlSettings().GetVersion());
                 }
-#if 0
-                else if (tableInfo->Description.HasTtlSettingsPresetId() && tableInfo->OlapStorePathId) {
-                    auto storeInfo = OlapStores.at(tableInfo->OlapStorePathId);
-                    auto& preset = storeInfo->TtlSettingsPresets.at(tableInfo->Description.GetTtlSettingsPresetId());
-                    result.SetColumnTableTtlSettingsVersion(tableInfo->Description.GetTtlSettingsPresetVersionAdj() + preset.Version);
-                } else {
-                    result.SetColumnTableTtlSettingsVersion(tableInfo->Description.GetTtlSettingsPresetVersionAdj());
-                }
-#endif
                 generalVersion += result.GetColumnTableTtlSettingsVersion();
 
                 break;
@@ -4386,15 +4389,15 @@ void TSchemeShard::MarkAsMigrated(TPathElement::TPtr node, const TActorContext &
                "Mark as Migrated path id " << node->PathId);
 
     Y_VERIFY(!node->Dropped());
-    Y_VERIFY_S(PathsById.contains(ResolveDomainId(node)),
+    Y_VERIFY_S(PathsById.contains(ResolvePathIdForDomain(node)),
                "details:"
                    << " node->PathId: " << node->PathId
                    << ", node->DomainPathId: " << node->DomainPathId);
 
-    Y_VERIFY_S(PathsById.at(ResolveDomainId(node))->IsExternalSubDomainRoot(),
+    Y_VERIFY_S(PathsById.at(ResolvePathIdForDomain(node))->IsExternalSubDomainRoot(),
                "details:"
-                   << " pathId: " << ResolveDomainId(node)
-                   << ", pathType: " << NKikimrSchemeOp::EPathType_Name(PathsById.at(ResolveDomainId(node))->PathType));
+                   << " pathId: " << ResolvePathIdForDomain(node)
+                   << ", pathType: " << NKikimrSchemeOp::EPathType_Name(PathsById.at(ResolvePathIdForDomain(node))->PathType));
 
     node->PathState = TPathElement::EPathState::EPathStateMigrated;
 
@@ -4445,7 +4448,7 @@ void TSchemeShard::DropNode(TPathElement::TPtr node, TStepId step, TTxId txId, N
             PersistOlapStoreRemove(db, node->PathId);
             break;
         case TPathElement::EPathType::EPathTypeColumnTable:
-            PersistOlapTableRemove(db, node->PathId);
+            PersistColumnTableRemove(db, node->PathId);
             break;
         case TPathElement::EPathType::EPathTypeSubDomain:
         case TPathElement::EPathType::EPathTypeExtSubDomain:
@@ -4662,6 +4665,7 @@ void TSchemeShard::Handle(TEvTabletPipe::TEvClientConnected::TPtr &ev, const TAc
                    << ", at schemeshard: " << TabletID());
 
     BorrowedCompactionHandleDisconnect(tabletId, clientId);
+    ConditionalEraseHandleDisconnect(tabletId, clientId, ctx);
     RestartPipeTx(tabletId, ctx);
 }
 
@@ -4700,6 +4704,7 @@ void TSchemeShard::Handle(TEvTabletPipe::TEvClientDestroyed::TPtr &ev, const TAc
     }
 
     BorrowedCompactionHandleDisconnect(tabletId, clientId);
+    ConditionalEraseHandleDisconnect(tabletId, clientId, ctx);
     RestartPipeTx(tabletId, ctx);
 }
 
@@ -5879,6 +5884,23 @@ bool TSchemeShard::FillUniformPartitioning(TVector<TString>& rangeEnds, ui32 key
     return true;
 }
 
+void TSchemeShard::SetPartitioning(TPathId pathId, TOlapStoreInfo::TPtr storeInfo) {
+    const TVector<TShardIdx>& partitioning = storeInfo->ColumnShards;
+
+    if (AppData()->FeatureFlags.GetEnableSystemViews()) {
+        TVector<std::pair<ui64, ui64>> shardIndices;
+        shardIndices.reserve(partitioning.size());
+        for (auto& shardIdx : partitioning) {
+            shardIndices.emplace_back(ui64(shardIdx.GetOwnerId()), ui64(shardIdx.GetLocalId()));
+        }
+
+        auto path = TPath::Init(pathId, this);
+        auto ev = MakeHolder<NSysView::TEvSysView::TEvSetPartitioning>(GetDomainKey(pathId), pathId, path.PathString());
+        ev->ShardIndices.swap(shardIndices);
+        Send(SysPartitionStatsCollector, ev.Release());
+    }
+}
+
 void TSchemeShard::SetPartitioning(TPathId pathId, TTableInfo::TPtr tableInfo, TVector<TTableShardInfo>&& newPartitioning) {
     if (AppData()->FeatureFlags.GetEnableSystemViews()) {
         TVector<std::pair<ui64, ui64>> shardIndices;
@@ -6101,7 +6123,7 @@ void TSchemeShard::ApplyConsoleConfigs(const NKikimrConfig::TFeatureFlags& featu
 void TSchemeShard::ConfigureStatsBatching(const NKikimrConfig::TSchemeShardConfig& config, const TActorContext& ctx) {
     StatsBatchTimeout = TDuration::MilliSeconds(config.GetStatsBatchTimeoutMs());
     StatsMaxBatchSize = config.GetStatsMaxBatchSize();
-    StatsMaxExecuteTime = TDuration::MicroSeconds(config.GetStatsMaxExecuteMs());
+    StatsMaxExecuteTime = TDuration::MilliSeconds(config.GetStatsMaxExecuteMs());
     LOG_NOTICE_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
                  "StatsBatching config: StatsBatchTimeout# " << StatsBatchTimeout
                  << ", StatsMaxBatchSize# " << StatsMaxBatchSize

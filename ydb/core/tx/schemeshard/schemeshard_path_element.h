@@ -448,7 +448,7 @@ public:
         return PathType == EPathType::EPathTypeColumnStore;
     }
 
-    bool IsOlapTable() const {
+    bool IsColumnTable() const {
         return PathType == EPathType::EPathTypeColumnTable;
     }
 
@@ -513,6 +513,14 @@ public:
 
     bool IsMigrated() const {
         return PathState == EPathState::EPathStateMigrated;
+    }
+
+    bool IsUnderMoving() const {
+        return PathState == EPathState::EPathStateMoving;
+    }
+
+    bool IsUnderCreating() const {
+        return PathState == EPathState::EPathStateCreate;
     }
 
     bool PlannedToCreate() const {

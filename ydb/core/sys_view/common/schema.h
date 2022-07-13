@@ -33,6 +33,9 @@ constexpr TStringBuf QueryMetricsName = "query_metrics_one_minute";
 constexpr TStringBuf StorePrimaryIndexStatsName = "store_primary_index_stats";
 constexpr TStringBuf TablePrimaryIndexStatsName = "primary_index_stats";
 
+constexpr TStringBuf TopPartitions1MinuteName = "top_partitions_one_minute";
+constexpr TStringBuf TopPartitions1HourName = "top_partitions_one_hour";
+
 struct Schema : NIceDb::Schema {
     struct PartitionStats : Table<1> {
         struct OwnerId              : Column<1, NScheme::NTypeIds::Uint64> {};
@@ -420,6 +423,34 @@ struct Schema : NIceDb::Schema {
         using TColumns = TableColumns<PDiskFilter, ErasureSpecies, CurrentGroupsCreated, CurrentAllocatedSize,
                                       CurrentAvailableSize, AvailableGroupsToCreate, AvailableSizeToCreate>;
     };
+
+    struct TopPartitions : Table<12> {
+        struct IntervalEnd     : Column<1, NScheme::NTypeIds::Timestamp> {};
+        struct Rank            : Column<2, NScheme::NTypeIds::Uint32> {};
+        struct TabletId        : Column<3, NScheme::NTypeIds::Uint64> {};
+        struct Path            : Column<4, NScheme::NTypeIds::Utf8> {};
+        struct PeakTime        : Column<5, NScheme::NTypeIds::Timestamp> {};
+        struct CPUCores        : Column<6, NScheme::NTypeIds::Double> {};
+        struct NodeId          : Column<7, NScheme::NTypeIds::Uint32> {};
+        struct DataSize        : Column<8, NScheme::NTypeIds::Uint64> {};
+        struct RowCount        : Column<9, NScheme::NTypeIds::Uint64> {};
+        struct IndexSize       : Column<10, NScheme::NTypeIds::Uint64> {};
+        struct InFlightTxCount : Column<11, NScheme::NTypeIds::Uint32> {};
+
+        using TKey = TableKey<IntervalEnd, Rank>;
+        using TColumns = TableColumns<
+            IntervalEnd,
+            Rank,
+            TabletId,
+            Path,
+            PeakTime,
+            CPUCores,
+            NodeId,
+            DataSize,
+            RowCount,
+            IndexSize,
+            InFlightTxCount>;
+    };
 };
 
 bool MaybeSystemViewPath(const TVector<TString>& path);
@@ -433,7 +464,7 @@ public:
         Domain,
         SubDomain,
         OlapStore,
-        OlapTable
+        ColumnTable
     };
 
     struct TSystemViewPath {

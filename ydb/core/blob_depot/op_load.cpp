@@ -1,16 +1,23 @@
 #include "blob_depot_tablet.h"
 #include "schema.h"
+#include "blocks.h"
+#include "data.h"
+#include "garbage_collection.h"
 
 namespace NKikimr::NBlobDepot {
 
     void TBlobDepot::ExecuteTxLoad() {
         class TTxLoad : public NTabletFlatExecutor::TTransactionBase<TBlobDepot> {
+            bool Configured = false;
+
         public:
             TTxLoad(TBlobDepot *self)
                 : TTransactionBase(self)
             {}
 
             bool Execute(TTransactionContext& txc, const TActorContext&) override {
+                STLOG(PRI_DEBUG, BLOB_DEPOT, BDT15, "TTxLoad::Execute", (TabletId, Self->TabletID()));
+
                 NIceDb::TNiceDb db(txc.DB);
 
                 if (!Precharge(db)) {
@@ -24,8 +31,8 @@ namespace NKikimr::NBlobDepot {
                         return false;
                     } else if (table.IsValid()) {
                         if (table.HaveValue<Schema::Config::ConfigProtobuf>()) {
-                            const bool success = Self->Config.ParseFromString(table.GetValue<Schema::Config::ConfigProtobuf>());
-                            Y_VERIFY(success);
+                            Configured = Self->Config.ParseFromString(table.GetValue<Schema::Config::ConfigProtobuf>());
+                            Y_VERIFY(Configured);
                         }
                     }
                 }
@@ -37,10 +44,79 @@ namespace NKikimr::NBlobDepot {
                         return false;
                     }
                     while (table.IsValid()) {
-                        Self->BlocksManager.AddBlockOnLoad(
+                        Self->BlocksManager->AddBlockOnLoad(
                             table.GetValue<Schema::Blocks::TabletId>(),
-                            table.GetValue<Schema::Blocks::BlockedGeneration>()
+                            table.GetValue<Schema::Blocks::BlockedGeneration>(),
+                            table.GetValue<Schema::Blocks::IssuerGuid>()
                         );
+                        if (!table.Next()) {
+                            return false;
+                        }
+                    }
+                }
+
+                // Barriers
+                {
+                    auto table = db.Table<Schema::Barriers>().Select();
+                    if (!table.IsReady()) {
+                        return false;
+                    }
+                    while (table.IsValid()) {
+                        Self->BarrierServer->AddBarrierOnLoad(
+                            table.GetValue<Schema::Barriers::TabletId>(),
+                            table.GetValue<Schema::Barriers::Channel>(),
+                            table.GetValue<Schema::Barriers::LastRecordGenStep>(),
+                            table.GetValue<Schema::Barriers::Soft>(),
+                            table.GetValue<Schema::Barriers::Hard>()
+                        );
+                        if (!table.Next()) {
+                            return false;
+                        }
+                    }
+                }
+
+                // Data
+                {
+                    auto table = db.Table<Schema::Data>().Select();
+                    if (!table.IsReady()) {
+                        return false;
+                    }
+                    while (table.IsValid()) {
+                        Self->Data->AddDataOnLoad(
+                            TData::TKey::FromBinaryKey(table.GetValue<Schema::Data::Key>(), Self->Config),
+                            table.GetValue<Schema::Data::Value>()
+                        );
+                        if (!table.Next()) {
+                            return false;
+                        }
+                    }
+                }
+
+                // Trash
+                {
+                    auto table = db.Table<Schema::Trash>().Select();
+                    if (!table.IsReady()) {
+                        return false;
+                    }
+                    while (table.IsValid()) {
+                        const TString& blobId = table.GetValue<Schema::Trash::BlobId>();
+                        Self->Data->AddTrashOnLoad(TLogoBlobID(reinterpret_cast<const ui64*>(blobId.data())));
+                        if (!table.Next()) {
+                            return false;
+                        }
+                    }
+                }
+
+                // ConfirmedGC
+                {
+                    auto table = db.Table<Schema::ConfirmedGC>().Select();
+                    if (!table.IsReady()) {
+                        return false;
+                    }
+                    while (table.IsValid()) {
+                        Self->Data->AddConfirmedGenStepOnLoad(table.GetValue<Schema::ConfirmedGC::Channel>(),
+                            table.GetValue<Schema::ConfirmedGC::GroupId>(),
+                            table.GetValue<Schema::ConfirmedGC::ConfirmedGenStep>());
                         if (!table.Next()) {
                             return false;
                         }
@@ -53,11 +129,24 @@ namespace NKikimr::NBlobDepot {
             bool Precharge(NIceDb::TNiceDb& db) {
                 auto config = db.Table<Schema::Config>().Select();
                 auto blocks = db.Table<Schema::Blocks>().Select();
-                return config.IsReady() && blocks.IsReady();
+                auto barriers = db.Table<Schema::Barriers>().Select();
+                auto data = db.Table<Schema::Data>().Select();
+                auto trash = db.Table<Schema::Trash>().Select();
+                auto confirmedGC = db.Table<Schema::ConfirmedGC>().Select();
+                return config.IsReady() && blocks.IsReady() && barriers.IsReady() && data.IsReady() && trash.IsReady() &&
+                    confirmedGC.IsReady();
             }
 
             void Complete(const TActorContext&) override {
-                Self->InitChannelKinds();
+                STLOG(PRI_DEBUG, BLOB_DEPOT, BDT16, "TTxLoad::Complete", (TabletId, Self->TabletID()),
+                    (Configured, Configured));
+
+                if (Configured) {
+                    Self->InitChannelKinds();
+                    Self->Data->HandleTrash();
+                }
+
+                Self->OnLoadFinished();
             }
         };
 

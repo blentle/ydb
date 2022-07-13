@@ -159,6 +159,7 @@ namespace NSQLTranslationV1 {
             return IntoHeading;
         }
 
+        bool IsAlreadyDeclared(const TString& varName) const;
         void DeclareVariable(const TString& varName, const TNodePtr& typeNode);
 
         bool AddExport(TPosition symbolPos, const TString& symbolName);
@@ -248,6 +249,7 @@ namespace NSQLTranslationV1 {
         TMaybe<bool> AnsiInForEmptyOrNullableItemsCollections;
         TMaybe<bool> AnsiRankForNullableKeys = true;
         TMaybe<bool> AnsiOrderByLimitInUnionAll = true;
+        bool EnforceAnsiOrderByLimitInUnionAll = false;
         const bool AnsiQuotedIdentifiers;
         bool AnsiOptionalAs = true;
         bool OrderedColumns = false;
@@ -264,6 +266,7 @@ namespace NSQLTranslationV1 {
         bool FlexibleTypes = false;
         // see YQL-10265
         bool AnsiCurrentRow = false;
+        TMaybe<bool> YsonCastToString;
         THashMap<TString, TMaybe<TString>> Libraries; // alias -> optional file
         THashMap<TString, ui32> PackageVersions;
         NYql::TWarningPolicy WarningPolicy;

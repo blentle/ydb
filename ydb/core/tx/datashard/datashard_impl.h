@@ -35,6 +35,7 @@
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
 #include <ydb/core/tablet_flat/tablet_flat_executor.h>
 #include <ydb/core/tablet_flat/flat_page_iface.h>
+#include <ydb/core/tx/long_tx_service/public/events.h>
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
 #include <ydb/core/protos/tx.pb.h>
 #include <ydb/core/protos/tx_datashard.pb.h>
@@ -54,6 +55,7 @@ extern TStringBuf SnapshotTransferReadSetMagic;
 
 using NTabletFlatExecutor::ITransaction;
 using NTabletFlatExecutor::TScanOptions;
+using NLongTxService::TEvLongTxService;
 
 // For CopyTable and MoveShadow
 class TTxTableSnapshotContext : public NTabletFlatExecutor::TTableSnapshotContext {
@@ -205,6 +207,7 @@ class TDataShard
     class TTxCompactBorrowed;
     class TTxCompactTable;
     class TTxPersistFullCompactionTs;
+    class TTxRemoveLock;
 
     template <typename T> friend class TTxDirectBase;
     class TTxUploadRows;
@@ -1024,6 +1027,8 @@ class TDataShard
 
     void Handle(TEvDataShard::TEvApplyReplicationChanges::TPtr& ev, const TActorContext& ctx);
 
+    void Handle(TEvLongTxService::TEvLockStatus::TPtr& ev, const TActorContext& ctx);
+
     void HandleByReplicationSourceOffsetsServer(STATEFN_SIG);
 
     void DoPeriodicTasks(const TActorContext &ctx);
@@ -1440,6 +1445,8 @@ public:
     static THashMap<TPathId, TPathId> GetRemapIndexes(const NKikimrTxDataShard::TMoveTable& move);
     TUserTable::TPtr MoveUserTable(TOperation::TPtr op, const NKikimrTxDataShard::TMoveTable& move,
         const TActorContext& ctx, TTransactionContext& txc);
+    TUserTable::TPtr MoveUserIndex(TOperation::TPtr op, const NKikimrTxDataShard::TMoveIndex& move,
+        const TActorContext& ctx, TTransactionContext& txc);
     void DropUserTable(TTransactionContext& txc, ui64 tableId);
 
     ui32 GetLastLocalTid() const { return LastLocalTid; }
@@ -1528,6 +1535,13 @@ public:
     bool CheckTxNeedWait(const TEvDataShard::TEvProposeTransaction::TPtr& ev) const;
 
     bool CheckChangesQueueOverflow() const;
+
+    void DeleteReadIterator(const TReadIteratorId& readId);
+    void DeleteReadIterator(TReadIteratorsMap::iterator it);
+    void CancelReadIterators(Ydb::StatusIds::StatusCode code, const TString& issue, const TActorContext& ctx);
+    void ReadIteratorsOnNodeDisconnected(const TActorId& sessionId, const TActorContext &ctx);
+
+    void SubscribeNewLocks(const TActorContext &ctx);
 
 private:
     ///
@@ -2246,6 +2260,7 @@ private:
     TReplicatedTableState* EnsureReplicatedTable(const TPathId& pathId);
 
     TReadIteratorsMap ReadIterators;
+    THashMap<TActorId, TReadIteratorSession> ReadIteratorSessions;
 
 protected:
     // Redundant init state required by flat executor implementation
@@ -2384,6 +2399,7 @@ protected:
             fFunc(TEvDataShard::EvGetReplicationSourceOffsets, HandleByReplicationSourceOffsetsServer);
             fFunc(TEvDataShard::EvReplicationSourceOffsetsAck, HandleByReplicationSourceOffsetsServer);
             fFunc(TEvDataShard::EvReplicationSourceOffsetsCancel, HandleByReplicationSourceOffsetsServer);
+            HFunc(TEvLongTxService::TEvLockStatus, Handle);
         default:
             if (!HandleDefaultEvents(ev, ctx)) {
                 LOG_WARN_S(ctx, NKikimrServices::TX_DATASHARD,
@@ -2405,6 +2421,10 @@ protected:
             HFuncTraced(TEvDataShard::TEvReadColumnsRequest, Handle);
             HFuncTraced(TEvTabletPipe::TEvServerConnected, Handle);
             HFuncTraced(TEvTabletPipe::TEvServerDisconnected, Handle);
+            HFuncTraced(TEvDataShard::TEvRead, Handle);
+            HFuncTraced(TEvDataShard::TEvReadContinue, Handle);
+            HFuncTraced(TEvDataShard::TEvReadAck, Handle);
+            HFuncTraced(TEvDataShard::TEvReadCancel, Handle);
         default:
             if (!HandleDefaultEvents(ev, ctx)) {
                 LOG_WARN_S(ctx, NKikimrServices::TX_DATASHARD, "TDataShard::StateWorkAsFollower unhandled event type: " << ev->GetTypeRewrite()
@@ -2529,12 +2549,13 @@ protected:
             ev->Record.MutableTableStats()->SetTxRejectedByOverload(TabletCounters->Cumulative()[COUNTER_PREPARE_OVERLOADED].Get());
             ev->Record.MutableTableStats()->SetTxRejectedBySpace(TabletCounters->Cumulative()[COUNTER_PREPARE_OUT_OF_SPACE].Get());
             ev->Record.MutableTableStats()->SetTxCompleteLagMsec(TabletCounters->Simple()[COUNTER_TX_COMPLETE_LAG].Get());
-            ev->Record.MutableTableStats()->SetInFlightTxCount(TabletCounters->Simple()[COUNTER_TX_IN_FLY].Get() +
-                 TabletCounters->Simple()[COUNTER_IMMEDIATE_TX_IN_FLY].Get());
+            ev->Record.MutableTableStats()->SetInFlightTxCount(TabletCounters->Simple()[COUNTER_TX_IN_FLY].Get()
+                + TabletCounters->Simple()[COUNTER_IMMEDIATE_TX_IN_FLY].Get());
 
-            ev->Record.MutableTableStats()->SetRowUpdates(TabletCounters->Cumulative()[COUNTER_ENGINE_HOST_UPDATE_ROW].Get() +
-                                                          TabletCounters->Cumulative()[COUNTER_UPLOAD_ROWS].Get());
-            ev->Record.MutableTableStats()->SetRowDeletes(TabletCounters->Cumulative()[COUNTER_ENGINE_HOST_ERASE_ROW].Get());
+            ev->Record.MutableTableStats()->SetRowUpdates(TabletCounters->Cumulative()[COUNTER_ENGINE_HOST_UPDATE_ROW].Get()
+                + TabletCounters->Cumulative()[COUNTER_UPLOAD_ROWS].Get());
+            ev->Record.MutableTableStats()->SetRowDeletes(TabletCounters->Cumulative()[COUNTER_ENGINE_HOST_ERASE_ROW].Get()
+                + TabletCounters->Cumulative()[COUNTER_ERASE_ROWS].Get());
             ev->Record.MutableTableStats()->SetRowReads(TabletCounters->Cumulative()[COUNTER_ENGINE_HOST_SELECT_ROW].Get());
             ev->Record.MutableTableStats()->SetRangeReads(TabletCounters->Cumulative()[COUNTER_ENGINE_HOST_SELECT_RANGE].Get());
             ev->Record.MutableTableStats()->SetRangeReadRows(TabletCounters->Cumulative()[COUNTER_ENGINE_HOST_SELECT_RANGE_ROWS].Get());
@@ -2597,5 +2618,12 @@ void SetStatusError(T &rec,
     issue->set_severity(severity);
     issue->set_message(msg);
 }
+
+void SendViaSession(const TActorId& sessionId,
+                    const TActorId& target,
+                    const TActorId& src,
+                    IEventBase* event,
+                    ui32 flags = 0,
+                    ui64 cookie = 0);
 
 }}

@@ -144,8 +144,6 @@ public:
         , Config(CreateConfig(kqpSettings, workerSettings))
         , ExplicitTransactions(*Config->_KqpMaxActiveTxPerSession.Get())
     {
-        IdleDuration = TDuration::Seconds(*Config->_KqpSessionIdleTimeoutSec.Get());
-
         RequestCounters = MakeIntrusive<TKqpRequestCounters>();
         RequestCounters->Counters = Counters;
         RequestCounters->DbCounters = Settings.DbCounters;
@@ -153,6 +151,7 @@ public:
     }
 
     void Bootstrap() {
+        LOG_D("SessonActor bootstrapped, workerId: " << SelfId());
         Counters->ReportSessionActorCreated(Settings.DbCounters);
         CreationTime = TInstant::Now();
 
@@ -467,6 +466,8 @@ public:
 
         Become(&TKqpSessionActor::ExecuteState);
 
+        QueryState->TxCtx->OnBeginQuery();
+
         if (queryRequest.GetType() == NKikimrKqp::QUERY_TYPE_SQL_SCAN) {
             AcquirePersistentSnapshot();
             return;
@@ -475,6 +476,8 @@ public:
             AcquireMvccSnapshot();
             return;
         }
+
+
         // Can reply inside (in case of deferred-only transactions) and become ReadyState
         ExecuteOrDefer();
     }
@@ -491,6 +494,12 @@ public:
             for (const auto& stage: phyTx.GetStages()) {
                 for (const auto& tableOp: stage.GetTableOps()) {
                     tablesSet.insert(tableOp.GetTable().GetPath());
+                }
+
+                for (const auto& input : stage.GetInputs()) {
+                    if (input.GetTypeCase() == NKqpProto::TKqpPhyConnection::kStreamLookup) {
+                        tablesSet.insert(input.GetStreamLookup().GetTable().GetPath());
+                    }
                 }
             }
         }
@@ -1063,28 +1072,22 @@ public:
         auto& txResult = *response->MutableResult();
         QueryState->QueryCtx->TxResults.emplace_back(ExtractTxResults(txResult));
 
+        if (ev->Get()->LockHandle) {
+            QueryState->TxCtx->Locks.LockHandle = std::move(ev->Get()->LockHandle);
+        }
+
         if (!MergeLocksWithTxResult(txResult)) {
             return;
         }
 
-        bool scan = QueryState->Request.GetType() == NKikimrKqp::QUERY_TYPE_SQL_SCAN;
-        if (scan) {
-            if (QueryState->RequestActorId && txResult.HasStats()) {
-                auto statsEv = MakeHolder<TEvKqpExecuter::TEvStreamProfile>();
-                auto& record = statsEv->Record;
-
-                record.MutableProfile()->Swap(txResult.MutableStats());
-                Send(QueryState->RequestActorId, statsEv.Release());
-            }
-        } else {
-            if (txResult.HasStats()) {
-                auto* exec = QueryState->Stats.AddExecutions();
-                exec->Swap(txResult.MutableStats());
-            }
+        if (txResult.HasStats()) {
+            auto* exec = QueryState->Stats.AddExecutions();
+            exec->Swap(txResult.MutableStats());
         }
 
         if (QueryState->PreparedQuery &&
-                QueryState->CurrentTx < QueryState->PreparedQuery->GetPhysicalQuery().TransactionsSize()) {
+            QueryState->CurrentTx < QueryState->PreparedQuery->GetPhysicalQuery().TransactionsSize())
+        {
             ExecuteOrDefer();
         } else {
             ReplySuccess();
@@ -1200,32 +1203,6 @@ public:
         }
     }
 
-    // TODO: Remove? Is it actual for NewEngine?
-    void FillQueryProfile(const NKqpProto::TKqpStatsQuery& stats, NKikimrKqp::TQueryResponse& response) {
-        auto& kqlProfile = *response.MutableProfile()->AddKqlProfiles();
-        for (auto& execStats : stats.GetExecutions()) {
-            auto& txStats = *kqlProfile.AddMkqlProfiles()->MutableTxStats();
-
-            txStats.SetDurationUs(execStats.GetDurationUs());
-            for (auto& tableStats : execStats.GetTables()) {
-                auto& txTableStats = *txStats.AddTableAccessStats();
-
-                txTableStats.MutableTableInfo()->SetName(tableStats.GetTablePath());
-                if (tableStats.GetReadRows() > 0) {
-                    txTableStats.MutableSelectRange()->SetRows(tableStats.GetReadRows());
-                    txTableStats.MutableSelectRange()->SetBytes(tableStats.GetReadBytes());
-                }
-                if (tableStats.GetWriteRows() > 0) {
-                    txTableStats.MutableUpdateRow()->SetCount(tableStats.GetWriteRows());
-                    txTableStats.MutableUpdateRow()->SetBytes(tableStats.GetWriteBytes());
-                }
-                if (tableStats.GetEraseRows() > 0) {
-                    txTableStats.MutableEraseRow()->SetCount(tableStats.GetEraseRows());
-                }
-            }
-        }
-    }
-
     void FillStats(NKikimrKqp::TEvQueryResponse* record) {
         auto *response = record->MutableResponse();
         auto* stats = &QueryState->Stats;
@@ -1260,7 +1237,6 @@ public:
 
         bool reportStats = (GetStatsModeInt(queryRequest) != EKikimrStatsMode::None);
         if (reportStats) {
-            FillQueryProfile(*stats, *response);
             response->SetQueryPlan(SerializeAnalyzePlan(*stats));
 
             response->MutableQueryStats()->Swap(stats);
@@ -1336,6 +1312,10 @@ public:
         FillStats(record);
 
         YQL_ENSURE(QueryState);
+        if (QueryState->TxCtx) {
+            QueryState->TxCtx->OnEndQuery();
+        }
+
         if (QueryState->Commit) {
             ResetTxState();
         }
@@ -1602,10 +1582,11 @@ public:
         StopIdleTimer();
 
         ++IdleTimerId;
-        IdleTimerActorId = CreateLongTimer(TlsActivationContext->AsActorContext(), IdleDuration,
+        auto idleDuration = TDuration::Seconds(*Config->_KqpSessionIdleTimeoutSec.Get());
+        IdleTimerActorId = CreateLongTimer(TlsActivationContext->AsActorContext(), idleDuration,
                 new IEventHandle(SelfId(), SelfId(), new TEvKqp::TEvIdleTimeout(IdleTimerId)));
         LOG_D("Created long timer for idle timeout, timer id: " << IdleTimerId
-                << ", duration: " << IdleDuration << ", actor: " << IdleTimerActorId);
+                << ", duration: " << idleDuration << ", actor: " << IdleTimerActorId);
     }
 
     void StopIdleTimer() {
@@ -1618,8 +1599,6 @@ public:
 
     void Handle(TEvKqp::TEvIdleTimeout::TPtr& ev) {
         auto timerId = ev->Get()->TimerId;
-        LOG_D("Received TEvIdleTimeout in ready state, timer id: "
-            << timerId << ", sender: " << ev->Sender);
 
         if (timerId == IdleTimerId) {
             LOG_N(TKqpRequestInfo("", SessionId) << "SessionActor idle timeout, worker destroyed");
@@ -1942,7 +1921,6 @@ private:
 
     TActorId IdleTimerActorId;
     ui32 IdleTimerId = 0;
-    TDuration IdleDuration;
     std::optional<TSessionShutdownState> ShutdownState;
 };
 

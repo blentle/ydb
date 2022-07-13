@@ -10,7 +10,7 @@
 #include <ydb/library/yql/providers/dq/provider/yql_dq_gateway.h>
 #include <ydb/library/yql/providers/dq/worker_manager/interface/counters.h>
 #include <ydb/library/yql/providers/solomon/provider/yql_solomon_gateway.h>
-#include <ydb/library/yql/providers/pq/cm_client/interface/client.h>
+#include <ydb/library/yql/providers/pq/cm_client/client.h>
 
 #include <library/cpp/actors/core/actorsystem.h>
 #include <library/cpp/time_provider/time_provider.h>
@@ -60,7 +60,7 @@ struct TRunActorParams { // TODO2 : Change name
         bool automatic,
         const TString& queryName,
         const TInstant& deadline,
-        const NMonitoring::TDynamicCounterPtr& clientCounters,
+        const ::NMonitoring::TDynamicCounterPtr& clientCounters,
         TInstant createdAt,
         const TString& tenantName,
         uint64_t resultBytesLimit
@@ -112,7 +112,7 @@ struct TRunActorParams { // TODO2 : Change name
     TString QueryName;
     TInstant Deadline;
 
-    const NMonitoring::TDynamicCounterPtr ClientCounters;
+    const ::NMonitoring::TDynamicCounterPtr ClientCounters;
     const TInstant CreatedAt;
     const TString TenantName;
     uint64_t ResultBytesLimit;

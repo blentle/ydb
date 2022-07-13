@@ -9,6 +9,8 @@
 
 #include <library/cpp/protobuf/util/repeated_field_utils.h>
 
+#include <google/protobuf/util/time_util.h>
+
 #include <util/string/join.h>
 #include <util/string/strip.h>
 #include <util/charset/utf8.h>
@@ -282,10 +284,9 @@ if (!partId.DiscoveryConverter->IsValid()) { \
 
                 const ui64 readOffset = req.read_offset();
                 const ui64 commitOffset = req.commit_offset();
-                const bool verifyReadOffset = req.verify_read_offset();
 
-                GET_PART_ID_OR_EXIT(request.start_partition_session_response());
-                ctx.Send(ctx.SelfID, new TEvPQProxy::TEvStartRead(partId, readOffset, commitOffset, verifyReadOffset));
+                GET_PART_ID_OR_EXIT(req);
+                ctx.Send(ctx.SelfID, new TEvPQProxy::TEvStartRead(partId, readOffset, commitOffset, req.has_read_offset()));
                 if (!Request->GetStreamCtx()->Read()) {
                     LOG_INFO_S(ctx, NKikimrServices::PQ_READ_PROXY, PQ_LOG_PREFIX << " grpc read failed at start");
                     Die(ctx);
@@ -293,20 +294,20 @@ if (!partId.DiscoveryConverter->IsValid()) { \
                 }
                 break;
             }
-            case TClientMessage::kCommitRequest: {
-                const auto& req = request.commit_request();
+            case TClientMessage::kCommitOffsetRequest: {
+                const auto& req = request.commit_offset_request();
 
-                if (!RangesMode || !req.commits_size()) {
+                if (!RangesMode || !req.commit_offsets_size()) {
                     CloseSession(TStringBuilder() << "can't commit without offsets", PersQueue::ErrorCode::BAD_REQUEST, ctx);
                     return;
                 }
 
                 THashMap<ui64, TEvPQProxy::TCommitRange> commitRange;
 
-                for (auto& pc: req.commits()) {
+                for (auto& pc: req.commit_offsets()) {
                     auto id = pc.partition_session_id();
                     for (auto& c: pc.offsets()) {
-                        commitRange[id].Ranges.push_back(std::make_pair(c.start_offset(), c.end_offset()));
+                        commitRange[id].Ranges.push_back(std::make_pair(c.start(), c.end()));
                     }
                 }
 
@@ -367,7 +368,7 @@ void TReadSessionActor<UseMigrationProtocol>::Die(const TActorContext& ctx) {
 
         if (!p.second.Released) {
             // ToDo[counters]
-            auto it = TopicCounters.find(p.second.Partition.DiscoveryConverter->GetInternalName());
+            auto it = TopicCounters.find(p.second.Topic->GetInternalName());
             Y_VERIFY(it != TopicCounters.end());
             it->second.PartitionsInfly.Dec();
             it->second.PartitionsReleased.Inc();
@@ -520,10 +521,10 @@ void TReadSessionActor<UseMigrationProtocol>::DropPartition(typename THashMap<ui
     bool res = ActualPartitionActors.erase(it->second.Actor);
     Y_VERIFY(res);
 
-    if (--NumPartitionsFromTopic[it->second.Partition.DiscoveryConverter->GetInternalName()] == 0) {
+    if (--NumPartitionsFromTopic[it->second.Topic->GetInternalName()] == 0) {
         //ToDo[counters]
-        bool res = TopicCounters.erase(it->second.Partition.DiscoveryConverter->GetInternalName());
-        Y_VERIFY(res);
+        bool res_ = TopicCounters.erase(it->second.Topic->GetInternalName());
+        Y_VERIFY(res_);
     }
 
     if (SessionsActive) {
@@ -578,7 +579,7 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(TEvPQProxy::TEvCommitDone::
             c->set_end_offset(ev->Get()->Offset);
 
         } else {
-            auto c = result.mutable_commit_response()->add_partitions_committed_offsets();
+            auto c = result.mutable_commit_offset_response()->add_partitions_committed_offsets();
             c->set_partition_session_id(assignId);
             c->set_committed_offset(ev->Get()->Offset);
         }
@@ -619,6 +620,20 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(TEvPQProxy::TEvReadSessionS
     ctx.Send(ev->Sender, result.Release());
 }
 
+inline TString GetTopicSettingsPath(const PersQueue::V1::MigrationStreamingReadClientMessage::TopicReadSettings& settings) {
+    return settings.topic();
+}
+inline TString GetTopicSettingsPath(const Topic::StreamReadMessage::InitRequest::TopicReadSettings& settings) {
+    return settings.path();
+}
+inline i64 GetTopicSettingsReadFrom(const PersQueue::V1::MigrationStreamingReadClientMessage::TopicReadSettings& settings) {
+    return settings.start_from_written_at_ms();
+}
+inline i64 GetTopicSettingsReadFrom(const Topic::StreamReadMessage::InitRequest::TopicReadSettings& settings) {
+    return ::google::protobuf::util::TimeUtil::TimestampToMilliseconds(settings.read_from());
+}
+
+
 template<bool UseMigrationProtocol>
 void TReadSessionActor<UseMigrationProtocol>::Handle(typename TEvReadInit::TPtr& ev, const TActorContext& ctx) {
 
@@ -646,7 +661,7 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(typename TEvReadInit::TPtr&
     if (AppData(ctx)->PQConfig.GetTopicsAreFirstClassCitizen()) {
         ClientPath = init.consumer();
     } else {
-        ClientPath = NPersQueue::NormalizeFullPath(NPersQueue::MakeConsumerPath(init.consumer()));
+        ClientPath = NPersQueue::StripLeadSlash(NPersQueue::MakeConsumerPath(init.consumer()));
     }
 
     TStringBuilder session;
@@ -658,36 +673,42 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(typename TEvReadInit::TPtr&
         RangesMode = init.ranges_mode();
         MaxReadMessagesCount = NormalizeMaxReadMessagesCount(init.read_params().max_read_messages_count());
         MaxReadSize = NormalizeMaxReadSize(init.read_params().max_read_size());
+        MaxTimeLagMs = init.max_lag_duration_ms();
+        ReadTimestampMs = static_cast<ui64>(init.start_from_written_at_ms());
+        ReadOnlyLocal = init.read_only_original();
     } else {
         RangesMode = true;
         MaxReadMessagesCount = NormalizeMaxReadMessagesCount(0);
         MaxReadSize = NormalizeMaxReadSize(0);
+        MaxTimeLagMs = 0; // max_lag per topic only
+        ReadTimestampMs = 0; // read_from per topic only
+        // MaxTimeLagMs = ::google::protobuf::util::TimeUtil::DurationToMilliseconds(init.max_lag());
+        // ReadTimestampMs = ::google::protobuf::util::TimeUtil::TimestampToMilliseconds(init.read_from());
+        ReadOnlyLocal = true;
     }
-    if (init.max_lag_duration_ms() < 0) {
+    if (MaxTimeLagMs < 0) {
         CloseSession("max_lag_duration_ms must be nonnegative number", PersQueue::ErrorCode::BAD_REQUEST, ctx);
         return;
     }
-    MaxTimeLagMs = init.max_lag_duration_ms();
-    if (init.start_from_written_at_ms() < 0) {
+    if (ReadTimestampMs < 0) {
         CloseSession("start_from_written_at_ms must be nonnegative number", PersQueue::ErrorCode::BAD_REQUEST, ctx);
         return;
     }
-    ReadTimestampMs = static_cast<ui64>(init.start_from_written_at_ms());
 
     PeerName = event->PeerName;
 
-    ReadOnlyLocal = init.read_only_original();
-
     for (const auto& topic : init.topics_read_settings()) {
-        if (topic.topic().empty()) {
+        TString topic_path = GetTopicSettingsPath(topic);
+        if (topic_path.empty()) {
             CloseSession("empty topic in init request", PersQueue::ErrorCode::BAD_REQUEST, ctx);
             return;
         }
-        if (topic.start_from_written_at_ms() < 0) {
+        i64 read_from = GetTopicSettingsReadFrom(topic);
+        if (read_from < 0) {
             CloseSession("start_from_written_at_ms must be nonnegative number", PersQueue::ErrorCode::BAD_REQUEST, ctx);
             return;
         }
-        TopicsToResolve.insert(topic.topic());
+        TopicsToResolve.insert(topic_path);
     }
 
     if (Request->GetInternalToken().empty()) {
@@ -712,25 +733,46 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(typename TEvReadInit::TPtr&
     }
 
     for (const auto& topic : init.topics_read_settings()) {
-        auto topicIter = TopicsList.ClientTopics.find(topic.topic());
+        auto topicIter = TopicsList.ClientTopics.find(GetTopicSettingsPath(topic));
         Y_VERIFY(!topicIter.IsEnd());
         for (const auto& converter: topicIter->second) {
-            const auto internalName = converter->GetInternalName();
-            for (i64 pg: topic.partition_group_ids()) {
-                if (pg < 0) {
-                    CloseSession("partition group id must be nonnegative number", PersQueue::ErrorCode::BAD_REQUEST,
-                                 ctx);
-                    return;
-                }
-                if (pg > Max<ui32>()) {
-                    CloseSession(
-                            TStringBuilder() << "partition group id " << pg << " is too big for partition group id",
+            const auto internalName = converter->GetOriginalPath();
+            if constexpr (UseMigrationProtocol) {
+                for (i64 pg: topic.partition_group_ids()) {
+                    if (pg <= 0) {
+                        CloseSession("partition group id must be positive number", PersQueue::ErrorCode::BAD_REQUEST,
+                                    ctx);
+                        return;
+                    }
+                    if (pg > Max<ui32>()) {
+                        CloseSession(
+                            TStringBuilder() << "partition group id is too big: " << pg << " > " << Max<ui32>(),
                             PersQueue::ErrorCode::BAD_REQUEST, ctx);
-                    return;
+                        return;
+                    }
+                    TopicGroups[internalName].push_back(static_cast<ui32>(pg));
                 }
-                TopicGroups[internalName].push_back(static_cast<ui32>(pg));
+                MaxLagByTopic[internalName] = MaxTimeLagMs;
+                ReadFromTimestamp[internalName] = GetTopicSettingsReadFrom(topic);
+            } else {
+                for (i64 p: topic.partition_ids()) {
+                    if (p < 0) {
+                        CloseSession("partition id must be nonnegative number", PersQueue::ErrorCode::BAD_REQUEST,
+                                    ctx);
+                        return;
+                    }
+                    if (p + 1 > Max<ui32>()) {
+                        CloseSession(
+                                TStringBuilder() << "partition id is too big: " << p << " > " << Max<ui32>() - 1,
+                                PersQueue::ErrorCode::BAD_REQUEST, ctx);
+                        return;
+                    }
+                    TopicGroups[internalName].push_back(static_cast<ui32>(p + 1));
+                }
+                MaxLagByTopic[internalName] =
+                    ::google::protobuf::util::TimeUtil::DurationToMilliseconds(topic.max_lag());;
+                ReadFromTimestamp[internalName] = GetTopicSettingsReadFrom(topic);
             }
-            ReadFromTimestamp[internalName] = topic.start_from_written_at_ms();
         }
     }
     LOG_INFO_S(ctx, NKikimrServices::PQ_READ_PROXY, PQ_LOG_PREFIX << " init: " << event->Request << " from " << PeerName);
@@ -752,7 +794,6 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(typename TEvReadInit::TPtr&
     SLIErrors = NKikimr::NPQ::TMultiCounter(subGroup, Aggr, {}, {"RequestsError"}, true, "sensor", false);
     SLITotal = NKikimr::NPQ::TMultiCounter(subGroup, Aggr, {}, {"RequestsTotal"}, true, "sensor", false);
     SLITotal.Inc();
-
 }
 
 
@@ -918,8 +959,27 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(TEvPQProxy::TEvAuthResultOk
         Y_VERIFY(!BalancersInitStarted);
         BalancersInitStarted = true;
 
-        for (auto& t : ev->Get()->TopicAndTablets) { // ToDo - return something from Init and Auth Actor (Full Path - ?)
-            auto& topicHolder = Topics[t.TopicNameConverter->GetInternalName()];
+        for (auto& [name, t] : ev->Get()->TopicAndTablets) { // ToDo - return something from Init and Auth Actor (Full Path - ?)
+            auto internalName = t.TopicNameConverter->GetInternalName();
+            auto topicGrIter = TopicGroups.find(name);
+            if (!topicGrIter.IsEnd()) {
+                auto value = std::move(topicGrIter->second);
+                TopicGroups.erase(topicGrIter);
+                TopicGroups.insert(std::make_pair(internalName, std::move(value)));
+            }
+            auto rtfsIter = ReadFromTimestamp.find(name);
+            if (!rtfsIter.IsEnd()) {
+                auto value = std::move(rtfsIter->second);
+                ReadFromTimestamp.erase(rtfsIter);
+                ReadFromTimestamp[internalName] = value;
+            }
+            auto lagIter = MaxLagByTopic.find(name);
+            if (!lagIter.IsEnd()) {
+                auto value = std::move(lagIter->second);
+                MaxLagByTopic.erase(lagIter);
+                MaxLagByTopic[internalName] = value;
+            }
+            auto& topicHolder = Topics[internalName];
             topicHolder.TabletID = t.TabletID;
             topicHolder.FullConverter = t.TopicNameConverter;
             topicHolder.CloudId = t.CloudId;
@@ -948,7 +1008,7 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(TEvPQProxy::TEvAuthResultOk
 
         ctx.Schedule(CHECK_ACL_DELAY, new TEvents::TEvWakeup());
     } else {
-        for (auto& t : ev->Get()->TopicAndTablets) {
+        for (auto& [name, t] : ev->Get()->TopicAndTablets) {
             if (Topics.find(t.TopicNameConverter->GetInternalName()) == Topics.end()) {
                 CloseSession(
                         TStringBuilder() << "list of topics changed - new topic '"
@@ -1067,13 +1127,14 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(TEvPQProxy::TEvPartitionSta
             result.mutable_assigned()->set_end_offset(ev->Get()->EndOffset);
 
         } else {
-            result.mutable_start_partition_session_request()->mutable_partition_session()->set_topic(it->second.Topic->GetFederationPath());
-            result.mutable_start_partition_session_request()->mutable_partition_session()->set_cluster(it->second.Topic->GetCluster());
+            // TODO GetFederationPath() -> GetFederationPathWithDC()
+            result.mutable_start_partition_session_request()->mutable_partition_session()->set_path(it->second.Topic->GetFederationPath());
             result.mutable_start_partition_session_request()->mutable_partition_session()->set_partition_id(ev->Get()->Partition.Partition);
             result.mutable_start_partition_session_request()->mutable_partition_session()->set_partition_session_id(it->first);
 
             result.mutable_start_partition_session_request()->set_committed_offset(ev->Get()->Offset);
-            result.mutable_start_partition_session_request()->set_end_offset(ev->Get()->EndOffset);
+            result.mutable_start_partition_session_request()->mutable_partition_offsets()->set_start(ev->Get()->Offset);
+            result.mutable_start_partition_session_request()->mutable_partition_offsets()->set_end(ev->Get()->EndOffset);
         }
 
         LOG_INFO_S(ctx, NKikimrServices::PQ_READ_PROXY, PQ_LOG_PREFIX << " sending to client create partition stream event");
@@ -1111,8 +1172,10 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(TEvPQProxy::TEvPartitionSta
             result.mutable_partition_session_status_response()->set_partition_session_id(it->first);
 
             result.mutable_partition_session_status_response()->set_committed_offset(ev->Get()->Offset);
-            result.mutable_partition_session_status_response()->set_end_offset(ev->Get()->EndOffset);
-            result.mutable_partition_session_status_response()->set_written_at_watermark_ms(ev->Get()->WriteTimestampEstimateMs);
+            result.mutable_partition_session_status_response()->mutable_partition_offsets()->set_start(ev->Get()->Offset);
+            result.mutable_partition_session_status_response()->mutable_partition_offsets()->set_end(ev->Get()->EndOffset);
+            *result.mutable_partition_session_status_response()->mutable_write_time_high_watermark() =
+                ::google::protobuf::util::TimeUtil::MillisecondsToTimestamp(ev->Get()->WriteTimestampEstimateMs);
         }
 
         auto pp = it->second.Partition;
@@ -1688,15 +1751,28 @@ void TReadSessionActor<UseMigrationProtocol>::ProcessReads(const TActorContext& 
             Y_VERIFY(csize < Max<i32>());
 
             auto jt = ReadFromTimestamp.find(it->second.Topic->GetInternalName());
-            Y_VERIFY(jt != ReadFromTimestamp.end());
+            if (jt == ReadFromTimestamp.end()) {
+                LOG_ALERT_S(ctx, NKikimrServices::PQ_READ_PROXY, PQ_LOG_PREFIX << "Error searching for topic: " <<  it->second.Topic->GetInternalName()
+                            << " (" << it->second.Topic->GetPrintableString() << ")");
+                for (const auto& [k, v] : ReadFromTimestamp) {
+                    const auto& kk = k;
+                    LOG_ALERT_S(ctx, NKikimrServices::PQ_READ_PROXY, PQ_LOG_PREFIX << "Have topic: " << kk);
+                }
+                CloseSession(TStringBuilder() << "Internal error", PersQueue::ErrorCode::ERROR, ctx);
+                return;
+            }
             ui64 readTimestampMs = Max(ReadTimestampMs, jt->second);
 
-            TAutoPtr<TEvPQProxy::TEvRead> read = new TEvPQProxy::TEvRead(Reads.front()->Guid, ccount, csize, MaxTimeLagMs, readTimestampMs);
+            auto lags_it = MaxLagByTopic.find(it->second.Topic->GetInternalName());
+            Y_VERIFY(lags_it != MaxLagByTopic.end());
+            ui32 maxLag = Max(MaxTimeLagMs, lags_it->second);
+
+            TAutoPtr<TEvPQProxy::TEvRead> read = new TEvPQProxy::TEvRead(Reads.front()->Guid, ccount, csize, maxLag, readTimestampMs);
 
             LOG_DEBUG_S(ctx, NKikimrServices::PQ_READ_PROXY, PQ_LOG_PREFIX
                                         << " performing read request with guid " << read->Guid
                                         << " from " << it->second.Partition << " count " << ccount << " size " << csize
-                                        << " partitionsAsked " << partitionsAsked << " maxTimeLag " << MaxTimeLagMs << "ms");
+                                        << " partitionsAsked " << partitionsAsked << " maxTimeLag " << maxLag << "ms");
 
 
             Y_VERIFY(!it->second.Reading);

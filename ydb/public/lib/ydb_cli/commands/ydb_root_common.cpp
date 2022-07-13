@@ -7,7 +7,7 @@
 #include "ydb_service_scheme.h"
 #include "ydb_service_scripting.h"
 #include "ydb_service_table.h"
-#include "ydb_service_stream.h"
+#include "ydb_service_topic.h"
 #include "ydb_tools.h"
 #include "ydb_yql.h"
 
@@ -37,7 +37,7 @@ TClientCommandRootCommon::TClientCommandRootCommon(const TClientSettings& settin
     AddCommand(std::make_unique<TCommandConfig>());
     AddCommand(std::make_unique<TCommandInit>());
     AddCommand(std::make_unique<TCommandYql>());
-    AddCommand(std::make_unique<TCommandStream>());
+    AddCommand(std::make_unique<TCommandTopic>());
     AddCommand(std::make_unique<TCommandWorkload>());
 }
 
@@ -227,8 +227,10 @@ void TClientCommandRootCommon::Parse(TConfig& config) {
     ParseProfile();
 
     TClientCommandRootBase::Parse(config);
-    ParseDatabase(config);
-    ParseCaCerts(config);
+    if (!config.IsSystemCommand()) {
+        ParseDatabase(config);
+        ParseCaCerts(config);
+    }
     config.IsVerbose = IsVerbose;
 }
 
@@ -292,15 +294,11 @@ void TClientCommandRootCommon::ParseDatabase(TConfig& config) {
     }
 
     if (Database.empty()) {
-        if (!config.IsSystemCommand()) {
-            throw TMisuseException()
-                << "Missing required option 'database'.";
-        }
+        throw TMisuseException()
+            << "Missing required option 'database'.";
     } else if (!Database.StartsWith('/')) {
-        if (!config.IsSystemCommand()) {
-            throw TMisuseException() << "Path to a database \"" << Database
-                << "\" is incorrect. It must be absolute and thus must begin with '/'.";
-        }
+        throw TMisuseException() << "Path to a database \"" << Database
+            << "\" is incorrect. It must be absolute and thus must begin with '/'.";
     }
     config.Database = Database;
 }

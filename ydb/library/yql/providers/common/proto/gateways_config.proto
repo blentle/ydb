@@ -66,6 +66,7 @@ message TYtClusterConfig {
     optional bool Default = 3 [default = false]; // Default cluster
     optional string YTToken = 4; // token to use at YT servers
     optional string YTName = 5; // YT cluster name
+    optional bool EnabledYtQlQueries = 6 [default = true]; // Allow to handle YtQl queries
 
     repeated TAttr Settings = 100;
 }
@@ -88,6 +89,18 @@ message TYtGatewayConfig {
     repeated TRemoteFilePattern RemoteFilePatterns = 100;
     repeated TYtClusterConfig ClusterMapping = 101; // Accepted cluster shortcuts. All names not from this list will be rejected
     repeated TAttr DefaultSettings = 102;
+}
+
+/////////////////////////////// Grut ///////////////////////////////
+
+message TYtOrmClusterConfig {
+    optional string Name = 1;
+    optional string Cluster = 2; // Real cluster server name with port
+    optional bool Enabled = 3 [default = true]; // Allow to handle YTORM queries
+}
+
+message TYtOrmGatewayConfig {
+    repeated TYtOrmClusterConfig ClusterMapping = 1;
 }
 
 /////////////////////////////// Kikimr ///////////////////////////////
@@ -409,6 +422,10 @@ message TDqGatewayConfig {
     repeated string DefaultAnalyzeQueryForUsers = 4;
 
     repeated TAttr DefaultSettings = 102;
+
+    optional uint32 WithHiddenPercentage = 5 [default = 0];
+    repeated TDefaultAutoByHourPercentage WithHiddenByHour = 6;
+    repeated string NoWithHiddenForUsers = 7;
 }
 
 /////////////////////////////// Yql Core ///////////////////////////////
@@ -458,4 +475,5 @@ message TGatewaysConfig {
     optional TPqGatewayConfig Pq = 16;
     optional TS3GatewayConfig S3 = 17;
     optional THttpGatewayConfig HttpGateway = 18;
+    optional TYtOrmGatewayConfig YtOrm = 19;
 }

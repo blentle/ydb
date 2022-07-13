@@ -4,6 +4,7 @@
 #include <util/stream/str.h>
 #include <util/string/builder.h>
 #include <util/generic/size_literals.h>
+#include <util/generic/yexception.h>
 
 #include <thread>
 #include <mutex>
@@ -17,13 +18,27 @@ class TEasyCurl {
 public:
     using TPtr = std::shared_ptr<TEasyCurl>;
 
-    TEasyCurl(const NMonitoring::TDynamicCounters::TCounterPtr&  counter, const NMonitoring::TDynamicCounters::TCounterPtr& downloadedBytes, TString url, IHTTPGateway::THeaders headers, size_t offset, bool withData)
-        : Offset(offset), Handle(curl_easy_init()), Counter(counter), DownloadedBytes(downloadedBytes)
+    enum class EMethod {
+        GET,
+        POST,
+        PUT
+    };
+
+    TEasyCurl(const ::NMonitoring::TDynamicCounters::TCounterPtr&  counter, const ::NMonitoring::TDynamicCounters::TCounterPtr& downloadedBytes, const ::NMonitoring::TDynamicCounters::TCounterPtr& uploadedBytes, TString url, IHTTPGateway::THeaders headers, EMethod method, size_t offset = 0ULL, bool withBody = false)
+        : Offset(offset), Handle(curl_easy_init()), Counter(counter), DownloadedBytes(downloadedBytes), UploadedBytes(uploadedBytes)
     {
+        switch (method) {
+            case EMethod::GET:
+                break;
+            case EMethod::POST:
+                curl_easy_setopt(Handle, CURLOPT_POST, 1L);
+                break;
+            case EMethod::PUT:
+                curl_easy_setopt(Handle, CURLOPT_UPLOAD, 1L);
+                break;
+        }
+
         curl_easy_setopt(Handle, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(Handle, CURLOPT_POST, withData ?  1L : 0L);
-        curl_easy_setopt(Handle, CURLOPT_WRITEFUNCTION, &WriteMemoryCallback);
-        curl_easy_setopt(Handle, CURLOPT_WRITEDATA, static_cast<void*>(this));
         curl_easy_setopt(Handle, CURLOPT_USERAGENT, "YQ HTTP gateway");
         curl_easy_setopt(Handle, CURLOPT_SSL_VERIFYPEER, 0L);
 
@@ -37,7 +52,10 @@ public:
             curl_easy_setopt(Handle, CURLOPT_RANGE,  (ToString(Offset) += '-').c_str());
         }
 
-        if (withData) {
+        curl_easy_setopt(Handle, EMethod::PUT == method ? CURLOPT_HEADERFUNCTION : CURLOPT_WRITEFUNCTION, &WriteMemoryCallback);
+        curl_easy_setopt(Handle, EMethod::PUT == method ? CURLOPT_HEADERDATA :CURLOPT_WRITEDATA, static_cast<void*>(this));
+
+        if (withBody) {
             curl_easy_setopt(Handle, CURLOPT_READFUNCTION, &ReadMemoryCallback);
             curl_easy_setopt(Handle, CURLOPT_READDATA, static_cast<void*>(this));
         }
@@ -68,21 +86,26 @@ protected:
 private:
     static size_t
     WriteMemoryCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-        auto self = static_cast<TEasyCurl*>(userp);
-        self->DownloadedBytes->Add(size * nmemb);
-        return self->Write(contents, size, nmemb);
+        const auto self = static_cast<TEasyCurl*>(userp);
+        const auto res = self->Write(contents, size, nmemb);
+        self->DownloadedBytes->Add(res);
+        return res;
     };
 
     static size_t
     ReadMemoryCallback(char *buffer, size_t size, size_t nmemb, void *userp) {
-        return static_cast<TEasyCurl*>(userp)->Read(buffer, size, nmemb);
+        const auto self = static_cast<TEasyCurl*>(userp);
+        const auto res = self->Read(buffer, size, nmemb);
+        self->UploadedBytes->Add(res);
+        return res;
     };
 
     const size_t Offset;
     CURL *const Handle;
     curl_slist* Headers = nullptr;
-    const NMonitoring::TDynamicCounters::TCounterPtr Counter;
-    const NMonitoring::TDynamicCounters::TCounterPtr DownloadedBytes;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr Counter;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr DownloadedBytes;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr UploadedBytes;
 };
 
 class TEasyCurlBuffer : public TEasyCurl {
@@ -90,15 +113,15 @@ public:
     using TPtr = std::shared_ptr<TEasyCurlBuffer>;
     using TWeakPtr = std::weak_ptr<TEasyCurlBuffer>;
 
-    TEasyCurlBuffer(const NMonitoring::TDynamicCounters::TCounterPtr&  counter, const NMonitoring::TDynamicCounters::TCounterPtr& downloadedBytes, TString url, TString data, IHTTPGateway::THeaders headers, size_t offset, size_t expectedSize, IHTTPGateway::TOnResult callback)
-        : TEasyCurl(counter, downloadedBytes, url, headers, offset, !data.empty()), ExpectedSize(expectedSize), Data(std::move(data)), Input(Data), Output(Buffer)
+    TEasyCurlBuffer(const ::NMonitoring::TDynamicCounters::TCounterPtr&  counter, const ::NMonitoring::TDynamicCounters::TCounterPtr& downloadedBytes, const ::NMonitoring::TDynamicCounters::TCounterPtr& uploadededBytes, TString url, EMethod method, TString data, IHTTPGateway::THeaders headers, size_t offset, size_t expectedSize, IHTTPGateway::TOnResult callback)
+        : TEasyCurl(counter, downloadedBytes, uploadededBytes, url, headers, method, offset, !data.empty()), ExpectedSize(expectedSize), Data(std::move(data)), Input(Data), Output(Buffer)
     {
         Output.Reserve(ExpectedSize);
         Callbacks.emplace(std::move(callback));
     }
 
-    static TPtr Make(const NMonitoring::TDynamicCounters::TCounterPtr&  counter, const NMonitoring::TDynamicCounters::TCounterPtr& downloadedBytes, TString url, TString data, IHTTPGateway::THeaders headers, size_t offset, size_t expectedSize, IHTTPGateway::TOnResult callback) {
-        return std::make_shared<TEasyCurlBuffer>(counter, downloadedBytes, std::move(url), std::move(data), std::move(headers), offset, expectedSize, std::move(callback));
+    static TPtr Make(const ::NMonitoring::TDynamicCounters::TCounterPtr&  counter, const ::NMonitoring::TDynamicCounters::TCounterPtr& downloadedBytes, const ::NMonitoring::TDynamicCounters::TCounterPtr& uploadededBytes, TString url, EMethod method, TString data, IHTTPGateway::THeaders headers, size_t offset, size_t expectedSize, IHTTPGateway::TOnResult callback) {
+        return std::make_shared<TEasyCurlBuffer>(counter, downloadedBytes, uploadededBytes, std::move(url), method, std::move(data), std::move(headers), offset, expectedSize, std::move(callback));
     }
 
     size_t GetExpectedSize() const {
@@ -144,11 +167,11 @@ private:
         const auto realsize = size * nmemb;
         Output.Write(contents, realsize);
         return realsize;
-    };
+    }
 
     size_t Read(char *buffer, size_t size, size_t nmemb) final {
         return Input.Read(buffer, size * nmemb);
-    };
+    }
 
     const size_t ExpectedSize;
     const TString Data;
@@ -165,12 +188,12 @@ public:
     using TPtr = std::shared_ptr<TEasyCurlStream>;
     using TWeakPtr = std::weak_ptr<TEasyCurlStream>;
 
-    TEasyCurlStream(const NMonitoring::TDynamicCounters::TCounterPtr&  counter, const NMonitoring::TDynamicCounters::TCounterPtr& downloadedBytes, TString url, IHTTPGateway::THeaders headers, size_t offset, IHTTPGateway::TOnNewDataPart onNewData, IHTTPGateway::TOnDownloadFinish onFinish)
-        : TEasyCurl(counter, downloadedBytes, url, headers, offset, false), OnNewData(std::move(onNewData)), OnFinish(std::move(onFinish)), Counter(std::make_shared<std::atomic_size_t>(0ULL))
+    TEasyCurlStream(const ::NMonitoring::TDynamicCounters::TCounterPtr&  counter, const ::NMonitoring::TDynamicCounters::TCounterPtr& downloadedBytes, const ::NMonitoring::TDynamicCounters::TCounterPtr& uploadededBytes, TString url, IHTTPGateway::THeaders headers, size_t offset, IHTTPGateway::TOnNewDataPart onNewData, IHTTPGateway::TOnDownloadFinish onFinish)
+        : TEasyCurl(counter, downloadedBytes, uploadededBytes, url, headers, EMethod::GET, offset), OnNewData(std::move(onNewData)), OnFinish(std::move(onFinish)), Counter(std::make_shared<std::atomic_size_t>(0ULL))
     {}
 
-    static TPtr Make(const NMonitoring::TDynamicCounters::TCounterPtr&  counter, const NMonitoring::TDynamicCounters::TCounterPtr& downloadedBytes, TString url, IHTTPGateway::THeaders headers, size_t offset, IHTTPGateway::TOnNewDataPart onNewData, IHTTPGateway::TOnDownloadFinish onFinish) {
-        return std::make_shared<TEasyCurlStream>(counter, downloadedBytes, std::move(url), std::move(headers), offset, std::move(onNewData), std::move(onFinish));
+    static TPtr Make(const ::NMonitoring::TDynamicCounters::TCounterPtr&  counter, const ::NMonitoring::TDynamicCounters::TCounterPtr& downloadedBytes, const ::NMonitoring::TDynamicCounters::TCounterPtr& uploadededBytes, TString url, IHTTPGateway::THeaders headers, size_t offset, IHTTPGateway::TOnNewDataPart onNewData, IHTTPGateway::TOnDownloadFinish onFinish) {
+        return std::make_shared<TEasyCurlStream>(counter, downloadedBytes, uploadededBytes, std::move(url), std::move(headers), offset, std::move(onNewData), std::move(onFinish));
     }
 
     enum class EAction : i8 {
@@ -207,7 +230,7 @@ private:
         Position += realsize;
         OnNewData(IHTTPGateway::TCountedContent(TString(static_cast<char*>(contents), realsize), Counter));
         return realsize;
-    };
+    }
 
     size_t Read(char*, size_t, size_t) final { return 0ULL; }
 
@@ -244,7 +267,7 @@ public:
 
     explicit THTTPMultiGateway(
         const THttpGatewayConfig* httpGatewaysCfg,
-        NMonitoring::TDynamicCounterPtr counters)
+        ::NMonitoring::TDynamicCounterPtr counters)
         : Counters(std::move(counters))
         , Rps(Counters->GetCounter("Requests", true))
         , InFlight(Counters->GetCounter("InFlight"))
@@ -257,6 +280,7 @@ public:
         , AwaitQueue(Counters->GetCounter("AwaitQueue"))
         , AwaitQueueTopExpectedSize(Counters->GetCounter("AwaitQueueTopExpectedSize"))
         , DownloadedBytes(Counters->GetCounter("DownloadedBytes", true))
+        , UploadedBytes(Counters->GetCounter("UploadedBytes", true))
     {
         if (httpGatewaysCfg) {
             if (httpGatewaysCfg->HasMaxInFlightCount()) {
@@ -275,68 +299,84 @@ public:
         }
 
         TaskScheduler.Start();
+
+        InitCurl();
     }
 
     ~THTTPMultiGateway() {
-        if (Handle)
-            curl_multi_wakeup(Handle);
-        Thread.join();
+        curl_multi_wakeup(Handle);
+        if (Thread.joinable()) {
+            Thread.join();
+        }
+        UninitCurl();
     }
+
 private:
     size_t MaxHandlers = 1024U;
     size_t MaxSimulatenousDownloadsSize = 8_GB;
     size_t BuffersSizePerStream = CURL_MAX_WRITE_SIZE << 1U;
 
-    static void Perform(const TWeakPtr& weak) {
-        OutputSize.store(0ULL);
-        curl_global_init(CURL_GLOBAL_ALL);
+    void InitCurl() {
+        const CURLcode globalInitResult = curl_global_init(CURL_GLOBAL_ALL);
+        if (globalInitResult == CURLE_OK) {
+            Handle = curl_multi_init();
+            if (!Handle) {
+                Cerr << "curl_multi_init error" << Endl;
+            }
+        } else {
+            Cerr << "curl_global_init error " << int(globalInitResult) << ": " << curl_easy_strerror(globalInitResult) << Endl;
+        }
+    }
 
-        if (const auto handle = curl_multi_init()) {
+    void UninitCurl() {
+        if (Handle) {
+            const CURLMcode multiCleanupResult = curl_multi_cleanup(Handle);
+            if (multiCleanupResult != CURLM_OK) {
+                Cerr << "curl_multi_cleanup error " << int(multiCleanupResult) << ": " << curl_multi_strerror(multiCleanupResult) << Endl;
+            }
+        }
+        curl_global_cleanup();
+    }
+
+    static void Perform(const TWeakPtr& weak, CURLM* handle) {
+        OutputSize.store(0ULL);
+
+        for (size_t handlers = 0U;;) {
             if (const auto& self = weak.lock()) {
-                self->Handle = handle;
+                handlers = self->FillHandlers();
+                self->PerformCycles->Inc();
+                self->OutputMemory->Set(OutputSize);
+            } else {
+                break;
             }
 
-            for (size_t handlers = 0U;;) {
+            int running = 0;
+            if (const auto c = curl_multi_perform(handle, &running); CURLM_OK != c) {
                 if (const auto& self = weak.lock()) {
-                    handlers = self->FillHandlers();
-                    self->PerformCycles->Inc();
-                    self->OutputMemory->Set(OutputSize);
-                } else {
-                    break;
+                    self->Fail(c);
                 }
+                break;
+            }
 
-                int running = 0;
-                if (const auto c = curl_multi_perform(handle, &running); CURLM_OK != c) {
+            if (running < int(handlers)) {
+                if (const auto& self = weak.lock()) {
+                    for (int messages = int(handlers) - running; messages;) {
+                        if (const auto msg = curl_multi_info_read(handle, &messages)) {
+                            if(msg->msg == CURLMSG_DONE) {
+                                self->Done(msg->easy_handle, msg->data.result);
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (const auto c = curl_multi_poll(handle, nullptr, 0, 1024, nullptr); CURLM_OK != c) {
                     if (const auto& self = weak.lock()) {
                         self->Fail(c);
                     }
                     break;
                 }
-
-                if (running < int(handlers)) {
-                    if (const auto& self = weak.lock()) {
-                        for (int messages = int(handlers) - running; messages;) {
-                            if (const auto msg = curl_multi_info_read(handle, &messages)) {
-                                if(msg->msg == CURLMSG_DONE) {
-                                    self->Done(msg->easy_handle, msg->data.result);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    if (const auto c = curl_multi_poll(handle, nullptr, 0, 1024, nullptr); CURLM_OK != c) {
-                        if (const auto& self = weak.lock()) {
-                            self->Fail(c);
-                        }
-                        break;
-                    }
-                }
             }
-
-            curl_multi_cleanup(handle);
         }
-
-        curl_global_cleanup();
     }
 
     size_t FillHandlers() {
@@ -426,6 +466,16 @@ private:
         }
     }
 
+    void Upload(TString url, THeaders headers, TString body, TOnResult callback, bool put, IRetryPolicy<long>::TPtr retryPolicy) final {
+        Rps->Inc();
+
+        const std::unique_lock lock(Sync);
+        auto easy = TEasyCurlBuffer::Make(InFlight, DownloadedBytes, UploadedBytes, std::move(url), put ? TEasyCurl::EMethod::PUT : TEasyCurl::EMethod::POST, std::move(body), std::move(headers), 0U, 0U, std::move(callback));
+        Easy2RetryState.emplace(easy, std::move(retryPolicy->CreateRetryState()));
+        Await.emplace(std::move(easy));
+        Wakeup(0U);
+    }
+
     void Download(
         TString url,
         THeaders headers,
@@ -447,7 +497,7 @@ private:
             if (easy->AddCallback(callback))
                 return;
 
-        auto easy = TEasyCurlBuffer::Make(InFlight, DownloadedBytes, std::move(url), std::move(data), std::move(headers), 0U, expectedSize, std::move(callback));
+        auto easy = TEasyCurlBuffer::Make(InFlight, DownloadedBytes, UploadedBytes, std::move(url),  TEasyCurl::EMethod::GET, std::move(data), std::move(headers), 0U, expectedSize, std::move(callback));
         entry = easy;
         Easy2RetryState.emplace(easy, std::move(retryPolicy->CreateRetryState()));
         Await.emplace(std::move(easy));
@@ -461,8 +511,7 @@ private:
         TOnNewDataPart onNewData,
         TOnDownloadFinish onFinish) final
     {
-
-        auto stream = TEasyCurlStream::Make(InFlightStreams, DownloadedBytes, std::move(url), std::move(headers), offset, std::move(onNewData), std::move(onFinish));
+        auto stream = TEasyCurlStream::Make(InFlightStreams, DownloadedBytes, UploadedBytes, std::move(url), std::move(headers), offset, std::move(onNewData), std::move(onFinish));
         const std::unique_lock lock(Sync);
         const auto handle = stream->GetHandle();
         Streams.emplace_back(stream);
@@ -505,6 +554,10 @@ private:
         THTTPMultiGateway::TWeakPtr Gateway;
     };
 
+    CURLM* GetHandle() const {
+        return Handle;
+    }
+
 private:
     CURLM* Handle = nullptr;
 
@@ -524,18 +577,19 @@ private:
     static std::mutex CreateSync;
     static TWeakPtr Singleton;
 
-    const NMonitoring::TDynamicCounterPtr Counters;
-    const NMonitoring::TDynamicCounters::TCounterPtr Rps;
-    const NMonitoring::TDynamicCounters::TCounterPtr InFlight;
-    const NMonitoring::TDynamicCounters::TCounterPtr InFlightStreams;
-    const NMonitoring::TDynamicCounters::TCounterPtr MaxInFlight;
-    const NMonitoring::TDynamicCounters::TCounterPtr AllocatedMemory;
-    const NMonitoring::TDynamicCounters::TCounterPtr MaxAllocatedMemory;
-    const NMonitoring::TDynamicCounters::TCounterPtr OutputMemory;
-    const NMonitoring::TDynamicCounters::TCounterPtr PerformCycles;
-    const NMonitoring::TDynamicCounters::TCounterPtr AwaitQueue;
-    const NMonitoring::TDynamicCounters::TCounterPtr AwaitQueueTopExpectedSize;
-    const NMonitoring::TDynamicCounters::TCounterPtr DownloadedBytes;
+    const ::NMonitoring::TDynamicCounterPtr Counters;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr Rps;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr InFlight;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr InFlightStreams;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr MaxInFlight;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr AllocatedMemory;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr MaxAllocatedMemory;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr OutputMemory;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr PerformCycles;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr AwaitQueue;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr AwaitQueueTopExpectedSize;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr DownloadedBytes;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr UploadedBytes;
 
     TTaskScheduler TaskScheduler;
 };
@@ -604,14 +658,18 @@ TString IHTTPGateway::TCountedContent::Extract() {
 }
 
 IHTTPGateway::TPtr
-IHTTPGateway::Make(const THttpGatewayConfig* httpGatewaysCfg, NMonitoring::TDynamicCounterPtr counters) {
+IHTTPGateway::Make(const THttpGatewayConfig* httpGatewaysCfg, ::NMonitoring::TDynamicCounterPtr counters) {
     const std::unique_lock lock(THTTPMultiGateway::CreateSync);
     if (const auto g = THTTPMultiGateway::Singleton.lock())
         return g;
 
     const auto gateway = std::make_shared<THTTPMultiGateway>(httpGatewaysCfg, std::move(counters));
     THTTPMultiGateway::Singleton = gateway;
-    gateway->Thread = std::thread(std::bind(&THTTPMultiGateway::Perform, THTTPMultiGateway::Singleton));
+    if (gateway->GetHandle()) {
+        gateway->Thread = std::thread(std::bind(&THTTPMultiGateway::Perform, THTTPMultiGateway::Singleton, gateway->GetHandle()));
+    } else {
+        ythrow yexception() << "Failed to initialize http gateway";
+    }
     return gateway;
 }
 

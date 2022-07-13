@@ -11,6 +11,7 @@
 #include <ydb/core/yq/libs/private_client/internal_service.h>
 #include <ydb/core/yq/libs/private_client/loopback_service.h>
 #include <ydb/core/yq/libs/quota_manager/quota_manager.h>
+#include <ydb/core/yq/libs/rate_limiter/control_plane_service/rate_limiter_control_plane_service.h>
 #include <ydb/core/yq/libs/shared_resources/shared_resources.h>
 #include <ydb/library/folder_service/folder_service.h>
 #include <ydb/library/yql/providers/common/metrics/service_counters.h>
@@ -55,9 +56,10 @@ void Init(
     ::NPq::NConfigurationManager::IConnections::TPtr pqCmConnections,
     const IYqSharedResources::TPtr& iyqSharedResources,
     const std::function<IActor*(const NKikimrProto::NFolderService::TFolderServiceConfig& authConfig)>& folderServiceFactory,
-    const std::function<IActor*(const NYq::NConfig::TAuditConfig& auditConfig, const NMonitoring::TDynamicCounterPtr& counters)>& auditServiceFactory,
+    const std::function<IActor*(const NYq::NConfig::TAuditConfig& auditConfig, const ::NMonitoring::TDynamicCounterPtr& counters)>& auditServiceFactory,
     const NKikimr::TYdbCredentialsProviderFactory& credentialsProviderFactory,
-    const ui32& icPort
+    ui32 icPort,
+    const std::vector<NKikimr::NMiniKQL::TComputationNodeFactory>& additionalCompNodeFactories
     )
 {
     Y_VERIFY(iyqSharedResources, "No YQ shared resources created");
@@ -83,6 +85,11 @@ void Init(
         actorRegistrator(NYq::ControlPlaneProxyActorId(), controlPlaneProxy);
     }
 
+    if (protoConfig.GetRateLimiter().GetControlPlaneEnabled()) {
+        NActors::IActor* rateLimiterService = NYq::CreateRateLimiterControlPlaneService(protoConfig.GetRateLimiter(), yqSharedResources, credentialsProviderFactory);
+        actorRegistrator(NYq::RateLimiterControlPlaneServiceId(), rateLimiterService);
+    }
+
     if (protoConfig.GetAudit().GetEnabled()) {
         auto* auditSerive = auditServiceFactory(
             protoConfig.GetAudit(),
@@ -104,11 +111,14 @@ void Init(
     auto yqCounters = appData->Counters->GetSubgroup("counters", "yq");
     auto workerManagerCounters = NYql::NDqs::TWorkerManagerCounters(yqCounters->GetSubgroup("subsystem", "worker_manager"));
 
-    NKikimr::NMiniKQL::TComputationNodeFactory dqCompFactory = NKikimr::NMiniKQL::GetCompositeWithBuiltinFactory({
+    TVector<NKikimr::NMiniKQL::TComputationNodeFactory> compNodeFactories = {
         NYql::GetCommonDqFactory(),
         NYql::GetDqYdbFactory(yqSharedResources->UserSpaceYdbDriver),
         NKikimr::NMiniKQL::GetYqlFactory()
-    });
+    };
+
+    compNodeFactories.insert(compNodeFactories.end(), additionalCompNodeFactories.begin(), additionalCompNodeFactories.end());
+    NKikimr::NMiniKQL::TComputationNodeFactory dqCompFactory = NKikimr::NMiniKQL::GetCompositeWithBuiltinFactory(std::move(compNodeFactories));
 
     NYql::TTaskTransformFactory dqTaskTransformFactory = NYql::CreateCompositeTaskTransformFactory({
         NYql::CreateCommonDqTaskTransformFactory(),
@@ -197,6 +207,7 @@ void Init(
             protoConfig.GetPrivateApi(),
             yqSharedResources,
             icPort,
+            protoConfig.GetNodesManager().GetUseDataCenter() ? protoConfig.GetNodesManager().GetDataCenter() : "",
             tenant,
             mkqlInitialMemoryLimit);
 
@@ -270,8 +281,8 @@ void Init(
             /* yqSharedResources, */
             serviceCounters.Counters,
             {
-                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_RESULT_LIMIT, 20_MB),
-                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_COUNT_LIMIT, 100, NYq::ControlPlaneStorageServiceActorId())
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_RESULT_LIMIT, 20_MB, 2_GB),
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_COUNT_LIMIT, 100, 200, NYq::ControlPlaneStorageServiceActorId())
             });
         actorRegistrator(NYq::MakeQuotaServiceActorId(), quotaService);
     }
@@ -280,7 +291,7 @@ void Init(
 IYqSharedResources::TPtr CreateYqSharedResources(
     const NYq::NConfig::TConfig& config,
     const NKikimr::TYdbCredentialsProviderFactory& credentialsProviderFactory,
-    const NMonitoring::TDynamicCounterPtr& counters)
+    const ::NMonitoring::TDynamicCounterPtr& counters)
 {
     return CreateYqSharedResourcesImpl(config, credentialsProviderFactory, counters);
 }

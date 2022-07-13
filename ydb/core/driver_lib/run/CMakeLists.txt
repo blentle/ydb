@@ -108,6 +108,8 @@ target_link_libraries(run PUBLIC
   ydb-library-pdisk_io
   ydb-library-security
   yql-minikql-comp_nodes
+  yql-minikql-computation
+  providers-pq-cm_client
   udf-service-exception_policy
   public-lib-base
   lib-deprecated-client

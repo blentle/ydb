@@ -42,7 +42,7 @@ public:
         const NActors::TActorId& printerId,
         const TString& traceId, const TString& username,
         const TDqConfiguration::TPtr& settings,
-        const TIntrusivePtr<NMonitoring::TDynamicCounters>& counters,
+        const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters,
         TInstant requestStartTime,
         bool createTaskSuspended)
         : TRichActor<TDqExecuter>(&TDqExecuter::Handler)
@@ -174,7 +174,7 @@ private:
 
 
         const bool enableComputeActor = Settings->EnableComputeActor.Get().GetOrElse(false);
-        const TString computeActorType = Settings->ComputeActorType.Get().GetOrElse("old");
+        const TString computeActorType = Settings->ComputeActorType.Get().GetOrElse("sync");
 
         auto resourceAllocator = RegisterChild(CreateResourceAllocator(
             GwmActorId, SelfId(), ControlId, workerCount,
@@ -265,6 +265,8 @@ private:
                 TIssues issues;
                 IssuesFromMessage(ev->Get()->Record.GetIssues(), issues);
                 Issues.AddIssues(issues);
+            } else if (ev->Get()->Record.GetStatusCode() == 0) {
+                Issues.AddIssue(TIssue("Unknown Error"));
             }
             Finish(ev->Get()->Record.GetStatusCode(), retriable, fallback);
         }
@@ -314,7 +316,7 @@ private:
                     << ev->Get()->Record.GetError().GetMessage() << ":"
                     << static_cast<int>(ev->Get()->Record.GetError().GetErrorCode());
                 Issues.AddIssue(TIssue(ev->Get()->Record.GetError().GetMessage()).SetCode(TIssuesIds::DQ_GATEWAY_NEED_FALLBACK_ERROR, TSeverityIds::S_ERROR));
-                Finish(NYql::NDqProto::StatusIds::OVERLOADED, /*retriable = */ true, /*fallback = */ true);
+                Finish(NYql::NDqProto::StatusIds::CLUSTER_OVERLOADED, /*retriable = */ true, /*fallback = */ true);
                 return;
             }
             case TAllocateWorkersResponse::kNodes:
@@ -455,7 +457,7 @@ private:
     ui64 ResourceId = 0;
     const TString TraceId;
     const TString Username;
-    TIntrusivePtr<NMonitoring::TDynamicCounters> Counters;
+    TIntrusivePtr<::NMonitoring::TDynamicCounters> Counters;
     TDynamicCounters::TCounterPtr LongWorkersAllocationCounter;
     TDynamicCounters::TCounterPtr ExecutionTimeoutCounter;
 
@@ -482,7 +484,7 @@ NActors::IActor* MakeDqExecuter(
     const NActors::TActorId& printerId,
     const TString& traceId, const TString& username,
     const TDqConfiguration::TPtr& settings,
-    const TIntrusivePtr<NMonitoring::TDynamicCounters>& counters,
+    const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters,
     TInstant requestStartTime,
     bool createTaskSuspended
 ) {

@@ -28,7 +28,9 @@
 #include <ydb/services/rate_limiter/grpc_service.h>
 #include <ydb/services/persqueue_cluster_discovery/grpc_service.h>
 #include <ydb/services/persqueue_v1/persqueue.h>
+#include <ydb/services/persqueue_v1/topic.h>
 #include <ydb/services/persqueue_v1/grpc_pq_write.h>
+#include <ydb/services/monitoring/grpc_service.h>
 #include <ydb/services/yq/grpc_service.h>
 #include <ydb/core/yq/libs/control_plane_proxy/control_plane_proxy.h>
 #include <ydb/core/yq/libs/control_plane_storage/control_plane_storage.h>
@@ -259,7 +261,7 @@ namespace Tests {
         auto grpcMon = system->Register(NGRpcService::CreateGrpcMonService(), TMailboxType::ReadAsFilled);
         system->RegisterLocalService(NGRpcService::GrpcMonServiceId(), grpcMon);
 
-        GRpcServerRootCounters = MakeIntrusive<NMonitoring::TDynamicCounters>();
+        GRpcServerRootCounters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
         auto& counters = GRpcServerRootCounters;
 
         auto& appData = Runtime->GetAppData();
@@ -311,6 +313,7 @@ namespace Tests {
         GRpcServer->AddService(new NGRpcService::TGRpcYdbScriptingService(system, counters, grpcRequestProxyId));
         GRpcServer->AddService(new NGRpcService::TGRpcOperationService(system, counters, grpcRequestProxyId));
         GRpcServer->AddService(new NGRpcService::V1::TGRpcPersQueueService(system, counters, NMsgBusProxy::CreatePersQueueMetaCacheV2Id(), grpcRequestProxyId));
+        GRpcServer->AddService(new NGRpcService::V1::TGRpcTopicService(system, counters, NMsgBusProxy::CreatePersQueueMetaCacheV2Id(), grpcRequestProxyId));
         GRpcServer->AddService(new NGRpcService::TGRpcPQClusterDiscoveryService(system, counters, grpcRequestProxyId));
         GRpcServer->AddService(new NKesus::TKesusGRpcService(system, counters, grpcRequestProxyId));
         GRpcServer->AddService(new NGRpcService::TGRpcCmsService(system, counters, grpcRequestProxyId));
@@ -321,6 +324,7 @@ namespace Tests {
         GRpcServer->AddService(new NQuoter::TRateLimiterGRpcService(system, counters, grpcRequestProxyId));
         GRpcServer->AddService(new NGRpcService::TGRpcYdbLongTxService(system, counters, grpcRequestProxyId));
         GRpcServer->AddService(new NGRpcService::TGRpcDataStreamsService(system, counters, grpcRequestProxyId));
+        GRpcServer->AddService(new NGRpcService::TGRpcMonitoringService(system, counters, grpcRequestProxyId));
         if (Settings->EnableYq) {
             GRpcServer->AddService(new NGRpcService::TGRpcYandexQueryService(system, counters, grpcRequestProxyId));
             GRpcServer->AddService(new NGRpcService::TGRpcYqPrivateTaskService(system, counters, grpcRequestProxyId));
@@ -667,7 +671,7 @@ namespace Tests {
         {
             if (Settings->PQConfig.GetEnabled() == true) {
                 IActor *pqMetaCache = NMsgBusProxy::NPqMetaCacheV2::CreatePQMetaCache(
-                        new NMonitoring::TDynamicCounters(), TDuration::Seconds(1)
+                        new ::NMonitoring::TDynamicCounters(), TDuration::Seconds(1)
                 );
 
                 TActorId pqMetaCacheId = Runtime->Register(pqMetaCache, nodeIdx);
@@ -805,7 +809,7 @@ namespace Tests {
             };
 
             const auto ydbCredFactory = NKikimr::CreateYdbCredentialsProviderFactory;
-            auto counters = MakeIntrusive<NMonitoring::TDynamicCounters>();
+            auto counters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
             YqSharedResources = NYq::CreateYqSharedResources(protoConfig, ydbCredFactory, counters);
             NYq::Init(
                 protoConfig,
@@ -818,7 +822,8 @@ namespace Tests {
                 NKikimr::NFolderService::CreateMockFolderServiceActor,
                 NYq::CreateMockYqAuditServiceActor,
                 ydbCredFactory,
-                /*IcPort = */0
+                /*IcPort = */0,
+                {}
                 );
             NYq::InitTest(Runtime.Get(), port, Settings->GrpcPort, YqSharedResources);
         }
@@ -1472,14 +1477,14 @@ namespace Tests {
         return (NMsgBusProxy::EResponseStatus)response.GetStatus();
     }
 
-    NMsgBusProxy::EResponseStatus TClient::CreateOlapTable(const TString& parent, const TString& scheme) {
+    NMsgBusProxy::EResponseStatus TClient::CreateColumnTable(const TString& parent, const TString& scheme) {
         NKikimrSchemeOp::TColumnTableDescription table;
         bool parseOk = ::google::protobuf::TextFormat::ParseFromString(scheme, &table);
         UNIT_ASSERT(parseOk);
-        return CreateOlapTable(parent, table);
+        return CreateColumnTable(parent, table);
     }
 
-    NMsgBusProxy::EResponseStatus TClient::CreateOlapTable(const TString& parent,
+    NMsgBusProxy::EResponseStatus TClient::CreateColumnTable(const TString& parent,
                                                            const NKikimrSchemeOp::TColumnTableDescription& table) {
         auto request = std::make_unique<NMsgBusProxy::TBusSchemeOperation>();
         auto* op = request->Record.MutableTransaction()->MutableModifyScheme();
@@ -1514,6 +1519,24 @@ namespace Tests {
         op->SetOperationType(NKikimrSchemeOp::EOperationType::ESchemeOpAlterTable);
         op->SetWorkingDir(parent);
         op->MutableAlterTable()->CopyFrom(alter);
+        TAutoPtr<NBus::TBusMessage> reply;
+        if (userToken) {
+            request->Record.SetSecurityToken(userToken);
+        }
+        NBus::EMessageStatus status = SendAndWaitCompletion(request.Release(), reply);
+        UNIT_ASSERT_VALUES_EQUAL(status, NBus::MESSAGE_OK);
+        return dynamic_cast<NMsgBusProxy::TBusResponse *>(reply.Release());
+    }
+
+    TAutoPtr<NMsgBusProxy::TBusResponse> TClient::MoveIndex(const TString& table, const TString& src, const TString& dst, bool allowOverwrite, const TString& userToken) {
+        TAutoPtr<NMsgBusProxy::TBusSchemeOperation> request(new NMsgBusProxy::TBusSchemeOperation());
+        auto *op = request->Record.MutableTransaction()->MutableModifyScheme();
+        op->SetOperationType(NKikimrSchemeOp::EOperationType::ESchemeOpMoveIndex);
+        auto descr = op->MutableMoveIndex();
+        descr->SetTablePath(table);
+        descr->SetSrcPath(src);
+        descr->SetDstPath(dst);
+        descr->SetAllowOverwrite(allowOverwrite);
         TAutoPtr<NBus::TBusMessage> reply;
         if (userToken) {
             request->Record.SetSecurityToken(userToken);

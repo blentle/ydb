@@ -14,11 +14,14 @@ namespace NKikimr {
             EvRegisterAgentResult,
             EvAllocateIds,
             EvAllocateIdsResult,
+            EvPushNotify,
+            EvPushNotifyResult,
             EvBlock,
             EvBlockResult,
-            EvPushNotify,
             EvQueryBlocks,
             EvQueryBlocksResult,
+            EvCollectGarbage,
+            EvCollectGarbageResult,
             EvCommitBlobSeq,
             EvCommitBlobSeqResult,
             EvResolve,
@@ -50,19 +53,46 @@ namespace NKikimr {
 
         BLOBDEPOT_EVENT_PB(EvApplyConfig, TxId);
         BLOBDEPOT_EVENT_PB(EvApplyConfigResult, TabletId, TxId);
-        BLOBDEPOT_EVENT_PB(EvRegisterAgent, VirtualGroupId);
+        BLOBDEPOT_EVENT_PB(EvRegisterAgent, VirtualGroupId, AgentInstanceId);
         BLOBDEPOT_EVENT_PB_NO_ARGS(EvRegisterAgentResult);
-        BLOBDEPOT_EVENT_PB(EvAllocateIds, ChannelKind);
+        BLOBDEPOT_EVENT_PB(EvAllocateIds, ChannelKind, Count);
         BLOBDEPOT_EVENT_PB(EvAllocateIdsResult, ChannelKind, Generation);
-        BLOBDEPOT_EVENT_PB(EvBlock, TabletId, BlockedGeneration);
-        BLOBDEPOT_EVENT_PB(EvBlockResult, Status, ErrorReason);
         BLOBDEPOT_EVENT_PB_NO_ARGS(EvPushNotify);
+        BLOBDEPOT_EVENT_PB_NO_ARGS(EvPushNotifyResult);
+        BLOBDEPOT_EVENT_PB(EvBlock, TabletId, BlockedGeneration, IssuerGuid);
+        BLOBDEPOT_EVENT_PB(EvBlockResult, Status, ErrorReason, TimeToLiveMs);
         BLOBDEPOT_EVENT_PB_NO_ARGS(EvQueryBlocks);
         BLOBDEPOT_EVENT_PB_NO_ARGS(EvQueryBlocksResult);
+        BLOBDEPOT_EVENT_PB_NO_ARGS(EvCollectGarbage);
+        BLOBDEPOT_EVENT_PB(EvCollectGarbageResult, Status, ErrorReason);
         BLOBDEPOT_EVENT_PB_NO_ARGS(EvCommitBlobSeq);
         BLOBDEPOT_EVENT_PB_NO_ARGS(EvCommitBlobSeqResult);
         BLOBDEPOT_EVENT_PB_NO_ARGS(EvResolve);
         BLOBDEPOT_EVENT_PB(EvResolveResult, Status, ErrorReason);
+
+        template<typename TEvent>
+        struct TResponseFor {};
+
+        template<> struct TResponseFor<TEvApplyConfig> { using Type = TEvApplyConfigResult; };
+        template<> struct TResponseFor<TEvRegisterAgent> { using Type = TEvRegisterAgentResult; };
+        template<> struct TResponseFor<TEvAllocateIds> { using Type = TEvAllocateIdsResult; };
+        template<> struct TResponseFor<TEvPushNotify> { using Type = TEvPushNotifyResult; };
+        template<> struct TResponseFor<TEvBlock> { using Type = TEvBlockResult; };
+        template<> struct TResponseFor<TEvQueryBlocks> { using Type = TEvQueryBlocksResult; };
+        template<> struct TResponseFor<TEvCollectGarbage> { using Type = TEvCollectGarbageResult; };
+        template<> struct TResponseFor<TEvCommitBlobSeq> { using Type = TEvCommitBlobSeqResult; };
+        template<> struct TResponseFor<TEvResolve> { using Type = TEvResolveResult; };
+
+        template<typename TRequestEvent, typename... TArgs>
+        static auto MakeResponseFor(TEventHandle<TRequestEvent>& ev, TActorId selfId, TArgs&&... args) {
+            auto event = std::make_unique<typename TResponseFor<TRequestEvent>::Type>(std::forward<TArgs>(args)...);
+            auto *record = &event->Record;
+            auto handle = std::make_unique<IEventHandle>(ev.Sender, selfId, event.release(), 0, ev.Cookie);
+            if (ev.InterconnectSession) {
+                handle->Rewrite(TEvInterconnect::EvForward, ev.InterconnectSession);
+            }
+            return std::make_pair(std::move(handle), record);
+        }
     };
 
 } // NKikimr

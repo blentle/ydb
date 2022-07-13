@@ -1,18 +1,20 @@
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
 #include <ydb/core/kqp/counters/kqp_counters.h>
+#include <ydb/core/tx/scheme_cache/scheme_cache.h>
 
 #include <ydb/public/lib/experimental/ydb_experimental.h>
 
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor.h>
 
 #include <util/generic/size_literals.h>
+#include <ydb/core/kqp/kqp.h>
+#include <ydb/core/kqp/executer/kqp_executer.h>
 
 namespace NKikimr {
 namespace NKqp {
 
 using namespace NYdb;
 using namespace NYdb::NTable;
-
 
 namespace {
 
@@ -64,7 +66,7 @@ void CreateNullSampleTables(TKikimrRunner& kikimr) {
     auto session = db.CreateSession().GetValueSync().GetSession();
 
     UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
-        CREATE TABLE [/Root/TestNulls] (
+        CREATE TABLE `/Root/TestNulls` (
             Key1 Uint32,
             Key2 Uint32,
             Value String,
@@ -73,7 +75,7 @@ void CreateNullSampleTables(TKikimrRunner& kikimr) {
     )").GetValueSync().IsSuccess());
 
     UNIT_ASSERT(session.ExecuteDataQuery(R"(
-        REPLACE INTO [/Root/TestNulls] (Key1, Key2, Value) VALUES
+        REPLACE INTO `/Root/TestNulls` (Key1, Key2, Value) VALUES
             (NULL, NULL, "One"),
             (NULL, 100u, "Two"),
             (NULL, 200u, "Three"),
@@ -794,12 +796,12 @@ Y_UNIT_TEST_SUITE(KqpScan) {
 
         auto replaceQuery = R"(
             DECLARE $rows AS
-                'List<Struct<
+                List<Struct<
                     Key: Uint64?,
                     Value: String?
-                >>';
+                >>;
 
-            REPLACE INTO [/Root/Tmp]
+            REPLACE INTO `/Root/Tmp`
             SELECT * FROM AS_TABLE($rows);
         )";
 
@@ -1130,34 +1132,26 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         auto cfg = AppCfg();
         cfg.MutableFeatureFlags()->SetEnablePredicateExtractForScanQueries(WithPredicatesExtract);
         auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, cfg);
-        NExperimental::TStreamQueryClient db(kikimr.GetDriver());
+        auto db = kikimr.GetTableClient();
 
-        auto settings = NExperimental::TExecuteStreamQuerySettings()
-            .ProfileMode(NExperimental::EStreamQueryProfileMode::Basic);
+        TStreamExecScanQuerySettings settings;
+        settings.CollectQueryStats(ECollectQueryStatsMode::Basic);
 
         // simple key
         {
-            auto it = db.ExecuteStreamQuery(Sprintf(R"(
+            auto it = db.StreamExecuteScanQuery(Sprintf(R"(
                 PRAGMA Kikimr.OptEnablePredicateExtract = '%s';
                 SELECT * FROM `/Root/EightShard` WHERE Key = 301;
             )", WithPredicatesExtract ? "true" : "false"), settings).GetValueSync();
 
             UNIT_ASSERT(it.IsSuccess());
 
-            TVector<TString> profiles;
-            CompareYson(R"([[[3];[301u];["Value1"]]])", StreamResultToYson(it, &profiles));
+            auto res = CollectStreamResult(it);
+            CompareYson(R"([[[3];[301u];["Value1"]]])", res.ResultSetYson);
 
-            UNIT_ASSERT_EQUAL(1, profiles.size());
-
-            {
-                NYql::NDqProto::TDqExecutionStats stats;
-                google::protobuf::TextFormat::ParseFromString(profiles[0], &stats);
-                UNIT_ASSERT(stats.IsInitialized());
-
-                NKqpProto::TKqpExecutionExtraStats extraStats;
-                UNIT_ASSERT(stats.GetExtra().UnpackTo(&extraStats));
-                UNIT_ASSERT_VALUES_EQUAL_C(extraStats.GetAffectedShards(), 1, "" << stats.DebugString());
-            }
+            UNIT_ASSERT(res.QueryStats);
+            UNIT_ASSERT_VALUES_EQUAL(res.QueryStats->query_phases().size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(res.QueryStats->query_phases(0).affected_shards(), 1);
         }
 
         // complex key
@@ -1166,7 +1160,7 @@ Y_UNIT_TEST_SUITE(KqpScan) {
                 .AddParam("$ts").Int64(2).Build()
                 .Build();
 
-            auto it = db.ExecuteStreamQuery(Sprintf(R"(
+            auto it = db.StreamExecuteScanQuery(Sprintf(R"(
                 PRAGMA Kikimr.OptEnablePredicateExtract = '%s';
                 DECLARE $ts AS Int64;
                 SELECT * FROM `/Root/Logs` WHERE App = "nginx" AND Ts > $ts
@@ -1174,65 +1168,42 @@ Y_UNIT_TEST_SUITE(KqpScan) {
 
             UNIT_ASSERT(it.IsSuccess());
 
-            TVector<TString> profiles;
-            CompareYson(R"([[["nginx"];["nginx-23"];["GET /cat.jpg HTTP/1.1"];[3]]])", StreamResultToYson(it, &profiles));
+            auto res = CollectStreamResult(it);
+            CompareYson(R"([[["nginx"];["nginx-23"];["GET /cat.jpg HTTP/1.1"];[3]]])", res.ResultSetYson);
 
-            UNIT_ASSERT_EQUAL(1, profiles.size());
-
-            {
-                NYql::NDqProto::TDqExecutionStats stats;
-                google::protobuf::TextFormat::ParseFromString(profiles[0], &stats);
-                UNIT_ASSERT(stats.IsInitialized());
-
-                NKqpProto::TKqpExecutionExtraStats extraStats;
-                UNIT_ASSERT(stats.GetExtra().UnpackTo(&extraStats));
-                UNIT_ASSERT_VALUES_EQUAL_C(extraStats.GetAffectedShards(), 1, "" << stats.DebugString());
-            }
+            UNIT_ASSERT(res.QueryStats);
+            UNIT_ASSERT_VALUES_EQUAL(res.QueryStats->query_phases().size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(res.QueryStats->query_phases(0).affected_shards(), 1);
         }
     }
 
     Y_UNIT_TEST_TWIN(PrunePartitionsByExpr, UseSessionActor) {
         auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
-        NExperimental::TStreamQueryClient db(kikimr.GetDriver());
+        auto db = kikimr.GetTableClient();
 
-        auto settings = NExperimental::TExecuteStreamQuerySettings()
-            .ProfileMode(NExperimental::EStreamQueryProfileMode::Basic);
+        TStreamExecScanQuerySettings settings;
+        settings.CollectQueryStats(ECollectQueryStatsMode::Basic);
 
         auto params = TParamsBuilder()
             .AddParam("$key").Uint64(300).Build()
             .Build();
 
-        auto it = db.ExecuteStreamQuery(R"(
+        auto it = db.StreamExecuteScanQuery(R"(
             DECLARE $key AS Uint64;
             SELECT * FROM `/Root/EightShard` WHERE Key = $key + 1;
         )", params, settings).GetValueSync();
 
         UNIT_ASSERT(it.IsSuccess());
 
-        TVector<TString> profiles;
-        CompareYson(R"([[[3];[301u];["Value1"]]])", StreamResultToYson(it, &profiles));
+        auto res = CollectStreamResult(it);
+        CompareYson(R"([
+            [[3];[301u];["Value1"]]
+        ])", res.ResultSetYson);
 
-        UNIT_ASSERT_EQUAL(2, profiles.size());
-
-        {
-            NYql::NDqProto::TDqExecutionStats stats;
-            google::protobuf::TextFormat::ParseFromString(profiles[0], &stats);
-            UNIT_ASSERT(stats.IsInitialized());
-
-            NKqpProto::TKqpExecutionExtraStats extraStats;
-            UNIT_ASSERT(stats.GetExtra().UnpackTo(&extraStats));
-            UNIT_ASSERT_VALUES_EQUAL(extraStats.GetAffectedShards(), 0);
-        }
-
-        {
-            NYql::NDqProto::TDqExecutionStats stats;
-            google::protobuf::TextFormat::ParseFromString(profiles[1], &stats);
-            UNIT_ASSERT(stats.IsInitialized());
-
-            NKqpProto::TKqpExecutionExtraStats extraStats;
-            UNIT_ASSERT(stats.GetExtra().UnpackTo(&extraStats));
-            UNIT_ASSERT_VALUES_EQUAL(extraStats.GetAffectedShards(), 1);
-        }
+        UNIT_ASSERT(res.QueryStats);
+        UNIT_ASSERT_VALUES_EQUAL(res.QueryStats->query_phases().size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(res.QueryStats->query_phases(0).affected_shards(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(res.QueryStats->query_phases(1).affected_shards(), 1);
     }
 
     Y_UNIT_TEST_TWIN(TooManyComputeActors, UseSessionActor) {
@@ -1596,7 +1567,7 @@ Y_UNIT_TEST_SUITE(KqpScan) {
 
         auto it = db.StreamExecuteScanQuery(R"(
             --!syntax_v0
-            SELECT * FROM [/Root/EightShard] WHERE Key = 1;
+            SELECT * FROM `/Root/EightShard` WHERE Key = 1;
         )").GetValueSync();
         UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
         auto part = it.ReadNext().GetValueSync();
@@ -1709,7 +1680,11 @@ Y_UNIT_TEST_SUITE(KqpScan) {
     }
 
     Y_UNIT_TEST_TWIN(SecondaryIndex, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+        auto settings = TKikimrSettings()
+            .SetEnableKqpSessionActor(UseSessionActor)
+            .SetEnableKqpScanQueryStreamLookup(true);
+
+        TKikimrRunner kikimr(settings);
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
@@ -1727,24 +1702,44 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT_C(itOk.IsSuccess(), itOk.GetIssues().ToString());
         CompareYson(R"([[["Payload1"]];[["Payload2"]]])", StreamResultToYson(itOk));
 
-        // should NOT work with explicit view
-        auto itIndex = db.StreamExecuteScanQuery(R"(
-            PRAGMA AnsiInForEmptyOrNullableItemsCollections;
-            SELECT Value
-            FROM `/Root/SecondaryComplexKeys` VIEW Index
-            WHERE (Fk1, Fk2) IN AsList((1, "Fk1"), (2, "Fk2"), (42, "Fk5"), (Null, "FkNull"))
-            ORDER BY Value;
-        )").GetValueSync();
+        {  // Index contains required columns
+            auto itIndex = db.StreamExecuteScanQuery(R"(
+                PRAGMA AnsiInForEmptyOrNullableItemsCollections;
+                SELECT Fk2
+                FROM `/Root/SecondaryComplexKeys` VIEW Index
+                WHERE Fk1 IN [1, 2, 3, 4, 5]
+                ORDER BY Fk2;
+            )").GetValueSync();
 
-        NYdb::EStatus status = NYdb::EStatus::STATUS_UNDEFINED;
-        for (;;) {
-            auto streamPart = itIndex.ReadNext().GetValueSync();
-            if (!streamPart.IsSuccess()) {
-                status = streamPart.GetStatus();
-                break;
-            }
+            UNIT_ASSERT_C(itIndex.IsSuccess(), itIndex.GetIssues().ToString());
+            CompareYson(R"([[["Fk1"]];[["Fk2"]];[["Fk5"]]])", StreamResultToYson(itIndex));
         }
-        UNIT_ASSERT_VALUES_EQUAL_C(status, EStatus::BAD_REQUEST, "ScanQuery with explicit index should fail");
+
+        {
+            auto itIndex = db.StreamExecuteScanQuery(R"(
+                PRAGMA AnsiInForEmptyOrNullableItemsCollections;
+                SELECT Value
+                FROM `/Root/SecondaryComplexKeys` VIEW Index
+                WHERE Fk1 >= 1 AND Fk1 < 5
+                ORDER BY Value;
+            )").GetValueSync();
+
+            UNIT_ASSERT_C(itIndex.IsSuccess(), itIndex.GetIssues().ToString());
+            CompareYson(R"([[["Payload1"]];[["Payload2"]]])", StreamResultToYson(itIndex));
+        }
+
+        {
+            auto itIndex = db.StreamExecuteScanQuery(R"(
+                PRAGMA AnsiInForEmptyOrNullableItemsCollections;
+                SELECT Value
+                FROM `/Root/SecondaryComplexKeys` VIEW Index
+                WHERE (Fk1, Fk2) IN AsList((1, "Fk1"), (2, "Fk2"), (42, "Fk5"), (Null, "FkNull"))
+                ORDER BY Value;
+            )").GetValueSync();
+
+            UNIT_ASSERT_C(itIndex.IsSuccess(), itIndex.GetIssues().ToString());
+            CompareYson(R"([[["Payload1"]];[["Payload2"]]])", StreamResultToYson(itIndex));
+        }
     }
 
     Y_UNIT_TEST_TWIN(BoolFlag, UseSessionActor) {
@@ -1852,7 +1847,7 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         // EnableDebugLogging(kikimr);
 
         UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
-            CREATE TABLE [/Root/SampleMapTable] (
+            CREATE TABLE `/Root/SampleMapTable` (
                 Key Int32,
                 Value String,
                 Price Int32,
@@ -1861,7 +1856,7 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         )").GetValueSync().IsSuccess());
 
         UNIT_ASSERT(session.ExecuteDataQuery(R"(
-            REPLACE INTO [/Root/SampleMapTable] (Key, Value, Price) VALUES
+            REPLACE INTO `/Root/SampleMapTable` (Key, Value, Price) VALUES
                 (1, "Bitcoin", 50000),
                 (2, "Dogecoin", 1000),
                 (3, "Ethereum", 5000),
@@ -1969,6 +1964,185 @@ Y_UNIT_TEST_SUITE(KqpScan) {
 
         UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
         CompareYson("[[%false]]", StreamResultToYson(result));
+    }
+
+    Y_UNIT_TEST_TWIN(StreamLookup, UseSessionActor) {
+        auto settings = TKikimrSettings()
+            .SetEnableKqpSessionActor(UseSessionActor)
+            .SetEnableKqpScanQueryStreamLookup(true);
+
+        TKikimrRunner kikimr(settings);
+        auto db = kikimr.GetTableClient();
+        CreateSampleTables(kikimr);
+
+        {
+            auto result = db.CreateSession().GetValueSync().GetSession().ExecuteDataQuery(R"(
+            REPLACE INTO `/Root/EightShard` (Key, Text, Data) VALUES
+                (1u, "Value1",  1),
+                (2u, "Value2",  1),
+                (3u, "Value3",  1),
+                (4u, "Value4",  1),
+                (5u, "Value5",  1);
+            )", TTxControl::BeginTx().CommitTx()).GetValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        }
+
+        {
+            auto result = db.StreamExecuteScanQuery(R"(
+                PRAGMA kikimr.UseNewEngine = "true";
+                PRAGMA kikimr.OptEnablePredicateExtract = "false";
+                $keys = SELECT Key FROM `/Root/EightShard`;
+                SELECT * FROM `/Root/KeyValue` WHERE Key IN $keys ORDER BY Key;
+            )").GetValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+            CompareYson(R"([[[1u];["One"]];[[2u];["Two"]]])", StreamResultToYson(result));
+        }
+    }
+
+    Y_UNIT_TEST_TWIN(StreamLookupByPkPrefix, UseSessionActor) {
+        auto settings = TKikimrSettings()
+            .SetEnableKqpSessionActor(UseSessionActor)
+            .SetEnableKqpScanQueryStreamLookup(true);
+
+        TKikimrRunner kikimr(settings);
+        auto db = kikimr.GetTableClient();
+        CreateSampleTables(kikimr);
+
+        {
+            kikimr.GetTestClient().CreateTable("/Root", R"(
+                Name: "TestTable"
+                Columns { Name: "Key1", Type: "Uint64" }
+                Columns { Name: "Key2", Type: "Uint64" }
+                Columns { Name: "Value", Type: "String" }
+                KeyColumnNames: ["Key1", "Key2"]
+                SplitBoundary {
+                    KeyPrefix {
+                        Tuple { Optional { Uint64: 2 } }
+                        Tuple { Optional { Uint64: 20 } }
+                    }
+                }
+            )");
+
+            auto result = db.CreateSession().GetValueSync().GetSession().ExecuteDataQuery(R"(
+            REPLACE INTO `/Root/TestTable` (Key1, Key2, Value) VALUES
+                (1u, 10, "Value1"),
+                (2u, 19, "Value2"),
+                (2u, 21, "Value2"),
+                (3u, 30, "Value3"),
+                (4u, 40, "Value4"),
+                (5u, 50, "Value5");
+            )", TTxControl::BeginTx().CommitTx()).GetValueSync();
+                UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        }
+
+        {
+            auto result = db.StreamExecuteScanQuery(R"(
+                PRAGMA kikimr.UseNewEngine = "true";
+                PRAGMA kikimr.OptEnablePredicateExtract = "false";
+                $keys = SELECT Key FROM `/Root/KeyValue`;
+                SELECT * FROM `/Root/TestTable` WHERE Key1 IN $keys ORDER BY Key1, Key2;
+            )").GetValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+            CompareYson(R"([[[1u];[10u];["Value1"]];[[2u];[19u];["Value2"]];[[2u];[21u];["Value2"]]])", StreamResultToYson(result));
+        }
+    }
+
+    Y_UNIT_TEST_TWIN(StreamLookupTryGetDataBeforeSchemeInitialization, UseSessionActor) {
+        TPortManager tp;
+
+        ui16 mbusport = tp.GetPort(2134);
+        auto settings = Tests::TServerSettings(mbusport)
+            .SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableKqpScanQueryStreamLookup(true);
+
+        Tests::TServer::TPtr server = new Tests::TServer(settings);
+
+        auto runtime = server->GetRuntime();
+        auto sender = runtime->AllocateEdgeActor();
+        auto kqpProxy = MakeKqpProxyID(runtime->GetNodeId(0));
+
+        InitRoot(server, sender);
+
+        std::vector<TAutoPtr<IEventHandle>> captured;
+        bool firstAttemptToGetData = false;
+
+        auto captureEvents =  [&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle> &ev) {
+            if (ev->GetTypeRewrite() == TEvTxProxySchemeCache::TEvNavigateKeySetResult::EventType) {
+                IActor* actor = runtime->FindActor(ev->GetRecipientRewrite());
+                if (actor && actor->GetActivityType() == NKikimrServices::TActivity::KQP_STREAM_LOOKUP_ACTOR) {
+                    if (!firstAttemptToGetData) {
+                        // capture response from scheme cache until CA calls GetAsyncInputData()
+                        captured.push_back(ev.Release());
+                        return true;
+                    }
+
+                    for (auto ev : captured) {
+                        runtime->Send(ev.Release());
+                    }
+                }
+            } else if (ev->GetTypeRewrite() == NYql::NDq::IDqComputeActorAsyncInput::TEvNewAsyncInputDataArrived::EventType) {
+                firstAttemptToGetData = true;
+            } else if (ev->GetTypeRewrite() == NKqp::TEvKqpExecuter::TEvStreamData::EventType) {
+                auto& record = ev->Get<NKqp::TEvKqpExecuter::TEvStreamData>()->Record;
+                Y_ASSERT(record.GetResultSet().rows().size() == 0);
+
+                auto resp = MakeHolder<NKqp::TEvKqpExecuter::TEvStreamDataAck>();
+                resp->Record.SetEnough(false);
+                resp->Record.SetSeqNo(record.GetSeqNo());
+                runtime->Send(new IEventHandle(ev->Sender, sender, resp.Release()));
+                return true;
+            }
+
+            return false;
+        };
+
+        auto createSession = [&]() {
+            runtime->Send(new IEventHandle(kqpProxy, sender, new TEvKqp::TEvCreateSessionRequest()));
+            auto reply = runtime->GrabEdgeEventRethrow<TEvKqp::TEvCreateSessionResponse>(sender);
+            auto record = reply->Get()->Record;
+            UNIT_ASSERT_VALUES_EQUAL(record.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+            return record.GetResponse().GetSessionId();
+        };
+
+        auto createTable = [&](const TString& sessionId, const TString& queryText) {
+            auto ev = std::make_unique<NKqp::TEvKqp::TEvQueryRequest>();
+            ev->Record.MutableRequest()->SetSessionId(sessionId);
+            ev->Record.MutableRequest()->SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
+            ev->Record.MutableRequest()->SetType(NKikimrKqp::QUERY_TYPE_SQL_DDL);
+            ev->Record.MutableRequest()->SetQuery(queryText);
+
+            runtime->Send(new IEventHandle(kqpProxy, sender, ev.release()));
+            auto reply = runtime->GrabEdgeEventRethrow<TEvKqp::TEvQueryResponse>(sender);
+            UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.GetRef().GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+        };
+
+        auto sendQuery = [&](const TString& queryText) {
+            auto ev = std::make_unique<NKqp::TEvKqp::TEvQueryRequest>();
+            ev->Record.MutableRequest()->SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
+            ev->Record.MutableRequest()->SetType(NKikimrKqp::QUERY_TYPE_SQL_SCAN);
+            ev->Record.MutableRequest()->SetQuery(queryText);
+            ev->Record.MutableRequest()->SetKeepSession(false);
+            ActorIdToProto(sender, ev->Record.MutableRequestActorId());
+
+            runtime->Send(new IEventHandle(kqpProxy, sender, ev.release()));
+            auto reply = runtime->GrabEdgeEventRethrow<TEvKqp::TEvQueryResponse>(sender);
+            UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.GetRef().GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+        };
+
+        createTable(createSession(), R"(
+            --!syntax_v1
+            CREATE TABLE `/Root/Table` (Key int32, Value int32, PRIMARY KEY(Key));
+        )");
+
+        server->GetRuntime()->SetEventFilter(captureEvents);
+
+        sendQuery(R"(
+            PRAGMA kikimr.UseNewEngine = "true";
+            PRAGMA kikimr.OptEnablePredicateExtract = "false";
+            SELECT Value FROM `/Root/Table` WHERE Key IN AsList(1, 2, 3);
+        )");
+
     }
 }
 

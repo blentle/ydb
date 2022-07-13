@@ -95,7 +95,7 @@ public:
         TSet<ui64> shardIds;
         for (auto& [stageId, stageInfo] : TasksGraph.GetStagesInfo()) {
             if (stageInfo.Meta.ShardKey) {
-                for (auto& partition : stageInfo.Meta.ShardKey->Partitions) {
+                for (auto& partition : stageInfo.Meta.ShardKey->GetPartitions()) {
                     shardIds.insert(partition.ShardId);
                 }
             }
@@ -370,7 +370,7 @@ private:
     }
 
 private:
-    void FillReadInfo(TTaskMeta& taskMeta, ui64 itemsLimit, bool reverse,
+    void FillReadInfo(TTaskMeta& taskMeta, ui64 itemsLimit, bool reverse, bool sorted,
         const TMaybe<::NKqpProto::TKqpPhyOpReadOlapRanges>& readOlapRange)
     {
         if (taskMeta.Reads && !taskMeta.Reads.GetRef().empty()) {
@@ -389,6 +389,7 @@ private:
 
         taskMeta.ReadInfo.ItemsLimit = itemsLimit;
         taskMeta.ReadInfo.Reverse = reverse;
+        taskMeta.ReadInfo.Sorted = sorted;
 
         if (!readOlapRange || readOlapRange->GetOlapProgram().empty()) {
             return;
@@ -421,7 +422,12 @@ private:
         bool sorted)
     {
         ui64 nodeId = ShardIdToNodeId.at(shardId);
-        if (stageInfo.Meta.IsOlap() && sorted) {
+        bool supportsMultipleOlapShards = AppData()->FeatureFlags.GetEnableKqpScanQueryMultipleOlapShardsReads();
+        if (sorted) {
+            supportsMultipleOlapShards = false;
+        }
+
+        if (stageInfo.Meta.IsOlap() && !supportsMultipleOlapShards) {
             auto& task = TasksGraph.AddTask(stageInfo);
             task.Meta.NodeId = nodeId;
             return task;
@@ -512,9 +518,9 @@ private:
 
                 if (op.GetTypeCase() == NKqpProto::TKqpPhyTableOperation::kReadOlapRange) {
                     const auto& readRange = op.GetReadOlapRange();
-                    FillReadInfo(task.Meta, itemsLimit, reverse, readRange);
+                    FillReadInfo(task.Meta, itemsLimit, reverse, sorted, readRange);
                 } else {
-                    FillReadInfo(task.Meta, itemsLimit, reverse, TMaybe<::NKqpProto::TKqpPhyOpReadOlapRanges>());
+                    FillReadInfo(task.Meta, itemsLimit, reverse, sorted, TMaybe<::NKqpProto::TKqpPhyOpReadOlapRanges>());
                 }
 
                 if (!task.Meta.Reads) {
@@ -583,6 +589,7 @@ private:
                     case NKqpProto::TKqpPhyConnection::kHashShuffle:
                     case NKqpProto::TKqpPhyConnection::kUnionAll:
                     case NKqpProto::TKqpPhyConnection::kMerge:
+                    case NKqpProto::TKqpPhyConnection::kStreamLookup:
                         break;
                     default:
                         YQL_ENSURE(false, "Unexpected connection type: " << (ui32)input.GetTypeCase());
@@ -605,6 +612,7 @@ private:
                 }
 
                 case NKqpProto::TKqpPhyConnection::kMap:
+                case NKqpProto::TKqpPhyConnection::kStreamLookup:
                     partitionsCount = originStageInfo.Tasks.size();
                     break;
 
@@ -646,7 +654,7 @@ private:
                 YQL_ENSURE(false, "Unexpected stage type " << (int) stageInfo.Meta.TableKind);
             }
 
-            BuildKqpStageChannels(TasksGraph, TableKeys, stageInfo, TxId, AppData()->EnableKqpSpilling);
+            BuildKqpStageChannels(TasksGraph, TableKeys, stageInfo, TxId, AppData()->EnableKqpSpilling, Request.Snapshot);
         }
 
         BuildKqpExecuterResults(*tx.Body, Results);

@@ -3,6 +3,12 @@ import "ydb/core/protos/base.proto";
 
 package NKikimrBlobDepot;
 
+enum EKeepState {
+    Default = 0;
+    Keep = 1;
+    DoNotKeep = 2;
+}
+
 message TBlobSeqId {
     optional uint32 Channel = 1;
     optional uint32 Generation = 2;
@@ -15,6 +21,7 @@ message TBlobLocator {
     optional TBlobSeqId BlobSeqId = 2;
     optional uint32 Checksum = 3;
     optional uint64 TotalDataLen = 4;
+    optional uint32 FooterLen = 5;
 }
 
 message TValueChain {
@@ -22,6 +29,25 @@ message TValueChain {
     optional uint64 SubrangeBegin = 2;
     optional uint64 SubrangeEnd = 3;
 }
+
+message TValue {
+    optional bytes Meta = 1;
+    repeated TValueChain ValueChain = 2;
+    optional EKeepState KeepState = 3;
+    optional bool Public = 4;
+}
+
+message TGivenIdRange {
+    message TChannelRange {
+        optional uint32 Channel = 1;
+        optional uint64 Begin = 2;
+        optional uint64 End = 3;
+    }
+    repeated TChannelRange ChannelRanges = 1;
+}
+
+
+
 
 message TEvApplyConfig {
     optional uint64 TxId = 1;
@@ -35,6 +61,7 @@ message TEvApplyConfigResult {
 
 message TEvRegisterAgent {
     optional uint32 VirtualGroupId = 1; // for validation purposes
+    optional fixed64 AgentInstanceId = 2; // randomly generated number every time agent starts from scratch
 }
 
 message TEvRegisterAgentResult {
@@ -52,18 +79,19 @@ message TEvRegisterAgentResult {
 
 message TEvAllocateIds {
     optional NKikimrBlobDepot.TChannelKind.E ChannelKind = 1;
+    optional uint32 Count = 2;
 }
 
 message TEvAllocateIdsResult {
     optional NKikimrBlobDepot.TChannelKind.E ChannelKind = 1;
     optional uint32 Generation = 2; // executor generation, for validation purposes
-    optional uint64 RangeBegin = 3; // <Generation> <Step> <Channel>
-    optional uint64 RangeEnd = 4;
+    optional TGivenIdRange GivenIdRange = 3;
 }
 
 message TEvBlock {
     optional fixed64 TabletId = 1;
     optional uint32 BlockedGeneration = 2;
+    optional uint64 IssuerGuid = 3;
 }
 
 message TEvBlockResult {
@@ -72,8 +100,22 @@ message TEvBlockResult {
     optional uint32 TimeToLiveMs = 3;
 }
 
-message TEvPushNotify { // BlobDepot -> Agent push notification (to take some action)
-    repeated fixed64 UpdateBlocksForTabletIds = 1; // notify about some changed blocks
+message TEvPushNotify {
+    message TBlockedTablet {
+        optional fixed64 TabletId = 1;
+        optional uint32 BlockedGeneration = 2;
+    }
+    message TInvalidatedStep {
+        optional uint32 Channel = 1;
+        optional uint32 Generation = 2; // for validation purposes
+        optional uint32 InvalidatedStep = 3;
+    }
+    repeated TBlockedTablet BlockedTablets = 1;
+    repeated TInvalidatedStep InvalidatedSteps = 2;
+}
+
+message TEvPushNotifyResult {
+    repeated TBlobSeqId WritesInFlight = 1;
 }
 
 message TEvQueryBlocks {
@@ -85,9 +127,28 @@ message TEvQueryBlocksResult {
     optional uint32 TimeToLiveMs = 2; // TTL starting since sending TEvQueryBlocks at agent
 }
 
+message TEvCollectGarbage {
+    repeated NKikimrProto.TLogoBlobID Keep = 1;
+    repeated NKikimrProto.TLogoBlobID DoNotKeep = 2;
+    optional uint64 TabletId = 3;
+    optional uint32 Generation = 4;
+    optional uint32 PerGenerationCounter = 5;
+    optional uint32 Channel = 6;
+    optional bool Hard = 7;
+    optional uint32 CollectGeneration = 8;
+    optional uint64 CollectStep = 9;
+}
+
+message TEvCollectGarbageResult {
+    optional NKikimrProto.EReplyStatus Status = 1;
+    optional string ErrorReason = 2;
+}
+
 message TEvCommitBlobSeq {
     message TItem {
         optional TBlobLocator BlobLocator = 1; // GroupId and Generation are for validation purposes
+        optional bytes Key = 2;
+        optional bytes Meta = 3;
     }
 
     repeated TItem Items = 1;

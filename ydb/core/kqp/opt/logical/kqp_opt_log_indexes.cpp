@@ -109,17 +109,40 @@ TExprBase DoRewriteIndexRead(const TKqlReadTableIndex& read, TExprContext& ctx,
 } // namespace
 
 TExprBase KqpRewriteIndexRead(const TExprBase& node, TExprContext& ctx, const TKqpOptimizeContext& kqpCtx) {
-    if (!kqpCtx.IsDataQuery()) {
-        return node;
-    }
-
     if (auto maybeIndexRead = node.Maybe<TKqlReadTableIndex>()) {
         auto indexRead = maybeIndexRead.Cast();
 
         const auto& tableDesc = GetTableData(*kqpCtx.Tables, kqpCtx.Cluster, indexRead.Table().Path());
         const auto& [indexMeta, _ ] = tableDesc.Metadata->GetIndexMetadata(TString(indexRead.Index().Value()));
 
-        return DoRewriteIndexRead(indexRead, ctx, tableDesc, indexMeta, {});
+        if (kqpCtx.IsDataQuery()) {
+            return DoRewriteIndexRead(indexRead, ctx, tableDesc, indexMeta, {});
+        }
+
+        const bool needDataRead = CheckIndexCovering(indexRead, indexMeta);
+        if (!needDataRead) {
+            return Build<TKqlReadTable>(ctx, indexRead.Pos())
+                .Table(BuildTableMeta(*indexMeta, indexRead.Pos(), ctx))
+                .Range(indexRead.Range())
+                .Columns(indexRead.Columns())
+                .Settings(indexRead.Settings())
+                .Done();
+        }
+
+        auto keyColumnsList = BuildKeyColumnsList(tableDesc, indexRead.Pos(), ctx);
+
+        TExprBase readIndexTable = Build<TKqlReadTable>(ctx, indexRead.Pos())
+            .Table(BuildTableMeta(*indexMeta, indexRead.Pos(), ctx))
+            .Range(indexRead.Range())
+            .Columns(keyColumnsList)
+            .Settings(indexRead.Settings())
+            .Done();
+
+        return Build<TKqlStreamLookupTable>(ctx, indexRead.Pos())
+            .Table(indexRead.Table())
+            .LookupKeys(readIndexTable.Ptr())
+            .Columns(indexRead.Columns())
+            .Done();
     }
 
     return node;
@@ -164,9 +187,47 @@ TExprBase KqpRewriteLookupIndex(const TExprBase& node, TExprContext& ctx, const 
     return node;
 }
 
-// The index and main table have same number of rows, so we can push TCoTopSort or TCoTake through TKqlLookupTable.
-// The simplest way is to match TopSort or Take over TKqlReadTableIndex.
+TExprBase KqpRewriteStreamLookupIndex(const TExprBase& node, TExprContext& ctx, const TKqpOptimizeContext& kqpCtx) {
+    if (!kqpCtx.IsScanQuery()) {
+        return node;
+    }
 
+    if (auto maybeStreamLookupIndex = node.Maybe<TKqlStreamLookupIndex>()) {
+        auto streamLookupIndex = maybeStreamLookupIndex.Cast();
+
+        const auto& tableDesc = GetTableData(*kqpCtx.Tables, kqpCtx.Cluster, streamLookupIndex.Table().Path());
+        const auto& [indexMeta, _] = tableDesc.Metadata->GetIndexMetadata(streamLookupIndex.Index().StringValue());
+
+        const bool needDataRead = CheckIndexCovering(streamLookupIndex, indexMeta);
+        if (!needDataRead) {
+            return Build<TKqlStreamLookupTable>(ctx, node.Pos())
+                .Table(BuildTableMeta(*indexMeta, node.Pos(), ctx))
+                .LookupKeys(streamLookupIndex.LookupKeys())
+                .Columns(streamLookupIndex.Columns())
+                .Done();
+        }
+
+        auto keyColumnsList = BuildKeyColumnsList(tableDesc, streamLookupIndex.Pos(), ctx);
+
+        TExprBase lookupIndexTable = Build<TKqlStreamLookupTable>(ctx, node.Pos())
+            .Table(BuildTableMeta(*indexMeta, node.Pos(), ctx))
+            .LookupKeys(streamLookupIndex.LookupKeys())
+            .Columns(keyColumnsList)
+            .Done();
+
+        return Build<TKqlStreamLookupTable>(ctx, node.Pos())
+            .Table(streamLookupIndex.Table())
+            .LookupKeys(lookupIndexTable.Ptr())
+            .Columns(streamLookupIndex.Columns())
+            .Done();
+    }
+
+    return node;
+}
+
+// The index and main table have same number of rows, so we can push a copy of TCoTopSort or TCoTake
+// through TKqlLookupTable.
+// The simplest way is to match TopSort or Take over TKqlReadTableIndex.
 TExprBase KqpRewriteTopSortOverIndexRead(const TExprBase& node, TExprContext& ctx, const TKqpOptimizeContext& kqpCtx) {
     if (!kqpCtx.IsDataQuery()) {
         return node;
@@ -201,7 +262,14 @@ TExprBase KqpRewriteTopSortOverIndexRead(const TExprBase& node, TExprContext& ct
             return TExprBase(newTopSort);
         };
 
-        return DoRewriteIndexRead(readTableIndex, ctx, tableDesc, indexMeta, sortByColumns, filter);
+        auto lookup = DoRewriteIndexRead(readTableIndex, ctx, tableDesc, indexMeta, sortByColumns, filter);
+
+        return Build<TCoTopSort>(ctx, node.Pos())
+            .Input(lookup)
+            .KeySelectorLambda(ctx.DeepCopyLambda(topSort.KeySelectorLambda().Ref()))
+            .SortDirections(topSort.SortDirections())
+            .Count(topSort.Count())
+            .Done();
     }
 
     return node;

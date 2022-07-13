@@ -19,14 +19,11 @@ namespace NKikimr::NBlobDepot {
         };
 
     public:
-        TBlobDepot(TActorId tablet, TTabletStorageInfo *info)
-            : TActor(&TThis::StateInit)
-            , TTabletExecutedFlat(info, tablet, new NMiniKQL::TMiniKQLFactory)
-            , BlocksManager(this)
-        {}
+        TBlobDepot(TActorId tablet, TTabletStorageInfo *info);
+        ~TBlobDepot();
 
         void HandlePoison() {
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT02, "HandlePoison", (TabletId, TabletID()));
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT19, "HandlePoison", (TabletId, TabletID()));
             Become(&TThis::StateZombie);
             Send(Tablet(), new TEvents::TEvPoison);
         }
@@ -34,32 +31,42 @@ namespace NKikimr::NBlobDepot {
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
         static constexpr TDuration ExpirationTimeout = TDuration::Minutes(1);
-        static constexpr ui32 PreallocatedIdCount = 100;
 
-        struct TAgentInfo {
+        struct TAgent {
             std::optional<TActorId> ConnectedAgent;
             ui32 ConnectedNodeId;
             TInstant ExpirationTimestamp;
+            std::optional<ui64> AgentInstanceId;
+
+            THashMap<ui8, TGivenIdRange> GivenIdRanges;
+
+            THashMap<ui8, ui32> InvalidatedStepInFlight;
+            THashMap<ui64, THashMap<ui8, ui32>> InvalidateStepRequests;
+            ui64 LastRequestId = 0;
         };
 
         THashMap<TActorId, std::optional<ui32>> PipeServerToNode;
-        THashMap<ui32, TAgentInfo> Agents; // NodeId -> Agent
-
-        struct TChannelKind
-            : NBlobDepot::TChannelKind
-        {
-            ui64 NextBlobSeqId = 0;
-        };
+        THashMap<ui32, TAgent> Agents; // NodeId -> Agent
 
         THashMap<NKikimrBlobDepot::TChannelKind::E, TChannelKind> ChannelKinds;
 
+        struct TChannelInfo {
+            NKikimrBlobDepot::TChannelKind::E ChannelKind;
+            TChannelKind *KindPtr;
+            TGivenIdRange GivenIdRanges; // accumulated through all agents
+            ui64 NextBlobSeqId = 0;
+        };
+        std::vector<TChannelInfo> Channels;
+
         void Handle(TEvTabletPipe::TEvServerConnected::TPtr ev);
         void Handle(TEvTabletPipe::TEvServerDisconnected::TPtr ev);
-        void OnAgentDisconnect(TAgentInfo& agent);
+        void OnAgentDisconnect(TAgent& agent);
         void Handle(TEvBlobDepot::TEvRegisterAgent::TPtr ev);
-        void OnAgentConnect(TAgentInfo& agent);
+        void OnAgentConnect(TAgent& agent);
         void Handle(TEvBlobDepot::TEvAllocateIds::TPtr ev);
-        TAgentInfo& GetAgent(const TActorId& pipeServerId);
+        TAgent& GetAgent(const TActorId& pipeServerId);
+        TAgent& GetAgent(ui32 nodeId);
+        void ResetAgent(TAgent& agent);
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -70,10 +77,12 @@ namespace NKikimr::NBlobDepot {
         }
 
         void OnActivateExecutor(const TActorContext&) override {
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT03, "OnActivateExecutor", (TabletId, TabletID()));
-
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT20, "OnActivateExecutor", (TabletId, TabletID()));
             ExecuteTxInitSchema();
+        }
 
+        void OnLoadFinished() {
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT20, "OnLoadFinished", (TabletId, TabletID()));
             Become(&TThis::StateWork);
             for (auto&& ev : std::exchange(InitialEventsQ, {})) {
                 TActivationContext::Send(ev.release());
@@ -81,18 +90,16 @@ namespace NKikimr::NBlobDepot {
         }
 
         void OnDetach(const TActorContext&) override {
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT04, "OnDetach", (TabletId, TabletID()));
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT21, "OnDetach", (TabletId, TabletID()));
 
             // TODO: what does this callback mean
             PassAway();
         }
 
         void OnTabletDead(TEvTablet::TEvTabletDead::TPtr& /*ev*/, const TActorContext&) override {
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT05, "OnTabletDead", (TabletId, TabletID()));
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT22, "OnTabletDead", (TabletId, TabletID()));
             PassAway();
         }
-
-        void SendResponseToAgent(IEventHandle& request, std::unique_ptr<IEventBase> response);
 
         void InitChannelKinds();
 
@@ -110,29 +117,7 @@ namespace NKikimr::NBlobDepot {
             StateInitImpl(ev, ctx);
         }
 
-        STFUNC(StateWork) {
-            switch (const ui32 type = ev->GetTypeRewrite()) {
-                cFunc(TEvents::TSystem::Poison, HandlePoison);
-
-                hFunc(TEvBlobDepot::TEvApplyConfig, Handle);
-                hFunc(TEvBlobDepot::TEvRegisterAgent, Handle);
-                hFunc(TEvBlobDepot::TEvAllocateIds, Handle);
-                hFunc(TEvBlobDepot::TEvCommitBlobSeq, Handle);
-                hFunc(TEvBlobDepot::TEvResolve, Handle);
-
-                hFunc(TEvBlobDepot::TEvBlock, BlocksManager.Handle);
-                hFunc(TEvBlobDepot::TEvQueryBlocks, BlocksManager.Handle);
-
-                hFunc(TEvTabletPipe::TEvServerConnected, Handle);
-                hFunc(TEvTabletPipe::TEvServerDisconnected, Handle);
-
-                default:
-                    if (!HandleDefaultEvents(ev, ctx)) {
-                        Y_FAIL("unexpected event Type# 0x%08" PRIx32, type);
-                    }
-                    break;
-            }
-        }
+        void StateWork(STFUNC_SIG);
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -159,34 +144,32 @@ namespace NKikimr::NBlobDepot {
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
         // Blocks
 
-        class TBlocksManager {
-            class TImpl;
-            std::unique_ptr<TImpl> Impl;
-
-        public:
-            TBlocksManager(TBlobDepot *self);
-            ~TBlocksManager();
-            void AddBlockOnLoad(ui64 tabletId, ui32 blockedGeneration);
-            void OnAgentConnect(TAgentInfo& agent);
-            void OnAgentDisconnect(TAgentInfo& agent);
-
-            void Handle(TEvBlobDepot::TEvBlock::TPtr ev);
-            void Handle(TEvBlobDepot::TEvQueryBlocks::TPtr ev);
-        };
-
-        TBlocksManager BlocksManager;
+        class TBlocksManager;
+        std::unique_ptr<TBlocksManager> BlocksManager;
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-        // Key operation
+        // Garbage collection
 
-        struct TKeyValue {
-        };
+        class TBarrierServer;
+        std::unique_ptr<TBarrierServer> BarrierServer;
 
-        std::map<TString, TKeyValue> Data;
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // Data operations
+
+        class TData;
+        std::unique_ptr<TData> Data;
 
         void Handle(TEvBlobDepot::TEvCommitBlobSeq::TPtr ev);
-
         void Handle(TEvBlobDepot::TEvResolve::TPtr ev);
+
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // Monitoring
+
+        class TTxMonData;
+        
+        bool OnRenderAppHtmlPage(NMon::TEvRemoteHttpInfo::TPtr ev, const TActorContext&) override;
+
+        void RenderMainPage(IOutputStream& s);
     };
 
 } // NKikimr::NBlobDepot

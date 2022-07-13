@@ -100,6 +100,10 @@ namespace NKikimr {
 
         const ui64* GetRaw() const { return Raw.X; }
 
+        TStringBuf AsBinaryString() const {
+            return {reinterpret_cast<const char*>(GetRaw()), 3 * sizeof(ui64)};
+        }
+
         TString ToString() const;
         void Out(IOutputStream &o) const;
         static bool Parse(TLogoBlobID &out, const TString &buf, TString &errorExplanation);
@@ -320,3 +324,15 @@ struct THash<NKikimr::TLogoBlobID> {
         return x.Hash();
     }
 };
+
+template<>
+inline NKikimr::TLogoBlobID Min<NKikimr::TLogoBlobID>() noexcept {
+    return {};
+}
+
+template<>
+inline NKikimr::TLogoBlobID Max<NKikimr::TLogoBlobID>() noexcept {
+    return NKikimr::TLogoBlobID(Max<ui64>(), Max<ui32>(), Max<ui32>(), NKikimr::TLogoBlobID::MaxChannel,
+        NKikimr::TLogoBlobID::MaxBlobSize, NKikimr::TLogoBlobID::MaxCookie, NKikimr::TLogoBlobID::MaxPartId,
+        NKikimr::TLogoBlobID::MaxCrcMode);
+}

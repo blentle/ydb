@@ -105,6 +105,8 @@ public:
         if (enableYq) {
             Server_->GetRuntime()->SetLogPriority(NKikimrServices::YQL_PROXY, NActors::NLog::PRI_DEBUG);
             Server_->GetRuntime()->SetLogPriority(NKikimrServices::KQP_COMPUTE, NActors::NLog::PRI_DEBUG);
+            Server_->GetRuntime()->SetLogPriority(NKikimrServices::YQ_CONTROL_PLANE_STORAGE, NActors::NLog::PRI_DEBUG);
+            Server_->GetRuntime()->SetLogPriority(NKikimrServices::YQ_CONTROL_PLANE_PROXY, NActors::NLog::PRI_DEBUG);
         }
 
         NGrpc::TServerOptions grpcOption;
@@ -233,7 +235,7 @@ struct TTestOlap {
         annoyingClient.SetSecurityToken("root@builtin");
         NMsgBusProxy::EResponseStatus status = annoyingClient.CreateOlapStore("/Root", tableDescr);
         UNIT_ASSERT_VALUES_EQUAL(status, NMsgBusProxy::EResponseStatus::MSTATUS_OK);
-        status = annoyingClient.CreateOlapTable("/Root", Sprintf(R"(
+        status = annoyingClient.CreateColumnTable("/Root", Sprintf(R"(
             Name: "%s/%s"
             ColumnShardCount : %d
             Sharding {

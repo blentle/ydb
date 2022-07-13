@@ -141,7 +141,8 @@ public:
                                                           const TSnapshot& outdatedSnapshot) override;
     std::shared_ptr<TColumnEngineChanges> StartCleanup(const TSnapshot& snapshot,
                                                        THashSet<ui64>& pathsToDrop) override;
-    std::shared_ptr<TColumnEngineChanges> StartTtl(const THashMap<ui64, TTiersInfo>& pathTtls) override;
+    std::shared_ptr<TColumnEngineChanges> StartTtl(const THashMap<ui64, TTiersInfo>& pathTtls,
+                                                   ui64 maxEvictBytes = TCompactionLimits::DEFAULT_EVICTION_BYTES) override;
     bool ApplyChanges(IDbWrapper& db, std::shared_ptr<TColumnEngineChanges> indexChanges,
                       const TSnapshot& snapshot) override;
     void UpdateDefaultSchema(const TSnapshot& snapshot, TIndexInfo&& info) override;
@@ -149,6 +150,7 @@ public:
     const TMap<ui64, std::shared_ptr<TColumnEngineStats>>& GetStats() const override;
     const TColumnEngineStats& GetTotalStats() override;
     ui64 MemoryUsage() const override;
+    TSnapshot LastUpdate() const override { return LastSnapshot; }
 
     std::shared_ptr<TSelectInfo> Select(ui64 pathId, TSnapshot snapshot,
                                         const THashSet<ui32>& columnIds,
@@ -249,8 +251,7 @@ private:
 
     bool CanInsert(const TChanges& changes, const TSnapshot& commitSnap) const;
     TMap<TSnapshot, TVector<ui64>> GetOrderedPortions(ui64 granule, const TSnapshot& snapshot = TSnapshot::Max()) const;
-    void UpdateOverloaded(const THashMap<ui64, std::shared_ptr<TGranuleMeta>>& granules,
-                          const TChanges::TSrcGranule& splitted);
+    void UpdateOverloaded(const THashMap<ui64, std::shared_ptr<TGranuleMeta>>& granules);
 
     TVector<TVector<std::pair<ui64, ui64>>> EmptyGranuleTracks(ui64 pathId) const;
 };

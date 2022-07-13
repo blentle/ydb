@@ -45,9 +45,9 @@ Y_UNIT_TEST_SUITE(KqpService) {
                     DECLARE $key AS Uint32;
                     DECLARE $value AS Int32;
 
-                    SELECT * FROM [/Root/EightShard];
+                    SELECT * FROM `/Root/EightShard`;
 
-                    UPSERT INTO [/Root/TwoShard] (Key, Value2) VALUES
+                    UPSERT INTO `/Root/TwoShard` (Key, Value2) VALUES
                         ($key, $value);
                 )", TTxControl::BeginTx().CommitTx(), params).GetValueSync();
 
@@ -110,14 +110,14 @@ Y_UNIT_TEST_SUITE(KqpService) {
                 }
 
                 auto query = Sprintf(R"(
-                    SELECT Key, Text, Data FROM [/Root/EightShard] WHERE Key=%1$d + 0;
-                    SELECT Key, Data, Text FROM [/Root/EightShard] WHERE Key=%1$d + 1;
-                    SELECT Text, Key, Data FROM [/Root/EightShard] WHERE Key=%1$d + 2;
-                    SELECT Text, Data, Key FROM [/Root/EightShard] WHERE Key=%1$d + 3;
-                    SELECT Data, Key, Text FROM [/Root/EightShard] WHERE Key=%1$d + 4;
-                    SELECT Data, Text, Key FROM [/Root/EightShard] WHERE Key=%1$d + 5;
+                    SELECT Key, Text, Data FROM `/Root/EightShard` WHERE Key=%1$d + 0;
+                    SELECT Key, Data, Text FROM `/Root/EightShard` WHERE Key=%1$d + 1;
+                    SELECT Text, Key, Data FROM `/Root/EightShard` WHERE Key=%1$d + 2;
+                    SELECT Text, Data, Key FROM `/Root/EightShard` WHERE Key=%1$d + 3;
+                    SELECT Data, Key, Text FROM `/Root/EightShard` WHERE Key=%1$d + 4;
+                    SELECT Data, Text, Key FROM `/Root/EightShard` WHERE Key=%1$d + 5;
 
-                    UPSERT INTO [/Root/EightShard] (Key, Text) VALUES
+                    UPSERT INTO `/Root/EightShard` (Key, Text) VALUES
                         (%2$dul, "New");
                 )", RandomNumber<ui32>(), RandomNumber<ui32>());
 
@@ -135,7 +135,7 @@ Y_UNIT_TEST_SUITE(KqpService) {
         TVector<TAsyncDataQueryResult> futures;
         for (ui32 i = 0; i < count; ++i) {
             auto query = Sprintf(R"(
-                SELECT * FROM [/Root/EightShard] WHERE Key=%1$d;
+                SELECT * FROM `/Root/EightShard` WHERE Key=%1$d;
             )", i);
 
             auto future = session.ExecuteDataQuery(query, TTxControl::BeginTx().CommitTx());
@@ -228,6 +228,68 @@ Y_UNIT_TEST_SUITE(KqpService) {
          UNIT_ASSERT_VALUES_EQUAL_C(status.GetStatus(), EStatus::SUCCESS, status.GetIssues().ToString());
     }
 
+    Y_UNIT_TEST_TWIN(PatternCache, UseCache) {
+        auto settings = TKikimrSettings()
+            .SetWithSampleTables(false);
+        settings.FeatureFlags.SetEnableKqpPatternCacheLiteral(UseCache);
+        auto kikimr = TKikimrRunner{settings};
+        auto driver = kikimr.GetDriver();
+
+        size_t InFlight = 10;
+        NPar::LocalExecutor().RunAdditionalThreads(InFlight);
+        NPar::LocalExecutor().ExecRange([&driver](int /*id*/) {
+            TTimer t;
+            NYdb::NTable::TTableClient db(driver);
+            auto session = db.CreateSession().GetValueSync().GetSession();
+                for (ui32 i = 0; i < 500; ++i) {
+                ui64 total = 100500;
+                TString request = (TStringBuilder() << R"_(
+                    $data = AsList(
+                        AsStruct("aaa" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("aaa" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("aaa" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("aaa" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("aaa" AS Key,)_" << i / 5 << R"_(u AS Value),
+
+                        AsStruct("aaa" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("aaa" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("aaa" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("aaa" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("aaa" AS Key,)_" << i / 5 << R"_(u AS Value),
+
+                        AsStruct("aaa" AS Key,)_" << total - 10 * (i / 5) << R"_(u AS Value),
+
+                        AsStruct("bbb" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("bbb" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("bbb" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("bbb" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("bbb" AS Key,)_" << i / 5 << R"_(u AS Value),
+
+                        AsStruct("bbb" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("bbb" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("bbb" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("bbb" AS Key,)_" << i / 5 << R"_(u AS Value),
+                        AsStruct("bbb" AS Key,)_" << i / 5 << R"_(u AS Value)
+                    );
+
+                    SELECT * FROM (
+                        SELECT Key, SUM(Value) as Sum FROM (
+                            SELECT * FROM AS_TABLE($data)
+                        ) GROUP BY Key
+                    ) WHERE Key == "aaa";
+                )_");
+
+                NYdb::NTable::TExecDataQuerySettings execSettings;
+                execSettings.KeepInQueryCache(true);
+
+                auto result = session.ExecuteDataQuery(request,
+                    TTxControl::BeginTx(TTxSettings::SerializableRW()).CommitTx(), execSettings).ExtractValueSync();
+                AssertSuccessResult(result);
+
+                CompareYson(R"( [ ["aaa";100500u] ])", FormatResultSetYson(result.GetResultSet(0)));
+            }
+        }, 0, InFlight, NPar::TLocalExecutor::WAIT_COMPLETE | NPar::TLocalExecutor::MED_PRIORITY);
+    }
 }
 
 } // namspace NKqp

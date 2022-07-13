@@ -870,8 +870,8 @@ message TS3Settings {
 
     message TLimits {
         optional uint32 ReadBatchSize = 1 [default = 8388608]; // 8 MB
-        optional uint32 WriteBatchSize = 2 [default = 67108864]; // 64 MB
-        optional uint32 ReadBufferSizeLimit = 3 [default = 67108864]; // 64 MB
+        optional uint32 MinWriteBatchSize = 2 [default = 5242880]; // 5 MB
+        reserved 3; // ReadBufferSizeLimit
     };
 
     optional TLimits Limits = 100;
@@ -1074,6 +1074,13 @@ message TMove { // private description of the operation
     optional string DstPath = 2;
 }
 
+message TMoveIndex {
+    optional string TablePath = 1;
+    optional string SrcPath = 2;
+    optional string DstPath = 3;
+    optional bool AllowOverwrite = 4;
+}
+
 message TSequenceDescription {
     optional string Name = 1; // mandatory
     optional NKikimrProto.TPathID PathId = 2; // sequence path id, assigned by schemeshard
@@ -1221,6 +1228,9 @@ enum EOperationType {
     ESchemeOpCreateBlobDepot = 79;
     ESchemeOpAlterBlobDepot = 80;
     ESchemeOpDropBlobDepot = 81;
+
+    // Move index
+    ESchemeOpMoveIndex = 82;
 }
 
 message TApplyIf {
@@ -1324,6 +1334,7 @@ message TModifyScheme {
     optional TSequenceDescription Sequence = 51;
     optional TReplicationDescription Replication = 52;
     optional TBlobDepotDescription BlobDepot = 54;
+    optional TMoveIndex MoveIndex = 55;
 }
 
 // "Script", used by client to parse text files with multiple DDL commands

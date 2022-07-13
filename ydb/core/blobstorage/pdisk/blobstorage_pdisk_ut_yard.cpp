@@ -102,6 +102,12 @@ YARD_UNIT_TEST(TestLogWriteReadMedium) {
     Run<TTestLogWriteRead<6000>>(&tc, 1, MIN_CHUNK_SIZE);
 }
 
+YARD_UNIT_TEST(TestLogWriteReadMediumWithHddSectorMap) {
+    TTestContext tc(false, true, NPDisk::NSectorMap::DM_HDD);
+    FillDeviceWithZeroes(&tc, MIN_CHUNK_SIZE);
+    Run<TTestLogWriteRead<6000>>(&tc, 1, MIN_CHUNK_SIZE);
+}
+
 YARD_UNIT_TEST(TestLogWriteReadLarge) {
     TTestContext tc(false, true);
     Run<TTestLogWriteRead<9000>>(&tc, 1, MIN_CHUNK_SIZE);
@@ -203,6 +209,11 @@ YARD_UNIT_TEST(TestChunkWriteRead) {
     Run<TTestChunkWriteRead<30000, 2 << 20>>(&tc, 1, 5 << 20);
 }
 
+YARD_UNIT_TEST(TestChunkWriteReadWithHddSectorMap) {
+    TTestContext tc(false, true, NPDisk::NSectorMap::DM_HDD);
+    Run<TTestChunkWriteRead<30000, 2 << 20>>(&tc, 1, 5 << 20);
+}
+
 YARD_UNIT_TEST(TestChunkWriteReadMultiple) {
     {
         TTestContext tc(false, true);
@@ -222,8 +233,33 @@ YARD_UNIT_TEST(TestChunkWriteReadMultiple) {
     }
 }
 
+YARD_UNIT_TEST(TestChunkWriteReadMultipleWithHddSectorMap) {
+    {
+        TTestContext tc(false, true, NPDisk::NSectorMap::DM_HDD);
+        Run<TTestChunkWriteRead<6000000, 6500000>>(&tc, 1, 16 << 20, false);
+    }
+    {
+        TTestContext tc(false, true, NPDisk::NSectorMap::DM_HDD);
+        Run<TTestChunkWriteRead<3000000, 3500000>>(&tc, 1, 8 << 20, false);
+    }
+    {
+        TTestContext tc(false, true, NPDisk::NSectorMap::DM_HDD);
+        Run<TTestChunkWriteRead<2 << 20, 2 << 20>>(&tc, 1, 8 << 20, false);
+    }
+    {
+        TTestContext tc(false, true, NPDisk::NSectorMap::DM_HDD);
+        Run<TTestChunkWriteRead<1000000, 1500000>>(&tc, 1, 4 << 20, false);
+    }
+}
+
 YARD_UNIT_TEST(TestChunkWriteReadWhole) {
     TTestContext tc(false, true);
+    FillDeviceWithZeroes(&tc, MIN_CHUNK_SIZE);
+    Run<TTestChunkWriteReadWhole>(&tc, 1, MIN_CHUNK_SIZE);
+}
+
+YARD_UNIT_TEST(TestChunkWriteReadWholeWithHddSectorMap) {
+    TTestContext tc(false, true, NPDisk::NSectorMap::DM_HDD);
     FillDeviceWithZeroes(&tc, MIN_CHUNK_SIZE);
     Run<TTestChunkWriteReadWhole>(&tc, 1, MIN_CHUNK_SIZE);
 }
@@ -942,7 +978,7 @@ YARD_UNIT_TEST(TestInitOnOldDisk) {
     TString path = "/place/home/cthulhu/tmp_hdd2";
     ASSERT_YTHROW(NFs::Exists(path), "File " << path << " does not exist.");
     {
-        TIntrusivePtr<NMonitoring::TDynamicCounters> counters = new NMonitoring::TDynamicCounters;
+        TIntrusivePtr<::NMonitoring::TDynamicCounters> counters = new ::NMonitoring::TDynamicCounters;
         TPDiskMon mon(counters);
         THolder<NPDisk::IBlockDevice> device(NPDisk::CreateSyncBlockDevice(path, 999, mon));
         VERBOSE_COUT("  Performing Pread of " << dataSize);

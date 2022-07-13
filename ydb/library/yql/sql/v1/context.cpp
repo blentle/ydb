@@ -55,6 +55,7 @@ THashMap<TStringBuf, TPragmaField> CTX_PRAGMA_FIELDS = {
     {"FlexibleTypes", &TContext::FlexibleTypes},
     {"AnsiCurrentRow", &TContext::AnsiCurrentRow},
     {"EmitStartsWith", &TContext::EmitStartsWith},
+    {"EnforceAnsiOrderByLimitInUnionAll", &TContext::EnforceAnsiOrderByLimitInUnionAll},
 };
 
 typedef TMaybe<bool> TContext::*TPragmaMaybeField;
@@ -280,8 +281,13 @@ TNodePtr TContext::UniversalAlias(const TString& baseName, TNodePtr&& node) {
     return BuildAtom(node->GetPos(), alias, TNodeFlags::Default);
 }
 
+bool TContext::IsAlreadyDeclared(const TString& varName) const {
+    return Variables.find(varName) != Variables.end();
+}
+
 void TContext::DeclareVariable(const TString& varName, const TNodePtr& typeNode) {
-    Variables.emplace(varName, typeNode);
+    auto inserted = Variables.emplace(varName, typeNode);
+    YQL_ENSURE(inserted.second);
 }
 
 bool TContext::AddExport(TPosition pos, const TString& name) {

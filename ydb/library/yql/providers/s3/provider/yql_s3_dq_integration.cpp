@@ -8,6 +8,7 @@
 #include <ydb/library/yql/providers/dq/expr_nodes/dqs_expr_nodes.h>
 #include <ydb/library/yql/providers/s3/expr_nodes/yql_s3_expr_nodes.h>
 #include <ydb/library/yql/providers/s3/proto/range.pb.h>
+#include <ydb/library/yql/providers/s3/proto/sink.pb.h>
 #include <ydb/library/yql/providers/s3/proto/source.pb.h>
 #include <ydb/library/yql/utils/log/log.h>
 
@@ -57,9 +58,11 @@ public:
         }
 
         partitions.reserve(parts.size());
+        ui64 startIdx = 0;
         for (const auto& part : parts) {
             NS3::TRange range;
-            std::for_each(part.cbegin(), part.cend(), [&range](const TString& path) { range.AddPath(path); });
+            range.SetStartPathIndex(startIdx);
+            std::for_each(part.cbegin(), part.cend(), [&range, &startIdx](const TString& path) { range.AddPath(path); ++startIdx; });
 
             partitions.emplace_back();
             TStringOutput out(partitions.back());
@@ -95,7 +98,23 @@ public:
                     .Seal().Build()
             );
 
-            if (const auto useCoro = State_->Configuration->SourceCoroActor.Get(); useCoro && *useCoro && !s3ReadObject.Object().Format().Ref().IsAtom({"raw", "json_list"}))
+            TExprNodeList extraColumns;
+            for (size_t i = 0; i < s3ReadObject.Object().Paths().Size(); ++i) {
+                extraColumns.push_back(s3ReadObject.Object().Paths().Item(i).ExtraColumns().Ptr());
+            }
+            YQL_ENSURE(!extraColumns.empty());
+            if (extraColumns.front()->GetTypeAnn()->Cast<TStructExprType>()->GetSize()) {
+                settings.push_back(
+                    ctx.Builder(s3ReadObject.Object().Pos())
+                        .List()
+                            .Atom(0, "extraColumns")
+                            .Add(1, ctx.NewCallable(s3ReadObject.Object().Pos(), "AsList", std::move(extraColumns)))
+                        .Seal()
+                        .Build()
+                );
+            }
+
+            if (const auto useCoro = State_->Configuration->SourceCoroActor.Get(); (!useCoro || *useCoro) && !s3ReadObject.Object().Format().Ref().IsAtom({"raw", "json_list"}))
                 return Build<TDqSourceWrap>(ctx, read->Pos())
                     .Input<TS3ParseSettings>()
                         .Paths(s3ReadObject.Object().Paths())
@@ -149,6 +168,8 @@ public:
             srcDesc.SetToken(settings.Token().Name().StringValue());
 
             const auto& paths = settings.Paths();
+            YQL_ENSURE(paths.Size() > 0);
+            const TStructExprType* extraColumnsType = paths.Item(0).ExtraColumns().Ref().GetTypeAnn()->Cast<TStructExprType>();
             for (auto i = 0U; i < paths.Size(); ++i) {
                 const auto p = srcDesc.AddPath();
                 p->SetPath(paths.Item(i).Path().StringValue());
@@ -158,14 +179,27 @@ public:
             if (const auto mayParseSettings = settings.Maybe<TS3ParseSettings>()) {
                 const auto parseSettings = mayParseSettings.Cast();
                 srcDesc.SetFormat(parseSettings.Format().StringValue().c_str());
-                srcDesc.SetRowType(NCommon::WriteTypeToYson(parseSettings.RowType().Ref().GetTypeAnn()->Cast<TTypeExprType>()->GetType(), NYT::NYson::EYsonFormat::Text));
+
+                const TStructExprType* fullRowType = parseSettings.RowType().Ref().GetTypeAnn()->Cast<TTypeExprType>()->GetType()->Cast<TStructExprType>();
+                // exclude extra columns to get actual row type we need to read from input
+                auto rowTypeItems = fullRowType->GetItems();
+                EraseIf(rowTypeItems, [extraColumnsType](const auto& item) { return extraColumnsType->FindItem(item->GetName()); });
+                {
+                    // TODO: pass context
+                    TExprContext ctx;
+                    srcDesc.SetRowType(NCommon::WriteTypeToYson(ctx.MakeType<TStructExprType>(rowTypeItems), NYT::NYson::EYsonFormat::Text));
+                }
 
                 if (const auto maySettings = parseSettings.Settings()) {
                     const auto& settings = maySettings.Cast();
                     for (auto i = 0U; i < settings.Ref().ChildrenSize(); ++i) {
-                        srcDesc.MutableSettings()->insert({TString(settings.Ref().Child(i)->Head().Content()), TString(settings.Ref().Child(i)->Tail().Head().Content())});
+                        srcDesc.MutableSettings()->insert({TString(settings.Ref().Child(i)->Head().Content()), TString(settings.Ref().Child(i)->Tail().IsAtom() ? settings.Ref().Child(i)->Tail().Content() : settings.Ref().Child(i)->Tail().Head().Content())});
                     }
                 }
+            }
+
+            if (extraColumnsType->GetSize()) {
+                srcDesc.MutableSettings()->insert({"addPathIndex", "true"});
             }
 
             protoSettings.PackFrom(srcDesc);
@@ -173,10 +207,26 @@ public:
         }
     }
 
+    void FillSinkSettings(const TExprNode& node, ::google::protobuf::Any& protoSettings, TString& sinkType) override {
+        const TDqSink sink(&node);
+        if (const auto maySettings = sink.Settings().Maybe<TS3SinkSettings>()) {
+            const auto settings = maySettings.Cast();
+            const auto& cluster = sink.DataSink().Cast<TS3DataSink>().Cluster().StringValue();
+            const auto& connect = State_->Configuration->Clusters.at(cluster);
+
+            NS3::TSink sinkDesc;
+            sinkDesc.SetUrl(connect.Url);
+            sinkDesc.SetToken(settings.Token().Name().StringValue());
+            sinkDesc.SetPath(settings.Path().StringValue());
+
+            protoSettings.PackFrom(sinkDesc);
+            sinkType = "S3Sink";
+        }
+    }
+
     void RegisterMkqlCompiler(NCommon::TMkqlCallableCompilerBase& compiler) override {
         RegisterDqS3MkqlCompilers(compiler, State_);
     }
-
 private:
     const TS3State::TPtr State_;
 };

@@ -32,6 +32,8 @@ struct TEnvironmentSetup {
         const ui32 NumDataCenters = 0;
         const std::function<TNodeLocation(ui32)> LocationGenerator;
         const bool SetupTablets = false;
+        const ui64 BlobDepotId = 0;
+        const ui32 BlobDepotChannels = 0;
     };
 
     const TSettings Settings;
@@ -245,7 +247,9 @@ struct TEnvironmentSetup {
 
     void SetupStaticStorage() {
         const TActorId proxyId = MakeBlobStorageProxyID(GroupId);
-        Runtime->RegisterService(proxyId, Runtime->Register(CreateBlobStorageGroupProxyMockActor(Group0), Settings.ControllerNodeId));
+        for (const ui32 nodeId : Runtime->GetNodes()) {
+            Runtime->RegisterService(proxyId, Runtime->Register(CreateBlobStorageGroupProxyMockActor(Group0), nodeId));
+        }
     }
 
     void SetupStorage(ui32 targetNodeId = 0) {
@@ -312,10 +316,15 @@ struct TEnvironmentSetup {
             ui64 TabletId;
             TTabletTypes::EType Type;
             IActor* (*Create)(const TActorId&, TTabletStorageInfo*);
+            ui32 NumChannels = 4;
         };
         std::vector<TTabletInfo> tablets{
             {MakeBSControllerID(DomainId), TTabletTypes::BSController, &CreateFlatBsController},
         };
+        if (Settings.BlobDepotId) {
+            tablets.push_back(TTabletInfo{Settings.BlobDepotId, TTabletTypes::BlobDepot, &NBlobDepot::CreateBlobDepot,
+                Settings.BlobDepotChannels});
+        }
 
         auto *appData = Runtime->GetAppData();
 
@@ -341,7 +350,7 @@ struct TEnvironmentSetup {
 
         for (const TTabletInfo& tablet : tablets) {
             Runtime->CreateTestBootstrapper(
-                TTestActorSystem::CreateTestTabletInfo(tablet.TabletId, tablet.Type, Settings.Erasure.GetErasure(), GroupId),
+                TTestActorSystem::CreateTestTabletInfo(tablet.TabletId, tablet.Type, Settings.Erasure.GetErasure(), GroupId, tablet.NumChannels),
                 tablet.Create, Settings.ControllerNodeId);
 
             bool working = true;
@@ -360,7 +369,7 @@ struct TEnvironmentSetup {
 
                 auto config = MakeIntrusive<NSchemeCache::TSchemeCacheConfig>();
                 config->Roots.emplace_back(DomainId, domain.SchemeRoot, domain.Name);
-                config->Counters = MakeIntrusive<NMonitoring::TDynamicCounters>();
+                config->Counters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
                 Runtime->RegisterService(MakeSchemeCacheID(), Runtime->Register(CreateSchemeBoardSchemeCache(config.Get()), nodeId));
             }
         }
@@ -494,11 +503,11 @@ struct TEnvironmentSetup {
     }
 
     TActorId CreateQueueActor(const TVDiskID& vdiskId, NKikimrBlobStorage::EVDiskQueueId queueId, ui32 index) {
-        TBSProxyContextPtr bspctx = MakeIntrusive<TBSProxyContext>(MakeIntrusive<NMonitoring::TDynamicCounters>());
+        TBSProxyContextPtr bspctx = MakeIntrusive<TBSProxyContext>(MakeIntrusive<::NMonitoring::TDynamicCounters>());
         auto flowRecord = MakeIntrusive<NBackpressure::TFlowRecord>();
         auto groupInfo = GetGroupInfo(vdiskId.GroupID);
         std::unique_ptr<IActor> actor(CreateVDiskBackpressureClient(groupInfo, vdiskId, queueId,
-            MakeIntrusive<NMonitoring::TDynamicCounters>(), bspctx,
+            MakeIntrusive<::NMonitoring::TDynamicCounters>(), bspctx,
             NBackpressure::TQueueClientId(NBackpressure::EQueueClientType::DSProxy, index), TStringBuilder()
             << "test# " << index, 0, false, TDuration::Seconds(60), flowRecord, NMonitoring::TCountableBase::EVisibility::Private));
         const ui32 nodeId = Settings.ControllerNodeId;

@@ -36,7 +36,7 @@ public:
     }
 
     void Bootstrap(const TActorContext& ctx) {
-        VCtx.Reset(new TVDiskContext(ctx.SelfID, Top, new NMonitoring::TDynamicCounters, VDiskId,
+        VCtx.Reset(new TVDiskContext(ctx.SelfID, Top, new ::NMonitoring::TDynamicCounters, VDiskId,
                 ctx.ExecutorThread.ActorSystem, NPDisk::DEVICE_TYPE_UNKNOWN));
         Become(&TVDiskMockActor::StateFunc);
     }
@@ -111,8 +111,15 @@ public:
         }
 
         // check for blocks
-        if (!record.GetIgnoreBlock() && IsBlocked(id)) {
-            return sendResponse(NKikimrProto::BLOCKED, "blocked");
+        if (!record.GetIgnoreBlock()) {
+            if (IsBlocked(id)) {
+                return sendResponse(NKikimrProto::BLOCKED, "blocked");
+            }
+            for (const auto& extra : record.GetExtraBlockChecks()) {
+                if (IsBlocked(extra.GetTabletId(), extra.GetGeneration())) {
+                    return sendResponse(NKikimrProto::BLOCKED, "blocked");
+                }
+            }
         }
 
         // put the blob in place

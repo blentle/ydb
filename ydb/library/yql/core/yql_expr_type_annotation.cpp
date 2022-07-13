@@ -375,86 +375,36 @@ IGraphTransformer::TStatus TryConvertToImpl(TExprContext& ctx, TExprNode::TPtr& 
             return IGraphTransformer::TStatus::Repeat;
         }
     }
-    else if (expectedType.GetKind() == ETypeAnnotationKind::Struct && node->IsCallable({"Struct", "AsStruct"})) {
-        auto from = sourceType.Cast<TStructExprType>();
-        auto to = expectedType.Cast<TStructExprType>();
-        THashMap<TString, TExprNode::TPtr> columnTransforms;
-        ui32 usedFields = 0;
-        for (auto newField : to->GetItems()) {
-            auto pos = from->FindItem(newField->GetName());
-            TExprNode::TPtr field;
-            if (!pos) {
-                if (newField->GetItemType()->GetKind() != ETypeAnnotationKind::Optional) {
-                    if (raiseIssues) {
-                        ctx.AddError(TIssue(node->Pos(ctx), TStringBuilder() <<
-                                "Can't find  '" << newField->GetName() << "': " << *newField->GetItemType() << " in " << sourceType));
-                    }
-                    return IGraphTransformer::TStatus::Error;
-                }
-
-                field = ctx.Builder(node->Pos())
-                    .Callable("Nothing")
-                        .Add(0, ExpandType(node->Pos(), *newField->GetItemType(), ctx))
-                    .Seal()
-                    .Build();
-            } else {
-                ++usedFields;
-                auto oldType = from->GetItems()[*pos];
-                for (ui32 i = node->IsCallable("Struct") ? 1 : 0; i < node->ChildrenSize(); ++i) {
-                    if (node->Child(i)->Head().Content() == newField->GetName()) {
-                        field = node->Child(i)->ChildPtr(1);
-                        break;
-                    }
-                }
-
-                YQL_ENSURE(field);
-                auto status = TryConvertToImpl(ctx, field, *oldType->GetItemType(), *newField->GetItemType(), flags, raiseIssues);
-                if (status.Level == IGraphTransformer::TStatus::Error) {
-                    if (raiseIssues) {
-                        ctx.AddError(TIssue(node->Pos(ctx), TStringBuilder() <<
-                                "Failed to convert '" << newField->GetName() << "': " << *oldType->GetItemType() << " to " << *newField->GetItemType()));
-                    }
-                    return status;
-                }
-            }
-
-            columnTransforms[newField->GetName()] = field;
-        }
-
-        if (flags.Test(NConvertFlags::DisableTruncation) && usedFields != from->GetSize()) {
-            return IGraphTransformer::TStatus::Error;
-        }
-
-        TExprNode::TListType nodeChildren;
-        for (auto& child : columnTransforms) {
-            nodeChildren.push_back(ctx.NewList(node->Pos(), {
-                ctx.NewAtom(node->Pos(), child.first), child.second }));
-        }
-
-        node = ctx.NewCallable(node->Pos(), "AsStruct", std::move(nodeChildren));
-        return IGraphTransformer::TStatus::Repeat;
-    }
     else if (expectedType.GetKind() == ETypeAnnotationKind::Struct && sourceType.GetKind() == ETypeAnnotationKind::Struct) {
         auto from = sourceType.Cast<TStructExprType>();
         auto to = expectedType.Cast<TStructExprType>();
+        const bool literalStruct = node->IsCallable({"Struct", "AsStruct"});
         THashMap<TString, TExprNode::TPtr> columnTransforms;
         ui32 usedFields = 0;
         for (auto newField : to->GetItems()) {
             auto pos = from->FindItem(newField->GetName());
             TExprNode::TPtr field;
             if (!pos) {
-                if (newField->GetItemType()->GetKind() == ETypeAnnotationKind::Null) {
+                switch (newField->GetItemType()->GetKind()) {
+                case ETypeAnnotationKind::Null:
+                case ETypeAnnotationKind::EmptyList:
+                case ETypeAnnotationKind::EmptyDict:
+                case ETypeAnnotationKind::Void:
                     field = ctx.Builder(node->Pos())
-                        .Callable("Null")
-                        .Seal()
-                    .Build();
-                } else if (newField->GetItemType()->GetKind() == ETypeAnnotationKind::Optional) {
+                        .Callable(ToString(newField->GetItemType()->GetKind())).Seal()
+                        .Build();
+                    break;
+                case ETypeAnnotationKind::Optional:
+                case ETypeAnnotationKind::List:
+                case ETypeAnnotationKind::Dict:
+                case ETypeAnnotationKind::Pg:
                     field = ctx.Builder(node->Pos())
-                        .Callable("Nothing")
+                        .Callable(GetEmptyCollectionName(newField->GetItemType()->GetKind()))
                             .Add(0, ExpandType(node->Pos(), *newField->GetItemType(), ctx))
                         .Seal()
-                       .Build();
-                } else {
+                        .Build();
+                    break;
+                default:
                     if (raiseIssues) {
                         ctx.AddError(TIssue(node->Pos(ctx), TStringBuilder() <<
                                 "Can't find  '" << newField->GetName() << ": " << *newField->GetItemType() << "' in " << sourceType));
@@ -464,12 +414,22 @@ IGraphTransformer::TStatus TryConvertToImpl(TExprContext& ctx, TExprNode::TPtr& 
             } else {
                 ++usedFields;
                 auto oldType = from->GetItems()[*pos];
-                field = ctx.Builder(node->Pos())
-                    .Callable("Member")
-                        .Add(0, node)
-                        .Atom(1, newField->GetName())
-                        .Seal()
-                    .Build();
+                if (literalStruct) {
+                    for (ui32 i = node->IsCallable("Struct") ? 1 : 0; i < node->ChildrenSize(); ++i) {
+                        if (node->Child(i)->Head().Content() == newField->GetName()) {
+                            field = node->Child(i)->ChildPtr(1);
+                            break;
+                        }
+                    }
+                    YQL_ENSURE(field);
+                } else {
+                    field = ctx.Builder(node->Pos())
+                        .Callable("Member")
+                            .Add(0, node)
+                            .Atom(1, newField->GetName())
+                            .Seal()
+                        .Build();
+                }
 
                 auto status = TryConvertToImpl(ctx, field, *oldType->GetItemType(), *newField->GetItemType(), flags, raiseIssues);
                 if (status.Level == IGraphTransformer::TStatus::Error) {
@@ -1948,6 +1908,48 @@ bool EnsureTupleOfAtoms(const TExprNode& node, TExprContext& ctx) {
         }
     }
     return true;
+}
+
+bool EnsureValidSettings(const TExprNode& node,
+    const THashSet<TStringBuf>& supportedSettings,
+    const TSettingNodeValidator& validator,
+    TExprContext& ctx)
+{
+    if (!EnsureTuple(node, ctx)) {
+        return false;
+    }
+
+    for (auto& settingNode : node.ChildrenList()) {
+        if (!EnsureTupleMinSize(*settingNode, 1, ctx)) {
+            return false;
+        }
+
+        if (!EnsureAtom(settingNode->Head(), ctx)) {
+            return false;
+        }
+
+        const TStringBuf name = settingNode->Head().Content();
+        if (!supportedSettings.contains(name)) {
+            ctx.AddError(TIssue(ctx.GetPosition(settingNode->Head().Pos()), TStringBuilder() << "Unknown setting '" << name << "'"));
+            return false;
+        }
+
+        if (!validator(name, *settingNode, ctx)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TSettingNodeValidator RequireSingleValueSettings(const TSettingNodeValidator& validator) {
+    return [validator](TStringBuf name, const TExprNode& setting, TExprContext& ctx) {
+        if (setting.ChildrenSize() != 2) {
+            ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()),
+                                TStringBuilder() << "Option '" << name << "' requires single argument"));
+            return false;
+        }
+        return validator(name, setting, ctx);
+    };
 }
 
 bool EnsureTupleSize(const TExprNode& node, ui32 expectedSize, TExprContext& ctx) {
@@ -5036,7 +5038,7 @@ bool ExtractPgType(const TTypeAnnotationNode* type, ui32& pgType, bool& convertT
         if (unpacked->GetKind() != ETypeAnnotationKind::Data) {
             ctx.AddError(TIssue(ctx.GetPosition(pos),
                 "Nested optional type is not compatible to PG"));
-            return IGraphTransformer::TStatus::Error;
+            return false;
         }
 
         auto slot = unpacked->Cast<TDataExprType>()->GetSlot();

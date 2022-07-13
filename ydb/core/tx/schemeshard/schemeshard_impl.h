@@ -198,7 +198,7 @@ public:
     THashMap<TPathId, TFileStoreInfo::TPtr> FileStoreInfos;
     THashMap<TPathId, TKesusInfo::TPtr> KesusInfos;
     THashMap<TPathId, TOlapStoreInfo::TPtr> OlapStores;
-    THashMap<TPathId, TOlapTableInfo::TPtr> OlapTables;
+    THashMap<TPathId, TColumnTableInfo::TPtr> ColumnTables;
 
     // it is only because we need to manage undo of upgrade subdomain, finally remove it
     THashMap<TPathId, TVector<TTabletId>> RevertedMigrations;
@@ -467,11 +467,12 @@ public:
 
     const TTableInfo* GetMainTableForIndex(TPathId indexTableId) const;
 
-    TPathId ResolveDomainId(TPathId pathId) const;
-    TPathId ResolveDomainId(TPathElement::TPtr pathEl) const;
+    TPathId ResolvePathIdForDomain(TPathId pathId) const;
+    TPathId ResolvePathIdForDomain(TPathElement::TPtr pathEl) const;
     TSubDomainInfo::TPtr ResolveDomainInfo(TPathId pathId) const;
     TSubDomainInfo::TPtr ResolveDomainInfo(TPathElement::TPtr pathEl) const;
 
+    TPathId GetDomainKey(TPathElement::TPtr pathEl) const;
     TPathId GetDomainKey(TPathId pathId) const;
 
     const NKikimrSubDomains::TProcessingParams& SelectProcessingPrarams(TPathId id) const;
@@ -516,9 +517,10 @@ public:
 
     void DoShardsDeletion(const THashSet<TShardIdx>& shardIdx, const TActorContext& ctx);
 
+    void SetPartitioning(TPathId pathId, TOlapStoreInfo::TPtr storeInfo);
     void SetPartitioning(TPathId pathId, TTableInfo::TPtr tableInfo, TVector<TTableShardInfo>&& newPartitioning);
     auto BuildStatsForCollector(TPathId tableId, TShardIdx shardIdx, TTabletId datashardId,
-        TMaybe<ui32> nodeId, TMaybe<ui64> startTime, const TTableInfo::TPartitionStats& stats);
+        TMaybe<ui32> nodeId, TMaybe<ui64> startTime, const TPartitionStats& stats);
 
     bool ReadSysValue(NIceDb::TNiceDb& db, ui64 sysTag, TString& value, TString defValue = TString());
     bool ReadSysValue(NIceDb::TNiceDb& db, ui64 sysTag, ui64& value, ui64 defVal = 0);
@@ -558,7 +560,7 @@ public:
     void PersistTablePartitioning(NIceDb::TNiceDb &db, const TPathId pathId, const TTableInfo::TPtr tableInfo);
     void PersistTablePartitioningDeletion(NIceDb::TNiceDb& db, const TPathId tableId, const TTableInfo::TPtr tableInfo);
     void PersistTablePartitionCondErase(NIceDb::TNiceDb& db, const TPathId& pathId, ui64 id, const TTableInfo::TPtr tableInfo);
-    void PersistTablePartitionStats(NIceDb::TNiceDb& db, const TPathId& tableId, ui64 partitionId, const TTableInfo::TPartitionStats& stats);
+    void PersistTablePartitionStats(NIceDb::TNiceDb& db, const TPathId& tableId, ui64 partitionId, const TPartitionStats& stats);
     void PersistTablePartitionStats(NIceDb::TNiceDb& db, const TPathId& tableId, const TShardIdx& shardIdx, const TTableInfo::TPtr tableInfo);
     void PersistTablePartitionStats(NIceDb::TNiceDb& db, const TPathId& tableId, const TTableInfo::TPtr tableInfo);
     void PersistTableCreated(NIceDb::TNiceDb& db, const TPathId tableId);
@@ -653,11 +655,11 @@ public:
     void PersistOlapStoreAlter(NIceDb::TNiceDb& db, TPathId pathId, const TOlapStoreInfo& storeInfo);
     void PersistOlapStoreAlterRemove(NIceDb::TNiceDb& db, TPathId pathId);
 
-    // OlapTable
-    void PersistOlapTable(NIceDb::TNiceDb& db, TPathId pathId, const TOlapTableInfo& tableInfo, bool isAlter = false);
-    void PersistOlapTableRemove(NIceDb::TNiceDb& db, TPathId pathId, bool isAlter = false);
-    void PersistOlapTableAlter(NIceDb::TNiceDb& db, TPathId pathId, const TOlapTableInfo& tableInfo);
-    void PersistOlapTableAlterRemove(NIceDb::TNiceDb& db, TPathId pathId);
+    // ColumnTable
+    void PersistColumnTable(NIceDb::TNiceDb& db, TPathId pathId, const TColumnTableInfo& tableInfo, bool isAlter = false);
+    void PersistColumnTableRemove(NIceDb::TNiceDb& db, TPathId pathId, bool isAlter = false);
+    void PersistColumnTableAlter(NIceDb::TNiceDb& db, TPathId pathId, const TColumnTableInfo& tableInfo);
+    void PersistColumnTableAlterRemove(NIceDb::TNiceDb& db, TPathId pathId);
 
     // Sequence
     void PersistSequence(NIceDb::TNiceDb& db, TPathId pathId, const TSequenceInfo& sequenceInfo);
@@ -735,14 +737,14 @@ public:
     void ScheduleCleanDroppedPaths();
     void Handle(TEvPrivate::TEvCleanDroppedPaths::TPtr& ev, const TActorContext& ctx);
 
-    void EnqueueBackgroundCompaction(const TShardIdx& shardIdx, const TTableInfo::TPartitionStats& stats);
-    void UpdateBackgroundCompaction(const TShardIdx& shardIdx, const TTableInfo::TPartitionStats& stats);
+    void EnqueueBackgroundCompaction(const TShardIdx& shardIdx, const TPartitionStats& stats);
+    void UpdateBackgroundCompaction(const TShardIdx& shardIdx, const TPartitionStats& stats);
     void RemoveBackgroundCompaction(const TShardIdx& shardIdx);
 
     void EnqueueBorrowedCompaction(const TShardIdx& shardIdx);
     void RemoveBorrowedCompaction(const TShardIdx& shardIdx);
 
-    void UpdateShardMetrics(const TShardIdx& shardIdx, const TTableInfo::TPartitionStats& newStats);
+    void UpdateShardMetrics(const TShardIdx& shardIdx, const TPartitionStats& newStats);
     void RemoveShardMetrics(const TShardIdx& shardIdx);
 
     void ShardRemoved(const TShardIdx& shardIdx);
@@ -948,6 +950,7 @@ public:
     void ScheduleConditionalEraseRun(const TActorContext& ctx);
     void Handle(TEvPrivate::TEvRunConditionalErase::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvConditionalEraseRowsResponse::TPtr& ev, const TActorContext& ctx);
+    void ConditionalEraseHandleDisconnect(TTabletId tabletId, const TActorId& clientId, const TActorContext& ctx);
 
     void Handle(NSysView::TEvSysView::TEvGetPartitionStats::TPtr& ev, const TActorContext& ctx);
 

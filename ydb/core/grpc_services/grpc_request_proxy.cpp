@@ -248,6 +248,9 @@ private:
                         return;
                     }
                 }
+                if (domain.GetDomainState().GetDiskQuotaExceeded()) {
+                    requestBaseCtx->SetDiskQuotaExceeded(true);
+                }
             } else {
                 Counters->IncDatabaseUnavailableCounter();
                 auto issue = MakeIssue(NKikimrIssues::TIssuesIds::YDB_DB_NOT_READY, "database unavailable");
@@ -579,8 +582,9 @@ void TGRpcRequestProxyImpl::StateFunc(TAutoPtr<IEventHandle>& ev, const TActorCo
         HFunc(TEvBiStreamPingRequest, PreHandle);
         HFunc(TEvExperimentalStreamQueryRequest, PreHandle);
         HFunc(TEvStreamPQWriteRequest, PreHandle);
-        HFunc(TEvStreamPQReadRequest, PreHandle);
         HFunc(TEvStreamPQMigrationReadRequest, PreHandle);
+//        HFunc(TEvStreamTopicWriteRequest, PreHandle);
+        HFunc(TEvStreamTopicReadRequest, PreHandle);
         HFunc(TEvPQReadInfoRequest, PreHandle);
         HFunc(TEvPQDropTopicRequest, PreHandle);
         HFunc(TEvPQCreateTopicRequest, PreHandle);
@@ -590,6 +594,11 @@ void TGRpcRequestProxyImpl::StateFunc(TAutoPtr<IEventHandle>& ev, const TActorCo
         HFunc(TEvPQDescribeTopicRequest, PreHandle);
         HFunc(TEvDiscoverPQClustersRequest, PreHandle);
         HFunc(TEvCoordinationSessionRequest, PreHandle);
+        HFunc(TEvDropTopicRequest, PreHandle);
+        HFunc(TEvCreateTopicRequest, PreHandle);
+        HFunc(TEvAlterTopicRequest, PreHandle);
+        HFunc(TEvDescribeTopicRequest, PreHandle);
+        HFunc(TEvNodeCheckRequest, PreHandle);
 
         HFunc(TEvProxyRuntimeEvent, PreHandle);
 

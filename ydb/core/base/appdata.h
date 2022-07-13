@@ -113,7 +113,7 @@ struct TAppData {
     ui64 CompilerSchemeCacheTables;
 
     NActors::TMon* Mon;
-    NMonitoring::TDynamicCounterPtr Counters;
+    ::NMonitoring::TDynamicCounterPtr Counters;
     NMonitoring::TBusNgMonPage* BusMonPage;
     TIntrusivePtr<NKikimr::TControlBoard> Icb;
     TIntrusivePtr<NGRpcService::TInFlightLimiterRegistry> InFlightLimiterRegistry;
@@ -144,6 +144,7 @@ struct TAppData {
     bool EnableKqpSpilling = false;
     bool AllowShadowDataInSchemeShardForTests = false;
     bool EnableMvccSnapshotWithLegacyDomainRoot = false;
+    bool UsePartitionStatsCollectorForTests = false;
     TVector<TString> AdministrationAllowedSIDs; // users/groups which allowed to perform administrative tasks
     TVector<TString> DefaultUserSIDs;
     TString AllAuthenticatedUsers;

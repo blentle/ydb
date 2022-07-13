@@ -136,6 +136,7 @@ class KikimrConfigGenerator(object):
             bs_cache_file_path=None,
             yq_tenant=None,
             use_legacy_pq=False,
+            dc_mapping={},
     ):
         self._version = version
         self.use_log_files = use_log_files
@@ -197,6 +198,7 @@ class KikimrConfigGenerator(object):
         self.__output_path = output_path or yatest_common.output_path()
         self.node_kind = node_kind
         self.yq_tenant = yq_tenant
+        self.dc_mapping = dc_mapping
 
         self.__bs_cache_file_path = bs_cache_file_path
 
@@ -205,6 +207,7 @@ class KikimrConfigGenerator(object):
         self.yaml_config["feature_flags"]["enable_public_api_external_blobs"] = enable_public_api_external_blobs
         self.yaml_config["feature_flags"]["enable_mvcc"] = "VALUE_FALSE" if disable_mvcc else "VALUE_TRUE"
         self.yaml_config['pqconfig']['enabled'] = enable_pq
+        self.yaml_config['pqconfig']['enable_proto_source_id_info'] = True
         # NOTE(shmel1k@): KIKIMR-14221
         if use_legacy_pq:
             self.yaml_config['pqconfig']['topics_are_first_class_citizen'] = False

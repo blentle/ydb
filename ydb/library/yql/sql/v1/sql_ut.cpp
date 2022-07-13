@@ -147,6 +147,46 @@ void VerifySqlInHints(const TString& query, const THashSet<TString>& expectedHin
     VerifySqlInHints(query, expectedHints, true);
 }
 
+NSQLTranslation::TTranslationSettings GetSettingsWithS3Binding(const TString& name) {
+    NSQLTranslation::TTranslationSettings settings;
+    NSQLTranslation::TTableBindingSettings bindSettings;
+    bindSettings.ClusterType = "s3";
+    bindSettings.Settings["cluster"] = "cluster";
+    bindSettings.Settings["path"] = "path";
+    bindSettings.Settings["format"] = "format";
+    bindSettings.Settings["compression"] = "ccompression";
+    bindSettings.Settings["bar"] = "1";
+    // schema is not validated in this test but should be valid YSON text
+    bindSettings.Settings["schema"] = R"__("[
+                        "StructType";
+                        [
+                            [
+                                "key";
+                                [
+                                    "DataType";
+                                    "String"
+                                ]
+                            ];
+                            [
+                                "subkey";
+                                [
+                                    "DataType";
+                                    "String"
+                                ]
+                            ];
+                            [
+                                "value";
+                                [
+                                    "DataType";
+                                    "String"
+                                ]
+                            ]
+    ]])__";
+    bindSettings.Settings["partitioned_by"] = "[\"key\", \"subkey\"]";
+    settings.PrivateBindings[name] = bindSettings;
+    return settings;
+}
+
 Y_UNIT_TEST_SUITE(AnsiMode) {
     Y_UNIT_TEST(PragmaAnsi) {
         UNIT_ASSERT(SqlToYql("PRAGMA ANSI 2016;").IsOk());
@@ -1241,7 +1281,7 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
 
         auto res = SqlToYql(req);
         UNIT_ASSERT(res.Root);
-        UNIT_ASSERT_NO_DIFF(Err2Str(res), "");
+        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:1:8: Warning: Use of deprecated DisableAnsiOrderByLimitInUnionAll pragma. It will be dropped soon, code: 4518\n");
     }
 
     Y_UNIT_TEST(WarnUnionAllWithDiscardIntoResultWithExplicitLegacyMode) {
@@ -1254,7 +1294,8 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
 
         auto res = SqlToYql(req);
         UNIT_ASSERT(res.Root);
-        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:4:21: Warning: INTO RESULT will be ignored here. Please use INTO RESULT after last subquery in UNION ALL if you want label entire UNION ALL result, code: 4522\n"
+        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:2:8: Warning: Use of deprecated DisableAnsiOrderByLimitInUnionAll pragma. It will be dropped soon, code: 4518\n"
+                                          "<main>:4:21: Warning: INTO RESULT will be ignored here. Please use INTO RESULT after last subquery in UNION ALL if you want label entire UNION ALL result, code: 4522\n"
                                           "<main>:6:1: Warning: DISCARD will be ignored here. Please use DISCARD before first subquery in UNION ALL if you want to discard entire UNION ALL result, code: 4522\n");
     }
 
@@ -1269,7 +1310,8 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
                    ");";
         auto res = SqlToYql(req);
         UNIT_ASSERT(res.Root);
-        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:7:3: Warning: ORDER BY without LIMIT in subquery will be ignored, code: 4504\n");
+        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:2:8: Warning: Use of deprecated DisableAnsiOrderByLimitInUnionAll pragma. It will be dropped soon, code: 4518\n"
+                                          "<main>:7:3: Warning: ORDER BY without LIMIT in subquery will be ignored, code: 4504\n");
     }
 
     Y_UNIT_TEST(ReduceUsingUdfWithShortcutsWorks) {
@@ -1525,43 +1567,7 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
     }
 
     Y_UNIT_TEST(TableBindings) {
-        NSQLTranslation::TTranslationSettings settings;
-        NSQLTranslation::TTableBindingSettings bindSettings;
-        bindSettings.ClusterType = "s3";
-        bindSettings.Settings["cluster"] = "cluster";
-        bindSettings.Settings["path"] = "path";
-        bindSettings.Settings["format"] = "format";
-        bindSettings.Settings["compression"] = "ccompression";
-        bindSettings.Settings["bar"] = "1";
-        // schema is not validated in this test but should be valid YSON text
-        bindSettings.Settings["schema"] = R"__("[
-                        "StructType";
-                        [
-                            [
-                                "key";
-                                [
-                                    "DataType";
-                                    "String"
-                                ]
-                            ];
-                            [
-                                "subkey";
-                                [
-                                    "DataType";
-                                    "String"
-                                ]
-                            ];
-                            [
-                                "value";
-                                [
-                                    "DataType";
-                                    "String"
-                                ]
-                            ]
-                        ]])__";
-
-        settings.PrivateBindings["foo"] = bindSettings;
-
+        NSQLTranslation::TTranslationSettings settings = GetSettingsWithS3Binding("foo");
         NYql::TAstParseResult res = SqlToYqlWithSettings(
             "select * from bindings.foo",
             settings
@@ -1571,18 +1577,14 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
         TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
             if (word == "MrObject") {
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos,
-                    line.find(R"__((MrObject '"path" '"format" '('('"bar" (String '"1")) '('"compression" (String '"ccompression")))))__"));
-            } else if (word == "userschema") {
-                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos,
-                    line.find(R"__('('('"userschema" (SqlTypeFromYson)__"));
+                                           line.find(R"__((MrTableConcat (Key '('table (String '"path")))) (Void) '('('"bar" '"1") '('"compression" '"ccompression") '('"format" '"format") '('"partitionedby" '"key" '"subkey") '('"userschema" (SqlTypeFromYson)__"));
             }
         };
 
-        TWordCountHive elementStat = {{TString("MrObject"), 0}, {TString("userschema"), 0}};
+        TWordCountHive elementStat = {{TString("MrTableConcat"), 0}};
         VerifyProgram(res, elementStat, verifyLine);
 
-        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["MrObject"]);
-        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["userschema"]);
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["MrTableConcat"]);
     }
 
     Y_UNIT_TEST(TrailingCommaInWithout) {
@@ -1654,6 +1656,11 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
 
     Y_UNIT_TEST(UseShouldWorkAsColumnName) {
         UNIT_ASSERT(SqlToYql("select use from (select 1 as use);").IsOk());
+    }
+
+    Y_UNIT_TEST(TrueFalseWorkAfterDollar) {
+        UNIT_ASSERT(SqlToYql("$ true = false; SELECT $ true or false;").IsOk());
+        UNIT_ASSERT(SqlToYql("$False = 0; SELECT $False;").IsOk());
     }
 }
 
@@ -4247,5 +4254,55 @@ Y_UNIT_TEST_SUITE(FlexibleTypes) {
             "PRAGMA FlexibleTypes;\n"
             "SELECT 1 + String + MAX(key) FROM plato.Input;";
         UNIT_ASSERT(SqlToYql(q).IsOk());
+    }
+}
+
+Y_UNIT_TEST_SUITE(ExternalDeclares) {
+    Y_UNIT_TEST(BasicUsage) {
+        NSQLTranslation::TTranslationSettings settings;
+        settings.DeclaredNamedExprs["foo"] = "String";
+        auto res = SqlToYqlWithSettings("select $foo;", settings);
+        UNIT_ASSERT(res.IsOk());
+        UNIT_ASSERT(res.Issues.Size() == 0);
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "declare") {
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find(R"__((declare $foo (DataType 'String)))__"));
+            }
+        };
+
+        TWordCountHive elementStat = {{TString("declare"), 0}};
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["declare"]);
+    }
+
+    Y_UNIT_TEST(NoDeclareOverrides) {
+        NSQLTranslation::TTranslationSettings settings;
+        settings.DeclaredNamedExprs["foo"] = "String";
+        auto res = SqlToYqlWithSettings("declare $foo as Int32; select $foo;", settings);
+        UNIT_ASSERT(res.IsOk());
+        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:1:9: Warning: Duplicate declaration of '$foo' will be ignored, code: 4536\n");
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "declare") {
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find(R"__((declare $foo (DataType 'String)))__"));
+            }
+        };
+
+        TWordCountHive elementStat = {{TString("declare"), 0}};
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["declare"]);
+    }
+
+    Y_UNIT_TEST(DeclaresWithInvalidTypesFails) {
+        NSQLTranslation::TTranslationSettings settings;
+        settings.DeclaredNamedExprs["foo"] = "List<BadType>";
+        auto res = SqlToYqlWithSettings("select 1;", settings);
+        UNIT_ASSERT(!res.Root);
+        UNIT_ASSERT_NO_DIFF(Err2Str(res),
+            "<main>:0:5: Error: Unknown type: 'BadType'\n"
+            "<main>: Error: Failed to parse type for externally declared name 'foo'\n");
     }
 }

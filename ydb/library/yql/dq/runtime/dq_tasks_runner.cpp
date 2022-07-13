@@ -147,7 +147,7 @@ NUdf::TUnboxedValue DqBuildInputValue(const NDqProto::TTaskInput& inputDesc, con
 }
 
 IDqOutputConsumer::TPtr DqBuildOutputConsumer(const NDqProto::TTaskOutput& outputDesc, const NMiniKQL::TType* type,
-    const NMiniKQL::TTypeEnvironment& typeEnv, TVector<IDqOutput::TPtr>&& outputs)
+    const NMiniKQL::TTypeEnvironment& /*typeEnv*/, TVector<IDqOutput::TPtr>&& outputs)
 {
     switch (outputDesc.GetTypeCase()) {
         case NDqProto::TTaskOutput::kSink:
@@ -159,7 +159,7 @@ IDqOutputConsumer::TPtr DqBuildOutputConsumer(const NDqProto::TTaskOutput& outpu
         }
 
         case NDqProto::TTaskOutput::kHashPartition: {
-            TVector<NUdf::TDataTypeId> keyColumnTypes;
+            TVector<TType*> keyColumnTypes;
             TVector<ui32> keyColumnIndices;
             GetColumnsInfo(type, outputDesc.GetHashPartition().GetKeyColumns(), keyColumnTypes, keyColumnIndices);
             YQL_ENSURE(!keyColumnTypes.empty());
@@ -171,7 +171,7 @@ IDqOutputConsumer::TPtr DqBuildOutputConsumer(const NDqProto::TTaskOutput& outpu
             }
 
             return CreateOutputHashPartitionConsumer(std::move(outputs), std::move(keyColumnTypes),
-                std::move(keyColumnIndices), typeEnv);
+                std::move(keyColumnIndices));
         }
 
         case NDqProto::TTaskOutput::kBroadcast: {
@@ -249,13 +249,15 @@ public:
         return TaskId;
     }
 
-    void BuildTask(const NDqProto::TDqTask& task, const TDqTaskRunnerParameterProvider& parameterProvider) {
+    void BuildTask(const NDqProto::TDqTask& task, const TDqTaskRunnerParameterProvider& parameterProvider,
+        const std::shared_ptr<TPatternWithEnv>& compPattern)
+    {
         LOG(TStringBuilder() << "Build task: " << TaskId);
         auto startTime = TInstant::Now();
 
         auto& typeEnv = TypeEnv();
 
-        auto& program = task.GetProgram();
+        const NDqProto::TProgram &program = task.GetProgram();
         YQL_ENSURE(program.GetRuntimeVersion());
         YQL_ENSURE(program.GetRuntimeVersion() <= NYql::NDqProto::ERuntimeVersion::RUNTIME_VERSION_YQL_1_0);
 
@@ -342,15 +344,31 @@ public:
         }
 
         auto validatePolicy = Settings.TerminateOnError ? NUdf::EValidatePolicy::Fail : NUdf::EValidatePolicy::Exception;
-        TComputationPatternOpts opts(Alloc().Ref(), typeEnv, Context.ComputationFactory, Context.FuncRegistry,
-            NUdf::EValidateMode::None, validatePolicy, Settings.OptLLVM,
-            EGraphPerProcess::Multi, ProgramParsed.StatsRegistry.Get());
-        SecureParamsProvider = MakeSimpleSecureParamsProvider(Settings.SecureParams);
-        opts.SecureParamsProvider = SecureParamsProvider.get();
-        ProgramParsed.CompPattern = MakeComputationPattern(programExplorer, programRoot, ProgramParsed.EntryPoints, opts);
 
-        ProgramParsed.CompGraph = ProgramParsed.CompPattern->Clone(
-            opts.ToComputationOptions(*Context.RandomProvider, *Context.TimeProvider));
+        auto& compPatternAlloc = compPattern ? compPattern->Alloc.Ref() : Alloc().Ref();
+        auto& compPatternEnv = compPattern ? compPattern->Env : typeEnv;
+
+        TComputationPatternOpts opts(compPatternAlloc, compPatternEnv, Context.ComputationFactory,
+            Context.FuncRegistry, NUdf::EValidateMode::None, validatePolicy, Settings.OptLLVM, EGraphPerProcess::Multi,
+            ProgramParsed.StatsRegistry.Get());
+
+            SecureParamsProvider = MakeSimpleSecureParamsProvider(Settings.SecureParams);
+            opts.SecureParamsProvider = SecureParamsProvider.get();
+
+        if (compPattern) {
+            if (!compPattern->Pattern) {
+                auto guard = compPattern->Env.BindAllocator();
+                compPattern->Pattern = MakeComputationPattern(programExplorer, programRoot, ProgramParsed.EntryPoints, opts);
+            }
+            ProgramParsed.CompPattern = compPattern->Pattern;
+            // clone pattern using alloc from current scope
+            ProgramParsed.CompGraph = ProgramParsed.CompPattern->Clone(
+                opts.ToComputationOptions(*Context.RandomProvider, *Context.TimeProvider, &Alloc().Ref()));
+        } else {
+            ProgramParsed.CompPattern = MakeComputationPattern(programExplorer, programRoot, ProgramParsed.EntryPoints, opts);
+            ProgramParsed.CompGraph = ProgramParsed.CompPattern->Clone(
+                opts.ToComputationOptions(*Context.RandomProvider, *Context.TimeProvider));
+        }
 
         TBindTerminator term(ProgramParsed.CompGraph->GetTerminator());
 
@@ -396,10 +414,11 @@ public:
     }
 
     void Prepare(const NDqProto::TDqTask& task, const TDqTaskRunnerMemoryLimits& memoryLimits,
-        const IDqTaskRunnerExecutionContext& execCtx, const TDqTaskRunnerParameterProvider& parameterProvider) override
+        const IDqTaskRunnerExecutionContext& execCtx, const TDqTaskRunnerParameterProvider& parameterProvider,
+        const std::shared_ptr<TPatternWithEnv>& compPattern) override
     {
         TaskId = task.GetId();
-        BuildTask(task, parameterProvider);
+        BuildTask(task, parameterProvider, compPattern);
 
         LOG(TStringBuilder() << "Prepare task: " << TaskId);
         auto startTime = TInstant::Now();
@@ -422,13 +441,13 @@ public:
                 Y_VERIFY(!transform->TransformInput);
                 Y_VERIFY(!transform->TransformOutput);
 
-                TStringBuilder err;
-                transform->TransformInputType = NCommon::ParseTypeFromYson(TStringBuf{transformDesc.GetInputType()}, *pb, err.Out);
-                YQL_ENSURE(transform->TransformInputType, "Can't parse transform input type: " << err);
+                auto inputTypeNode = NMiniKQL::DeserializeNode(TStringBuf{transformDesc.GetInputType()}, typeEnv);
+                YQL_ENSURE(inputTypeNode, "Failed to deserialize transform input type");
+                transform->TransformInputType = static_cast<TType*>(inputTypeNode);
 
-                err.clear();
-                TType* outputType = NCommon::ParseTypeFromYson(TStringBuf{transformDesc.GetOutputType()}, *pb, err.Out);
-                YQL_ENSURE(outputType, "Can't parse transform output type: " << err);
+                auto outputTypeNode = NMiniKQL::DeserializeNode(TStringBuf{transformDesc.GetOutputType()}, typeEnv);
+                YQL_ENSURE(outputTypeNode, "Failed to deserialize transform output type");
+                TType* outputType = static_cast<TType*>(outputTypeNode);
                 YQL_ENSURE(outputType->IsSameType(*ProgramParsed.InputItemTypes[i]));
                 LOG(TStringBuilder() << "Task: " << TaskId << " has transform by "
                     << transformDesc.GetType() << " with input type: " << *transform->TransformInputType
@@ -488,13 +507,13 @@ public:
                 Y_VERIFY(!transform->TransformInput);
                 Y_VERIFY(!transform->TransformOutput);
 
-                TStringBuilder err;
-                transform->TransformOutputType = NCommon::ParseTypeFromYson(TStringBuf{transformDesc.GetOutputType()}, *pb, err.Out);
-                YQL_ENSURE(transform->TransformOutputType, "Can't parse transform output type: " << err);
+                auto outputTypeNode = NMiniKQL::DeserializeNode(TStringBuf{transformDesc.GetOutputType()}, typeEnv);
+                YQL_ENSURE(outputTypeNode, "Failed to deserialize transform output type");
+                transform->TransformOutputType = static_cast<TType*>(outputTypeNode);
 
-                err.clear();
-                TType* inputType = NCommon::ParseTypeFromYson(TStringBuf{transformDesc.GetInputType()}, *pb, err.Out);
-                YQL_ENSURE(inputType, "Can't parse transform input type: " << err);
+                auto inputTypeNode = NMiniKQL::DeserializeNode(TStringBuf{transformDesc.GetInputType()}, typeEnv);
+                YQL_ENSURE(inputTypeNode, "Failed to deserialize transform input type");
+                TType* inputType = static_cast<TType*>(inputTypeNode);
                 YQL_ENSURE(inputType->IsSameType(*ProgramParsed.OutputItemTypes[i]));
                 LOG(TStringBuilder() << "Task: " << TaskId << " has transform by "
                     << transformDesc.GetType() << " with input type: " << *inputType

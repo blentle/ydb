@@ -291,7 +291,7 @@ message TLogConfig {
 
     repeated TEntry Entry = 1;
     optional bool   SysLog = 2 [default = false];
-    optional uint32 DefaultLevel = 3 [default = 4]; // NActors::NLog::PRI_WARN
+    optional uint32 DefaultLevel = 3 [default = 5]; // NActors::NLog::PRI_NOTICE
     optional uint32 DefaultSamplingLevel = 4 [default = 7]; // NActors::NLog::PRI_DEBUG
     optional uint32 DefaultSamplingRate = 5 [default = 0];
     optional string Format = 6 [default = "full"]; // "full" | "short" | "json"
@@ -686,9 +686,9 @@ message TFeatureFlags {
     optional bool EnableBackgroundCompaction = 51 [default = true];
     optional bool EnableArrowFormatInChannels = 52 [default = false];
     optional bool EnableBackgroundCompactionServerless = 53 [default = false];
-    optional bool EnableNotNullColumns = 54 [default = false];
+    optional bool EnableNotNullColumns = 54 [default = true];
     optional bool EnableTtlOnAsyncIndexedTables = 55 [default = true];
-    optional bool EnableBulkUpsertToAsyncIndexedTables = 56 [default = false];
+    optional bool EnableBulkUpsertToAsyncIndexedTables = 56 [default = true];
     optional bool EnableNodeBrokerSingleDomainMode = 57 [default = false];
     optional bool EnableKqpSessionActor = 58 [default = true];
     // Dangerous settings we don't want in the public api unless required
@@ -697,8 +697,12 @@ message TFeatureFlags {
     optional bool EnableImplicitScanQueryInScripts = 61 [default = true];
     optional bool EnablePredicateExtractForScanQueries = 62 [default = true];
     optional bool AllowVDiskDefrag = 63 [default = true];
-    optional bool EnableAsyncHttpMon = 64 [default = false];
+    optional bool EnableAsyncHttpMon = 64 [default = true];
     optional bool EnableChangefeeds = 65 [default = true];
+    optional bool EnableKqpScanQueryStreamLookup = 66 [default = false];
+    optional bool EnableKqpScanQueryMultipleOlapShardsReads = 67 [default = false];
+    optional bool EnablePredicateExtractForDataQueries = 68 [default = false];
+    optional bool EnableKqpPatternCacheLiteral = 69 [default = false];
 }
 
 
@@ -1043,10 +1047,23 @@ message TTableServiceConfig {
     }
 
     message TSessionBalancerSettings {
-        optional bool Enabled = 1 [default = false];
+        optional bool Enabled = 1 [default = true];
+
+        enum EEnableTier  {
+            TIER_DISABLED = 1;
+            TIER_ENABLED_FOR_SESSIONS_WITH_SUPPORT = 2;
+            TIER_ENABLED_FOR_ALL = 3;
+        }
+
+        enum EBalancingStrategy {
+            BALANCE_BY_CPU = 1;
+            BALANCE_BY_COUNT = 2;
+            BALANCE_BY_CPU_AND_COUNT = 3;
+        }
+
         // MaxSessionsShutdownInFlightSize option determines the number of sessions
         // that we can keep in shutdown state at the moment.
-        optional uint32 MaxSessionsShutdownInFlightSize = 2 [default = 3];
+        optional uint32 MaxSessionsShutdownInFlightSize = 2 [default = 1];
         //         GREEN ZONE         YELLOW ZONE               RED ZONE
         //                     MinCV                   MaxCV
         //    < MinCV           |                        |     > MaxCV
@@ -1061,11 +1078,11 @@ message TTableServiceConfig {
         optional uint32 MaxCVTreshold = 4 [default = 20];
         // timeout (in milliseconds)
         // After HardSessionShutdownTimeoutMs session will be terminated.
-        optional uint32 HardSessionShutdownTimeoutMs = 5 [default = 5000];
+        optional uint32 HardSessionShutdownTimeoutMs = 5 [default = 30000];
         // timeout (in milliseconds)
         // After SoftSessionShutdownTimeoutMs milliseconds
         // session will not accept new query requests.
-        optional uint32 SoftSessionShutdownTimeoutMs = 6 [default = 1000];
+        optional uint32 SoftSessionShutdownTimeoutMs = 6 [default = 15000];
         // Minimum number of sessions on node to start balancing. If number of sessions on node
         // less than MinNodeSessions, balancer will not be able to kick session from node.
         optional uint32 MinNodeSessions = 7 [default = 10];
@@ -1077,6 +1094,9 @@ message TTableServiceConfig {
 
         optional uint32 BoardPublishIntervalMs = 10 [default = 1000];
         optional uint32 BoardLookupIntervalMs = 11 [default = 30000];
+        optional EEnableTier EnableTier = 12 [ default = TIER_DISABLED ];
+        optional EBalancingStrategy Strategy = 13 [ default = BALANCE_BY_COUNT ];
+        optional bool SupportRemoteSessionCreation = 14 [ default = false ];
     }
 
     message TQueryReplayConfig {
@@ -1411,6 +1431,7 @@ message TDataShardConfig {
     optional uint64 TtlReadAheadLo = 13 [default = 524288];
     optional uint64 TtlReadAheadHi = 14 [default = 1048576];
     optional uint64 IdleMemCompactionIntervalSeconds = 15 [default = 60];
+    optional uint64 RestoreReadBufferSizeLimit = 16 [default = 268435456]; // 256 MB
 }
 
 message TSchemeShardConfig {
@@ -1489,6 +1510,12 @@ message TCompactionConfig {
     optional TBorrowedCompactionConfig BorrowedCompactionConfig = 2;
 }
 
+message TTracingConfig {
+    optional string Host = 1;
+    optional uint32 Port = 2;
+    optional string RootCA = 3;
+}
+
 // This message is used to upload custom service configs
 // to CMS. Config name is used to identify owner and
 // data format.
@@ -1560,6 +1587,7 @@ message TAppConfig {
     optional TCompactionConfig CompactionConfig = 52;
     optional THttpProxyConfig HttpProxyConfig = 53;
     optional TSchemeShardConfig SchemeShardConfig = 54;
+    optional TTracingConfig TracingConfig = 55;
 
     repeated TNamedConfig NamedConfigs = 100;
     optional string ClusterYamlConfig = 101;

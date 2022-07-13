@@ -5,7 +5,6 @@
 #include <ydb/core/blobstorage/vdisk/common/vdisk_events.h>
 
 #include <ydb/core/blobstorage/lwtrace_probes/blobstorage_probes.h>
-#include <ydb/core/blobstorage/base/wilson_events.h>
 
 #include <util/generic/ymath.h>
 #include <util/system/datetime.h>
@@ -46,9 +45,10 @@ class TBlobStorageGroupPutRequest : public TBlobStorageGroupRequestActor<TBlobSt
         NWilson::TTraceId TraceId;
         NLWTrace::TOrbit Orbit;
         bool Replied = false;
+        std::vector<std::pair<ui64, ui32>> ExtraBlockChecks;
 
         TMultiPutItemInfo(TLogoBlobID id, const TString& buffer, TActorId recipient, ui64 cookie,
-                NWilson::TTraceId traceId, NLWTrace::TOrbit &&orbit)
+                NWilson::TTraceId traceId, NLWTrace::TOrbit &&orbit, std::vector<std::pair<ui64, ui32>> extraBlockChecks)
             : BlobId(id)
             , Buffer(buffer)
             , BufferSize(buffer.size())
@@ -56,6 +56,7 @@ class TBlobStorageGroupPutRequest : public TBlobStorageGroupRequestActor<TBlobSt
             , Cookie(cookie)
             , TraceId(std::move(traceId))
             , Orbit(std::move(orbit))
+            , ExtraBlockChecks(std::move(extraBlockChecks))
         {}
     };
 
@@ -92,6 +93,8 @@ class TBlobStorageGroupPutRequest : public TBlobStorageGroupRequestActor<TBlobSt
     bool IsAccelerateScheduled;
 
     const bool IsMultiPutMode;
+
+    bool RequireExtraBlockChecks = false;
 
     void SanityCheck() {
         if (RequestsSent <= MaxSaneRequests) {
@@ -142,8 +145,6 @@ class TBlobStorageGroupPutRequest : public TBlobStorageGroupRequestActor<TBlobSt
             "BPP01", "received " << ev->Get()->ToString() << " from# " << VDiskIDFromVDiskID(ev->Get()->Record.GetVDiskID()));
 
         ProcessReplyFromQueue(ev);
-        // generate wilson event about request completion
-        WILSON_TRACE_FROM_ACTOR(*TlsActivationContext, *this, &TraceId, EvVPutResultReceived, MergedNode = std::move(ev->TraceId));
         ResponsesReceived++;
 
         const ui64 cyclesPerUs = NHPTimer::GetCyclesPerSecond() / 1000000;
@@ -220,8 +221,6 @@ class TBlobStorageGroupPutRequest : public TBlobStorageGroupRequestActor<TBlobSt
 
     void Handle(TEvBlobStorage::TEvVMultiPutResult::TPtr &ev) {
         ProcessReplyFromQueue(ev);
-        // generate wilson event about request completion
-        WILSON_TRACE_FROM_ACTOR(*TlsActivationContext, *this, &TraceId, EvVPutResultReceived, MergedNode = std::move(ev->TraceId));
         ResponsesReceived++;
 
         const ui64 cyclesPerUs = NHPTimer::GetCyclesPerSecond() / 1000000;
@@ -363,7 +362,6 @@ class TBlobStorageGroupPutRequest : public TBlobStorageGroupRequestActor<TBlobSt
         const TDuration duration = TActivationContext::Now() - StartTime;
         TLogoBlobID blobId = putResult->Id;
         TLogoBlobID origBlobId = TLogoBlobID(blobId, 0);
-        WILSON_TRACE_FROM_ACTOR(*TlsActivationContext, *this, &ItemsInfo[blobIdx].TraceId, EvPutResultSent, ReplyStatus = status);
         Mon->CountPutPesponseTime(Info->GetDeviceType(), HandleClass, ItemsInfo[blobIdx].BufferSize, duration);
         *Mon->ActivePutCapacity -= ReportedBytes;
         Y_VERIFY(PutImpl.GetHandoffPartsSent() <= Info->Type.TotalPartCount() * MaxHandoffNodes * ItemsInfo.size());
@@ -384,8 +382,7 @@ class TBlobStorageGroupPutRequest : public TBlobStorageGroupRequestActor<TBlobSt
             SendResponse(std::move(putResult), TimeStatsEnabled ? &TimeStats : nullptr);
         } else {
             SendResponse(std::move(putResult), TimeStatsEnabled ? &TimeStats : nullptr,
-                ItemsInfo[blobIdx].Recipient, ItemsInfo[blobIdx].Cookie,
-                std::move(ItemsInfo[blobIdx].TraceId));
+                ItemsInfo[blobIdx].Recipient, ItemsInfo[blobIdx].Cookie); // FIXME about traces
             ItemsInfo[blobIdx].Replied = true;
         }
     }
@@ -452,7 +449,7 @@ public:
             bool enableRequestMod3x3ForMinLatecy)
         : TBlobStorageGroupRequestActor(info, state, mon, source, cookie, std::move(traceId),
                 NKikimrServices::BS_PROXY_PUT, false, latencyQueueKind, now, storagePoolCounters,
-                ev->RestartCounter)
+                ev->RestartCounter, "DSProxy.Put")
         , PutImpl(info, state, ev, mon, enableRequestMod3x3ForMinLatecy)
         , WaitingVDiskResponseCount(info->GetTotalVDisksNum())
         , Deadline(ev->Deadline)
@@ -465,11 +462,13 @@ public:
         , IsAccelerated(false)
         , IsAccelerateScheduled(false)
         , IsMultiPutMode(false)
+        , RequireExtraBlockChecks(!ev->ExtraBlockChecks.empty())
     {
         if (ev->Orbit.HasShuttles()) {
             RootCauseTrack.IsOn = true;
         }
-        ItemsInfo.emplace_back(ev->Id, ev->Buffer, source, cookie, NWilson::TTraceId(), std::move(ev->Orbit));
+        ItemsInfo.emplace_back(ev->Id, ev->Buffer, source, cookie, NWilson::TTraceId(), std::move(ev->Orbit),
+            std::move(ev->ExtraBlockChecks));
         LWPROBE(DSProxyBlobPutTactics, ItemsInfo[0].BlobId.TabletID(), Info->GroupID, ItemsInfo[0].BlobId.ToString(),
                 Tactic, NKikimrBlobStorage::EPutHandleClass_Name(HandleClass));
         ReportBytes(ItemsInfo[0].Buffer.capacity() + sizeof(*this));
@@ -497,7 +496,7 @@ public:
             bool enableRequestMod3x3ForMinLatecy)
         : TBlobStorageGroupRequestActor(info, state, mon, TActorId(), 0, NWilson::TTraceId(),
                 NKikimrServices::BS_PROXY_PUT, false, latencyQueueKind, now, storagePoolCounters,
-                MaxRestartCounter(events))
+                MaxRestartCounter(events), "DSProxy.Put")
         , PutImpl(info, state, events, mon, handleClass, tactic, enableRequestMod3x3ForMinLatecy)
         , WaitingVDiskResponseCount(info->GetTotalVDisksNum())
         , IsManyPuts(true)
@@ -514,17 +513,22 @@ public:
     {
         Y_VERIFY_DEBUG(events.size() <= MaxBatchedPutRequests);
         for (auto &ev : events) {
-            Deadline = Max(Deadline, ev->Get()->Deadline);
-            if (ev->Get()->Orbit.HasShuttles()) {
+            auto& msg = *ev->Get();
+            Deadline = Max(Deadline, msg.Deadline);
+            if (msg.Orbit.HasShuttles()) {
                 RootCauseTrack.IsOn = true;
             }
+            if (!msg.ExtraBlockChecks.empty()) {
+                RequireExtraBlockChecks = true;
+            }
             ItemsInfo.emplace_back(
-                ev->Get()->Id,
-                ev->Get()->Buffer,
+                msg.Id,
+                msg.Buffer,
                 ev->Sender,
                 ev->Cookie,
                 std::move(ev->TraceId),
-                std::move(ev->Get()->Orbit)
+                std::move(msg.Orbit),
+                std::move(msg.ExtraBlockChecks)
             );
             LWPROBE(DSProxyBlobPutTactics, ItemsInfo.back().BlobId.TabletID(), Info->GroupID,
                     ItemsInfo.back().BlobId.ToString(), Tactic, NKikimrBlobStorage::EPutHandleClass_Name(HandleClass));
@@ -563,10 +567,6 @@ public:
         Become(&TThis::StateWait);
 
         Timer.Reset();
-
-        // TODO: how correct rewrite this?
-        WILSON_TRACE_FROM_ACTOR(*TlsActivationContext, *this, &TraceId, EvPutReceived, Size = RequestBytes,
-                LogoBlobId = ItemsInfo[0].BlobId);
 
         double wilsonSec = Timer.PassedReset();
 

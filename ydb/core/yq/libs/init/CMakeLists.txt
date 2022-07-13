@@ -29,6 +29,7 @@ target_link_libraries(yq-libs-init PUBLIC
   yq-libs-gateway
   yq-libs-health
   yq-libs-quota_manager
+  libs-rate_limiter-control_plane_service
   yq-libs-shared_resources
   yq-libs-test_connection
   ydb-library-folder_service
@@ -48,7 +49,7 @@ target_link_libraries(yq-libs-init PUBLIC
   providers-dq-worker_manager
   dq-worker_manager-interface
   providers-pq-async_io
-  pq-cm_client-interface
+  providers-pq-cm_client
   pq-gateway-native
   providers-pq-provider
   providers-s3-actors

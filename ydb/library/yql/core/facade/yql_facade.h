@@ -61,7 +61,8 @@ public:
     TProgramPtr Create(
             const TString& filename,
             const TString& sourceCode,
-            const TString& sessionId = TString());
+            const TString& sessionId = TString(),
+            EHiddenMode hiddenMode = EHiddenMode::Disable);
 
     void UnrepeatableRandom();
 private:
@@ -218,7 +219,7 @@ public:
 
     TMaybe<TString> GetTasksInfo();
 
-    TMaybe<TString> GetStatistics(bool totalOnly = false);
+    TMaybe<TString> GetStatistics(bool totalOnly = false, THashMap<TString, TStringBuf> extraYsons = {});
 
     TMaybe<TString> GetDiscoveredData();
 
@@ -293,6 +294,10 @@ public:
 
     IPlanBuilder& GetPlanBuilder();
 
+    void SetBeforeFallback(std::function<void()>&& func) {
+        BeforeFallback = std::move(func);
+    }
+
 private:
     TProgram(
         const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
@@ -313,7 +318,8 @@ private:
         const TString& sourceCode,
         const TString& sessionId,
         const TString& runner,
-        bool enableRangeComputeFor);
+        bool enableRangeComputeFor,
+        EHiddenMode hiddenMode);
 
     TTypeAnnotationContextPtr BuildTypeAnnotationContext(const TString& username);
     TTypeAnnotationContextPtr GetAnnotationContext() const;
@@ -387,6 +393,8 @@ private:
     TString ExtractedQueryParametersMetadataYson_;
     const bool EnableRangeComputeFor_;
     i64 FallbackCounter = 0;
+    std::function<void()> BeforeFallback = [](){};
+    const EHiddenMode HiddenMode_ = EHiddenMode::Disable;
 };
 
 } // namspace NYql

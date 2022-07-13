@@ -22,7 +22,7 @@ namespace NKikimr::NBsController {
 
         // determine storage pool that will contain newly created virtual group
         TBoxStoragePoolId storagePoolId;
-        auto& pools = StoragePools.Get();
+        auto& pools = StoragePools.Unshare();
         switch (cmd.GetStoragePoolCase()) {
             case NKikimrBlobStorage::TAllocateVirtualGroup::kStoragePoolName: {
                 ui32 found = 0;
@@ -62,10 +62,22 @@ namespace NKikimr::NBsController {
             pool.EncryptionMode.GetOrElse(TBlobStorageGroupInfo::EEM_NONE), TBlobStorageGroupInfo::ELCP_INITIAL,
             TString(), TString(), 0u, 0u, false, false, storagePoolId, 0u, 0u, 0u);
 
+        // bind group to storage pool
+        ++pool.NumGroups;
+        StoragePoolGroups.Unshare().emplace(storagePoolId, group->ID);
+
         group->VirtualGroupPool = id;
         group->VirtualGroupState = NKikimrBlobStorage::EVirtualGroupState::CREATED;
         group->ParentDir = cmd.GetParentDir();
         group->Name = TStringBuilder() << "vgroup" << groupId.GetRaw();
+
+        if (cmd.GetBlobDepotId()) {
+            group->VirtualGroupState = NKikimrBlobStorage::EVirtualGroupState::WORKING;
+            group->BlobDepotId = cmd.GetBlobDepotId();
+            group->SeenOperational = true;
+        }
+
+        group->CalculateGroupStatus();
 
         NKikimrBlobDepot::TBlobDepotConfig config;
         config.SetOperationMode(NKikimrBlobDepot::EOperationMode::VirtualGroup);
@@ -124,6 +136,9 @@ namespace NKikimr::NBsController {
                 PARAM(BlobDepotId)
                 PARAM(ErrorReason)
 #undef PARAM
+                if (group->SeenOperational) {
+                    row.Update<T::SeenOperational>(true);
+                }
                 return true;
             }
 
@@ -227,6 +242,7 @@ namespace NKikimr::NBsController {
                 group->VirtualGroupState = NKikimrBlobStorage::EVirtualGroupState::CREATE_FAILED;
                 group->ErrorReason = record.GetSchemeShardReason();
             }
+            group->CalculateGroupStatus();
 
             Self->Execute(new TTxUpdateGroup(this));
         }
@@ -285,6 +301,8 @@ namespace NKikimr::NBsController {
             const auto& desc = record.GetPathDescription().GetBlobDepotDescription();
             group->VirtualGroupState = NKikimrBlobStorage::EVirtualGroupState::WORKING;
             group->BlobDepotId = desc.GetTabletId();
+            group->SeenOperational = true;
+            group->CalculateGroupStatus();
             Y_VERIFY(*group->BlobDepotId);
 
             Self->Execute(new TTxUpdateGroup(this));

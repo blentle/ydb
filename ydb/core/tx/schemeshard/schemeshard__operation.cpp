@@ -525,7 +525,7 @@ TOperation::TConsumeQuotaResult TOperation::ConsumeQuota(const TTxTransaction& t
         return result;
     }
 
-    auto domainId = path.DomainId();
+    auto domainPathId = path.GetPathIdForDomain();
     auto domainInfo = path.DomainInfo();
     if (!domainInfo->TryConsumeSchemeQuota(context.Ctx.Now())) {
         result.Status = NKikimrScheme::StatusQuotaExceeded;
@@ -534,7 +534,7 @@ TOperation::TConsumeQuotaResult TOperation::ConsumeQuota(const TTxTransaction& t
 
     // Even if operation fails later we want to persist updated/consumed quotas
     NIceDb::TNiceDb db(context.GetTxc().DB); // write quotas directly in db even if operation fails
-    context.SS->PersistSubDomainSchemeQuotas(db, domainId, *domainInfo);
+    context.SS->PersistSubDomainSchemeQuotas(db, domainPathId, *domainInfo);
     return result;
 }
 
@@ -799,12 +799,12 @@ ISubOperationBase::TPtr TOperation::RestorePart(TTxState::ETxType txType, TTxSta
             return CreateAlterOlapStore(NextPartId(), txState);
         case TTxState::ETxType::TxDropOlapStore:
             return CreateDropOlapStore(NextPartId(), txState);
-        case TTxState::ETxType::TxCreateOlapTable:
-            return CreateNewOlapTable(NextPartId(), txState);
-        case TTxState::ETxType::TxAlterOlapTable:
-            return CreateAlterOlapTable(NextPartId(), txState);
-        case TTxState::ETxType::TxDropOlapTable:
-            return CreateDropOlapTable(NextPartId(), txState);
+        case TTxState::ETxType::TxCreateColumnTable:
+            return CreateNewColumnTable(NextPartId(), txState);
+        case TTxState::ETxType::TxAlterColumnTable:
+            return CreateAlterColumnTable(NextPartId(), txState);
+        case TTxState::ETxType::TxDropColumnTable:
+            return CreateDropColumnTable(NextPartId(), txState);
         case TTxState::ETxType::TxCreatePQGroup:
             return CreateNewPQ(NextPartId(), txState);
         case TTxState::ETxType::TxAlterPQGroup:
@@ -845,6 +845,8 @@ ISubOperationBase::TPtr TOperation::RestorePart(TTxState::ETxType txType, TTxSta
             return CreateFinalizeBuildIndexMainTable(NextPartId(), txState);
         case TTxState::ETxType::TxDropTableIndexAtMainTable:
             return CreateDropTableIndexAtMainTable(NextPartId(), txState);
+        case TTxState::ETxType::TxUpdateMainTableOnIndexMove:
+            return CreateUpdateMainTableOnIndexMove(NextPartId(), txState);
         case TTxState::ETxType::TxCreateLockForIndexBuild:
             return CreateLockForIndexBuild(NextPartId(), txState);
         case TTxState::ETxType::TxDropLock:
@@ -966,11 +968,11 @@ ISubOperationBase::TPtr TOperation::ConstructPart(NKikimrSchemeOp::EOperationTyp
     case NKikimrSchemeOp::EOperationType::ESchemeOpDropColumnStore:
         return CreateDropOlapStore(NextPartId(), tx);
     case NKikimrSchemeOp::EOperationType::ESchemeOpCreateColumnTable:
-        return CreateNewOlapTable(NextPartId(), tx);
+        return CreateNewColumnTable(NextPartId(), tx);
     case NKikimrSchemeOp::EOperationType::ESchemeOpAlterColumnTable:
-        return CreateAlterOlapTable(NextPartId(), tx);
+        return CreateAlterColumnTable(NextPartId(), tx);
     case NKikimrSchemeOp::EOperationType::ESchemeOpDropColumnTable:
-        return CreateDropOlapTable(NextPartId(), tx);
+        return CreateDropColumnTable(NextPartId(), tx);
     case NKikimrSchemeOp::EOperationType::ESchemeOpCreatePersQueueGroup:
         return CreateNewPQ(NextPartId(), tx);
     case NKikimrSchemeOp::EOperationType::ESchemeOpAlterPersQueueGroup:
@@ -1090,6 +1092,8 @@ ISubOperationBase::TPtr TOperation::ConstructPart(NKikimrSchemeOp::EOperationTyp
         return CreateMoveTable(NextPartId(), tx);
     case NKikimrSchemeOp::EOperationType::ESchemeOpMoveTableIndex:
         return CreateMoveTableIndex(NextPartId(), tx);
+    case NKikimrSchemeOp::EOperationType::ESchemeOpMoveIndex:
+        Y_FAIL("imposible");
 
     // Replication
     case NKikimrSchemeOp::EOperationType::ESchemeOpCreateReplication:
@@ -1148,6 +1152,8 @@ TVector<ISubOperationBase::TPtr> TOperation::ConstructParts(const TTxTransaction
         return CreateConsistentMoveTable(NextPartId(), tx, context);
     case NKikimrSchemeOp::EOperationType::ESchemeOpAlterTable:
         return CreateConsistentAlterTable(NextPartId(), tx, context);
+    case NKikimrSchemeOp::EOperationType::ESchemeOpMoveIndex:
+        return CreateConsistentMoveIndex(NextPartId(), tx, context);
 
     default:
         return {ConstructPart(opType, tx)};

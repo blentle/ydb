@@ -34,10 +34,10 @@ struct TSchemeCacheConfig : public TThrRefBase {
     };
 
     TSchemeCacheConfig() = default;
-    explicit TSchemeCacheConfig(const TAppData* appData, NMonitoring::TDynamicCounterPtr counters);
+    explicit TSchemeCacheConfig(const TAppData* appData, ::NMonitoring::TDynamicCounterPtr counters);
 
     TVector<TTagEntry> Roots;
-    NMonitoring::TDynamicCounterPtr Counters;
+    ::NMonitoring::TDynamicCounterPtr Counters;
 };
 
 struct TDomainInfo : public TAtomicRefCount<TDomainInfo> {
@@ -120,7 +120,7 @@ struct TSchemeCacheNavigate {
         KindExtSubdomain = 9,
         KindIndex = 10,
         KindOlapStore = 11,
-        KindOlapTable = 12,
+        KindColumnTable = 12,
         KindCdcStream = 13,
         KindSequence = 14,
         KindReplication = 15,
@@ -180,7 +180,7 @@ struct TSchemeCacheNavigate {
         NKikimrSchemeOp::TColumnStoreDescription Description;
     };
 
-    struct TOlapTableInfo : public TAtomicRefCount<TOlapTableInfo> {
+    struct TColumnTableInfo : public TAtomicRefCount<TColumnTableInfo> {
         EKind Kind = KindUnknown;
         NKikimrSchemeOp::TColumnTableDescription Description;
         TTableId OlapStoreId;
@@ -247,7 +247,7 @@ struct TSchemeCacheNavigate {
         TIntrusiveConstPtr<TKesusInfo> KesusInfo;
         TIntrusiveConstPtr<TSolomonVolumeInfo> SolomonVolumeInfo;
         TIntrusiveConstPtr<TOlapStoreInfo> OlapStoreInfo;
-        TIntrusiveConstPtr<TOlapTableInfo> OlapTableInfo;
+        TIntrusiveConstPtr<TColumnTableInfo> ColumnTableInfo;
         TIntrusiveConstPtr<TCdcStreamInfo> CdcStreamInfo;
         TIntrusiveConstPtr<TSequenceInfo> SequenceInfo;
         TIntrusiveConstPtr<TReplicationInfo> ReplicationInfo;
@@ -345,6 +345,7 @@ struct TSchemeCacheRequestContext : TAtomicRefCount<TSchemeCacheRequestContext>,
     ui64 WaitCounter;
     TAutoPtr<TSchemeCacheRequest> Request;
     const TInstant CreatedAt;
+    TIntrusivePtr<TDomainInfo> ResolvedDomainInfo; // resolved from DatabaseName
 
     TSchemeCacheRequestContext(const TActorId& sender, TAutoPtr<TSchemeCacheRequest> request, const TInstant& now = TInstant::Now())
         : Sender(sender)
@@ -359,6 +360,7 @@ struct TSchemeCacheNavigateContext : TAtomicRefCount<TSchemeCacheNavigateContext
     ui64 WaitCounter;
     TAutoPtr<TSchemeCacheNavigate> Request;
     const TInstant CreatedAt;
+    TIntrusivePtr<TDomainInfo> ResolvedDomainInfo; // resolved from DatabaseName
 
     TSchemeCacheNavigateContext(const TActorId& sender, TAutoPtr<TSchemeCacheNavigate> request, const TInstant& now = TInstant::Now())
         : Sender(sender)

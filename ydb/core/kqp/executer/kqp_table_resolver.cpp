@@ -81,8 +81,8 @@ private:
                 return;
             }
 
-            if (entry.Kind == NSchemeCache::TSchemeCacheNavigate::KindOlapTable) {
-                YQL_ENSURE(entry.OlapTableInfo || entry.OlapStoreInfo);
+            if (entry.Kind == NSchemeCache::TSchemeCacheNavigate::KindColumnTable) {
+                YQL_ENSURE(entry.ColumnTableInfo || entry.OlapStoreInfo);
                 // NOTE: entry.SysViewInfo might not be empty for OLAP stats virtual tables
                 table->TableKind = ETableKind::Olap;
             } else if (entry.TableId.IsSystemView()) {
@@ -196,7 +196,7 @@ private:
                 return;
             }
 
-            for (auto& partition : entry.KeyDescription->Partitions) {
+            for (auto& partition : entry.KeyDescription->GetPartitions()) {
                 YQL_ENSURE(partition.Range);
             }
 
@@ -229,6 +229,16 @@ private:
                     auto& table = TableKeys.GetOrAddTable(MakeTableId(op.GetTable()), op.GetTable().GetPath());
                     for (auto& column : op.GetColumns()) {
                         table.Columns.emplace(column.GetName(), TKqpTableKeys::TColumn());
+                    }
+                }
+
+                for (const auto& input : stage.GetInputs()) {
+                    if (input.GetTypeCase() == NKqpProto::TKqpPhyConnection::kStreamLookup) {
+                        const auto& streamLookup = input.GetStreamLookup();
+                        auto& table = TableKeys.GetOrAddTable(MakeTableId(streamLookup.GetTable()), streamLookup.GetTable().GetPath());
+                        for (auto& column : input.GetStreamLookup().GetColumns()) {
+                            table.Columns.emplace(column, TKqpTableKeys::TColumn());
+                        }
                     }
                 }
             }

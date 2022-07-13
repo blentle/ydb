@@ -27,7 +27,7 @@ service TopicService {
     //        <----------------
     //         [something went wrong] (status != SUCCESS, issues not empty)
     //        <----------------
-    rpc StreamWrite(stream StreamWriteClientMessage) returns (stream StreamWriteServerMessage);
+    rpc StreamWrite(stream StreamWriteMessage.FromClient) returns (stream StreamWriteMessage.FromServer);
 
 
     // Create Read Session
@@ -45,11 +45,13 @@ service TopicService {
     //        <----------------
     //         StartPartitionSessionRequest(Topic2, Partition2, PartitionSessionID2, ...)
     //        <----------------
-    //         StartPartitionSessionResponse(PartitionSessionID1, ...) - client must respond with this message to actually start recieving data messages from this partition
+    //         StartPartitionSessionResponse(PartitionSessionID1, ...)
+    //             client must respond with this message to actually start recieving data messages from this partition
     //        ---------------->
     //         StopPartitionSessionRequest(PartitionSessionID1, ...)
     //        <----------------
-    //         StopPartitionSessionResponse(PartitionSessionID1, ...) - only after this response server will give this parittion to other session.
+    //         StopPartitionSessionResponse(PartitionSessionID1, ...)
+    //             only after this response server will give this parittion to other session.
     //        ---------------->
     //         StartPartitionSessionResponse(PartitionSession2, ...)
     //        ---------------->
@@ -61,29 +63,21 @@ service TopicService {
     //        <----------------
     //         [something went wrong] (status != SUCCESS, issues not empty)
     //        <----------------
-    rpc StreamRead(stream StreamReadClientMessage) returns (stream StreamReadServerMessage);
-
-
-    // Describe topic command.
-    rpc DescribeTopic(DescribeTopicRequest) returns (DescribeTopicResponse);
-
-
-    // Drop topic command.
-    rpc DropTopic(DropTopicRequest) returns (DropTopicResponse);
+    rpc StreamRead(stream StreamReadMessage.FromClient) returns (stream StreamReadMessage.FromServer);
 
 
     // Create topic command.
     rpc CreateTopic(CreateTopicRequest) returns (CreateTopicResponse);
 
 
+    // Describe topic command.
+    rpc DescribeTopic(DescribeTopicRequest) returns (DescribeTopicResponse);
+
+
     // Alter topic command.
     rpc AlterTopic(AlterTopicRequest) returns (AlterTopicResponse);
 
 
-    // Add consumer command.
-    rpc AddConsumer(AddConsumerRequest) returns (AddConsumerResponse);
-
-
-    // Remove consumer command.
-    rpc RemoveConsumer(RemoveConsumerRequest) returns (RemoveConsumerResponse);
+    // Drop topic command.
+    rpc DropTopic(DropTopicRequest) returns (DropTopicResponse);
 }

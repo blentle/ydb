@@ -236,7 +236,7 @@ private:
         }
 
         NActors::IActor* actor;
-        std::tie(Actor, actor) = TaskRunnerActorFactory->Create(this, TraceId);
+        std::tie(Actor, actor) = TaskRunnerActorFactory->Create(this, TraceId, Task.GetId());
         TaskRunnerActor = RegisterLocalChild(actor);
         TDqTaskRunnerMemoryLimits limits; // used for local mode only
         limits.ChannelBufferSize = 20_MB;
@@ -678,6 +678,10 @@ private:
     void OnAsyncOutputError(ui64 outputIndex, const TIssues& issues, bool isFatal) override {
         Y_UNUSED(outputIndex);
         SendFailure(MakeHolder<TEvDqFailure>(isFatal ? NYql::NDqProto::StatusIds::UNSPECIFIED : NYql::NDqProto::StatusIds::INTERNAL_ERROR, issues.ToString()));
+    }
+
+    void OnAsyncOutputFinished(ui64 outputIndex) override {
+        Y_UNUSED(outputIndex);
     }
 
     void OnAsyncOutputStateSaved(NDqProto::TSinkState&& state, ui64 outputIndex, const NDqProto::TCheckpoint& checkpoint) override {

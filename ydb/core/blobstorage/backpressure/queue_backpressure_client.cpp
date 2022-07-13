@@ -30,12 +30,13 @@ class TVDiskBackpressureClientActor : public TActorBootstrapped<TVDiskBackpressu
     TBSProxyContextPtr BSProxyCtx;
     TString LogPrefix;
     const TString QueueName;
-    const NMonitoring::TDynamicCounterPtr Counters;
+    const ::NMonitoring::TDynamicCounterPtr Counters;
     TBlobStorageQueue Queue;
     TActorId BlobStorageProxy;
     const TVDiskIdShort VDiskIdShort;
     TActorId RemoteVDisk;
     TVDiskID VDiskId;
+    ui32 VDiskOrderNumber;
     NKikimrBlobStorage::EVDiskQueueId QueueId;
     const TDuration QueueWatchdogTimeout;
     ui64 CheckReadinessCookie = 1;
@@ -65,13 +66,15 @@ class TVDiskBackpressureClientActor : public TActorBootstrapped<TVDiskBackpressu
         return "<unknown>";
     }
 
+    bool ExtraBlockChecksSupport = false;
+
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
         return NKikimrServices::TActivity::BS_QUEUE_ACTOR;
     }
 
     TVDiskBackpressureClientActor(const TIntrusivePtr<TBlobStorageGroupInfo>& info, TVDiskIdShort vdiskId,
-            NKikimrBlobStorage::EVDiskQueueId queueId,const TIntrusivePtr<NMonitoring::TDynamicCounters>& counters,
+            NKikimrBlobStorage::EVDiskQueueId queueId,const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters,
             const TBSProxyContextPtr& bspctx, const NBackpressure::TQueueClientId& clientId, const TString& queueName,
             ui32 interconnectChannel, bool /*local*/, TDuration watchdogTimeout,
             TIntrusivePtr<NBackpressure::TFlowRecord> &flowRecord, NMonitoring::TCountableBase::EVisibility visibility)
@@ -108,6 +111,7 @@ private:
         Y_VERIFY(info.Type.GetErasure() == GType.GetErasure());
         VDiskId = info.CreateVDiskID(VDiskIdShort);
         RemoteVDisk = info.GetActorId(VDiskIdShort);
+        VDiskOrderNumber = info.GetOrderNumber(VDiskIdShort);
         LogPrefix = Sprintf("[%s TargetVDisk# %s Queue# %s]", SelfId().ToString().data(), VDiskId.ToString().data(), QueueName.data());
         RecentGroup = info.Group;
     }
@@ -123,7 +127,7 @@ private:
     void Pump(const TActorContext &ctx) {
         // if in 'Running' state, then send messages to VDisk
         if (IsReady()) {
-            Queue.SendToVDisk(ctx, RemoteVDisk, this);
+            Queue.SendToVDisk(ctx, RemoteVDisk, VDiskOrderNumber);
         }
     }
 
@@ -197,11 +201,7 @@ private:
             << " cookie# " << ev->Cookie);
 
         if (IsReady()) {
-            // trace wilson event if tracing is enabled for this request
-            WILSON_TRACE_FROM_ACTOR(ctx, *this, &ev->TraceId, EvBlobStorageQueuePut,
-                InQueueWaitingItems = Queue.GetItemsWaiting(), InQueueWaitingBytes = Queue.GetBytesWaiting());
-
-            Queue.Enqueue(ctx, ev, deadline, RemoteVDisk.NodeId() == SelfId().NodeId());
+            Queue.Enqueue(ctx, ev, deadline, RemoteVDisk.NodeId() == SelfId().NodeId(), TActivationContext::Now());
             Pump(ctx);
             UpdateRequestTrackingStats(ctx);
         } else {
@@ -455,7 +455,7 @@ private:
             case EState::READY:
                 QLOG_NOTICE_S("BSQ96", "connection lost status# " << NKikimrProto::EReplyStatus_Name(status)
                     << " errorReason# " << errorReason << " timeout# " << timeout);
-                ctx.Send(BlobStorageProxy, new TEvProxyQueueState(VDiskId, QueueId, false));
+                ctx.Send(BlobStorageProxy, new TEvProxyQueueState(VDiskId, QueueId, false, false));
                 Queue.DrainQueue(status, TStringBuilder() << "BS_QUEUE: " << errorReason, ctx);
                 DrainStatus(status, ctx);
                 break;
@@ -553,7 +553,8 @@ private:
 
         const auto& record = ev->Get()->Record;
         if (record.GetStatus() != NKikimrProto::NOTREADY) {
-            ctx.Send(BlobStorageProxy, new TEvProxyQueueState(VDiskId, QueueId, true));
+            ExtraBlockChecksSupport = record.GetExtraBlockChecksSupport();
+            ctx.Send(BlobStorageProxy, new TEvProxyQueueState(VDiskId, QueueId, true, ExtraBlockChecksSupport));
             if (record.HasExpectedMsgId()) {
                 Queue.SetMessageId(NBackpressure::TMessageId(record.GetExpectedMsgId()));
             }
@@ -760,7 +761,7 @@ private:
             << " RemoteVDisk# " << RemoteVDisk
             << " VDiskId# " << VDiskId
             << " IsConnected# " << isConnected);
-        ctx.Send(ev->Sender, new TEvProxyQueueState(VDiskId, QueueId, isConnected));
+        ctx.Send(ev->Sender, new TEvProxyQueueState(VDiskId, QueueId, isConnected, isConnected && ExtraBlockChecksSupport));
     }
 
 #define QueueRequestHFunc(TEvType) \
@@ -835,7 +836,7 @@ private:
     XX(TEvents::TSystem::Poison, Poison) \
     // END
 
-#define XX(EVENT, NAME) NMonitoring::TDynamicCounters::TCounterPtr EventCounter##NAME;
+#define XX(EVENT, NAME) ::NMonitoring::TDynamicCounters::TCounterPtr EventCounter##NAME;
     DEFINE_EVENTS(XX)
 #undef XX
 
@@ -925,7 +926,7 @@ namespace NKikimr {
 // QUEUE CREATOR
 ////////////////////////////////////////////////////////////////////////////
 IActor* CreateVDiskBackpressureClient(const TIntrusivePtr<TBlobStorageGroupInfo>& info, TVDiskIdShort vdiskId,
-        NKikimrBlobStorage::EVDiskQueueId queueId,const TIntrusivePtr<NMonitoring::TDynamicCounters>& counters,
+        NKikimrBlobStorage::EVDiskQueueId queueId,const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters,
         const TBSProxyContextPtr& bspctx, const NBackpressure::TQueueClientId& clientId, const TString& queueName,
         ui32 interconnectChannel, bool local, TDuration watchdogTimeout,
         TIntrusivePtr<NBackpressure::TFlowRecord> &flowRecord, NMonitoring::TCountableBase::EVisibility visibility) {

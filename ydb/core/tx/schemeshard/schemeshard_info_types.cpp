@@ -1288,12 +1288,16 @@ void TTableInfo::SetPartitioning(TVector<TTableShardInfo>&& newPartitioning) {
     }
 }
 
-void TTableInfo::UpdateShardStats(TShardIdx datashardIdx, TPartitionStats& newStats) {
+void TTableInfo::UpdateShardStats(TShardIdx datashardIdx, const TPartitionStats& newStats) {
+    Stats.UpdateShardStats(datashardIdx, newStats);
+}
+
+void TAggregatedStats::UpdateShardStats(TShardIdx datashardIdx, const TPartitionStats& newStats) {
     // Ignore stats from unknown datashard (it could have been split)
-    if (!Stats.PartitionStats.contains(datashardIdx))
+    if (!PartitionStats.contains(datashardIdx))
         return;
 
-    TPartitionStats& oldStats = Stats.PartitionStats[datashardIdx];
+    TPartitionStats& oldStats = PartitionStats[datashardIdx];
 
     if (newStats.SeqNo <= oldStats.SeqNo) {
         // Ignore outdated message
@@ -1313,46 +1317,47 @@ void TTableInfo::UpdateShardStats(TShardIdx datashardIdx, TPartitionStats& newSt
         oldStats.RangeReadRows = 0;
     }
 
-    Stats.Aggregated.RowCount += (newStats.RowCount - oldStats.RowCount);
-    Stats.Aggregated.DataSize += (newStats.DataSize - oldStats.DataSize);
-    Stats.Aggregated.IndexSize += (newStats.IndexSize - oldStats.IndexSize);
-    Stats.Aggregated.LastAccessTime = Max(Stats.Aggregated.LastAccessTime, newStats.LastAccessTime);
-    Stats.Aggregated.LastUpdateTime = Max(Stats.Aggregated.LastUpdateTime, newStats.LastUpdateTime);
-    Stats.Aggregated.ImmediateTxCompleted += (newStats.ImmediateTxCompleted - oldStats.ImmediateTxCompleted);
-    Stats.Aggregated.PlannedTxCompleted += (newStats.PlannedTxCompleted - oldStats.PlannedTxCompleted);
-    Stats.Aggregated.TxRejectedByOverload += (newStats.TxRejectedByOverload - oldStats.TxRejectedByOverload);
-    Stats.Aggregated.TxRejectedBySpace += (newStats.TxRejectedBySpace - oldStats.TxRejectedBySpace);
-    Stats.Aggregated.InFlightTxCount += (newStats.InFlightTxCount - oldStats.InFlightTxCount);
+    Aggregated.RowCount += (newStats.RowCount - oldStats.RowCount);
+    Aggregated.DataSize += (newStats.DataSize - oldStats.DataSize);
+    Aggregated.IndexSize += (newStats.IndexSize - oldStats.IndexSize);
+    Aggregated.LastAccessTime = Max(Aggregated.LastAccessTime, newStats.LastAccessTime);
+    Aggregated.LastUpdateTime = Max(Aggregated.LastUpdateTime, newStats.LastUpdateTime);
+    Aggregated.ImmediateTxCompleted += (newStats.ImmediateTxCompleted - oldStats.ImmediateTxCompleted);
+    Aggregated.PlannedTxCompleted += (newStats.PlannedTxCompleted - oldStats.PlannedTxCompleted);
+    Aggregated.TxRejectedByOverload += (newStats.TxRejectedByOverload - oldStats.TxRejectedByOverload);
+    Aggregated.TxRejectedBySpace += (newStats.TxRejectedBySpace - oldStats.TxRejectedBySpace);
+    Aggregated.InFlightTxCount += (newStats.InFlightTxCount - oldStats.InFlightTxCount);
 
-    Stats.Aggregated.RowUpdates += (newStats.RowUpdates - oldStats.RowUpdates);
-    Stats.Aggregated.RowDeletes += (newStats.RowDeletes - oldStats.RowDeletes);
-    Stats.Aggregated.RowReads += (newStats.RowReads - oldStats.RowReads);
-    Stats.Aggregated.RangeReads += (newStats.RangeReads - oldStats.RangeReads);
-    Stats.Aggregated.RangeReadRows += (newStats.RangeReadRows - oldStats.RangeReadRows);
+    Aggregated.RowUpdates += (newStats.RowUpdates - oldStats.RowUpdates);
+    Aggregated.RowDeletes += (newStats.RowDeletes - oldStats.RowDeletes);
+    Aggregated.RowReads += (newStats.RowReads - oldStats.RowReads);
+    Aggregated.RangeReads += (newStats.RangeReads - oldStats.RangeReads);
+    Aggregated.RangeReadRows += (newStats.RangeReadRows - oldStats.RangeReadRows);
 
     i64 cpuUsageDelta = newStats.GetCurrentRawCpuUsage() - oldStats.GetCurrentRawCpuUsage();
-    i64 prevCpuUsage = Stats.Aggregated.GetCurrentRawCpuUsage();
+    i64 prevCpuUsage = Aggregated.GetCurrentRawCpuUsage();
     ui64 newAggregatedCpuUsage = std::max<i64>(0, prevCpuUsage + cpuUsageDelta);
     TInstant now = AppData()->TimeProvider->Now();
-    Stats.Aggregated.SetCurrentRawCpuUsage(newAggregatedCpuUsage, now);
-    Stats.Aggregated.Memory += (newStats.Memory - oldStats.Memory);
-    Stats.Aggregated.Network += (newStats.Network - oldStats.Network);
-    Stats.Aggregated.Storage += (newStats.Storage - oldStats.Storage);
-    Stats.Aggregated.ReadThroughput += (newStats.ReadThroughput - oldStats.ReadThroughput);
-    Stats.Aggregated.WriteThroughput += (newStats.WriteThroughput - oldStats.WriteThroughput);
-    Stats.Aggregated.ReadIops += (newStats.ReadIops - oldStats.ReadIops);
-    Stats.Aggregated.WriteIops += (newStats.WriteIops - oldStats.WriteIops);
+    Aggregated.SetCurrentRawCpuUsage(newAggregatedCpuUsage, now);
+    Aggregated.Memory += (newStats.Memory - oldStats.Memory);
+    Aggregated.Network += (newStats.Network - oldStats.Network);
+    Aggregated.Storage += (newStats.Storage - oldStats.Storage);
+    Aggregated.ReadThroughput += (newStats.ReadThroughput - oldStats.ReadThroughput);
+    Aggregated.WriteThroughput += (newStats.WriteThroughput - oldStats.WriteThroughput);
+    Aggregated.ReadIops += (newStats.ReadIops - oldStats.ReadIops);
+    Aggregated.WriteIops += (newStats.WriteIops - oldStats.WriteIops);
 
-    newStats.SaveCpuUsageHistory(oldStats);
+    auto topUsage = oldStats.TopUsage.Update(newStats.TopUsage);
     oldStats = newStats;
-    Stats.PartitionStatsUpdated++;
+    oldStats.TopUsage = std::move(topUsage);
+    PartitionStatsUpdated++;
 
     // Rescan stats for aggregations only once in a while
-    if (Stats.PartitionStatsUpdated >= Stats.PartitionStats.size()) {
-        Stats.PartitionStatsUpdated = 0;
-        Stats.Aggregated.TxCompleteLag = TDuration();
-        for (const auto& ps : Stats.PartitionStats) {
-            Stats.Aggregated.TxCompleteLag = Max(Stats.Aggregated.TxCompleteLag, ps.second.TxCompleteLag);
+    if (PartitionStatsUpdated >= PartitionStats.size()) {
+        PartitionStatsUpdated = 0;
+        Aggregated.TxCompleteLag = TDuration();
+        for (const auto& ps : PartitionStats) {
+            Aggregated.TxCompleteLag = Max(Aggregated.TxCompleteLag, ps.second.TxCompleteLag);
         }
     }
 }
@@ -1550,44 +1555,6 @@ bool TTableInfo::CheckCanMergePartitions(const TSplitSettings& splitSettings,
     }
 
     return shardsToMerge.size() > 1;
-}
-
-bool TTableInfo::CheckFastSplitForPartition(const TSplitSettings& splitSettings, TShardIdx shardIdx, ui64 dataSize, ui64 rowCount) const {
-    // Don't split/merge backup tables
-    if (IsBackup)
-        return false;
-
-    // Ignore stats from unknown datashard (it could have been split)
-    if (!Stats.PartitionStats.contains(shardIdx))
-        return false;
-
-    if (!Shard2PartitionIdx.contains(shardIdx))
-        return false;
-
-    const ui64 MIN_ROWS_FOR_FAST_SPLIT = 1000;
-    ui64 sizeThreshold = splitSettings.FastSplitSizeThreshold;
-    ui64 rowCountThreshold = splitSettings.FastSplitRowCountThreshold;
-    float cpuUsageThreshold = 0.01 * splitSettings.FastSplitCpuPercentageThreshold;
-
-    const auto& partitionConfig = PartitionConfig();
-
-    if (partitionConfig.GetPartitioningPolicy().HasFastSplitSettings()) {
-        const auto& settings = partitionConfig.GetPartitioningPolicy().GetFastSplitSettings();
-        sizeThreshold = settings.GetSizeThreshold();
-        rowCountThreshold = settings.GetRowCountThreshold();
-        cpuUsageThreshold = 0.01 * settings.GetCpuPercentageThreshold();
-    }
-
-    const auto& stats = *Stats.PartitionStats.FindPtr(shardIdx);
-    if ((dataSize < sizeThreshold && rowCount < rowCountThreshold) ||
-         rowCount < MIN_ROWS_FOR_FAST_SPLIT ||
-         stats.InFlightTxCount == 0 ||
-         stats.GetCurrentRawCpuUsage() < cpuUsageThreshold * 1000000)
-    {
-        return false;
-    }
-
-    return true;
 }
 
 bool TTableInfo::CheckSplitByLoad(const TSplitSettings& splitSettings, TShardIdx shardIdx, ui64 dataSize, ui64 rowCount) const {
@@ -2030,22 +1997,7 @@ TOlapStoreInfo::TOlapStoreInfo(
         preset.NextColumnId = presetProto.GetSchema().GetNextColumnId();
         preset.Version = presetProto.GetSchema().GetVersion();
     }
-#if 0
-    size_t ttlSettingsPresetIndex = 0;
-    for (const auto& presetProto : Description.GetTtlSettingsPresets()) {
-        Y_VERIFY(presetProto.HasId());
-        Y_VERIFY(presetProto.HasName());
-        Y_VERIFY(presetProto.HasTtlSettings());
-        Y_VERIFY(!TtlSettingsPresets.contains(presetProto.GetId()));
-        auto& preset = TtlSettingsPresets[presetProto.GetId()];
-        preset.Id = presetProto.GetId();
-        preset.Name = presetProto.GetName();
-        preset.ProtoIndex = ttlSettingsPresetIndex++;
-        TtlSettingsPresetByName[preset.Name] = preset.Id;
-        // TODO: parse relevant settings
-        preset.Version = presetProto.GetTtlSettings().GetVersion();
-    }
-#endif
+
     for (const auto& shardIdx : Sharding.GetColumnShards()) {
         ColumnShards.push_back(TShardIdx(
             TOwnerId(shardIdx.GetOwnerId()),
@@ -2053,7 +2005,7 @@ TOlapStoreInfo::TOlapStoreInfo(
     }
 }
 
-TOlapTableInfo::TOlapTableInfo(
+TColumnTableInfo::TColumnTableInfo(
         ui64 alterVersion,
         NKikimrSchemeOp::TColumnTableDescription&& description,
         NKikimrSchemeOp::TColumnTableSharding&& sharding,

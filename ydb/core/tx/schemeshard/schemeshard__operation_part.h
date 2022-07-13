@@ -285,6 +285,9 @@ TVector<ISubOperationBase::TPtr> CreateDropIndex(TOperationId id, const TTxTrans
 ISubOperationBase::TPtr CreateDropTableIndexAtMainTable(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateDropTableIndexAtMainTable(TOperationId id, TTxState::ETxState state);
 
+ISubOperationBase::TPtr CreateUpdateMainTableOnIndexMove(TOperationId id, const TTxTransaction& tx);
+ISubOperationBase::TPtr CreateUpdateMainTableOnIndexMove(TOperationId id, TTxState::ETxState state);
+
 /// CDC
 // Create
 TVector<ISubOperationBase::TPtr> CreateNewCdcStream(TOperationId id, const TTxTransaction& tx, TOperationContext& context);
@@ -332,12 +335,12 @@ ISubOperationBase::TPtr CreateAlterOlapStore(TOperationId id, TTxState::ETxState
 ISubOperationBase::TPtr CreateDropOlapStore(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateDropOlapStore(TOperationId id, TTxState::ETxState state);
 
-ISubOperationBase::TPtr CreateNewOlapTable(TOperationId id, const TTxTransaction& tx);
-ISubOperationBase::TPtr CreateNewOlapTable(TOperationId id, TTxState::ETxState state);
-ISubOperationBase::TPtr CreateAlterOlapTable(TOperationId id, const TTxTransaction& tx);
-ISubOperationBase::TPtr CreateAlterOlapTable(TOperationId id, TTxState::ETxState state);
-ISubOperationBase::TPtr CreateDropOlapTable(TOperationId id, const TTxTransaction& tx);
-ISubOperationBase::TPtr CreateDropOlapTable(TOperationId id, TTxState::ETxState state);
+ISubOperationBase::TPtr CreateNewColumnTable(TOperationId id, const TTxTransaction& tx);
+ISubOperationBase::TPtr CreateNewColumnTable(TOperationId id, TTxState::ETxState state);
+ISubOperationBase::TPtr CreateAlterColumnTable(TOperationId id, const TTxTransaction& tx);
+ISubOperationBase::TPtr CreateAlterColumnTable(TOperationId id, TTxState::ETxState state);
+ISubOperationBase::TPtr CreateDropColumnTable(TOperationId id, const TTxTransaction& tx);
+ISubOperationBase::TPtr CreateDropColumnTable(TOperationId id, TTxState::ETxState state);
 
 ISubOperationBase::TPtr CreateNewBSV(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateNewBSV(TOperationId id, TTxState::ETxState state);
@@ -441,9 +444,13 @@ ISubOperationBase::TPtr CreateAlterLogin(TOperationId id, const TTxTransaction& 
 ISubOperationBase::TPtr CreateAlterLogin(TOperationId id, TTxState::ETxState state);
 
 TVector<ISubOperationBase::TPtr> CreateConsistentMoveTable(TOperationId id, const TTxTransaction& tx, TOperationContext& context);
+TVector<ISubOperationBase::TPtr> CreateConsistentMoveIndex(TOperationId id, const TTxTransaction& tx, TOperationContext& context);
 
 ISubOperationBase::TPtr CreateMoveTable(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateMoveTable(TOperationId id, TTxState::ETxState state);
+
+ISubOperationBase::TPtr CreateMoveIndex(TOperationId id, const TTxTransaction& tx);
+ISubOperationBase::TPtr CreateMoveIndex(TOperationId id, TTxState::ETxState state);
 
 ISubOperationBase::TPtr CreateMoveTableIndex(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateMoveTableIndex(TOperationId id, TTxState::ETxState state);
