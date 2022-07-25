@@ -44,6 +44,20 @@ namespace NKikimr::NBlobDepot {
         ProcessResponse(id, std::move(context), std::move(response));
     }
 
+    TString TRequestSender::ToString(const TResponse& response) {
+        auto printer = [](auto& value) -> TString {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, TTabletDisconnected>) {
+                return "TTabletDisconnected";
+            } else if constexpr (std::is_same_v<T, TKeyResolved>) {
+                return "TKeyResolved";
+            } else {
+                return value->ToString();
+            }
+        };
+        return std::visit(printer, response);
+    }
+
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     // TBlobDepotAgent machinery
 
@@ -57,10 +71,9 @@ namespace NKikimr::NBlobDepot {
 
     template<typename TEvent>
     void TBlobDepotAgent::HandleTabletResponse(TAutoPtr<TEventHandle<TEvent>> ev) {
-        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA15, "HandleTabletResponse", (VirtualGroupId, VirtualGroupId),
+        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA16, "HandleTabletResponse", (VirtualGroupId, VirtualGroupId),
             (Id, ev->Cookie), (Type, TypeName<TEvent>()));
-        auto *event = ev->Get();
-        OnRequestComplete(ev->Cookie, event, TabletRequestInFlight);
+        OnRequestComplete(ev->Cookie, ev->Get(), TabletRequestInFlight);
     }
 
     template void TBlobDepotAgent::HandleTabletResponse(TEvBlobDepot::TEvRegisterAgentResult::TPtr ev);
@@ -73,21 +86,20 @@ namespace NKikimr::NBlobDepot {
 
     template<typename TEvent>
     void TBlobDepotAgent::HandleOtherResponse(TAutoPtr<TEventHandle<TEvent>> ev) {
-        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA16, "HandleOtherResponse", (VirtualGroupId, VirtualGroupId),
+        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA17, "HandleOtherResponse", (VirtualGroupId, VirtualGroupId),
             (Id, ev->Cookie), (Type, TypeName<TEvent>()));
-        auto *event = ev->Get();
-        OnRequestComplete(ev->Cookie, event, OtherRequestInFlight);
+        OnRequestComplete(ev->Cookie, ev->Get(), OtherRequestInFlight);
     }
 
     template void TBlobDepotAgent::HandleOtherResponse(TEvBlobStorage::TEvGetResult::TPtr ev);
     template void TBlobDepotAgent::HandleOtherResponse(TEvBlobStorage::TEvPutResult::TPtr ev);
 
     void TBlobDepotAgent::OnRequestComplete(ui64 id, TResponse response, TRequestsInFlight& map) {
-        const auto it = map.find(id);
-        Y_VERIFY(it != map.end());
-        auto& [_, request] = *it;
-        request.Sender->OnRequestComplete(id, std::move(response));
-        map.erase(it);
+        if (const auto it = map.find(id); it != map.end()) {
+            TRequestInFlight request = std::move(it->second);
+            map.erase(it);
+            request.Sender->OnRequestComplete(id, std::move(response));
+        }
     }
 
 } // NKikimr::NBlobDepot

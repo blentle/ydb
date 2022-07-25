@@ -56,14 +56,16 @@ struct TRunActorParams { // TODO2 : Change name
         TVector<YandexQuery::ResultSetMeta> resultSetMetas,
         TVector<TString> dqGraphs,
         int32_t dqGraphIndex,
-        TVector<Yq::Private::TopicConsumer> createdTopicConsumers,
+        TVector<Fq::Private::TopicConsumer> createdTopicConsumers,
         bool automatic,
         const TString& queryName,
         const TInstant& deadline,
         const ::NMonitoring::TDynamicCounterPtr& clientCounters,
         TInstant createdAt,
         const TString& tenantName,
-        uint64_t resultBytesLimit
+        uint64_t resultBytesLimit,
+        TDuration executionTtl,
+        TInstant requestStartedAt
     );
 
     TRunActorParams(const TRunActorParams& params) = default;
@@ -106,7 +108,7 @@ struct TRunActorParams { // TODO2 : Change name
     const TVector<YandexQuery::ResultSetMeta> ResultSetMetas;
     const TVector<TString> DqGraphs;
     const int32_t DqGraphIndex;
-    TVector<Yq::Private::TopicConsumer> CreatedTopicConsumers;
+    TVector<Fq::Private::TopicConsumer> CreatedTopicConsumers;
 
     bool Automatic = false;
     TString QueryName;
@@ -116,6 +118,8 @@ struct TRunActorParams { // TODO2 : Change name
     const TInstant CreatedAt;
     const TString TenantName;
     uint64_t ResultBytesLimit;
+    TDuration ExecutionTtl;
+    TInstant RequestStartedAt;
 };
 
 } /* NYq */

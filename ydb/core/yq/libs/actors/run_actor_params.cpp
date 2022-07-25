@@ -41,14 +41,16 @@ TRunActorParams::TRunActorParams(
     TVector<YandexQuery::ResultSetMeta> resultSetMetas,
     TVector<TString> dqGraphs,
     int32_t dqGraphIndex,
-    TVector<Yq::Private::TopicConsumer> createdTopicConsumers,
+    TVector<Fq::Private::TopicConsumer> createdTopicConsumers,
     bool automatic,
     const TString& queryName,
     const TInstant& deadline,
     const ::NMonitoring::TDynamicCounterPtr& clientCounters,
     TInstant createdAt,
     const TString& tenantName,
-    uint64_t resultBytesLimit
+    uint64_t resultBytesLimit,
+    TDuration executionTtl,
+    TInstant requestStartedAt
     )
     : YqSharedResources(yqSharedResources)
     , CredentialsProviderFactory(credentialsProviderFactory)
@@ -94,6 +96,8 @@ TRunActorParams::TRunActorParams(
     , CreatedAt(createdAt)
     , TenantName(tenantName)
     , ResultBytesLimit(resultBytesLimit)
+    , ExecutionTtl(executionTtl)
+    , RequestStartedAt(requestStartedAt)
     {
     }
 

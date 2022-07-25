@@ -66,6 +66,11 @@ private:
             return TStatus::Error;
         }
 
+        if (const auto& path = input->Child(TS3Target::idx_Path)->Content(); path.empty() || path.back() != '/') {
+            ctx.AddError(TIssue(ctx.GetPosition(input->Child(TS3Target::idx_Path)->Pos()), "Expected non empty path to directory ends with '/'."));
+            return TStatus::Error;
+        }
+
         if (!EnsureAtom(*input->Child(TS3Target::idx_Format), ctx) || !NCommon::ValidateFormat(input->Child(TS3Target::idx_Format)->Content(), ctx)) {
             return TStatus::Error;
         }
@@ -92,7 +97,7 @@ private:
     }
 
     TStatus HandleOutput(const TExprNode::TPtr& input, TExprContext& ctx) {
-        if (!EnsureMinMaxArgsCount(*input, 2U, 3U, ctx)) {
+        if (!EnsureMinMaxArgsCount(*input, 3U, 4U, ctx)) {
             return TStatus::Error;
         }
 
@@ -104,11 +109,40 @@ private:
             return TStatus::Error;
         }
 
+        if (!EnsureTupleOfAtoms(*input->Child(TS3SinkOutput::idx_KeyColumns), ctx)) {
+            return TStatus::Error;
+        }
+
         if (input->ChildrenSize() > TS3SinkOutput::idx_Settings && !EnsureTuple(*input->Child(TS3SinkOutput::idx_Settings), ctx)) {
             return TStatus::Error;
         }
 
-        input->SetTypeAnn(ctx.MakeType<TFlowExprType>(ctx.MakeType<TDataExprType>(EDataSlot::String)));
+        if (const auto keysCount = input->Child(TS3SinkOutput::idx_KeyColumns)->ChildrenSize()) {
+            const auto source = input->Child(TS3SinkOutput::idx_Input);
+            const auto itemType = source->GetTypeAnn()->Cast<TFlowExprType>()->GetItemType();
+            if (!EnsureStructType(source->Pos(), *itemType, ctx)) {
+                return TStatus::Error;
+            }
+
+            const auto structType = itemType->Cast<TStructExprType>();
+            for (auto i = 0U; i < keysCount; ++i) {
+                const auto key = input->Child(TS3SinkOutput::idx_KeyColumns)->Child(i);
+                if (const auto keyType = structType->FindItemType(key->Content())) {
+                    if (!EnsureDataType(key->Pos(), *keyType, ctx)) {
+                        return TStatus::Error;
+                    }
+                } else {
+                    ctx.AddError(TIssue(ctx.GetPosition(key->Pos()), "Missed key column."));
+                    return TStatus::Error;
+                }
+
+                TTypeAnnotationNode::TListType itemTypes(keysCount + 1U, ctx.MakeType<TDataExprType>(EDataSlot::Utf8));
+                itemTypes.front() = ctx.MakeType<TDataExprType>(EDataSlot::String);
+                input->SetTypeAnn(ctx.MakeType<TFlowExprType>(ctx.MakeType<TTupleExprType>(itemTypes)));
+            }
+        } else
+            input->SetTypeAnn(ctx.MakeType<TFlowExprType>(ctx.MakeType<TDataExprType>(EDataSlot::String)));
+
         return TStatus::Ok;
     }
 

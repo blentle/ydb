@@ -7,6 +7,8 @@
 #include <ydb/core/yq/libs/control_plane_storage/schema.h>
 #include <ydb/core/yq/libs/db_schema/db_schema.h>
 
+#include <library/cpp/protobuf/interop/cast.h>
+
 namespace NYq {
 
 namespace {
@@ -175,11 +177,11 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
     const ui64 tasksBatchSize = Config.Proto.GetTasksBatchSize();
     const ui64 numTasksProportion = Config.Proto.GetNumTasksProportion();
 
-    CPS_LOG_T("GetTaskRequest: " << owner << " " << hostName);
+    CPS_LOG_T("GetTaskRequest: {" << request.DebugString() << "}");
 
     NYql::TIssues issues = ValidateGetTask(owner, hostName);
     if (issues) {
-        CPS_LOG_D("GetTaskRequest, validation failed: " << owner << " " << hostName << " " << issues.ToString());
+        CPS_LOG_W("GetTaskRequest: {" << request.DebugString() << "} validation FAILED: " << issues.ToOneLineString());
         const TDuration delta = TInstant::Now() - startTime;
         SendResponseIssues<TEvControlPlaneStorage::TEvGetTaskResponse>(ev->Sender, issues, ev->Cookie, delta, requestCounters);
         LWPROBE(GetTaskRequest, owner, hostName, delta, false);
@@ -203,7 +205,8 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
     );
 
     auto responseTasks = std::make_shared<TResponseTasks>();
-    auto prepareParams = [=, actorSystem=NActors::TActivationContext::ActorSystem(), responseTasks=responseTasks](const TVector<TResultSet>& resultSets) mutable {
+
+    auto prepareParams = [=, rootCounters=Counters.Counters, actorSystem=NActors::TActivationContext::ActorSystem(), responseTasks=responseTasks](const TVector<TResultSet>& resultSets) mutable {
         TVector<TTaskInternal> tasks;
         TVector<TPickTaskParams> pickTaskParams;
         const auto now = TInstant::Now();
@@ -233,12 +236,14 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
             auto lastSeenAt = parser.ColumnParser(LAST_SEEN_AT_COLUMN_NAME).GetOptionalTimestamp().GetOrElse(TInstant::Zero());
 
             if (previousOwner) { // task lease timeout case only, other cases are updated at ping time
-                CPS_LOG_AS_D(*actorSystem, "Task (Query): " << task.QueryId <<  " Lease TIMEOUT, RetryCounterUpdatedAt " << taskInternal.RetryLimiter.RetryCounterUpdatedAt
+                CPS_LOG_AS_T(*actorSystem, "Task (Query): " << task.QueryId <<  " Lease TIMEOUT, RetryCounterUpdatedAt " << taskInternal.RetryLimiter.RetryCounterUpdatedAt
                     << " LastSeenAt: " << lastSeenAt);
                 taskInternal.ShouldAbortTask = !taskInternal.RetryLimiter.UpdateOnRetry(lastSeenAt, Config.TaskLeaseRetryPolicy, now);
             }
 
-            CPS_LOG_AS_D(*actorSystem, "Task (Query): " << task.QueryId <<  " RetryRate: " << taskInternal.RetryLimiter.RetryRate
+            *rootCounters->GetSubgroup("scope", task.Scope)->GetSubgroup("query_id", task.QueryId)->GetCounter("RetryCount") = taskInternal.RetryLimiter.RetryCount;
+
+            CPS_LOG_AS_T(*actorSystem, "Task (Query): " << task.QueryId <<  " RetryRate: " << taskInternal.RetryLimiter.RetryRate
                 << " RetryCounter: " << taskInternal.RetryLimiter.RetryCount << " At: " << taskInternal.RetryLimiter.RetryCounterUpdatedAt
                 << (taskInternal.ShouldAbortTask ? " ABORTED" : ""));
         }
@@ -314,9 +319,8 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
         });
     });
 
-    auto prepare = [response] { 
-        
-        Yq::Private::GetTaskResult result;
+    auto prepare = [response] {
+        Fq::Private::GetTaskResult result;
         const auto& tasks = std::get<0>(*response);
 
         for (const auto& task : tasks) {
@@ -327,6 +331,16 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
                     << YandexQuery::QueryContent::QueryType_Name(queryType)
                     << " unsupported";
             }
+
+            auto userExecutionLimit = TDuration::MilliSeconds(task.Query.content().Getlimits().vcpu_time_limit());
+            auto systemExecutionLimit = NProtoInterop::CastFromProto(task.Internal.execution_ttl());
+            auto executionLimit = std::min(userExecutionLimit, systemExecutionLimit);
+            if (systemExecutionLimit == TDuration::Zero()) {
+                executionLimit = userExecutionLimit;
+            } else if (userExecutionLimit == TDuration::Zero()) {
+                executionLimit = systemExecutionLimit;
+            }
+
             auto* newTask = result.add_tasks();
             newTask->set_query_type(queryType);
             newTask->set_execute_mode(task.Query.meta().execute_mode());
@@ -349,6 +363,8 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
             *newTask->mutable_deadline() = NProtoInterop::CastToProto(task.Deadline);
             newTask->mutable_disposition()->CopyFrom(task.Internal.disposition());
             newTask->set_result_limit(task.Internal.result_limit());
+            *newTask->mutable_execution_limit() = NProtoInterop::CastToProto(executionLimit);
+            *newTask->mutable_request_started_at() = task.Query.meta().started_at();
 
             for (const auto& connection: task.Internal.connection()) {
                 const auto serviceAccountId = ExtractServiceAccountId(connection);
@@ -361,15 +377,16 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
 
             *newTask->mutable_dq_graph() = task.Internal.dq_graph();
             newTask->set_dq_graph_index(task.Internal.dq_graph_index());
+            *newTask->mutable_dq_graph_compressed() = task.Internal.dq_graph_compressed();
 
             *newTask->mutable_result_set_meta() = task.Query.result_set_meta();
             newTask->set_scope(task.Scope);
         }
 
-        return result; 
+        return result;
     };
-    auto success = SendResponse<TEvControlPlaneStorage::TEvGetTaskResponse, Yq::Private::GetTaskResult>
-        ("GetTaskRequest",
+    auto success = SendResponse<TEvControlPlaneStorage::TEvGetTaskResponse, Fq::Private::GetTaskResult>
+        ("GetTaskRequest - GetTaskResult",
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),

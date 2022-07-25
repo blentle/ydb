@@ -503,9 +503,9 @@ public:
             THolder<TIntermediate> &intermediate)
     {
         auto &record = kvRequest->Record;
-        intermediate->HasGeneration = true;
-        intermediate->Generation = record.lock_generation();
         if (record.has_lock_generation() && record.lock_generation() != StoredState.GetUserGeneration()) {
+            intermediate->HasGeneration = true;
+            intermediate->Generation = record.lock_generation();
             TStringStream str;
             str << "KeyValue# " << TabletId;
             str << " Generation mismatch! Requested# " << record.lock_generation();
@@ -514,6 +514,8 @@ public:
             ReplyError<typename TGrpcRequestWithLockGeneration::TResponse>(ctx, str.Str(),
                     NKikimrKeyValue::Statuses::RSTATUS_WRONG_LOCK_GENERATION, intermediate);
             return true;
+        } else {
+            intermediate->HasGeneration = false;
         }
         return false;
     }
@@ -560,8 +562,8 @@ public:
     TPrepareResult InitGetStatusCommand(TIntermediate::TGetStatus &cmd,
         NKikimrClient::TKeyValueRequest::EStorageChannel storageChannel, const TTabletStorageInfo *info);
     void ReplyError(const TActorContext &ctx, TString errorDescription,
-        NMsgBusProxy::EResponseStatus status, THolder<TIntermediate> &intermediate,
-        const TTabletStorageInfo *info = nullptr);
+        NMsgBusProxy::EResponseStatus oldStatus, NKikimrKeyValue::Statuses::ReplyStatus newStatus,
+        THolder<TIntermediate> &intermediate, const TTabletStorageInfo *info = nullptr);
 
     template <typename TResponse>
     void ReplyError(const TActorContext &ctx, TString errorDescription,

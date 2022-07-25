@@ -33,8 +33,9 @@ public:
         IDqAsyncIoFactory::TPtr asyncIoFactory,
         const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
         const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits,
-        const NTaskRunnerActor::ITaskRunnerActorFactory::TPtr& taskRunnerActorFactory)
-        : TBase(executerId, txId, std::move(task), std::move(asyncIoFactory), functionRegistry, settings, memoryLimits, /* ownMemoryQuota = */ false)
+        const NTaskRunnerActor::ITaskRunnerActorFactory::TPtr& taskRunnerActorFactory,
+        ::NMonitoring::TDynamicCounterPtr taskCounters)
+        : TBase(executerId, txId, std::move(task), std::move(asyncIoFactory), functionRegistry, settings, memoryLimits, /* ownMemoryQuota = */ false, false, taskCounters)
         , TaskRunnerActorFactory(taskRunnerActorFactory)
         , ReadyToCheckpointFlag(false)
         , SentStatsRequest(false)
@@ -106,6 +107,35 @@ private:
         WaitingForStateResponse.push_back({ev->Sender, ev->Cookie});
     }
 
+    void FillIssues(NYql::TIssues& issues) {
+        auto applyToAllIssuesHolders = [this](auto& function){
+            function(SourcesMap);
+            function(InputTransformsMap);
+            function(SinksMap);
+            function(OutputTransformsMap);
+        };
+
+        uint64_t expectingSize = 0;
+        auto addSize = [&expectingSize](auto& issuesHolder) {
+            for (auto& [inputIndex, source]: issuesHolder) {
+                expectingSize += source.IssuesBuffer.GetAllAddedIssuesCount();
+            }
+        };
+
+        auto exhaustIssues = [&issues](auto& issuesHolder){
+            for (auto& [inputIndex, source]: issuesHolder) {
+            auto sourceIssues = source.IssuesBuffer.Dump();
+                for (auto& issueInfo: sourceIssues) {
+                    issues.AddIssues(issueInfo.Issues);
+                }
+            }
+        };
+
+        applyToAllIssuesHolders(addSize);
+        issues.Reserve(expectingSize);
+        applyToAllIssuesHolders(exhaustIssues);
+    }
+
     void OnStatisticsResponse(NTaskRunnerActor::TEvStatistics::TPtr& ev) {
         SentStatsRequest = false;
         if (ev->Get()->Stats) {
@@ -116,6 +146,10 @@ private:
         record.SetState(NDqProto::COMPUTE_STATE_EXECUTING);
         record.SetStatusCode(NYql::NDqProto::StatusIds::SUCCESS);
         record.SetTaskId(Task.GetId());
+        NYql::TIssues issues;
+        FillIssues(issues);
+
+        IssuesToMessage(issues, record.MutableIssues());
         FillStats(record.MutableStats(), /* last */ false);
         for (const auto& [actorId, cookie] : WaitingForStateResponse) {
             auto state = MakeHolder<TEvDqCompute::TEvState>();
@@ -156,7 +190,7 @@ private:
             );
 
         outputChannel.PopStarted = true;
-        ProcessOutputsState.Inflight ++;
+        ProcessOutputsState.Inflight++;
         if (toSend <= 0) {
             if (Y_UNLIKELY(outputChannel.Stats)) {
                 outputChannel.Stats->BlockedByCapacity++;
@@ -195,7 +229,7 @@ private:
             );
 
         sinkInfo.PopStarted = true;
-        ProcessOutputsState.Inflight ++;
+        ProcessOutputsState.Inflight++;
         sinkInfo.FreeSpaceBeforeSend = sinkFreeSpaceBeforeSend;
         Send(TaskRunnerActorId, new NTaskRunnerActor::TEvSinkPop(outputIndex, sinkFreeSpaceBeforeSend));
     }
@@ -534,7 +568,7 @@ private:
         }
 
         sinkInfo.PopStarted = false;
-        ProcessOutputsState.Inflight --;
+        ProcessOutputsState.Inflight--;
         ProcessOutputsState.HasDataToSend |= !sinkInfo.Finished;
 
         {
@@ -544,7 +578,7 @@ private:
         }
 
         Y_VERIFY(batch.empty());
-        CA_LOG_D("sink " << outputIndex << ": sent " << dataSize << " bytes of data and " << checkpointSize << " bytes of checkpoint barrier");
+        CA_LOG_D("Sink " << outputIndex << ": sent " << dataSize << " bytes of data and " << checkpointSize << " bytes of checkpoint barrier");
 
         CA_LOG_D("Drain sink " << outputIndex
             << ". Free space decreased: " << (sinkInfo.FreeSpaceBeforeSend - sinkInfo.AsyncOutput->GetFreeSpace())
@@ -652,10 +686,11 @@ IActor* CreateDqAsyncComputeActor(const TActorId& executerId, const TTxId& txId,
     IDqAsyncIoFactory::TPtr asyncIoFactory,
     const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
     const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits,
-    const NTaskRunnerActor::ITaskRunnerActorFactory::TPtr& taskRunnerActorFactory)
+    const NTaskRunnerActor::ITaskRunnerActorFactory::TPtr& taskRunnerActorFactory,
+    ::NMonitoring::TDynamicCounterPtr taskCounters)
 {
     return new TDqAsyncComputeActor(executerId, txId, std::move(task), std::move(asyncIoFactory),
-        functionRegistry, settings, memoryLimits, taskRunnerActorFactory);
+        functionRegistry, settings, memoryLimits, taskRunnerActorFactory, taskCounters);
 }
 
 } // namespace NDq

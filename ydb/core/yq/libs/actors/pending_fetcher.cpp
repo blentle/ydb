@@ -42,6 +42,7 @@
 #include <ydb/public/sdk/cpp/client/ydb_value/value.h>
 #include <ydb/public/sdk/cpp/client/ydb_result/result.h>
 
+#include <ydb/core/yq/libs/common/compression.h>
 #include <ydb/core/yq/libs/common/entity_id.h>
 #include <ydb/core/yq/libs/events/events.h>
 
@@ -70,6 +71,7 @@ namespace NYq {
 
 using namespace NActors;
 using namespace NYql;
+using namespace NFq;
 
 namespace {
 
@@ -143,6 +145,7 @@ public:
         , CredentialsFactory(credentialsFactory)
         , S3Gateway(s3Gateway)
         , PqCmConnections(std::move(pqCmConnections))
+        , FetcherGuid(CreateGuidAsString())
         , ClientCounters(clientCounters)
         , TenantName(tenantName)
         , InternalServiceId(MakeInternalServiceActorId())
@@ -163,9 +166,7 @@ public:
         DatabaseResolver = Register(CreateDatabaseResolver(MakeYqlAnalyticsHttpProxyId(), CredentialsFactory));
         Send(SelfId(), new NActors::TEvents::TEvWakeup());
 
-        TString guidActor = CreateGuidAsString();
-        LOG_I("STARTED " + guidActor);
-        LogScope.ConstructInPlace(NActors::TActivationContext::ActorSystem(), NKikimrServices::YQL_PROXY, guidActor);
+        LogScope.ConstructInPlace(NActors::TActivationContext::ActorSystem(), NKikimrServices::YQL_PROXY, FetcherGuid);
     }
 
 private:
@@ -239,23 +240,27 @@ private:
     }
 
     void GetPendingTask() {
-        OwnerId = CreateGuidAsString();
-        LOG_D("Request Private::GetTask" << ", Owner: " << OwnerId << ", Host: " << HostName() << ", Tenant: " << TenantName);
-        Yq::Private::GetTaskRequest request;
-        request.set_owner_id(OwnerId);
+        FetcherGeneration++;
+        LOG_D("Request Private::GetTask" << ", Owner: " << GetOwnerId() << ", Host: " << HostName() << ", Tenant: " << TenantName);
+        Fq::Private::GetTaskRequest request;
+        request.set_owner_id(GetOwnerId());
         request.set_host(HostName());
         request.set_tenant(TenantName);
         Send(InternalServiceId, new TEvInternalService::TEvGetTaskRequest(request));
     }
 
-    void ProcessTask(const Yq::Private::GetTaskResult& result) {
+    void ProcessTask(const Fq::Private::GetTaskResult& result) {
         for (const auto& task : result.tasks()) {
             RunTask(task);
         }
 
     }
 
-    void RunTask(const Yq::Private::GetTaskResult::Task& task) {
+    TString GetOwnerId() const {
+        return FetcherGuid + ToString(FetcherGeneration);
+    }
+
+    void RunTask(const Fq::Private::GetTaskResult::Task& task) {
         LOG_D("NewTask:"
               << " Scope: " << task.scope()
               << " Id: " << task.query_id().value()
@@ -296,7 +301,17 @@ private:
 
         queryCounters.InitUptimeCounter();
         const auto createdAt = TInstant::Now();
-
+        TVector<TString> dqGraphs;
+        if (!task.dq_graph_compressed().empty()) {
+            dqGraphs.reserve(task.dq_graph_compressed().size());
+            for (auto& g : task.dq_graph_compressed()) {
+                TCompressor compressor(g.method());
+                dqGraphs.emplace_back(compressor.Decompress(g.data()));
+            }
+        } else {
+            // todo: remove after migration
+            dqGraphs = VectorFromProto(task.dq_graph());
+        }
         TRunActorParams params(
             YqSharedResources, CredentialsProviderFactory, S3Gateway,
             FunctionRegistry, RandomProvider,
@@ -306,7 +321,7 @@ private:
             PrivateApiConfig, GatewaysConfig, PingerConfig,
             task.text(), task.scope(), task.user_token(),
             DatabaseResolver, queryId,
-            task.user_id(), OwnerId, task.generation(),
+            task.user_id(), GetOwnerId(), task.generation(),
             VectorFromProto(task.connection()),
             VectorFromProto(task.binding()),
             CredentialsFactory,
@@ -319,7 +334,7 @@ private:
             task.status(),
             cloudId,
             VectorFromProto(task.result_set_meta()),
-            VectorFromProto(task.dq_graph()),
+            std::move(dqGraphs),
             task.dq_graph_index(),
             VectorFromProto(task.created_topic_consumers()),
             task.automatic(),
@@ -328,7 +343,10 @@ private:
             ClientCounters,
             createdAt,
             TenantName,
-            task.result_limit());
+            task.result_limit(),
+            NProtoInterop::CastFromProto(task.execution_limit()),
+            NProtoInterop::CastFromProto(task.request_started_at())
+            );
 
         auto runActorId = Register(CreateRunActor(SelfId(), queryCounters, std::move(params)));
 
@@ -372,7 +390,8 @@ private:
     const IHTTPGateway::TPtr S3Gateway;
     const ::NPq::NConfigurationManager::IConnections::TPtr PqCmConnections;
 
-    TString OwnerId;
+    const TString FetcherGuid;
+    uint64_t FetcherGeneration = 0;
     const ::NMonitoring::TDynamicCounterPtr ClientCounters;
 
     TMaybe<NYql::NLog::TScopedBackend<NYql::NDq::TYqlLogScope>> LogScope;

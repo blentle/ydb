@@ -11,6 +11,7 @@
 #include <ydb/core/yq/libs/private_client/internal_service.h>
 #include <ydb/core/yq/libs/private_client/loopback_service.h>
 #include <ydb/core/yq/libs/quota_manager/quota_manager.h>
+#include <ydb/core/yq/libs/quota_manager/quota_proxy.h>
 #include <ydb/core/yq/libs/rate_limiter/control_plane_service/rate_limiter_control_plane_service.h>
 #include <ydb/core/yq/libs/shared_resources/shared_resources.h>
 #include <ydb/library/folder_service/folder_service.h>
@@ -29,6 +30,7 @@
 #include <ydb/library/yql/providers/common/comp_nodes/yql_factory.h>
 #include <ydb/library/yql/providers/dq/task_runner/tasks_runner_local.h>
 #include <ydb/library/yql/providers/dq/worker_manager/local_worker_manager.h>
+#include <ydb/library/yql/providers/s3/actors/yql_s3_sink_factory.h>
 #include <ydb/library/yql/providers/s3/actors/yql_s3_source_factory.h>
 #include <ydb/library/yql/providers/s3/proto/retry_config.pb.h>
 #include <ydb/library/yql/providers/clickhouse/actors/yql_ch_source_factory.h>
@@ -148,6 +150,8 @@ void Init(
         RegisterYdbReadActorFactory(*asyncIoFactory, yqSharedResources->UserSpaceYdbDriver, credentialsFactory);
         RegisterS3ReadActorFactory(*asyncIoFactory, credentialsFactory,
             httpGateway, std::make_shared<NYql::NS3::TRetryConfig>(protoConfig.GetReadActorsFactoryConfig().GetS3ReadActorFactoryConfig().GetRetryConfig()));
+        RegisterS3WriteActorFactory(*asyncIoFactory, credentialsFactory,
+            httpGateway, std::make_shared<NYql::NS3::TRetryConfig>(protoConfig.GetReadActorsFactoryConfig().GetS3ReadActorFactoryConfig().GetRetryConfig()));
         RegisterClickHouseReadActorFactory(*asyncIoFactory, credentialsFactory, httpGateway);
 
         RegisterDqPqWriteActorFactory(*asyncIoFactory, yqSharedResources->UserSpaceYdbDriver, credentialsFactory);
@@ -168,6 +172,7 @@ void Init(
         }
         NYql::NDqs::TLocalWorkerManagerOptions lwmOptions;
         lwmOptions.Counters = workerManagerCounters;
+        lwmOptions.DqTaskCounters = appData->Counters->GetSubgroup("counters", "dq_tasks");
         lwmOptions.Factory = NYql::NTaskRunnerProxy::CreateFactory(appData->FunctionRegistry, dqCompFactory, dqTaskTransformFactory, false);
         lwmOptions.AsyncIoFactory = asyncIoFactory;
         lwmOptions.FunctionRegistry = appData->FunctionRegistry;
@@ -188,14 +193,14 @@ void Init(
 
     if (protoConfig.GetNodesManager().GetEnabled() || protoConfig.GetPendingFetcher().GetEnabled()) {
         auto internal = protoConfig.GetPrivateApi().GetLoopback()
-            ? CreateLoopbackServiceActor(clientCounters)
-            : CreateInternalServiceActor(
+            ? NFq::CreateLoopbackServiceActor(clientCounters)
+            : NFq::CreateInternalServiceActor(
                 yqSharedResources,
                 credentialsProviderFactory,
                 protoConfig.GetPrivateApi(),
                 clientCounters
             );
-        actorRegistrator(MakeInternalServiceActorId(), internal);
+        actorRegistrator(NFq::MakeInternalServiceActorId(), internal);
     }
 
     if (protoConfig.GetNodesManager().GetEnabled()) {
@@ -207,7 +212,8 @@ void Init(
             protoConfig.GetPrivateApi(),
             yqSharedResources,
             icPort,
-            protoConfig.GetNodesManager().GetUseDataCenter() ? protoConfig.GetNodesManager().GetDataCenter() : "",
+            protoConfig.GetNodesManager().GetDataCenter(),
+            protoConfig.GetNodesManager().GetUseDataCenter(),
             tenant,
             mkqlInitialMemoryLimit);
 
@@ -282,9 +288,15 @@ void Init(
             serviceCounters.Counters,
             {
                 TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_RESULT_LIMIT, 20_MB, 2_GB),
-                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_COUNT_LIMIT, 100, 200, NYq::ControlPlaneStorageServiceActorId())
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_COUNT_LIMIT, 100, 200, NYq::ControlPlaneStorageServiceActorId()),
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_TIME_LIMIT, 0)
             });
         actorRegistrator(NYq::MakeQuotaServiceActorId(), quotaService);
+
+        auto quotaProxy = NYq::CreateQuotaProxyActor(
+            protoConfig.GetQuotasManager(),
+            serviceCounters.Counters);
+        actorRegistrator(NYq::MakeQuotaProxyActorId(), quotaProxy);
     }
 }
 

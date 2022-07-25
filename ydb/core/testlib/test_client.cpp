@@ -7,7 +7,8 @@
 #include <ydb/core/grpc_services/grpc_request_proxy.h>
 #include <ydb/services/auth/grpc_service.h>
 #include <ydb/services/yq/grpc_service.h>
-#include <ydb/services/yq/private_grpc.h>
+#include <ydb/services/fq/grpc_service.h>
+#include <ydb/services/fq/private_grpc.h>
 #include <ydb/services/cms/grpc_service.h>
 #include <ydb/services/datastreams/grpc_service.h>
 #include <ydb/services/kesus/grpc_service.h>
@@ -327,7 +328,8 @@ namespace Tests {
         GRpcServer->AddService(new NGRpcService::TGRpcMonitoringService(system, counters, grpcRequestProxyId));
         if (Settings->EnableYq) {
             GRpcServer->AddService(new NGRpcService::TGRpcYandexQueryService(system, counters, grpcRequestProxyId));
-            GRpcServer->AddService(new NGRpcService::TGRpcYqPrivateTaskService(system, counters, grpcRequestProxyId));
+            GRpcServer->AddService(new NGRpcService::TGRpcFederatedQueryService(system, counters, grpcRequestProxyId));
+            GRpcServer->AddService(new NGRpcService::TGRpcFqPrivateTaskService(system, counters, grpcRequestProxyId));
         }
         if (const auto& factory = Settings->GrpcServiceFactory) {
             // All services enabled by default for ut
@@ -1349,7 +1351,7 @@ namespace Tests {
 
     NMsgBusProxy::EResponseStatus TClient::CreateTableWithUniformShardedIndex(const TString& parent,
         const NKikimrSchemeOp::TTableDescription &table, const TString& indexName, const TVector<TString> indexColumns,
-        const TVector<TString> dataColumns, TDuration timeout)
+        NKikimrSchemeOp::EIndexType type, const TVector<TString> dataColumns, TDuration timeout)
     {
         TAutoPtr<NMsgBusProxy::TBusSchemeOperation> request(new NMsgBusProxy::TBusSchemeOperation());
         auto *op = request->Record.MutableTransaction()->MutableModifyScheme();
@@ -1369,7 +1371,7 @@ namespace Tests {
                 indexDesc->AddDataColumnNames(c);
             }
 
-            indexDesc->SetType(NKikimrSchemeOp::EIndexType::EIndexTypeGlobal);
+            indexDesc->SetType(type);
             indexDesc->MutableIndexImplTableDescription()->SetUniformPartitionsCount(16);
         }
 

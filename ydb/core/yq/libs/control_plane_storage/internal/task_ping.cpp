@@ -4,6 +4,8 @@
 
 #include <ydb/core/yq/libs/db_schema/db_schema.h>
 
+#include <google/protobuf/util/time_util.h>
+
 namespace NYq {
 
 namespace {
@@ -18,13 +20,18 @@ bool IsFinishedStatus(YandexQuery::QueryMeta::ComputeStatus status) {
 } // namespace
 
 std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParams>(const TVector<NYdb::TResultSet>&)>> ConstructHardPingTask(
-    const Yq::Private::PingTaskRequest& request, std::shared_ptr<Yq::Private::PingTaskResult> response,
-    const TString& tablePathPrefix, const TDuration& automaticQueriesTtl, const TDuration& taskLeaseTtl, const THashMap<ui64, TRetryPolicyItem>& retryPolicies) {
+    const Fq::Private::PingTaskRequest& request, std::shared_ptr<Fq::Private::PingTaskResult> response,
+    const TString& tablePathPrefix, const TDuration& automaticQueriesTtl, const TDuration& taskLeaseTtl, const THashMap<ui64, TRetryPolicyItem>& retryPolicies,
+    ::NMonitoring::TDynamicCounterPtr rootCounters) {
+
+    auto scope = request.scope();
+    auto query_id = request.query_id().value();
+    auto counters = rootCounters->GetSubgroup("scope", scope)->GetSubgroup("query_id", query_id);
 
     TSqlQueryBuilder readQueryBuilder(tablePathPrefix, "HardPingTask(read)");
     readQueryBuilder.AddString("tenant", request.tenant());
-    readQueryBuilder.AddString("scope", request.scope());
-    readQueryBuilder.AddString("query_id", request.query_id().value());
+    readQueryBuilder.AddString("scope", scope);
+    readQueryBuilder.AddString("query_id", query_id);
     readQueryBuilder.AddText(
         "$last_job_id = SELECT `" LAST_JOB_ID_COLUMN_NAME "` FROM `" QUERIES_TABLE_NAME "`\n"
         "   WHERE `" SCOPE_COLUMN_NAME "` = $scope AND `" QUERY_ID_COLUMN_NAME "` = $query_id;\n"
@@ -36,15 +43,12 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
         "FROM `" PENDING_SMALL_TABLE_NAME "` WHERE `" TENANT_COLUMN_NAME "` = $tenant AND `" SCOPE_COLUMN_NAME "` = $scope AND `" QUERY_ID_COLUMN_NAME "` = $query_id;\n"
     );
 
-    auto prepareParams = [=, actorSystem = NActors::TActivationContext::ActorSystem()](const TVector<TResultSet>& resultSets) {
+    auto prepareParams = [=, counters=counters, actorSystem = NActors::TActivationContext::ActorSystem()](const TVector<TResultSet>& resultSets) {
         TString jobId;
         YandexQuery::Query query;
         YandexQuery::Internal::QueryInternal internal;
         YandexQuery::Job job;
         TString owner;
-        ui64 retryCounter = 0;
-        TInstant retryCounterUpdatedAt = TInstant::Zero();
-        double retryRate = 0.0;
 
         if (resultSets.size() != 3) {
             ythrow TControlPlaneStorageException(TIssuesIds::INTERNAL_ERROR) << "RESULT SET SIZE of " << resultSets.size() << " != 3";
@@ -86,8 +90,8 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
             }
             retryLimiter.Assign(
                 parser.ColumnParser(RETRY_COUNTER_COLUMN_NAME).GetOptionalUint64().GetOrElse(0),
-                retryCounterUpdatedAt = parser.ColumnParser(RETRY_COUNTER_UPDATE_COLUMN_NAME).GetOptionalTimestamp().GetOrElse(TInstant::Zero()),
-                retryRate = parser.ColumnParser(RETRY_RATE_COLUMN_NAME).GetOptionalDouble().GetOrElse(0.0)
+                parser.ColumnParser(RETRY_COUNTER_UPDATE_COLUMN_NAME).GetOptionalTimestamp().GetOrElse(TInstant::Zero()),
+                parser.ColumnParser(RETRY_RATE_COLUMN_NAME).GetOptionalDouble().GetOrElse(0.0)
             );
         }
 
@@ -137,7 +141,7 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
                     }
                 }
             }
-            CPS_LOG_AS_D(*actorSystem, "PingTaskRequest (resign): " << (!policyFound ? " DEFAULT POLICY" : "") << (owner ? " FAILURE " : " ") << NYql::NDqProto::StatusIds_StatusCode_Name(request.status_code()) << " " << retryLimiter.RetryCount << " " << retryLimiter.RetryCounterUpdatedAt << " " << backoff);
+            CPS_LOG_AS_T(*actorSystem, "PingTaskRequest (resign): " << (!policyFound ? " DEFAULT POLICY" : "") << (owner ? " FAILURE " : " ") << NYql::NDqProto::StatusIds_StatusCode_Name(request.status_code()) << " " << retryLimiter.RetryCount << " " << retryLimiter.RetryCounterUpdatedAt << " " << backoff);
         }
 
         if (queryStatus) {
@@ -183,6 +187,20 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
             job.mutable_plan()->set_json(request.plan());
         }
 
+        if (request.ast_compressed().data()) {
+            internal.mutable_ast_compressed()->set_method(request.ast_compressed().method());
+            internal.mutable_ast_compressed()->set_data(request.ast_compressed().data());
+            // todo: keep AST compressed in JobInternal
+            // job.mutable_ast()->set_data(request.ast());
+        }
+
+        if (request.plan_compressed().data()) {
+            internal.mutable_plan_compressed()->set_method(request.plan_compressed().method());
+            internal.mutable_plan_compressed()->set_data(request.plan_compressed().data());
+            // todo: keep plan compressed in JobInternal
+            // job.mutable_plan()->set_json(request.plan());
+        }
+
         if (request.has_started_at()) {
             *query.mutable_meta()->mutable_started_at() = request.started_at();
             *job.mutable_query_meta()->mutable_started_at() = request.started_at();
@@ -221,12 +239,12 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
 
         if (request.status() && IsFinishedStatus(request.status())) {
             internal.clear_created_topic_consumers();
-            internal.clear_dq_graph();
+            // internal.clear_dq_graph(); keep for debug
             internal.clear_dq_graph_index();
         }
 
         if (!request.created_topic_consumers().empty()) {
-            std::set<Yq::Private::TopicConsumer, TTopicConsumerLess> mergedConsumers;
+            std::set<Fq::Private::TopicConsumer, TTopicConsumerLess> mergedConsumers;
             for (auto&& c : *internal.mutable_created_topic_consumers()) {
                 mergedConsumers.emplace(std::move(c));
             }
@@ -241,6 +259,10 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
 
         if (!request.dq_graph().empty()) {
             *internal.mutable_dq_graph() = request.dq_graph();
+        }
+
+        if (!request.dq_graph_compressed().empty()) {
+            *internal.mutable_dq_graph_compressed() = request.dq_graph_compressed();
         }
 
         if (request.dq_graph_index()) {
@@ -258,6 +280,7 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
         writeQueryBuilder.AddString("result_id", request.result_id().value());
         writeQueryBuilder.AddString("query_id", request.query_id().value());
 
+        TInstant ttl;
         if (IsTerminalStatus(query.meta().status())) {
             // delete pending
             writeQueryBuilder.AddText(
@@ -265,12 +288,14 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
                 "WHERE `" TENANT_COLUMN_NAME "` = $tenant AND `" SCOPE_COLUMN_NAME "` = $scope AND `" QUERY_ID_COLUMN_NAME "` = $query_id;\n"
             );
         } else {
+            *counters->GetCounter("RetryCount") = retryLimiter.RetryCount;
             // update pending small
+            ttl = TInstant::Now() + backoff;
             writeQueryBuilder.AddTimestamp("now", TInstant::Now());
-            writeQueryBuilder.AddTimestamp("ttl", TInstant::Now() + backoff);
-            writeQueryBuilder.AddTimestamp("retry_counter_update_time", retryCounterUpdatedAt);
-            writeQueryBuilder.AddDouble("retry_rate", retryRate);
-            writeQueryBuilder.AddUint64("retry_counter", retryCounter);
+            writeQueryBuilder.AddTimestamp("ttl", ttl);
+            writeQueryBuilder.AddTimestamp("retry_counter_update_time", retryLimiter.RetryCounterUpdatedAt);
+            writeQueryBuilder.AddDouble("retry_rate", retryLimiter.RetryRate);
+            writeQueryBuilder.AddUint64("retry_counter", retryLimiter.RetryCount);
             writeQueryBuilder.AddString("owner", owner);
             writeQueryBuilder.AddText(
                 "UPDATE `" PENDING_SMALL_TABLE_NAME "` SET `" LAST_SEEN_AT_COLUMN_NAME "` = $now, `" ASSIGNED_UNTIL_COLUMN_NAME "` = $ttl,\n"
@@ -317,7 +342,9 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
         );
 
         response->set_action(internal.action());
-
+        if (ttl) {
+            *response->mutable_expired_at() = google::protobuf::util::TimeUtil::MillisecondsToTimestamp(ttl.MilliSeconds());
+        }
         const auto writeQuery = writeQueryBuilder.Build();
         return std::make_pair(writeQuery.Sql, writeQuery.Params);
     };
@@ -326,7 +353,7 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
 }
 
 std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParams>(const TVector<NYdb::TResultSet>&)>> ConstructSoftPingTask(
-    const Yq::Private::PingTaskRequest& request, std::shared_ptr<Yq::Private::PingTaskResult> response,
+    const Fq::Private::PingTaskRequest& request, std::shared_ptr<Fq::Private::PingTaskResult> response,
     const TString& tablePathPrefix, const TDuration& taskLeaseTtl) {
     TSqlQueryBuilder readQueryBuilder(tablePathPrefix, "SoftPingTask(read)");
     readQueryBuilder.AddString("tenant", request.tenant());
@@ -368,11 +395,13 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
             }
         }
 
+        TInstant ttl = TInstant::Now() + taskLeaseTtl;
         response->set_action(internal.action());
+        *response->mutable_expired_at() = google::protobuf::util::TimeUtil::MillisecondsToTimestamp(ttl.MilliSeconds());
 
         TSqlQueryBuilder writeQueryBuilder(tablePathPrefix, "SoftPingTask(write)");
         writeQueryBuilder.AddTimestamp("now", TInstant::Now());
-        writeQueryBuilder.AddTimestamp("ttl", TInstant::Now() + taskLeaseTtl);
+        writeQueryBuilder.AddTimestamp("ttl", ttl);
         writeQueryBuilder.AddString("tenant", request.tenant());
         writeQueryBuilder.AddString("scope", request.scope());
         writeQueryBuilder.AddString("query_id", request.query_id().value());
@@ -392,7 +421,7 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
 void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvPingTaskRequest::TPtr& ev)
 {
     TInstant startTime = TInstant::Now();
-    Yq::Private::PingTaskRequest& request = ev->Get()->Request;
+    Fq::Private::PingTaskRequest& request = ev->Get()->Request;
     const TString cloudId = "";
     const TString scope = request.scope();
     TRequestCountersPtr requestCounters = Counters.GetScopeCounters("" /*CloudId*/, scope, RTS_PING_TASK);
@@ -402,25 +431,23 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvPingTaskReq
     const TString owner = request.owner_id();
     const TInstant deadline = NProtoInterop::CastFromProto(request.deadline());
 
-    CPS_LOG_T("PingTaskRequest: " << request.tenant() << " " << scope << " " << queryId
-        << " " << owner << " " << deadline << " "
-        << (request.status() ? YandexQuery::QueryMeta_ComputeStatus_Name(request.status()) : "no status"));
+    CPS_LOG_T("PingTaskRequest: {" << request.DebugString() << "}");
 
     NYql::TIssues issues = ValidatePingTask(scope, queryId, owner, deadline, Config.ResultSetsTtl);
     if (issues) {
-        CPS_LOG_D("PingTaskRequest, validation failed: " << scope << " " << queryId  << " " << owner << " " << deadline << issues.ToString());
+        CPS_LOG_W("PingTaskRequest: {" << request.DebugString() << "} validation FAILED: " << issues.ToOneLineString());
         const TDuration delta = TInstant::Now() - startTime;
         SendResponseIssues<TEvControlPlaneStorage::TEvPingTaskResponse>(ev->Sender, issues, ev->Cookie, delta, requestCounters);
         LWPROBE(PingTaskRequest, queryId, delta, false);
         return;
     }
 
-    std::shared_ptr<Yq::Private::PingTaskResult> response = std::make_shared<Yq::Private::PingTaskResult>();
+    std::shared_ptr<Fq::Private::PingTaskResult> response = std::make_shared<Fq::Private::PingTaskResult>();
 
     if (request.status())
         Counters.GetFinalStatusCounters(cloudId, scope)->IncByStatus(request.status());
     auto pingTaskParams = DoesPingTaskUpdateQueriesTable(request) ?
-        ConstructHardPingTask(request, response, YdbConnection->TablePathPrefix, Config.AutomaticQueriesTtl, Config.TaskLeaseTtl, Config.RetryPolicies) :
+        ConstructHardPingTask(request, response, YdbConnection->TablePathPrefix, Config.AutomaticQueriesTtl, Config.TaskLeaseTtl, Config.RetryPolicies, Counters.Counters) :
         ConstructSoftPingTask(request, response, YdbConnection->TablePathPrefix, Config.TaskLeaseTtl);
     auto readQuery = std::get<0>(pingTaskParams); // Use std::get for win compiler
     auto readParams = std::get<1>(pingTaskParams);
@@ -429,8 +456,8 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvPingTaskReq
     auto debugInfo = Config.Proto.GetEnableDebugMode() ? std::make_shared<TDebugInfo>() : TDebugInfoPtr{};
     auto result = ReadModifyWrite(NActors::TActivationContext::ActorSystem(), readQuery, readParams, prepareParams, requestCounters, debugInfo);
     auto prepare = [response] { return *response; };
-    auto success = SendResponse<TEvControlPlaneStorage::TEvPingTaskResponse, Yq::Private::PingTaskResult>(
-        "PingTaskRequest",
+    auto success = SendResponse<TEvControlPlaneStorage::TEvPingTaskResponse, Fq::Private::PingTaskResult>(
+        "PingTaskRequest - PingTaskResult",
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),

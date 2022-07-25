@@ -167,7 +167,9 @@ protected:
     TDqComputeActorBase(const NActors::TActorId& executerId, const TTxId& txId, NDqProto::TDqTask&& task,
         IDqAsyncIoFactory::TPtr asyncIoFactory,
         const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
-        const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits, bool ownMemoryQuota = true, bool passExceptions = false)
+        const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits,
+        bool ownMemoryQuota = true, bool passExceptions = false,
+        ::NMonitoring::TDynamicCounterPtr taskCounters = nullptr)
         : ExecuterId(executerId)
         , TxId(txId)
         , Task(std::move(task))
@@ -186,12 +188,14 @@ protected:
             BasicStats = std::make_unique<TBasicStats>();
         }
         InitializeTask();
+        InitMonCounters(taskCounters);
     }
 
     TDqComputeActorBase(const NActors::TActorId& executerId, const TTxId& txId, const NDqProto::TDqTask& task,
         IDqAsyncIoFactory::TPtr asyncIoFactory,
         const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
-        const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits)
+        const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits,
+        ::NMonitoring::TDynamicCounterPtr taskCounters = nullptr)
         : ExecuterId(executerId)
         , TxId(txId)
         , Task(task)
@@ -208,6 +212,22 @@ protected:
             BasicStats = std::make_unique<TBasicStats>();
         }
         InitializeTask();
+        InitMonCounters(taskCounters);
+    }
+
+    void InitMonCounters(::NMonitoring::TDynamicCounterPtr taskCounters) {
+        if (taskCounters) {
+            MkqlMemoryUsage = taskCounters->GetSubgroup("subsystem", "mkql")->GetCounter("MemoryUsage");
+            MkqlMemoryLimit = taskCounters->GetSubgroup("subsystem", "mkql")->GetCounter("MemoryLimit");
+            MonCountersProvided = true;
+        }
+    }
+
+    void UpdateMonCounters() {
+        if (MonCountersProvided) {
+            *MkqlMemoryUsage = GetProfileStats()->MkqlMaxUsedMemory;
+            *MkqlMemoryLimit = GetMkqlMemoryLimit();
+        }
     }
 
     void ReportEventElapsedTime() {
@@ -1436,7 +1456,8 @@ protected:
                         .Callback = static_cast<TSinkCallbacks*>(this),
                         .SecureParams = secureParams,
                         .TypeEnv = typeEnv,
-                        .HolderFactory = holderFactory
+                        .HolderFactory = holderFactory,
+                        .RandomProvider = TaskRunner ? TaskRunner->GetRandomProvider() : nullptr
                     });
             } catch (const std::exception& ex) {
                 throw yexception() << "Failed to create sink " << outputDesc.GetSink().GetType() << ": " << ex.what();
@@ -1448,8 +1469,7 @@ protected:
     void PollAsyncInput(TAsyncInputInfoBase& info, ui64 inputIndex) {
         Y_VERIFY(!TaskRunner || info.Buffer);
         if (info.Finished) {
-            const ui64 indexForLogging = inputIndex; // Crutch for clang
-            CA_LOG_D("Skip polling async input[" << indexForLogging << "]: finished");
+            CA_LOG_D("Skip polling async input[" << inputIndex << "]: finished");
             return;
         }
         const i64 freeSpace = AsyncIoFreeSpace(info);
@@ -1798,6 +1818,10 @@ private:
     bool Running = true;
     TInstant LastSendStatsTime;
     bool PassExceptions = false;
+protected:
+    bool MonCountersProvided = false;
+    ::NMonitoring::TDynamicCounters::TCounterPtr MkqlMemoryUsage;
+    ::NMonitoring::TDynamicCounters::TCounterPtr MkqlMemoryLimit;
 };
 
 } // namespace NYql

@@ -110,14 +110,18 @@ TExprBase DqBuildPartitionsStageStub(TExprBase node, TExprContext& ctx, const TP
     auto handler = partition.ListHandlerLambda();
 
     if constexpr(std::is_base_of<TCoPartitionsByKeys, TPartition>::value) {
-        if (ETypeAnnotationKind::List == handler.Ref().GetTypeAnn()->GetKind()) {
+        if (ETypeAnnotationKind::List == partition.Input().Ref().GetTypeAnn()->GetKind()) {
             handler = Build<TCoLambda>(ctx, handler.Pos())
                 .Args({"flow"})
-                .template Body<TCoToFlow>()
-                    .template Input<TExprApplier>()
-                        .Apply(handler)
-                        .template With<TCoForwardList>(0)
-                            .Stream("flow")
+                .template Body<TCoFlatMap>()
+                    .template Input<TCoSqueezeToList>()
+                        .Stream("flow")
+                    .Build()
+                    .Lambda()
+                        .Args({"list"})
+                        .template Body<TExprApplier>()
+                            .Apply(handler)
+                            .With(0, "list")
                         .Build()
                     .Build()
                 .Build().Done();
@@ -1204,47 +1208,16 @@ TExprBase DqRewriteLengthOfStageOutput(TExprBase node, TExprContext& ctx, IOptim
 
     auto field = BuildAtom("_dq_agg_cnt", node.Pos(), ctx);
 
-    auto combineLambda = Build<TCoLambda>(ctx, node.Pos())
+    auto dqLengthLambda = Build<TCoLambda>(ctx, node.Pos())
         .Args({"stream"})
-        .Body<TCoCombineByKey>()
+        .Body<TDqPhyLength>()
             .Input("stream")
-            .PreMapLambda()
-                .Args({"item"})
-                .Body<TCoJust>()
-                    .Input("item")
-                    .Build()
-                .Build()
-            .KeySelectorLambda()
-                .Args({"item"})
-                .Body(zero)
-                .Build()
-            .InitHandlerLambda()
-                .Args({"key", "item"})
-                .Body<TCoUint64>()
-                    .Literal().Build("1")
-                    .Build()
-                .Build()
-            .UpdateHandlerLambda()
-                .Args({"key", "item", "state"})
-                .Body<TCoInc>()
-                    .Value("state")
-                    .Build()
-                .Build()
-            .FinishHandlerLambda()
-                .Args({"key", "state"})
-                .Body<TCoJust>()
-                    .Input<TCoAsStruct>()
-                        .Add<TCoNameValueTuple>()
-                            .Name(field)
-                            .Value("state")
-                            .Build()
-                        .Build()
-                    .Build()
-                .Build()
+            .Name(field)
             .Build()
         .Done();
 
-    auto result = DqPushLambdaToStageUnionAll(dqUnion, combineLambda, {}, ctx, optCtx);
+
+    auto result = DqPushLambdaToStageUnionAll(dqUnion, dqLengthLambda, {}, ctx, optCtx);
     if (!result) {
         return node;
     }
@@ -1266,10 +1239,7 @@ TExprBase DqRewriteLengthOfStageOutput(TExprBase node, TExprContext& ctx, IOptim
                     .Args({"item", "state"})
                     .Body<TCoAggrAdd>()
                         .Left("state")
-                        .Right<TCoMember>()
-                            .Struct("item")
-                            .Name(field)
-                            .Build()
+                        .Right("item")
                         .Build()
                     .Build()
                 .Build()

@@ -17,6 +17,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvWriteResult
     const Ydb::ResultSet& resultSet = request.result_set();
     const int byteSize = resultSet.ByteSize();
 
+
     CPS_LOG_T("WriteResultDataRequest: " << resultId << " " << resultSetId << " " << startRowId << " " << resultSet.ByteSize() << " " << deadline);
 
     NYql::TIssues issues = ValidateWriteResultData(resultId, resultSet, deadline, Config.ResultSetsTtl);
@@ -28,7 +29,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvWriteResult
         return;
     }
 
-    std::shared_ptr<Yq::Private::WriteTaskResultResult> response = std::make_shared<Yq::Private::WriteTaskResultResult>();
+    std::shared_ptr<Fq::Private::WriteTaskResultResult> response = std::make_shared<Fq::Private::WriteTaskResultResult>();
     response->set_request_id(request.request_id());
 
     NYdb::TValueBuilder itemsAsList;
@@ -67,8 +68,8 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvWriteResult
     auto debugInfo = Config.Proto.GetEnableDebugMode() ? std::make_shared<TDebugInfo>() : TDebugInfoPtr{};
     TAsyncStatus result = Write(NActors::TActivationContext::ActorSystem(), query.Sql, query.Params, requestCounters, debugInfo);
     auto prepare = [response] { return *response; };
-    auto success = SendResponse<TEvControlPlaneStorage::TEvWriteResultDataResponse, Yq::Private::WriteTaskResultResult>(
-        "WriteResultDataRequest",
+    auto success = SendResponse<TEvControlPlaneStorage::TEvWriteResultDataResponse, Fq::Private::WriteTaskResultResult>(
+        "WriteResultDataRequest - WriteResultDataResult",
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),

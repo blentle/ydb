@@ -33,6 +33,7 @@ namespace NYq {
 
 using namespace NActors;
 using namespace NYql;
+using namespace NFq;
 
 struct TEvPingResponse : public NActors::TEventLocal<TEvPingResponse, NActors::TEvents::TSystem::CallbackCompletion> {
     TPingTaskResult Result;
@@ -288,8 +289,23 @@ private:
         }
 
         const TInstant now = TActivationContext::Now();
-        const bool success = ev->Get()->Status.IsSuccess();
-        const bool retryable = !success && Retryable(ev);
+        bool success = ev->Get()->Status.IsSuccess();
+        bool retryable = !success && Retryable(ev);
+
+        TString errorMessage;
+        if (ev->Get()->Result.has_expired_at()) {
+            TInstant expiredAt = NProtoInterop::CastFromProto(ev->Get()->Result.expired_at());
+            if (expiredAt < now) {
+                success = false;
+                retryable = false;
+                errorMessage += "Query ownership time is over: expired_at=" + expiredAt.ToString() + " < now=" + now.ToString();
+            }
+        }
+
+        if (!success) {
+            errorMessage += ev->Get()->Status.GetIssues().ToOneLineString();
+        }
+
         const bool continueLeaseRequest = ev->Cookie == ContinueLeaseRequestCookie;
         TRetryState* retryState = nullptr;
         Y_VERIFY(continueLeaseRequest || !ForwardRequests.empty());
@@ -337,14 +353,14 @@ private:
                 }
             }
         } else if (retryAfter) {
-            LOG_W("Ping response error: " << ev->Get()->Status.GetIssues().ToOneLineString() << ". Retry after: " << *retryAfter);
+            LOG_W("Ping response error: " << errorMessage << ". Retry after: " << *retryAfter);
             Schedule(*retryAfter, new NActors::TEvents::TEvWakeup(continueLeaseRequest ? RetryContinueLeaseWakeupTag : RetryForwardPingRequestWakeupTag));
         } else {
             TRetryState* retryStateForLogging = retryState;
             if (!retryStateForLogging) {
                 retryStateForLogging = continueLeaseRequest ? &RetryState : &ForwardRequests.front().RetryState;
             }
-            LOG_E("Ping response error: " << ev->Get()->Status.GetIssues().ToOneLineString() << ". Retried " << retryStateForLogging->GetRetriesCount() << " times during " << retryStateForLogging->GetRetryTime(now));
+            LOG_E("Ping response error: " << errorMessage << ". Retried " << retryStateForLogging->GetRetriesCount() << " times during " << retryStateForLogging->GetRetryTime(now));
             auto action = ev->Get()->Status.IsSuccess() ? ev->Get()->Result.action() : YandexQuery::QUERY_ACTION_UNSPECIFIED;
             Send(Parent, new TEvents::TEvForwardPingResponse(false, action), 0, ev->Cookie);
             FatalError = true;
@@ -381,10 +397,10 @@ private:
         if (!retry) {
             RetryState.Init(TActivationContext::Now(), StartLeaseTime, Config.PingPeriod);
         }
-        Ping(Yq::Private::PingTaskRequest(), ContinueLeaseRequestCookie);
+        Ping(Fq::Private::PingTaskRequest(), ContinueLeaseRequestCookie);
     }
 
-    void Ping(Yq::Private::PingTaskRequest request, ui64 cookie) {
+    void Ping(Fq::Private::PingTaskRequest request, ui64 cookie) {
         QueryCounters.SetUptimePublicAndServiceCounter((TInstant::Now() - CreatedAt).Seconds());
         // Fill ids
         request.set_tenant(TenantName);

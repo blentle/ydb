@@ -27,18 +27,18 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvNodesHealth
     const auto ttl = TDuration::Seconds(5);
     const auto deadline = startTime + ttl * 3;
 
-    CPS_LOG_T("NodesHealthCheck: " << tenant << " " << nodeId << " " << instanceId << " " << hostName << " " << node.node_address() << ":" << node.interconnect_port());
+    CPS_LOG_T("NodesHealthCheckRequest: {" << request.DebugString() << "}");
 
     NYql::TIssues issues = ValidateNodesHealthCheck(tenant, instanceId, hostName);
     if (issues) {
-        CPS_LOG_D("NodesHealthCheckRequest, validation failed: " << issues.ToString());
+        CPS_LOG_W("NodesHealthCheckRequest: {" << request.DebugString() << "} validation FAILED: " << issues.ToOneLineString());
         const TDuration delta = TInstant::Now() - startTime;
         SendResponseIssues<TEvControlPlaneStorage::TEvNodesHealthCheckResponse>(ev->Sender, issues, ev->Cookie, delta, requestCounters);
         LWPROBE(NodesHealthCheckRequest, "", 0, "", "", delta, false);
         return;
     }
 
-    std::shared_ptr<Yq::Private::NodesHealthCheckResult> response = std::make_shared<Yq::Private::NodesHealthCheckResult>();
+    std::shared_ptr<Fq::Private::NodesHealthCheckResult> response = std::make_shared<Fq::Private::NodesHealthCheckResult>();
     {
         auto* node = response->add_nodes();
         node->set_node_id(nodeId);
@@ -60,7 +60,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvNodesHealth
         "WHERE `" TENANT_COLUMN_NAME"` = $tenant AND `" EXPIRE_AT_COLUMN_NAME "` >= $now;\n"
     );
 
-    auto prepareParams = [=](const TVector<TResultSet>& resultSets) {
+    auto prepareParams = [=, tablePathPrefix=YdbConnection->TablePathPrefix](const TVector<TResultSet>& resultSets) {
         for (const auto& resultSet : resultSets) {
             TResultSetParser parser(resultSet);
             while (parser.TryNextRow()) {
@@ -80,7 +80,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvNodesHealth
             }
         }
 
-        TSqlQueryBuilder writeQueryBuilder(YdbConnection->TablePathPrefix, "NodesHealthCheck(write)");
+        TSqlQueryBuilder writeQueryBuilder(tablePathPrefix, "NodesHealthCheck(write)");
         writeQueryBuilder.AddString("tenant", tenant);
         writeQueryBuilder.AddUint32("node_id", nodeId);
         writeQueryBuilder.AddString("instance_id", instanceId);
@@ -109,8 +109,8 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvNodesHealth
     auto debugInfo = Config.Proto.GetEnableDebugMode() ? std::make_shared<TDebugInfo>() : TDebugInfoPtr{};
     TAsyncStatus status = ReadModifyWrite(NActors::TActivationContext::ActorSystem(), readQuery.Sql, readQuery.Params, prepareParams, requestCounters, debugInfo);
     auto prepare = [response] { return *response; };
-    auto success = SendResponse<TEvControlPlaneStorage::TEvNodesHealthCheckResponse, Yq::Private::NodesHealthCheckResult>(
-        "NodesHealthCheckRequest",
+    auto success = SendResponse<TEvControlPlaneStorage::TEvNodesHealthCheckResponse, Fq::Private::NodesHealthCheckResult>(
+        "NodesHealthCheckRequest - NodesHealthCheckResult",
         NActors::TActivationContext::ActorSystem(),
         status,
         SelfId(),

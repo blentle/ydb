@@ -198,14 +198,14 @@ namespace NKikimr::NBlobDepot {
                     TABLEH() { Stream << "soft"; }
                     TABLEH() { Stream << "hard"; }
                 } else {
-                    Self->BarrierServer->Enumerate([&](ui64 tabletId, ui8 channel, ui32 recordGen, ui32 recordCounter,
-                                ui32 softGen, ui32 softStep, ui32 hardGen, ui32 hardStep) {
+                    Self->BarrierServer->Enumerate([&](ui64 tabletId, ui8 channel, ui32 recordGen, ui32 perGenerationCounter,
+                            TGenStep soft, TGenStep hard) {
                         TABLER() {
                             TABLED() { Stream << tabletId; }
                             TABLED() { Stream << int(channel); }
-                            TABLED() { Stream << recordGen << ":" << recordCounter; }
-                            TABLED() { Stream << softGen << ":" << softStep; }
-                            TABLED() { Stream << hardGen << ":" << hardStep; }
+                            TABLED() { Stream << recordGen << ":" << perGenerationCounter; }
+                            TABLED() { soft.Output(Stream); }
+                            TABLED() { hard.Output(Stream); }
                         }
                     });
                 }
@@ -270,6 +270,69 @@ namespace NKikimr::NBlobDepot {
     void TBlobDepot::RenderMainPage(IOutputStream& s) {
         HTML(s) {
             s << "<a href='app?TabletID=" << TabletID() << "&page=data'>Contained data</a><br>";
+
+            DIV_CLASS("panel panel-info") {
+                DIV_CLASS("panel-heading") {
+                    s << "Stats";
+                }
+                DIV_CLASS("panel-body") {
+                    TABLE_CLASS("table") {
+                        TABLEHEAD() {
+                            TABLER() {
+                                TABLEH() { s << "Parameter"; }
+                                TABLEH() { s << "Value"; }
+                            }
+                        }
+                        TABLEBODY() {
+                            auto outSize = [&](ui64 size) {
+                                static const char *suffixes[] = {
+                                    "B", "KiB", "MiB", "GiB", "TiB", "PiB", nullptr
+                                };
+                                FormatHumanReadable(s, size, 1024, 2, suffixes);
+                            };
+                            TABLER() {
+                                TABLED() { s << "Data, bytes"; }
+                                TABLED() {
+                                    ui64 total = 0;
+                                    Data->EnumerateRefCount([&](TLogoBlobID id, ui32 /*refCount*/) {
+                                        total += id.BlobSize();
+                                    });
+                                    outSize(total);
+                                }
+                            }
+
+                            ui64 trashInFlight = 0;
+                            ui64 trashPending = 0;
+                            Data->EnumerateTrash([&](ui32 /*groupId*/, TLogoBlobID id, bool inFlight) {
+                                (inFlight ? trashInFlight : trashPending) += id.BlobSize();
+                            });
+
+                            TABLER() {
+                                TABLED() { s << "Trash in flight, bytes"; }
+                                TABLED() { outSize(trashInFlight); }
+                            }
+
+                            TABLER() {
+                                TABLED() { s << "Trash pending, bytes"; }
+                                TABLED() { outSize(trashPending); }
+                            }
+
+                            std::vector<ui32> groups;
+                            for (const auto& [groupId, _] : Groups) {
+                                groups.push_back(groupId);
+                            }
+                            std::sort(groups.begin(), groups.end());
+                            for (const ui32 groupId : groups) {
+                                TGroupInfo& group = Groups[groupId];
+                                TABLER() {
+                                    TABLED() { s << "Data in GroupId# " << groupId << ", bytes"; }
+                                    TABLED() { outSize(group.AllocatedBytes); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

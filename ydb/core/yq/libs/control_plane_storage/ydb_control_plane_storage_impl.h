@@ -219,9 +219,10 @@ class TYdbControlPlaneStorageActor : public NActors::TActorBootstrapped<TYdbCont
 
         TMap<TMetricsScope, TScopeCountersPtr> ScopeCounters;
         TMap<TMetricsScope, TFinalStatusCountersPtr> FinalStatusCounters;
-        ::NMonitoring::TDynamicCounterPtr Counters;
 
     public:
+        ::NMonitoring::TDynamicCounterPtr Counters;
+
         explicit TCounters(const ::NMonitoring::TDynamicCounterPtr& counters)
             : Counters(counters)
         {
@@ -535,7 +536,7 @@ private:
             const auto& request = ev->Get()->Request;
             size_t responseByteSize = 0;
             if (issues) {
-                CPS_LOG_AS_D(*actorSystem, name << ": " << request.DebugString() << " error: " << internalIssues.ToString());
+                CPS_LOG_AS_W(*actorSystem, name << ": {" << TrimForLogs(request.DebugString()) << "} ERROR: " << internalIssues.ToOneLineString());
                 auto event = std::make_unique<ResponseEvent>(issues);
                 event->DebugInfo = debugInfo;
                 responseByteSize = event->GetByteSize();
@@ -548,7 +549,7 @@ private:
                     });
                 }
             } else {
-                CPS_LOG_AS_T(*actorSystem, name << ": " << request.DebugString() << " success");
+                CPS_LOG_AS_T(*actorSystem, name << ": {" << TrimForLogs(result.DebugString()) << "} SUCCESS");
                 auto event = std::make_unique<ResponseEvent>(result);
                 event->DebugInfo = debugInfo;
                 responseByteSize = event->GetByteSize();
@@ -610,7 +611,7 @@ private:
             const auto& request = ev->Get()->Request;
             size_t responseByteSize = 0;
             if (issues) {
-                CPS_LOG_AS_D(*actorSystem, name << ": " << request.DebugString() << " error: " << internalIssues.ToString());
+                CPS_LOG_AS_W(*actorSystem, name << ": {" << request.DebugString() << "} ERROR: " << internalIssues.ToOneLineString());
                 auto event = std::make_unique<ResponseEvent>(issues);
                 event->DebugInfo = debugInfo;
                 responseByteSize = event->GetByteSize();
@@ -623,7 +624,7 @@ private:
                     });
                 }
             } else {
-                CPS_LOG_AS_T(*actorSystem, name << ": " << request.DebugString() << " success");
+                CPS_LOG_AS_T(*actorSystem, name << ": {" << result.DebugString() << "} SUCCESS");
                 auto event = std::make_unique<ResponseEvent>(result, auditDetails);
                 event->DebugInfo = debugInfo;
                 responseByteSize = event->GetByteSize();
@@ -680,7 +681,7 @@ private:
 
             size_t responseByteSize = 0;
             if (issues) {
-                CPS_LOG_AS_D(*actorSystem, name << ": error: " << internalIssues.ToString());
+                CPS_LOG_AS_W(*actorSystem, name << " ERROR: " << internalIssues.ToOneLineString());
                 std::unique_ptr<ResponseEvent> event(new ResponseEvent(issues));
                 event->DebugInfo = debugInfo;
                 responseByteSize = event->GetByteSize();
@@ -693,7 +694,7 @@ private:
                     });
                 }
             } else {
-                CPS_LOG_AS_T(*actorSystem, name << ":  success");
+                CPS_LOG_AS_T(*actorSystem, name << ": SUCCESS");
                 std::unique_ptr<ResponseEvent> event(new ResponseEvent(std::make_from_tuple<ResponseEvent>(result)));
                 event->DebugInfo = debugInfo;
                 responseByteSize = event->GetByteSize();
@@ -736,6 +737,14 @@ private:
 
     static TString MakeLogPrefix(const TString& scope, const TString& user, const TString& id = "") {
         return "[" + scope + ", " + user + (id ? ", " + id : "") + "] ";
+    }
+
+    static TString MakeUserInfo(const TString& user, const TString& token = "") {
+        return "[" + user + (token ? ", " + NKikimr::MaskTicket(token) : "") + "] ";
+    }
+
+    static TString TrimForLogs(const TString& s, ui64 maxLength = 4096) {
+        return s.size() > maxLength ? (s.substr(0, maxLength - 3) + "...") : s;
     }
 
     struct TPickTaskParams {

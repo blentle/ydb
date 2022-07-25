@@ -130,7 +130,7 @@
             "Match": {"Type": "Callable", "Name": "S3SinkSettings"},
             "Children": [
                 {"Index": 0, "Name": "Path", "Type": "TCoAtom"},
-                {"Index": 1, "Name": "Settings", "Type": "TCoNameValueTupleList"},
+                {"Index": 1, "Name": "Settings", "Type": "TExprList"},
                 {"Index": 2, "Name": "Token", "Type": "TCoSecureParam"}
             ]
         },
@@ -141,7 +141,8 @@
             "Children": [
                 {"Index": 0, "Name": "Input", "Type": "TExprBase"},
                 {"Index": 1, "Name": "Format", "Type": "TCoAtom"},
-                {"Index": 2, "Name": "Settings", "Type": "TCoNameValueTupleList", "Optional": true}
+                {"Index": 2, "Name": "KeyColumns", "Type": "TCoAtomList"},
+                {"Index": 3, "Name": "Settings", "Type": "TCoNameValueTupleList", "Optional": true}
             ]
         }
     ]

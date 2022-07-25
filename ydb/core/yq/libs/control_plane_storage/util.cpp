@@ -140,7 +140,7 @@ NConfig::TControlPlaneStorageConfig FillDefaultParameters(NConfig::TControlPlane
     return config;
 }
 
-bool DoesPingTaskUpdateQueriesTable(const Yq::Private::PingTaskRequest& request) {
+bool DoesPingTaskUpdateQueriesTable(const Fq::Private::PingTaskRequest& request) {
     return request.status() != YandexQuery::QueryMeta::COMPUTE_STATUS_UNSPECIFIED
         || !request.issues().empty()
         || !request.transient_issues().empty()
@@ -173,6 +173,19 @@ std::pair<TString, TString> SplitId(const TString& id, char delim) {
     auto it = std::find(id.begin(), id.end(), delim);
     return std::make_pair(id.substr(0, it - id.begin()),
         (it != id.end() ? id.substr(it - id.begin() + 1) : TString{""}));
+}
+
+bool IsValidIntervalUnit(const TString& unit) {
+    static constexpr std::array<std::string_view, 10> IntervalUnits = {
+        "MICROSECONDS"sv,
+        "MILLISECONDS"sv,
+        "SECONDS"sv,
+        "MINUTES"sv,
+        "HOURS"sv,
+        "DAYS"sv,
+        "WEEKS"sv
+    };
+    return IsIn(IntervalUnits, unit);
 }
 
 } //namespace NYq

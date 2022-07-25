@@ -3,17 +3,45 @@
 
 namespace NKikimr::NBlobDepot {
 
-    class TBlobDepot::TData::TTxConfirmGC : public NTabletFlatExecutor::TTransactionBase<TBlobDepot> {
+    using TData = TBlobDepot::TData;
+
+    class TData::TTxIssueGC : public NTabletFlatExecutor::TTransactionBase<TBlobDepot> {
+        const ui8 Channel;
+        const ui32 GroupId;
+        const TGenStep IssuedGenStep;
+        std::unique_ptr<TEvBlobStorage::TEvCollectGarbage> CollectGarbage;
+
+    public:
+        TTxIssueGC(TBlobDepot *self, ui8 channel, ui32 groupId, TGenStep issuedGenStep,
+                std::unique_ptr<TEvBlobStorage::TEvCollectGarbage> collectGarbage)
+            : TTransactionBase(self)
+            , Channel(channel)
+            , GroupId(groupId)
+            , IssuedGenStep(issuedGenStep)
+            , CollectGarbage(std::move(collectGarbage))
+        {}
+
+        bool Execute(TTransactionContext& txc, const TActorContext&) override {
+            NIceDb::TNiceDb db(txc.DB);
+            db.Table<Schema::GC>().Key(Channel, GroupId).Update<Schema::GC::IssuedGenStep>(ui64(IssuedGenStep));
+            return true;
+        }
+
+        void Complete(const TActorContext&) override {
+            SendToBSProxy(Self->SelfId(), GroupId, CollectGarbage.release(), GroupId);
+        }
+    };
+
+    class TData::TTxConfirmGC : public NTabletFlatExecutor::TTransactionBase<TBlobDepot> {
         const ui8 Channel;
         const ui32 GroupId;
         std::vector<TLogoBlobID> TrashDeleted;
-        const ui64 ConfirmedGenStep;
+        const TGenStep ConfirmedGenStep;
 
         static constexpr ui32 MaxKeysToProcessAtOnce = 10'000;
 
     public:
-        TTxConfirmGC(TBlobDepot *self, ui8 channel, ui32 groupId, std::vector<TLogoBlobID> trashDeleted,
-                ui64 confirmedGenStep)
+        TTxConfirmGC(TBlobDepot *self, ui8 channel, ui32 groupId, std::vector<TLogoBlobID> trashDeleted, TGenStep confirmedGenStep)
             : TTransactionBase(self)
             , Channel(channel)
             , GroupId(groupId)
@@ -29,8 +57,7 @@ namespace NKikimr::NBlobDepot {
             }
             if (TrashDeleted.size() <= MaxKeysToProcessAtOnce) {
                 TrashDeleted.clear();
-                db.Table<Schema::ConfirmedGC>().Key(Channel, GroupId).Update<Schema::ConfirmedGC::ConfirmedGenStep>(
-                    ConfirmedGenStep);
+                db.Table<Schema::GC>().Key(Channel, GroupId).Update<Schema::GC::ConfirmedGenStep>(ui64(ConfirmedGenStep));
             } else {
                 std::vector<TLogoBlobID> temp;
                 temp.insert(temp.end(), TrashDeleted.begin() + MaxKeysToProcessAtOnce, TrashDeleted.end());
@@ -49,21 +76,21 @@ namespace NKikimr::NBlobDepot {
         }
     };
 
-    std::optional<TBlobDepot::TData::TValue> TBlobDepot::TData::FindKey(const TKey& key) {
+    std::optional<TData::TValue> TData::FindKey(const TKey& key) {
         const auto it = Data.find(key);
         return it != Data.end() ? std::make_optional(it->second) : std::nullopt;
     }
 
-    TBlobDepot::TData::TRecordsPerChannelGroup& TBlobDepot::TData::GetRecordsPerChannelGroup(TLogoBlobID id) {
+    TData::TRecordsPerChannelGroup& TData::GetRecordsPerChannelGroup(TLogoBlobID id) {
         TTabletStorageInfo *info = Self->Info();
         const ui32 groupId = info->GroupFor(id.Channel(), id.Generation());
         Y_VERIFY(groupId != Max<ui32>());
         const auto& key = std::make_tuple(id.TabletID(), id.Channel(), groupId);
-        const auto [it, _] = RecordsPerChannelGroup.try_emplace(key, id.TabletID(), id.Channel(), groupId);
+        const auto [it, _] = RecordsPerChannelGroup.emplace(std::piecewise_construct, key, key);
         return it->second;
     }
 
-    void TBlobDepot::TData::AddDataOnLoad(TKey key, TString value) {
+    void TData::AddDataOnLoad(TKey key, TString value) {
         NKikimrBlobDepot::TValue proto;
         const bool success = proto.ParseFromString(value);
         Y_VERIFY(success);
@@ -75,21 +102,23 @@ namespace NKikimr::NBlobDepot {
         });
     }
 
-    void TBlobDepot::TData::AddTrashOnLoad(TLogoBlobID id) {
+    void TData::AddTrashOnLoad(TLogoBlobID id) {
         auto& record = GetRecordsPerChannelGroup(id);
         record.Trash.insert(id);
-        OnTrashInserted(record);
+        record.EnqueueForCollectionIfPossible(this);
+        AccountBlob(id, true);
     }
 
-    void TBlobDepot::TData::AddConfirmedGenStepOnLoad(ui8 channel, ui32 groupId, ui64 confirmedGenStep) {
+    void TData::AddGenStepOnLoad(ui8 channel, ui32 groupId, TGenStep issuedGenStep, TGenStep confirmedGenStep) {
         const auto& key = std::make_tuple(Self->TabletID(), channel, groupId);
-        const auto [it, _] = RecordsPerChannelGroup.try_emplace(key, Self->TabletID(), channel, groupId);
+        const auto [it, _] = RecordsPerChannelGroup.emplace(std::piecewise_construct, key, key);
         auto& record = it->second;
+        record.IssuedGenStep = issuedGenStep;
         record.LastConfirmedGenStep = confirmedGenStep;
     }
 
-    void TBlobDepot::TData::PutKey(TKey key, TValue&& data) {
-        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT08, "PutKey", (TabletId, Self->TabletID()), (Key, key.ToString(Self->Config)),
+    void TData::PutKey(TKey key, TValue&& data) {
+        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT10, "PutKey", (TabletId, Self->TabletID()), (Key, key.ToString(Self->Config)),
             (KeepState, NKikimrBlobDepot::EKeepState_Name(data.KeepState)));
 
         EnumerateBlobsForValueChain(data.ValueChain, Self->TabletID(), [&](TLogoBlobID id) {
@@ -98,19 +127,14 @@ namespace NKikimr::NBlobDepot {
                 auto& record = GetRecordsPerChannelGroup(id);
                 const auto [_, inserted] = record.Used.insert(id);
                 Y_VERIFY(inserted);
+                AccountBlob(id, 1);
             }
         });
 
         Data[std::move(key)] = std::move(data);
     }
 
-    void TBlobDepot::TData::OnTrashInserted(TRecordsPerChannelGroup& record) {
-        if (!record.CollectGarbageRequestInFlight && record.TabletId == Self->TabletID()) {
-            RecordsWithTrash.PushBack(&record);
-        }
-    }
-
-    std::optional<TString> TBlobDepot::TData::UpdateKeepState(TKey key, NKikimrBlobDepot::EKeepState keepState) {
+    std::optional<TString> TData::UpdateKeepState(TKey key, NKikimrBlobDepot::EKeepState keepState) {
         const auto it = Data.find(key);
         if (it != Data.end() && keepState <= it->second.KeepState) {
             return std::nullopt;
@@ -120,7 +144,7 @@ namespace NKikimr::NBlobDepot {
         return ToValueProto(value);
     }
 
-    void TBlobDepot::TData::DeleteKey(const TKey& key, const std::function<void(TLogoBlobID)>& updateTrash, void *cookie) {
+    void TData::DeleteKey(const TKey& key, const std::function<void(TLogoBlobID)>& updateTrash, void *cookie) {
         const auto it = Data.find(key);
         Y_VERIFY(it != Data.end());
         TValue& value = it->second;
@@ -136,19 +160,16 @@ namespace NKikimr::NBlobDepot {
         Data.erase(it);
     }
 
-    void TBlobDepot::TData::CommitTrash(void *cookie) {
+    void TData::CommitTrash(void *cookie) {
         auto range = InFlightTrash.equal_range(cookie);
         for (auto it = range.first; it != range.second; ++it) {
             auto& record = GetRecordsPerChannelGroup(it->second);
-            const auto usedIt = record.Used.find(it->second);
-            Y_VERIFY(usedIt != record.Used.end());
-            record.Trash.insert(record.Used.extract(usedIt));
-            OnTrashInserted(record);
+            record.MoveToTrash(this, it->second);
         }
         InFlightTrash.erase(range.first, range.second);
     }
 
-    TString TBlobDepot::TData::ToValueProto(const TValue& value) {
+    TString TData::ToValueProto(const TValue& value) {
         NKikimrBlobDepot::TValue proto;
         if (value.Meta) {
             proto.SetMeta(value.Meta);
@@ -167,71 +188,76 @@ namespace NKikimr::NBlobDepot {
         return s;
     }
 
-    void TBlobDepot::TData::HandleTrash() {
+    void TData::HandleTrash() {
         const ui32 generation = Self->Executor()->Generation();
         THashMap<ui32, std::unique_ptr<TEvBlobDepot::TEvPushNotify>> outbox;
 
-        for (TRecordsPerChannelGroup& record : RecordsWithTrash) {
+        while (RecordsWithTrash) {
+            TRecordsPerChannelGroup& record = *RecordsWithTrash.PopFront();
+
             Y_VERIFY(!record.CollectGarbageRequestInFlight);
             Y_VERIFY(record.TabletId == Self->TabletID());
             Y_VERIFY(!record.Trash.empty());
 
-            ui64 nextGenStep = GenStep(*--record.Trash.end());
-
             Y_VERIFY(record.Channel < Self->Channels.size());
             auto& channel = Self->Channels[record.Channel];
 
-            if (!channel.GivenIdRanges.IsEmpty()) {
-                // minimum blob seq id that can still be written by other party
-                const auto minBlobSeqId = TBlobSeqId::FromSequentalNumber(record.Channel, generation,
-                    channel.GivenIdRanges.GetMinimumValue());
+            TGenStep nextGenStep(*--record.Trash.end());
 
-                // step we are going to invalidate (including blobs with this one)
-                const ui32 invalidatedStep = ui32(nextGenStep);
+            // step we are going to invalidate (including blobs with this one)
+            if (TGenStep(record.LeastExpectedBlobId) <= nextGenStep) {
+                const ui32 invalidatedStep = nextGenStep.Step(); // the step we want to invalidate and garbage collect
 
-                if (minBlobSeqId.Step <= invalidatedStep) {
-                    const TLogoBlobID maxId(record.TabletId, generation, minBlobSeqId.Step, record.Channel, 0, 0);
-                    const auto it = record.Trash.lower_bound(maxId);
-                    if (it != record.Trash.begin()) {
-                        nextGenStep = GenStep(*std::prev(it));
-                    } else {
-                        nextGenStep = 0;
+                // remove invalidated step from allocations
+                auto blobSeqId = TBlobSeqId::FromSequentalNumber(record.Channel, generation, channel.NextBlobSeqId);
+                Y_VERIFY(record.LastConfirmedGenStep < TGenStep(blobSeqId));
+                if (blobSeqId.Step <= invalidatedStep) {
+                    blobSeqId.Step = invalidatedStep + 1;
+                    blobSeqId.Index = 0;
+                    channel.NextBlobSeqId = blobSeqId.ToSequentialNumber();
+                }
+
+                // issue notifications to agents
+                for (auto& [agentId, agent] : Self->Agents) {
+                    if (!agent.AgentId) {
+                        continue;
                     }
+                    const auto [it, inserted] = agent.InvalidatedStepInFlight.emplace(record.Channel, invalidatedStep);
+                    if (inserted || it->second < invalidatedStep) {
+                        it->second = invalidatedStep;
 
-                    // issue notifications to agents
-                    for (auto& [agentId, agent] : Self->Agents) {
-                        if (!agent.ConnectedAgent) {
-                            continue;
+                        auto& ev = outbox[agentId];
+                        if (!ev) {
+                            ev.reset(new TEvBlobDepot::TEvPushNotify);
                         }
-                        const auto [it, inserted] = agent.InvalidatedStepInFlight.emplace(record.Channel, invalidatedStep);
-                        if (inserted || it->second < invalidatedStep) {
-                            it->second = invalidatedStep;
-
-                            auto& ev = outbox[agentId];
-                            if (!ev) {
-                                ev.reset(new TEvBlobDepot::TEvPushNotify);
-                            }
-                            auto *item = ev->Record.AddInvalidatedSteps();
-                            item->SetChannel(record.Channel);
-                            item->SetGeneration(generation);
-                            item->SetInvalidatedStep(invalidatedStep);
-                        }
+                        auto *item = ev->Record.AddInvalidatedSteps();
+                        item->SetChannel(record.Channel);
+                        item->SetGeneration(generation);
+                        item->SetInvalidatedStep(invalidatedStep);
                     }
+                }
+                
+                // adjust the barrier to keep it safe now
+                const TLogoBlobID maxId(record.TabletId, record.LeastExpectedBlobId.Generation,
+                    record.LeastExpectedBlobId.Step, record.Channel, 0, 0);
+                const auto it = record.Trash.lower_bound(maxId);
+                if (it != record.Trash.begin()) {
+                    nextGenStep = TGenStep(*std::prev(it));
+                } else {
+                    nextGenStep = {};
                 }
             }
 
             auto keep = std::make_unique<TVector<TLogoBlobID>>();
             auto doNotKeep = std::make_unique<TVector<TLogoBlobID>>();
 
-            // FIXME: check for blob leaks when LastConfirmedGenStep is not properly persisted
-            for (auto it = record.Trash.begin(); it != record.Trash.end() && GenStep(*it) <= record.LastConfirmedGenStep; ++it) {
+            for (auto it = record.Trash.begin(); it != record.Trash.end() && TGenStep(*it) <= record.LastConfirmedGenStep; ++it) {
                 doNotKeep->push_back(*it);
             }
 
-            // FIXME: check for blob loss when LastConfirmedGenStep is not properly persisted
-            const TLogoBlobID keepFrom(record.TabletId, ui32(record.LastConfirmedGenStep >> 32),
-                ui32(record.LastConfirmedGenStep), record.Channel, 0, 0);
-            for (auto it = record.Used.upper_bound(keepFrom); it != record.Used.end() && GenStep(*it) <= nextGenStep; ++it) {
+            const TLogoBlobID keepFrom(record.TabletId, record.LastConfirmedGenStep.Generation(),
+                record.LastConfirmedGenStep.Step(), record.Channel, 0, 0);
+            for (auto it = record.Used.upper_bound(keepFrom); it != record.Used.end() && TGenStep(*it) <= nextGenStep; ++it) {
                 keep->push_back(*it);
             }
 
@@ -244,11 +270,11 @@ namespace NKikimr::NBlobDepot {
             const bool collect = nextGenStep > record.LastConfirmedGenStep;
 
             if (!keep && !doNotKeep && !collect) {
-                continue; // skip this one
+                continue; // nothing to do here
             }
 
             auto ev = std::make_unique<TEvBlobStorage::TEvCollectGarbage>(record.TabletId, generation,
-                record.PerGenerationCounter, record.Channel, collect, ui32(nextGenStep >> 32), ui32(nextGenStep),
+                record.PerGenerationCounter, record.Channel, collect, nextGenStep.Generation(), nextGenStep.Step(),
                 keep.get(), doNotKeep.get(), TInstant::Max(), true);
             keep.release();
             doNotKeep.release();
@@ -256,25 +282,22 @@ namespace NKikimr::NBlobDepot {
             record.CollectGarbageRequestInFlight = true;
             record.PerGenerationCounter += ev->Collect ? ev->PerGenerationCounterStepSize() : 0;
             record.TrashInFlight.insert(record.TrashInFlight.end(), record.Trash.begin(), record.Trash.end());
-            record.NextGenStep = Max(nextGenStep, record.LastConfirmedGenStep);
+            record.IssuedGenStep = Max(nextGenStep, record.LastConfirmedGenStep);
 
-            auto blobSeqId = TBlobSeqId::FromSequentalNumber(record.Channel, generation, channel.NextBlobSeqId);
-            Y_VERIFY(record.LastConfirmedGenStep < GenStep(blobSeqId));
-            if (GenStep(blobSeqId) <= nextGenStep) {
-                blobSeqId.Step = ui32(nextGenStep) + 1;
-                blobSeqId.Index = 0;
-                channel.NextBlobSeqId = blobSeqId.ToSequentialNumber();
-            }
+            record.TIntrusiveListItem<TRecordsPerChannelGroup, TRecordWithTrash>::Unlink();
 
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT09, "issuing TEvCollectGarbage", (TabletId, Self->TabletID()),
-                (Channel, record.Channel), (GroupId, record.GroupId), (Msg, ev->ToString()),
-                (LastConfirmedGenStep, record.LastConfirmedGenStep), (NextGenStep, record.NextGenStep),
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT11, "issuing TEvCollectGarbage", (TabletId, Self->TabletID()),
+                (Channel, int(record.Channel)), (GroupId, record.GroupId), (Msg, ev->ToString()),
+                (LastConfirmedGenStep, record.LastConfirmedGenStep), (IssuedGenStep, record.IssuedGenStep),
                 (TrashInFlight.size, record.TrashInFlight.size()));
 
-            SendToBSProxy(Self->SelfId(), record.GroupId, ev.release(), record.GroupId);
+            if (collect) {
+                Self->Execute(std::make_unique<TTxIssueGC>(Self, record.Channel, record.GroupId, record.IssuedGenStep,
+                    std::move(ev)));
+            } else {
+                SendToBSProxy(Self->SelfId(), record.GroupId, ev.release(), record.GroupId);
+            }
         }
-
-        RecordsWithTrash.Clear();
 
         for (auto& [agentId, ev] : outbox) {
             TAgent& agent = Self->GetAgent(agentId);
@@ -283,62 +306,170 @@ namespace NKikimr::NBlobDepot {
             for (const auto& item : ev->Record.GetInvalidatedSteps()) {
                 request[item.GetChannel()] = item.GetInvalidatedStep();
             }
-            if (const auto& actorId = agent.ConnectedAgent) {
-                TActivationContext::Send(new IEventHandle(*actorId, Self->SelfId(), ev.release(), 0, id));
-            }
+
+            Y_VERIFY(agent.AgentId);
+            agent.PushCallbacks.emplace(id, std::bind(&TData::OnPushNotifyResult, this, std::placeholders::_1));
+            TActivationContext::Send(new IEventHandle(*agent.AgentId, Self->SelfId(), ev.release(), 0, id));
         }
     }
 
-    void TBlobDepot::TData::Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr ev) {
-        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT10, "TEvCollectGarbageResult", (TabletId, ev->Get()->TabletId),
+    void TData::Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr ev) {
+        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT12, "TEvCollectGarbageResult", (TabletId, ev->Get()->TabletId),
             (Channel, ev->Get()->Channel), (GroupId, ev->Cookie), (Msg, ev->Get()->ToString()));
         const auto& key = std::make_tuple(ev->Get()->TabletId, ev->Get()->Channel, ev->Cookie);
         const auto it = RecordsPerChannelGroup.find(key);
         Y_VERIFY(it != RecordsPerChannelGroup.end());
         auto& record = it->second;
-        Y_VERIFY(record.CollectGarbageRequestInFlight);
         if (ev->Get()->Status == NKikimrProto::OK) {
-            for (const TLogoBlobID& id : record.TrashInFlight) { // make it merge
-                record.Trash.erase(id);
-            }
-            record.LastConfirmedGenStep = record.NextGenStep;
+            Y_VERIFY(record.CollectGarbageRequestInFlight);
+            record.OnSuccessfulCollect(this);
             Self->Execute(std::make_unique<TTxConfirmGC>(Self, record.Channel, record.GroupId,
                 std::exchange(record.TrashInFlight, {}), record.LastConfirmedGenStep));
         } else {
-            record.CollectGarbageRequestInFlight = false;
-            OnTrashInserted(record);
+            record.ClearInFlight(this);
             HandleTrash();
         }
     }
 
-    void TBlobDepot::TData::Handle(TEvBlobDepot::TEvPushNotifyResult::TPtr ev) {
+    void TData::OnPushNotifyResult(TEvBlobDepot::TEvPushNotifyResult::TPtr ev) {
         TAgent& agent = Self->GetAgent(ev->Recipient);
+
+        const auto it = agent.InvalidateStepRequests.find(ev->Cookie);
+        Y_VERIFY(it != agent.InvalidateStepRequests.end());
+        auto items = std::move(it->second);
+        agent.InvalidateStepRequests.erase(it);
+
         const ui32 generation = Self->Executor()->Generation();
-        if (const auto it = agent.InvalidateStepRequests.find(ev->Cookie); it != agent.InvalidateStepRequests.end()) {
-            for (const auto& [channel, invalidatedStep] : it->second) {
-                Self->Channels[channel].GivenIdRanges.Trim(channel, generation, invalidatedStep);
-                agent.GivenIdRanges[channel].Trim(channel, generation, invalidatedStep);
-            }
-            agent.InvalidateStepRequests.erase(it);
-        }
+
+        std::set<TBlobSeqId> writesInFlight;
         for (const auto& item : ev->Get()->Record.GetWritesInFlight()) {
-            const auto blobSeqId = TBlobSeqId::FromProto(item);
-            Self->Channels[blobSeqId.Channel].GivenIdRanges.AddPoint(blobSeqId.ToSequentialNumber());
-            agent.GivenIdRanges[blobSeqId.Channel].AddPoint(blobSeqId.ToSequentialNumber());
+            writesInFlight.insert(TBlobSeqId::FromProto(item));
         }
+
+        for (const auto& [channel, invalidatedStep] : items) {
+            const ui32 channel_ = channel;
+            const ui32 invalidatedStep_ = invalidatedStep;
+            auto& agentGivenIdRanges = agent.GivenIdRanges[channel];
+            auto& givenIdRanges = Self->Channels[channel].GivenIdRanges;
+
+            auto begin = writesInFlight.lower_bound(TBlobSeqId{channel, 0, 0, 0});
+            auto end = writesInFlight.upper_bound(TBlobSeqId{channel, Max<ui32>(), Max<ui32>(), TBlobSeqId::MaxIndex});
+
+            auto makeWritesInFlight = [&] {
+                TStringStream s;
+                s << "[";
+                for (auto it = begin; it != end; ++it) {
+                    s << (it != begin ? " " : "") << it->ToString();
+                }
+                s << "]";
+                return s.Str();
+            };
+
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT13, "Trim", (TabletId, Self->TabletID()), (AgentId, agent.ConnectedNodeId),
+                (Id, ev->Cookie), (Channel, channel_), (InvalidatedStep, invalidatedStep_),
+                (GivenIdRanges, Self->Channels[channel_].GivenIdRanges),
+                (Agent.GivenIdRanges, agent.GivenIdRanges[channel_]),
+                (WritesInFlight, makeWritesInFlight()));
+
+            for (auto it = begin; it != end; ++it) {
+                Y_VERIFY_S(agentGivenIdRanges.GetPoint(it->ToSequentialNumber()), "blobSeqId# " << it->ToString());
+                Y_VERIFY_S(givenIdRanges.GetPoint(it->ToSequentialNumber()), "blobSeqId# " << it->ToString());
+            }
+
+            const TBlobSeqId trimmedBlobSeqId{channel, generation, invalidatedStep, TBlobSeqId::MaxIndex};
+            const ui64 validSince = trimmedBlobSeqId.ToSequentialNumber() + 1;
+            givenIdRanges.Subtract(agentGivenIdRanges.Trim(validSince));
+
+            for (auto it = begin; it != end; ++it) {
+                agentGivenIdRanges.AddPoint(it->ToSequentialNumber());
+                givenIdRanges.AddPoint(it->ToSequentialNumber());
+            }
+
+            OnLeastExpectedBlobIdChange(channel);
+        }
+
         HandleTrash();
     }
 
-    void TBlobDepot::TData::OnCommitConfirmedGC(ui8 channel, ui32 groupId) {
+    void TData::OnCommitConfirmedGC(ui8 channel, ui32 groupId) {
         const auto& key = std::make_tuple(Self->TabletID(), channel, groupId);
         const auto it = RecordsPerChannelGroup.find(key);
         Y_VERIFY(it != RecordsPerChannelGroup.end());
-        auto& record = it->second;
-        Y_VERIFY(record.CollectGarbageRequestInFlight);
-        record.CollectGarbageRequestInFlight = false;
-        if (!record.Trash.empty()) {
-            OnTrashInserted(record);
-            HandleTrash();
+        it->second.ClearInFlight(this);
+    }
+
+    void TData::AccountBlob(TLogoBlobID id, bool add) {
+        // account record
+        const ui32 groupId = Self->Info()->GroupFor(id.Channel(), id.Generation());
+        auto& groupStat = Self->Groups[groupId];
+        if (add) {
+            groupStat.AllocatedBytes += id.BlobSize();
+        } else {
+            groupStat.AllocatedBytes -= id.BlobSize();
+        }
+    }
+
+    bool TData::CanBeCollected(ui32 groupId, TBlobSeqId id) const {
+        const auto it = RecordsPerChannelGroup.find(std::make_tuple(Self->TabletID(), id.Channel, groupId));
+        return it != RecordsPerChannelGroup.end() && TGenStep(id) <= it->second.IssuedGenStep;
+    }
+
+    void TData::OnLeastExpectedBlobIdChange(ui8 channel) {
+        auto& ch = Self->Channels[channel];
+        const ui64 minSequenceNumber = ch.GivenIdRanges.IsEmpty()
+            ? ch.NextBlobSeqId
+            : ch.GivenIdRanges.GetMinimumValue();
+        const TBlobSeqId leastExpectedBlobId = TBlobSeqId::FromSequentalNumber(channel, Self->Executor()->Generation(),
+            minSequenceNumber);
+
+        const TTabletStorageInfo *info = Self->Info();
+        const TTabletChannelInfo *storageChannel = info->ChannelInfo(leastExpectedBlobId.Channel);
+        Y_VERIFY(storageChannel);
+        for (const auto& entry : storageChannel->History) {
+            const auto& key = std::make_tuple(info->TabletID, storageChannel->Channel, entry.GroupID);
+            auto [it, _] = RecordsPerChannelGroup.emplace(std::piecewise_construct, key, key);
+            auto& record = it->second;
+            record.OnLeastExpectedBlobIdChange(this, leastExpectedBlobId);
+        }
+    }
+
+    void TData::TRecordsPerChannelGroup::MoveToTrash(TData *self, TLogoBlobID id) {
+        const auto usedIt = Used.find(id);
+        Y_VERIFY(usedIt != Used.end());
+        Trash.insert(Used.extract(usedIt));
+        EnqueueForCollectionIfPossible(self);
+    }
+
+    void TData::TRecordsPerChannelGroup::OnSuccessfulCollect(TData *self) {
+        auto it = Trash.begin();
+        for (const TLogoBlobID& id : TrashInFlight) {
+            for (; it != Trash.end() && *it < id; ++it) {}
+            Y_VERIFY(it != Trash.end() && *it == id);
+            it = Trash.erase(it);
+            self->AccountBlob(id, false);
+        }
+        LastConfirmedGenStep = IssuedGenStep;
+        EnqueueForCollectionIfPossible(self);
+    }
+
+    void TData::TRecordsPerChannelGroup::OnLeastExpectedBlobIdChange(TData *self, TBlobSeqId leastExpectedBlobId) {
+        Y_VERIFY_S(LeastExpectedBlobId <= leastExpectedBlobId, "Prev# " << LeastExpectedBlobId.ToString()
+            << " Next# " << leastExpectedBlobId.ToString());
+        if (LeastExpectedBlobId < leastExpectedBlobId) {
+            LeastExpectedBlobId = leastExpectedBlobId;
+            EnqueueForCollectionIfPossible(self);
+        }
+    }
+
+    void TData::TRecordsPerChannelGroup::ClearInFlight(TData *self) {
+        Y_VERIFY(CollectGarbageRequestInFlight);
+        CollectGarbageRequestInFlight = false;
+        EnqueueForCollectionIfPossible(self);
+    }
+
+    void TData::TRecordsPerChannelGroup::EnqueueForCollectionIfPossible(TData *self) {
+        if (!CollectGarbageRequestInFlight && TabletId == self->Self->TabletID() && Empty() && !Trash.empty()) {
+            self->RecordsWithTrash.PushBack(this);
         }
     }
 

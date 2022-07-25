@@ -61,6 +61,8 @@ namespace NKikimr::NBlobDepot {
             TEvBlobStorage::TEvPutResult*
         >;
 
+        static TString ToString(const TResponse& response);
+
     public:
         TRequestSender(TBlobDepotAgent& agent);
         virtual ~TRequestSender();
@@ -165,7 +167,6 @@ namespace NKikimr::NBlobDepot {
             {}
         };
 
-        bool Registered = false;
         ui32 BlobDepotGeneration = 0;
 
         void Handle(TEvTabletPipe::TEvClientConnected::TPtr ev);

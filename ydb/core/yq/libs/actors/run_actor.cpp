@@ -70,6 +70,7 @@
 #include <ydb/core/yq/libs/checkpointing/checkpoint_coordinator.h>
 #include <ydb/core/yq/libs/checkpointing_common/defs.h>
 #include <ydb/core/yq/libs/checkpoint_storage/storage_service.h>
+#include <ydb/core/yq/libs/common/compression.h>
 #include <ydb/core/yq/libs/private_client/private_client.h>
 
 #define LOG_E(stream) \
@@ -83,6 +84,7 @@ namespace NYq {
 using namespace NActors;
 using namespace NYql;
 using namespace NDqs;
+using namespace NFq;
 
 namespace {
 
@@ -273,6 +275,7 @@ public:
         , QueryCounters(queryCounters)
         , EnableCheckpointCoordinator(Params.QueryType == YandexQuery::QueryContent::STREAMING && Params.CheckpointCoordinatorConfig.GetEnabled())
         , MaxTasksPerOperation(Params.CommonConfig.GetMaxTasksPerOperation() ? Params.CommonConfig.GetMaxTasksPerOperation() : 40)
+        , Compressor(Params.CommonConfig.GetQueryArtifactsCompressionMethod(), Params.CommonConfig.GetQueryArtifactsCompressionMinSize())
     {
         QueryCounters.SetUptimePublicAndServiceCounter(0);
     }
@@ -281,6 +284,7 @@ public:
 
     void Bootstrap() {
         LOG_D("Start run actor. Compute state: " << YandexQuery::QueryMeta::ComputeStatus_Name(Params.Status));
+
         QueryCounters.SetUptimePublicAndServiceCounter((TInstant::Now() - CreatedAt).Seconds());
         LogReceivedParams();
         Pinger = Register(
@@ -297,6 +301,7 @@ public:
                 CreatedAt
                 ));
         Become(&TRunActor::StateFuncWrapper<&TRunActor::StateFunc>);
+
         try {
             Run();
         } catch (const std::exception&) {
@@ -305,6 +310,11 @@ public:
     }
 
 private:
+    enum RunActorWakeupTag : ui64 {
+        ExecutionTimeout = 1
+    };
+
+
     template <void (TRunActor::* DelegatedStateFunc)(STFUNC_SIG)>
     STFUNC(StateFuncWrapper) {
         try {
@@ -321,10 +331,12 @@ private:
         hFunc(TEvents::TEvGraphParams, Handle);
         hFunc(TEvents::TEvDataStreamsReadRulesCreationResult, Handle);
         hFunc(NYql::NDqs::TEvQueryResponse, Handle);
+        hFunc(NActors::TEvents::TEvWakeup, Handle);
         hFunc(TEvents::TEvQueryActionResult, Handle);
         hFunc(TEvents::TEvForwardPingResponse, Handle);
         hFunc(TEvCheckpointCoordinator::TEvZeroCheckpointDone, Handle);
         hFunc(TEvents::TEvRaiseTransientIssues, Handle);
+        hFunc(TEvDqStats, Handle);
     )
 
     STRICT_STFUNC(FinishStateFunc,
@@ -340,6 +352,7 @@ private:
         IgnoreFunc(TEvents::TEvQueryActionResult);
         IgnoreFunc(TEvCheckpointCoordinator::TEvZeroCheckpointDone);
         IgnoreFunc(TEvents::TEvRaiseTransientIssues);
+        IgnoreFunc(TEvDqStats);
     )
 
     void KillExecuter() {
@@ -381,9 +394,32 @@ private:
         NActors::TActorBootstrapped<TRunActor>::PassAway();
     }
 
+    bool TimeLimitExceeded() {
+        if (Params.ExecutionTtl != TDuration::Zero()) {
+            auto currentTime = TInstant::Now();
+            auto started_at = Params.RequestStartedAt;
+            if (started_at == TInstant::Zero()) {
+                started_at = currentTime;
+            }
+            auto deadline = started_at  + Params.ExecutionTtl;
+
+            if (currentTime >= deadline) {
+                Abort("Execution time limit exceeded", YandexQuery::QueryMeta::ABORTED_BY_SYSTEM);
+                return true;
+            } else {
+                Schedule(deadline, new NActors::TEvents::TEvWakeup(RunActorWakeupTag::ExecutionTimeout));
+            }
+        }
+        return false;
+    }
+
     void Run() {
         if (!Params.DqGraphs.empty() && Params.Status != YandexQuery::QueryMeta::STARTING) {
             FillDqGraphParams();
+        }
+
+        if (TimeLimitExceeded()) {
+            return;
         }
 
         switch (Params.Status) {
@@ -440,7 +476,7 @@ private:
         Issues.AddIssue("Internal Error");
 
         if (!ConsumersAreDeleted) {
-            for (const Yq::Private::TopicConsumer& c : Params.CreatedTopicConsumers) {
+            for (const Fq::Private::TopicConsumer& c : Params.CreatedTopicConsumers) {
                 TransientIssues.AddIssue(TStringBuilder() << "Created read rule `" << c.consumer_name() << "` for topic `" << c.topic_path() << "` (database id " << c.database_id() << ") maybe was left undeleted: internal error occurred");
                 TransientIssues.back().Severity = NYql::TSeverityIds::S_WARNING;
             }
@@ -564,6 +600,19 @@ private:
         }
     }
 
+    void Handle(NActors::TEvents::TEvWakeup::TPtr& ev) {
+        auto tag = (RunActorWakeupTag) ev->Get()->Tag;
+        switch (tag) {
+            case RunActorWakeupTag::ExecutionTimeout: {
+                Abort("Execution timeout", YandexQuery::QueryMeta::ABORTED_BY_SYSTEM);
+                break;
+            }
+            default: {
+                Y_VERIFY(false);
+            }
+        }
+    }
+
     void Handle(TEvents::TEvForwardPingResponse::TPtr& ev) {
         LOG_D("Forward ping response. Success: " << ev->Get()->Success << ". Cookie: " << ev->Cookie);
         if (!ev->Get()->Success) { // Failed setting new status or lease was lost
@@ -660,11 +709,17 @@ private:
     }
 
     void Handle(TEvents::TEvRaiseTransientIssues::TPtr& ev) {
-        Yq::Private::PingTaskRequest request;
+        Fq::Private::PingTaskRequest request;
 
         NYql::IssuesToMessage(ev->Get()->TransientIssues, request.mutable_transient_issues());
 
         Send(Pinger, new TEvents::TEvForwardPingRequest(request), 0, RaiseTransientIssuesCookie);
+    }
+
+    void Handle(TEvDqStats::TPtr& ev) {
+        Fq::Private::PingTaskRequest request;
+        *request.mutable_transient_issues() = ev->Get()->Record.issues();
+        Send(Pinger, new TEvents::TEvForwardPingRequest(request), 0);
     }
 
     i32 UpdateResultIndices() {
@@ -676,9 +731,20 @@ private:
     }
 
     void UpdateAstAndPlan(const TString& plan, const TString& expr) {
-        Yq::Private::PingTaskRequest request;
-        request.set_ast(expr);
-        request.set_plan(plan);
+        Fq::Private::PingTaskRequest request;
+        if (Compressor.IsEnabled()) {
+            auto [astCompressionMethod, astCompressed] = Compressor.Compress(expr);
+            request.mutable_ast_compressed()->set_method(astCompressionMethod);
+            request.mutable_ast_compressed()->set_data(astCompressed);
+
+            auto [planCompressionMethod, planCompressed] = Compressor.Compress(plan);
+            request.mutable_plan_compressed()->set_method(planCompressionMethod);
+            request.mutable_plan_compressed()->set_data(planCompressed);
+        } else {
+            request.set_ast(expr); // todo: remove after migration
+            request.set_plan(plan); // todo: remove after migration
+        }
+
         Send(Pinger, new TEvents::TEvForwardPingRequest(request));
     }
 
@@ -687,7 +753,7 @@ private:
             return;
         }
 
-        Yq::Private::PingTaskRequest request;
+        Fq::Private::PingTaskRequest request;
 
         request.set_result_set_count(UpdateResultIndices());
         QueryStateUpdateRequest.set_result_set_count(UpdateResultIndices());
@@ -721,14 +787,22 @@ private:
         }
 
         for (const auto& graphParams : DqGraphParams) {
-            request.add_dq_graph(graphParams.SerializeAsString());
+            const TString& serializedGraph = graphParams.SerializeAsString();
+            if (Compressor.IsEnabled()) {
+                auto& dq_graph_compressed = *request.add_dq_graph_compressed();
+                auto [method, data] = Compressor.Compress(serializedGraph);
+                dq_graph_compressed.set_method(method);
+                dq_graph_compressed.set_data(data);
+            } else {
+                request.add_dq_graph(serializedGraph); // todo: remove after migration
+            }
         }
 
         Send(Pinger, new TEvents::TEvForwardPingRequest(request), 0, SaveQueryInfoCookie);
     }
 
     void SetLoadFromCheckpointMode() {
-        Yq::Private::PingTaskRequest request;
+        Fq::Private::PingTaskRequest request;
         request.set_state_load_mode(YandexQuery::FROM_LAST_CHECKPOINT);
         request.mutable_disposition()->mutable_from_last_checkpoint();
 
@@ -865,29 +939,29 @@ private:
 
             IDqGateway::TResult QueryResult;
 
-            auto& result = ev->Get()->Record;		
+            auto& result = ev->Get()->Record;
 
             LOG_D("Query evaluation response. Issues count: " << result.IssuesSize()
                 << ". Rows count: " << result.GetRowsCount());
 
-            QueryResult.Data = result.yson();	
+            QueryResult.Data = result.yson();
 
-            TIssues issues;		
-            IssuesFromMessage(result.GetIssues(), issues);		
-            bool error = false;		
-            for (const auto& issue : issues) {		
-                if (issue.GetSeverity() <= TSeverityIds::S_ERROR) {		
-                    error = true;		
-                }		
-            }		
+            TIssues issues;
+            IssuesFromMessage(result.GetIssues(), issues);
+            bool error = false;
+            for (const auto& issue : issues) {
+                if (issue.GetSeverity() <= TSeverityIds::S_ERROR) {
+                    error = true;
+                }
+            }
 
-            if (!error) {		
-                QueryResult.SetSuccess();		
-            }		
+            if (!error) {
+                QueryResult.SetSuccess();
+            }
 
-            QueryResult.AddIssues(issues);		
-            QueryResult.Truncated = result.GetTruncated();		
-            QueryResult.RowsCount = result.GetRowsCount();		
+            QueryResult.AddIssues(issues);
+            QueryResult.Truncated = result.GetTruncated();
+            QueryResult.RowsCount = result.GetRowsCount();
             EvaluationResult.SetValue(QueryResult);
 
             EvaluationInProgress = false;
@@ -985,7 +1059,7 @@ private:
     void RunReadRulesDeletionActor() {
         TVector<std::shared_ptr<NYdb::ICredentialsProviderFactory>> credentials;
         credentials.reserve(Params.CreatedTopicConsumers.size());
-        for (const Yq::Private::TopicConsumer& c : Params.CreatedTopicConsumers) {
+        for (const Fq::Private::TopicConsumer& c : Params.CreatedTopicConsumers) {
             if (const TString& tokenName = c.token_name()) {
                 credentials.emplace_back(
                     CreateCredentialsProviderFactoryForStructuredToken(Params.CredentialsFactory, FindTokenByName(tokenName), c.add_bearer_to_token()));
@@ -1016,7 +1090,7 @@ private:
 
         {
             Params.Status = YandexQuery::QueryMeta::RUNNING;
-            Yq::Private::PingTaskRequest request;
+            Fq::Private::PingTaskRequest request;
             request.set_status(YandexQuery::QueryMeta::RUNNING);
             *request.mutable_started_at() = google::protobuf::util::TimeUtil::MillisecondsToTimestamp(Now().MilliSeconds());
             Send(Pinger, new TEvents::TEvForwardPingRequest(request), 0, UpdateQueryInfoCookie);
@@ -1257,7 +1331,7 @@ private:
         const YandexQuery::QueryMeta::ComputeStatus finalizingStatus = GetFinalizingStatus();
         Params.Status = finalizingStatus;
         LOG_D("Write finalizing status: " << YandexQuery::QueryMeta::ComputeStatus_Name(finalizingStatus));
-        Yq::Private::PingTaskRequest request;
+        Fq::Private::PingTaskRequest request;
         request.set_status(finalizingStatus);
         Send(Pinger, new TEvents::TEvForwardPingRequest(request), 0, SaveFinalizingStatusCookie);
     }
@@ -1491,7 +1565,7 @@ private:
 
 /*
         return RunProgram(
-            Params.FunctionRegistry, 
+            Params.FunctionRegistry,
             Params.NextUniqueId,
             dataProvidersInit,
             Params.ModuleResolver,
@@ -1504,7 +1578,7 @@ private:
 */
         ProgramRunnerId = Register(new TProgramRunnerActor(
             SelfId(),
-            Params.FunctionRegistry, 
+            Params.FunctionRegistry,
             Params.NextUniqueId,
             dataProvidersInit,
             Params.ModuleResolver,
@@ -1633,9 +1707,10 @@ private:
     ::NYql::NCommon::TServiceCounters QueryCounters;
     const ::NMonitoring::TDynamicCounters::TCounterPtr QueryUptime;
     bool EnableCheckpointCoordinator = false;
-    Yq::Private::PingTaskRequest QueryStateUpdateRequest;
+    Fq::Private::PingTaskRequest QueryStateUpdateRequest;
 
-    const ui64 MaxTasksPerOperation = 100;
+    const ui64 MaxTasksPerOperation;
+    const TCompressor Compressor;
 
     // Consumers creation
     TVector<NYql::NPq::NProto::TDqPqTopicSource> TopicsForConsumersCreation;

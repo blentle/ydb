@@ -20,6 +20,7 @@
 #include <ydb/core/base/tablet_pipecache.h>
 #include <ydb/core/base/tabletid.h>
 #include <ydb/core/base/user_registry.h>
+#include <ydb/core/base/services/datashard_service_id.h>
 
 #include <ydb/core/blobstorage/backpressure/unisched.h>
 #include <ydb/core/blobstorage/nodewarden/node_warden.h>
@@ -111,6 +112,7 @@
 #include <ydb/core/tx/coordinator/coordinator.h>
 #include <ydb/core/tx/columnshard/blob_cache.h>
 #include <ydb/core/tx/datashard/datashard.h>
+#include <ydb/core/tx/datashard/testload/test_load_actor.h>
 #include <ydb/core/tx/columnshard/columnshard.h>
 #include <ydb/core/tx/mediator/mediator.h>
 #include <ydb/core/tx/replication/controller/controller.h>
@@ -169,6 +171,7 @@
 #include <library/cpp/actors/interconnect/interconnect_tcp_proxy.h>
 #include <library/cpp/actors/interconnect/interconnect_proxy_wrapper.h>
 #include <library/cpp/actors/interconnect/interconnect_tcp_server.h>
+#include <library/cpp/actors/interconnect/handshake_broker.h>
 #include <library/cpp/actors/interconnect/load.h>
 #include <library/cpp/actors/interconnect/poller_actor.h>
 #include <library/cpp/actors/interconnect/poller_tcp.h>
@@ -636,6 +639,13 @@ void TBasicServicesInitializer::InitializeServices(NActors::TActorSystemSetup* s
 
             // create poller actor (whether platform supports it)
             setup->LocalServices.emplace_back(MakePollerActorId(), TActorSetupCmd(CreatePollerActor(), TMailboxType::ReadAsFilled, systemPoolId));
+
+            // create handshake broker actor
+            setup->LocalServices.emplace_back(MakeHandshakeBrokerOutId(), TActorSetupCmd(CreateHandshakeBroker(),
+                TMailboxType::ReadAsFilled, systemPoolId));
+
+            setup->LocalServices.emplace_back(MakeHandshakeBrokerInId(), TActorSetupCmd(CreateHandshakeBroker(),
+                TMailboxType::ReadAsFilled, systemPoolId));
 
             auto destructorQueueSize = std::make_shared<std::atomic<TAtomicBase>>(0);
 
@@ -1826,9 +1836,12 @@ TLoadInitializer::TLoadInitializer(const TKikimrRunConfig& runConfig)
 {}
 
 void TLoadInitializer::InitializeServices(NActors::TActorSystemSetup *setup, const NKikimr::TAppData *appData) {
-    IActor *actor = CreateTestLoadActor(appData->Counters);
-    setup->LocalServices.emplace_back(MakeBlobStorageLoadID(NodeId), TActorSetupCmd(actor, TMailboxType::HTSwap, appData->UserPoolId));
+    IActor *bsActor = CreateTestLoadActor(appData->Counters);
+    setup->LocalServices.emplace_back(MakeBlobStorageLoadID(NodeId), TActorSetupCmd(bsActor, TMailboxType::HTSwap, appData->UserPoolId));
     // FIXME: correct service id
+
+    IActor *dsActor = NDataShard::CreateTestLoadActor(appData->Counters);
+    setup->LocalServices.emplace_back(MakeDataShardLoadId(NodeId), TActorSetupCmd(dsActor, TMailboxType::HTSwap, appData->UserPoolId));
 }
 
 // TFailureInjectionInitializer

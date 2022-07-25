@@ -257,7 +257,7 @@ public:
 
         auto& typeEnv = TypeEnv();
 
-        const NDqProto::TProgram &program = task.GetProgram();
+        const NDqProto::TProgram& program = task.GetProgram();
         YQL_ENSURE(program.GetRuntimeVersion());
         YQL_ENSURE(program.GetRuntimeVersion() <= NYql::NDqProto::ERuntimeVersion::RUNTIME_VERSION_YQL_1_0);
 
@@ -713,6 +713,10 @@ public:
 
     const THashMap<TString, TString>& GetTaskParams() const override {
         return Settings.TaskParams;
+    }
+
+    IRandomProvider* GetRandomProvider() const override {
+        return Context.RandomProvider;
     }
 
     void UpdateStats() override {
