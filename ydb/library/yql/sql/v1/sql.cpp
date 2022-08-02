@@ -3004,8 +3004,8 @@ TNodePtr TSqlTranslation::StructLiteral(const TRule_struct_literal& node) {
 bool TSqlTranslation::TableHintImpl(const TRule_table_hint& rule, TTableHints& hints) {
     // table_hint:
     //      an_id_hint (EQUALS (type_name_tag | LPAREN type_name_tag (COMMA type_name_tag)* COMMA? RPAREN))?
-    //    | (SCHEMA | COLUMNS) type_name_or_bind
-    //    | SCHEMA LPAREN (struct_arg_positional (COMMA struct_arg_positional)*)? COMMA? RPAREN
+    //    | (SCHEMA | COLUMNS) EQUALS? type_name_or_bind
+    //    | SCHEMA EQUALS? LPAREN (struct_arg_positional (COMMA struct_arg_positional)*)? COMMA? RPAREN
     switch (rule.Alt_case()) {
     case TRule_table_hint::kAltTableHint1: {
         const auto& alt = rule.GetAlt_table_hint1();
@@ -3039,7 +3039,7 @@ bool TSqlTranslation::TableHintImpl(const TRule_table_hint& rule, TTableHints& h
 
     case TRule_table_hint::kAltTableHint2: {
         const auto& alt2 = rule.GetAlt_table_hint2();
-        auto node = TypeNodeOrBind(alt2.GetRule_type_name_or_bind2());
+        auto node = TypeNodeOrBind(alt2.GetRule_type_name_or_bind3());
         if (!node) {
             return false;
         }
@@ -3052,7 +3052,7 @@ bool TSqlTranslation::TableHintImpl(const TRule_table_hint& rule, TTableHints& h
         const auto& alt = rule.GetAlt_table_hint3();
         TVector<TNodePtr> labels;
         TVector<TNodePtr> structTypeItems;
-        if (alt.HasBlock3()) {
+        if (alt.HasBlock4()) {
             bool warn = false;
             auto processItem = [&](const TRule_struct_arg_positional& arg) {
                 // struct_arg_positional:
@@ -3087,11 +3087,11 @@ bool TSqlTranslation::TableHintImpl(const TRule_table_hint& rule, TTableHints& h
                 return true;
             };
 
-            if (!processItem(alt.GetBlock3().GetRule_struct_arg_positional1())) {
+            if (!processItem(alt.GetBlock4().GetRule_struct_arg_positional1())) {
                 return false;
             }
 
-            for (auto& entry : alt.GetBlock3().GetBlock2()) {
+            for (auto& entry : alt.GetBlock4().GetBlock2()) {
                 if (!processItem(entry.GetRule_struct_arg_positional2())) {
                     return false;
                 }
@@ -6701,7 +6701,7 @@ TSourcePtr TSqlSelect::SelectCore(const TRule_select_core& node, const TWriteSet
         Ctx.IncrementMonCounter("sql_features", "DistinctInSelect");
     }
 
-    TSourcePtr source(BuildFakeSource(selectPos, /* missingFrom = */ true));
+    TSourcePtr source(BuildFakeSource(selectPos, /* missingFrom = */ true, Mode == NSQLTranslation::ESqlMode::SUBQUERY));
     if (node.HasBlock1() && node.HasBlock9()) {
         Token(node.GetBlock9().GetToken1());
         Ctx.IncrementMonCounter("sql_errors", "DoubleFrom");
@@ -9826,6 +9826,9 @@ TNodePtr TSqlQuery::PragmaStatement(const TRule_pragma_stmt& stmt, bool& success
         } else if (normalizedPragma == "disableansicurrentrow") {
             Ctx.AnsiCurrentRow = false;
             Ctx.IncrementMonCounter("sql_pragma", "DisableAnsiCurrentRow");
+        } else if (normalizedPragma == "emitaggapply") {
+            Ctx.EmitAggApply = true;
+            Ctx.IncrementMonCounter("sql_pragma", "EmitAggApply");
         } else {
             Error() << "Unknown pragma: " << pragma;
             Ctx.IncrementMonCounter("sql_errors", "UnknownPragma");

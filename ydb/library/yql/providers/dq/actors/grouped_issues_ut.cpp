@@ -1,15 +1,8 @@
-#include <ydb/core/yq/libs/ydb/ydb.h>
-
-#include <ydb/library/security/ydb_credentials_provider_factory.h>
 #include <ydb/library/yql/providers/dq/actors/grouped_issues.h>
-
-#include <ydb/public/sdk/cpp/client/ydb_scheme/scheme.h>
-#include <ydb/public/sdk/cpp/client/ydb_table/table.h>
 
 #include <library/cpp/testing/unittest/registar.h>
 #include <library/cpp/time_provider/time_provider.h>
 
-#include <util/system/env.h>
 
 namespace NYq {
 
