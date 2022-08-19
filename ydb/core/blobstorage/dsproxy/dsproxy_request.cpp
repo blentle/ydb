@@ -161,7 +161,7 @@ namespace NKikimr {
         const TActorId reqId = Register(
                 CreateBlobStorageGroupPatchRequest(Info, Sessions->GroupQueues, ev->Sender, Mon,
                         ev->Get(), ev->Cookie, std::move(ev->TraceId), now,
-                        StoragePoolCounters, SelfId(), EnableVPatch.Update(now)));
+                        StoragePoolCounters, EnableVPatch.Update(now)));
         ActiveRequests.insert(reqId);
     }
 
@@ -231,6 +231,14 @@ namespace NKikimr {
         ActiveRequests.insert(reqID);
     }
 
+    void TBlobStorageGroupProxy::HandleNormal(TEvBlobStorage::TEvAssimilate::TPtr &ev) {
+        EnsureMonitoring(true);
+        Mon->EventAssimilate->Inc();
+        const TActorId reqID = Register(CreateBlobStorageGroupAssimilateRequest(Info, Sessions->GroupQueues, ev->Sender,
+            Mon, ev->Get(), ev->Cookie, std::move(ev->TraceId), TActivationContext::Now(), StoragePoolCounters));
+        ActiveRequests.insert(reqID);
+    }
+
     void TBlobStorageGroupProxy::Handle(TEvDeathNote::TPtr ev) {
         const bool wasEmpty = ResponsivenessTracker.IsEmpty();
         for (const auto &item : ev->Get()->Responsiveness) {
@@ -243,11 +251,7 @@ namespace NKikimr {
     }
 
     void TBlobStorageGroupProxy::Handle(TEvBlobStorage::TEvBunchOfEvents::TPtr ev) {
-        const TActorContext& ctx = TActivationContext::ActorContextFor(SelfId());
-        for (auto& ev : ev->Get()->Bunch) {
-            TAutoPtr<IEventHandle> handle(ev.release());
-            Receive(handle, ctx);
-        }
+        ev->Get()->Process(this);
     }
 
     void TBlobStorageGroupProxy::ProcessBatchedPutRequests(TBatchedQueue<TEvBlobStorage::TEvPut::TPtr> &batchedPuts,

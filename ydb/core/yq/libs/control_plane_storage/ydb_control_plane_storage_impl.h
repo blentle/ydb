@@ -193,6 +193,8 @@ class TYdbControlPlaneStorageActor : public NActors::TActorBootstrapped<TYdbCont
         RTC_GET_TASK,
         RTC_NODES_HEALTH_CHECK,
         RTS_QUOTA_USAGE,
+        RTC_CREATE_RATE_LIMITER_RESOURCE,
+        RTC_DELETE_RATE_LIMITER_RESOURCE,
         RTC_MAX,
     };
 
@@ -215,6 +217,8 @@ class TYdbControlPlaneStorageActor : public NActors::TActorBootstrapped<TYdbCont
             { MakeIntrusive<TRequestCounters>("GetTask") },
             { MakeIntrusive<TRequestCounters>("NodesHealthCheck") },
             { MakeIntrusive<TRequestCounters>("GetQuotaUsage") },
+            { MakeIntrusive<TRequestCounters>("CreateRateLimiterResource") },
+            { MakeIntrusive<TRequestCounters>("DeleteRateLimiterResource") },
         });
 
         TMap<TMetricsScope, TScopeCountersPtr> ScopeCounters;
@@ -359,8 +363,11 @@ public:
         hFunc(TEvControlPlaneStorage::TEvGetTaskRequest, Handle);
         hFunc(TEvControlPlaneStorage::TEvPingTaskRequest, Handle);
         hFunc(TEvControlPlaneStorage::TEvNodesHealthCheckRequest, Handle);
+        hFunc(TEvControlPlaneStorage::TEvCreateRateLimiterResourceRequest, Handle);
+        hFunc(TEvControlPlaneStorage::TEvDeleteRateLimiterResourceRequest, Handle);
         hFunc(NMon::TEvHttpInfo, Handle);
         hFunc(TEvQuotaService::TQuotaUsageRequest, Handle);
+        hFunc(TEvQuotaService::TQuotaLimitChangeRequest, Handle);
         hFunc(TEvents::TEvCallback, [](TEvents::TEvCallback::TPtr& ev) { ev->Get()->Callback(); } );
     )
 
@@ -390,10 +397,16 @@ public:
     void Handle(TEvControlPlaneStorage::TEvWriteResultDataRequest::TPtr& ev);
     void Handle(TEvControlPlaneStorage::TEvGetTaskRequest::TPtr& ev);
     void Handle(TEvControlPlaneStorage::TEvPingTaskRequest::TPtr& ev);
+    void Handle(TEvControlPlaneStorage::TEvCreateRateLimiterResourceRequest::TPtr& ev);
+    void Handle(TEvControlPlaneStorage::TEvDeleteRateLimiterResourceRequest::TPtr& ev);
 
     void Handle(TEvControlPlaneStorage::TEvNodesHealthCheckRequest::TPtr& ev);
 
     void Handle(TEvQuotaService::TQuotaUsageRequest::TPtr& ev);
+    void Handle(TEvQuotaService::TQuotaLimitChangeRequest::TPtr& ev);
+
+    template <class TEventPtr, class TRequestActor, ERequestTypeCommon requestType>
+    void HandleRateLimiterImpl(TEventPtr& ev);
 
     template<typename T>
     NYql::TIssues ValidateConnection(T& ev, bool clickHousePasswordRequire = true)

@@ -1,4 +1,4 @@
-#include "ut_utils.h"
+#include <ydb/public/sdk/cpp/client/ydb_persqueue_core/ut/ut_utils/ut_utils.h>
 
 #include <library/cpp/testing/unittest/registar.h>
 #include <library/cpp/threading/future/future.h>
@@ -184,7 +184,7 @@ Y_UNIT_TEST_SUITE(BasicUsage) {
         auto setup = std::make_shared<TPersQueueYdbSdkTestSetup>(TEST_CASE_NAME);
         TWriteSessionSettings writeSettings;
         writeSettings.Path(setup->GetTestTopic()).MessageGroupId("src_id");
-        IExecutor::TPtr executor = new TSyncExecutor();
+        IExecutor::TPtr executor = CreateSyncExecutor();
         writeSettings.CompressionExecutor(executor);
         // LOGBROKER-7189
         //SimpleWriteAndValidateData(setup.get(), writeSettings, 100u, false);

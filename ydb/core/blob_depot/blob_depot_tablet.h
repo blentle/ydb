@@ -3,6 +3,7 @@
 #include "defs.h"
 #include "events.h"
 #include "types.h"
+#include "schema.h"
 
 namespace NKikimr::NBlobDepot {
 
@@ -23,7 +24,7 @@ namespace NKikimr::NBlobDepot {
         ~TBlobDepot();
 
         void HandlePoison() {
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT23, "HandlePoison", (TabletId, TabletID()));
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT23, "HandlePoison", (Id, GetLogId()));
             Become(&TThis::StateZombie);
             Send(Tablet(), new TEvents::TEvPoison);
         }
@@ -31,6 +32,9 @@ namespace NKikimr::NBlobDepot {
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
         static constexpr TDuration ExpirationTimeout = TDuration::Minutes(1);
+
+        // when in decommission mode and not all blocks are yet recovered, then we postpone agent registration
+        THashMap<TActorId, std::deque<std::unique_ptr<IEventHandle>>> RegisterAgentQ;
 
         struct TAgent {
             std::optional<TActorId> PipeServerId;
@@ -77,6 +81,8 @@ namespace NKikimr::NBlobDepot {
         void ResetAgent(TAgent& agent);
         void Handle(TEvBlobDepot::TEvPushNotifyResult::TPtr ev);
 
+        void ProcessRegisterAgentQ();
+
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
         void Enqueue(TAutoPtr<IEventHandle>& ev, const TActorContext&) override {
@@ -86,29 +92,45 @@ namespace NKikimr::NBlobDepot {
         void DefaultSignalTabletActive(const TActorContext&) override {} // signalled explicitly after load is complete
 
         void OnActivateExecutor(const TActorContext&) override {
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT24, "OnActivateExecutor", (TabletId, TabletID()));
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT24, "OnActivateExecutor", (Id, GetLogId()));
             ExecuteTxInitSchema();
         }
 
         void OnLoadFinished() {
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT25, "OnLoadFinished", (TabletId, TabletID()));
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT25, "OnLoadFinished", (Id, GetLogId()));
             Become(&TThis::StateWork);
             SignalTabletActive(TActivationContext::AsActorContext());
         }
 
+        void StartOperation() {
+            InitChannelKinds();
+            StartGroupAssimilator();
+            ProcessRegisterAgentQ();
+        }
+
         void OnDetach(const TActorContext&) override {
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT26, "OnDetach", (TabletId, TabletID()));
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT26, "OnDetach", (Id, GetLogId()));
 
             // TODO: what does this callback mean
             PassAway();
         }
 
         void OnTabletDead(TEvTablet::TEvTabletDead::TPtr& /*ev*/, const TActorContext&) override {
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT27, "OnTabletDead", (TabletId, TabletID()));
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT27, "OnTabletDead", (Id, GetLogId()));
             PassAway();
         }
 
+        void PassAway() override;
+
         void InitChannelKinds();
+
+        TString GetLogId() const {
+            if (Config.HasDecommitGroupId()) {
+                return TStringBuilder() << "{" << TabletID() << "@" << Config.GetDecommitGroupId() << "}";
+            } else {
+                return TStringBuilder() << "{" << TabletID() << "}";
+            }
+        }
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -144,6 +166,7 @@ namespace NKikimr::NBlobDepot {
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
         // Configuration
 
+        bool Configured = false;
         NKikimrBlobDepot::TBlobDepotConfig Config;
 
         void Handle(TEvBlobDepot::TEvApplyConfig::TPtr ev);
@@ -172,10 +195,24 @@ namespace NKikimr::NBlobDepot {
         // Monitoring
 
         class TTxMonData;
-        
+
         bool OnRenderAppHtmlPage(NMon::TEvRemoteHttpInfo::TPtr ev, const TActorContext&) override;
 
         void RenderMainPage(IOutputStream& s);
+
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // Group assimilation
+
+        struct TToken {};
+        std::shared_ptr<TToken> Token = std::make_shared<TToken>();
+
+        TActorId GroupAssimilatorId;
+        EDecommitState DecommitState = EDecommitState::Default;
+        std::optional<TString> AssimilatorState;
+
+        class TGroupAssimilator;
+
+        void StartGroupAssimilator();
     };
 
 } // NKikimr::NBlobDepot

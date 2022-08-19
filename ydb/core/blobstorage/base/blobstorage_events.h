@@ -417,6 +417,14 @@ namespace NKikimr {
 
     struct TEvBlobStorage::TEvBunchOfEvents : TEventLocal<TEvBunchOfEvents, EvBunchOfEvents> {
         std::vector<std::unique_ptr<IEventHandle>> Bunch;
+
+        void Process(IActor *actor) {
+            const TActorContext& ctx = TActivationContext::AsActorContext();
+            for (auto& ev : Bunch) {
+                TAutoPtr<IEventHandle> handle(ev.release());
+                actor->Receive(handle, ctx);
+            }
+        }
     };
 
     struct TEvBlobStorage::TEvAskRestartPDisk : TEventLocal<TEvAskRestartPDisk, EvAskRestartPDisk> {
@@ -513,6 +521,24 @@ namespace NKikimr {
             x->SetNodeId(nodeId);
             x->SetPDiskId(pdiskId);
             x->SetVSlotId(vslotId);
+        }
+    };
+
+    struct TEvBlobStorage::TEvControllerGroupDecommittedNotify : TEventPB<TEvControllerGroupDecommittedNotify,
+            NKikimrBlobStorage::TEvControllerGroupDecommittedNotify, EvControllerGroupDecommittedNotify> {
+        TEvControllerGroupDecommittedNotify() = default;
+
+        TEvControllerGroupDecommittedNotify(ui32 groupId) {
+            Record.SetGroupId(groupId);
+        }
+    };
+
+    struct TEvBlobStorage::TEvControllerGroupDecommittedResponse : TEventPB<TEvControllerGroupDecommittedResponse,
+            NKikimrBlobStorage::TEvControllerGroupDecommittedResponse, EvControllerGroupDecommittedResponse> {
+        TEvControllerGroupDecommittedResponse() = default;
+
+        TEvControllerGroupDecommittedResponse(NKikimrProto::EReplyStatus status) {
+            Record.SetStatus(status);
         }
     };
 

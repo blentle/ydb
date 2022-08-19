@@ -41,6 +41,7 @@ NActors::IActor* CreatePendingFetcher(
     const ::NYq::NConfig::TPrivateApiConfig& privateApiConfig,
     const ::NYq::NConfig::TGatewaysConfig& gatewaysConfig,
     const ::NYq::NConfig::TPingerConfig& pingerConfig,
+    const ::NYq::NConfig::TRateLimiterConfig& rateLimiterConfig,
     const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
     TIntrusivePtr<ITimeProvider> timeProvider,
     TIntrusivePtr<IRandomProvider> randomProvider,
@@ -86,6 +87,16 @@ NActors::IActor* CreatePingerActor(
     TInstant deadline,
     const ::NYql::NCommon::TServiceCounters& queryCounters,
     TInstant createdAt);
+
+NActors::IActor* CreateRateLimiterResourceCreator(
+    const NActors::TActorId& parent,
+    const TString& ownerId,
+    const TString& queryId);
+
+NActors::IActor* CreateRateLimiterResourceDeleter(
+    const NActors::TActorId& parent,
+    const TString& ownerId,
+    const TString& queryId);
 
 TString MakeInternalError(const TString& text);
 

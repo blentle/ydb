@@ -8,14 +8,14 @@ namespace NKikimr::NBlobDepot {
         auto& block = Blocks[tabletId];
         const TMonotonic now = TActivationContext::Monotonic();
         if (generation <= block.BlockedGeneration) {
-            status = NKikimrProto::ALREADY;
+            status = NKikimrProto::BLOCKED;
         } else if (now < block.ExpirationTimestamp) {
             if (blockedGeneration) {
                 *blockedGeneration = block.BlockedGeneration;
             }
             status = NKikimrProto::OK;
         }
-        if (status != NKikimrProto::ALREADY && now + block.TimeToLive / 2 >= block.ExpirationTimestamp && !block.RefreshInFlight) {
+        if (status != NKikimrProto::BLOCKED && now + block.TimeToLive / 2 >= block.ExpirationTimestamp && !block.RefreshInFlight) {
             NKikimrBlobDepot::TEvQueryBlocks queryBlocks;
             queryBlocks.AddTabletIds(tabletId);
             Agent.Issue(std::move(queryBlocks), this, std::make_shared<TQueryBlockContext>(
@@ -67,7 +67,7 @@ namespace NKikimr::NBlobDepot {
         });
     }
 
-    std::pair<ui32, ui64> TBlobDepotAgent::TBlocksManager::GetBlockForTablet(ui64 tabletId) {
+    std::tuple<ui32, ui64> TBlobDepotAgent::TBlocksManager::GetBlockForTablet(ui64 tabletId) {
         if (const auto it = Blocks.find(tabletId); it != Blocks.end()) {
             const auto& record = it->second;
             return {record.BlockedGeneration, record.IssuerGuid};

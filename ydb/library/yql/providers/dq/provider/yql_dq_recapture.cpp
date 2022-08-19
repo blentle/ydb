@@ -22,8 +22,8 @@ using namespace NNodes;
 
 namespace {
 
-const THashSet<TStringBuf> VALID_SOURCES = {DqProviderName, ConfigProviderName, YtProviderName, ClickHouseProviderName, YdbProviderName};
-const THashSet<TStringBuf> VALID_SINKS = {ResultProviderName, YtProviderName};
+const THashSet<TStringBuf> VALID_SOURCES = {DqProviderName, ConfigProviderName, YtProviderName, ClickHouseProviderName, YdbProviderName, S3ProviderName};
+const THashSet<TStringBuf> VALID_SINKS = {ResultProviderName, YtProviderName, S3ProviderName};
 const THashSet<TStringBuf> UNSUPPORTED_CALLABLE = { TCoForwardList::CallableName() };
 
 }
@@ -80,17 +80,19 @@ public:
             TNodeSet visited;
             Scan(*input, ctx, good, dataSize, visited, hasJoin);
 
+            if (good && hasJoin && dataSize > State_->Settings->MaxDataSizePerQuery.Get().GetOrElse(10_GB)) {
+                Statistics_["DqAnalyzerBigJoin"]++;
+                AddInfo(ctx, TStringBuilder() << "too big join input: " << dataSize);
+                good = false;
+            }
+
             if (good) {
                 Statistics_["DqAnalyzerOk"]++;
             } else {
                 Statistics_["DqAnalyzerFail"] ++;
             }
 
-            if ((hasJoin && dataSize > State_->Settings->MaxDataSizePerQuery.Get().GetOrElse(10_GB))) {
-                Statistics_["DqAnalyzerBigJoin"]++;
-            }
-
-            if (!good || (hasJoin && dataSize > State_->Settings->MaxDataSizePerQuery.Get().GetOrElse(10_GB))) {
+            if (!good) {
                 YQL_CLOG(DEBUG, ProviderDq) << "good: " << good << " hasJoin: " << hasJoin << " dataSize: " << dataSize;
                 return TStatus::Ok;
             }

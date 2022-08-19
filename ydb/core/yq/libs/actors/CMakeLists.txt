@@ -19,6 +19,7 @@ target_link_libraries(yq-libs-actors PUBLIC
   cpp-json-yson
   cpp-monlib-dynamic_counters
   library-cpp-random_provider
+  library-cpp-scheme
   cpp-string_utils-quote
   library-cpp-time_provider
   library-cpp-yson
@@ -36,6 +37,7 @@ target_link_libraries(yq-libs-actors PUBLIC
   yq-libs-events
   yq-libs-grpc
   yq-libs-private_client
+  libs-rate_limiter-utils
   yq-libs-result_formatter
   yq-libs-shared_resources
   yq-libs-signer
@@ -86,6 +88,8 @@ target_sources(yq-libs-actors PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/yq/libs/actors/pinger.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/yq/libs/actors/proxy.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/yq/libs/actors/proxy_private.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/yq/libs/actors/rate_limiter_resources.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/yq/libs/actors/rate_limiter.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/yq/libs/actors/result_writer.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/yq/libs/actors/run_actor.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/yq/libs/actors/run_actor_params.cpp

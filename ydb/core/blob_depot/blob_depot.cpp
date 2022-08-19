@@ -19,6 +19,12 @@ namespace NKikimr::NBlobDepot {
 
     STFUNC(TBlobDepot::StateWork) {
         try {
+            // postpone any messages from agents until metadata suction is done
+            if (const auto it = RegisterAgentQ.find(ev->Recipient); it != RegisterAgentQ.end()) {
+                it->second.emplace_back(ev.Release());
+                return;
+            }
+
             switch (const ui32 type = ev->GetTypeRewrite()) {
                 cFunc(TEvents::TSystem::Poison, HandlePoison);
 
@@ -49,6 +55,16 @@ namespace NKikimr::NBlobDepot {
         } catch (...) {
             Y_FAIL_S("unexpected exception# " << CurrentExceptionMessage());
         }
+    }
+
+    void TBlobDepot::PassAway() {
+        for (const TActorId& actorId : {GroupAssimilatorId}) {
+            if (actorId) {
+                TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
+            }
+        }
+
+        TActor::PassAway();
     }
 
     IActor *CreateBlobDepot(const TActorId& tablet, TTabletStorageInfo *info) {

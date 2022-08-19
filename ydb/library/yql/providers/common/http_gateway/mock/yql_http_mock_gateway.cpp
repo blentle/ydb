@@ -69,12 +69,14 @@ public:
         }
     }
 
-     virtual void Download(
+     TCancelHook Download(
             TString ,
             THeaders ,
             std::size_t ,
+            TOnDownloadStart ,
             TOnNewDataPart ,
-            TOnDownloadFinish ) {
+            TOnDownloadFinish ) final {
+        return {};
     }
 
     void AddDefaultResponse(TDataDefaultResponse response) {

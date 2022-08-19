@@ -32,7 +32,7 @@ namespace NKikimr::NBlobDepot {
         bool Execute(TTransactionContext& txc, const TActorContext&) override {
             NIceDb::TNiceDb db(txc.DB);
 
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT22, "TTxResolve::Execute", (TabletId, Self->TabletID()),
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT22, "TTxResolve::Execute", (Id, Self->GetLogId()),
                 (Sender, Request->Sender), (Cookie, Request->Cookie), (ItemIndex, ItemIndex),
                 (LastScannedKey, LastScannedKey));
 
@@ -158,7 +158,7 @@ namespace NKikimr::NBlobDepot {
         }
 
         void Complete(const TActorContext&) override {
-            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT30, "TTxResolve::Complete", (TabletId, Self->TabletID()),
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT30, "TTxResolve::Complete", (Id, Self->GetLogId()),
                 (Sender, Request->Sender), (Cookie, Request->Cookie), (SuccessorTx, bool(SuccessorTx)),
                 (Outbox.size, Outbox.size()));
 
@@ -221,7 +221,19 @@ namespace NKikimr::NBlobDepot {
                 item.SetCookie(*cookie);
             }
             item.SetKey(key.MakeBinaryKey());
-            item.MutableValueChain()->CopyFrom(value.ValueChain);
+            EnumerateBlobsForValueChain(value.ValueChain, Self->TabletID(), [&](const TLogoBlobID& id, ui32 begin, ui32 end) {
+                if (begin != end) {
+                    auto *out = item.AddValueChain();
+                    out->SetGroupId(Self->Info()->GroupFor(id.Channel(), id.Generation()));
+                    LogoBlobIDFromLogoBlobID(id, out->MutableBlobId());
+                    if (begin) {
+                        out->SetSubrangeBegin(begin);
+                    }
+                    if (end != id.BlobSize()) {
+                        out->SetSubrangeEnd(end);
+                    }
+                }
+            });
             if (value.Meta) {
                 item.SetMeta(value.Meta.data(), value.Meta.size());
             }
@@ -244,8 +256,22 @@ namespace NKikimr::NBlobDepot {
     };
 
     void TData::Handle(TEvBlobDepot::TEvResolve::TPtr ev) {
-        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT21, "TEvResolve", (TabletId, Self->TabletID()), (Msg, ev->Get()->ToString()),
+        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT21, "TEvResolve", (Id, Self->GetLogId()), (Msg, ev->Get()->ToString()),
             (Sender, ev->Sender), (Cookie, ev->Cookie));
+
+        if (Self->Config.HasDecommitGroupId() && Self->DecommitState <= EDecommitState::BlobsFinished) {
+            for (const auto& item : ev->Get()->Record.GetItems()) {
+                std::optional<TKey> end = item.HasEndingKey()
+                    ? std::make_optional(TKey::FromBinaryKey(item.GetEndingKey(), Self->Config))
+                    : std::nullopt;
+
+                if (!end || !LastAssimilatedKey || *LastAssimilatedKey < *end) {
+                    // see if we have to query BS for this range and to apply items here
+                    Y_VERIFY_DEBUG(false, "going to return corrupt data");
+                }
+            }
+        }
+
         Self->Execute(std::make_unique<TTxResolve>(Self, ev));
     }
 

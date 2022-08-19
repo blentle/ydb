@@ -46,32 +46,34 @@
 #include <ydb/library/mkql_proto/mkql_proto.h>
 #include <ydb/core/protos/services.pb.h>
 
-#include <library/cpp/yson/node/node_io.h>
+#include <ydb/core/yq/libs/actors/nodes_manager.h>
+#include <ydb/core/yq/libs/common/compression.h>
+#include <ydb/core/yq/libs/common/entity_id.h>
+#include <ydb/core/yq/libs/control_plane_storage/control_plane_storage.h>
+#include <ydb/core/yq/libs/control_plane_storage/events/events.h>
+#include <ydb/core/yq/libs/db_id_async_resolver_impl/db_async_resolver_impl.h>
+#include <ydb/core/yq/libs/gateway/empty_gateway.h>
+#include <ydb/core/yq/libs/checkpointing/checkpoint_coordinator.h>
+#include <ydb/core/yq/libs/checkpointing_common/defs.h>
+#include <ydb/core/yq/libs/checkpoint_storage/storage_service.h>
+#include <ydb/core/yq/libs/private_client/events.h>
+#include <ydb/core/yq/libs/private_client/private_client.h>
+#include <ydb/core/yq/libs/rate_limiter/utils/path.h>
+#include <ydb/core/yq/libs/read_rule/read_rule_creator.h>
+#include <ydb/core/yq/libs/read_rule/read_rule_deleter.h>
+#include <ydb/core/yq/libs/tasks_packer/tasks_packer.h>
+
 #include <library/cpp/actors/core/events.h>
 #include <library/cpp/actors/core/hfunc.h>
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 #include <library/cpp/actors/core/log.h>
-#include <ydb/core/yq/libs/common/entity_id.h>
-#include <ydb/core/yq/libs/db_id_async_resolver_impl/db_async_resolver_impl.h>
-#include <ydb/core/yq/libs/actors/nodes_manager.h>
-#include <ydb/core/yq/libs/gateway/empty_gateway.h>
-#include <ydb/core/yq/libs/read_rule/read_rule_creator.h>
-#include <ydb/core/yq/libs/read_rule/read_rule_deleter.h>
-#include <ydb/core/yq/libs/tasks_packer/tasks_packer.h>
-#include <util/system/hostname.h>
-
 #include <library/cpp/json/yson/json2yson.h>
+#include <library/cpp/yson/node/node_io.h>
 
-#include <ydb/core/yq/libs/control_plane_storage/control_plane_storage.h>
-#include <ydb/core/yq/libs/control_plane_storage/events/events.h>
 #include <google/protobuf/util/time_util.h>
 
 #include <util/string/split.h>
-#include <ydb/core/yq/libs/checkpointing/checkpoint_coordinator.h>
-#include <ydb/core/yq/libs/checkpointing_common/defs.h>
-#include <ydb/core/yq/libs/checkpoint_storage/storage_service.h>
-#include <ydb/core/yq/libs/common/compression.h>
-#include <ydb/core/yq/libs/private_client/private_client.h>
+#include <util/system/hostname.h>
 
 #define LOG_E(stream) \
     LOG_ERROR_S(*TlsActivationContext, NKikimrServices::YQL_PROXY, Params.QueryId << " RunActor : " << stream)
@@ -279,6 +281,7 @@ public:
         , EnableCheckpointCoordinator(Params.QueryType == YandexQuery::QueryContent::STREAMING && Params.CheckpointCoordinatorConfig.GetEnabled())
         , MaxTasksPerOperation(Params.CommonConfig.GetMaxTasksPerOperation() ? Params.CommonConfig.GetMaxTasksPerOperation() : 40)
         , Compressor(Params.CommonConfig.GetQueryArtifactsCompressionMethod(), Params.CommonConfig.GetQueryArtifactsCompressionMinSize())
+        , RateLimiterResourceWasCreated(CalcRateLimiterResourceWasCreated())
     {
         QueryCounters.SetUptimePublicAndServiceCounter(0);
     }
@@ -347,6 +350,7 @@ private:
         hFunc(TEvents::TEvForwardPingResponse, Handle);
         hFunc(TEvCheckpointCoordinator::TEvZeroCheckpointDone, Handle);
         hFunc(TEvents::TEvRaiseTransientIssues, Handle);
+        hFunc(NFq::TEvInternalService::TEvCreateRateLimiterResourceResponse, Handle);
         hFunc(TEvDqStats, Handle);
     )
 
@@ -355,6 +359,8 @@ private:
         hFunc(TEvents::TEvDataStreamsReadRulesDeletionResult, HandleFinish);
         hFunc(NYql::NDqs::TEvQueryResponse, HandleFinish);
         hFunc(TEvents::TEvForwardPingResponse, HandleFinish);
+        hFunc(NFq::TEvInternalService::TEvCreateRateLimiterResourceResponse, HandleFinish);
+        hFunc(NFq::TEvInternalService::TEvDeleteRateLimiterResourceResponse, HandleFinish);
 
         // Ignore tail of action events after normal work.
         IgnoreFunc(TEvents::TEvAsyncContinue);
@@ -382,6 +388,14 @@ private:
             Send(ReadRulesCreatorId, new NActors::TEvents::TEvPoison());
         }
 
+        if (RateLimiterResourceCreatorId) {
+            Send(RateLimiterResourceCreatorId, new NActors::TEvents::TEvPoison());
+        }
+
+        if (RateLimiterResourceDeleterId) {
+            Send(RateLimiterResourceDeleterId, new NActors::TEvents::TEvPoison());
+        }
+
         KillExecuter();
     }
 
@@ -389,6 +403,10 @@ private:
         if (ReadRulesCreatorId) {
             LOG_D("Cancel read rules creation");
             Send(ReadRulesCreatorId, new NActors::TEvents::TEvPoison());
+        }
+
+        if (RateLimiterResourceCreatorId) {
+            Send(RateLimiterResourceCreatorId, new NActors::TEvents::TEvPoison());
         }
 
         if (ControlId) {
@@ -440,6 +458,11 @@ private:
             break;
         case YandexQuery::QueryMeta::STARTING:
             HandleConnections();
+            if (Params.RateLimiterConfig.GetEnabled()) {
+                if (StartRateLimiterResourceCreatorIfNeeded() || !RateLimiterResourceWasCreated) {
+                    return;
+                }
+            }
             RunProgram();
             break;
         case YandexQuery::QueryMeta::RESUMING:
@@ -692,6 +715,14 @@ private:
         } else {
             DqGraphParams.push_back(ev->Get()->GraphParams);
 
+            if (RateLimiterPath) {
+                const TString rateLimiterResource = GetRateLimiterResourcePath(Params.CloudId, Params.Scope.ParseFolder(), Params.QueryId);
+                for (auto& task : *DqGraphParams.back().MutableTasks()) {
+                    task.SetRateLimiter(RateLimiterPath);
+                    task.SetRateLimiterResource(rateLimiterResource);
+                }
+            }
+
             NYql::IDqGateway::TResult gatewayResult;
             // fake it till you make it
             // generate dummy result for YQL facade now, remove this gateway completely
@@ -915,8 +946,7 @@ private:
 
     void SaveQueryResponse(NYql::NDqs::TEvQueryResponse::TPtr& ev) {
         auto& result = ev->Get()->Record;
-        LOG_D("Query response. Retryable: " << result.GetDeprecatedRetriable()
-            << ". Result set index: " << DqGraphIndex
+        LOG_D("Query response. Result set index: " << DqGraphIndex
             << ". Issues count: " << result.IssuesSize()
             << ". Rows count: " << result.GetRowsCount());
 
@@ -1013,7 +1043,6 @@ private:
         if (ev->Get()->Record.GetStatusCode() != NYql::NDqProto::StatusIds::SUCCESS) {
             ev->Get()->Record.SetStatusCode(NYql::NDqProto::StatusIds::CANCELLED);
         }
-        ev->Get()->Record.SetDeprecatedRetriable(false); // User aborted => don't retry, only show issues
 
         QueryResponseArrived = true;
         SaveQueryResponse(ev);
@@ -1085,6 +1114,53 @@ private:
                 std::move(credentials)
             )
         );
+    }
+
+    void Handle(NFq::TEvInternalService::TEvCreateRateLimiterResourceResponse::TPtr& ev) {
+        LOG_D("Rate limiter resource creation finished. Success: " << ev->Get()->Status.IsSuccess());
+        RateLimiterResourceCreatorId = {};
+        if (!ev->Get()->Status.IsSuccess()) {
+            AddIssueWithSubIssues("Problems with rate limiter resource creation", ev->Get()->Status.GetIssues());
+            LOG_D(Issues.ToOneLineString());
+            Finish(YandexQuery::QueryMeta::FAILED);
+        } else {
+            RateLimiterResourceWasCreated = true;
+            RateLimiterPath = ev->Get()->Result.rate_limiter();
+            RunProgram();
+        }
+    }
+
+    void HandleFinish(NFq::TEvInternalService::TEvCreateRateLimiterResourceResponse::TPtr& ev) {
+        LOG_D("Rate limiter resource creation finished. Success: " << ev->Get()->Status.IsSuccess() << ". Issues: " << ev->Get()->Status.GetIssues().ToOneLineString());
+        RateLimiterResourceCreatorId = {};
+
+        StartRateLimiterResourceDeleterIfCan();
+    }
+
+    void HandleFinish(NFq::TEvInternalService::TEvDeleteRateLimiterResourceResponse::TPtr& ev) {
+        LOG_D("Rate limiter resource deletion finished. Success: " << ev->Get()->Status.IsSuccess() << ". Issues: " << ev->Get()->Status.GetIssues().ToOneLineString());
+        RateLimiterResourceDeleterId = {};
+        RateLimiterResourceWasDeleted = true;
+
+        ContinueFinish();
+    }
+
+    bool StartRateLimiterResourceCreatorIfNeeded() {
+        if (!RateLimiterResourceWasCreated && !RateLimiterResourceCreatorId && Params.RateLimiterConfig.GetEnabled()) {
+            LOG_D("Start rate limiter resource creator");
+            RateLimiterResourceCreatorId = Register(CreateRateLimiterResourceCreator(SelfId(), Params.Owner, Params.QueryId));
+            return true;
+        }
+        return false;
+    }
+
+    bool StartRateLimiterResourceDeleterIfCan() {
+        if (!RateLimiterResourceDeleterId && !RateLimiterResourceCreatorId && FinalizingStatusIsWritten && QueryResponseArrived && Params.RateLimiterConfig.GetEnabled()) {
+            LOG_D("Start rate limiter resource deleter");
+            RateLimiterResourceDeleterId = Register(CreateRateLimiterResourceDeleter(SelfId(), Params.Owner, Params.QueryId));
+            return true;
+        }
+        return false;
     }
 
     void RunDqGraphs() {
@@ -1361,10 +1437,20 @@ private:
     }
 
     void ContinueFinish() {
+        bool notFinished = false;
         if (NeedDeleteReadRules() && !ConsumersAreDeleted) {
             if (CanRunReadRulesDeletionActor()) {
                 RunReadRulesDeletionActor();
             }
+            notFinished = true;
+        }
+
+        if (!RateLimiterResourceWasDeleted && Params.RateLimiterConfig.GetEnabled()) {
+            StartRateLimiterResourceDeleterIfCan();
+            notFinished = true;
+        }
+
+        if (notFinished) {
             return;
         }
 
@@ -1687,6 +1773,13 @@ private:
             << " }");
     }
 
+    bool CalcRateLimiterResourceWasCreated() const {
+        if (Params.Status == YandexQuery::QueryMeta::STARTING) {
+            return false;
+        }
+        return true;
+    }
+
 private:
     TActorId FetcherId;
     TActorId ProgramRunnerId;
@@ -1723,6 +1816,13 @@ private:
     TVector<std::shared_ptr<NYdb::ICredentialsProviderFactory>> CredentialsForConsumersCreation;
     TVector<TString> Statistics;
     NActors::TActorId ReadRulesCreatorId;
+
+    // Rate limiter resource creation
+    bool RateLimiterResourceWasCreated = false;
+    bool RateLimiterResourceWasDeleted = false;
+    NActors::TActorId RateLimiterResourceCreatorId;
+    NActors::TActorId RateLimiterResourceDeleterId;
+    TString RateLimiterPath;
 
     // Finish
     bool Finishing = false;

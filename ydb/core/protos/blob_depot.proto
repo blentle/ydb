@@ -35,6 +35,8 @@ message TValue {
     repeated TValueChain ValueChain = 2;
     optional EKeepState KeepState = 3;
     optional bool Public = 4;
+    optional bool Unconfirmed = 5;
+    optional NKikimrProto.TLogoBlobID OriginalBlobId = 6;
 }
 
 message TGivenIdRange {
@@ -46,6 +48,12 @@ message TGivenIdRange {
     repeated TChannelRange ChannelRanges = 1;
 }
 
+message TResolvedValueChain {
+    optional uint32 GroupId = 1;
+    optional NKikimrProto.TLogoBlobID BlobId = 2;
+    optional uint32 SubrangeBegin = 3;
+    optional uint32 SubrangeEnd = 4;
+}
 
 
 
@@ -75,7 +83,7 @@ message TEvRegisterAgentResult {
     }
     optional uint32 Generation = 1;
     repeated TChannelKind ChannelKinds = 2;
-    repeated uint32 DecommittingGroups = 3;
+    optional uint32 DecommitGroupId = 3;
 }
 
 message TEvAllocateIds {
@@ -150,6 +158,7 @@ message TEvCommitBlobSeq {
         optional TBlobLocator BlobLocator = 1; // GroupId and Generation are for validation purposes
         optional bytes Key = 2;
         optional bytes Meta = 3;
+        optional bool Unconfirmed = 4; // if true, then write to BS hasn't been actually performed yet
     }
 
     repeated TItem Items = 1;
@@ -188,7 +197,7 @@ message TEvResolveResult {
     message TResolvedKey {
         optional uint64 Cookie = 1;
         optional bytes Key = 2;
-        repeated TValueChain ValueChain = 3;
+        repeated TResolvedValueChain ValueChain = 3;
         optional bytes Meta = 4;
         repeated uint64 Owners = 5;
     }

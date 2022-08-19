@@ -3,6 +3,7 @@
 
 #include <ydb/library/yql/providers/s3/expr_nodes/yql_s3_expr_nodes.h>
 #include <ydb/library/yql/providers/s3/path_generator/yql_s3_path_generator.h>
+#include <ydb/library/yql/providers/s3/range_helpers/path_list_reader.h>
 #include <ydb/library/yql/core/yql_expr_optimize.h>
 #include <ydb/library/yql/core/yql_opt_utils.h>
 #include <ydb/library/yql/utils/log/log.h>
@@ -27,20 +28,25 @@ std::array<TExprNode::TPtr, 2U> ExtractSchema(TExprNode::TListType& settings) {
     return {};
 }
 
+using namespace NPathGenerator;
+
 struct TListRequest {
     TString Token;
     TString Url;
     TString Pattern;
+    TString UserPath;
+    TVector<IPathGenerator::TColumnWithValue> ColumnValues;
 };
 
 bool operator<(const TListRequest& a, const TListRequest& b) {
-    return std::tie(a.Token, a.Url, a.Pattern) < std::tie(b.Token, b.Url, b.Pattern);
+    return std::tie(a.Token, a.Url, a.Pattern, a.UserPath) < std::tie(b.Token, b.Url, b.Pattern, b.UserPath);
 }
 
 using TPendingRequests = TMap<TListRequest, NThreading::TFuture<IS3Lister::TListResult>>;
 
 struct TGeneratedColumnsConfig {
     TVector<TString> Columns;
+    TPathGeneratorPtr Generator;
     TExprNode::TPtr SchemaTypeNode;
 };
 
@@ -97,9 +103,11 @@ public:
 
         TPendingRequests pendingRequests;
         TNodeMap<TVector<TListRequest>> requestsByNode;
+        TNodeMap<TGeneratedColumnsConfig> genColumnsByNode;
 
         pendingRequests.swap(PendingRequests_);
         requestsByNode.swap(RequestsByNode_);
+        genColumnsByNode.swap(GenColumnsByNode_);
 
         TNodeOnNodeOwnedMap replaces;
         size_t count = 0;
@@ -127,6 +135,21 @@ public:
                 }
             }
 
+            struct TExtraColumnValue {
+                TString Name;
+                TMaybe<NUdf::EDataSlot> Type;
+                TString Value;
+                bool operator<(const TExtraColumnValue& other) const {
+                    return std::tie(Name, Type, Value) < std::tie(other.Name, other.Type, other.Value);
+                }
+            };
+
+            TMap<TMaybe<TVector<TExtraColumnValue>>, NS3Details::TPathList> pathsByExtraValues;
+            const TGeneratedColumnsConfig* generatedColumnsConfig = nullptr;
+            if (auto it = genColumnsByNode.find(node); it != genColumnsByNode.end()) {
+                generatedColumnsConfig = &it->second;
+            }
+
             for (auto& req : requests) {
                 auto it = pendingRequests.find(req);
                 YQL_ENSURE(it != pendingRequests.end());
@@ -141,57 +164,47 @@ public:
                 }
 
                 const auto& listEntries = std::get<IS3Lister::TListEntries>(listResult);
-                if (listEntries.empty()) {
-                    if (IS3Lister::HasWildcards(req.Pattern)) {
-                        ctx.AddError(TIssue(ctx.GetPosition(object.Pos()), TStringBuilder() << "Object " << req.Pattern << " has no items."));
-                    } else {
-                        ctx.AddError(TIssue(ctx.GetPosition(object.Pos()),
-                            TStringBuilder() << "Object " << req.Pattern << " doesn't exist" << (req.Pattern.EndsWith('/') ? " or is a directory." : ".")));
-                    }
+                if (listEntries.empty() && !generatedColumnsConfig && !req.UserPath.EndsWith("/")) {
+                    // request to list particular files that are missing
+                    ctx.AddError(TIssue(ctx.GetPosition(object.Pos()),
+                        TStringBuilder() << "Object " << req.UserPath << " doesn't exist."));
                     return TStatus::Error;
                 }
-                for (auto& entry : listEntries) {
 
+                for (auto& entry : listEntries) {
                     if (entry.Size > fileSizeLimit) {
                         ctx.AddError(TIssue(ctx.GetPosition(object.Pos()),
                             TStringBuilder() << "Size of object " << entry.Path << " = " << entry.Size << " and exceeds limit = " << fileSizeLimit << " specified for format " << formatName));
                         return TStatus::Error;
                     }
 
-                    TExprNodeList extraColumnsAsStructArgs;
-                    if (auto confIt = GenColumnsByNode_.find(node); confIt != GenColumnsByNode_.end()) {
-                        const TGeneratedColumnsConfig& config = confIt->second;
-                        YQL_ENSURE(config.Columns.size() <= entry.MatchedGlobs.size());
-                        YQL_ENSURE(config.SchemaTypeNode);
-
-                        for (size_t i = 0; i < config.Columns.size(); ++i) {
-                            auto& col = config.Columns[i];
-                            extraColumnsAsStructArgs.push_back(
-                                ctx.Builder(object.Pos())
-                                    .List()
-                                        .Atom(0, col)
-                                        .Callable(1, "Data")
-                                            .Callable(0, "StructMemberType")
-                                                .Add(0, config.SchemaTypeNode)
-                                                .Atom(1, col)
-                                            .Seal()
-                                            .Atom(1, entry.MatchedGlobs[i])
-                                        .Seal()
-                                    .Seal()
-                                    .Build()
-                            );
+                    TMaybe<TVector<TExtraColumnValue>> extraValues;
+                    if (generatedColumnsConfig) {
+                        extraValues = TVector<TExtraColumnValue>{};
+                        if (!req.ColumnValues.empty()) {
+                            // explicit partitioning
+                            YQL_ENSURE(req.ColumnValues.size() == generatedColumnsConfig->Columns.size());
+                            for (auto& cv : req.ColumnValues) {
+                                TExtraColumnValue value;
+                                value.Name = cv.Name;
+                                value.Type = cv.Type;
+                                value.Value = cv.Value;
+                                extraValues->push_back(std::move(value));
+                            }
+                        } else {
+                            // last entry matches file name
+                            YQL_ENSURE(entry.MatchedGlobs.size() == generatedColumnsConfig->Columns.size() + 1);
+                            for (size_t i = 0; i < generatedColumnsConfig->Columns.size(); ++i) {
+                                TExtraColumnValue value;
+                                value.Name = generatedColumnsConfig->Columns[i];
+                                value.Value = entry.MatchedGlobs[i];
+                                extraValues->push_back(std::move(value));
+                            }
                         }
                     }
 
-                    pathNodes.emplace_back(
-                        ctx.Builder(object.Pos())
-                            .List()
-                                .Atom(0, entry.Path)
-                                .Atom(1, ToString(entry.Size), TNodeFlags::Default)
-                                .Add(2, ctx.NewCallable(object.Pos(), "AsStruct", std::move(extraColumnsAsStructArgs)))
-                            .Seal()
-                            .Build()
-                    );
+                    auto& pathList = pathsByExtraValues[extraValues];
+                    pathList.emplace_back(entry.Path, entry.Size);
                     ++count;
                     readSize += entry.Size;
                 }
@@ -200,13 +213,92 @@ public:
                 totalSize += readSize;
             }
 
+            for (const auto& [extraValues, pathList] : pathsByExtraValues) {
+                TExprNodeList extraColumnsAsStructArgs;
+                if (extraValues) {
+                    YQL_ENSURE(generatedColumnsConfig);
+                    YQL_ENSURE(generatedColumnsConfig->SchemaTypeNode);
+
+                    for (auto& ev : *extraValues) {
+                        auto resultType = ctx.Builder(object.Pos())
+                            .Callable("StructMemberType")
+                                .Add(0, generatedColumnsConfig->SchemaTypeNode)
+                                .Atom(1, ev.Name)
+                            .Seal()
+                            .Build();
+                        TExprNode::TPtr value;
+                        if (ev.Type.Defined()) {
+                            value = ctx.Builder(object.Pos())
+                                .Callable("StrictCast")
+                                    .Callable(0, "Data")
+                                        .Add(0, ExpandType(object.Pos(), *ctx.MakeType<TDataExprType>(*ev.Type), ctx))
+                                        .Atom(1, ev.Value)
+                                    .Seal()
+                                    .Add(1, resultType)
+                                .Seal()
+                                .Build();
+                        } else {
+                            value = ctx.Builder(object.Pos())
+                                .Callable("DataOrOptionalData")
+                                    .Add(0, resultType)
+                                    .Atom(1, ev.Value)
+                                .Seal()
+                                .Build();
+                        }
+                        extraColumnsAsStructArgs.push_back(
+                            ctx.Builder(object.Pos())
+                                .List()
+                                    .Atom(0, ev.Name)
+                                    .Add(1, value)
+                                .Seal()
+                                .Build()
+                        );
+                    }
+                }
+
+                auto extraColumns = ctx.NewCallable(object.Pos(), "AsStruct", std::move(extraColumnsAsStructArgs));
+
+                TString packedPaths;
+                bool isTextFormat;
+                NS3Details::PackPathsList(pathList, packedPaths, isTextFormat);
+
+                pathNodes.emplace_back(
+                    Build<TS3Path>(ctx, object.Pos())
+                        .Data<TCoString>()
+                            .Literal()
+                            .Build(packedPaths)
+                        .Build()
+                        .IsText<TCoBool>()
+                            .Literal()
+                            .Build(ToString(isTextFormat))
+                        .Build()
+                        .ExtraColumns(extraColumns)
+                    .Done().Ptr()
+                );
+            }
+
             auto settings = read.Ref().Child(4)->ChildrenList();
             auto userSchema = ExtractSchema(settings);
+            if (pathNodes.empty()) {
+                auto data = ctx.Builder(read.Pos())
+                    .Callable("List")
+                        .Callable(0, "ListType")
+                            .Add(0, userSchema.front())
+                        .Seal()
+                    .Seal()
+                    .Build();
+                if (userSchema.back()) {
+                    data = ctx.NewCallable(read.Pos(), "AssumeColumnOrder", { data, userSchema.back() });
+                }
+                replaces.emplace(node, ctx.NewCallable(read.Pos(), "Cons!", { read.World().Ptr(), data }));
+                continue;
+            }
+
             TExprNode::TPtr s3Object;
             s3Object = Build<TS3Object>(ctx, object.Pos())
-                .Paths(ctx.NewList(object.Pos(), std::move(pathNodes)))
-                .Format(ExtractFormat(settings))
-                .Settings(ctx.NewList(object.Pos(), std::move(settings)))
+                    .Paths(ctx.NewList(object.Pos(), std::move(pathNodes)))
+                    .Format(ExtractFormat(settings))
+                    .Settings(ctx.NewList(object.Pos(), std::move(settings)))
                 .Done().Ptr();
 
             replaces.emplace(node, userSchema.back() ?
@@ -308,56 +400,67 @@ private:
         const TString url = connect.Url;
         const TString tokenStr = credentialsProviderFactory->CreateProvider()->GetAuthInfo();
 
-        TString generatedPattern;
+        TGeneratedColumnsConfig config;
         if (!partitionedBy.empty()) {
-            TGeneratedColumnsConfig config;
-            if (!BuildGeneratedPattern(projection, partitionedBy, schema->ChildPtr(1), config, generatedPattern)) {
-                return false;
+            config.Columns = partitionedBy;
+            config.SchemaTypeNode = schema->ChildPtr(1);
+            if (!projection.empty()) {
+                config.Generator = CreatePathGenerator(projection, partitionedBy);
             }
             GenColumnsByNode_[read.Raw()] = config;
         }
 
         for (const auto& path : paths) {
+            // each path in CONCAT() can generate multiple list requests for explicit partitioning
+            TVector<TListRequest> reqs;
+
             TListRequest req;
             req.Token = tokenStr;
             req.Url = url;
+            req.UserPath = path;
 
             if (partitionedBy.empty()) {
-                // treat paths as regular wildcard patterns
-                req.Pattern = path;
+                if (path.EndsWith("/")) {
+                    req.Pattern = path + "*";
+                } else {
+                    // treat paths as regular wildcard patterns
+                    req.Pattern = path;
+                }
+                reqs.push_back(req);
             } else {
                 if (IS3Lister::HasWildcards(path)) {
                     ctx.AddError(TIssue(ctx.GetPosition(read.Pos()), TStringBuilder() << "Path prefix: '" << path << "' contains wildcards"));
                     return false;
                 }
-                req.Pattern = path + generatedPattern;
+                if (!config.Generator) {
+                    // Hive-style partitioning
+                    TString generated;
+                    for (auto& col : config.Columns) {
+                        generated += "/" + col + "=*";
+                    }
+                    generated += "/*";
+                    req.Pattern = path + generated;
+                    reqs.push_back(req);
+                } else {
+                    for (auto& rule : config.Generator->GetRules()) {
+                        YQL_ENSURE(rule.ColumnValues.size() == config.Columns.size());
+                        req.ColumnValues.assign(rule.ColumnValues.begin(), rule.ColumnValues.end());
+                        req.Pattern = path + rule.Path + "/*";
+                        reqs.push_back(req);
+                    }
+                }
             }
 
-            RequestsByNode_[read.Raw()].push_back(req);
-            if (PendingRequests_.find(req) == PendingRequests_.end()) {
-                auto future = Lister_->List(req.Token, req.Url, req.Pattern);
-                PendingRequests_[req] = future;
-                futures.push_back(std::move(future));
+            for (auto& req : reqs) {
+                RequestsByNode_[read.Raw()].push_back(req);
+                if (PendingRequests_.find(req) == PendingRequests_.end()) {
+                    auto future = Lister_->List(req.Token, req.Url, req.Pattern);
+                    PendingRequests_[req] = future;
+                    futures.push_back(std::move(future));
+                }
             }
         }
 
-        return true;
-    }
-
-    static bool BuildGeneratedPattern(const TString& projection, const TVector<TString>& partitionedBy,
-        const TExprNode::TPtr& schemaTypeNode, TGeneratedColumnsConfig& config, TString& generatedPattern)
-    {
-        if (!projection.empty()) {
-            ythrow yexception() << "Projection settings are not supported yet";
-        }
-
-        generatedPattern.clear();
-        config.Columns = partitionedBy;
-        config.SchemaTypeNode = schemaTypeNode;
-        for (auto& col : partitionedBy) {
-            generatedPattern += "/" + col + "=*";
-        }
-        generatedPattern += "/*";
         return true;
     }
 

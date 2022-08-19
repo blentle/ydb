@@ -24,6 +24,7 @@ target_link_libraries(ydb-services-persqueue_v1-ut PUBLIC
   ydb-services-persqueue_v1
   library-cpp-getopt
   library-cpp-svnversion
+  cpp-digest-md5
   ydb-core-testlib
   ydb-library-aclib
   library-persqueue-topic_parser
@@ -49,6 +50,7 @@ target_sources(ydb-services-persqueue_v1-ut PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/services/persqueue_v1/persqueue_common_ut.cpp
   ${CMAKE_SOURCE_DIR}/ydb/services/persqueue_v1/persqueue_compat_ut.cpp
   ${CMAKE_SOURCE_DIR}/ydb/services/persqueue_v1/ut/rate_limiter_test_setup.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/services/persqueue_v1/ut/functions_executor_wrapper.cpp
 )
 add_test(
   NAME

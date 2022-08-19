@@ -214,7 +214,13 @@ public:
         Y_VERIFY(parseOk);
 
         ui64 throughput = ((ui64)pqGroup->TotalPartitionCount) * config.GetPartitionConfig().GetWriteSpeedInBytesPerSecond();
-        ui64 storage = throughput * config.GetPartitionConfig().GetLifetimeSeconds();
+        const ui64 storage = [&config, &throughput]() {
+                        if (config.GetPartitionConfig().HasStorageLimitBytes()) {
+                            return config.GetPartitionConfig().GetStorageLimitBytes();
+                        } else {
+                            return throughput * config.GetPartitionConfig().GetLifetimeSeconds();
+                        }
+                    }();
 
         auto domainInfo = context.SS->ResolveDomainInfo(pathId);
         domainInfo->DecPathsInside();
@@ -467,6 +473,10 @@ public:
 
         if (pqGroup->AlterData) {
             result->SetError(NKikimrScheme::StatusMultipleModifications, "Drop over Create/Alter");
+            return result;
+        }
+        if (!context.SS->CheckInFlightLimit(TTxState::TxDropPQGroup, errStr)) {
+            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
             return result;
         }
 

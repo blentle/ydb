@@ -212,6 +212,32 @@ namespace NKikimr::NBlobDepot {
             TValueChain ValueChain;
             NKikimrBlobDepot::EKeepState KeepState;
             bool Public;
+            bool Unconfirmed;
+            std::optional<TLogoBlobID> OriginalBlobId;
+
+            TValue() = delete;
+            TValue(const TValue&) = delete;
+            TValue(TValue&&) = default;
+
+            TValue& operator =(const TValue&) = delete;
+            TValue& operator =(TValue&&) = default;
+
+            explicit TValue(NKikimrBlobDepot::TValue&& proto)
+                : Meta(proto.GetMeta())
+                , ValueChain(std::move(*proto.MutableValueChain()))
+                , KeepState(proto.GetKeepState())
+                , Public(proto.GetPublic())
+                , Unconfirmed(proto.GetUnconfirmed())
+                , OriginalBlobId(proto.HasOriginalBlobId()
+                    ? std::make_optional(LogoBlobIDFromLogoBlobID(proto.GetOriginalBlobId()))
+                    : std::nullopt)
+            {}
+
+            explicit TValue(NKikimrBlobDepot::EKeepState keepState)
+                : KeepState(keepState)
+                , Public(false)
+                , Unconfirmed(false)
+            {}
         };
 
         enum EScanFlags : ui32 {
@@ -260,6 +286,7 @@ namespace NKikimr::NBlobDepot {
         THashMap<std::tuple<ui64, ui8, ui32>, TRecordsPerChannelGroup> RecordsPerChannelGroup;
         TIntrusiveList<TRecordsPerChannelGroup, TRecordWithTrash> RecordsWithTrash;
         std::optional<TKey> LastLoadedKey; // keys are being loaded in ascending order
+        std::optional<TKey> LastAssimilatedKey;
 
         THashMultiMap<void*, TLogoBlobID> InFlightTrash; // being committed, but not yet confirmed
 
@@ -275,8 +302,6 @@ namespace NKikimr::NBlobDepot {
         TData(TBlobDepot *self)
             : Self(self)
         {}
-
-        std::optional<TValue> FindKey(const TKey& key);
 
         template<typename TCallback>
         void ScanRange(const TKey *begin, const TKey *end, TScanFlags flags, TCallback&& callback) {
@@ -308,9 +333,12 @@ namespace NKikimr::NBlobDepot {
             }
         }
 
+        NKikimrBlobDepot::EKeepState GetKeepState(const TKey& key) const;
+
         TRecordsPerChannelGroup& GetRecordsPerChannelGroup(TLogoBlobID id);
 
         void AddDataOnLoad(TKey key, TString value);
+        void AddDataOnDecommit(const TEvBlobStorage::TEvAssimilateResult::TBlob& blob, NTabletFlatExecutor::TTransactionContext& txc);
         void AddTrashOnLoad(TLogoBlobID id);
         void AddGenStepOnLoad(ui8 channel, ui32 groupId, TGenStep issuedGenStep, TGenStep confirmedGenStep);
 

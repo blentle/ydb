@@ -23,6 +23,15 @@ namespace NKikimr::NBlobDepot {
             void Initiate() override {
                 auto& msg = GetQuery();
 
+                if (msg.Decommission) {
+                    // just forward this message to underlying proxy
+                    Y_VERIFY(Agent.ProxyId);
+                    const bool sent = TActivationContext::Send(Event->Forward(Agent.ProxyId));
+                    Y_VERIFY(sent);
+                    delete this;
+                    return;
+                }
+
                 Response = std::make_unique<TEvBlobStorage::TEvGetResult>(NKikimrProto::OK, msg.QuerySize,
                     Agent.VirtualGroupId);
                 AnswersRemain = msg.QuerySize;
@@ -36,7 +45,7 @@ namespace NKikimr::NBlobDepot {
                     response.RequestedSize = query.Size;
 
                     TString blobId = query.Id.AsBinaryString();
-                    if (const TValueChain *value = Agent.BlobMappingCache.ResolveKey(blobId, this,
+                    if (const TResolvedValueChain *value = Agent.BlobMappingCache.ResolveKey(blobId, this,
                             std::make_shared<TResolveKeyContext>(i))) {
                         if (!ProcessSingleResult(i, value)) {
                             return;
@@ -45,7 +54,7 @@ namespace NKikimr::NBlobDepot {
                 }
             }
 
-            bool ProcessSingleResult(ui32 queryIdx, const TValueChain *value) {
+            bool ProcessSingleResult(ui32 queryIdx, const TResolvedValueChain *value) {
                 auto& msg = GetQuery();
 
                 if (!value) {
@@ -57,7 +66,7 @@ namespace NKikimr::NBlobDepot {
                 } else if (value) {
                     TString error;
                     const bool success = Agent.IssueRead(*value, msg.Queries[queryIdx].Shift, msg.Queries[queryIdx].Size,
-                        msg.GetHandleClass, msg.MustRestoreFirst, this, queryIdx, true, &error);
+                        msg.GetHandleClass, msg.MustRestoreFirst, this, queryIdx, &error);
                     if (!success) {
                         EndWithError(NKikimrProto::ERROR, std::move(error));
                         return false;

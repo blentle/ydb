@@ -164,6 +164,15 @@ enum EEntityStatus {
     RESTART = 4; // entity has changed config or changed environment and should be restarted by warden
 }
 
+message TGroupDecommitStatus {
+    enum E {
+        NONE = 0; // no decomission
+        PENDING = 1; // decommission machinery is starting
+        IN_PROGRESS = 2; // decomission underway
+        DONE = 3; // group decomission complete
+    }
+}
+
 message TGroupInfo {
     message TFailRealm {
         message TFailDomain {
@@ -187,7 +196,7 @@ message TGroupInfo {
     optional string StoragePoolName = 13;
     optional EPDiskType DeviceType = 14;
     optional uint64 BlobDepotId = 15; // if filled, then this is virtual group
-    optional uint32 AssimilatorGroupId = 16; // if filled, then this group is being assimilated by AssimilatorGroupId
+    optional TGroupDecommitStatus.E DecommitStatus = 16;
 }
 
 message TEvVPatchStart {
@@ -555,6 +564,63 @@ message TEvVGetBlockResult {
 
     optional NKikimrBlobStorage.TVDiskID VDiskID = 4;
     optional TMsgQoS MsgQoS = 10;
+
+    optional TGroupInfo RecentGroup = 100; // filled in by VDisk on RACE when VDisk has newer generation
+}
+
+message TEvVAssimilate {
+    message TBarrierKey {
+        optional fixed64 TabletId = 1;
+        optional uint32 Channel = 2;
+    }
+
+    optional NKikimrBlobStorage.TVDiskID VDiskID = 1;
+    optional bool NotifyIfNotReady = 2;
+
+    optional fixed64 SkipBlocksUpTo = 10; // return keys strictly greater than this; if not set, return since the first one
+    optional TBarrierKey SkipBarriersUpTo = 11; // the same behaviour
+    optional NKikimrProto.TLogoBlobID SkipBlobsUpTo = 12; // the same behaviour
+}
+
+message TEvVAssimilateResult {
+    message TBlock {
+        optional fixed64 TabletId = 1;
+        optional uint32 BlockedGeneration = 2;
+    }
+
+    message TBarrier {
+        message TValue {
+            optional uint32 RecordGeneration = 1;
+            optional uint32 PerGenerationCounter = 2;
+            optional uint32 CollectGeneration = 3;
+            optional uint32 CollectStep = 4;
+        }
+
+        optional fixed64 TabletId = 1;
+        optional uint32 Channel = 2;
+        optional TValue Soft = 3;
+        optional TValue Hard = 4;
+    }
+
+    message TBlob {
+        // incremental blob encoding
+        optional fixed64 RawX1 = 1;
+        optional fixed64 RawX2 = 2;
+        optional fixed64 RawX3 = 3;
+        optional uint64 DiffX1 = 4;
+        optional uint64 DiffX2 = 5;
+        optional uint64 DiffX3 = 6;
+
+        optional uint64 Ingress = 7;
+    }
+
+    optional NKikimrProto.EReplyStatus Status = 1;
+    optional string ErrorReason = 2;
+    optional NKikimrBlobStorage.TVDiskID VDiskID = 3;
+
+    repeated TBlock Blocks = 10;
+    repeated TBarrier Barriers = 11;
+    repeated TBlob Blobs = 12;
 
     optional TGroupInfo RecentGroup = 100; // filled in by VDisk on RACE when VDisk has newer generation
 }
@@ -1262,17 +1328,25 @@ message TEvControllerNodeReport {
         WIPED = 2;
         DESTROYED = 3;
         OPERATION_ERROR = 4;
-        DROP_DONOR = 5;
+        reserved 5;
     }
     message TVDiskReport {
         optional NKikimrBlobStorage.TVSlotId VSlotId = 1;
         optional NKikimrBlobStorage.TVDiskID VDiskId = 2;
         optional EVDiskPhase Phase = 3;
-        optional NKikimrBlobStorage.TVDiskID OtherVDiskId = 4;
     }
 
     optional uint32 NodeId = 1;
     repeated TVDiskReport VDiskReports = 2;
+}
+
+message TEvControllerGroupDecommittedNotify {
+    optional uint32 GroupId = 1;
+}
+
+message TEvControllerGroupDecommittedResponse {
+    optional NKikimrProto.EReplyStatus Status = 1;
+    optional string ErrorReason = 2;
 }
 
 message TEvTestLoadRequest {
@@ -1464,23 +1538,22 @@ message TEvTestLoadRequest {
 
     message TKqpLoadStart {
         message TStockWorkload {
-            optional uint64 ProductCount = 1;
-            optional uint64 Quantity = 2;
+            optional uint64 ProductCount = 1 [default = 100];
+            optional uint64 Quantity = 2 [default = 1000];
+            optional uint64 OrderCount = 3 [default = 100];
+            optional uint64 Limit = 4 [default = 10]; 
+            optional bool PartitionsByLoad = 5 [default = true];
         }
         optional uint64 Tag = 1;
         optional uint32 DurationSeconds = 2;
-        optional uint32 NumOfSessions = 3;
-        optional uint32 MaxInFlight = 4;
-        optional uint32 StringValueSize = 5 [default = 8000];
-        optional uint64 FirstKey = 6 [default = 0];
-        optional bool DeleteTableOnFinish = 7 [default = true];
-        optional bool SequentialWrite = 8 [default = true];
-        optional uint32 UniformPartitionsCount = 9 [default = 1];
-        optional uint64 TotalRowsToUpsert = 10;
-        optional string WorkingDir = 11;
-        optional string WorkloadName = 12;
+        optional uint32 WindowDuration = 3;
+        optional string WorkingDir = 4;
+        optional uint32 NumOfSessions = 5;
+        optional bool DeleteTableOnFinish = 6;
+        optional uint32 UniformPartitionsCount = 7;
+        optional uint32 WorkloadType = 8;
         oneof Workload {
-            TStockWorkload Stock = 13;
+            TStockWorkload Stock = 9;
         }
     }
 

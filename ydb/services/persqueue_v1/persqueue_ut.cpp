@@ -4,6 +4,7 @@
 #include <ydb/services/persqueue_v1/ut/rate_limiter_test_setup.h>
 #include <ydb/services/persqueue_v1/ut/test_utils.h>
 #include <ydb/services/persqueue_v1/ut/persqueue_test_fixture.h>
+#include <ydb/services/persqueue_v1/ut/functions_executor_wrapper.h>
 
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/mon/sync_http_mon.h>
@@ -20,6 +21,7 @@
 
 #include <library/cpp/testing/unittest/tests_data.h>
 #include <library/cpp/testing/unittest/registar.h>
+#include <library/cpp/digest/md5/md5.h>
 #include <library/cpp/json/json_reader.h>
 #include <library/cpp/monlib/dynamic_counters/encode.h>
 #include <google/protobuf/text_format.h>
@@ -242,6 +244,18 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
             UNIT_ASSERT(resp.assigned().partition() == 0);
 
             assignId = resp.assigned().assign_id();
+
+            req.Clear();
+            req.mutable_start_read()->mutable_topic()->set_path("acc/topic1");
+            req.mutable_start_read()->set_cluster("dc1");
+            req.mutable_start_read()->set_partition(0);
+            req.mutable_start_read()->set_assign_id(354235); // invalid id should receive no reaction
+
+            req.mutable_start_read()->set_read_offset(10);
+            UNIT_ASSERT_C(readStream->Write(req), "write fail");
+
+            Sleep(TDuration::MilliSeconds(100));
+
             req.Clear();
             req.mutable_start_read()->mutable_topic()->set_path("acc/topic1");
             req.mutable_start_read()->set_cluster("dc1");
@@ -409,6 +423,16 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
             UNIT_ASSERT((partition_ids == TVector<i64>{0, 1}));
 
             assignId = resp.start_partition_session_request().partition_session().partition_session_id();
+
+            req.Clear();
+
+            // invalid id should receive no reaction
+            req.mutable_start_partition_session_response()->set_partition_session_id(1124134);
+
+            UNIT_ASSERT_C(readStream->Write(req), "write fail");
+
+            Sleep(TDuration::MilliSeconds(100));
+
             req.Clear();
             req.mutable_start_partition_session_response()->set_partition_session_id(assignId);
 
@@ -1782,18 +1806,114 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         }
     }
 
+    Y_UNIT_TEST(EventBatching) {
+        NPersQueue::TTestServer server;
+        server.EnableLogs({ NKikimrServices::PQ_WRITE_PROXY, NKikimrServices::PQ_READ_PROXY});
+        PrepareForGrpc(server);
+
+        auto driver = server.AnnoyingClient->GetDriver();
+        auto decompressor = CreateSyncExecutorWrapper();
+
+        NYdb::NPersQueue::TReadSessionSettings settings;
+        settings.ConsumerName("shared/user").AppendTopics(SHORT_TOPIC_NAME).ReadOriginal({"dc1"});
+        settings.DecompressionExecutor(decompressor);
+        auto reader = CreateReader(*driver, settings);
+
+        for (ui32 i = 0; i < 2; ++i) {
+            auto msg = reader->GetEvent(true, 1);
+            UNIT_ASSERT(msg);
+
+            auto ev = std::get_if<NYdb::NPersQueue::TReadSessionEvent::TCreatePartitionStreamEvent>(&*msg);
+            UNIT_ASSERT(ev);
+
+            ev->Confirm();
+        }
+
+        auto writeDataAndWaitForDecompressionTasks = [&](const TString &message,
+                                                         const TString &sourceId,
+                                                         ui32 partitionId,
+                                                         size_t tasksCount) {
+            //
+            // write data
+            //
+            auto writer = CreateSimpleWriter(*driver, SHORT_TOPIC_NAME, sourceId, partitionId, "raw");
+            writer->Write(message, 1);
+
+            writer->Close(TDuration::Seconds(10));
+
+            //
+            // wait for decompression tasks
+            //
+            while (decompressor->GetFuncsCount() < tasksCount) {
+                Sleep(TDuration::Seconds(1));
+            }
+        };
+
+        //
+        // stream #1: [0-, 2-]
+        // stream #2: [1-, 3-]
+        // session  : []
+        //
+        writeDataAndWaitForDecompressionTasks("111", "source_id_0", 1, 1); // 0
+        writeDataAndWaitForDecompressionTasks("333", "source_id_1", 2, 2); // 1
+        writeDataAndWaitForDecompressionTasks("222", "source_id_2", 1, 3); // 2
+        writeDataAndWaitForDecompressionTasks("444", "source_id_3", 2, 4); // 3
+
+        //
+        // stream #1: [0+, 2+]
+        // stream #2: [1+, 3+]
+        // session  : [(#1: 1), (#2: 1), (#1, 1)]
+        //
+        decompressor->StartFuncs({0, 3, 1, 2});
+
+        auto messages = reader->GetEvents(true);
+        UNIT_ASSERT_VALUES_EQUAL(messages.size(), 3);
+
+        {
+            auto ev = std::get_if<NYdb::NPersQueue::TReadSessionEvent::TDataReceivedEvent>(&messages[0]);
+            UNIT_ASSERT(ev);
+            UNIT_ASSERT_VALUES_EQUAL(ev->GetMessages().size(), 1);
+
+            UNIT_ASSERT_VALUES_EQUAL(ev->GetMessages()[0].GetData(), "111");
+        }
+
+        {
+            auto ev = std::get_if<NYdb::NPersQueue::TReadSessionEvent::TDataReceivedEvent>(&messages[1]);
+            UNIT_ASSERT(ev);
+            UNIT_ASSERT_VALUES_EQUAL(ev->GetMessages().size(), 2);
+
+            UNIT_ASSERT_VALUES_EQUAL(ev->GetMessages()[0].GetData(), "333");
+            UNIT_ASSERT_VALUES_EQUAL(ev->GetMessages()[1].GetData(), "444");
+        }
+
+        {
+            auto ev = std::get_if<NYdb::NPersQueue::TReadSessionEvent::TDataReceivedEvent>(&messages[2]);
+            UNIT_ASSERT(ev);
+            UNIT_ASSERT_VALUES_EQUAL(ev->GetMessages().size(), 1);
+
+            UNIT_ASSERT_VALUES_EQUAL(ev->GetMessages()[0].GetData(), "222");
+        }
+
+        //
+        // stream #1: []
+        // stream #2: []
+        // session  : []
+        //
+        auto msg = reader->GetEvent(false);
+        UNIT_ASSERT(!msg);
+    }
+
     Y_UNIT_TEST(CheckKillBalancer) {
         NPersQueue::TTestServer server;
         server.EnableLogs({ NKikimrServices::PQ_WRITE_PROXY, NKikimrServices::PQ_READ_PROXY});
         PrepareForGrpc(server);
 
-        TPQDataWriter writer("source1", server);
-
-
         auto driver = server.AnnoyingClient->GetDriver();
+        auto decompressor = CreateThreadPoolExecutorWrapper(2);
 
         NYdb::NPersQueue::TReadSessionSettings settings;
         settings.ConsumerName("shared/user").AppendTopics(SHORT_TOPIC_NAME).ReadOriginal({"dc1"});
+        settings.DecompressionExecutor(decompressor);
         auto reader = CreateReader(*driver, settings);
 
 
@@ -1811,17 +1931,30 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         }
 
 
+        for (ui32 i = 0; i < 10; ++i) {
+            auto writer = CreateSimpleWriter(*driver, SHORT_TOPIC_NAME, TStringBuilder() << "source" << i);
+            bool res = writer->Write("valuevaluevalue", 1);
+            UNIT_ASSERT(res);
+            res = writer->Close(TDuration::Seconds(10));
+            UNIT_ASSERT(res);
+        }
 
-        server.AnnoyingClient->RestartBalancerTablet(server.CleverServer->GetRuntime(), "rt3.dc1--topic1");
-        Cerr << "Balancer killed\n";
 
 
-        ui32 createEv = 0, destroyEv = 0;
-        for (ui32 i = 0; i < 4; ++i) {
+        ui32 createEv = 0, destroyEv = 0, dataEv = 0;
+        std::vector<ui32> gotDestroy{0, 0};
+
+        auto doRead = [&]() {
             auto msg = reader->GetEvent(true, 1);
             UNIT_ASSERT(msg);
 
             Cerr << "Got message: " << NYdb::NPersQueue::DebugString(*msg) << "\n";
+
+
+            if (std::get_if<NYdb::NPersQueue::TReadSessionEvent::TDataReceivedEvent>(&*msg)) {
+                ++dataEv;
+                return;
+            }
 
             auto ev1 = std::get_if<NYdb::NPersQueue::TReadSessionEvent::TPartitionStreamClosedEvent>(&*msg);
             auto ev2 = std::get_if<NYdb::NPersQueue::TReadSessionEvent::TCreatePartitionStreamEvent>(&*msg);
@@ -1830,15 +1963,47 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
 
             if (ev1) {
                 ++destroyEv;
+                UNIT_ASSERT(ev1->GetPartitionStream()->GetPartitionId() < 2);
+                gotDestroy[ev1->GetPartitionStream()->GetPartitionId()]++;
             }
             if (ev2) {
-                ev2->Confirm();
+                ev2->Confirm(ev2->GetEndOffset());
                 ++createEv;
+                UNIT_ASSERT(ev2->GetPartitionStream()->GetPartitionId() < 2);
+                UNIT_ASSERT_VALUES_EQUAL(gotDestroy[ev2->GetPartitionStream()->GetPartitionId()], 1);
 
             }
+        };
+
+        decompressor->StartFuncs({0, 1, 2, 3, 4});
+
+        for (ui32 i = 0; i < 5; ++i) {
+            doRead();
         }
-        UNIT_ASSERT(createEv == 2);
-        UNIT_ASSERT(destroyEv == 2);
+
+        UNIT_ASSERT_VALUES_EQUAL(dataEv, 5);
+
+        server.AnnoyingClient->RestartBalancerTablet(server.CleverServer->GetRuntime(), "rt3.dc1--topic1");
+        Cerr << "Balancer killed\n";
+
+        Sleep(TDuration::Seconds(5));
+
+        for (ui32 i = 0; i < 4; ++i) {
+            doRead();
+        }
+
+        UNIT_ASSERT_VALUES_EQUAL(createEv, 2);
+        UNIT_ASSERT_VALUES_EQUAL(destroyEv, 2);
+
+        UNIT_ASSERT_VALUES_EQUAL(dataEv, 5);
+
+        decompressor->StartFuncs({5, 6, 7, 8, 9});
+
+        Sleep(TDuration::Seconds(5));
+
+        auto msg = reader->GetEvent(false, 1);
+
+        UNIT_ASSERT(!msg);
 
         UNIT_ASSERT(!reader->WaitEvent().Wait(TDuration::Seconds(1)));
     }
@@ -3258,8 +3423,8 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
       Codecs: "lzop"
       Codecs: "CUSTOM"
     }
-    ReadRuleServiceTypes: "data-transfer"
-    ReadRuleServiceTypes: "data-transfer"
+    ReadRuleServiceTypes: "data-streams"
+    ReadRuleServiceTypes: "data-streams"
     FormatVersion: 0
     Codecs {
       Ids: 2
@@ -3608,7 +3773,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
             UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
         }
         checkDescribe({
-            {"acc/consumer1", "data-transfer"},
+            {"acc/consumer1", "data-streams"},
             {"acc/consumer2", "MyGreatType"}
         });
         {
@@ -3647,7 +3812,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
             UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
         }
         checkDescribe({
-            {"acc/consumer1", "data-transfer"},
+            {"acc/consumer1", "data-streams"},
             {"acc/consumer2", "AnotherType"},
             {"acc/consumer3", "SecondType"}
         });
@@ -3677,7 +3842,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
             UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::BAD_REQUEST);
         }
         checkDescribe({
-            {"acc/consumer1", "data-transfer"},
+            {"acc/consumer1", "data-streams"},
             {"acc/consumer2", "AnotherType"},
             {"acc/consumer3", "SecondType"}
         });
@@ -4219,6 +4384,116 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         }
     }
 
+
+    void TestReadRuleServiceTypePasswordImpl(bool forcePassword)
+    {
+        TServerSettings settings = PQSettings(0);
+        {
+            settings.PQConfig.SetDisallowDefaultClientServiceType(false);
+            settings.PQConfig.SetForceClientServiceTypePasswordCheck(forcePassword);
+            settings.PQConfig.MutableDefaultClientServiceType()->SetName("default_type");
+            settings.PQConfig.SetTopicsAreFirstClassCitizen(true);
+            auto type = settings.PQConfig.AddClientServiceType();
+            type->SetName("MyGreatType");
+            TString passwordHash = MD5::Data("password");
+            passwordHash.to_lower();
+            type->AddPasswordHashes(passwordHash);
+        }
+
+        NPersQueue::TTestServer server(settings);
+
+        {
+            NYdb::TDriverConfig driverCfg;
+            driverCfg.SetEndpoint(TStringBuilder() << "localhost:" << server.GrpcPort);
+            std::shared_ptr<NYdb::TDriver> ydbDriver(new NYdb::TDriver(driverCfg));
+            auto topicClient = NYdb::NTopic::TTopicClient(*ydbDriver);
+
+            {
+                NYdb::NTopic::TCreateTopicSettings settings;
+
+                NYdb::NTopic::TConsumerSettings<NYdb::NTopic::TCreateTopicSettings> consumerSettings(settings, "consumer");
+                consumerSettings.AddAttribute("_service_type", "MyGreatType");
+                if (!forcePassword)
+                    consumerSettings.AddAttribute("_service_type_password", "aaa");
+
+                settings.PartitioningSettings(1,1).AppendConsumers(consumerSettings);
+
+                auto res = topicClient.CreateTopic("/Root/PQ/ttt", settings);
+                res.Wait();
+                Cerr << res.GetValue().IsSuccess() << " " << res.GetValue().GetIssues().ToString() << "\n";
+                UNIT_ASSERT(!res.GetValue().IsSuccess());
+            }
+            {
+                NYdb::NTopic::TCreateTopicSettings settings;
+                settings.PartitioningSettings(1,1)
+                    .BeginAddConsumer("consumer").AddAttribute("_service_type", "MyGreatType")
+                                                 .AddAttribute("_service_type_password", "password")
+                    .EndAddConsumer();
+                auto res = topicClient.CreateTopic("/Root/PQ/ttt", settings);
+                res.Wait();
+                Cerr << res.GetValue().IsSuccess() << " " << res.GetValue().GetIssues().ToString() << "\n";
+                UNIT_ASSERT(res.GetValue().IsSuccess());
+            }
+
+            {
+                NYdb::NTopic::TAlterTopicSettings settings;
+
+                NYdb::NTopic::TAlterConsumerSettings consumerSettings(settings, "consumer");
+
+                if (!forcePassword) {
+                    consumerSettings.BeginAlterAttributes().Add("_service_type_password", "aaa");
+                }
+
+                settings
+                    .BeginAddConsumer("consumer2")
+                    .EndAddConsumer()
+                    .AppendAlterConsumers(consumerSettings);
+                auto res = topicClient.AlterTopic("/Root/PQ/ttt", settings);
+                res.Wait();
+                Cerr << res.GetValue().IsSuccess() << " " << res.GetValue().GetIssues().ToString() << "\n";
+                UNIT_ASSERT(!res.GetValue().IsSuccess());
+            }
+            {
+                NYdb::NTopic::TAlterTopicSettings settings;
+                settings
+                    .BeginAddConsumer("consumer2")
+                    .EndAddConsumer()
+                    .BeginAlterConsumer("consumer").BeginAlterAttributes().Alter("_service_type_password", "password")
+                                                   .EndAlterAttributes()
+                    .EndAlterConsumer();
+                auto res = topicClient.AlterTopic("/Root/PQ/ttt", settings);
+                res.Wait();
+                Cerr << res.GetValue().IsSuccess() << " " << res.GetValue().GetIssues().ToString() << "\n";
+                UNIT_ASSERT(res.GetValue().IsSuccess());
+            }
+
+            {
+                NYdb::NTopic::TAlterTopicSettings settings;
+                settings.AppendDropConsumers("consumer");
+                auto res = topicClient.AlterTopic("/Root/PQ/ttt", settings);
+                res.Wait();
+                Cerr << res.GetValue().IsSuccess() << " " << res.GetValue().GetIssues().ToString() << "\n";
+                UNIT_ASSERT(res.GetValue().IsSuccess());
+            }
+
+            { // check that important consumer is forbidden
+                NYdb::NTopic::TAlterTopicSettings settings;
+                settings
+                    .BeginAddConsumer("consumer2").Important(true)
+                    .EndAddConsumer();
+                auto res = topicClient.AlterTopic("/Root/PQ/ttt", settings);
+                res.Wait();
+                Cerr << res.GetValue().IsSuccess() << " " << res.GetValue().GetIssues().ToString() << "\n";
+                UNIT_ASSERT(!res.GetValue().IsSuccess());
+            }
+        }
+    }
+    Y_UNIT_TEST(TestReadRuleServiceTypePassword) {
+        TestReadRuleServiceTypePasswordImpl(false);
+        TestReadRuleServiceTypePasswordImpl(true);
+    }
+
+
     Y_UNIT_TEST(TClusterTrackerTest) {
         APITestSetup setup{TEST_CASE_NAME};
         setup.GetPQConfig().SetClustersUpdateTimeoutSec(0);
@@ -4364,12 +4639,12 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         server.AnnoyingClient->CreateTopic(legacyName, 100);
 
         runTest(legacyName, shortLegacyName, topicName, srcId1, 5, 100);
-        runTest(legacyName, legacyName, topicName, srcId2, 6, 100);
+        runTest(legacyName, shortLegacyName, topicName, srcId2, 6, 100);
         runTest("", "", topicName, srcId1, 5, 100);
         runTest("", "", topicName, srcId2, 6, 100);
 
         ui64 time = (TInstant::Now() + TDuration::Hours(4)).MilliSeconds();
-        runTest(legacyName, legacyName, topicName, srcId2, 7, time);
+        runTest(legacyName, shortLegacyName, topicName, srcId2, 7, time);
     }
 
     Y_UNIT_TEST(TestReadPartitionStatus) {

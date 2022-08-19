@@ -26,12 +26,17 @@ namespace NKikimr::NBlobDepot {
                 const ui32 generation = Self->Executor()->Generation();
 
                 for (const auto& item : Request->Get()->Record.GetItems()) {
+                    auto key = TData::TKey::FromBinaryKey(item.GetKey(), Self->Config);
+
                     auto *responseItem = responseRecord->AddItems();
                     responseItem->SetStatus(NKikimrProto::OK);
 
                     NKikimrBlobDepot::TValue value;
                     if (item.HasMeta()) {
                         value.SetMeta(item.GetMeta());
+                    }
+                    if (const auto keepState = Self->Data->GetKeepState(key); keepState != NKikimrBlobDepot::EKeepState::Default) {
+                        value.SetKeepState(keepState);
                     }
                     auto *chain = value.AddValueChain();
                     auto *locator = chain->MutableLocator();
@@ -54,9 +59,7 @@ namespace NKikimr::NBlobDepot {
                         continue;
                     }
 
-                    auto key = TData::TKey::FromBinaryKey(item.GetKey(), Self->Config);
-
-                    if (!CheckKeyAgainstBarrier(key)) {
+                    if (!CheckKeyAgainstBarrier(key, value)) {
                         responseItem->SetStatus(NKikimrProto::ERROR);
                         responseItem->SetErrorReason(TStringBuilder() << "BlobId# " << key.ToString()
                             << " is being put beyond the barrier");
@@ -69,12 +72,7 @@ namespace NKikimr::NBlobDepot {
 
                     db.Table<Schema::Data>().Key(item.GetKey()).Update<Schema::Data::Value>(valueData);
 
-                    Self->Data->PutKey(std::move(key), {
-                        .Meta = value.GetMeta(),
-                        .ValueChain = std::move(*value.MutableValueChain()),
-                        .KeepState = value.GetKeepState(),
-                        .Public = value.GetPublic(),
-                    });
+                    Self->Data->PutKey(std::move(key), TData::TValue(std::move(value)));
                 }
 
                 return true;
@@ -84,7 +82,7 @@ namespace NKikimr::NBlobDepot {
                 Y_VERIFY(blobSeqId.Channel < Self->Channels.size());
 
                 const ui64 value = blobSeqId.ToSequentialNumber();
-                STLOG(PRI_DEBUG, BLOB_DEPOT, BDT18, "MarkGivenIdCommitted", (TabletId, Self->TabletID()),
+                STLOG(PRI_DEBUG, BLOB_DEPOT, BDT18, "MarkGivenIdCommitted", (Id, Self->GetLogId()),
                     (AgentId, agent.ConnectedNodeId), (BlobSeqId, blobSeqId), (Value, value),
                     (GivenIdRanges, Self->Channels[blobSeqId.Channel].GivenIdRanges),
                     (Agent.GivenIdRanges, agent.GivenIdRanges[blobSeqId.Channel]));
@@ -98,10 +96,11 @@ namespace NKikimr::NBlobDepot {
                 }
             }
 
-            bool CheckKeyAgainstBarrier(const TData::TKey& key) {
+            bool CheckKeyAgainstBarrier(const TData::TKey& key, const NKikimrBlobDepot::TValue& value) {
                 const auto& v = key.AsVariant();
                 const auto *id = std::get_if<TLogoBlobID>(&v);
-                return !id || Self->BarrierServer->CheckBlobForBarrier(*id);
+                return !id || Self->BarrierServer->CheckBlobForBarrier(*id) ||
+                    value.GetKeepState() == NKikimrBlobDepot::EKeepState::Keep;
             }
 
             void Complete(const TActorContext&) override {

@@ -31,6 +31,7 @@
 
 #include <util/charset/wide.h>
 #include <util/generic/array_ref.h>
+#include <util/generic/scope.h>
 #include <util/generic/set.h>
 #include <util/generic/ylimits.h>
 #include <util/string/ascii.h>
@@ -874,6 +875,7 @@ protected:
     bool RoleNameClause(const TRule_role_name& node, TDeferredAtom& result, bool allowSystemRoles);
     bool RoleParameters(const TRule_create_user_option& node, TRoleParameters& result) ;
 private:
+    bool SimpleTableRefCoreImpl(const TRule_simple_table_ref_core& node, TTableRef& result);
     static bool IsValidFrameSettings(TContext& ctx, const TFrameSpecification& frameSpec, size_t sortSpecSize);
     static TString FrameSettingsToString(EFrameSettings settings, bool isUnbounded);
 
@@ -3056,7 +3058,7 @@ bool TSqlTranslation::TableHintImpl(const TRule_table_hint& rule, TTableHints& h
             bool warn = false;
             auto processItem = [&](const TRule_struct_arg_positional& arg) {
                 // struct_arg_positional:
-                //     type_name_tag type_name_or_bind
+                //     type_name_tag type_name_or_bind (NOT? NULL)?
                 //   | type_name_or_bind AS type_name_tag; //deprecated
                 const bool altCurrent = arg.Alt_case() == TRule_struct_arg_positional::kAltStructArgPositional1;
                 auto& typeNameOrBind = altCurrent ?
@@ -3072,6 +3074,13 @@ bool TSqlTranslation::TableHintImpl(const TRule_table_hint& rule, TTableHints& h
                     Ctx.Warning(pos, TIssuesIds::YQL_DEPRECATED_POSITIONAL_SCHEMA)
                         << "Deprecated syntax for positional schema: please use 'column type' instead of 'type AS column'";
                     warn = true;
+                }
+
+                if (altCurrent) {
+                    bool notNull = arg.GetAlt_struct_arg_positional1().HasBlock3() && arg.GetAlt_struct_arg_positional1().GetBlock3().HasBlock1();
+                    if (!notNull) {
+                        typeNode = new TCallNodeImpl(pos, "AsOptionalType", { typeNode });
+                    }
                 }
 
                 auto& typeNameTag = altCurrent ?
@@ -3141,60 +3150,8 @@ TMaybe<TTableHints> TSqlTranslation::TableHintsImpl(const TRule_table_hints& nod
 }
 
 bool TSqlTranslation::SimpleTableRefImpl(const TRule_simple_table_ref& node, TTableRef& result) {
-    TString service = Context().Scoped->CurrService;
-    TDeferredAtom cluster = Context().Scoped->CurrCluster;
-    switch (node.GetBlock1().Alt_case()) {
-    case TRule_simple_table_ref_TBlock1::AltCase::kAlt1: {
-        if (node.GetBlock1().GetAlt1().GetBlock1().HasBlock1()) {
-            if (Mode == NSQLTranslation::ESqlMode::LIMITED_VIEW) {
-                Error() << "Cluster should not be used in limited view";
-                return false;
-            }
-
-            if (!ClusterExpr(node.GetBlock1().GetAlt1().GetBlock1().GetBlock1().GetRule_cluster_expr1(), false, service, cluster)) {
-                return false;
-            }
-        }
-
-        if (cluster.Empty()) {
-            Error() << "No cluster name given and no default cluster is selected";
-            return false;
-        }
-
-        result = TTableRef(Context().MakeName("table"), service, cluster, nullptr);
-        auto tableOrAt = Id(node.GetBlock1().GetAlt1().GetBlock1().GetRule_id_or_at2(), *this);
-        auto tableAndView = TableKeyImpl(tableOrAt, "", *this);
-        result.Keys = BuildTableKey(Context().Pos(), result.Service, result.Cluster,
-            TDeferredAtom(Context().Pos(), tableAndView.first), tableAndView.second);
-        break;
-    }
-    case TRule_simple_table_ref_TBlock1::AltCase::kAlt2: {
-        if (cluster.Empty()) {
-            Error() << "No cluster name given and no default cluster is selected";
-            return false;
-        }
-
-        auto at = node.GetBlock1().GetAlt2().HasBlock1();
-        TString bindName;
-        if (!NamedNodeImpl(node.GetBlock1().GetAlt2().GetRule_bind_parameter2(), bindName, *this)) {
-            return false;
-        }
-        auto named = GetNamedNode(bindName);
-        if (!named) {
-            return false;
-        }
-
-        TDeferredAtom table;
-        MakeTableFromExpression(Context(), named, table);
-        result = TTableRef(Context().MakeName("table"), service, cluster, nullptr);
-        result.Keys = BuildTableKey(Context().Pos(), result.Service, result.Cluster, table, at ? "@" : "");
-        break;
-    }
-    default:
-        Y_FAIL("You should change implementation according to grammar changes");
-    }
-
-    if (!result.Keys) {
+    // simple_table_ref: simple_table_ref_core table_hints?;
+    if (!SimpleTableRefCoreImpl(node.GetRule_simple_table_ref_core1(), result)) {
         return false;
     }
 
@@ -3214,6 +3171,64 @@ bool TSqlTranslation::SimpleTableRefImpl(const TRule_simple_table_ref& node, TTa
     }
 
     return true;
+}
+
+bool TSqlTranslation::SimpleTableRefCoreImpl(const TRule_simple_table_ref_core& node, TTableRef& result) {
+    // simple_table_ref_core: ((cluster_expr DOT)? id_or_at) | AT? bind_parameter;
+    TString service = Context().Scoped->CurrService;
+    TDeferredAtom cluster = Context().Scoped->CurrCluster;
+    switch (node.Alt_case()) {
+    case TRule_simple_table_ref_core::AltCase::kAltSimpleTableRefCore1: {
+        if (node.GetAlt_simple_table_ref_core1().GetBlock1().HasBlock1()) {
+            if (Mode == NSQLTranslation::ESqlMode::LIMITED_VIEW) {
+                Error() << "Cluster should not be used in limited view";
+                return false;
+            }
+
+            if (!ClusterExpr(node.GetAlt_simple_table_ref_core1().GetBlock1().GetBlock1().GetRule_cluster_expr1(), false, service, cluster)) {
+                return false;
+            }
+        }
+
+        if (cluster.Empty()) {
+            Error() << "No cluster name given and no default cluster is selected";
+            return false;
+        }
+
+        result = TTableRef(Context().MakeName("table"), service, cluster, nullptr);
+        auto tableOrAt = Id(node.GetAlt_simple_table_ref_core1().GetBlock1().GetRule_id_or_at2(), *this);
+        auto tableAndView = TableKeyImpl(tableOrAt, "", *this);
+        result.Keys = BuildTableKey(Context().Pos(), result.Service, result.Cluster,
+            TDeferredAtom(Context().Pos(), tableAndView.first), tableAndView.second);
+        break;
+    }
+    case TRule_simple_table_ref_core::AltCase::kAltSimpleTableRefCore2: {
+        if (cluster.Empty()) {
+            Error() << "No cluster name given and no default cluster is selected";
+            return false;
+        }
+
+        auto at = node.GetAlt_simple_table_ref_core2().HasBlock1();
+        TString bindName;
+        if (!NamedNodeImpl(node.GetAlt_simple_table_ref_core2().GetRule_bind_parameter2(), bindName, *this)) {
+            return false;
+        }
+        auto named = GetNamedNode(bindName);
+        if (!named) {
+            return false;
+        }
+
+        TDeferredAtom table;
+        MakeTableFromExpression(Context(), named, table);
+        result = TTableRef(Context().MakeName("table"), service, cluster, nullptr);
+        result.Keys = BuildTableKey(Context().Pos(), result.Service, result.Cluster, table, at ? "@" : "");
+        break;
+    }
+    default:
+        Y_FAIL("You should change implementation according to grammar changes");
+    }
+
+    return result.Keys != nullptr;
 }
 
 bool TSqlCallExpr::Init(const TRule_value_constructor& node) {
@@ -4313,7 +4328,7 @@ TNodePtr TSqlExpression::UnaryCasualExpr(const TUnaryCasualExprRule& node, const
             Y_FAIL("You should change implementation according to grammar changes");
     }
 
-    bool onlyDots = true;
+    // bool onlyDots = true;
     bool isColumnRef = !expr;
     bool isFirstElem = true;
 
@@ -4321,7 +4336,7 @@ TNodePtr TSqlExpression::UnaryCasualExpr(const TUnaryCasualExprRule& node, const
         switch (b.Alt_case()) {
         case TRule_unary_subexpr_suffix::TBlock1::kAlt1: {
             // key_expr
-            onlyDots = false;
+            // onlyDots = false;
             break;
         }
         case TRule_unary_subexpr_suffix::TBlock1::kAlt2: {
@@ -4330,7 +4345,7 @@ TNodePtr TSqlExpression::UnaryCasualExpr(const TUnaryCasualExprRule& node, const
                 isColumnRef = false;
             }
 
-            onlyDots = false;
+            // onlyDots = false;
             break;
         }
         case TRule_unary_subexpr_suffix::TBlock1::kAlt3: {
@@ -4852,7 +4867,12 @@ TMaybe<TExprOrIdent> TSqlExpression::InAtomExpr(const TRule_in_atom_expr& node, 
                 return {};
             }
             Ctx.IncrementMonCounter("sql_features", "InSubquery");
-            result.Expr = BuildSelectResult(pos, std::move(source), false, Mode == NSQLTranslation::ESqlMode::SUBQUERY, Ctx.Scoped);
+            const auto alias = Ctx.MakeName("subquerynode");
+            const auto ref = Ctx.MakeName("subquery");
+            auto& blocks = Ctx.GetCurrentBlocks();
+            blocks.push_back(BuildSubquery(std::move(source), alias, Mode == NSQLTranslation::ESqlMode::SUBQUERY, -1, Ctx.Scoped));
+            blocks.back()->SetLabel(ref);
+            result.Expr = BuildSubqueryRef(blocks.back(), ref, -1);
             break;
         }
         case TRule_in_atom_expr::kAltInAtomExpr8: {
@@ -8168,17 +8188,17 @@ TNodePtr TSqlIntoTable::Build(const TRule_into_table_stmt& node) {
     SqlIntoModeStr = JoinRange("", modeStrings.begin(), modeStrings.end());
     SqlIntoUserModeStr = JoinRange(" ", userModeStrings.begin(), userModeStrings.end());
 
-    auto intoTableRef = node.GetRule_into_simple_table_ref3();
-    auto tableRef = intoTableRef.GetRule_simple_table_ref1();
+    const auto& intoTableRef = node.GetRule_into_simple_table_ref3();
+    const auto& tableRef = intoTableRef.GetRule_simple_table_ref1();
+    const auto& tableRefCore = tableRef.GetRule_simple_table_ref_core1();
 
     auto service = Ctx.Scoped->CurrService;
     auto cluster = Ctx.Scoped->CurrCluster;
     std::pair<bool, TDeferredAtom> nameOrAt;
-    if (tableRef.HasBlock1()) {
-        switch (tableRef.GetBlock1().Alt_case()) {
-        case TRule_simple_table_ref_TBlock1::AltCase::kAlt1: {
-            if (tableRef.GetBlock1().GetAlt1().GetBlock1().HasBlock1()) {
-                if (!ClusterExpr(tableRef.GetBlock1().GetAlt1().GetBlock1().GetBlock1().GetRule_cluster_expr1(), false, service, cluster)) {
+    switch (tableRefCore.Alt_case()) {
+        case TRule_simple_table_ref_core::AltCase::kAltSimpleTableRefCore1: {
+            if (tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().HasBlock1()) {
+                if (!ClusterExpr(tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().GetBlock1().GetRule_cluster_expr1(), false, service, cluster)) {
                     return nullptr;
                 }
             }
@@ -8188,14 +8208,14 @@ TNodePtr TSqlIntoTable::Build(const TRule_into_table_stmt& node) {
                 return nullptr;
             }
 
-            auto id = Id(tableRef.GetBlock1().GetAlt1().GetBlock1().GetRule_id_or_at2(), *this);
+            auto id = Id(tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().GetRule_id_or_at2(), *this);
             nameOrAt = std::make_pair(id.first, TDeferredAtom(Ctx.Pos(), id.second));
             break;
         }
-        case TRule_simple_table_ref_TBlock1::AltCase::kAlt2: {
-            auto at = tableRef.GetBlock1().GetAlt2().HasBlock1();
+        case TRule_simple_table_ref_core::AltCase::kAltSimpleTableRefCore2: {
+            auto at = tableRefCore.GetAlt_simple_table_ref_core2().HasBlock1();
             TString name;
-            if (!NamedNodeImpl(tableRef.GetBlock1().GetAlt2().GetRule_bind_parameter2(), name, *this)) {
+            if (!NamedNodeImpl(tableRefCore.GetAlt_simple_table_ref_core2().GetRule_bind_parameter2(), name, *this)) {
                 return nullptr;
             }
             auto named = GetNamedNode(name);
@@ -8215,7 +8235,6 @@ TNodePtr TSqlIntoTable::Build(const TRule_into_table_stmt& node) {
         }
         default:
             Y_FAIL("You should change implementation according to grammar changes");
-        }
     }
 
     bool withTruncate = false;
@@ -8573,6 +8592,11 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
         case TRule_sql_stmt_core::kAltSqlStmtCore4: {
             Ctx.BodyPart();
             const auto& rule = core.GetAlt_sql_stmt_core4().GetRule_create_table_stmt1();
+            const bool isTablestore = rule.GetToken2().GetId() == SQLv1LexerTokens::TOKEN_TABLESTORE;
+            if (isTablestore) {
+                Context().Error(GetPos(rule.GetToken2())) << "CREATE TABLESTORE is not supported yet";
+                return false;
+            }
             TTableRef tr;
             if (!SimpleTableRefImpl(rule.GetRule_simple_table_ref3(), tr)) {
                 return false;
@@ -8590,9 +8614,24 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             }
 
             if (rule.HasBlock8()) {
-                if (!CreateTableSettings(rule.GetBlock8().GetRule_with_table_settings1(), params.TableSettings)) {
+                Context().Error(GetPos(rule.GetBlock8().GetRule_table_inherits1().GetToken1())) << "INHERITS clause is not supported yet";
+                return false;
+            }
+
+            if (rule.HasBlock9()) {
+                Context().Error(GetPos(rule.GetBlock9().GetRule_table_partition_by1().GetToken1())) << "PARTITION BY clause is not supported yet";
+                return false;
+            }
+
+            if (rule.HasBlock10()) {
+                if (!CreateTableSettings(rule.GetBlock10().GetRule_with_table_settings1(), params.TableSettings)) {
                     return false;
                 }
+            }
+
+            if (rule.HasBlock11()) {
+                Context().Error(GetPos(rule.GetBlock11().GetRule_table_tablestore1().GetToken1())) << "TABLESTORE clause is not supported yet";
+                return false;
             }
 
             AddStatementToBlocks(blocks, BuildCreateTable(Ctx.Pos(), tr, params, Ctx.Scoped));
@@ -8601,6 +8640,11 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
         case TRule_sql_stmt_core::kAltSqlStmtCore5: {
             Ctx.BodyPart();
             const auto& rule = core.GetAlt_sql_stmt_core5().GetRule_drop_table_stmt1();
+            const bool isTablestore = rule.GetToken2().GetId() == SQLv1LexerTokens::TOKEN_TABLESTORE;
+            if (isTablestore) {
+                Context().Error(GetPos(rule.GetToken2())) << "DROP TABLESTORE is not supported yet";
+                return false;
+            }
             if (rule.HasBlock3()) {
                 Context().Error(GetPos(rule.GetToken1())) << "IF EXISTS in " << humanStatementName
                     << " is not supported.";
@@ -10122,6 +10166,10 @@ TNodePtr TSqlQuery::Build(const TSQLv1ParserAST& ast) {
 
     const auto& query = ast.GetRule_sql_query();
     TVector<TNodePtr> blocks;
+    Ctx.PushCurrentBlocks(&blocks);
+    Y_DEFER {
+        Ctx.PopCurrentBlocks();
+    };
     if (query.Alt_case() == TRule_sql_query::kAltSqlQuery1) {
         const auto& statements = query.GetAlt_sql_query1().GetRule_sql_stmt_list1();
         if (!Statement(blocks, statements.GetRule_sql_stmt2().GetRule_sql_stmt_core2())) {
@@ -10158,6 +10206,10 @@ TNodePtr TSqlQuery::Build(const TSQLv1ParserAST& ast) {
 
 bool TSqlTranslation::DefineActionOrSubqueryBody(TSqlQuery& query, TBlocks& blocks, const TRule_define_action_or_subquery_body& body) {
     if (body.HasBlock2()) {
+        Ctx.PushCurrentBlocks(&blocks);
+        Y_DEFER {
+            Ctx.PopCurrentBlocks();
+        };
         if (!query.Statement(blocks, body.GetBlock2().GetRule_sql_stmt_core1())) {
             return false;
         }

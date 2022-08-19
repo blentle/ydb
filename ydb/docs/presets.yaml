@@ -5,7 +5,7 @@ default:
   ydb: true
   example_cluster: ydbtest
   feature_secondary_index: true 
-  feature_changefeed: false # temporarily disabled
+  feature_changefeed: true
   feature_replace: true
   feature_upsert: true
   feature_join: true
@@ -27,10 +27,10 @@ default:
   managed-k8s-name: Managed Service for Kubernetes
   s3-storage-host: s3.mds.yandex.net
   objstorage-name: Object Storage
-
   ydb-cli: ydb
   k8s: Kubernetes
   oss: true
+  feature_not_null_for_pk: true
 
   ydb-doc-repo: https://github.com/ydb-platform/ydb/tree/main/ydb/docs
 

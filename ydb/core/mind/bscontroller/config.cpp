@@ -190,7 +190,7 @@ namespace NKikimr::NBsController {
             ////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
             void ApplyGroupCreated(const TGroupId& /*groupId*/, const TGroupInfo &groupInfo) {
-                if (groupInfo.VirtualGroupState && *groupInfo.VirtualGroupState != NKikimrBlobStorage::EVirtualGroupState::WORKING) {
+                if (!groupInfo.VDisksInGroup && groupInfo.VirtualGroupState != NKikimrBlobStorage::EVirtualGroupState::WORKING) {
                     return; // do not report virtual groups that are not properly created yet
                 }
 
@@ -237,8 +237,9 @@ namespace NKikimr::NBsController {
                         meta->SetCurrentGeneration(cur.Generation);
                     }
                 }
-                Y_VERIFY(prev.VDisksInGroup.size() == cur.VDisksInGroup.size());
-                for (size_t i = 0; i < prev.VDisksInGroup.size(); ++i) {
+                Y_VERIFY(prev.VDisksInGroup.size() == cur.VDisksInGroup.size() ||
+                    (cur.VDisksInGroup.empty() && cur.DecommitStatus == NKikimrBlobStorage::TGroupDecommitStatus::DONE));
+                for (size_t i = 0; i < cur.VDisksInGroup.size(); ++i) {
                     const TVSlotInfo& prevSlot = *prev.VDisksInGroup[i];
                     const TVSlotInfo& curSlot = *cur.VDisksInGroup[i];
                     if (prevSlot.VSlotId != curSlot.VSlotId) {
@@ -330,7 +331,6 @@ namespace NKikimr::NBsController {
             MakeTableMerger<Schema::Box>(&Boxes, &state.Boxes.Get(), this)(txc);
             MakeTableMerger<Schema::BoxStoragePool>(&StoragePools, &state.StoragePools.Get(), this)(txc);
             MakeTableMerger<Schema::Node>(&Nodes, &state.Nodes.Get(), this)(txc);
-            MakeTableMerger<Schema::VirtualGroupPool>(&VirtualGroupPools, &state.VirtualGroupPools.Get(), this)(txc);
 
             // apply overlay maps to their respective tables
             state.PDisks.ApplyToTable(this, txc);
@@ -910,7 +910,7 @@ namespace NKikimr::NBsController {
                 pb->SetX2(x.second);
             }
 
-            if (!groupInfo.VirtualGroupState) {
+            if (groupInfo.VDisksInGroup) {
                 group->SetErasureSpecies(groupInfo.ErasureSpecies);
                 group->SetDeviceType(PDiskTypeToPDiskType(groupInfo.GetCommonDeviceType()));
 
@@ -937,16 +937,17 @@ namespace NKikimr::NBsController {
 
                     Serialize(domain->AddVDiskLocations(), *vslot);
                 }
-            } else if (*groupInfo.VirtualGroupState == NKikimrBlobStorage::EVirtualGroupState::WORKING) {
+            }
+
+            if (groupInfo.VirtualGroupState == NKikimrBlobStorage::EVirtualGroupState::WORKING) {
                 Y_VERIFY(groupInfo.BlobDepotId);
                 group->SetBlobDepotId(*groupInfo.BlobDepotId);
-            } else if (*groupInfo.VirtualGroupState == NKikimrBlobStorage::EVirtualGroupState::CREATE_FAILED) {
+            } else if (groupInfo.VirtualGroupState == NKikimrBlobStorage::EVirtualGroupState::CREATE_FAILED) {
                 group->SetBlobDepotId(0);
             }
 
-            if (groupInfo.DecommitStatus != NKikimrBlobStorage::EGroupDecommitStatus::NONE) {
-                Y_VERIFY(groupInfo.AssimilatorGroupId);
-                group->SetAssimilatorGroupId(*groupInfo.AssimilatorGroupId);
+            if (groupInfo.DecommitStatus != NKikimrBlobStorage::TGroupDecommitStatus::NONE) {
+                group->SetDecommitStatus(groupInfo.DecommitStatus);
             }
         }
 

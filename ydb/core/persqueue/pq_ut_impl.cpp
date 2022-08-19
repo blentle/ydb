@@ -40,9 +40,14 @@ void PQTabletPrepare(const TTabletPreparationParameters& parameters,
             if (tc.Runtime->GetAppData().PQConfig.GetTopicsAreFirstClassCitizen()) {
                 tabletConfig->SetTopicName("topic");
                 tabletConfig->SetTopicPath(tc.Runtime->GetAppData().PQConfig.GetDatabase() + "/topic");
+                tabletConfig->SetYcCloudId(parameters.cloudId);
+                tabletConfig->SetYcFolderId(parameters.folderId);
+                tabletConfig->SetYdbDatabaseId(parameters.databaseId);
+                tabletConfig->SetYdbDatabasePath(parameters.databasePath);
+                tabletConfig->SetFederationAccount(parameters.account);
             } else {
-                tabletConfig->SetTopicName("rt3.dc1--topic");
-                tabletConfig->SetTopicPath("/Root/PQ/rt3.dc1--topic");
+                tabletConfig->SetTopicName("rt3.dc1--asdfgs--topic");
+                tabletConfig->SetTopicPath("/Root/PQ/rt3.dc1--asdfgs--topic");
             }
             tabletConfig->SetTopic("topic");
             tabletConfig->SetVersion(version);
@@ -70,7 +75,8 @@ void PQTabletPrepare(const TTabletPreparationParameters& parameters,
                     tabletConfig->AddReadRules(u.first);
             }
             tc.Runtime->SendToPipe(tc.TabletId, tc.Edge, request.Release(), 0, GetPipeConfigWithRetries());
-            TEvPersQueue::TEvUpdateConfigResponse* result = tc.Runtime->GrabEdgeEvent<TEvPersQueue::TEvUpdateConfigResponse>(handle);
+            TEvPersQueue::TEvUpdateConfigResponse* result =
+                tc.Runtime->GrabEdgeEvent<TEvPersQueue::TEvUpdateConfigResponse>(handle);
 
             UNIT_ASSERT(result);
             auto& rec = result->Record;

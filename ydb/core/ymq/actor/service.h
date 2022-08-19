@@ -22,9 +22,6 @@ class TSqsService
     : public TActorBootstrapped<TSqsService>
 {
 public:
-    TSqsService();
-    ~TSqsService();
-
     void Bootstrap();
 
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
@@ -141,6 +138,7 @@ private:
     TIntrusivePtr<::NMonitoring::TDynamicCounters> YmqRootCounters_;
     std::shared_ptr<TAlignedPagePoolCounters> AllocPoolCounters_;
     TIntrusivePtr<TUserCounters> AggregatedUserCounters_;
+    TIntrusivePtr<TMonitoringCounters> MonitoringCounters_;
     TUsersMap Users_;
     THashMap<TActorId, TQueueInfoPtr> LocalLeaderRefs_; // referer -> queue info
     TActorId SchemeCache_;

@@ -13,6 +13,9 @@
 #include <ydb/core/yq/libs/quota_manager/quota_manager.h>
 #include <ydb/core/yq/libs/quota_manager/quota_proxy.h>
 #include <ydb/core/yq/libs/rate_limiter/control_plane_service/rate_limiter_control_plane_service.h>
+#include <ydb/core/yq/libs/rate_limiter/events/control_plane_events.h>
+#include <ydb/core/yq/libs/rate_limiter/events/data_plane.h>
+#include <ydb/core/yq/libs/rate_limiter/quoter_service/quoter_service.h>
 #include <ydb/core/yq/libs/shared_resources/shared_resources.h>
 #include <ydb/library/folder_service/folder_service.h>
 #include <ydb/library/yql/providers/common/metrics/service_counters.h>
@@ -88,8 +91,13 @@ void Init(
     }
 
     if (protoConfig.GetRateLimiter().GetControlPlaneEnabled()) {
+        Y_VERIFY(protoConfig.GetQuotasManager().GetEnabled()); // Rate limiter resources want to know CPU quota on creation
         NActors::IActor* rateLimiterService = NYq::CreateRateLimiterControlPlaneService(protoConfig.GetRateLimiter(), yqSharedResources, credentialsProviderFactory);
         actorRegistrator(NYq::RateLimiterControlPlaneServiceId(), rateLimiterService);
+    }
+
+    if (protoConfig.GetRateLimiter().GetDataPlaneEnabled()) {
+        actorRegistrator(NYq::YqQuoterServiceActorId(), NYq::CreateQuoterService(protoConfig.GetRateLimiter(), yqSharedResources, credentialsProviderFactory));
     }
 
     if (protoConfig.GetAudit().GetEnabled()) {
@@ -142,7 +150,7 @@ void Init(
             caContent = TUnbufferedFileInput(path).ReadAll();
         }
 
-        credentialsFactory = NYql::CreateSecuredServiceAccountCredentialsOverTokenAccessorFactory(tokenAccessorConfig.GetEndpoint(), tokenAccessorConfig.GetUseSsl(), caContent);
+        credentialsFactory = NYql::CreateSecuredServiceAccountCredentialsOverTokenAccessorFactory(tokenAccessorConfig.GetEndpoint(), tokenAccessorConfig.GetUseSsl(), caContent, tokenAccessorConfig.GetConnectionPoolSize());
     }
 
     if (protoConfig.GetPrivateApi().GetEnabled()) {
@@ -184,6 +192,9 @@ void Init(
             [=](const NYql::NDqProto::TDqTask& task, const NYql::NDq::TLogFunc&) {
                 return lwmOptions.Factory->Get(task);
             });
+        if (protoConfig.GetRateLimiter().GetDataPlaneEnabled()) {
+            lwmOptions.QuoterServiceActorId = NYq::YqQuoterServiceActorId();
+        }
         auto resman = NYql::NDqs::CreateLocalWorkerManager(lwmOptions);
 
         actorRegistrator(NYql::NDqs::MakeWorkerManagerActorID(nodeId), resman);
@@ -247,6 +258,7 @@ void Init(
             protoConfig.GetPrivateApi(),
             protoConfig.GetGateways(),
             protoConfig.GetPinger(),
+            protoConfig.GetRateLimiter(),
             appData->FunctionRegistry,
             TAppData::TimeProvider,
             TAppData::RandomProvider,
@@ -289,9 +301,14 @@ void Init(
             credentialsProviderFactory,
             serviceCounters.Counters,
             {
-                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_RESULT_LIMIT, 20_MB, 2_GB),
-                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_COUNT_LIMIT, 100, 200, NYq::ControlPlaneStorageServiceActorId()),
-                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_TIME_LIMIT, 0)
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_ANALYTICS_COUNT_LIMIT, 100, 1000, NYq::ControlPlaneStorageServiceActorId()),
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_STREAMING_COUNT_LIMIT, 100, 1000, NYq::ControlPlaneStorageServiceActorId()),
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_CPU_PERCENT_LIMIT, 200, 3200),
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_MEMORY_LIMIT, 0),
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_RESULT_LIMIT, 0),
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_ANALYTICS_DURATION_LIMIT, 1440),
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_STREAMING_DURATION_LIMIT, 0),
+                TQuotaDescription(SUBJECT_TYPE_CLOUD, QUOTA_QUERY_RESULT_LIMIT, 20_MB, 2_GB)
             });
         actorRegistrator(NYq::MakeQuotaServiceActorId(nodeId), quotaService);
 

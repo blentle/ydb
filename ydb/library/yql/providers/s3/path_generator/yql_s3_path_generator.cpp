@@ -11,6 +11,33 @@ namespace NYql::NPathGenerator {
 
 namespace {
 
+TInstant Strptime(const TString& input, const TString& format) {
+    struct tm inputTm;
+    memset(&inputTm, 0, sizeof(tm));
+    inputTm.tm_mday = 1;
+    if (strptime(input.data(), format.data(), &inputTm) != nullptr) {
+        const time_t seconds = TimeGM(&inputTm);
+        if (seconds != static_cast<time_t>(-1)) {
+            return TInstant::Seconds(seconds);
+        }
+    }
+    ythrow yexception() << "Can't parse date " << input << " in format " << format;
+}
+
+TString Strftime(const char* format, TInstant time) {
+    struct tm tm{};
+    time_t clock = time.Seconds();
+    localtime_r(&clock, &tm);
+    size_t size = Max<size_t>(strlen(format) * 2 + 1, 107);
+    TTempBuf buf(size);
+    int r = strftime(buf.Data(), buf.Size(), format, &tm);
+    if (r != 0) {
+        return TString(buf.Data(), r);
+    }
+    ythrow yexception() << "Can't format date " << time << " in format " << format;
+}
+
+
 void ReplaceAll(TString& str, const TString& from, const TString& to) {
     size_t start_pos = 0;
     while((start_pos = str.find(from, start_pos)) != TString::npos) {
@@ -94,7 +121,7 @@ IPathGenerator::EType ToType(const TString& type) {
     ythrow yexception() << "Invalid projection scheme: type " << type << " must be one of " << to_lower(GetEnumAllNames<IPathGenerator::EType>());
 }
 
-std::string fmtInteger(int32_t width, int64_t value)
+std::string fmtInteger(int32_t width, i64 value)
 {
     if (width > 64) {
          ythrow yexception() << "Digits cannot exceed 64, but received " << width;
@@ -103,22 +130,22 @@ std::string fmtInteger(int32_t width, int64_t value)
         return std::to_string(value);
     }
     char buf[65];
-    snprintf(buf, 64, "%0*ld", width, value);
+    snprintf(buf, sizeof(buf), "%0*lld", width, static_cast<long long>(value));
     return buf;
 }
 
-bool IsOverflow(int64_t a, int64_t b) {
+bool IsOverflow(i64 a, i64 b) {
     if (a ^ b < 0) {
         return false;
     }
     if (a > 0) {
-        return b > std::numeric_limits<int64_t>::max() - a;
+        return b > std::numeric_limits<i64>::max() - a;
     }
-    return b < std::numeric_limits<int64_t>::min() - a;
+    return b < std::numeric_limits<i64>::min() - a;
 }
 
-bool IsOverflow(uint64_t a, uint64_t b) {
-    uint64_t diff = std::numeric_limits<int64_t>::max() - a;
+bool IsOverflow(ui64 a, ui64 b) {
+    uint64_t diff = std::numeric_limits<ui64>::max() - a;
     return b > diff;
 }
 
@@ -206,15 +233,15 @@ public:
             return TString{dataValue};
         }
         case IPathGenerator::EType::INTEGER: {
-            int64_t value = 0;
+            i64 value = 0;
             if (!TryFromString(dataValue.Data(), dataValue.size(), value)) {
                 ythrow yexception() << dataValue << " data is not a int64";
             }
             return fmtInteger(config.Digits, value);
         }
         case IPathGenerator::EType::DATE: {
-            TInstant time = TInstant::Zero() /* ToInstant(dataValue) */;
-            return time.FormatLocalTime(config.Format.c_str());
+            TInstant time = TInstant::ParseIso8601(dataValue);
+            return Strftime(config.Format.c_str(), time);
         }
         break;
         }
@@ -244,8 +271,8 @@ public:
             return std::to_string(value);
         }
         case IPathGenerator::EType::DATE: {
-            TInstant time = TInstant::Zero() /* ToInstant(dataValue) */;
-            return time.FormatLocalTime(config.Format.c_str());
+            TInstant time = Strptime(TString{pathValue}, config.Format);
+            return time.ToStringLocal();
         }
         break;
         }
@@ -500,7 +527,7 @@ private:
         const TDuration interval = FromUnit(rule.Interval, rule.IntervalUnit);
         for (TInstant current = ParseDate(rule.From, now); current <= to; current += interval) {
             TString copyLocationTemplate = locationTemplate;
-            const TString time = current.FormatLocalTime(rule.Format.c_str());
+            const TString time = Strftime(rule.Format.c_str(), current);
             ReplaceAll(copyLocationTemplate, "${" + rule.Name + "}", time);
             columnsWithValue.push_back(TColumnWithValue{.Name=rule.Name, .Type=NUdf::EDataSlot::String, .Value=time});
             DoGenerate(rules, copyLocationTemplate, columnsWithValue, result, pathsLimit, now, p + 1);

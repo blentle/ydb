@@ -2,6 +2,7 @@
 
 #include <ydb/library/yql/core/expr_nodes/yql_expr_nodes.h>
 #include <ydb/library/yql/providers/s3/expr_nodes/yql_s3_expr_nodes.h>
+#include <ydb/library/yql/providers/s3/range_helpers/path_list_reader.h>
 
 #include <ydb/library/yql/providers/common/provider/yql_provider.h>
 #include <ydb/library/yql/providers/common/provider/yql_provider_names.h>
@@ -15,6 +16,24 @@ using namespace NNodes;
 
 namespace {
 
+bool ValidateS3PackedPaths(TPositionHandle pos, TStringBuf blob, bool isTextEncoded, TExprContext& ctx) {
+    using namespace NYql::NS3Details;
+    try {
+        TPathList paths;
+        UnpackPathsList(blob, isTextEncoded, paths);
+        for (size_t i = 0; i < paths.size(); ++i) {
+            if (std::get<0>(paths[i]).empty()) {
+                ctx.AddError(TIssue(ctx.GetPosition(pos), TStringBuilder() << "Expected non-empty path (index " << i << ")"));
+                return false;
+            }
+        }
+    } catch (const std::exception& ex) {
+        ctx.AddError(TIssue(ctx.GetPosition(pos), TStringBuilder() << "Failed to parse packed paths: " << ex.what()));
+        return false;
+    }
+    return true;
+}
+
 bool ValidateS3Paths(const TExprNode& node, const TStructExprType*& extraColumnsType, TExprContext& ctx) {
     if (!EnsureTupleMinSize(node, 1, ctx)) {
         return false;
@@ -26,21 +45,19 @@ bool ValidateS3Paths(const TExprNode& node, const TStructExprType*& extraColumns
             return false;
         }
 
-        if (!EnsureAtom(*path->Child(TS3Path::idx_Path), ctx) || !EnsureAtom(*path->Child(TS3Path::idx_Size), ctx))
-        {
+        auto pathAndSizeList = path->Child(TS3Path::idx_Data);
+        if (!TCoString::Match(pathAndSizeList)) {
+            ctx.AddError(TIssue(ctx.GetPosition(pathAndSizeList->Pos()), "Expected String literal for Data"));
             return false;
         }
 
-        if (path->Child(TS3Path::idx_Path)->Content().empty()) {
-            ctx.AddError(TIssue(ctx.GetPosition(path->Child(TS3Path::idx_Path)->Pos()), "Expected non-empty path"));
+        const TExprNode* isTextEncoded = path->Child(TS3Path::idx_IsText);
+        if (!TCoBool::Match(isTextEncoded)) {
+            ctx.AddError(TIssue(ctx.GetPosition(isTextEncoded->Pos()), "Expected Bool literal for IsText"));
             return false;
         }
 
-        ui64 size = 0;
-        auto sizeStr = path->Child(TS3Path::idx_Size)->Content();
-        if (!TryFromString(sizeStr, size)) {
-            ctx.AddError(TIssue(ctx.GetPosition(path->Child(TS3Path::idx_Size)->Pos()),
-                TStringBuilder() << "Expected number as S3 object size, got: '" << sizeStr << "'"));
+        if (!ValidateS3PackedPaths(pathAndSizeList->Pos(), pathAndSizeList->Head().Content(), FromString<bool>(isTextEncoded->Head().Content()), ctx)) {
             return false;
         }
 
@@ -240,14 +257,15 @@ public:
         }
 
         if (input->ChildrenSize() > TS3Object::idx_Settings) {
-            auto validator = [](TStringBuf name, const TExprNode& setting, TExprContext& ctx) {
+            bool haveProjection = false;
+            bool havePartitionedBy = false;
+            auto validator = [&](TStringBuf name, const TExprNode& setting, TExprContext& ctx) {
                 if ((name == "compression" || name == "projection" || name == "data.interval.unit") && setting.ChildrenSize() != 2) {
                     ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()),
                         TStringBuilder() << "Expected single value setting for " << name << ", but got " << setting.ChildrenSize() - 1));
                     return false;
                 }
 
-                bool havePartitionedBy = false;
                 if (name == "compression") {
                     auto& value = setting.Tail();
                     TStringBuf compression;
@@ -307,6 +325,7 @@ public:
                 }
 
                 YQL_ENSURE(name == "projection");
+                haveProjection = true;
                 if (!EnsureAtom(setting.Tail(), ctx)) {
                     return false;
                 }
@@ -316,16 +335,15 @@ public:
                     return false;
                 }
 
-                if (!havePartitionedBy) {
-                    ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), "Missing partitioned_by setting for projection"));
-                    return false;
-                }
-
                 return true;
             };
             if (!EnsureValidSettings(*input->Child(TS3Object::idx_Settings),
                                      { "compression", "partitionedby", "projection", "data.interval.unit" }, validator, ctx))
             {
+                return TStatus::Error;
+            }
+            if (haveProjection && !havePartitionedBy) {
+                ctx.AddError(TIssue(ctx.GetPosition(input->Child(TS3Object::idx_Settings)->Pos()), "Missing partitioned_by setting for projection"));
                 return TStatus::Error;
             }
         }

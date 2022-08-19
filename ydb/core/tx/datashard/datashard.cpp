@@ -1537,17 +1537,15 @@ TReadWriteVersions TDataShard::GetReadWriteVersions(TOperation* op) const {
     if (!IsMvccEnabled())
         return {TRowVersion::Max(), SnapshotManager.GetMinWriteVersion()};
 
-    if (op && op->MvccReadWriteVersion) {
+    if (op) {
+        if (!op->MvccReadWriteVersion) {
+            op->MvccReadWriteVersion = GetMvccTxVersion(op->IsReadOnly() ? EMvccTxMode::ReadOnly : EMvccTxMode::ReadWrite, op);
+        }
+
         return *op->MvccReadWriteVersion;
     }
 
-    auto mvccVersion = GetMvccTxVersion(EMvccTxMode::ReadWrite, op);
-
-    if (op) {
-        op->MvccReadWriteVersion = mvccVersion;
-    }
-
-    return mvccVersion;
+    return GetMvccTxVersion(EMvccTxMode::ReadWrite, nullptr);
 }
 
 TDataShard::TPromotePostExecuteEdges TDataShard::PromoteImmediatePostExecuteEdges(
@@ -2005,6 +2003,7 @@ bool TDataShard::CheckDataTxRejectAndReply(TEvDataShard::TEvProposeTransaction* 
 
 void TDataShard::UpdateProposeQueueSize() const {
     SetCounter(COUNTER_PROPOSE_QUEUE_SIZE, MediatorStateWaitingMsgs.size() + ProposeQueue.Size() + DelayedProposeQueue.size() + Pipeline.WaitingTxs());
+    SetCounter(COUNTER_READ_ITERATORS_WAITING, Pipeline.WaitingReadIterators());
 }
 
 void TDataShard::Handle(TEvDataShard::TEvProposeTransaction::TPtr &ev, const TActorContext &ctx) {
@@ -3027,6 +3026,7 @@ void TDataShard::Handle(TEvents::TEvUndelivered::TPtr &ev,
         op->AddInputEvent(ev.Release());
         Pipeline.AddCandidateOp(op);
         PlanQueue.Progress(ctx);
+        return;
     }
 
     switch (ev->Get()->SourceType) {

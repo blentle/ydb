@@ -16,19 +16,28 @@
 
 namespace NYq {
 
-constexpr auto SUBJECT_TYPE_CLOUD = "cloud"; 
-constexpr auto QUOTA_RESULT_LIMIT = "fq.queryResultLimit.bytes"; 
-constexpr auto QUOTA_COUNT_LIMIT  = "fq.queryLimit.count";
-constexpr auto QUOTA_TIME_LIMIT = "fq.queryLimit.ttl";
+constexpr auto SUBJECT_TYPE_CLOUD = "cloud";
+
+// Quota per cloud
+constexpr auto QUOTA_ANALYTICS_COUNT_LIMIT    = "yq.analyticsQuery.count";
+constexpr auto QUOTA_STREAMING_COUNT_LIMIT    = "yq.streamingQuery.count";
+constexpr auto QUOTA_CPU_PERCENT_LIMIT        = "yq.cpuPercent.count";
+constexpr auto QUOTA_MEMORY_LIMIT             = "yq.memory.size";
+constexpr auto QUOTA_RESULT_LIMIT             = "yq.result.size";
+
+// Quota per query
+constexpr auto QUOTA_ANALYTICS_DURATION_LIMIT = "yq.analyticsQueryDurationMinutes.count";
+constexpr auto QUOTA_STREAMING_DURATION_LIMIT = "yq.streamingQueryDurationMinutes.count"; // internal, for preview purposes
+constexpr auto QUOTA_QUERY_RESULT_LIMIT       = "yq.queryResult.size";
 
 struct TQuotaInfo {
     ui64 DefaultLimit;
     ui64 HardLimit;
-    NActors::TActorId UsageUpdater;
-    TQuotaInfo(ui64 defaultLimit, ui64 hardLimit = 0, NActors::TActorId usageUpdater = {})
+    NActors::TActorId QuotaController;
+    TQuotaInfo(ui64 defaultLimit, ui64 hardLimit = 0, NActors::TActorId quotaController = {})
         : DefaultLimit(defaultLimit)
         , HardLimit(hardLimit)
-        , UsageUpdater(usageUpdater)
+        , QuotaController(quotaController)
     {
     }
 };
@@ -37,10 +46,10 @@ struct TQuotaDescription {
     TString SubjectType;
     TString MetricName;
     TQuotaInfo Info;
-    TQuotaDescription(const TString& subjectType, const TString& metricName, ui64 defaultLimit, ui64 hardLimit = 0, NActors::TActorId usageUpdater = {})
+    TQuotaDescription(const TString& subjectType, const TString& metricName, ui64 defaultLimit, ui64 hardLimit = 0, NActors::TActorId quotaController = {})
         : SubjectType(subjectType)
         , MetricName(metricName)
-        , Info(defaultLimit, hardLimit, usageUpdater)
+        , Info(defaultLimit, hardLimit, quotaController)
     {
     }
 };
@@ -52,6 +61,7 @@ struct TTimedValue {
     TTimedValue() = default;
     TTimedValue(const TTimedValue&) = default;
     TTimedValue(T value, const TInstant& updatedAt = TInstant::Zero()) : Value(value), UpdatedAt(updatedAt) {}
+    TTimedValue &operator=(const TTimedValue& other) = default;
 };
 
 using TTimedUint64 = TTimedValue<ui64>;
@@ -64,6 +74,7 @@ struct TQuotaUsage {
     TQuotaUsage(ui64 limit, const TInstant& limitUpdatedAt = Now()) : Limit(limit, limitUpdatedAt) {}
     TQuotaUsage(ui64 limit, const TInstant& limitUpdatedAt, ui64 usage, const TInstant& usageUpdatedAt = Now())
       : Limit(limit, limitUpdatedAt), Usage(NMaybe::TInPlace{}, usage, usageUpdatedAt) {}
+    TQuotaUsage &operator=(const TQuotaUsage& other) = default;
     void Merge(const TQuotaUsage& other);
     TString ToString() {
         return (Usage ? std::to_string(Usage->Value) : "*") + "/" + std::to_string(Limit.Value);
@@ -226,20 +237,22 @@ struct TEvQuotaService {
     struct TQuotaLimitChangeRequest : public NActors::TEventLocal<TQuotaLimitChangeRequest, EvQuotaLimitChangeRequest> {
         TString SubjectType;
         TString SubjectId;
-        TQuotaUsage Quota;
+        TString MetricName;
+        ui64 Limit;
         ui64 LimitRequested;
-        TQuotaLimitChangeRequest(const TString& subjectType, const TString& subjectId)
-            : SubjectType(subjectType), SubjectId(subjectId)
+        TQuotaLimitChangeRequest(const TString& subjectType, const TString& subjectId, const TString& metricName, ui64 limit, ui64 limitRequested)
+            : SubjectType(subjectType), SubjectId(subjectId), MetricName(metricName), Limit(limit), LimitRequested(limitRequested)
         {}
     };
 
     struct TQuotaLimitChangeResponse : public NActors::TEventLocal<TQuotaLimitChangeResponse, EvQuotaLimitChangeResponse> {
         TString SubjectType;
         TString SubjectId;
-        TQuotaUsage Quota;
+        TString MetricName;
+        ui64 Limit;
         ui64 LimitRequested;
-        TQuotaLimitChangeResponse(const TString& subjectType, const TString& subjectId)
-            : SubjectType(subjectType), SubjectId(subjectId)
+        TQuotaLimitChangeResponse(const TString& subjectType, const TString& subjectId, const TString& metricName, ui64 limit, ui64 limitRequested)
+            : SubjectType(subjectType), SubjectId(subjectId), MetricName(metricName), Limit(limit), LimitRequested(limitRequested)
         {}
     };
 

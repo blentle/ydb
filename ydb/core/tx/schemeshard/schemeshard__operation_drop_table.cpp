@@ -35,11 +35,13 @@ void DropPath(NIceDb::TNiceDb& db,
     context.SS->TabletCounters->Simple()[COUNTER_USER_ATTRIBUTES_COUNT].Sub(path->UserAttrs->Size());
     context.SS->PersistUserAttributes(db, path->PathId, path->UserAttrs, nullptr);
 
+    const auto isBackupTable = context.SS->IsBackupTable(path->PathId);
+
     auto domainInfo = context.SS->ResolveDomainInfo(path->PathId);
-    domainInfo->DecPathsInside();
+    domainInfo->DecPathsInside(1, isBackupTable);
 
     auto parentDir = path.Parent();
-    parentDir->DecAliveChildren();
+    parentDir->DecAliveChildren(1, isBackupTable);
     ++parentDir->DirAlterVersion;
     context.SS->PersistPathDirAlterVersion(db, parentDir.Base());
 
@@ -595,6 +597,10 @@ public:
 
         if (!context.SS->CheckLocks(path.Base()->PathId, Transaction, errStr)) {
             result->SetError(NKikimrScheme::StatusMultipleModifications, errStr);
+            return result;
+        }
+        if (!context.SS->CheckInFlightLimit(TTxState::TxDropTable, errStr)) {
+            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
             return result;
         }
 

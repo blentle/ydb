@@ -45,10 +45,10 @@ class TBlobStorageGroupRangeRequest : public TBlobStorageGroupRequestActor<TBlob
 
     template<typename TPtr>
     void SendReply(TPtr& reply) {
-        ui32 size = 0;
+        /*ui32 size = 0;
         for (const TEvBlobStorage::TEvRangeResult::TResponse& resp : reply->Responses) {
             size += resp.Buffer.size();
-        }
+        }*/
         Mon->CountRangeResponseTime(TActivationContext::Now() - StartTime);
         SendResponseAndDie(std::move(reply));
     }
@@ -250,7 +250,7 @@ class TBlobStorageGroupRangeRequest : public TBlobStorageGroupRequestActor<TBlob
 
         A_LOG_DEBUG_S("DSR08", "sending TEvGet# " << get->ToString());
 
-        SendToBSProxy(SelfId(), Info->GroupID, get.release(), 0, Span.GetTraceId());
+        SendToProxy(std::move(get), 0, Span.GetTraceId());
 
         // switch state
         Become(&TThis::StateGet);

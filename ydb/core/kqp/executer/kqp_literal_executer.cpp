@@ -68,6 +68,7 @@ public:
         , Counters(counters)
     {
         ResponseEv = std::make_unique<TEvKqpExecuter::TEvTxResponse>();
+        ResponseEv->Orbit = std::move(Request.Orbit);
         Stats = std::make_unique<TQueryExecutionStats>(Request.StatsMode, &TasksGraph,
             ResponseEv->Record.MutableResponse()->MutableResult()->MutableStats());
     }
@@ -346,6 +347,8 @@ private:
             }
         }
 
+        LWTRACK(KqpLiteralExecuterFinalize, ResponseEv->Orbit, TxId);
+
         LOG_D("Sending response to: " << Target << ", results: " << Results.size());
         Send(Target, ResponseEv.release());
     }
@@ -407,6 +410,8 @@ private:
 
         response.SetStatus(status);
         response.MutableIssues()->Swap(issues);
+
+        LWTRACK(KqpLiteralExecuterReplyErrorAndDie, ResponseEv->Orbit, TxId);
 
         Send(Target, ResponseEv.release());
         PassAway();

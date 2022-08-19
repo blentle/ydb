@@ -34,6 +34,8 @@ namespace boost { namespace xpressive { namespace detail
         {
         }
 
+        optional_matcher(const optional_matcher& other) = default;
+
         template<typename BidiIter, typename Next>
         bool match(match_state<BidiIter> &state, Next const &next) const
         {
@@ -97,6 +99,8 @@ namespace boost { namespace xpressive { namespace detail
         {
             return this->match_(state, next, Greedy());
         }
+
+        optional_mark_matcher(const optional_mark_matcher& other) = default;
 
     private:
         template<typename BidiIter, typename Next>

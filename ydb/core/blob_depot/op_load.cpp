@@ -8,15 +8,13 @@ namespace NKikimr::NBlobDepot {
 
     void TBlobDepot::ExecuteTxLoad() {
         class TTxLoad : public NTabletFlatExecutor::TTransactionBase<TBlobDepot> {
-            bool Configured = false;
-
         public:
             TTxLoad(TBlobDepot *self)
                 : TTransactionBase(self)
             {}
 
             bool Execute(TTransactionContext& txc, const TActorContext&) override {
-                STLOG(PRI_DEBUG, BLOB_DEPOT, BDT19, "TTxLoad::Execute", (TabletId, Self->TabletID()));
+                STLOG(PRI_DEBUG, BLOB_DEPOT, BDT19, "TTxLoad::Execute", (Id, Self->GetLogId()));
 
                 NIceDb::TNiceDb db(txc.DB);
 
@@ -31,8 +29,12 @@ namespace NKikimr::NBlobDepot {
                         return false;
                     } else if (table.IsValid()) {
                         if (table.HaveValue<Schema::Config::ConfigProtobuf>()) {
-                            Configured = Self->Config.ParseFromString(table.GetValue<Schema::Config::ConfigProtobuf>());
-                            Y_VERIFY(Configured);
+                            Self->Configured = Self->Config.ParseFromString(table.GetValue<Schema::Config::ConfigProtobuf>());
+                            Y_VERIFY(Self->Configured);
+                        }
+                        Self->DecommitState = table.GetValueOrDefault<Schema::Config::DecommitState>();
+                        if (table.HaveValue<Schema::Config::AssimilatorState>()) {
+                            Self->AssimilatorState.emplace(table.GetValue<Schema::Config::AssimilatorState>());
                         }
                     }
                 }
@@ -65,9 +67,9 @@ namespace NKikimr::NBlobDepot {
                         Self->BarrierServer->AddBarrierOnLoad(
                             table.GetValue<Schema::Barriers::TabletId>(),
                             table.GetValue<Schema::Barriers::Channel>(),
-                            table.GetValue<Schema::Barriers::RecordGeneration>(),
-                            table.GetValue<Schema::Barriers::PerGenerationCounter>(),
+                            TGenStep(table.GetValue<Schema::Barriers::SoftGenCtr>()),
                             TGenStep(table.GetValue<Schema::Barriers::Soft>()),
+                            TGenStep(table.GetValue<Schema::Barriers::HardGenCtr>()),
                             TGenStep(table.GetValue<Schema::Barriers::Hard>())
                         );
                         if (!table.Next()) {
@@ -80,17 +82,20 @@ namespace NKikimr::NBlobDepot {
             }
 
             bool Precharge(NIceDb::TNiceDb& db) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wbitwise-instead-of-logical"
                 return db.Table<Schema::Config>().Precharge()
                     & db.Table<Schema::Blocks>().Precharge()
                     & db.Table<Schema::Barriers>().Precharge();
+#pragma clang diagnostic pop
             }
 
             void Complete(const TActorContext&) override {
-                STLOG(PRI_DEBUG, BLOB_DEPOT, BDT20, "TTxLoad::Complete", (TabletId, Self->TabletID()),
-                    (Configured, Configured));
+                STLOG(PRI_DEBUG, BLOB_DEPOT, BDT20, "TTxLoad::Complete", (Id, Self->GetLogId()),
+                    (Configured, Self->Configured));
 
-                if (Configured) {
-                    Self->InitChannelKinds();
+                if (Self->Configured) {
+                    Self->StartOperation();
                 }
 
                 Self->OnLoadFinished();
