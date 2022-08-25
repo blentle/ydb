@@ -67,6 +67,7 @@ struct TEvPrivate {
         EvBegin = EventSpaceBegin(TEvents::ES_PRIVATE),
 
         EvReadResult = EvBegin,
+        EvDataPart,
         EvReadStarted,
         EvReadFinished,
         EvReadError,
@@ -85,7 +86,7 @@ struct TEvPrivate {
         const size_t PathIndex;
     };
 
-    struct TEvDataPart : public TEventLocal<TEvDataPart, EvReadResult> {
+    struct TEvDataPart : public TEventLocal<TEvDataPart, EvDataPart> {
         TEvDataPart(IHTTPGateway::TCountedContent&& data) : Result(std::move(data)) {}
         IHTTPGateway::TCountedContent Result;
     };
@@ -127,7 +128,8 @@ public:
         TPathList&& paths,
         bool addPathIndex,
         ui64 startPathIndex,
-        const NActors::TActorId& computeActorId
+        const NActors::TActorId& computeActorId,
+        ui64 expectedSize
     )   : Gateway(std::move(gateway))
         , HolderFactory(holderFactory)
         , InputIndex(inputIndex)
@@ -138,6 +140,7 @@ public:
         , Paths(std::move(paths))
         , AddPathIndex(addPathIndex)
         , StartPathIndex(startPathIndex)
+        , ExpectedSize(expectedSize)
     {}
 
     void Bootstrap() {
@@ -145,7 +148,7 @@ public:
         for (size_t pathInd = 0; pathInd < Paths.size(); ++pathInd) {
             const TPath& path = Paths[pathInd];
             Gateway->Download(Url + std::get<TString>(path),
-                Headers, std::get<size_t>(path),
+                Headers, std::min(std::get<size_t>(path), ExpectedSize),
                 std::bind(&TS3ReadActor::OnDownloadFinished, ActorSystem, SelfId(), std::placeholders::_1, pathInd + StartPathIndex), {}, GetS3RetryPolicy());
         };
     }
@@ -216,11 +219,12 @@ private:
 
     void Handle(TEvPrivate::TEvReadError::TPtr& result) {
         ++IsDoneCounter;
-        Send(ComputeActorId, new TEvAsyncInputError(InputIndex, result->Get()->Error, true));
+        Send(ComputeActorId, new TEvAsyncInputError(InputIndex, result->Get()->Error, NYql::NDqProto::StatusIds::EXTERNAL_ERROR));
     }
 
     // IActor & IDqComputeActorAsyncInput
     void PassAway() override { // Is called from Compute Actor
+        ContainerCache.Clear();
         TActorBootstrapped<TS3ReadActor>::PassAway();
     }
 
@@ -245,6 +249,7 @@ private:
     const TPathList Paths;
     const bool AddPathIndex;
     const ui64 StartPathIndex;
+    const ui64 ExpectedSize;
 
     std::queue<std::tuple<IHTTPGateway::TContent, ui64>> Blocks;
 };
@@ -255,6 +260,7 @@ struct TReadSpec {
     NDB::ColumnsWithTypeAndName Columns;
     NDB::FormatSettings Settings;
     TString Format, Compression;
+    ui64 ExpectedSize = 0;
 };
 
 struct TRetryStuff {
@@ -355,27 +361,41 @@ private:
         if (InputFinished)
             return;
 
-        const auto ev = WaitForSpecificEvent<TEvPrivate::TEvReadError, TEvPrivate::TEvReadFinished>();
-        InputFinished = true;
-        switch (const auto etype = ev->GetTypeRewrite()) {
-            case TEvPrivate::TEvReadFinished::EventType:
-                break;
-            case TEvPrivate::TEvReadError::EventType:
-                Issues = std::move(ev->Get<TEvPrivate::TEvReadError>()->Error);
-                break;
-            default:
-                break;
+        while (true) {
+            const auto ev = WaitForSpecificEvent<TEvPrivate::TEvReadError, TEvPrivate::TEvDataPart, TEvPrivate::TEvReadFinished>();
+            const auto etype = ev->GetTypeRewrite();
+            if (etype == TEvPrivate::TEvDataPart::EventType) {
+                // just ignore all data parts event to drain event queue
+                continue;
+            }
+            switch (etype) {
+                case TEvPrivate::TEvReadFinished::EventType:
+                    break;
+                case TEvPrivate::TEvReadError::EventType:
+                    Issues = std::move(ev->Get<TEvPrivate::TEvReadError>()->Error);
+                    break;
+                default:
+                    break;
+            }
+            InputFinished = true;
+            return;
         }
     }
 
     void Run() final try {
-        TReadBufferFromStream buffer(this);
-        const auto decompress(MakeDecompressor(buffer, ReadSpec->Compression));
-        YQL_ENSURE(ReadSpec->Compression.empty() == !decompress, "Unsupported " << ReadSpec->Compression << " compression.");
-        NDB::InputStreamFromInputFormat stream(NDB::FormatFactory::instance().getInputFormat(ReadSpec->Format, decompress ? *decompress : buffer, NDB::Block(ReadSpec->Columns), nullptr, 1_MB, ReadSpec->Settings));
 
-        while (auto block = stream.read())
-            Send(ParentActorId, new TEvPrivate::TEvNextBlock(block, PathIndex));
+        TIssue exceptIssue;
+        try {
+            TReadBufferFromStream buffer(this);
+            const auto decompress(MakeDecompressor(buffer, ReadSpec->Compression));
+            YQL_ENSURE(ReadSpec->Compression.empty() == !decompress, "Unsupported " << ReadSpec->Compression << " compression.");
+            NDB::InputStreamFromInputFormat stream(NDB::FormatFactory::instance().getInputFormat(ReadSpec->Format, decompress ? *decompress : buffer, NDB::Block(ReadSpec->Columns), nullptr, 1_MB, ReadSpec->Settings));
+
+            while (auto block = stream.read())
+                Send(ParentActorId, new TEvPrivate::TEvNextBlock(block, PathIndex));
+        } catch (const std::exception& err) {
+            exceptIssue.Message = TStringBuilder() << "Error while reading file " << Path << ", details: " << err.what();
+        }
 
         WaitFinish();
 
@@ -399,19 +419,24 @@ private:
             Issues.AddIssues({TIssue(str)});
         }
 
+        if (exceptIssue.Message) {
+            Issues.AddIssue(exceptIssue);
+        }
+
         if (Issues)
-            Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, std::move(Issues), true));
+            Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, std::move(Issues), NYql::NDqProto::StatusIds::EXTERNAL_ERROR));
         else
             Send(ParentActorId, new TEvPrivate::TEvReadFinished);
     } catch (const TDtorException&) {
         return RetryStuff->Cancel();
     } catch (const std::exception& err) {
-        Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, TIssues{TIssue(TStringBuilder() << "Error while reading file " << Path << ", details: " << err.what())}, true));
+        Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, TIssues{TIssue(TStringBuilder() << "Error while reading file " << Path << ", details: " << err.what())}, NYql::NDqProto::StatusIds::EXTERNAL_ERROR));
         return;
     }
 
-    void ProcessUnexpectedEvent(TAutoPtr<IEventHandle>) final {
-        Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, TIssues{TIssue("Unexpected event")}, true));
+    void ProcessUnexpectedEvent(TAutoPtr<IEventHandle> ev) final {
+        TString message = Sprintf("Unexpected message type 0x%08" PRIx32, ev->GetTypeRewrite());
+        Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, TIssues{TIssue(message)}, NYql::NDqProto::StatusIds::EXTERNAL_ERROR));
     }
 private:
     const ui64 InputIndex;
@@ -570,6 +595,7 @@ private:
 
     // IActor & IDqComputeActorAsyncInput
     void PassAway() override { // Is called from Compute Actor
+        ContainerCache.Clear();
         TActorBootstrapped<TS3StreamReadActor>::PassAway();
     }
 
@@ -764,9 +790,9 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
         const auto readSpec = std::make_shared<TReadSpec>();
         readSpec->Columns.resize(structType->GetMembersCount());
         for (ui32 i = 0U; i < structType->GetMembersCount(); ++i) {
-            auto& colsumn = readSpec->Columns[i];
-            colsumn.type = MetaToClickHouse(structType->GetMemberType(i), intervalUnit);
-            colsumn.name = structType->GetMemberName(i);
+            auto& column = readSpec->Columns[i];
+            column.type = MetaToClickHouse(structType->GetMemberType(i), intervalUnit);
+            column.name = structType->GetMemberName(i);
         }
         readSpec->Format = params.GetFormat();
 
@@ -794,8 +820,12 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
                                                   std::move(paths), addPathIndex, startPathIndex, readSpec, computeActorId);
         return {actor, actor};
     } else {
+        ui64 expectedSize = std::numeric_limits<ui64>::max();
+        if (const auto it = settings.find("expectedSize"); settings.cend() != it)
+            expectedSize = FromString<ui64>(it->second);
+
         const auto actor = new TS3ReadActor(inputIndex, std::move(gateway), holderFactory, params.GetUrl(), authToken,
-                                            std::move(paths), addPathIndex, startPathIndex, computeActorId);
+                                            std::move(paths), addPathIndex, startPathIndex, computeActorId, expectedSize);
         return {actor, actor};
     }
 }

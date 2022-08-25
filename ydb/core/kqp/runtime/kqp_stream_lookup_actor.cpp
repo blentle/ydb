@@ -429,6 +429,8 @@ private:
         THolder<TEvDataShard::TEvRead> request(new TEvDataShard::TEvRead());
         auto& record = request->Record;
 
+        YQL_ENSURE(Snapshot.IsValid());
+
         record.MutableSnapshot()->SetStep(Snapshot.Step);
         record.MutableSnapshot()->SetTxId(Snapshot.TxId);
 
@@ -543,7 +545,7 @@ private:
 
         NYql::TIssues issues;
         issues.AddIssue(std::move(issue));
-        Send(ComputeActorId, new TEvAsyncInputError(InputIndex, std::move(issues), true));
+        Send(ComputeActorId, new TEvAsyncInputError(InputIndex, std::move(issues), NYql::NDqProto::StatusIds::EXTERNAL_ERROR));
     }
 
 private:

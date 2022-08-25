@@ -4,8 +4,10 @@
 #include <ydb/library/yql/providers/common/schema/mkql/yql_mkql_schema.h>
 #include <ydb/library/yql/providers/common/schema/expr/yql_expr_schema.h>
 #include <ydb/library/yql/providers/common/codec/yql_codec.h>
+#include <ydb/library/yql/providers/common/codec/yql_json_codec.h>
 #include <ydb/library/yql/public/udf/udf_data_type.h>
 #include <ydb/library/yql/ast/yql_expr.h>
+#include <ydb/library/yql/ast/yql_type_string.h>
 #include <ydb/library/yql/minikql/mkql_node.h>
 #include <ydb/library/yql/minikql/computation/mkql_computation_node_holders.h>
 
@@ -305,7 +307,8 @@ TTypePair FormatColumnType(
     NJson::TJsonValue& root,
     const NYdb::TType& type,
     NKikimr::NMiniKQL::TTypeEnvironment& typeEnv,
-    NYql::TExprContext& ctx)
+    NYql::TExprContext& ctx,
+    bool typeNameAsString)
 {
     TTypePair result;
     NYdb::TTypeParser parser(type);
@@ -319,9 +322,10 @@ TTypePair FormatColumnType(
         return result;
     }
 
-    //NJson::ReadJsonTree(
-    //    NJson2Yson::ConvertYson2Json(NYql::NCommon::WriteTypeToYson(result.MiniKQLType)),
-    //    &root);
+    if (typeNameAsString) {
+        root = NYql::FormatType(result.TypeAnnotation);
+        return result;
+    }
 
     NJson::ReadJsonTree(
         NJson2Yson::ConvertYson2Json(NYql::NCommon::WriteTypeToYson(result.TypeAnnotation)),
@@ -330,28 +334,25 @@ TTypePair FormatColumnType(
     return result;
 }
 
-void FormatColumnValue(
-    NJson::TJsonValue& root,
+template <typename F>
+NJson::TJsonValue GenericFormatColumnValue(
     const NYdb::TValue& value,
     NKikimr::NMiniKQL::TType* type,
-    const NKikimr::NMiniKQL::TTypeEnvironment&,
-    const THolderFactory& holderFactory)
+    const THolderFactory& holderFactory,
+    F f)
 {
     if (type->GetKind() == TType::EKind::Pg) {
         NYdb::TValueParser parser(value);
         auto pgValue = parser.GetPg();
         if (pgValue.IsNull()) {
-            root = NJson::TJsonValue(NJson::JSON_NULL);
-            return;
+            return NJson::TJsonValue(NJson::JSON_NULL);
         }
 
         if (pgValue.IsText()) {
-            root = NJson::TJsonValue(pgValue.Content_);
-            return;
+            return NJson::TJsonValue(pgValue.Content_);
         }
 
-        root = NJson::TJsonValue("<binary pg value>");
-        return;
+        return NJson::TJsonValue("<binary pg value>");
     }
 
     const Ydb::Value& rawProtoValue = NYdb::TProtoAccessor::GetProto(value);
@@ -361,9 +362,42 @@ void FormatColumnValue(
         rawProtoValue,
         holderFactory);
 
-    NJson::ReadJsonTree(
-        NJson2Yson::ConvertYson2Json(NYql::NCommon::WriteYsonValue(unboxed, type)),
-        &root);
+    return f(unboxed);
+}
+
+NJson::TJsonValue FormatColumnValue(
+    const NYdb::TValue& value,
+    NKikimr::NMiniKQL::TType* type,
+    const THolderFactory& holderFactory)
+{
+    return GenericFormatColumnValue(value, type, holderFactory, [type](auto unboxed) {
+        NJson::TJsonValue v;
+        NJson::ReadJsonTree(
+            NJson2Yson::ConvertYson2Json(NYql::NCommon::WriteYsonValue(unboxed, type)),
+            &v);
+        return v;
+    });
+}
+
+NJson::TJsonValue FormatColumnPrettyValue(
+    const NYdb::TValue& value,
+    NKikimr::NMiniKQL::TType* type,
+    const THolderFactory& holderFactory)
+{
+
+    using namespace NYql::NCommon::NJsonCodec;
+
+    static const TValueConvertPolicy convertPolicy{ NUMBER_AS_STRING };
+
+    return GenericFormatColumnValue(value, type, holderFactory, [type](auto unboxed) {
+        NJson::TJsonValue v;
+        TStringStream out;
+        NJson::TJsonWriter jsonWriter(&out, MakeJsonConfig());
+        WriteValueToJson(jsonWriter, unboxed, type, convertPolicy);
+        jsonWriter.Flush();
+        NJson::ReadJsonTree(out.Str(), &v);
+        return v;
+    });
 }
 
 } // namespace
@@ -382,7 +416,7 @@ TString FormatSchema(const YandexQuery::Schema& schema)
     return NYql::NCommon::WriteTypeToYson(MakeStructType(typedColumns, ctx), NYson::EYsonFormat::Text);
 }
 
-void FormatResultSet(NJson::TJsonValue& root, const NYdb::TResultSet& resultSet)
+void FormatResultSet(NJson::TJsonValue& root, const NYdb::TResultSet& resultSet, bool typeNameAsString, bool prettyValueFormat)
 {
     NYql::TExprContext ctx;
     NKikimr::NMiniKQL::TScopedAlloc alloc;
@@ -390,7 +424,6 @@ void FormatResultSet(NJson::TJsonValue& root, const NYdb::TResultSet& resultSet)
 
     TMemoryUsageInfo memInfo("BuildYdbResultSet");
     THolderFactory holderFactory(alloc.Ref(), memInfo);
-
 
     NJson::TJsonValue& columns = root["columns"];
     const auto& columnsMeta = resultSet.GetColumnsMeta();
@@ -402,7 +435,7 @@ void FormatResultSet(NJson::TJsonValue& root, const NYdb::TResultSet& resultSet)
     for (const NYdb::TColumn& columnMeta : columnsMeta) {
         NJson::TJsonValue& column = columns.AppendValue(NJson::TJsonValue());
         column["name"] = columnMeta.Name;
-        columnTypes[i++] = FormatColumnType(column["type"], columnMeta.Type, typeEnv, ctx);
+        columnTypes[i++] = FormatColumnType(column["type"], columnMeta.Type, typeEnv, ctx, typeNameAsString);
     }
 
     NJson::TJsonValue& data = root["data"];
@@ -413,12 +446,9 @@ void FormatResultSet(NJson::TJsonValue& root, const NYdb::TResultSet& resultSet)
         NJson::TJsonValue& row = data.AppendValue(NJson::TJsonValue());
         for (size_t columnNum = 0; columnNum < columnsMeta.size(); ++columnNum) {
             const NYdb::TColumn& columnMeta = columnsMeta[columnNum];
-            FormatColumnValue(
-                row[columnMeta.Name],
-                rsParser.GetValue(columnNum),
-                columnTypes[columnNum].MiniKQLType,
-                typeEnv,
-                holderFactory);
+            row[columnMeta.Name] = prettyValueFormat
+                ? FormatColumnPrettyValue(rsParser.GetValue(columnNum), columnTypes[columnNum].MiniKQLType, holderFactory)
+                : FormatColumnValue(rsParser.GetValue(columnNum), columnTypes[columnNum].MiniKQLType, holderFactory);
         }
     }
 }

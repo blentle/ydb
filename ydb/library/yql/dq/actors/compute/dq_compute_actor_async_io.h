@@ -55,15 +55,15 @@ struct IDqComputeActorAsyncInput {
     };
 
     struct TEvAsyncInputError : public NActors::TEventLocal<TEvAsyncInputError, TDqComputeEvents::EvAsyncInputError> {
-        TEvAsyncInputError(ui64 inputIndex, const TIssues& issues, bool isFatal)
+        TEvAsyncInputError(ui64 inputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode)
             : InputIndex(inputIndex)
             , Issues(issues)
-            , IsFatal(isFatal)
+            , FatalCode(fatalCode)
         {}
 
         const ui64 InputIndex;
         const TIssues Issues;
-        const bool IsFatal;
+        const NYql::NDqProto::StatusIds::StatusCode FatalCode;
     };
 
     virtual ui64 GetInputIndex() const = 0;
@@ -78,8 +78,13 @@ struct IDqComputeActorAsyncInput {
     virtual void CommitState(const NDqProto::TCheckpoint& checkpoint) = 0; // Apply side effects related to this checkpoint.
     virtual void LoadState(const NDqProto::TSourceState& state) = 0;
 
-    virtual void PassAway() = 0; // The same signature as IActor::PassAway()
+    // The same signature as IActor::PassAway().
+    // It is guaranted that this method will be called with bound MKQL allocator.
+    // So, it is the right place to destroy all internal UnboxedValues.
+    virtual void PassAway() = 0;
 
+    // Do not destroy UnboxedValues inside destructor!!!
+    // It is called from actor system thread, and MKQL allocator is not bound in this case.
     virtual ~IDqComputeActorAsyncInput() = default;
 };
 
@@ -105,7 +110,7 @@ struct IDqComputeActorAsyncInput {
 struct IDqComputeActorAsyncOutput {
     struct ICallbacks { // Compute actor
         virtual void ResumeExecution() = 0;
-        virtual void OnAsyncOutputError(ui64 outputIndex, const TIssues& issues, bool isFatal) = 0;
+        virtual void OnAsyncOutputError(ui64 outputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode) = 0;
 
         // Checkpointing
         virtual void OnAsyncOutputStateSaved(NDqProto::TSinkState&& state, ui64 outputIndex, const NDqProto::TCheckpoint& checkpoint) = 0;

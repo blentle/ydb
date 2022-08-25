@@ -352,6 +352,7 @@ private:
         hFunc(TEvents::TEvRaiseTransientIssues, Handle);
         hFunc(NFq::TEvInternalService::TEvCreateRateLimiterResourceResponse, Handle);
         hFunc(TEvDqStats, Handle);
+        hFunc(NMon::TEvHttpInfo, Handle);
     )
 
     STRICT_STFUNC(FinishStateFunc,
@@ -1731,6 +1732,125 @@ private:
 
     void Handle(NActors::TEvents::TEvUndelivered::TPtr&) {
         Fail("TRunActor::OnUndelivered");
+    }
+
+    void Handle(NMon::TEvHttpInfo::TPtr& ev) {
+        TStringStream html;
+        html << "<h2>RunActor</h2>";
+
+        if (ExecuterId != NActors::TActorId{}) {
+            html << "<table class='table simple-table1 table-hover table-condensed'>";
+            html << "<thead><tr>";
+            html << "<th>Graph</th>";
+            html << "<th>Executer</th>";
+            html << "<th>Controller</th>";
+            html << "<th>Checkpoint Coord</th>";
+            html << "</tr></thead><tbody>";
+            html << "<tr>";
+                html << "<td>";
+                if (EvaluationInProgress) html << "EVAL";
+                else html << DqGraphIndex << " of " << DqGraphParams.size();
+                html << "</td>";
+                html << "<td>" << ExecuterId << "</td>";
+                html << "<td>" << ControlId << "</td>";
+                html << "<td>" << CheckpointCoordinatorId << "</td>";
+            html << "</tr>";
+            html << "</tbody></table>";
+        }
+
+        html << "<table class='table simple-table1 table-hover table-condensed'>";
+        html << "<thead><tr>";
+        html << "<th>Param</th>";
+        html << "<th>Value</th>";
+        html << "</tr></thead><tbody>";
+            html << "<tr><td>Cloud ID</td><td>"     << Params.CloudId                                              << "</td></tr>";
+            html << "<tr><td>Scope</td><td>"        << Params.Scope.ToString()                                     << "</td></tr>";
+            html << "<tr><td>Query ID</td><td>"     << Params.QueryId                                              << "</td></tr>";
+            html << "<tr><td>User ID</td><td>"      << Params.UserId                                               << "</td></tr>";
+            html << "<tr><td>Owner</td><td>"        << Params.Owner                                                << "</td></tr>";
+            html << "<tr><td>Result ID</td><td>"    << Params.ResultId                                             << "</td></tr>";
+            html << "<tr><td>Prev Rev</td><td>"     << Params.PreviousQueryRevision                                << "</td></tr>";
+            html << "<tr><td>Query Type</td><td>"   << YandexQuery::QueryContent::QueryType_Name(Params.QueryType) << "</td></tr>";
+            html << "<tr><td>Exec Mode</td><td>"    << YandexQuery::ExecuteMode_Name(Params.ExecuteMode)           << "</td></tr>";
+            html << "<tr><td>St Load Mode</td><td>" << YandexQuery::StateLoadMode_Name(Params.StateLoadMode)       << "</td></tr>";
+            html << "<tr><td>Disposition</td><td>"  << Params.StreamingDisposition                                 << "</td></tr>";
+            html << "<tr><td>Status</td><td>"       << YandexQuery::QueryMeta::ComputeStatus_Name(Params.Status)   << "</td></tr>";
+        html << "</tbody></table>";
+
+        if (Params.Connections.size()) {
+            html << "<table class='table simple-table1 table-hover table-condensed'>";
+            html << "<thead><tr>";
+            html << "<th>Connection</th>";
+            html << "<th>Type</th>";
+            html << "<th>ID</th>";
+            html << "<th>Description</th>";
+            html << "</tr></thead><tbody>";
+            for (const auto& connection : Params.Connections) {
+                html << "<tr>";
+                html << "<td>" << connection.content().name() << "</td>";
+                html << "<td>";
+                switch (connection.content().setting().connection_case()) {
+                case YandexQuery::ConnectionSetting::kYdbDatabase:
+                    html << "YDB";
+                    break;
+                case YandexQuery::ConnectionSetting::kClickhouseCluster:
+                    html << "CLICKHOUSE";
+                    break;
+                case YandexQuery::ConnectionSetting::kObjectStorage:
+                    html << "OBJECT STORAGE";
+                    break;
+                case YandexQuery::ConnectionSetting::kDataStreams: 
+                    html << "DATA STREAMS";
+                    break;
+                case YandexQuery::ConnectionSetting::kMonitoring:
+                    html << "MONITORING";
+                    break;
+                default:                    
+                    html << "UNDEFINED";
+                    break;
+                }
+                html << "</td>";
+                html << "<td>" << connection.meta().id() << "</td>";
+                html << "<td>" << connection.content().description() << "</td>";
+                html << "</tr>";
+            }
+            html << "</tbody></table>";
+        }
+
+        if (Params.Bindings.size()) {
+            html << "<table class='table simple-table1 table-hover table-condensed'>";
+            html << "<thead><tr>";
+            html << "<th>Binding</th>";
+            html << "<th>Type</th>";
+            html << "<th>ID</th>";
+            html << "<th>Connection ID</th>";
+            html << "<th>Description</th>";
+            html << "</tr></thead><tbody>";
+            for (const auto& binding : Params.Bindings) {
+                html << "<tr>";
+                html << "<td>" << binding.content().name() << "</td>";
+                html << "<td>";
+                switch (binding.content().setting().binding_case()) {
+                case YandexQuery::BindingSetting::kDataStreams: 
+                    html << "DATA STREAMS";
+                    break;
+                case YandexQuery::BindingSetting::kObjectStorage:
+                    html << "OBJECT STORAGE";
+                    break;
+                default:                    
+                    html << "UNDEFINED";
+                    break;
+                }
+                html << "</td>";
+                html << "<td>" << binding.meta().id() << "</td>";
+                html << "<td>" << binding.content().connection_id() << "</td>";
+                html << "<td>" << binding.content().description() << "</td>";
+                html << "</tr>";
+            }
+            html << "</tbody></table>";
+        }
+
+        Send(ev->Sender, new NMon::TEvHttpInfoRes(html.Str()));
     }
 
     TString FindTokenByName(const TString& tokenName) const {

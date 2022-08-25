@@ -55,8 +55,8 @@ namespace NDq {
 constexpr ui32 IssuesBufferSize = 16;
 
 struct TSinkCallbacks : public IDqComputeActorAsyncOutput::ICallbacks {
-    void OnAsyncOutputError(ui64 outputIndex, const TIssues& issues, bool isFatal) override final {
-        OnSinkError(outputIndex, issues, isFatal);
+    void OnAsyncOutputError(ui64 outputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode) override final {
+        OnSinkError(outputIndex, issues, fatalCode);
     }
 
     void OnAsyncOutputStateSaved(NDqProto::TSinkState&& state, ui64 outputIndex, const NDqProto::TCheckpoint& checkpoint) override final {
@@ -67,14 +67,14 @@ struct TSinkCallbacks : public IDqComputeActorAsyncOutput::ICallbacks {
         OnSinkFinished(outputIndex);
     }
 
-    virtual void OnSinkError(ui64 outputIndex, const TIssues& issues, bool isFatal) = 0;
+    virtual void OnSinkError(ui64 outputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode) = 0;
     virtual void OnSinkStateSaved(NDqProto::TSinkState&& state, ui64 outputIndex, const NDqProto::TCheckpoint& checkpoint) = 0;
     virtual void OnSinkFinished(ui64 outputIndex) = 0;
 };
 
 struct TOutputTransformCallbacks : public IDqComputeActorAsyncOutput::ICallbacks {
-    void OnAsyncOutputError(ui64 outputIndex, const TIssues& issues, bool isFatal) override final {
-        OnOutputTransformError(outputIndex, issues, isFatal);
+    void OnAsyncOutputError(ui64 outputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode) override final {
+        OnOutputTransformError(outputIndex, issues, fatalCode);
     }
 
     void OnAsyncOutputStateSaved(NDqProto::TSinkState&& state, ui64 outputIndex, const NDqProto::TCheckpoint& checkpoint) override final {
@@ -85,7 +85,7 @@ struct TOutputTransformCallbacks : public IDqComputeActorAsyncOutput::ICallbacks
         OnTransformFinished(outputIndex);
     }
 
-    virtual void OnOutputTransformError(ui64 outputIndex, const TIssues& issues, bool isFatal) = 0;
+    virtual void OnOutputTransformError(ui64 outputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode) = 0;
     virtual void OnTransformStateSaved(NDqProto::TSinkState&& state, ui64 outputIndex, const NDqProto::TCheckpoint& checkpoint) = 0;
     virtual void OnTransformFinished(ui64 outputIndex) = 0;
 };
@@ -365,6 +365,7 @@ protected:
     void ProcessOutputsImpl(ERunStatus status) {
         ProcessOutputsState.LastRunStatus = status;
 
+        CA_LOG_D("ProcessOutputsState.Inflight: " << ProcessOutputsState.Inflight );
         if (ProcessOutputsState.Inflight == 0) {
             ProcessOutputsState = TProcessOutputsState();
         }
@@ -497,51 +498,55 @@ protected:
             Checkpoints->Receive(handle, NActors::TActivationContext::AsActorContext());
         }
 
-        for (auto& [_, source] : SourcesMap) {
-            if (source.Actor) {
-                source.AsyncInput->PassAway();
-            }
-        }
-
-        for (auto& [_, transform] : InputTransformsMap) {
-            if (transform.Actor) {
-                transform.AsyncInput->PassAway();
-            }
-        }
-
-        for (auto& [_, sink] : SinksMap) {
-            if (sink.Actor) {
-                sink.AsyncOutput->PassAway();
-            }
-        }
-
-        for (auto& [_, transform] : OutputTransformsMap) {
-            if (transform.Actor) {
-                transform.AsyncOutput->PassAway();
-            }
-        }
-
-        for (auto& [_, outputChannel] : OutputChannelsMap) {
-            if (outputChannel.Channel) {
-                outputChannel.Channel->Terminate();
-            }
-        }
-
-        if (RuntimeSettings.TerminateHandler) {
-            RuntimeSettings.TerminateHandler(success, issues);
-        }
-
         {
-            // free MKQL memory then destroy TaskRunner and Allocator
-            if (auto guard = MaybeBindAllocator()) {
+            auto guard = MaybeBindAllocator(); // Source/Sink could destroy mkql values inside PassAway, which requires allocator to be bound
+
+            for (auto& [_, source] : SourcesMap) {
+                if (source.Actor) {
+                    source.AsyncInput->PassAway();
+                }
+            }
+
+            for (auto& [_, transform] : InputTransformsMap) {
+                if (transform.Actor) {
+                    transform.AsyncInput->PassAway();
+                }
+            }
+
+            for (auto& [_, sink] : SinksMap) {
+                if (sink.Actor) {
+                    sink.AsyncOutput->PassAway();
+                }
+            }
+
+            for (auto& [_, transform] : OutputTransformsMap) {
+                if (transform.Actor) {
+                    transform.AsyncOutput->PassAway();
+                }
+            }
+
+            for (auto& [_, outputChannel] : OutputChannelsMap) {
+                if (outputChannel.Channel) {
+                    outputChannel.Channel->Terminate();
+                }
+            }
+
+            if (RuntimeSettings.TerminateHandler) {
+                RuntimeSettings.TerminateHandler(success, issues);
+            }
+
+            {
+                if (guard) {
+                    // free MKQL memory then destroy TaskRunner and Allocator
 #define CLEANUP(what) decltype(what) what##_; what.swap(what##_);
-                CLEANUP(InputChannelsMap);
-                CLEANUP(SourcesMap);
-                CLEANUP(InputTransformsMap);
-                CLEANUP(OutputChannelsMap);
-                CLEANUP(SinksMap);
-                CLEANUP(OutputTransformsMap);
+                    CLEANUP(InputChannelsMap);
+                    CLEANUP(SourcesMap);
+                    CLEANUP(InputTransformsMap);
+                    CLEANUP(OutputChannelsMap);
+                    CLEANUP(SinksMap);
+                    CLEANUP(OutputTransformsMap);
 #undef CLEANUP
+                }
             }
         }
 
@@ -1500,10 +1505,12 @@ protected:
             return;
         }
 
+        CA_LOG_T("Poll sources");
         for (auto& [inputIndex, source] : SourcesMap) {
             PollAsyncInput(source, inputIndex);
         }
 
+        CA_LOG_T("Poll inputs");
         for (auto& [inputIndex, transform] : InputTransformsMap) {
             PollAsyncInput(transform, inputIndex);
         }
@@ -1516,52 +1523,52 @@ protected:
 
     void OnAsyncInputError(const IDqComputeActorAsyncInput::TEvAsyncInputError::TPtr& ev) {
         if (SourcesMap.FindPtr(ev->Get()->InputIndex)) {
-            OnSourceError(ev->Get()->InputIndex, ev->Get()->Issues, ev->Get()->IsFatal);
+            OnSourceError(ev->Get()->InputIndex, ev->Get()->Issues, ev->Get()->FatalCode);
         } else if (InputTransformsMap.FindPtr(ev->Get()->InputIndex)) {
-            OnInputTransformError(ev->Get()->InputIndex, ev->Get()->Issues, ev->Get()->IsFatal);
+            OnInputTransformError(ev->Get()->InputIndex, ev->Get()->Issues, ev->Get()->FatalCode);
         } else {
             YQL_ENSURE(false, "Unexpected input index: " << ev->Get()->InputIndex);
         }
     }
 
-    void OnSourceError(ui64 inputIndex, const TIssues& issues, bool isFatal) {
-        if (!isFatal) {
+    void OnSourceError(ui64 inputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode) {
+        if (fatalCode == NYql::NDqProto::StatusIds::UNSPECIFIED) {
             SourcesMap.at(inputIndex).IssuesBuffer.Push(issues);
             return;
         }
 
         CA_LOG_E("Source[" << inputIndex << "] fatal error: " << issues.ToOneLineString());
-        InternalError(NYql::NDqProto::StatusIds::EXTERNAL_ERROR, issues);
+        InternalError(fatalCode, issues);
     }
 
-    void OnInputTransformError(ui64 inputIndex, const TIssues& issues, bool isFatal) {
-        if (!isFatal) {
+    void OnInputTransformError(ui64 inputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode) {
+        if (fatalCode == NYql::NDqProto::StatusIds::UNSPECIFIED) {
             InputTransformsMap.at(inputIndex).IssuesBuffer.Push(issues);
             return;
         }
 
         CA_LOG_E("InputTransform[" << inputIndex << "] fatal error: " << issues.ToOneLineString());
-        InternalError(NYql::NDqProto::StatusIds::EXTERNAL_ERROR, issues);
+        InternalError(fatalCode, issues);
     }
 
-    void OnSinkError(ui64 outputIndex, const TIssues& issues, bool isFatal) override {
-        if (!isFatal) {
+    void OnSinkError(ui64 outputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode) override {
+        if (fatalCode == NYql::NDqProto::StatusIds::UNSPECIFIED) {
             SinksMap.at(outputIndex).IssuesBuffer.Push(issues);
             return;
         }
 
         CA_LOG_E("Sink[" << outputIndex << "] fatal error: " << issues.ToOneLineString());
-        InternalError(NYql::NDqProto::StatusIds::EXTERNAL_ERROR, issues);
+        InternalError(fatalCode, issues);
     }
 
-    void OnOutputTransformError(ui64 outputIndex, const TIssues& issues, bool isFatal) override {
-        if (!isFatal) {
+    void OnOutputTransformError(ui64 outputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode) override {
+        if (fatalCode == NYql::NDqProto::StatusIds::UNSPECIFIED) {
             OutputTransformsMap.at(outputIndex).IssuesBuffer.Push(issues);
             return;
         }
 
         CA_LOG_E("OutputTransform[" << outputIndex << "] fatal error: " << issues.ToOneLineString());
-        InternalError(NYql::NDqProto::StatusIds::EXTERNAL_ERROR, issues);
+        InternalError(fatalCode, issues);
     }
 
     bool AllAsyncOutputsFinished() const {

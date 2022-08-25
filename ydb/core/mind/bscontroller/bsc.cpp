@@ -235,6 +235,15 @@ void TBlobStorageController::ValidateInternalState() {
             Y_VERIFY(donor->Mood == TMood::Donor);
             Y_VERIFY(donor->AcceptorVSlotId == vslotId);
         }
+        if (vslot->Group) {
+            if (vslot->Status == NKikimrBlobStorage::EVDiskStatus::READY) {
+                Y_VERIFY_DEBUG(vslot->IsReady || vslot->IsInVSlotReadyTimestampQ());
+            } else {
+                Y_VERIFY_DEBUG(!vslot->IsReady && !vslot->IsInVSlotReadyTimestampQ());
+            }
+        } else {
+            Y_VERIFY_DEBUG(!vslot->IsInVSlotReadyTimestampQ());
+        }
     }
     for (const auto& [groupId, group] : GroupMap) {
         Y_VERIFY(groupId == group->ID);
@@ -291,7 +300,7 @@ ui32 TBlobStorageController::GetEventPriority(IEventHandle *ev) {
             const auto& record = msg->Record;
             for (const auto& item : record.GetVDiskStatus()) {
                 const TVSlotId vslotId(item.GetNodeId(), item.GetPDiskId(), item.GetVSlotId());
-                if (TVSlotInfo *slot = FindVSlot(vslotId); slot && slot->GetStatus() > item.GetStatus()) {
+                if (TVSlotInfo *slot = FindVSlot(vslotId); slot && slot->Status > item.GetStatus()) {
                     return 1;
                 } else if (const auto it = StaticVSlots.find(vslotId); it != StaticVSlots.end() && it->second.VDiskStatus > item.GetStatus()) {
                     return 1;
@@ -338,6 +347,7 @@ ui32 TBlobStorageController::GetEventPriority(IEventHandle *ev) {
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kReassignGroupDisk:
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kAllocateVirtualGroup:
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kDecommitGroups:
+                    case NKikimrBlobStorage::TConfigRequest::TCommand::kWipeVDisk:
                         return 2; // read-write commands go with higher priority as they are needed to keep cluster intact
 
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kReadHostConfig:

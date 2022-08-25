@@ -382,12 +382,60 @@ TRuntimeNode CreateSqueezeToSortedDict(TProgramBuilder& pb, size_t vecSize, TCal
     );
 }
 
+TRuntimeNode CreateMapJoin(TProgramBuilder& pb, size_t vecSize, TCallable *list = nullptr) {
+    TTimer t(TString(__func__) + ": ");
+    auto flow = CreateFlow(pb, vecSize, list);
+
+    const auto tupleType = pb.NewTupleType({
+        pb.NewDataType(NUdf::TDataType<ui32>::Id),
+        pb.NewDataType(NUdf::TDataType<ui64>::Id)
+    });
+
+    const auto list1 = pb.Map(flow, [&] (TRuntimeNode item) {
+        return pb.NewTuple({pb.Mod(item, pb.NewDataLiteral<ui64>(1000)), pb.NewDataLiteral<ui32>(1)});
+    });
+
+    const auto list2 = pb.NewList(tupleType, {
+        pb.NewTuple({pb.NewDataLiteral<ui32>(1), pb.NewDataLiteral<ui64>(3 * 1000)}),
+        pb.NewTuple({pb.NewDataLiteral<ui32>(2), pb.NewDataLiteral<ui64>(4 * 1000)}),
+        pb.NewTuple({pb.NewDataLiteral<ui32>(3), pb.NewDataLiteral<ui64>(5 * 1000)}),
+    });
+
+    const auto dict = pb.ToSortedDict(list2, false,
+        [&](TRuntimeNode item) {
+            return pb.Nth(item, 0);
+        },
+        [&](TRuntimeNode item) {
+            return pb.NewTuple({pb.Nth(item, 1U)});
+    });
+
+    const auto resultType = pb.NewFlowType(pb.NewTupleType({
+        pb.NewDataType(NUdf::TDataType<char*>::Id),
+        pb.NewDataType(NUdf::TDataType<char*>::Id),
+    }));
+
+    return pb.Map(
+            pb.NarrowMap(pb.MapJoinCore(
+                pb.ExpandMap(list1, [&] (TRuntimeNode item) -> TRuntimeNode::TList { return {pb.Nth(item, 0), pb.Nth(item, 1)}; }),
+                dict,
+                EJoinKind::Inner,
+                {0U},
+                {1U, 0U},
+                {0U, 1U},
+                resultType
+            ),
+            [&](TRuntimeNode::TList items) { return pb.NewTuple(items); }
+        ),
+        [&](TRuntimeNode item) { return pb.Nth(item, 1); }
+    );
+}
+
 Y_UNIT_TEST_SUITE(ComputationGraphDataRace) {
     template<class T>
-    void ParallelProgTest(T f, bool useLLVM, ui64 testResult, size_t vecSize = 100'000) {
+    void ParallelProgTest(T f, bool useLLVM, ui64 testResult, size_t vecSize = 10'000) {
         TTimer t("total: ");
         const ui32 cacheSize = 10;
-        const ui32 inFlight = 3;
+        const ui32 inFlight = 7;
         TComputationPatternLRUCache cache(cacheSize);
 
         auto functionRegistry = CreateFunctionRegistry(CreateBuiltinRegistry())->Clone();
@@ -467,27 +515,27 @@ Y_UNIT_TEST_SUITE(ComputationGraphDataRace) {
     }
 
     Y_UNIT_TEST_QUAD(Filter, Wide, UseLLVM) {
-        ParallelProgTest(CreateFilter<Wide>, UseLLVM, 136480896);
+        ParallelProgTest(CreateFilter<Wide>, UseLLVM, 10098816);
     }
 
     Y_UNIT_TEST_QUAD(Map, Wide, UseLLVM) {
-        ParallelProgTest(CreateMap<Wide>, UseLLVM, 782);
+        ParallelProgTest(CreateMap<Wide>, UseLLVM, 78);
     }
 
     Y_UNIT_TEST_QUAD(Condense, Wide, UseLLVM) {
-        ParallelProgTest(CreateCondense<Wide>, UseLLVM, 17451450000);
+        ParallelProgTest(CreateCondense<Wide>, UseLLVM, 1295145000);
     }
 
     Y_UNIT_TEST_QUAD(Chopper, Wide, UseLLVM) {
-        ParallelProgTest(CreateChopper<Wide>, UseLLVM, 17451450000);
+        ParallelProgTest(CreateChopper<Wide>, UseLLVM, 1295145000);
     }
 
     Y_UNIT_TEST_QUAD(Combine, Wide, UseLLVM) {
-        ParallelProgTest(CreateCombine<Wide>, UseLLVM, 17451450000);
+        ParallelProgTest(CreateCombine<Wide>, UseLLVM, 1295145000);
     }
 
     Y_UNIT_TEST_QUAD(Chain1Map, Wide, UseLLVM) {
-        ParallelProgTest(CreateChain1Map<Wide>, UseLLVM, 789247892400000);
+        ParallelProgTest(CreateChain1Map<Wide>, UseLLVM, 6393039240000);
     }
 
     Y_UNIT_TEST_QUAD(Discard, Wide, UseLLVM) {
@@ -495,19 +543,23 @@ Y_UNIT_TEST_SUITE(ComputationGraphDataRace) {
     }
 
     Y_UNIT_TEST_QUAD(Skip, Wide, UseLLVM) {
-        ParallelProgTest(CreateSkip<Wide>, UseLLVM, 17389067750);
+        ParallelProgTest(CreateSkip<Wide>, UseLLVM, 1232762750);
     }
 
     Y_UNIT_TEST_QUAD(NarrowFlatMap, Flow, UseLLVM) {
-        ParallelProgTest(CreateNarrowFlatMap<Flow>, UseLLVM, 17451450000);
+        ParallelProgTest(CreateNarrowFlatMap<Flow>, UseLLVM, 1295145000);
     }
 
     Y_UNIT_TEST_TWIN(NarrowMultiMap, UseLLVM) {
-        ParallelProgTest(CreateNarrowMultiMap, UseLLVM, 17451450000ull * 2);
+        ParallelProgTest(CreateNarrowMultiMap, UseLLVM, 1295145000ull * 2);
     }
 
     Y_UNIT_TEST_QUAD(SqueezeToSortedDict, WithPayload, UseLLVM) {
         ParallelProgTest(CreateSqueezeToSortedDict<WithPayload>, UseLLVM, 125014500, 1000);
+    }
+
+    Y_UNIT_TEST_TWIN(MapJoin, UseLLVM) {
+        ParallelProgTest(CreateMapJoin, UseLLVM, 120000, 10'000);
     }
 }
 
@@ -590,10 +642,12 @@ Y_UNIT_TEST_SUITE(ComputationPatternCache) {
         auto graph = pattern->Clone(opts.ToComputationOptions(*randomProvider, *timeProvider));
         t_clone.reset();
 
+        const ui64 repeats = 100'000;
+
         {
             TTimer t("graph: ");
             ui64 acc = 0;
-            for (ui32 i = 0; i < 100'000'000; ++i) {
+            for (ui64 i = 0; i < repeats; ++i) {
                 acc += graph->GetValue().Get<ui64>();
             }
             Y_DO_NOT_OPTIMIZE_AWAY(acc);
@@ -605,7 +659,7 @@ Y_UNIT_TEST_SUITE(ComputationPatternCache) {
 
             TTimer t("lambda: ");
             ui64 acc = 0;
-            for (ui32 i = 0; i < 100'000'000; ++i) {
+            for (ui64 i = 0; i < repeats; ++i) {
                 acc += add(123591592ULL, 323591592ULL);
             }
             Y_DO_NOT_OPTIMIZE_AWAY(acc);
@@ -621,7 +675,7 @@ Y_UNIT_TEST_SUITE(ComputationPatternCache) {
             TUnboxedValue acc(TUnboxedValuePod(0));
             TUnboxedValue v1(TUnboxedValuePod(ui64{123591592UL}));
             TUnboxedValue v2(TUnboxedValuePod(ui64{323591592UL}));
-            for (ui32 i = 0; i < 100'000'000; ++i) {
+            for (ui64 i = 0; i < repeats; ++i) {
                 auto r = add(v1, v2);
                 acc = add(r, acc);
             }
@@ -636,7 +690,7 @@ Y_UNIT_TEST_SUITE(ComputationPatternCache) {
         auto functionRegistry = CreateFunctionRegistry(CreateBuiltinRegistry())->Clone();
 
         TProgramBuilder pb(typeEnv, *functionRegistry);
-        const ui64 vecSize = 100'000'000;
+        const ui64 vecSize = 100'000;
         Cerr << "vecSize: " << vecSize << Endl;
         const auto listType = pb.NewListType(pb.NewDataType(NUdf::TDataType<ui64>::Id));
         const auto list = TCallableBuilder(pb.GetTypeEnvironment(), "TestList", listType).Build();
@@ -677,6 +731,9 @@ Y_UNIT_TEST_SUITE(ComputationPatternCache) {
                 UNIT_ASSERT_VALUES_EQUAL(count, 781263);
             } else if (vecSize == 10'000'000) {
                 UNIT_ASSERT_VALUES_EQUAL(acc, 222145217664);
+            } else if (vecSize == 100'000) {
+                UNIT_ASSERT_VALUES_EQUAL(acc, 136480896);
+                UNIT_ASSERT_VALUES_EQUAL(count, 782);
             } else {
                 UNIT_FAIL("result is not checked");
             }

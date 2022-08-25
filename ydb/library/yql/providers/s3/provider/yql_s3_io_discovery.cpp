@@ -10,6 +10,7 @@
 #include <ydb/library/yql/utils/url_builder.h>
 
 #include <util/generic/size_literals.h>
+#include <util/string/join.h>
 
 namespace NYql {
 
@@ -34,12 +35,11 @@ struct TListRequest {
     TString Token;
     TString Url;
     TString Pattern;
-    TString UserPath;
     TVector<IPathGenerator::TColumnWithValue> ColumnValues;
 };
 
 bool operator<(const TListRequest& a, const TListRequest& b) {
-    return std::tie(a.Token, a.Url, a.Pattern, a.UserPath) < std::tie(b.Token, b.Url, b.Pattern, b.UserPath);
+    return std::tie(a.Token, a.Url, a.Pattern) < std::tie(b.Token, b.Url, b.Pattern);
 }
 
 using TPendingRequests = TMap<TListRequest, NThreading::TFuture<IS3Lister::TListResult>>;
@@ -110,30 +110,12 @@ public:
         genColumnsByNode.swap(GenColumnsByNode_);
 
         TNodeOnNodeOwnedMap replaces;
-        size_t count = 0;
-        size_t totalSize = 0;
         for (auto& [node, requests] : requestsByNode) {
             const TS3Read read(node);
             const auto& object = read.Arg(2).Ref();
             YQL_ENSURE(object.IsCallable("MrTableConcat"));
             size_t readSize = 0;
             TExprNode::TListType pathNodes;
-
-            TString formatName;
-            {
-                const auto& settings = *read.Ref().Child(4);
-                auto format = GetSetting(settings, "format");
-                if (format && format->ChildrenSize() >= 2) {
-                    formatName = format->Child(1)->Content();
-                }
-            }
-            auto fileSizeLimit = State_->Configuration->FileSizeLimit;
-            if (formatName) {
-                auto it = State_->Configuration->FormatSizeLimits.find(formatName);
-                if (it != State_->Configuration->FormatSizeLimits.end() && fileSizeLimit > it->second) {
-                    fileSizeLimit = it->second;
-                }
-            }
 
             struct TExtraColumnValue {
                 TString Name;
@@ -164,20 +146,14 @@ public:
                 }
 
                 const auto& listEntries = std::get<IS3Lister::TListEntries>(listResult);
-                if (listEntries.empty() && !generatedColumnsConfig && !req.UserPath.EndsWith("/")) {
+                if (listEntries.empty() && !IS3Lister::HasWildcards(req.Pattern)) {
                     // request to list particular files that are missing
                     ctx.AddError(TIssue(ctx.GetPosition(object.Pos()),
-                        TStringBuilder() << "Object " << req.UserPath << " doesn't exist."));
+                        TStringBuilder() << "Object " << req.Pattern << " doesn't exist."));
                     return TStatus::Error;
                 }
 
                 for (auto& entry : listEntries) {
-                    if (entry.Size > fileSizeLimit) {
-                        ctx.AddError(TIssue(ctx.GetPosition(object.Pos()),
-                            TStringBuilder() << "Size of object " << entry.Path << " = " << entry.Size << " and exceeds limit = " << fileSizeLimit << " specified for format " << formatName));
-                        return TStatus::Error;
-                    }
-
                     TMaybe<TVector<TExtraColumnValue>> extraValues;
                     if (generatedColumnsConfig) {
                         extraValues = TVector<TExtraColumnValue>{};
@@ -205,12 +181,10 @@ public:
 
                     auto& pathList = pathsByExtraValues[extraValues];
                     pathList.emplace_back(entry.Path, entry.Size);
-                    ++count;
                     readSize += entry.Size;
                 }
 
                 YQL_CLOG(INFO, ProviderS3) << "Object " << req.Pattern << " has " << listEntries.size() << " items with total size " << readSize;
-                totalSize += readSize;
             }
 
             for (const auto& [extraValues, pathList] : pathsByExtraValues) {
@@ -317,21 +291,29 @@ public:
                 .Done().Ptr());
         }
 
-        const auto maxFiles = State_->Configuration->MaxFilesPerQuery;
-        if (count > maxFiles) {
-            ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TStringBuilder() << "Too many objects to read: " << count << ", but limit is " << maxFiles));
-            return TStatus::Error;
-        }
-
-        const auto maxSize = State_->Configuration->MaxReadSizePerQuery;
-        if (totalSize > maxSize) {
-            ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TStringBuilder() << "Too large objects to read: " << totalSize << ", but limit is " << maxSize));
-            return TStatus::Error;
-        }
-
         return RemapExpr(input, output, replaces, ctx, TOptimizeExprSettings(nullptr));
     }
 private:
+    static bool ValidateProjection(TPositionHandle pos, const TPathGeneratorPtr& generator, const TVector<TString>& partitionedBy, TExprContext& ctx) {
+        const TSet<TString> partitionedBySet(partitionedBy.begin(), partitionedBy.end());
+        TSet<TString> projectionSet;
+        const auto& config = generator->GetConfig();
+        if (!config.Enabled) {
+            ctx.AddError(TIssue(ctx.GetPosition(pos), "Projection is configured but not enabled"));
+            return false;
+        }
+        for (auto& rule : config.Rules) {
+            projectionSet.insert(rule.Name);
+        }
+
+        if (projectionSet != partitionedBySet) {
+            ctx.AddError(TIssue(ctx.GetPosition(pos), TStringBuilder() << "Column set in partitioned_by doesn't match column set in projection: {"
+                << JoinSeq(",", partitionedBySet) << "} != {" << JoinSeq(",", projectionSet) << "}"));
+            return false;
+        }
+        return true;
+    }
+
     bool LaunchListsForNode(const TS3Read& read, TVector<NThreading::TFuture<IS3Lister::TListResult>>& futures, TExprContext& ctx) {
         const auto& settings = *read.Ref().Child(4);
 
@@ -367,6 +349,7 @@ private:
         }
 
         TString projection;
+        TPositionHandle projectionPos;
         if (auto projectionSetting = GetSetting(settings, "projection")) {
             if (!EnsureTupleSize(*projectionSetting, 2, ctx)) {
                 return false;
@@ -386,6 +369,7 @@ private:
                 return false;
             }
             projection = projectionSetting->Tail().Content();
+            projectionPos = projectionSetting->Tail().Pos();
         }
 
         TVector<TString> paths;
@@ -406,6 +390,9 @@ private:
             config.SchemaTypeNode = schema->ChildPtr(1);
             if (!projection.empty()) {
                 config.Generator = CreatePathGenerator(projection, partitionedBy);
+                if (!ValidateProjection(projectionPos, config.Generator, partitionedBy, ctx)) {
+                    return false;
+                }
             }
             GenColumnsByNode_[read.Raw()] = config;
         }
@@ -417,7 +404,6 @@ private:
             TListRequest req;
             req.Token = tokenStr;
             req.Url = url;
-            req.UserPath = path;
 
             if (partitionedBy.empty()) {
                 if (path.EndsWith("/")) {
@@ -432,6 +418,7 @@ private:
                     ctx.AddError(TIssue(ctx.GetPosition(read.Pos()), TStringBuilder() << "Path prefix: '" << path << "' contains wildcards"));
                     return false;
                 }
+                const TString pathNoTrailingSlash = path.substr(0, path.EndsWith("/") ? path.size() - 1 : path.size());
                 if (!config.Generator) {
                     // Hive-style partitioning
                     TString generated;
@@ -439,13 +426,13 @@ private:
                         generated += "/" + col + "=*";
                     }
                     generated += "/*";
-                    req.Pattern = path + generated;
+                    req.Pattern = pathNoTrailingSlash + generated;
                     reqs.push_back(req);
                 } else {
                     for (auto& rule : config.Generator->GetRules()) {
                         YQL_ENSURE(rule.ColumnValues.size() == config.Columns.size());
                         req.ColumnValues.assign(rule.ColumnValues.begin(), rule.ColumnValues.end());
-                        req.Pattern = path + rule.Path + "/*";
+                        req.Pattern = pathNoTrailingSlash + rule.Path + "/*";
                         reqs.push_back(req);
                     }
                 }

@@ -55,6 +55,7 @@ namespace NWilson {
             TFlags Flags;
             int UncaughtExceptions = std::uncaught_exceptions();
             bool Sent = false;
+            bool Ignored = false;
 
             TData(TInstant startTime, ui64 startCycles, TTraceId traceId, TFlags flags)
                 : StartTime(startTime)
@@ -64,7 +65,7 @@ namespace NWilson {
             {}
 
             ~TData() {
-                Y_VERIFY_DEBUG(Sent);
+                Y_VERIFY_DEBUG(Sent || Ignored);
             }
         };
 
@@ -81,17 +82,21 @@ namespace NWilson {
                     : nullptr)
         {
             if (Y_UNLIKELY(*this)) {
-                if (!parentId.IsRoot()) {
-                    Data->Span.set_parent_span_id(parentId.GetSpanIdPtr(), parentId.GetSpanIdSize());
-                }
-                Data->Span.set_start_time_unix_nano(Data->StartTime.NanoSeconds());
-                Data->Span.set_kind(opentelemetry::proto::trace::v1::Span::SPAN_KIND_INTERNAL);
+                if (verbosity <= parentId.GetVerbosity()) {
+                    if (!parentId.IsRoot()) {
+                        Data->Span.set_parent_span_id(parentId.GetSpanIdPtr(), parentId.GetSpanIdSize());
+                    }
+                    Data->Span.set_start_time_unix_nano(Data->StartTime.NanoSeconds());
+                    Data->Span.set_kind(opentelemetry::proto::trace::v1::Span::SPAN_KIND_INTERNAL);
 
-                if (name) {
-                    Name(std::move(*name));
-                }
+                    if (name) {
+                        Name(std::move(*name));
+                    }
 
-                Attribute("node_id", NActors::TActivationContext::ActorSystem()->NodeId);
+                    Attribute("node_id", NActors::TActivationContext::ActorSystem()->NodeId);
+                } else {
+                    Data->Ignored = true; // ignore this span due to verbosity mismatch, still allowing child spans to be created
+                }
             }
         }
 
@@ -120,14 +125,14 @@ namespace NWilson {
         }
 
         explicit operator bool() const {
-            return Data && !Data->Sent;
+            return Data && !Data->Sent && !Data->Ignored;
         }
 
         TSpan& EnableAutoEnd() {
             if (Y_UNLIKELY(*this)) {
                 Data->Flags |= EFlags::AUTO_END;
             } else {
-                Y_VERIFY_DEBUG(!Data, "span has been ended");
+                VerifyNotSent();
             }
             return *this;
         }
@@ -136,7 +141,7 @@ namespace NWilson {
             if (Y_UNLIKELY(*this)) {
                 // update relation in data somehow
             } else {
-                Y_VERIFY_DEBUG(!Data, "span has been ended");
+                VerifyNotSent();
             }
             return *this;
         }
@@ -145,7 +150,7 @@ namespace NWilson {
             if (Y_UNLIKELY(*this)) {
                 Data->Span.set_name(std::move(name));
             } else {
-                Y_VERIFY_DEBUG(!Data, "span has been ended");
+                VerifyNotSent();
             }
             return *this;
         }
@@ -154,7 +159,7 @@ namespace NWilson {
             if (Y_UNLIKELY(*this)) {
                 SerializeKeyValue(std::move(name), std::move(value), Data->Span.add_attributes());
             } else {
-                Y_VERIFY_DEBUG(!Data, "span has been ended");
+                VerifyNotSent();
             }
             return *this;
         }
@@ -168,7 +173,7 @@ namespace NWilson {
                     SerializeKeyValue(std::move(key), std::move(value), event->add_attributes());
                 }
             } else {
-                Y_VERIFY_DEBUG(!Data, "span has been ended");
+                VerifyNotSent();
             }
             return *this;
         }
@@ -182,7 +187,7 @@ namespace NWilson {
                     SerializeKeyValue(std::move(key), std::move(value), link->add_attributes());
                 }
             } else {
-                Y_VERIFY_DEBUG(!Data, "span has been ended");
+                VerifyNotSent();
             }
             return *this;
         }
@@ -193,7 +198,7 @@ namespace NWilson {
                 status->set_code(NTraceProto::Status::STATUS_CODE_OK);
                 End();
             } else {
-                Y_VERIFY_DEBUG(!Data, "span has been ended");
+                VerifyNotSent();
             }
         }
 
@@ -204,7 +209,7 @@ namespace NWilson {
                 status->set_message(std::move(error));
                 End();
             } else {
-                Y_VERIFY_DEBUG(!Data, "span has been ended");
+                VerifyNotSent();
             }
         }
 
@@ -215,7 +220,7 @@ namespace NWilson {
                 Data->Span.set_end_time_unix_nano(TimeUnixNano());
                 Send();
             } else {
-                Y_VERIFY_DEBUG(!Data, "span has been ended");
+                VerifyNotSent();
             }
         }
 
@@ -229,6 +234,10 @@ namespace NWilson {
         ui64 TimeUnixNano() const {
             const TInstant now = Data->StartTime + CyclesToDuration(GetCycleCount() - Data->StartCycles);
             return now.NanoSeconds();
+        }
+
+        void VerifyNotSent() {
+            Y_VERIFY_DEBUG(!Data || !Data->Sent, "span has been ended");
         }
     };
 

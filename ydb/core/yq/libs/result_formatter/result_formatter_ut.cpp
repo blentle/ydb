@@ -30,17 +30,34 @@ Y_UNIT_TEST_SUITE(ResultFormatter) {
             value.add_items()->set_int64_value(1000000002);
         }
 
-        NJson::TJsonValue root;
-        FormatResultSet(root, rs);
+        {
+            NJson::TJsonValue root;
+            FormatResultSet(root, rs);
 
-        TStringStream stream;
-        NJson::WriteJson(&stream, &root);
+            TStringStream stream;
+            NJson::WriteJson(&stream, &root);
 
-        // Cerr << stream.Str() << Endl;
+            // Cerr << stream.Str() << Endl;
 
-        TString expected = R"___({"data":[{"column0":"31337","column1":"1000000001"},{"column0":"31338","column1":"1000000002"}],"columns":[{"name":"column0","type":["DataType","Int32"]},{"name":"column1","type":["DataType","Int64"]}]})___";
+            TString expected = R"___({"data":[{"column0":"31337","column1":"1000000001"},{"column0":"31338","column1":"1000000002"}],"columns":[{"name":"column0","type":["DataType","Int32"]},{"name":"column1","type":["DataType","Int64"]}]})___";
 
-        UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+            UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+        }
+
+        // pretty format
+        {
+            NJson::TJsonValue root;
+            FormatResultSet(root, rs, true, true);
+
+            TStringStream stream;
+            NJson::WriteJson(&stream, &root);
+
+            // Cerr << stream.Str() << Endl;
+
+            TString expected = R"___({"data":[{"column0":"31337","column1":"1000000001"},{"column0":"31338","column1":"1000000002"}],"columns":[{"name":"column0","type":"Int32"},{"name":"column1","type":"Int64"}]})___";
+
+            UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+        }
     }
 
     Y_UNIT_TEST(List) {
@@ -58,17 +75,34 @@ Y_UNIT_TEST_SUITE(ResultFormatter) {
             cell.add_items()->set_int32_value(1000000001);
         }
 
-        NJson::TJsonValue root;
-        FormatResultSet(root, rs);
+        {
+            NJson::TJsonValue root;
+            FormatResultSet(root, rs);
 
-        TStringStream stream;
-        NJson::WriteJson(&stream, &root);
+            TStringStream stream;
+            NJson::WriteJson(&stream, &root);
 
-        //Cerr << stream.Str() << Endl;
+            //Cerr << stream.Str() << Endl;
 
-        TString expected = R"___({"data":[{"column0":["31337","1000000001"]}],"columns":[{"name":"column0","type":["ListType",["DataType","Int32"]]}]})___";
+            TString expected = R"___({"data":[{"column0":["31337","1000000001"]}],"columns":[{"name":"column0","type":["ListType",["DataType","Int32"]]}]})___";
 
-        UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+            UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+        }
+
+        // pretty format
+        {
+            NJson::TJsonValue root;
+            FormatResultSet(root, rs, true, true);
+
+            TStringStream stream;
+            NJson::WriteJson(&stream, &root);
+
+            //Cerr << stream.Str() << Endl;
+
+            TString expected = R"___({"data":[{"column0":["31337","1000000001"]}],"columns":[{"name":"column0","type":"List<Int32>"}]})___";
+
+            UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+        }
     }
 
     Y_UNIT_TEST(Optional) {
@@ -88,16 +122,32 @@ Y_UNIT_TEST_SUITE(ResultFormatter) {
             value.add_items()->set_null_flag_value(::google::protobuf::NullValue());
         }
 
-        NJson::TJsonValue root;
-        FormatResultSet(root, rs);
+        {
+            NJson::TJsonValue root;
+            FormatResultSet(root, rs);
 
-        TStringStream stream;
-        NJson::WriteJson(&stream, &root);
+            TStringStream stream;
+            NJson::WriteJson(&stream, &root);
 
-        //Cerr << stream.Str() << Endl;
-        TString expected = R"___({"data":[{"column0":["31337"]},{"column0":null}],"columns":[{"name":"column0","type":["OptionalType",["DataType","Int32"]]}]})___";
+            //Cerr << stream.Str() << Endl;
+            TString expected = R"___({"data":[{"column0":["31337"]},{"column0":null}],"columns":[{"name":"column0","type":["OptionalType",["DataType","Int32"]]}]})___";
 
-        UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+            UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+        }
+
+        // pretty format
+        {
+            NJson::TJsonValue root;
+            FormatResultSet(root, rs, true, true);
+
+            TStringStream stream;
+            NJson::WriteJson(&stream, &root);
+
+            //Cerr << stream.Str() << Endl;
+            TString expected = R"___({"data":[{"column0":["31337"]},{"column0":[]}],"columns":[{"name":"column0","type":"Optional<Int32>"}]})___";
+
+            UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+        }
     }
 
     Y_UNIT_TEST(Struct) {
@@ -122,14 +172,64 @@ Y_UNIT_TEST_SUITE(ResultFormatter) {
             cell.add_items()->set_int64_value(113370); // k2
         }
 
+        {
+            NJson::TJsonValue root;
+            FormatResultSet(root, rs);
+
+            TStringStream stream;
+            NJson::WriteJson(&stream, &root);
+
+            //Cerr << stream.Str() << Endl;
+            TString expected = R"___({"data":[{"column0":["31337","113370"]}],"columns":[{"name":"column0","type":["StructType",[["k1",["DataType","Int32"]],["k2",["DataType","Int64"]]]]}]})___";
+
+            UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+        }
+
+        // pretty format
+        {
+            NJson::TJsonValue root;
+            FormatResultSet(root, rs, true, true);
+
+            TStringStream stream;
+            NJson::WriteJson(&stream, &root);
+
+            //Cerr << stream.Str() << Endl;
+            TString expected = R"___({"data":[{"column0":{"k2":"113370","k1":"31337"}}],"columns":[{"name":"column0","type":"Struct<'k1':Int32,'k2':Int64>"}]})___";
+
+            UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
+        }
+    }
+
+    Y_UNIT_TEST(StructTypeNameAsString) {
+        Ydb::ResultSet rs;
+        {
+            auto& column = *rs.add_columns();
+            column.set_name("column0");
+            auto& struct_type = *column.mutable_type()->mutable_struct_type();
+            auto& m1 = *struct_type.add_members();
+            auto& m2 = *struct_type.add_members();
+
+            m1.set_name("k1");
+            m1.mutable_type()->set_type_id(Ydb::Type::INT32);
+
+            m2.set_name("k2");
+            m2.mutable_type()->set_type_id(Ydb::Type::INT64);
+        }
+        {
+            auto& value = *rs.add_rows();
+            auto& cell = *value.add_items();
+            cell.add_items()->set_int32_value(31337); // k1
+            cell.add_items()->set_int64_value(113370); // k2
+        }
+
         NJson::TJsonValue root;
-        FormatResultSet(root, rs);
+        FormatResultSet(root, rs, true);
 
         TStringStream stream;
         NJson::WriteJson(&stream, &root);
 
         //Cerr << stream.Str() << Endl;
-        TString expected = R"___({"data":[{"column0":["31337","113370"]}],"columns":[{"name":"column0","type":["StructType",[["k1",["DataType","Int32"]],["k2",["DataType","Int64"]]]]}]})___";
+        TString expected = R"___({"data":[{"column0":["31337","113370"]}],"columns":[{"name":"column0","type":"Struct<'k1':Int32,'k2':Int64>"}]})___";
 
         UNIT_ASSERT_VALUES_EQUAL(stream.Str(), expected);
     }

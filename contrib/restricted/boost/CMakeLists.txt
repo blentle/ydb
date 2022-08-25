@@ -41,19 +41,24 @@ target_link_libraries(contrib-restricted-boost INTERFACE
   restricted-boost-iterator
   restricted-boost-lambda
   restricted-boost-lexical_cast
+  restricted-boost-lockfree
   restricted-boost-math
   restricted-boost-move
   restricted-boost-mp11
   restricted-boost-mpl
   restricted-boost-multi_array
+  restricted-boost-multiprecision
   restricted-boost-numeric_conversion
   restricted-boost-optional
+  restricted-boost-parameter
   restricted-boost-phoenix
   restricted-boost-polygon
+  restricted-boost-pool
   restricted-boost-predef
   restricted-boost-preprocessor
   restricted-boost-proto
   restricted-boost-qvm
+  restricted-boost-random
   restricted-boost-range
   restricted-boost-rational
   restricted-boost-smart_ptr
@@ -70,4 +75,5 @@ target_link_libraries(contrib-restricted-boost INTERFACE
   restricted-boost-variant
   restricted-boost-vmd
   restricted-boost-winapi
+  restricted-boost-xpressive
 )
