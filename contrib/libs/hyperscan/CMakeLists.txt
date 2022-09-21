@@ -6,6 +6,10 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(runtime_avx2)
+add_subdirectory(runtime_avx512)
+add_subdirectory(runtime_core2)
+add_subdirectory(runtime_corei7)
 
 add_library(contrib-libs-hyperscan)
 target_compile_options(contrib-libs-hyperscan PRIVATE
@@ -20,8 +24,9 @@ target_include_directories(contrib-libs-hyperscan PRIVATE
 target_link_libraries(contrib-libs-hyperscan PUBLIC
   contrib-libs-cxxsupp
   contrib-restricted-boost
+  restricted-boost-graph
   restricted-boost-icl
-  boost-libs-graph
+  restricted-boost-property_map
 )
 target_sources(contrib-libs-hyperscan PRIVATE
   ${CMAKE_SOURCE_DIR}/contrib/libs/hyperscan/src/alloc.c

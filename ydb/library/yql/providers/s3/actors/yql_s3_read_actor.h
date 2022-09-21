@@ -15,9 +15,11 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, NActors::IActor*> CreateS3ReadA
     IHTTPGateway::TPtr gateway,
     NS3::TSource&& params,
     ui64 inputIndex,
+    const TTxId& txId,
     const THashMap<TString, TString>& secureParams,
     const THashMap<TString, TString>& taskParams,
     const NActors::TActorId& computeActorId,
-    ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory);
+    ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory,
+    const IRetryPolicy<long>::TPtr& retryPolicy);
 
 } // namespace NYql::NDq

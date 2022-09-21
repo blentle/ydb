@@ -64,7 +64,7 @@ struct TComputationOptsFull: public TComputationOpts {
 struct TWideFieldsInitInfo {
     ui32 MutablesIndex = 0;
     ui32 WideFieldsIndex = 0;
-    ui32 Count = 0;
+    std::set<ui32> Used;
 };
 
 struct TComputationMutables {
@@ -73,8 +73,9 @@ struct TComputationMutables {
     ui32 CurWideFieldsIndex = 0U;
     std::vector<TWideFieldsInitInfo> WideFieldInitialize;
 
-    void DeferWideFieldsInit(ui32 count) {
-        WideFieldInitialize.push_back({CurValueIndex, CurWideFieldsIndex, count});
+    void DeferWideFieldsInit(ui32 count, std::set<ui32> used) {
+        Y_VERIFY_DEBUG(AllOf(used, [count](ui32 i) { return i < count; }));
+        WideFieldInitialize.push_back({CurValueIndex, CurWideFieldsIndex, std::move(used)});
         CurValueIndex += count;
         CurWideFieldsIndex += count;
     }
@@ -276,7 +277,7 @@ struct TComputationNodeFactoryContext {
 using TComputationNodeFactory = std::function<IComputationNode* (TCallable&, const TComputationNodeFactoryContext&)>;
 using TStreamEmitter = std::function<void(NUdf::TUnboxedValue&&)>;
 
-struct TPatternWithEnv;
+struct TPatternCacheEntry;
 
 struct TComputationPatternOpts {
     TComputationPatternOpts(std::shared_ptr<TInjectedAlloc> cacheAlloc, std::shared_ptr<TTypeEnvironment> cacheEnv)
@@ -329,13 +330,8 @@ struct TComputationPatternOpts {
         SecureParamsProvider = secureParamsProvider;
     }
 
-    void SetPatternEnv(std::shared_ptr<TPatternWithEnv> cacheEnv) {
-        PatternEnv = std::move(cacheEnv);
-    }
-
-    mutable std::shared_ptr<TInjectedAlloc> CacheAlloc;
-    mutable std::shared_ptr<TTypeEnvironment> CacheTypeEnv;
-    mutable std::shared_ptr<TPatternWithEnv> PatternEnv;
+    mutable std::shared_ptr<TInjectedAlloc> CacheAlloc; // obsolete
+    mutable std::shared_ptr<TTypeEnvironment> CacheTypeEnv; // obsolete
     TAllocState& AllocState;
     const TTypeEnvironment& Env;
 
@@ -382,83 +378,6 @@ public:
     virtual void CleanCache() = 0;
     virtual size_t GetSize() const = 0;
     virtual size_t GetCacheHits() const = 0;
-};
-
-using TPrepareFunc = std::function<IComputationPattern::TPtr(TScopedAlloc &, TTypeEnvironment &)>;
-
-struct TPatternWithEnv {
-    TScopedAlloc Alloc;
-    TTypeEnvironment Env;
-    IComputationPattern::TPtr Pattern;
-
-    TPatternWithEnv() : Env(Alloc) {
-        Alloc.Release();
-    }
-
-    ~TPatternWithEnv() {
-        Alloc.Acquire();
-    }
-};
-
-class TComputationPatternLRUCache {
-    mutable std::mutex Mutex;
-
-    TLRUCache<TString, std::shared_ptr<TPatternWithEnv>> Cache;
-    std::atomic<size_t> Hits = 0;
-    std::atomic<size_t> TotalKeysSize = 0;
-    std::atomic<size_t> TotalValuesSize = 0;
-public:
-    TComputationPatternLRUCache(size_t size = 100)
-        : Cache(size)
-    {}
-
-    static std::shared_ptr<TPatternWithEnv> CreateEnv() {
-        return std::make_shared<TPatternWithEnv>();
-    }
-
-    std::shared_ptr<TPatternWithEnv> Find(const TString& serialized) {
-        auto guard = std::unique_lock<std::mutex>(Mutex);
-        if (auto it = Cache.Find(serialized); it != Cache.End()) {
-            ++Hits;
-            return *it;
-        }
-        return {};
-    }
-
-    void EmplacePattern(const TString& serialized, std::shared_ptr<TPatternWithEnv> patternWithEnv) {
-        auto guard = std::unique_lock<std::mutex>(Mutex);
-        Y_VERIFY_DEBUG(patternWithEnv && patternWithEnv->Pattern);
-        TotalKeysSize += serialized.Size();
-        TotalValuesSize += patternWithEnv->Alloc.GetAllocated();
-
-        if (Cache.TotalSize() == Cache.GetMaxSize()) {
-            auto oldest = Cache.FindOldest();
-            Y_VERIFY(oldest != Cache.End());
-            TotalKeysSize -= oldest.Key().Size();
-            TotalValuesSize -= oldest.Value()->Alloc.GetAllocated();
-            Cache.Erase(oldest);
-        }
-
-        Cache.Insert(serialized, std::move(patternWithEnv));
-    }
-
-    void CleanCache() {
-        auto guard = std::unique_lock<std::mutex>(Mutex);
-        Cache.Clear();
-    }
-
-    size_t GetSize() const {
-        auto guard = std::unique_lock<std::mutex>(Mutex);
-        return Cache.TotalSize();
-    }
-
-    size_t GetCacheHits() const {
-        return Hits.load();
-    }
-
-    ~TComputationPatternLRUCache() {
-        Mutex.lock();
-    }
 };
 
 std::unique_ptr<NUdf::ISecureParamsProvider> MakeSimpleSecureParamsProvider(const THashMap<TString, TString>& secureParams);

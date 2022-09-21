@@ -43,6 +43,9 @@ public:
     template <class T>
     static TRef FromPod(const T& data);
 
+    //! Converts to TStringBuf.
+    TStringBuf ToStringBuf() const;
+
     //! Creates a TRef for a part of existing range.
     TRef Slice(size_t startOffset, size_t endOffset) const;
 
@@ -108,13 +111,13 @@ public:
     TSharedRef() = default;
 
     //! Creates a TSharedRef with a given holder.
-    TSharedRef(TRef ref, THolderPtr holder);
+    TSharedRef(TRef ref, ISharedRangeHolderPtr holder);
 
     //! Creates a TSharedRef from a pointer and length.
-    TSharedRef(const void* data, size_t length, THolderPtr holder);
+    TSharedRef(const void* data, size_t length, ISharedRangeHolderPtr holder);
 
     //! Creates a TSharedRef from a range.
-    TSharedRef(const void* begin, const void* end, THolderPtr holder);
+    TSharedRef(const void* begin, const void* end, ISharedRangeHolderPtr holder);
 
     //! Creates an empty TSharedRef.
     static TSharedRef MakeEmpty();
@@ -141,6 +144,9 @@ public:
 
     //! Creates a TSharedRef for a given blob taking ownership of its content.
     static TSharedRef FromBlob(TBlob&& blob);
+
+    //! Converts to TStringBuf.
+    TStringBuf ToStringBuf() const;
 
     //! Creates a copy of a given TRef.
     //! The memory is marked with a given tag.
@@ -183,13 +189,13 @@ public:
     TSharedMutableRef() = default;
 
     //! Creates a TSharedMutableRef with a given holder.
-    TSharedMutableRef(const TMutableRef& ref, THolderPtr holder);
+    TSharedMutableRef(const TMutableRef& ref, ISharedRangeHolderPtr holder);
 
     //! Creates a TSharedMutableRef from a pointer and length.
-    TSharedMutableRef(void* data, size_t length, THolderPtr holder);
+    TSharedMutableRef(void* data, size_t length, ISharedRangeHolderPtr holder);
 
     //! Creates a TSharedMutableRef from a range.
-    TSharedMutableRef(void* begin, void* end, THolderPtr holder);
+    TSharedMutableRef(void* begin, void* end, ISharedRangeHolderPtr holder);
 
     //! Creates an empty TSharedMutableRef.
     static TSharedMutableRef MakeEmpty();

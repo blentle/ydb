@@ -49,12 +49,15 @@ namespace NKikimr::NBlobDepot {
 
                 NKikimrBlobDepot::TEvResolve resolve;
                 auto *item = resolve.AddItems();
-                item->SetBeginningKey(from.AsBinaryString());
-                item->SetIncludeBeginning(true);
-                item->SetEndingKey(to.AsBinaryString());
-                item->SetIncludeEnding(true);
-                item->SetMaxKeys(1);
-                item->SetReverse(true);
+                auto *range = item->MutableKeyRange();
+                range->SetBeginningKey(from.AsBinaryString());
+                range->SetIncludeBeginning(true);
+                range->SetEndingKey(to.AsBinaryString());
+                range->SetIncludeEnding(true);
+                range->SetMaxKeys(1);
+                range->SetReverse(true);
+                item->SetTabletId(TabletId);
+                item->SetMustRestoreFirst(true);
 
                 Agent.Issue(std::move(resolve), this, nullptr);
             }
@@ -94,7 +97,7 @@ namespace NKikimr::NBlobDepot {
                 STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA19, "HandleResolveResult", (VirtualGroupId, Agent.VirtualGroupId),
                     (QueryId, QueryId), (Msg, msg.Record));
 
-                Agent.BlobMappingCache.HandleResolveResult(msg.Record);
+                Agent.BlobMappingCache.HandleResolveResult(msg.Record, nullptr);
 
                 const NKikimrProto::EReplyStatus status = msg.Record.GetStatus();
                 if (status != NKikimrProto::OK && status != NKikimrProto::OVERRUN) {

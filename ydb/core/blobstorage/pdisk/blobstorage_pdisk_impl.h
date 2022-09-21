@@ -73,7 +73,7 @@ public:
     TVector<TLogWrite*> JointLogWrites;
     TVector<TLogWrite*> JointCommits;
     TVector<TChunkTrim*> JointChunkTrims;
-
+    TVector<std::unique_ptr<TChunkForget>> JointChunkForgets;
     TVector<std::unique_ptr<TRequestBase>> FastOperationsQueue;
     TDeque<TRequestBase*> PausedQueue;
     std::set<std::unique_ptr<TYardInit>> PendingYardInits;
@@ -173,11 +173,15 @@ public:
     TAtomic SlowDeviceMs = 0;
 
     const bool UseHugePages;
+    
+    // Chunk locking
+    TMap<TOwner, ui32> OwnerLocks;
+
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Initialization
     TPDisk(const TIntrusivePtr<TPDiskConfig> cfg, const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters);
     TString DynamicStateToString(bool isMultiline);
-    bool ReadChunk0Format(ui8* formatSectors, const TKey& mainKey); // Called by actor
+    TCheckDiskFormatResult ReadChunk0Format(ui8* formatSectors, const TMainKey& mainKey); // Called by actor
     bool IsFormatMagicValid(ui8 *magicData, ui32 magicDataSize); // Called by actor
     bool CheckGuid(TString *outReason); // Called by actor
     bool CheckFormatComplete(); // Called by actor
@@ -186,6 +190,7 @@ public:
     void PrintChunksDebugInfo();
     TString ProcessReadSysLogResult(ui64 &outWritePosition, ui64 &outLsn, const TEvReadLogResult &readLogResult);
     void ReadAndParseMainLog(const TActorId &pDiskActor);
+    void WriteFormatAsync(TDiskFormat format, const TKey &mainKey);
     // Called by the log reader on success with the current chunkOwnerMap.
     void ProcessChunkOwnerMap(TMap<ui32, TChunkState> &chunkOwnerMap);
     void InitLogChunksInfo();
@@ -266,20 +271,25 @@ public:
             ui64 *reallyReadBytes);
     void SplitChunkJobSize(ui32 totalSize, ui32 *outSmallJobSize, ui32 *outLargeJObSize, ui32 *outSmallJobCount);
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    void ChunksLockByRange(TFreeChunks &freeChunks, ui32 begin, ui32 end, TVector<ui32> &lockedChunks);
-    void ChunksLockByNumber(ui32 begin, ui32 number, TVector<ui32> &lockedChunks);
-    void ChunksLock(TChunksLock &evChunksLock);
-    void ChunksUnlock(TChunksUnlock &evChunksUnlock);
+    // Chunk locking
+    TVector<TChunkIdx> LockChunksForOwner(TOwner owner, const ui32 count, TString &errorReason);
+    std::unique_ptr<TEvChunkLockResult> ChunkLockFromQuota(TOwner owner, ui32 number);
+    std::unique_ptr<TEvChunkLockResult> ChunkLockFromQuota(TOwner owner, NKikimrBlobStorage::TPDiskSpaceColor::E color);
+    void ChunkLock(TChunkLock &evChunkLock);
+    void ChunkUnlock(TChunkUnlock &evChunkUnlock);
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Chunk reservation
     TVector<TChunkIdx> AllocateChunkForOwner(const TRequestBase *req, const ui32 count, TString &errorReason);
     void ChunkReserve(TChunkReserve &evChunkReserve);
+    bool ValidateForgetChunk(ui32 chunkIdx, TOwner owner, TStringStream& outErrorReason);
+    void ChunkForget(TChunkForget &evChunkForget);
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Whiteboard and HTTP reports creation
     void WhiteboardReport(TWhiteboardReport &whiteboardReport); // Called by actor
     void RenderState(IOutputStream &str, THttpInfo &httpInfo);
     void OutputHtmlOwners(TStringStream &str);
     void OutputHtmlLogChunksDetails(TStringStream &str);
-    void OutputHtmlChunksLockUnlockInfo(TStringStream &str);
+    void OutputHtmlChunkLockUnlockInfo(TStringStream &str);
     void HttpInfo(THttpInfo &httpInfo); // Called by actor
     void EventUndelivered(TUndelivered &req);
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -313,6 +323,7 @@ public:
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Update process
     void ProcessLogWriteQueueAndCommits();
+    void ProcessChunkForgetQueue();
     void ProcessChunkWriteQueue();
     void ProcessChunkReadQueue();
     void ProcessLogReadQueue();

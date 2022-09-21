@@ -30,9 +30,29 @@ namespace {
             EPriority::PRI_TRACE,
             EPriority::PRI_DEBUG,
             (ui32)0,
-            timeThresholdMs);
+            timeThresholdMs,
+            (ui64)0);
         s->Append(0, 1, ServiceToString);
         return s;
+    }
+
+    TIntrusivePtr<TSettings> BufferSettings(ui64 bufferSizeLimitBytes) {
+        auto loggerId = TActorId{0, "Logger"};
+        auto s = MakeIntrusive<TSettings>(
+            loggerId,
+            0,
+            EPriority::PRI_TRACE,
+            EPriority::PRI_DEBUG,
+            (ui32)0,
+            (ui32)0,
+            bufferSizeLimitBytes);
+        s->Append(0, 1, ServiceToString);
+        s->SetAllowDrop(true);
+        return s;
+    }
+
+    TIntrusivePtr<TSettings> NoBufferSettings() {
+        return BufferSettings(0);
     }
 
     class TMockBackend: public TLogBackend {
@@ -88,8 +108,12 @@ namespace {
             Runtime.Send(new IEventHandle{LoggerActor, {}, new TEvLog(TInstant::Zero(), TLevel{EPrio::Emerg}, 0, "foo")});
         }
 
-        void WriteLog(TInstant ts) {
-            Runtime.Send(new IEventHandle{LoggerActor, {}, new TEvLog(ts, TLevel{EPrio::Emerg}, 0, "foo")});
+        void WriteLog(TInstant ts, EPrio prio = EPrio::Emerg, TString msg = "foo") {
+            Runtime.Send(new IEventHandle{LoggerActor, {}, new TEvLog(ts, TLevel{prio}, 0, msg)});
+        }
+
+        void FlushLogBuffer() {
+            Runtime.Send(new IEventHandle{LoggerActor, {}, new TFlushLogBuffer()});
         }
 
         void Wakeup() {
@@ -181,5 +205,47 @@ Y_UNIT_TEST_SUITE(TLoggerActorTest) {
         test.WriteLog(now - TDuration::Seconds(6));
 
         UNIT_ASSERT_VALUES_EQUAL(messages.size(), COUNT + 1);
+    }
+
+    int BufferTest(TFixture &test, const int COUNT) {
+        TVector<TString> messages;
+        auto acceptWrites = [&] (const TLogRecord& r) {
+            messages.emplace_back(r.Data, r.Len);
+        };
+
+        test.LogBackend->SetWriteImpl(acceptWrites);
+        test.Wakeup();
+        test.Runtime.AdvanceCurrentTime(TDuration::Days(1));
+        auto now = test.Runtime.GetCurrentTime();
+
+        for (auto i = 0; i < COUNT; ++i) {
+            test.WriteLog(now - TDuration::Seconds(10), EPrio::Debug, std::to_string(i));
+        }
+
+        for (auto i = 0; i < COUNT; ++i) {
+            test.FlushLogBuffer();
+        }
+
+        for (ui64 i = 0; i < messages.size(); ++i) {
+            Cerr << messages[i] << Endl;
+        }
+
+        return messages.size();
+    }
+
+    Y_UNIT_TEST(ShouldUseLogBufferWhenOverloaded) {
+        TFixture test{BufferSettings(1024 * 1024 * 300)};
+        const auto LOG_COUNT = 100;
+        auto outputLogSize = BufferTest(test, LOG_COUNT);
+
+        UNIT_ASSERT_VALUES_EQUAL(outputLogSize, LOG_COUNT);
+    }
+
+    Y_UNIT_TEST(ShouldLoseLogsIfBufferZeroSize) {
+        TFixture test{NoBufferSettings()};
+        const auto LOG_COUNT = 100;
+        auto outputLogSize = BufferTest(test, LOG_COUNT);
+
+        UNIT_ASSERT(outputLogSize < LOG_COUNT);
     }
 }

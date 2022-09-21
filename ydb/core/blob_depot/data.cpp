@@ -1,13 +1,251 @@
 #include "data.h"
+#include "data_uncertain.h"
 #include "garbage_collection.h"
 
 namespace NKikimr::NBlobDepot {
 
     using TData = TBlobDepot::TData;
 
-    NKikimrBlobDepot::EKeepState TData::GetKeepState(const TKey& key) const {
+    enum class EUpdateOutcome {
+        CHANGE,
+        NO_CHANGE,
+        DROP
+    };
+
+    TData::TData(TBlobDepot *self)
+        : Self(self)
+        , UncertaintyResolver(std::make_unique<TUncertaintyResolver>(Self))
+    {}
+
+    TData::~TData()
+    {}
+
+    bool TData::TValue::Validate(const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item) {
+        if (!item.HasBlobLocator()) {
+            return false;
+        }
+        const auto& locator = item.GetBlobLocator();
+        return locator.HasGroupId() &&
+            locator.HasBlobSeqId() &&
+            locator.HasTotalDataLen() && std::invoke([&] {
+                const auto& blobSeqId = locator.GetBlobSeqId();
+                return blobSeqId.HasChannel() && blobSeqId.HasGeneration() && blobSeqId.HasStep() && blobSeqId.HasIndex();
+            });
+    }
+
+    bool TData::TValue::SameValueChainAsIn(const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item) const {
+        if (ValueChain.size() != 1) {
+            return false;
+        }
+        const auto& chain = ValueChain[0];
+        if (chain.HasSubrangeBegin() || chain.HasSubrangeEnd()) {
+            return false;
+        }
+
+        Y_VERIFY_DEBUG(chain.HasLocator());
+        const auto& locator1 = chain.GetLocator();
+        Y_VERIFY_DEBUG(locator1.HasGroupId() && locator1.HasBlobSeqId() && locator1.HasTotalDataLen());
+
+        Y_VERIFY_DEBUG(item.HasBlobLocator());
+        const auto& locator2 = item.GetBlobLocator();
+        Y_VERIFY_DEBUG(locator2.HasGroupId() && locator2.HasBlobSeqId() && locator2.HasTotalDataLen());
+
+#define COMPARE_FIELD(NAME) \
+        if (locator1.Has##NAME() != locator2.Has##NAME()) { \
+            return false; \
+        } else if (locator1.Has##NAME() && locator1.Get##NAME() != locator2.Get##NAME()) { \
+            return false; \
+        }
+        COMPARE_FIELD(GroupId)
+        COMPARE_FIELD(Checksum)
+        COMPARE_FIELD(TotalDataLen)
+        COMPARE_FIELD(FooterLen)
+#undef COMPARE_FIELD
+
+        if (TBlobSeqId::FromProto(locator1.GetBlobSeqId()) != TBlobSeqId::FromProto(locator2.GetBlobSeqId())) {
+            return false;
+        }
+
+        return true;
+    }
+
+    template<typename T, typename... TArgs>
+    bool TData::UpdateKey(TKey key, NTabletFlatExecutor::TTransactionContext& txc, void *cookie, T&& callback, TArgs&&... args) {
+        bool underSoft = false, underHard = false;
+        auto var = key.AsVariant();
+        if (auto *id = std::get_if<TLogoBlobID>(&var)) {
+            Self->BarrierServer->GetBlobBarrierRelation(*id, &underSoft, &underHard);
+        }
+        if (underHard || underSoft) {
+            if (const auto it = Data.find(key); it == Data.end()) {
+                return false; // no such key existed and will not be created as it hits the barrier
+            } else {
+                Y_VERIFY_S(!underHard && it->second.KeepState == NKikimrBlobDepot::EKeepState::Keep,
+                    "barrier invariant failed Key# " << key.ToString() << " Value# " << it->second.ToString());
+            }
+        }
+
+        const auto [it, inserted] = Data.try_emplace(std::move(key), std::forward<TArgs>(args)...);
+        {
+            auto& [key, value] = *it;
+            Y_VERIFY(!underHard);
+            Y_VERIFY(!underSoft || !inserted);
+
+            std::vector<TLogoBlobID> deleteQ;
+            const bool uncertainWriteBefore = value.UncertainWrite;
+
+            if (!inserted) {
+                EnumerateBlobsForValueChain(value.ValueChain, Self->TabletID(), [&](TLogoBlobID id, ui32, ui32) {
+                    const auto it = RefCount.find(id);
+                    Y_VERIFY(it != RefCount.end());
+                    if (!--it->second) {
+                        deleteQ.push_back(id);
+                    }
+                });
+            }
+
+            EUpdateOutcome outcome = callback(value, inserted);
+
+            Y_VERIFY(!value.UncertainWrite || !value.ValueChain.empty());
+
+            Y_VERIFY(!inserted || outcome != EUpdateOutcome::NO_CHANGE);
+            if (underSoft && value.KeepState != NKikimrBlobDepot::EKeepState::Keep) {
+                outcome = EUpdateOutcome::DROP;
+            }
+
+            EnumerateBlobsForValueChain(value.ValueChain, Self->TabletID(), [&](TLogoBlobID id, ui32, ui32) {
+                const auto [it, inserted] = RefCount.try_emplace(id, 1);
+                if (inserted) {
+                    // first mention of this id
+                    auto& record = GetRecordsPerChannelGroup(id);
+                    const auto [_, inserted] = record.Used.insert(id);
+                    Y_VERIFY(inserted);
+                    AccountBlob(id, 1);
+
+                    // blob is first mentioned and deleted as well
+                    if (outcome == EUpdateOutcome::DROP) {
+                        it->second = 0;
+                        deleteQ.push_back(id);
+                    }
+                } else if (outcome != EUpdateOutcome::DROP) {
+                    ++it->second;
+                }
+            });
+
+            for (const TLogoBlobID& id : deleteQ) {
+                const auto it = RefCount.find(id);
+                Y_VERIFY(it != RefCount.end());
+                if (!it->second) {
+                    InFlightTrash.emplace(cookie, id);
+                    NIceDb::TNiceDb(txc.DB).Table<Schema::Trash>().Key(id.AsBinaryString()).Update();
+                    RefCount.erase(it);
+                }
+            }
+            if (!deleteQ.empty()) {
+                UncertaintyResolver->DropBlobs(deleteQ);
+            }
+
+            auto row = NIceDb::TNiceDb(txc.DB).Table<Schema::Data>().Key(key.MakeBinaryKey());
+            switch (outcome) {
+                case EUpdateOutcome::DROP:
+                    UncertaintyResolver->DropKey(key);
+                    Data.erase(it);
+                    row.Delete();
+                    return true;
+
+                case EUpdateOutcome::CHANGE:
+                    row.template Update<Schema::Data::Value>(value.SerializeToString());
+                    if (inserted || uncertainWriteBefore != value.UncertainWrite) {
+                        if (value.UncertainWrite) {
+                            row.template Update<Schema::Data::UncertainWrite>(true);
+                        } else if (!inserted) {
+                            row.template UpdateToNull<Schema::Data::UncertainWrite>();
+                        }
+                    }
+                    if (uncertainWriteBefore && !value.UncertainWrite) {
+                        UncertaintyResolver->MakeKeyCertain(key);
+                    }
+                    return true;
+
+                case EUpdateOutcome::NO_CHANGE:
+                    return false;
+            }
+        }
+    }
+
+    const TData::TValue *TData::FindKey(const TKey& key) const {
         const auto it = Data.find(key);
-        return it != Data.end() ? it->second.KeepState : NKikimrBlobDepot::EKeepState::Default;
+        return it != Data.end() ? &it->second : nullptr;
+    }
+
+    void TData::UpdateKey(const TKey& key, const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item, bool uncertainWrite,
+            NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
+        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT10, "UpdateKey", (Id, Self->GetLogId()), (Key, key), (Item, item));
+        UpdateKey(key, txc, cookie, [&](TValue& value, bool inserted) {
+            if (!inserted) { // update value items
+                value.Meta = item.GetMeta();
+                value.Public = false;
+
+                // update it to keep new blob locator
+                value.ValueChain.Clear();
+                auto *chain = value.ValueChain.Add();
+                auto *locator = chain->MutableLocator();
+                locator->CopyFrom(item.GetBlobLocator());
+
+                // reset original blob id, if any
+                value.OriginalBlobId.reset();
+            }
+
+            value.UncertainWrite = uncertainWrite;
+            return EUpdateOutcome::CHANGE;
+        }, item, uncertainWrite);
+    }
+
+    void TData::MakeKeyCertain(const TKey& key) {
+        const auto it = Data.find(key);
+        Y_VERIFY(it != Data.end());
+        TValue& value = it->second;
+        value.UncertainWrite = false;
+        UncertaintyResolver->MakeKeyCertain(key);
+        KeysMadeCertain.push_back(key);
+        if (!CommitCertainKeysScheduled) {
+            TActivationContext::Schedule(TDuration::Seconds(1), new IEventHandle(TEvPrivate::EvCommitCertainKeys, 0,
+                Self->SelfId(), {}, nullptr, 0));
+            CommitCertainKeysScheduled = true;
+        }
+    }
+
+    void TData::HandleCommitCertainKeys() {
+        class TTxCommitCertainKeys : public NTabletFlatExecutor::TTransactionBase<TBlobDepot> {
+            std::deque<TKey> KeysMadeCertain;
+
+        public:
+            TTxCommitCertainKeys(TBlobDepot *self, std::deque<TKey> keysMadeCertain)
+                : TTransactionBase(self)
+                , KeysMadeCertain(std::move(keysMadeCertain))
+            {}
+
+            bool Execute(TTransactionContext& txc, const TActorContext&) override {
+                NIceDb::TNiceDb db(txc.DB);
+                for (const TKey& key : KeysMadeCertain) {
+                    if (const TValue *value = Self->Data->FindKey(key); value && !value->UncertainWrite) {
+                        db.Table<Schema::Data>().Key(key.MakeBinaryKey()).UpdateToNull<Schema::Data::UncertainWrite>();
+                    }
+                }
+                return true;
+            }
+
+            void Complete(const TActorContext&) override {
+                if (Self->Data->KeysMadeCertain.empty()) {
+                    Self->Data->CommitCertainKeysScheduled = false;
+                } else {
+                    TActivationContext::Schedule(TDuration::Seconds(1), new IEventHandle(TEvPrivate::EvCommitCertainKeys,
+                        0, Self->SelfId(), {}, nullptr, 0));
+                }
+            }
+        };
+
+        Self->Execute(std::make_unique<TTxCommitCertainKeys>(Self, std::exchange(KeysMadeCertain, {})));
     }
 
     TData::TRecordsPerChannelGroup& TData::GetRecordsPerChannelGroup(TLogoBlobID id) {
@@ -19,47 +257,50 @@ namespace NKikimr::NBlobDepot {
         return it->second;
     }
 
-    void TData::AddDataOnLoad(TKey key, TString value) {
-        if (Data.contains(key)) {
-            return; // we are racing with the offline load procedure -- skip this key, it is already new in memory
-        }
-
+    void TData::AddDataOnLoad(TKey key, TString value, bool uncertainWrite, NTabletFlatExecutor::TTransactionContext& txc,
+            void *cookie) {
         NKikimrBlobDepot::TValue proto;
         const bool success = proto.ParseFromString(value);
         Y_VERIFY(success);
-        PutKey(std::move(key), TValue(std::move(proto)));
+
+        UpdateKey(std::move(key), txc, cookie, [&](TValue& value, bool inserted) {
+            if (!inserted) { // do some merge logic
+                value.KeepState = Max(value.KeepState, proto.GetKeepState());
+                if (value.ValueChain.empty() && proto.ValueChainSize()) {
+                    value.ValueChain.CopyFrom(proto.GetValueChain());
+                    value.OriginalBlobId.reset();
+                    value.UncertainWrite = uncertainWrite;
+                } else if (!value.ValueChain.empty() && value.UncertainWrite && !uncertainWrite) {
+                    Y_VERIFY(!value.OriginalBlobId);
+                    value.ValueChain.CopyFrom(proto.GetValueChain());
+                    value.UncertainWrite = false;
+                }
+            }
+
+            return EUpdateOutcome::CHANGE;
+        }, std::move(proto), uncertainWrite);
     }
 
     void TData::AddDataOnDecommit(const TEvBlobStorage::TEvAssimilateResult::TBlob& blob,
-            NTabletFlatExecutor::TTransactionContext& txc) {
-        bool underSoft, underHard;
-        Self->BarrierServer->GetBlobBarrierRelation(blob.Id, &underSoft, &underHard);
-        if (underHard || (underSoft && !blob.Keep)) {
-            return; // we can skip this blob as it is already being collected
-        }
+            NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
+        UpdateKey(TKey(blob.Id), txc, cookie, [&](TValue& value, bool inserted) {
+            STLOG(PRI_DEBUG, BLOB_DEPOT, BDT49, "AddDataOnDecommit", (Id, Self->GetLogId()), (Blob, blob),
+                (Value, value), (Inserted, inserted));
 
-        TKey key(blob.Id);
+            // update keep state if necessary
+            if (blob.DoNotKeep && value.KeepState < NKikimrBlobDepot::EKeepState::DoNotKeep) {
+                value.KeepState = NKikimrBlobDepot::EKeepState::DoNotKeep;
+            } else if (blob.Keep && value.KeepState < NKikimrBlobDepot::EKeepState::Keep) {
+                value.KeepState = NKikimrBlobDepot::EKeepState::Keep;
+            }
 
-        // calculate keep state for this blob
-        const auto it = Data.find(key);
-        const NKikimrBlobDepot::EKeepState keepState = Max(it != Data.end() ? it->second.KeepState : NKikimrBlobDepot::EKeepState::Default,
-            blob.DoNotKeep ? NKikimrBlobDepot::EKeepState::DoNotKeep :
-            blob.Keep      ? NKikimrBlobDepot::EKeepState::Keep : NKikimrBlobDepot::EKeepState::Default);
+            // if there is not value chain for this blob, map it to the original blob id
+            if (value.ValueChain.empty()) {
+                value.OriginalBlobId = blob.Id;
+            }
 
-        NKikimrBlobDepot::TValue value;
-        value.SetKeepState(keepState);
-        value.SetUnconfirmed(true);
-        LogoBlobIDFromLogoBlobID(blob.Id, value.MutableOriginalBlobId());
-
-        TString valueData;
-        const bool success = value.SerializeToString(&valueData);
-        Y_VERIFY(success);
-
-        NIceDb::TNiceDb db(txc.DB);
-        db.Table<Schema::Data>().Key(key.MakeBinaryKey()).Update<Schema::Data::Value>(valueData);
-
-        PutKey(key, TValue(std::move(value)));
-        LastAssimilatedKey = key;
+            return EUpdateOutcome::CHANGE;
+        });
     }
 
     void TData::AddTrashOnLoad(TLogoBlobID id) {
@@ -77,83 +318,37 @@ namespace NKikimr::NBlobDepot {
         record.LastConfirmedGenStep = confirmedGenStep;
     }
 
-    void TData::PutKey(TKey key, TValue&& data) {
-        ui64 referencedBytes = 0;
-
-        EnumerateBlobsForValueChain(data.ValueChain, Self->TabletID(), [&](TLogoBlobID id, ui32 /*begin*/, ui32 /*end*/) {
-            if (!RefCount[id]++) {
-                // first mention of this id
-                auto& record = GetRecordsPerChannelGroup(id);
-                const auto [_, inserted] = record.Used.insert(id);
-                Y_VERIFY(inserted);
-                AccountBlob(id, 1);
-            }
-            referencedBytes += id.BlobSize();
-        });
-
-        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT10, "PutKey", (Id, Self->GetLogId()), (Key, key),
-            (ValueChain.size, data.ValueChain.size()), (ReferencedBytes, referencedBytes),
-            (KeepState, NKikimrBlobDepot::EKeepState_Name(data.KeepState)));
-
-        const auto [it, inserted] = Data.try_emplace(std::move(key), std::move(data));
-        if (!inserted) {
-            it->second = std::move(data);
-        }
+    bool TData::UpdateKeepState(TKey key, NKikimrBlobDepot::EKeepState keepState,
+            NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
+        return UpdateKey(std::move(key), txc, cookie, [&](TValue& value, bool inserted) {
+             STLOG(PRI_DEBUG, BLOB_DEPOT, BDT51, "UpdateKeepState", (Id, Self->GetLogId()), (Key, key),
+                (KeepState, keepState), (Value, value));
+             if (inserted) {
+                return EUpdateOutcome::CHANGE;
+             } else if (value.KeepState < keepState) {
+                value.KeepState = keepState;
+                return EUpdateOutcome::CHANGE;
+             } else {
+                return EUpdateOutcome::NO_CHANGE;
+             }
+        }, keepState);
     }
 
-    std::optional<TString> TData::UpdateKeepState(TKey key, NKikimrBlobDepot::EKeepState keepState) {
-        const auto [it, inserted] = Data.try_emplace(std::move(key), TValue(keepState));
-        if (!inserted) {
-            if (keepState <= it->second.KeepState) {
-                return std::nullopt;
-            }
-            it->second.KeepState = keepState;
-        }
-        return ToValueProto(it->second);
-    }
-
-    void TData::DeleteKey(const TKey& key, const std::function<void(TLogoBlobID)>& updateTrash, void *cookie) {
-        const auto it = Data.find(key);
-        Y_VERIFY(it != Data.end());
-        TValue& value = it->second;
-        EnumerateBlobsForValueChain(value.ValueChain, Self->TabletID(), [&](TLogoBlobID id, ui32 /*begin*/, ui32 /*end*/) {
-            const auto it = RefCount.find(id);
-            Y_VERIFY(it != RefCount.end());
-            if (!--it->second) {
-                InFlightTrash.emplace(cookie, id);
-                RefCount.erase(it);
-                updateTrash(id);
-            }
+    void TData::DeleteKey(const TKey& key, NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
+        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT14, "DeleteKey", (Id, Self->GetLogId()), (Key, key));
+        UpdateKey(key, txc, cookie, [&](TValue&, bool inserted) {
+            Y_VERIFY(!inserted);
+            return EUpdateOutcome::DROP;
         });
-        Data.erase(it);
     }
 
     void TData::CommitTrash(void *cookie) {
-        auto range = InFlightTrash.equal_range(cookie);
-        for (auto it = range.first; it != range.second; ++it) {
+        auto [first, last] = InFlightTrash.equal_range(cookie);
+        for (auto it = first; it != last; ++it) {
             auto& record = GetRecordsPerChannelGroup(it->second);
             record.MoveToTrash(this, it->second);
         }
-        InFlightTrash.erase(range.first, range.second);
-    }
-
-    TString TData::ToValueProto(const TValue& value) {
-        NKikimrBlobDepot::TValue proto;
-        if (value.Meta) {
-            proto.SetMeta(value.Meta);
-        }
-        proto.MutableValueChain()->CopyFrom(value.ValueChain);
-        if (proto.GetKeepState() != value.KeepState) {
-            proto.SetKeepState(value.KeepState);
-        }
-        if (proto.GetPublic() != value.Public) {
-            proto.SetPublic(value.Public);
-        }
-
-        TString s;
-        const bool success = proto.SerializeToString(&s);
-        Y_VERIFY(success);
-        return s;
+        InFlightTrash.erase(first, last);
     }
 
     void TData::HandleTrash() {
@@ -171,6 +366,7 @@ namespace NKikimr::NBlobDepot {
             auto& channel = Self->Channels[record.Channel];
 
             TGenStep nextGenStep(*--record.Trash.end());
+            std::set<TLogoBlobID>::iterator trashEndIter = record.Trash.end();
 
             // step we are going to invalidate (including blobs with this one)
             if (TGenStep(record.LeastExpectedBlobId) <= nextGenStep) {
@@ -208,49 +404,56 @@ namespace NKikimr::NBlobDepot {
                 // adjust the barrier to keep it safe now
                 const TLogoBlobID maxId(record.TabletId, record.LeastExpectedBlobId.Generation,
                     record.LeastExpectedBlobId.Step, record.Channel, 0, 0);
-                const auto it = record.Trash.lower_bound(maxId);
-                if (it != record.Trash.begin()) {
-                    nextGenStep = TGenStep(*std::prev(it));
+                trashEndIter = record.Trash.lower_bound(maxId);
+                if (trashEndIter != record.Trash.begin()) {
+                    nextGenStep = TGenStep(*std::prev(trashEndIter));
                 } else {
                     nextGenStep = {};
                 }
             }
 
-            auto keep = std::make_unique<TVector<TLogoBlobID>>();
-            auto doNotKeep = std::make_unique<TVector<TLogoBlobID>>();
+            TVector<TLogoBlobID> keep;
+            TVector<TLogoBlobID> doNotKeep;
+            std::vector<TLogoBlobID> trashInFlight;
 
-            for (auto it = record.Trash.begin(); it != record.Trash.end() && TGenStep(*it) <= record.LastConfirmedGenStep; ++it) {
-                doNotKeep->push_back(*it);
+            for (auto it = record.Trash.begin(); it != trashEndIter; ++it) {
+                if (const TGenStep genStep(*it); genStep <= record.LastConfirmedGenStep) {
+                    doNotKeep.push_back(*it);
+                } else if (nextGenStep < genStep) {
+                    Y_FAIL();
+                }
+                trashInFlight.push_back(*it);
             }
 
             const TLogoBlobID keepFrom(record.TabletId, record.LastConfirmedGenStep.Generation(),
-                record.LastConfirmedGenStep.Step(), record.Channel, 0, 0);
+                record.LastConfirmedGenStep.Step(), record.Channel, TLogoBlobID::MaxBlobSize, TLogoBlobID::MaxCookie,
+                TLogoBlobID::MaxPartId, TLogoBlobID::MaxCrcMode);
             for (auto it = record.Used.upper_bound(keepFrom); it != record.Used.end() && TGenStep(*it) <= nextGenStep; ++it) {
-                keep->push_back(*it);
+                Y_VERIFY(record.LastConfirmedGenStep < TGenStep(*it));
+                keep.push_back(*it);
             }
 
-            if (keep->empty()) {
-                keep.reset();
-            }
-            if (doNotKeep->empty()) {
-                doNotKeep.reset();
-            }
             const bool collect = nextGenStep > record.LastConfirmedGenStep;
 
-            if (!keep && !doNotKeep && !collect) {
+            if (trashInFlight.empty()) {
+                Y_VERIFY(keep.empty());
                 continue; // nothing to do here
             }
 
+            auto keep_ = keep ? std::make_unique<TVector<TLogoBlobID>>(std::move(keep)) : nullptr;
+            auto doNotKeep_ = doNotKeep ? std::make_unique<TVector<TLogoBlobID>>(std::move(doNotKeep)) : nullptr;
             auto ev = std::make_unique<TEvBlobStorage::TEvCollectGarbage>(record.TabletId, generation,
                 record.PerGenerationCounter, record.Channel, collect, nextGenStep.Generation(), nextGenStep.Step(),
-                keep.get(), doNotKeep.get(), TInstant::Max(), true);
-            keep.release();
-            doNotKeep.release();
+                keep_.get(), doNotKeep_.get(), TInstant::Max(), true);
+            keep_.release();
+            doNotKeep_.release();
 
             record.CollectGarbageRequestInFlight = true;
             record.PerGenerationCounter += ev->Collect ? ev->PerGenerationCounterStepSize() : 0;
-            record.TrashInFlight.insert(record.TrashInFlight.end(), record.Trash.begin(), record.Trash.end());
+            record.TrashInFlight.swap(trashInFlight);
             record.IssuedGenStep = Max(nextGenStep, record.LastConfirmedGenStep);
+
+            Y_VERIFY(trashInFlight.empty());
 
             record.TIntrusiveListItem<TRecordsPerChannelGroup, TRecordWithTrash>::Unlink();
 
@@ -293,6 +496,7 @@ namespace NKikimr::NBlobDepot {
             ExecuteConfirmGC(record.Channel, record.GroupId, std::exchange(record.TrashInFlight, {}),
                 record.LastConfirmedGenStep);
         } else {
+            record.TrashInFlight.clear();
             record.ClearInFlight(this);
             HandleTrash();
         }
@@ -365,6 +569,29 @@ namespace NKikimr::NBlobDepot {
         it->second.ClearInFlight(this);
     }
 
+    bool TData::OnBarrierShift(ui64 tabletId, ui8 channel, bool hard, TGenStep previous, TGenStep current, ui32& maxItems,
+            NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
+        const TData::TKey first(TLogoBlobID(tabletId, previous.Generation(), previous.Step(), channel, 0, 0));
+        const TData::TKey last(TLogoBlobID(tabletId, current.Generation(), current.Step(), channel,
+            TLogoBlobID::MaxBlobSize, TLogoBlobID::MaxCookie, TLogoBlobID::MaxPartId, TLogoBlobID::MaxCrcMode));
+
+        bool finished = true;
+        Self->Data->ScanRange(&first, &last, TData::EScanFlags::INCLUDE_END, [&](auto& key, auto& value) {
+            if (value.KeepState != NKikimrBlobDepot::EKeepState::Keep || hard) {
+                if (maxItems) {
+                    Self->Data->DeleteKey(key, txc, cookie);
+                    --maxItems;
+                } else {
+                    finished = false;
+                    return false;
+                }
+            }
+            return true;
+        });
+
+        return finished;
+    }
+
     void TData::AccountBlob(TLogoBlobID id, bool add) {
         // account record
         const ui32 groupId = Self->Info()->GroupFor(id.Channel(), id.Generation());
@@ -416,7 +643,6 @@ namespace NKikimr::NBlobDepot {
             self->AccountBlob(id, false);
         }
         LastConfirmedGenStep = IssuedGenStep;
-        EnqueueForCollectionIfPossible(self);
     }
 
     void TData::TRecordsPerChannelGroup::OnLeastExpectedBlobIdChange(TData *self, TBlobSeqId leastExpectedBlobId) {

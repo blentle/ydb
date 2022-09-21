@@ -563,6 +563,7 @@ namespace NKikimr::NHttpProxy {
         DECLARE_PROCESSOR(DecreaseStreamRetentionPeriod);
         DECLARE_PROCESSOR(IncreaseStreamRetentionPeriod);
         DECLARE_PROCESSOR(UpdateShardCount);
+        DECLARE_PROCESSOR(UpdateStreamMode);
         DECLARE_PROCESSOR(RegisterStreamConsumer);
         DECLARE_PROCESSOR(DeregisterStreamConsumer);
         DECLARE_PROCESSOR(DescribeStreamConsumer);
@@ -582,15 +583,6 @@ namespace NKikimr::NHttpProxy {
     bool THttpRequestProcessors::Execute(const TString& name, THttpRequestContext&& context,
                                          THolder<NKikimr::NSQS::TAwsRequestSignV4> signature,
                                          const TActorContext& ctx) {
-        // TODO: To be removed by CLOUD-79086
-        if (name == "RegisterStreamConsumer" ||
-            name == "DeregisterStreamConsumer" ||
-            name == "ListStreamConsumers") {
-            context.SendBadRequest(NYdb::EStatus::BAD_REQUEST,
-                                   TStringBuilder() << "Unsupported method name " << name, ctx);
-            return false;
-        }
-
         if (auto proc = Name2Processor.find(name); proc != Name2Processor.end()) {
             proc->second->Execute(std::move(context), std::move(signature), ctx);
             return true;
@@ -722,6 +714,16 @@ namespace NKikimr::NHttpProxy {
 
     void THttpRequestContext::RequestBodyToProto(NProtoBuf::Message* request) {
         auto requestJsonStr = Request->Body;
+        if (requestJsonStr.empty()) {
+            throw NKikimr::NSQS::TSQSException(NKikimr::NSQS::NErrors::MALFORMED_QUERY_STRING) <<
+                "Empty body";
+        }
+
+        // recursive is default setting
+        if (auto listStreamsRequest = dynamic_cast<Ydb::DataStreams::V1::ListStreamsRequest*>(request)) {
+            listStreamsRequest->set_recurse(true);
+        }
+
         std::string bufferStr;
         switch (ContentType) {
         case MIME_CBOR: {

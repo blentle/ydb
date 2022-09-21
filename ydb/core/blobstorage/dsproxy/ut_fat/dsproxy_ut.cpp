@@ -1420,7 +1420,7 @@ class TTestBlobStorageProxyVPutVGet : public TTestBlobStorageProxy {
                 TBlobStorageGroupType type(ErasureSpecies);
                 NKikimr::TDataPartSet partSet;
                 type.SplitData((TErasureType::ECrcMode)blobId.CrcMode(), encryptedTestData2, partSet);
-                TEST_RESPONSE(MessageVGetResult, OK, 1, partSet.Parts[0].OwnedString);
+                TEST_RESPONSE(MessageVGetResult, OK, 1, partSet.Parts[0].OwnedString.ConvertToString());
 
                 VERBOSE_COUT("Done");
                 Env->DoneEvent.Signal();
@@ -1713,7 +1713,7 @@ class TTestBlobStorageProxyVGet : public TTestBlobStorageProxy {
                 TBlobStorageGroupType type(ErasureSpecies);
                 NKikimr::TDataPartSet partSet;
                 type.SplitData((TErasureType::ECrcMode)blobId.CrcMode(), encryptedTestData2, partSet);
-                TEST_RESPONSE(MessageVGetResult, OK, 1, partSet.Parts[0].OwnedString);
+                TEST_RESPONSE(MessageVGetResult, OK, 1, partSet.Parts[0].OwnedString.ConvertToString());
 
                 isNoData = false;
                 VERBOSE_COUT("Done");
@@ -4227,8 +4227,9 @@ public:
                 pDiskConfig->SectorMap = SectorMapByPath[filePath];
                 pDiskConfig->EnableSectorEncryption = !pDiskConfig->SectorMap;
 
+                NPDisk::TMainKey mainKeys = { mainKey };
                 TActorSetupCmd pDiskSetup(
-                    CreatePDisk(pDiskConfig.Get(), mainKey, counters),
+                    CreatePDisk(pDiskConfig.Get(), mainKeys, counters),
                     TMailboxType::Revolving, 0);
                 setup2->LocalServices.push_back(std::pair<TActorId, TActorSetupCmd>(pdiskId, pDiskSetup));
 

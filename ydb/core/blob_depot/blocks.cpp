@@ -66,6 +66,10 @@ namespace NKikimr::NBlobDepot {
         THashSet<ui32> NodesWaitingForPushResult;
 
     public:
+        static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
+            return NKikimrServices::TActivity::BLOB_DEPOT_BLOCKS_PROCESSOR_ACTOR;
+        }
+
         TBlockProcessorActor(TBlobDepot *self, ui64 tabletId, ui32 blockedGeneration, ui32 nodeId, ui64 issuerGuid,
                 std::unique_ptr<IEventHandle> response)
             : Self(self)
@@ -128,7 +132,7 @@ namespace NKikimr::NBlobDepot {
 
         void IssueBlocksToStorage() {
             THashSet<ui32> processedGroups;
-            for (const auto& [_, kind] : Self->ChannelKinds) { // FIXME: SIGSEGV here?
+            for (const auto& [_, kind] : Self->ChannelKinds) {
                 for (const auto& [channel, groupId] : kind.ChannelGroups) {
                     // FIXME: consider previous group generations (because agent can write in obsolete tablet generation)
                     // !!!!!!!!!!!

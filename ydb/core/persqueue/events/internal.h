@@ -6,11 +6,15 @@
 #include <ydb/core/protos/pqconfig.pb.h>
 #include <ydb/core/tablet/tablet_counters.h>
 #include <ydb/core/persqueue/key.h>
-
+#include <ydb/core/persqueue/metering_sink.h>
 #include <library/cpp/actors/core/event_local.h>
 #include <library/cpp/actors/core/actorid.h>
 
 #include <util/generic/maybe.h>
+
+namespace NYdb {
+    class ICredentialsProviderFactory;
+}
 
 namespace NKikimr {
 
@@ -109,9 +113,11 @@ struct TEvPQ {
         EvReadLimiterCounters,
         EvRetryWrite,
         EvInitCredentials,
+        EvCredentialsCreated,
         EvCreateConsumer,
         EvRequestPartitionStatus,
         EvReaderEventArrived,
+        EvMetering,
         EvEnd
     };
 
@@ -136,6 +142,7 @@ struct TEvPQ {
             TString PartitionKey;
             TString ExplicitHashKey;
             bool External;
+            bool IgnoreQuotaDeadline;
         };
 
         TEvWrite(const ui64 cookie, const ui64 messageNo, const TString& ownerCookie, const TMaybe<ui64> offset, TVector<TMsg> &&msgs, bool isDirectWrite)
@@ -606,6 +613,19 @@ struct TEvPQ {
         TEvInitCredentials()
         {}
     };
+    
+    struct TEvCredentialsCreated : public TEventLocal<TEvCredentialsCreated, EvCredentialsCreated> {
+        TEvCredentialsCreated(const TString& error)
+            : Error(error)
+        {}
+        
+        TEvCredentialsCreated(std::shared_ptr<NYdb::ICredentialsProviderFactory> credentials)
+            : Credentials(credentials)
+        {}
+
+        std::shared_ptr<NYdb::ICredentialsProviderFactory> Credentials;
+        std::optional<TString> Error;
+    };
 
     struct TEvCreateConsumer : public TEventLocal<TEvCreateConsumer, EvCreateConsumer> {
         TEvCreateConsumer()
@@ -622,6 +642,16 @@ struct TEvPQ {
         {}
 
         ui64 Id;
+    };
+
+    struct TEvMetering : public TEventLocal<TEvMetering, EvMetering> {
+        TEvMetering(NPQ::EMeteringJson type, ui64 quantity)
+        : Type (type)
+        , Quantity(quantity)
+        {}
+
+        NPQ::EMeteringJson Type;
+        ui64 Quantity;
     };
 };
 

@@ -3,6 +3,7 @@
 #include "datashard_pipeline.h"
 #include "execution_unit_ctors.h"
 #include "setup_sys_locks.h"
+#include "datashard_locks_db.h"
 
 #include <ydb/core/engine/minikql/minikql_engine_host.h>
 #include <ydb/core/kqp/rm/kqp_rm.h>
@@ -67,7 +68,8 @@ EExecutionStatus TExecuteKqpDataTxUnit::Execute(TOperation::TPtr op, TTransactio
         op->MvccReadWriteVersion.reset();
     }
 
-    TSetupSysLocks guardLocks(op, DataShard);
+    TDataShardLocksDb locksDb(DataShard, txc);
+    TSetupSysLocks guardLocks(op, DataShard, &locksDb);
     TActiveTransaction* tx = dynamic_cast<TActiveTransaction*>(op.Get());
     Y_VERIFY_S(tx, "cannot cast operation of kind " << op->GetKind());
 
@@ -134,10 +136,13 @@ EExecutionStatus TExecuteKqpDataTxUnit::Execute(TOperation::TPtr op, TTransactio
         }
 
         if (!KqpValidateLocks(tabletId, tx, DataShard.SysLocksTable())) {
-            KqpRollbackLockChanges(tabletId, tx, DataShard, txc);
             KqpEraseLocks(tabletId, tx, DataShard.SysLocksTable());
             DataShard.SysLocksTable().ApplyLocks();
             DataShard.SubscribeNewLocks(ctx);
+            if (locksDb.HasChanges()) {
+                op->SetWaitCompletionFlag(true);
+                return EExecutionStatus::ExecutedNoMoreRestarts;
+            }
             return EExecutionStatus::Executed;
         }
 
@@ -163,7 +168,7 @@ EExecutionStatus TExecuteKqpDataTxUnit::Execute(TOperation::TPtr op, TTransactio
         dataTx->SetReadVersion(readVersion);
         dataTx->SetWriteVersion(writeVersion);
 
-        KqpCommitLockChanges(tabletId, tx, DataShard, txc);
+        KqpCommitLocks(tabletId, tx, writeVersion, DataShard, txc);
 
         auto& computeCtx = tx->GetDataTx()->GetKqpComputeCtx();
 
@@ -178,8 +183,6 @@ EExecutionStatus TExecuteKqpDataTxUnit::Execute(TOperation::TPtr op, TTransactio
         Y_VERIFY(result);
         op->Result().Swap(result);
         op->SetKqpAttachedRSFlag();
-
-        KqpEraseLocks(tabletId, tx, DataShard.SysLocksTable());
 
         if (dataTx->GetCounters().InvisibleRowSkips) {
             DataShard.SysLocksTable().BreakSetLocks(op->LockTxId(), op->LockNodeId());
@@ -226,7 +229,15 @@ EExecutionStatus TExecuteKqpDataTxUnit::Execute(TOperation::TPtr op, TTransactio
     DataShard.IncCounter(COUNTER_WAIT_TOTAL_LATENCY_MS, waitTotalLatency.MilliSeconds());
     op->ResetCurrentTimer();
 
-    return op->IsReadOnly() ? EExecutionStatus::Executed : EExecutionStatus::ExecutedNoMoreRestarts;
+    if (op->IsReadOnly() && !locksDb.HasChanges()) {
+        return EExecutionStatus::Executed;
+    }
+
+    if (locksDb.HasChanges()) {
+        op->SetWaitCompletionFlag(true);
+    }
+
+    return EExecutionStatus::ExecutedNoMoreRestarts;
 }
 
 void TExecuteKqpDataTxUnit::AddLocksToResult(TOperation::TPtr op, const TActorContext& ctx) {

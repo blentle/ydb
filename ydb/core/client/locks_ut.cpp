@@ -245,7 +245,7 @@ struct TLocksTestOptions {
         Range0Begin = "(Uint32 '0)";
         Range0End = BreakPoint;
         Range0OptKey = "";
-        Range1Inc = "'ExcFrom 'ExcTo";
+        Range1Inc = "'ExcFrom 'IncTo";
         Range1Begin = BreakPoint;
         Range1End = "(Void)";
         Range1OptKey = "";
@@ -264,7 +264,7 @@ struct TLocksTestOptions {
         Range0Begin = "(Uint32 '0)";
         Range0End = BreakPoint;
         Range0OptKey = "'('keyX (Uint64 '0) (Void))";
-        Range1Inc = "'ExcFrom 'ExcTo";
+        Range1Inc = "'ExcFrom 'IncTo";
         Range1Begin = BreakPoint;
         Range1End = "(Uint32 '4294967295)";
         Range1OptKey = "'('keyX (Uint64 '0) (Void))";
@@ -283,7 +283,7 @@ struct TLocksTestOptions {
         Range0Begin = "(String '\"0\")";
         Range0End = BreakPoint;
         Range0OptKey = "";
-        Range1Inc = "'ExcFrom 'ExcTo";
+        Range1Inc = "'ExcFrom 'IncTo";
         Range1Begin = BreakPoint;
         Range1End = "(Void)";
         Range1OptKey = "";
@@ -852,7 +852,7 @@ Y_UNIT_TEST(Range_BrokenLockMax) {
     TLocksTestOptions opts;
     opts.TestRange = true;
     opts.BreakKey = "'('key (Uint32 '4294967295))";
-    opts.Range1Inc = "'ExcFrom 'ExcTo";
+    opts.Range1Inc = "'ExcFrom 'IncTo";
     opts.Break = true;
     TestLock<TLocksV1>(opts);
     TestLock<TLocksV2>(opts);
@@ -1021,7 +1021,7 @@ Y_UNIT_TEST(Range_EmptyKey) {
     opts.SetOnly = true;
     //opts.TestErase = true;
     opts.TestRange = true;
-    opts.Range0Inc = "'IncFrom 'ExcTo";
+    opts.Range0Inc = "'IncFrom 'IncTo";
     opts.Range0Begin = "(String '\"\")";
     opts.Range0End = "(Void)";
     TestLock<TLocksV1>(opts);
@@ -1810,7 +1810,7 @@ static void LocksLimit() {
 
     using TLock = TSysTables::TLocksTable::TLock;
 
-    ui32 limit = NDataShard::TLockLocker::TLockLimiter::LockLimit();
+    ui32 limit = NDataShard::TLockLocker::LockLimit();
     const ui32 factor = 100;
 
     const char * query = R"((
@@ -1917,7 +1917,7 @@ static void ShardLocks() {
     TClient::TFlatQueryOptions opts;
 
 
-    ui32 limit = NDataShard::TLockLocker::TLockLimiter::LockLimit();
+    ui32 limit = NDataShard::TLockLocker::LockLimit();
     //const ui32 factor = 100;
 
     const char * setLock = R"___((

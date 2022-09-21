@@ -1,9 +1,14 @@
-#include "topic_util.h"
 #include "topic_write.h"
+
+#include <ydb/public/lib/ydb_cli/commands/ydb_common.h>
+
+#include <library/cpp/string_utils/base64/base64.h>
 #include <openssl/sha.h>
 #include <util/generic/overloaded.h>
 #include <util/stream/tokenizer.h>
 #include <util/string/hex.h>
+
+#include <signal.h>
 
 namespace NYdb::NConsoleClient {
     namespace {
@@ -13,15 +18,16 @@ namespace NYdb::NConsoleClient {
     TTopicWriterParams::TTopicWriterParams() {
     }
 
-    TTopicWriterParams::TTopicWriterParams(EOutputFormat inputFormat, TMaybe<TString> delimiter,
-                                           ui64 messageSizeLimit, TMaybe<TDuration> batchDuration,
-                                           TMaybe<ui64> batchSize, TMaybe<ui64> batchMessagesCount)
-        : InputFormat_(inputFormat)
+    TTopicWriterParams::TTopicWriterParams(EMessagingFormat inputFormat, TMaybe<TString> delimiter, ui64 messageSizeLimit,
+                                           TMaybe<TDuration> batchDuration, TMaybe<ui64> batchSize, TMaybe<ui64> batchMessagesCount,
+                                           ETransformBody transform)
+        : MessagingFormat_(inputFormat)
         , BatchDuration_(batchDuration)
         , BatchSize_(batchSize)
         , BatchMessagesCount_(batchMessagesCount)
+        , Transform_(transform)
         , MessageSizeLimit_(messageSizeLimit) {
-        if (inputFormat == EOutputFormat::NewlineDelimited || inputFormat == EOutputFormat::Concatenated) {
+        if (inputFormat == EMessagingFormat::NewlineDelimited || inputFormat == EMessagingFormat::Concatenated) {
             Delimiter_ = TMaybe<char>('\n');
         }
         if (delimiter.Defined()) {
@@ -56,7 +62,7 @@ namespace NYdb::NConsoleClient {
     TTopicWriter::TTopicWriter() {
     }
 
-    TTopicWriter::TTopicWriter(std::shared_ptr<NYdb::NPersQueue::IWriteSession> writeSession,
+    TTopicWriter::TTopicWriter(std::shared_ptr<NYdb::NTopic::IWriteSession> writeSession,
                                TTopicWriterParams params)
         : WriteSession_(writeSession)
         , WriterParams_(params) {
@@ -78,6 +84,14 @@ namespace NYdb::NConsoleClient {
 
         if (!initSeqNo.HasValue()) {
             // TODO(shmel1k@): logging
+            if (initSeqNo.HasException()) {
+                // NOTE(shmel1k@): SessionClosedEvent is stored in EventsQueue, so we can try to get it.
+                auto event = WriteSession_->GetEvent(true);
+                if (event.Defined()) {
+                    return HandleEvent(*event);
+                }
+                initSeqNo.TryRethrow();
+            }
             return EXIT_FAILURE;
         }
 
@@ -85,34 +99,41 @@ namespace NYdb::NConsoleClient {
         return EXIT_SUCCESS;
     }
 
-    int TTopicWriter::HandleAcksEvent(const NPersQueue::TWriteSessionEvent::TAcksEvent& event) {
+    int TTopicWriter::HandleAcksEvent(const NTopic::TWriteSessionEvent::TAcksEvent* event) {
         Y_UNUSED(event);
         return EXIT_SUCCESS;
     }
 
-    int TTopicWriter::HandleReadyToAcceptEvent(NPersQueue::TWriteSessionEvent::TReadyToAcceptEvent& event) {
-        ContinuationToken_ = std::move(event.ContinuationToken);
+    int TTopicWriter::HandleReadyToAcceptEvent(NTopic::TWriteSessionEvent::TReadyToAcceptEvent* event) {
+        ContinuationToken_ = std::move(event->ContinuationToken);
         return EXIT_SUCCESS;
     }
 
-    int TTopicWriter::HandleSessionClosedEvent(const NPersQueue::TSessionClosedEvent& event) {
-        ThrowOnError(event);
+    int TTopicWriter::HandleSessionClosedEvent(const NTopic::TSessionClosedEvent* event) {
+        ThrowOnError(*event);
         return EXIT_FAILURE;
     }
 
-    int TTopicWriter::HandleEvent(NPersQueue::TWriteSessionEvent::TEvent& event) {
-        return std::visit(TOverloaded{
-                              [&](const NPersQueue::TWriteSessionEvent::TAcksEvent& event) {
-                                  return HandleAcksEvent(event);
-                              },
-                              [&](NPersQueue::TWriteSessionEvent::TReadyToAcceptEvent& event) {
-                                  return HandleReadyToAcceptEvent(event);
-                              },
-                              [&](const NPersQueue::TSessionClosedEvent& event) {
-                                  return HandleSessionClosedEvent(event);
-                              },
-                          },
-                          event);
+    int TTopicWriter::HandleEvent(NTopic::TWriteSessionEvent::TEvent& event) {
+        if (auto* acksEvent = std::get_if<NTopic::TWriteSessionEvent::TAcksEvent>(&event)) {
+            return HandleAcksEvent(acksEvent);
+        } else if (auto* readyToAcceptEvent = std::get_if<NTopic::TWriteSessionEvent::TReadyToAcceptEvent>(&event)) {
+            return HandleReadyToAcceptEvent(readyToAcceptEvent);
+        } else if (auto* sessionClosedEvent = std::get_if<NTopic::TSessionClosedEvent>(&event)) {
+            return HandleSessionClosedEvent(sessionClosedEvent);
+        }
+
+        return EXIT_SUCCESS;
+    }
+
+    namespace {
+        TString TransformBody(const TString& body, ETransformBody transform) {
+            if (transform == ETransformBody::None) {
+                return body;
+            }
+
+            return Base64Decode(body);
+        }
     }
 
     TTopicWriter::TSendMessageData TTopicWriter::EnterMessage(IInputStream& input) {
@@ -120,9 +141,9 @@ namespace NYdb::NConsoleClient {
         // TODO(shmel1k@): add JSONStreamReader & etc interfaces.
         // TODO(shmel1k@): add stream parsing here & improve performance.
         if (!WriterParams_.Delimiter().Defined()) {
-            // TODO(shmel1k@): interruption?
+            TString body = input.ReadAll();
             return TSendMessageData{
-                .Data = input.ReadAll(),
+                .Data = TransformBody(body, WriterParams_.Transform()),
                 .NeedSend = true,
                 .ContinueSending = false,
             };
@@ -139,7 +160,7 @@ namespace NYdb::NConsoleClient {
             };
         }
         return TSendMessageData{
-            .Data = buffer,
+            .Data = TransformBody(buffer, WriterParams_.Transform()),
             .NeedSend = true,
             .ContinueSending = true,
         };
@@ -147,10 +168,11 @@ namespace NYdb::NConsoleClient {
 
     int TTopicWriter::Run(IInputStream& input) {
         // TODO(shmel1k@): add notificator about failures.
+        SetInterruptHandlers();
         bool continueSending = true;
         while (continueSending) {
             while (!ContinuationToken_.Defined()) {
-                TMaybe<NPersQueue::TWriteSessionEvent::TEvent> event = WriteSession_->GetEvent(true);
+                TMaybe<NTopic::TWriteSessionEvent::TEvent> event = WriteSession_->GetEvent(true);
                 if (event.Empty()) {
                     continue;
                 }
@@ -172,36 +194,27 @@ namespace NYdb::NConsoleClient {
     }
 
     bool TTopicWriter::Close(TDuration closeTimeout) {
-        Y_UNUSED(closeTimeout);
-        if (WriteSession_->Close(TDuration::Hours(12))) {
+        if (WriteSession_->Close(closeTimeout)) {
             return true;
         }
-        TVector<NPersQueue::TWriteSessionEvent::TEvent> events = WriteSession_->GetEvents(true);
+        TVector<NTopic::TWriteSessionEvent::TEvent> events = WriteSession_->GetEvents(true);
         if (events.empty()) {
             return false;
         }
         for (auto& evt : events) {
-            bool hasFailure = false;
-            std::visit(TOverloaded{
-                           [&](const NPersQueue::TWriteSessionEvent::TAcksEvent& event) {
-                               Y_UNUSED(event);
-                           },
-                           [&](NPersQueue::TWriteSessionEvent::TReadyToAcceptEvent& event) {
-                               Y_UNUSED(event);
-                           },
-                           [&](const NPersQueue::TSessionClosedEvent& event) {
-                               int result = HandleSessionClosedEvent(event);
-                               if (result == EXIT_FAILURE) {
-                                   hasFailure = true;
-                               }
-                               Y_UNUSED(result);
-                           },
-                       },
-                       evt);
-            if (hasFailure) {
+            if (HandleEvent(evt)) {
                 return false;
             }
         }
         return true;
+    }
+
+    void TTopicWriter::OnTerminate(int) {
+        exit(EXIT_FAILURE);
+    }
+
+    void TTopicWriter::SetInterruptHandlers() {
+        signal(SIGINT, &TTopicWriter::OnTerminate);
+        signal(SIGTERM, &TTopicWriter::OnTerminate);
     }
 } // namespace NYdb::NConsoleClient

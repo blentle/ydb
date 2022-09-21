@@ -4,6 +4,8 @@
 
 #include "log_iface.h"
 #include "log_settings.h"
+#include "log_metrics.h"
+#include "log_buffer.h"
 #include "actorsystem.h"
 #include "events.h"
 #include "event_local.h"
@@ -14,8 +16,6 @@
 #include <util/string/printf.h>
 #include <util/string/builder.h>
 #include <library/cpp/logger/all.h>
-#include <library/cpp/monlib/dynamic_counters/counters.h>
-#include <library/cpp/monlib/metrics/metric_registry.h>
 #include <library/cpp/json/writer/json.h>
 #include <library/cpp/svnversion/svnversion.h>
 
@@ -166,30 +166,15 @@ namespace NActors {
         TString Explanation;
     };
 
-    class TLogIgnored: public TEventLocal<TLogIgnored, int(NLog::EEv::Ignored)> {
+    class TFlushLogBuffer: public TEventLocal<TFlushLogBuffer, int(NLog::EEv::Buffer)> {
     public:
-        TLogIgnored() {
+        TFlushLogBuffer() {
         }
     };
 
     ////////////////////////////////////////////////////////////////////////////////
     // LOGGER ACTOR
     ////////////////////////////////////////////////////////////////////////////////
-    class ILoggerMetrics {
-    public:
-        virtual ~ILoggerMetrics() = default;
-
-        virtual void IncActorMsgs() = 0;
-        virtual void IncDirectMsgs() = 0;
-        virtual void IncLevelRequests() = 0;
-        virtual void IncIgnoredMsgs() = 0;
-        virtual void IncAlertMsgs() = 0;
-        virtual void IncEmergMsgs() = 0;
-        virtual void IncDroppedMsgs() = 0;
-
-        virtual void GetOutputHtml(IOutputStream&) = 0;
-    };
-
     class TLoggerActor: public TActor<TLoggerActor> {
     public:
         static constexpr IActor::EActivityType ActorActivityType() {
@@ -210,9 +195,9 @@ namespace NActors {
                      std::shared_ptr<NMonitoring::TMetricRegistry> metrics);
         ~TLoggerActor();
 
-        void StateFunc(TAutoPtr<IEventHandle>& ev, const TActorContext& ctx) {
+        void StateFunc(TAutoPtr<IEventHandle>& ev, const TActorContext& ctx) { 
             switch (ev->GetTypeRewrite()) {
-                HFunc(TLogIgnored, HandleIgnoredEvent);
+                HFunc(TFlushLogBuffer, FlushLogBufferMessageEvent);
                 HFunc(NLog::TEvLog, HandleLogEvent);
                 HFunc(TLogComponentLevelRequest, HandleLogComponentLevelRequest);
                 HFunc(NMon::TEvHttpInfo, HandleMonInfo);
@@ -221,7 +206,6 @@ namespace NActors {
 
         STFUNC(StateDefunct) {
             switch (ev->GetTypeRewrite()) {
-                cFunc(TLogIgnored::EventType, HandleIgnoredEventDrop);
                 hFunc(NLog::TEvLog, HandleLogEventDrop);
                 HFunc(TLogComponentLevelRequest, HandleLogComponentLevelRequest);
                 HFunc(NMon::TEvHttpInfo, HandleMonInfo);
@@ -237,23 +221,22 @@ namespace NActors {
     private:
         TIntrusivePtr<NLog::TSettings> Settings;
         std::shared_ptr<TLogBackend> LogBackend;
-        ui64 IgnoredCount = 0;
         ui64 PassedCount = 0;
-        static TAtomic IsOverflow;
         TDuration WakeupInterval{TDuration::Seconds(5)};
         std::unique_ptr<ILoggerMetrics> Metrics;
+        TLogBuffer LogBuffer;
 
         void BecomeDefunct();
-        void HandleIgnoredEvent(TLogIgnored::TPtr& ev, const NActors::TActorContext& ctx);
-        void HandleIgnoredEventDrop();
+        void FlushLogBufferMessageEvent(TFlushLogBuffer::TPtr& ev, const NActors::TActorContext& ctx);
         void HandleLogEvent(NLog::TEvLog::TPtr& ev, const TActorContext& ctx);
         void HandleLogEventDrop(const NLog::TEvLog::TPtr& ev);
         void HandleLogComponentLevelRequest(TLogComponentLevelRequest::TPtr& ev, const TActorContext& ctx);
         void HandleMonInfo(NMon::TEvHttpInfo::TPtr& ev, const TActorContext& ctx);
         void HandleWakeup();
+        [[nodiscard]] bool OutputRecord(NLog::TEvLog *evLog) noexcept;
         [[nodiscard]] bool OutputRecord(TInstant time, NLog::EPrio priority, NLog::EComponent component, const TString& formatted) noexcept;
         void RenderComponentPriorities(IOutputStream& str);
-        void LogIgnoredCount(TInstant now);
+        void FlushLogBufferMessage();
         void WriteMessageStat(const NLog::TEvLog& ev);
         static const char* FormatLocalTimestamp(TInstant time, char* buf);
     };

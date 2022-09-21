@@ -55,21 +55,29 @@ void FillColumnDescriptionImpl(TYdbProto& out,
 
         auto newColumn = out.add_columns();
         newColumn->set_name(column.GetName());
-        auto& item = *newColumn->mutable_type()->mutable_optional_type()->mutable_item();
+
+        Ydb::Type* columnType = nullptr;
+        if (column.GetNotNull()) {
+            columnType = newColumn->mutable_type();
+        } else {
+            columnType = newColumn->mutable_type()->mutable_optional_type()->mutable_item();
+        }
+
+        Y_ENSURE(columnType);
         if (protoType == NYql::NProto::TypeIds::Decimal) {
-            auto typeParams = item.mutable_decimal_type();
+            auto typeParams = columnType->mutable_decimal_type();
             // TODO: Change TEvDescribeSchemeResult to return decimal params
             typeParams->set_precision(22);
             typeParams->set_scale(9);
         } else {
-            NMiniKQL::ExportPrimitiveTypeToProto(protoType, item);
+            NMiniKQL::ExportPrimitiveTypeToProto(protoType, *columnType);
         }
 
         if (columnIdToKeyPos.count(column.GetId())) {
             size_t keyPos = columnIdToKeyPos[column.GetId()];
             auto tupleElement = splitKeyType.MutableTuple()->MutableElement(keyPos);
             tupleElement->SetKind(NKikimrMiniKQL::ETypeKind::Optional);
-            ConvertYdbTypeToMiniKQLType(item, *tupleElement->MutableOptional()->MutableItem());
+            ConvertYdbTypeToMiniKQLType(*columnType, *tupleElement->MutableOptional()->MutableItem());
         }
 
         if (column.HasFamilyName()) {
@@ -776,7 +784,8 @@ void FillReadReplicasSettings(Ydb::Table::CreateTableRequest& out,
 }
 
 bool FillTableDescription(NKikimrSchemeOp::TModifyScheme& out,
-        const Ydb::Table::CreateTableRequest& in, Ydb::StatusIds::StatusCode& status, TString& error)
+        const Ydb::Table::CreateTableRequest& in, const TTableProfiles& profiles,
+        Ydb::StatusIds::StatusCode& status, TString& error)
 {
     auto& tableDesc = *out.MutableCreateTable();
 
@@ -785,6 +794,10 @@ bool FillTableDescription(NKikimrSchemeOp::TModifyScheme& out,
     }
 
     tableDesc.MutableKeyColumnNames()->CopyFrom(in.primary_key());
+
+    if (!profiles.ApplyTableProfile(in.profile(), tableDesc, status, error)) {
+        return false;
+    }
 
     TColumnFamilyManager families(tableDesc.MutablePartitionConfig());
     if (in.has_storage_settings() && !families.ApplyStorageSettings(in.storage_settings(), &status, &error)) {

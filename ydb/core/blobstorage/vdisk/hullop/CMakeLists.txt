@@ -6,6 +6,8 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(hullcompdelete)
+add_subdirectory(ut)
 
 add_library(blobstorage-vdisk-hullop)
 target_link_libraries(blobstorage-vdisk-hullop PUBLIC
@@ -14,6 +16,12 @@ target_link_libraries(blobstorage-vdisk-hullop PUBLIC
   vdisk-hulldb-barriers
   vdisk-hulldb-base
   vdisk-hulldb-generic
+  vdisk-hulldb-cache_block
+  vdisk-hulldb-recovery
+  vdisk-hulldb-bulksst_add
+  vdisk-hullop-hullcompdelete
+  blobstorage-vdisk-handoff
+  blobstorage-vdisk-synclog
   ydb-core-protos
 )
 target_sources(blobstorage-vdisk-hullop PRIVATE

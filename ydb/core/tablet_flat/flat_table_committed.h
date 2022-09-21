@@ -2,7 +2,8 @@
 #include "defs.h"
 
 #include <ydb/core/base/row_version.h>
-#include <util/generic/hash.h>
+#include <library/cpp/containers/absl_flat_hash/flat_hash_map.h>
+#include <library/cpp/containers/absl_flat_hash/flat_hash_set.h>
 #include <util/generic/ptr.h>
 
 #include <unordered_map>
@@ -143,7 +144,7 @@ namespace NTable {
      */
     class TTransactionMap {
     private:
-        using TTxMap = std::unordered_map<ui64, TRowVersion>;
+        using TTxMap = absl::flat_hash_map<ui64, TRowVersion>;
 
         struct TState final : public ITransactionMap, public TTxMap {
             const TRowVersion* Find(ui64 txId) const override {
@@ -249,7 +250,7 @@ namespace NTable {
      */
     class TTransactionSet {
     private:
-        using TTxSet = std::unordered_set<ui64>;
+        using TTxSet = absl::flat_hash_set<ui64>;
 
         struct TState : public TThrRefBase, TTxSet {
         };
@@ -322,10 +323,28 @@ namespace NTable {
     public:
         /**
          * Called when iterator skips over an uncommitted delta
-         *
-         * This may be used for detecting possible conflicts with transactions.
          */
         virtual void OnSkipUncommitted(ui64 txId) = 0;
+
+        /**
+         * Called when iterator skips over committed delta
+         */
+        virtual void OnSkipCommitted(const TRowVersion& rowVersion) = 0;
+
+        /**
+         * Called when iterator skips over committed delta
+         */
+        virtual void OnSkipCommitted(const TRowVersion& rowVersion, ui64 txId) = 0;
+
+        /**
+         * Called when iterator applies committed changes from row version
+         */
+        virtual void OnApplyCommitted(const TRowVersion& rowVersion) = 0;
+
+        /**
+         * Called when iterator applies changes with a given row version and txId
+         */
+        virtual void OnApplyCommitted(const TRowVersion& rowVersion, ui64 txId) = 0;
     };
 
     /**
@@ -338,6 +357,30 @@ namespace NTable {
         void OnSkipUncommitted(ui64 txId) const {
             if (ITransactionObserver* p = Get()) {
                 p->OnSkipUncommitted(txId);
+            }
+        }
+
+        void OnSkipCommitted(const TRowVersion& rowVersion) const {
+            if (ITransactionObserver* p = Get()) {
+                p->OnSkipCommitted(rowVersion);
+            }
+        }
+
+        void OnSkipCommitted(const TRowVersion& rowVersion, ui64 txId) const {
+            if (ITransactionObserver* p = Get()) {
+                p->OnSkipCommitted(rowVersion, txId);
+            }
+        }
+
+        void OnApplyCommitted(const TRowVersion& rowVersion) const {
+            if (ITransactionObserver* p = Get()) {
+                p->OnApplyCommitted(rowVersion);
+            }
+        }
+
+        void OnApplyCommitted(const TRowVersion& rowVersion, ui64 txId) const {
+            if (ITransactionObserver* p = Get()) {
+                p->OnApplyCommitted(rowVersion, txId);
             }
         }
     };
@@ -368,6 +411,30 @@ namespace NTable {
         void OnSkipUncommitted(ui64 txId) const {
             if (Ptr) {
                 Ptr->OnSkipUncommitted(txId);
+            }
+        }
+
+        void OnSkipCommitted(const TRowVersion& rowVersion) const {
+            if (Ptr) {
+                Ptr->OnSkipCommitted(rowVersion);
+            }
+        }
+
+        void OnSkipCommitted(const TRowVersion& rowVersion, ui64 txId) const {
+            if (Ptr) {
+                Ptr->OnSkipCommitted(rowVersion, txId);
+            }
+        }
+
+        void OnApplyCommitted(const TRowVersion& rowVersion) const {
+            if (Ptr) {
+                Ptr->OnApplyCommitted(rowVersion);
+            }
+        }
+
+        void OnApplyCommitted(const TRowVersion& rowVersion, ui64 txId) const {
+            if (Ptr) {
+                Ptr->OnApplyCommitted(rowVersion, txId);
             }
         }
 

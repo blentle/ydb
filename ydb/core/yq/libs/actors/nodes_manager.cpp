@@ -21,6 +21,8 @@
     LOG_INFO_S(*TlsActivationContext, NKikimrServices::YQL_NODES_MANAGER, stream)
 #define LOG_D(stream) \
     LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::YQL_NODES_MANAGER, stream)
+#define LOG_T(stream) \
+    LOG_TRACE_S(*TlsActivationContext, NKikimrServices::YQL_NODES_MANAGER, stream)
 
 namespace NYq {
 
@@ -66,14 +68,14 @@ public:
     static constexpr char ActorName[] = "YQ_NODES_MANAGER";
 
     void PassAway() final {
-        LOG_I("PassAway STOPPED");
+        LOG_I("PassAway, InstanceId: " << InstanceId);
         NActors::IActor::PassAway();
     }
 
     void Bootstrap(const TActorContext&) {
         Become(&TNodesManagerActor::StateFunc);
         ServiceCounters.Counters->GetCounter("EvBootstrap", true)->Inc();
-        LOG_I("Bootstrap STARTED");
+        LOG_I("Bootstrap, InstanceId: " << InstanceId);
         NodesHealthCheck();
     }
 
@@ -87,7 +89,7 @@ private:
 
         if (count == 0) {
             auto& error = *req->Record.MutableError();
-            error.SetErrorCode(NYql::NDqProto::EMISMATCH);
+            error.SetStatusCode(NYql::NDqProto::StatusIds::BAD_REQUEST);
             error.SetMessage("Incorrect request - 0 nodes requested");
         } else {
             auto resourceId = rec.GetResourceId();
@@ -138,7 +140,7 @@ private:
                     } else {
                         placementFailure = true;
                         auto& error = *req->Record.MutableError();
-                        error.SetErrorCode(NYql::NDqProto::EMISMATCH);
+                        error.SetStatusCode(NYql::NDqProto::StatusIds::CLUSTER_OVERLOADED);
                         error.SetMessage("Not enough free memory in the cluster");
                         break;
                     }
@@ -252,7 +254,7 @@ private:
             ServiceCounters.Counters->GetCounter("PeerCount", false)->Set(Peers.size());
             ServiceCounters.Counters->GetCounter("NodesHealthCheckOk", true)->Inc();
 
-            LOG_D("Send NodeInfo with size: " << nodesInfo.size() << " to DynamicNameserver");
+            LOG_T("Send NodeInfo with size: " << nodesInfo.size() << " to DynamicNameserver");
             if (!nodesInfo.empty()) {
                 Send(GetNameserviceActorId(), nameServiceUpdateReq.Release());
             }

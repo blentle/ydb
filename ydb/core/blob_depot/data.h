@@ -3,6 +3,8 @@
 #include "defs.h"
 #include "blob_depot_tablet.h"
 
+#include <util/generic/hash_multi_map.h>
+
 namespace NKikimr::NBlobDepot {
 
     class TBlobDepot::TData {
@@ -170,6 +172,13 @@ namespace NKikimr::NBlobDepot {
             friend bool operator > (const TKey& x, const TKey& y) { return Compare(x, y) >  0; }
             friend bool operator >=(const TKey& x, const TKey& y) { return Compare(x, y) >= 0; }
 
+            struct THash {
+                size_t operator ()(const TKey& key) const {
+                    const auto v = key.AsVariant();
+                    return std::visit([&](auto& value) { return MultiHash(v.index(), value); }, v);
+                }
+            };
+
         private:
             void Reset() {
                 if (Data.Type == StringType) {
@@ -210,34 +219,90 @@ namespace NKikimr::NBlobDepot {
         struct TValue {
             TString Meta;
             TValueChain ValueChain;
-            NKikimrBlobDepot::EKeepState KeepState;
-            bool Public;
-            bool Unconfirmed;
+            NKikimrBlobDepot::EKeepState KeepState = NKikimrBlobDepot::EKeepState::Default;
+            bool Public = false;
             std::optional<TLogoBlobID> OriginalBlobId;
+            bool UncertainWrite = false;
 
-            TValue() = delete;
+            TValue() = default;
             TValue(const TValue&) = delete;
             TValue(TValue&&) = default;
 
             TValue& operator =(const TValue&) = delete;
             TValue& operator =(TValue&&) = default;
 
-            explicit TValue(NKikimrBlobDepot::TValue&& proto)
+            explicit TValue(NKikimrBlobDepot::TValue&& proto, bool uncertainWrite)
                 : Meta(proto.GetMeta())
                 , ValueChain(std::move(*proto.MutableValueChain()))
                 , KeepState(proto.GetKeepState())
                 , Public(proto.GetPublic())
-                , Unconfirmed(proto.GetUnconfirmed())
                 , OriginalBlobId(proto.HasOriginalBlobId()
                     ? std::make_optional(LogoBlobIDFromLogoBlobID(proto.GetOriginalBlobId()))
                     : std::nullopt)
+                , UncertainWrite(uncertainWrite)
             {}
+
+            explicit TValue(const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item, bool uncertainWrite)
+                : Meta(item.GetMeta())
+                , Public(false)
+                , UncertainWrite(uncertainWrite)
+            {
+                auto *chain = ValueChain.Add();
+                auto *locator = chain->MutableLocator();
+                locator->CopyFrom(item.GetBlobLocator());
+            }
 
             explicit TValue(NKikimrBlobDepot::EKeepState keepState)
                 : KeepState(keepState)
                 , Public(false)
-                , Unconfirmed(false)
+                , UncertainWrite(true)
             {}
+
+            void SerializeToProto(NKikimrBlobDepot::TValue *proto) const {
+                if (Meta) {
+                    proto->SetMeta(Meta);
+                }
+                if (!ValueChain.empty()) {
+                    proto->MutableValueChain()->CopyFrom(ValueChain);
+                }
+                if (KeepState != proto->GetKeepState()) {
+                    proto->SetKeepState(KeepState);
+                }
+                if (Public != proto->GetPublic()) {
+                    proto->SetPublic(Public);
+                }
+                if (OriginalBlobId) {
+                    LogoBlobIDFromLogoBlobID(*OriginalBlobId, proto->MutableOriginalBlobId());
+                }
+            }
+
+            static bool Validate(const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item);
+            bool SameValueChainAsIn(const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item) const;
+
+            TString SerializeToString() const {
+                NKikimrBlobDepot::TValue proto;
+                SerializeToProto(&proto);
+                TString s;
+                const bool success = proto.SerializeToString(&s);
+                Y_VERIFY(success);
+                return s;
+            }
+
+            TString ToString() const {
+                TStringStream s;
+                Output(s);
+                return s.Str();
+            }
+
+            void Output(IOutputStream& s) const {
+                s << "{Meta# '" << EscapeC(Meta) << "'"
+                    << " ValueChain# " << FormatList(ValueChain)
+                    << " KeepState# " << NKikimrBlobDepot::EKeepState_Name(KeepState)
+                    << " Public# " << (Public ? "true" : "false")
+                    << " OriginalBlobId# " << (OriginalBlobId ? OriginalBlobId->ToString() : "<none>")
+                    << " UncertainWrite# " << (UncertainWrite ? "true" : "false")
+                    << "}";
+            }
         };
 
         enum EScanFlags : ui32 {
@@ -286,9 +351,19 @@ namespace NKikimr::NBlobDepot {
         THashMap<std::tuple<ui64, ui8, ui32>, TRecordsPerChannelGroup> RecordsPerChannelGroup;
         TIntrusiveList<TRecordsPerChannelGroup, TRecordWithTrash> RecordsWithTrash;
         std::optional<TKey> LastLoadedKey; // keys are being loaded in ascending order
-        std::optional<TKey> LastAssimilatedKey;
+        std::optional<TLogoBlobID> LastAssimilatedBlobId;
+
+        friend class TGroupAssimilator;
 
         THashMultiMap<void*, TLogoBlobID> InFlightTrash; // being committed, but not yet confirmed
+
+        struct TResolveDecommitContext {
+            TEvBlobDepot::TEvResolve::TPtr Ev; // original resolve request
+            ui32 NumRangesInFlight = 0;
+            bool Errors = false;
+        };
+        ui64 LastRangeId = 0;
+        THashMap<ui64, TResolveDecommitContext> ResolveDecommitContexts;
 
         class TTxIssueGC;
         class TTxConfirmGC;
@@ -297,14 +372,21 @@ namespace NKikimr::NBlobDepot {
 
         class TTxLoadSpecificKeys;
         class TTxResolve;
+        class TResolveResultAccumulator;
+
+        class TUncertaintyResolver;
+        std::unique_ptr<TUncertaintyResolver> UncertaintyResolver;
+        friend class TBlobDepot;
+
+        std::deque<TKey> KeysMadeCertain; // but not yet committed
+        bool CommitCertainKeysScheduled = false;
 
     public:
-        TData(TBlobDepot *self)
-            : Self(self)
-        {}
+        TData(TBlobDepot *self);
+        ~TData();
 
         template<typename TCallback>
-        void ScanRange(const TKey *begin, const TKey *end, TScanFlags flags, TCallback&& callback) {
+        bool ScanRange(const TKey *begin, const TKey *end, TScanFlags flags, TCallback&& callback) {
             auto beginIt = !begin ? Data.begin()
                 : flags & EScanFlags::INCLUDE_BEGIN ? Data.lower_bound(*begin)
                 : Data.upper_bound(*begin);
@@ -319,7 +401,7 @@ namespace NKikimr::NBlobDepot {
                     do {
                         auto& current = *endIt--;
                         if (!callback(current.first, current.second)) {
-                            break;
+                            return false;
                         }
                     } while (beginIt != endIt);
                 }
@@ -327,38 +409,48 @@ namespace NKikimr::NBlobDepot {
                 while (beginIt != endIt) {
                     auto& current = *beginIt++;
                     if (!callback(current.first, current.second)) {
-                        break;
+                        return false;
                     }
                 }
             }
+            return true;
         }
 
-        NKikimrBlobDepot::EKeepState GetKeepState(const TKey& key) const;
+        const TValue *FindKey(const TKey& key) const;
+
+        template<typename T, typename... TArgs>
+        bool UpdateKey(TKey key, NTabletFlatExecutor::TTransactionContext& txc, void *cookie, T&& callback, TArgs&&... args);
+
+        void UpdateKey(const TKey& key, const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item, bool uncertainWrite,
+            NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
+
+        void MakeKeyCertain(const TKey& key);
+        void HandleCommitCertainKeys();
 
         TRecordsPerChannelGroup& GetRecordsPerChannelGroup(TLogoBlobID id);
 
-        void AddDataOnLoad(TKey key, TString value);
-        void AddDataOnDecommit(const TEvBlobStorage::TEvAssimilateResult::TBlob& blob, NTabletFlatExecutor::TTransactionContext& txc);
+        void AddDataOnLoad(TKey key, TString value, bool uncertainWrite, NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
+        void AddDataOnDecommit(const TEvBlobStorage::TEvAssimilateResult::TBlob& blob,
+            NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
         void AddTrashOnLoad(TLogoBlobID id);
         void AddGenStepOnLoad(ui8 channel, ui32 groupId, TGenStep issuedGenStep, TGenStep confirmedGenStep);
 
-        void PutKey(TKey key, TValue&& data);
-
-        std::optional<TString> UpdateKeepState(TKey key, NKikimrBlobDepot::EKeepState keepState);
-        void DeleteKey(const TKey& key, const std::function<void(TLogoBlobID)>& updateTrash, void *cookie);
+        bool UpdateKeepState(TKey key, NKikimrBlobDepot::EKeepState keepState,
+            NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
+        void DeleteKey(const TKey& key, NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
         void CommitTrash(void *cookie);
         void HandleTrash();
         void Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr ev);
         void OnPushNotifyResult(TEvBlobDepot::TEvPushNotifyResult::TPtr ev);
         void OnCommitConfirmedGC(ui8 channel, ui32 groupId);
+        bool OnBarrierShift(ui64 tabletId, ui8 channel, bool hard, TGenStep previous, TGenStep current, ui32& maxItems,
+            NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
 
         void AccountBlob(TLogoBlobID id, bool add);
 
         bool CanBeCollected(ui32 groupId, TBlobSeqId id) const;
 
         void OnLeastExpectedBlobIdChange(ui8 channel);
-
-        static TString ToValueProto(const TValue& value);
 
         template<typename TCallback>
         void EnumerateRefCount(TCallback&& callback) {
@@ -382,6 +474,7 @@ namespace NKikimr::NBlobDepot {
         bool IsLoaded() const { return Loaded; }
 
         void Handle(TEvBlobDepot::TEvResolve::TPtr ev);
+        void Handle(TEvBlobStorage::TEvRangeResult::TPtr ev);
 
     private:
         void ExecuteIssueGC(ui8 channel, ui32 groupId, TGenStep issuedGenStep,
@@ -393,3 +486,6 @@ namespace NKikimr::NBlobDepot {
     Y_DECLARE_OPERATORS_FOR_FLAGS(TBlobDepot::TData::TScanFlags)
 
 } // NKikimr::NBlobDepot
+
+template<> struct THash<NKikimr::NBlobDepot::TBlobDepot::TData::TKey> : NKikimr::NBlobDepot::TBlobDepot::TData::TKey::THash {};
+template<> struct std::hash<NKikimr::NBlobDepot::TBlobDepot::TData::TKey> : THash<NKikimr::NBlobDepot::TBlobDepot::TData::TKey> {};

@@ -13,6 +13,7 @@
 
 #include <util/digest/numeric.h>
 #include <util/generic/hash.h>
+#include <util/generic/hash_multi_map.h>
 #include <util/system/condvar.h>
 
 #include <atomic>
@@ -544,9 +545,9 @@ public:
         , Session(std::move(parentSession))
         , ErrorHandler(std::move(errorHandler))
     {
-        TAPartitionStream<false>::PartitionSessionId = static_cast<i64>(partitionStreamId);
+        TAPartitionStream<false>::PartitionSessionId = partitionStreamId;
         TAPartitionStream<false>::TopicPath = std::move(topicPath);
-        TAPartitionStream<false>::PartitionId = partitionId;
+        TAPartitionStream<false>::PartitionId = static_cast<ui64>(partitionId);
         MaxCommittedOffset = static_cast<ui64>(readOffset);
     }
 
@@ -764,7 +765,7 @@ public:
                         break;
                     }
                 }
-            } while (block && (eventInfos.empty() || eventInfos.back().IsSessionClosedEvent()));
+            } while (block && eventInfos.empty());
             ApplyCallbacksToReadyEventsImpl(deferred);
         }
 

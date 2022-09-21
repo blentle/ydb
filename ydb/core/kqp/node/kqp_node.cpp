@@ -14,10 +14,13 @@
 #include <ydb/core/kqp/common/kqp_resolve.h>
 #include <ydb/core/kqp/runtime/kqp_stream_lookup_factory.h>
 
+#include <ydb/core/base/wilson.h>
+
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor_async_io_factory.h>
 
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 #include <library/cpp/monlib/service/pages/templates.h>
+#include <library/cpp/actors/wilson/wilson_span.h>
 
 #include <util/string/join.h>
 
@@ -117,6 +120,8 @@ private:
     }
 
     void HandleWork(TEvKqpNode::TEvStartKqpTasksRequest::TPtr& ev) {
+        NWilson::TSpan sendTasksSpan(TWilsonKqp::KqpNodeSendTasks, NWilson::TTraceId(ev->TraceId), "KqpNode.SendTasks", NWilson::EFlags::AUTO_END);
+
         auto& msg = ev->Get()->Record;
         auto requester = ev->Sender;
 
@@ -136,23 +141,12 @@ private:
             return ReplyError(txId, request.Executer, msg, NKikimrKqp::TEvStartKqpTasksResponse::INTERNAL_ERROR);
         }
 
-        ui32 requestScans = 0;
         ui32 requestChannels = 0;
-
         for (auto& dqTask : *msg.MutableTasks()) {
-            ui32 nScans = 0;
-
-            if (isScan) {
-                NKikimrTxDataShard::TKqpTransaction::TScanTaskMeta protoTaskMeta;
-
-                YQL_ENSURE(msg.GetRuntimeSettings().GetExecType() == NYql::NDqProto::TComputeRuntimeSettings::SCAN);
-                YQL_ENSURE(msg.GetRuntimeSettings().GetTasksOnNodeCount() == 0); // legacy
-
-                dqTask.GetMeta().UnpackTo(&protoTaskMeta);
-                nScans = protoTaskMeta.GetReads().size();
-            }
-
-            auto estimation = EstimateTaskResources(dqTask, nScans, /* dsOnNodeCount */ 0, Config);
+            auto estimation = EstimateTaskResources(dqTask, Config);
+            LOG_D("Resource estimation complete"
+                << ", TxId: " << txId << ", task id: " << dqTask.GetId() << ", node id: " << SelfId().NodeId()
+                << ", estimated resources: " << estimation.ToString());
 
             NKqpNode::TTaskContext& taskCtx = request.InFlyTasks[dqTask.GetId()];
             YQL_ENSURE(taskCtx.TaskId == 0);
@@ -163,12 +157,11 @@ private:
 
             LOG_D("TxId: " << txId << ", task: " << taskCtx.TaskId << ", requested memory: " << taskCtx.Memory);
 
-            requestScans += estimation.ScanBuffersCount;
             requestChannels += estimation.ChannelBuffersCount;
             request.TotalMemory += taskCtx.Memory;
         }
 
-        LOG_D("TxId: " << txId << ", requested scans: " << requestScans << ", channels: " << requestChannels
+        LOG_D("TxId: " << txId << ", channels: " << requestChannels
             << ", computeActors: " << msg.GetTasks().size() << ", memory: " << request.TotalMemory);
 
         ui64 txMemory = State.GetTxMemory(txId, NRm::EKqpMemoryPool::ScanQuery) + request.TotalMemory;
@@ -232,7 +225,6 @@ private:
 
         NYql::NDq::TComputeMemoryLimits memoryLimits;
         memoryLimits.ChannelBufferSize = 0;
-        memoryLimits.ScanBufferSize = Config.GetScanBufferSize();
         memoryLimits.MkqlLightProgramMemoryLimit = Config.GetMkqlLightProgramMemoryLimit();
         memoryLimits.MkqlHeavyProgramMemoryLimit = Config.GetMkqlHeavyProgramMemoryLimit();
         if (Config.GetEnableInstantMkqlMemoryAlloc()) {
@@ -281,6 +273,7 @@ private:
 
         runtimeSettingsBase.ReportStatsSettings = NYql::NDq::TReportStatsSettings{MinStatInterval, MaxStatInterval};
 
+        TShardsScanningPolicy scanPolicy(Config.GetShardsScanningPolicy());
         auto actorSystem = TlsActivationContext->ActorSystem();
 
         // start compute actors
@@ -314,12 +307,12 @@ private:
             IActor* computeActor;
             if (tableKind == ETableKind::Datashard || tableKind == ETableKind::Olap) {
                 computeActor = CreateKqpScanComputeActor(msg.GetSnapshot(), request.Executer, txId, std::move(dqTask),
-                    CreateAsyncIoFactory(), nullptr, runtimeSettings, memoryLimits, Counters);
+                    CreateAsyncIoFactory(), nullptr, runtimeSettings, memoryLimits, scanPolicy, Counters, NWilson::TTraceId(ev->TraceId));
                 taskCtx.ComputeActorId = Register(computeActor);
             } else {
                 if (Y_LIKELY(!CaFactory)) {
                     computeActor = CreateKqpComputeActor(request.Executer, txId, std::move(dqTask), CreateAsyncIoFactory(),
-                        nullptr, runtimeSettings, memoryLimits);
+                        nullptr, runtimeSettings, memoryLimits, NWilson::TTraceId(ev->TraceId));
                     taskCtx.ComputeActorId = Register(computeActor);
                 } else {
                     computeActor = CaFactory->CreateKqpComputeActor(request.Executer, txId, std::move(dqTask),
@@ -440,7 +433,6 @@ private:
 #define FORCE_VALUE(name) if (!Config.Has ## name ()) Config.Set ## name(Config.Get ## name());
             FORCE_VALUE(ComputeActorsCount)
             FORCE_VALUE(ChannelBufferSize)
-            FORCE_VALUE(ScanBufferSize)
             FORCE_VALUE(MkqlLightProgramMemoryLimit)
             FORCE_VALUE(MkqlHeavyProgramMemoryLimit)
             FORCE_VALUE(QueryMemoryLimit)
@@ -448,8 +440,6 @@ private:
             FORCE_VALUE(EnableInstantMkqlMemoryAlloc);
             FORCE_VALUE(MaxTotalChannelBuffersSize);
             FORCE_VALUE(MinChannelBufferSize);
-            FORCE_VALUE(MaxTotalScanBuffersSize);
-            FORCE_VALUE(MinScanBufferSize);
 #undef FORCE_VALUE
 
             LOG_I("Updated table service config: " << Config.DebugString());

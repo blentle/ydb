@@ -118,6 +118,18 @@ public:
         PrimaryPath = path;
     }
 
+    void RestorePrimaryPath() {
+        Y_VERIFY(!OriginalPath.empty());
+        PrimaryPath = OriginalPath;
+        OriginalPath.clear();
+    }
+
+    // Only for control plane
+    const TString& GetFullModernName() const {
+        Y_VERIFY(!FullModernName.empty());
+        return FullModernName;
+    }
+
 protected:
     /** Account will be set for federation topics without database only;
      * Generally used only for discovery purposes
@@ -266,12 +278,16 @@ class TTopicNamesConverterFactory {
 public:
     TTopicNamesConverterFactory(
             bool noDcMode, const TString& pqRootPrefix,
-            const TString& localDc
+            const TString& localDc, TMaybe<bool> isLocalDc = Nothing()
     )
         : NoDcMode(noDcMode)
         , PQRootPrefix(pqRootPrefix)
-        , LocalDc(localDc)
     {
+        if (isLocalDc.Defined()) {
+            IsLocalDc = *isLocalDc;
+        } else {
+            LocalDc = localDc;
+        }
         SetPQNormPrefix();
     }
 

@@ -43,7 +43,7 @@ namespace NKikimr {
                 }
             }
 
-            TString GetPartData(TLogoBlobID id) const {
+            TRope GetPartData(TLogoBlobID id) const {
                 Y_VERIFY(id.FullID() == BlobId);
                 Y_VERIFY(id.PartId());
                 const ui32 partIdx = id.PartId() - 1;

@@ -1,7 +1,9 @@
 #include "topic_metadata_fields.h"
 #include "topic_read.h"
-#include "topic_util.h"
 #include "topic_write.h"
+
+#include <ydb/public/lib/ydb_cli/commands/ydb_common.h>
+
 #include <library/cpp/json/json_reader.h>
 #include <library/cpp/string_utils/base64/base64.h>
 #include <util/generic/set.h>
@@ -12,8 +14,8 @@ namespace NYdb::NConsoleClient {
         constexpr i64 MessagesLimitDefaultPrettyFormat = 10;
         constexpr i64 MessagesLimitDefaultJsonArrayFormat = 500;
 
-        bool IsStreamingFormat(EOutputFormat format) {
-            return format == EOutputFormat::NewlineBase64 || format == EOutputFormat::NewlineDelimited || format == EOutputFormat::Concatenated;
+        bool IsStreamingFormat(EMessagingFormat format) {
+            return format == EMessagingFormat::NewlineDelimited || format == EMessagingFormat::Concatenated;
         }
     }
 
@@ -24,13 +26,13 @@ namespace NYdb::NConsoleClient {
         TMaybe<i64> limit,
         bool commit,
         bool wait,
-        EOutputFormat format,
+        EMessagingFormat format,
         TVector<ETopicMetadataField> metadataFields,
         ETransformBody transform,
         TDuration idleTimeout)
         : MetadataFields_(metadataFields)
         , IdleTimeout_(idleTimeout)
-        , OutputFormat_(format)
+        , MessagingFormat_(format)
         , Transform_(transform)
         , Limit_(limit)
         , Commit_(commit)
@@ -53,20 +55,20 @@ namespace NYdb::NConsoleClient {
         OutputTable_ = std::make_unique<TPrettyTable>(table);
 
         if (!ReaderParams_.Limit().Defined()) {
-            if (IsStreamingFormat(ReaderParams_.OutputFormat())) {
+            if (IsStreamingFormat(ReaderParams_.MessagingFormat())) {
                 MessagesLeft_ = MessagesLimitUnlimited;
             }
-            if (ReaderParams_.OutputFormat() == EOutputFormat::Pretty) {
+            if (ReaderParams_.MessagingFormat() == EMessagingFormat::Pretty) {
                 MessagesLeft_ = MessagesLimitDefaultPrettyFormat;
             }
-            if (ReaderParams_.OutputFormat() == EOutputFormat::JsonRawArray) {
+            if (ReaderParams_.MessagingFormat() == EMessagingFormat::JsonArray) {
                 MessagesLeft_ = MessagesLimitDefaultJsonArrayFormat;
             }
             return;
         }
 
         i64 limit = *(ReaderParams_.Limit());
-        if (IsStreamingFormat(ReaderParams_.OutputFormat()) && limit == 0) {
+        if (IsStreamingFormat(ReaderParams_.MessagingFormat()) && limit == 0) {
             limit = -1;
         }
         MessagesLeft_ = limit;
@@ -83,20 +85,11 @@ namespace NYdb::NConsoleClient {
 
         using TReceivedMessage = NTopic::TReadSessionEvent::TDataReceivedEvent::TMessage;
 
-        void AddMetadataFieldToRow(TPrettyTable::TRow& row, const TReceivedMessage& message, EOutputFormat format, ETransformBody transform, ETopicMetadataField f, size_t idx) {
+        void AddMetadataFieldToRow(TPrettyTable::TRow& row, const TReceivedMessage& message, ETransformBody transform, ETopicMetadataField f, size_t idx) {
             switch (f) {
                 case ETopicMetadataField::Body:
-                    if (format == EOutputFormat::PrettyBase64) {
-                        row.Column(idx, FormatBody(message.GetData(), transform));
-                    }
-                    if (format == EOutputFormat::Pretty || format == EOutputFormat::PrettyRaw) {
-                        row.Column(idx, FormatBody(message.GetData(), transform));
-                    }
-                    if (format == EOutputFormat::PrettyUnicode) {
-                        row.Column(idx, message.GetData());
-                    }
+                    row.Column(idx, FormatBody(message.GetData(), transform));
                     break;
-
                 case ETopicMetadataField::CreateTime:
                     row.Column(idx, message.GetCreateTime());
                     break;
@@ -123,32 +116,28 @@ namespace NYdb::NConsoleClient {
         }
     } // namespace
 
-    void TTopicReader::PrintMessagesInPrettyFormat(IOutputStream& output) {
+    void TTopicReader::PrintMessagesInPrettyFormat(IOutputStream& output) const {
         for (const auto& message : ReceivedMessages_) {
             TPrettyTable::TRow& row = OutputTable_->AddRow();
             for (size_t i = 0; i < ReaderParams_.MetadataFields().size(); ++i) {
                 ETopicMetadataField f = ReaderParams_.MetadataFields()[i];
-                AddMetadataFieldToRow(row, message, ReaderParams_.OutputFormat(), ReaderParams_.Transform(), f, i);
+                AddMetadataFieldToRow(row, message, ReaderParams_.Transform(), f, i);
             }
         }
 
         OutputTable_->Print(output);
     }
 
-    void TTopicReader::PrintMessagesInJsonArrayFormat(IOutputStream& output) {
+    void TTopicReader::PrintMessagesInJsonArrayFormat(IOutputStream& output) const {
         // TODO(shmel1k@): not implemented yet.
         Y_UNUSED(output);
     }
 
     void TTopicReader::Close(IOutputStream& output, TDuration closeTimeout) {
-        if (ReaderParams_.OutputFormat() == EOutputFormat::Pretty ||
-            ReaderParams_.OutputFormat() == EOutputFormat::PrettyBase64 ||
-            ReaderParams_.OutputFormat() == EOutputFormat::PrettyRaw) {
+        if (ReaderParams_.MessagingFormat() == EMessagingFormat::Pretty) {
             PrintMessagesInPrettyFormat(output);
         }
-        if (ReaderParams_.OutputFormat() == EOutputFormat::JsonRawArray ||
-            ReaderParams_.OutputFormat() == EOutputFormat::JsonBase64Array ||
-            ReaderParams_.OutputFormat() == EOutputFormat::JsonUnicodeArray) {
+        if (ReaderParams_.MessagingFormat() == EMessagingFormat::JsonArray) {
             PrintMessagesInJsonArrayFormat(output);
         }
         output.Flush();
@@ -159,19 +148,19 @@ namespace NYdb::NConsoleClient {
     }
 
     void TTopicReader::HandleReceivedMessage(const TReceivedMessage& message, IOutputStream& output) {
-        EOutputFormat outputFormat = ReaderParams_.OutputFormat();
-        if (outputFormat == EOutputFormat::Default || outputFormat == EOutputFormat::Concatenated) {
+        EMessagingFormat MessagingFormat = ReaderParams_.MessagingFormat();
+        if (MessagingFormat == EMessagingFormat::SingleMessage || MessagingFormat == EMessagingFormat::Concatenated) {
             output << FormatBody(message.GetData(), ReaderParams_.Transform());
             output.Flush();
             return;
         }
-        if (outputFormat == EOutputFormat::NewlineDelimited) {
+        if (MessagingFormat == EMessagingFormat::NewlineDelimited) {
             output << FormatBody(message.GetData(), ReaderParams_.Transform());
             output << "\n";
             output.Flush();
             return;
         }
-        if (outputFormat == EOutputFormat::Default) {
+        if (MessagingFormat == EMessagingFormat::SingleMessage) {
             output << FormatBody(message.GetData(), ReaderParams_.Transform());
             return;
         }
@@ -180,6 +169,16 @@ namespace NYdb::NConsoleClient {
     }
 
     int TTopicReader::HandleDataReceivedEvent(NYdb::NTopic::TReadSessionEvent::TDataReceivedEvent* event, IOutputStream& output) {
+        ui64 sessionId = event->GetPartitionSession()->GetPartitionSessionId();
+        if (!HasSession(sessionId)) {
+            return EXIT_SUCCESS;
+        }
+
+        if (ActivePartitionSessions_[sessionId].second == EReadingStatus::PartitionWithoutData) {
+            ActivePartitionSessions_[sessionId].second = EReadingStatus::PartitionWithData;
+            ++PartitionsBeingRead_;
+        }
+
         HasFirstMessage_ = true;
 
         NTopic::TDeferredCommit defCommit;
@@ -206,8 +205,22 @@ namespace NYdb::NConsoleClient {
         return EXIT_SUCCESS;
     }
 
+    bool TTopicReader::HasSession(ui64 sessionId) const {
+        auto f = ActivePartitionSessions_.find(sessionId);
+        return !(f == ActivePartitionSessions_.end());
+    }
+
     int TTopicReader::HandleStartPartitionSessionEvent(NYdb::NTopic::TReadSessionEvent::TStartPartitionSessionEvent* event) {
         event->Confirm();
+
+        EReadingStatus readingStatus = EReadingStatus::PartitionWithData;
+        if (event->GetCommittedOffset() == event->GetEndOffset()) {
+            readingStatus = EReadingStatus::PartitionWithoutData;
+        } else {
+            ++PartitionsBeingRead_;
+        }
+
+        ActivePartitionSessions_.insert({event->GetPartitionSession()->GetPartitionSessionId(), {event->GetPartitionSession(), readingStatus}});
 
         return EXIT_SUCCESS;
     }
@@ -218,18 +231,72 @@ namespace NYdb::NConsoleClient {
         return EXIT_SUCCESS;
     }
 
-    int TTopicReader::HandleEvent(TMaybe<NYdb::NTopic::TReadSessionEvent::TEvent>& event, IOutputStream& output) {
-        if (!event) {
-            return 0;
+    int TTopicReader::HandlePartitionSessionStatusEvent(NTopic::TReadSessionEvent::TPartitionSessionStatusEvent* event) {
+        ui64 sessionId = event->GetPartitionSession()->GetPartitionSessionId();
+        if (!HasSession(sessionId)) {
+            return EXIT_SUCCESS;
         }
 
-        if (auto* dataEvent = std::get_if<NTopic::TReadSessionEvent::TDataReceivedEvent>(&*event)) {
+        auto status = ActivePartitionSessions_.find(sessionId);
+        EReadingStatus currentPartitionStatus = status->second.second;
+        if (event->GetEndOffset() == event->GetCommittedOffset()) {
+            if (currentPartitionStatus == EReadingStatus::PartitionWithData) {
+                --PartitionsBeingRead_;
+            }
+            ActivePartitionSessions_[sessionId].second = EReadingStatus::PartitionWithoutData;
+        } else {
+            if (currentPartitionStatus == EReadingStatus::PartitionWithoutData || currentPartitionStatus == EReadingStatus::NoPartitionTaken) {
+                ++PartitionsBeingRead_;
+            }
+            ActivePartitionSessions_[sessionId].second = EReadingStatus::PartitionWithData;
+        }
+
+        return EXIT_SUCCESS;
+    }
+
+    int TTopicReader::HandleStopPartitionSessionEvent(NTopic::TReadSessionEvent::TStopPartitionSessionEvent* event) {
+        if (!HasSession(event->GetPartitionSession()->GetPartitionSessionId())) {
+            return EXIT_SUCCESS;
+        }
+
+        event->Confirm();
+
+        auto f = ActivePartitionSessions_.find(event->GetPartitionSession()->GetPartitionSessionId());
+        if (f->second.second == EReadingStatus::PartitionWithData) {
+            --PartitionsBeingRead_;
+        }
+        ActivePartitionSessions_.erase(event->GetPartitionSession()->GetPartitionSessionId());
+
+        return EXIT_SUCCESS;
+    }
+
+    int TTopicReader::HandlePartitionSessionClosedEvent(NTopic::TReadSessionEvent::TPartitionSessionClosedEvent *event) {
+        if (!HasSession(event->GetPartitionSession()->GetPartitionSessionId())) {
+            return EXIT_SUCCESS;
+        }
+
+        if (ActivePartitionSessions_[event->GetPartitionSession()->GetPartitionSessionId()].second == EReadingStatus::PartitionWithData) {
+            --PartitionsBeingRead_;
+        }
+        ActivePartitionSessions_.erase(event->GetPartitionSession()->GetPartitionSessionId());
+
+        return EXIT_SUCCESS;
+    }
+
+    int TTopicReader::HandleEvent(NYdb::NTopic::TReadSessionEvent::TEvent& event, IOutputStream& output) {
+        if (auto* dataEvent = std::get_if<NTopic::TReadSessionEvent::TDataReceivedEvent>(&event)) {
             return HandleDataReceivedEvent(dataEvent, output);
-        } else if (auto* createPartitionStreamEvent = std::get_if<NTopic::TReadSessionEvent::TStartPartitionSessionEvent>(&*event)) {
+        } else if (auto* createPartitionStreamEvent = std::get_if<NTopic::TReadSessionEvent::TStartPartitionSessionEvent>(&event)) {
             return HandleStartPartitionSessionEvent(createPartitionStreamEvent);
-        } else if (auto* commitEvent = std::get_if<NTopic::TReadSessionEvent::TCommitOffsetAcknowledgementEvent>(&*event)) {
+        } else if (auto* commitEvent = std::get_if<NTopic::TReadSessionEvent::TCommitOffsetAcknowledgementEvent>(&event)) {
             return HandleCommitOffsetAcknowledgementEvent(commitEvent);
-        } else if (auto* sessionClosedEvent = std::get_if<NTopic::TSessionClosedEvent>(&*event)) {
+        } else if (auto* partitionStatusEvent = std::get_if<NTopic::TReadSessionEvent::TPartitionSessionStatusEvent>(&event)) {
+            return HandlePartitionSessionStatusEvent(partitionStatusEvent);
+        } else if (auto* stopPartitionSessionEvent = std::get_if<NTopic::TReadSessionEvent::TStopPartitionSessionEvent>(&event)) { 
+            return HandleStopPartitionSessionEvent(stopPartitionSessionEvent);
+        } else if (auto* partitionSessionClosedEvent = std::get_if<NTopic::TReadSessionEvent::TPartitionSessionClosedEvent>(&event)) {
+            return HandlePartitionSessionClosedEvent(partitionSessionClosedEvent);
+        } else if (auto* sessionClosedEvent = std::get_if<NTopic::TSessionClosedEvent>(&event)) {
             ThrowOnError(*sessionClosedEvent);
             return 1;
         }
@@ -239,35 +306,35 @@ namespace NYdb::NConsoleClient {
     int TTopicReader::Run(IOutputStream& output) {
         LastMessageReceivedTs_ = TInstant::Now();
 
-        bool waitForever = ReaderParams_.Wait() && (ReaderParams_.OutputFormat() == EOutputFormat::NewlineDelimited || ReaderParams_.OutputFormat() == EOutputFormat::Concatenated);
+        bool waitForever = (ReaderParams_.Wait() || (ReaderParams_.Limit().Defined() && *ReaderParams_.Limit() == 0)) &&
+                           (ReaderParams_.MessagingFormat() == EMessagingFormat::NewlineDelimited ||
+                            ReaderParams_.MessagingFormat() == EMessagingFormat::Concatenated);
 
         while ((MessagesLeft_ > 0 || MessagesLeft_ == -1) && !IsInterrupted()) {
             TInstant messageReceiveDeadline = LastMessageReceivedTs_ + ReaderParams_.IdleTimeout();
             NThreading::TFuture<void> future = ReadSession_->WaitEvent();
             future.Wait(messageReceiveDeadline);
-            if (!future.HasValue()) {
-                if (ReaderParams_.Wait() && !HasFirstMessage_) {
-                    LastMessageReceivedTs_ = Now();
-                    continue;
+            if (future.HasValue()) {
+                // TODO(shmel1k@): throttling?
+                // TODO(shmel1k@): think about limiting size of events
+                TVector<NTopic::TReadSessionEvent::TEvent> events = ReadSession_->GetEvents(true);
+                for (auto& event : events) {
+                    if (int status = HandleEvent(event, output); status) {
+                        return status;
+                    }
                 }
 
-                if (waitForever) {
-                    continue;
-                }
-
-                return EXIT_SUCCESS;
-            }
-
-            // TODO(shmel1k@): throttling?
-            // TODO(shmel1k@): think about limiting size of events
-            TMaybe<NYdb::NTopic::TReadSessionEvent::TEvent> event = ReadSession_->GetEvent(true);
-            if (!event) {
-                // TODO(shmel1k@): does it work properly?
                 continue;
             }
 
-            if (int status = HandleEvent(event, output); status) {
-                return status;
+            if (waitForever) {
+                LastMessageReceivedTs_ = TInstant::Now();
+                continue;
+            }
+
+            bool isReading = PartitionsBeingRead_ > 0;
+            if (!isReading || (isReading && HasFirstMessage_)) {
+                return EXIT_SUCCESS;
             }
         }
         return EXIT_SUCCESS;

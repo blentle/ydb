@@ -1,8 +1,9 @@
 #pragma once
 #include "defs.h"
 #include <ydb/core/blobstorage/vdisk/common/vdisk_hulllogctx.h>
-#include <ydb/core/blobstorage/vdisk/hulldb/hulldb_recovery.h>
-#include <ydb/core/blobstorage/vdisk/hulldb/hulldb_bulksst_add.h>
+#include <ydb/core/blobstorage/vdisk/hulldb/cache_block/cache_block.h>
+#include <ydb/core/blobstorage/vdisk/hulldb/recovery/hulldb_recovery.h>
+#include <ydb/core/blobstorage/vdisk/hulldb/bulksst_add/hulldb_bulksst_add.h>
 #include <ydb/core/blobstorage/vdisk/synclog/blobstorage_synclog_public_events.h>
 
 namespace NKikimr {
@@ -155,6 +156,10 @@ namespace NKikimr {
 
         bool GetBlocked(ui64 tabletID, ui32 *outGen) {
             return BlocksCache.Find(tabletID, outGen);
+        }
+
+        TBlocksCache::TBlockRes IsBlocked(ui64 tabletID, TBlocksCache::TBlockedGen tabletGeneration) {
+            return BlocksCache.IsBlocked(tabletID, tabletGeneration);
         }
 
         ////////////////////////////////////////////////////////////////////////

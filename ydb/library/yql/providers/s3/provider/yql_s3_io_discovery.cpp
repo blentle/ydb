@@ -1,5 +1,6 @@
-#include "yql_s3_provider_impl.h"
 #include "yql_s3_list.h"
+#include "yql_s3_path.h"
+#include "yql_s3_provider_impl.h"
 
 #include <ydb/library/yql/providers/s3/expr_nodes/yql_s3_expr_nodes.h>
 #include <ydb/library/yql/providers/s3/path_generator/yql_s3_path_generator.h>
@@ -35,6 +36,7 @@ struct TListRequest {
     TString Token;
     TString Url;
     TString Pattern;
+    TMaybe<TString> PathPrefix; // set iff Pattern is regex (not glob pattern)
     TVector<IPathGenerator::TColumnWithValue> ColumnValues;
 };
 
@@ -54,7 +56,7 @@ class TS3IODiscoveryTransformer : public TGraphTransformerBase {
 public:
     TS3IODiscoveryTransformer(TS3State::TPtr state, IHTTPGateway::TPtr gateway)
         : State_(std::move(state))
-        , Lister_(IS3Lister::Make(gateway, State_->Configuration->MaxDiscoveryFilesPerQuery))
+        , Lister_(IS3Lister::Make(gateway, State_->Configuration->MaxDiscoveryFilesPerQuery, State_->Configuration->MaxInflightListsPerQuery))
     {}
 
     TStatus DoTransform(TExprNode::TPtr input, TExprNode::TPtr& output, TExprContext& ctx) final {
@@ -146,7 +148,7 @@ public:
                 }
 
                 const auto& listEntries = std::get<IS3Lister::TListEntries>(listResult);
-                if (listEntries.empty() && !IS3Lister::HasWildcards(req.Pattern)) {
+                if (listEntries.empty() && !NS3::HasWildcards(req.Pattern)) {
                     // request to list particular files that are missing
                     ctx.AddError(TIssue(ctx.GetPosition(object.Pos()),
                         TStringBuilder() << "Object " << req.Pattern << " doesn't exist."));
@@ -268,10 +270,16 @@ public:
                 continue;
             }
 
+            auto format = ExtractFormat(settings);
+            if (!format) {
+                ctx.AddError(TIssue(ctx.GetPosition(read.Ref().Child(4)->Pos()), "No read format specified."));
+                return TStatus::Error;
+            }
+
             TExprNode::TPtr s3Object;
             s3Object = Build<TS3Object>(ctx, object.Pos())
                     .Paths(ctx.NewList(object.Pos(), std::move(pathNodes)))
-                    .Format(ExtractFormat(settings))
+                    .Format(std::move(format))
                     .Settings(ctx.NewList(object.Pos(), std::move(settings)))
                 .Done().Ptr();
 
@@ -406,33 +414,53 @@ private:
             req.Url = url;
 
             if (partitionedBy.empty()) {
+                if (path.empty()) {
+                    ctx.AddError(TIssue(ctx.GetPosition(read.Pos()), "Can not read from empty path"));
+                    return false;
+                }
                 if (path.EndsWith("/")) {
                     req.Pattern = path + "*";
                 } else {
                     // treat paths as regular wildcard patterns
                     req.Pattern = path;
                 }
+                req.Pattern = NS3::NormalizePath(req.Pattern);
                 reqs.push_back(req);
             } else {
-                if (IS3Lister::HasWildcards(path)) {
+                if (NS3::HasWildcards(path)) {
                     ctx.AddError(TIssue(ctx.GetPosition(read.Pos()), TStringBuilder() << "Path prefix: '" << path << "' contains wildcards"));
                     return false;
                 }
-                const TString pathNoTrailingSlash = path.substr(0, path.EndsWith("/") ? path.size() - 1 : path.size());
                 if (!config.Generator) {
                     // Hive-style partitioning
-                    TString generated;
-                    for (auto& col : config.Columns) {
-                        generated += "/" + col + "=*";
+                    req.PathPrefix = path;
+                    if (!path.empty()) {
+                        req.PathPrefix = NS3::NormalizePath(TStringBuilder() << path << "/");
+                        if (req.PathPrefix == "/") {
+                            req.PathPrefix = "";
+                        }
                     }
-                    generated += "/*";
-                    req.Pattern = pathNoTrailingSlash + generated;
+                    TString pp = *req.PathPrefix;
+                    if (!pp.empty() && pp.back() == '/') {
+                        pp.pop_back();
+                    }
+
+                    TStringBuilder generated;
+                    generated << NS3::EscapeRegex(pp);
+                    for (auto& col : config.Columns) {
+                        if (!generated.empty()) {
+                            generated << "/";
+                        }
+                        generated << NS3::EscapeRegex(col) << "=(.*?)";
+                    }
+                    generated << "/(.*)";
+                    req.Pattern = generated;
                     reqs.push_back(req);
                 } else {
                     for (auto& rule : config.Generator->GetRules()) {
                         YQL_ENSURE(rule.ColumnValues.size() == config.Columns.size());
                         req.ColumnValues.assign(rule.ColumnValues.begin(), rule.ColumnValues.end());
-                        req.Pattern = pathNoTrailingSlash + rule.Path + "/*";
+                        req.Pattern = NS3::NormalizePath(TStringBuilder() << path << "/" << rule.Path << "/*");
                         reqs.push_back(req);
                     }
                 }
@@ -441,7 +469,9 @@ private:
             for (auto& req : reqs) {
                 RequestsByNode_[read.Raw()].push_back(req);
                 if (PendingRequests_.find(req) == PendingRequests_.end()) {
-                    auto future = Lister_->List(req.Token, req.Url, req.Pattern);
+                    auto future = req.PathPrefix.Defined() ?
+                        Lister_->ListRegex(req.Token, req.Url, req.Pattern, *req.PathPrefix) :
+                        Lister_->List(req.Token, req.Url, req.Pattern);
                     PendingRequests_[req] = future;
                     futures.push_back(std::move(future));
                 }

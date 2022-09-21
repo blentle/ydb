@@ -3,6 +3,8 @@
 #include <ydb/core/util/stlog.h>
 #include <ydb/core/util/interval_set.h>
 
+#include <ydb/core/blobstorage/pdisk/blobstorage_pdisk_util_space_color.h>
+
 namespace NKikimr {
 
 #ifdef _MSC_VER
@@ -41,6 +43,7 @@ struct TPDiskMockState::TImpl {
     ui32 NextFreeChunk = 1;
     std::unordered_map<TString, ui32> Blocks;
     TIntervalSet<ui64> Corrupted;
+    NPDisk::TStatusFlags StatusFlags;
 
     TImpl(ui32 nodeId, ui32 pdiskId, ui64 pdiskGuid, ui64 size, ui32 chunkSize)
         : NodeId(nodeId)
@@ -51,6 +54,7 @@ struct TPDiskMockState::TImpl {
         , TotalChunks(Size / ChunkSize)
         , AppendBlockSize(4096)
         , NextFreeChunk(1)
+        , StatusFlags(NPDisk::TStatusFlags{})
     {}
 
     TImpl(const TImpl&) = default;
@@ -110,13 +114,22 @@ struct TPDiskMockState::TImpl {
     }
 
     std::tuple<ui8, TOwner*> FindOrCreateOwner(const TVDiskID& vdiskId, ui32 slotId, bool *created) {
+        bool slotIsValid = (slotId != Max<ui32>());
         for (auto& [ownerId, owner] : Owners) {
-            if (slotId == owner.SlotId) {
-                Y_VERIFY(owner.VDiskId.SameExceptGeneration(vdiskId));
-                *created = false;
-                return std::make_tuple(ownerId, &owner);
+            if (slotIsValid) {
+                if (slotId == owner.SlotId) {
+                    Y_VERIFY(owner.VDiskId.SameExceptGeneration(vdiskId));
+                    *created = false;
+                    return std::make_tuple(ownerId, &owner);
+                }
+            } else {
+                if (owner.VDiskId.SameExceptGeneration(vdiskId)) {
+                    *created = false;
+                    return std::make_tuple(ownerId, &owner);
+                }
             }
         }
+
         ui8 ownerId = 1;
         std::map<ui8, TOwner>::iterator it;
         for (it = Owners.begin(); it != Owners.end() && it->first == ownerId; ++it, ++ownerId)
@@ -147,9 +160,19 @@ struct TPDiskMockState::TImpl {
     void DeleteChunk(TOwner& owner, TChunkIdx chunkIdx) {
         const ui32 num = owner.ReservedChunks.erase(chunkIdx) + owner.CommittedChunks.erase(chunkIdx);
         Y_VERIFY(num);
+        owner.ChunkData.erase(chunkIdx);
         const bool inserted = FreeChunks.insert(chunkIdx).second;
         Y_VERIFY(inserted);
         AdjustFreeChunks();
+    }
+
+    void UncommitChunk(TOwner& owner, TChunkIdx chunkIdx) {
+        if (owner.ReservedChunks.contains(chunkIdx)) {
+        } else if (owner.CommittedChunks.erase(chunkIdx)) {
+            owner.ReservedChunks.insert(chunkIdx);
+        } else {
+            Y_FAIL();
+        }
     }
 
     void SetCorruptedArea(ui32 chunkIdx, ui32 begin, ui32 end, bool enabled) {
@@ -200,6 +223,14 @@ struct TPDiskMockState::TImpl {
             }
         }
     }
+
+    void SetStatusFlags(NPDisk::TStatusFlags flags) {
+        StatusFlags = flags;
+    }
+
+    void SetStatusFlags(NKikimrBlobStorage::TPDiskSpaceColor::E spaceColor) {
+        StatusFlags = SpaceColorToStatusFlag(spaceColor);
+    }
 };
 
 TPDiskMockState::TPDiskMockState(ui32 nodeId, ui32 pdiskId, ui64 pdiskGuid, ui64 size, ui32 chunkSize)
@@ -231,6 +262,14 @@ TIntervalSet<i64> TPDiskMockState::GetWrittenAreas(ui32 chunkIdx) const {
 
 void TPDiskMockState::TrimQuery() {
     Impl->TrimQuery();
+}
+
+void TPDiskMockState::SetStatusFlags(NKikimrBlobStorage::TPDiskSpaceColor::E spaceColor) {
+    Impl->SetStatusFlags(spaceColor);
+}
+
+void TPDiskMockState::SetStatusFlags(NPDisk::TStatusFlags flags) {
+    Impl->SetStatusFlags(flags);
 }
 
 TPDiskMockState::TPtr TPDiskMockState::Snapshot() {
@@ -445,7 +484,11 @@ public:
                         Impl.CommitChunk(owner, chunk);
                     }
                     for (const TChunkIdx chunk : cr.DeleteChunks) {
-                        Impl.DeleteChunk(owner, chunk);
+                        if (cr.DeleteToDecommitted) {
+                            Impl.UncommitChunk(owner, chunk);
+                        } else {
+                            Impl.DeleteChunk(owner, chunk);
+                        }
                     }
                     isStartingPoint = cr.IsStartingPoint;
                 }
@@ -484,6 +527,28 @@ public:
                 Send(owner.CutLogId, new NPDisk::TEvCutLog(ownerId, owner.OwnerRound, lsn, 0, 0, 0, 0));
             }
         }
+    }
+
+    void Handle(NPDisk::TEvChunkForget::TPtr ev) {
+        auto *msg = ev->Get();
+        NKikimrProto::EReplyStatus status = NKikimrProto::OK;
+        TString errorReason;
+        if (const auto it = Impl.Owners.find(msg->Owner); it == Impl.Owners.end()) {
+            Y_FAIL("invalid Owner");
+        } else if (it->second.Slain) {
+            status = NKikimrProto::INVALID_OWNER;
+            errorReason = "VDisk is slain";
+        } else if (msg->OwnerRound != it->second.OwnerRound) {
+            status = NKikimrProto::INVALID_ROUND;
+            errorReason = "invalid OwnerRound";
+        } else {
+            TImpl::TOwner& owner = it->second;
+            PDISK_MOCK_LOG(DEBUG, PDMxx, "received TEvChunkForget", (Msg, msg->ToString()), (VDiskId, owner.VDiskId));
+            for (const TChunkIdx chunkIdx : msg->ForgetChunks) {
+                Impl.DeleteChunk(owner, chunkIdx);
+            }
+        }
+        Send(ev->Sender, new NPDisk::TEvChunkForgetResult(status, {}, errorReason), 0, ev->Cookie);
     }
 
     void Handle(NPDisk::TEvReadLog::TPtr ev) {
@@ -651,8 +716,41 @@ public:
         Send(ev->Sender, res.release());
     }
 
-    void Handle(NPDisk::TEvHarakiri::TPtr /*ev*/) {
-        Y_FAIL();
+    void Handle(NPDisk::TEvHarakiri::TPtr ev) {
+        auto *msg = ev->Get();
+        PDISK_MOCK_LOG(INFO, PDM18, "received TEvHarakiri", (Msg, msg->ToString()));
+
+        TString errorReason = "";
+        auto res = std::make_unique<NPDisk::TEvHarakiriResult>(NKikimrProto::OK, GetStatusFlags(), errorReason);
+        auto it = Impl.Owners.find(msg->Owner);
+
+        if (it == Impl.Owners.end()) {
+            res->Status = NKikimrProto::ALREADY;
+            res->ErrorReason = "not found";
+        }
+
+        auto owner = it->second;
+
+        if (owner.Slain) {
+            res->Status = NKikimrProto::ALREADY; // already slain or not found
+            res->ErrorReason = "already slain or not found";
+        } else if (msg->OwnerRound <= owner.OwnerRound) {
+            res->Status = NKikimrProto::RACE;
+            res->ErrorReason = TStringBuilder() << "Message OwnerRound# " << msg->OwnerRound << " actual OwnerRound# "
+                << owner.OwnerRound << " race detected";
+        } else {
+            owner.Slain = true;
+            Impl.FreeChunks.merge(owner.ReservedChunks);
+            Impl.FreeChunks.merge(owner.CommittedChunks);
+            Impl.AdjustFreeChunks();
+            owner.ChunkData.clear();
+            owner.Log.clear();
+            owner.LogDataSize = 0;
+            owner.LastLsn = 0;
+            owner.StartingPoints.clear();
+        }
+
+        Send(ev->Sender, res.release());
     }
 
     void Handle(NPDisk::TEvCheckSpace::TPtr ev) {
@@ -671,12 +769,13 @@ public:
     }
 
     NPDisk::TStatusFlags GetStatusFlags() {
-        return {};
+        return Impl.StatusFlags;
     }
 
     STRICT_STFUNC(StateFunc,
         hFunc(NPDisk::TEvYardInit, Handle);
         hFunc(NPDisk::TEvLog, Handle);
+        hFunc(NPDisk::TEvChunkForget, Handle);
         hFunc(NPDisk::TEvMultiLog, Handle);
         cFunc(EvResume, HandleLogQ);
         hFunc(NPDisk::TEvReadLog, Handle);

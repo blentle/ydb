@@ -6,6 +6,10 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(protos)
+add_subdirectory(test)
+add_subdirectory(ut)
+add_subdirectory(ut_large)
 
 add_library(ydb-core-tablet_flat)
 target_compile_options(ydb-core-tablet_flat PRIVATE
@@ -16,6 +20,7 @@ target_link_libraries(ydb-core-tablet_flat PUBLIC
   yutil
   tools-enum_parser-enum_serialization_runtime
   contrib-libs-protobuf
+  cpp-containers-absl_flat_hash
   cpp-containers-intrusive_rb_tree
   cpp-containers-stack_vector
   cpp-digest-crc32c

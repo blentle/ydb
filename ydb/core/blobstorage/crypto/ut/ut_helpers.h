@@ -57,7 +57,7 @@ public:
     }
 };
 
-class TRopeAlignedBufferBackend : public IRopeChunkBackend {
+class TRopeAlignedBufferBackend : public IContiguousChunk {
     TAlignedBuf Buffer;
 
 public:
@@ -65,8 +65,16 @@ public:
         : Buffer(size, align)
     {}
 
-    TData GetData() const override {
+    TContiguousSpan GetData() const override {
         return {reinterpret_cast<const char *>(Buffer.Data()), Buffer.Size()};
+    }
+
+    TMutableContiguousSpan GetDataMut() override {
+        return {reinterpret_cast<char *>(Buffer.Data()), Buffer.Size()};
+    }
+
+    TMutableContiguousSpan UnsafeGetDataMut() override {
+        return {reinterpret_cast<char *>(Buffer.Data()), Buffer.Size()};
     }
 
     size_t GetCapacity() const override {

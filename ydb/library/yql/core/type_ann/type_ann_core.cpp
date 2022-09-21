@@ -1,4 +1,5 @@
 #include "type_ann_core.h"
+#include "type_ann_blocks.h"
 #include "type_ann_expr.h"
 #include "type_ann_impl.h"
 #include "type_ann_list.h"
@@ -7101,8 +7102,8 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         }
 
         scriptType = NKikimr::NMiniKQL::CanonizeScriptType(scriptType);
-        auto canonizedModuleName = NKikimr::NMiniKQL::ScriptTypeAsStr(scriptType);
         bool isCustomPython = NKikimr::NMiniKQL::IsCustomPython(scriptType);
+        auto canonizedModuleName = isCustomPython ? moduleName : NKikimr::NMiniKQL::ScriptTypeAsStr(scriptType);
         bool foundModule = false;
 
         // resolve script udf from external resources (files / urls)
@@ -10999,6 +11000,20 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         return IGraphTransformer::TStatus::Ok;
     }
 
+    IGraphTransformer::TStatus AssumeStrictWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+        Y_UNUSED(output);
+        if (!EnsureArgsCount(*input, 1, ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (!EnsureComputable(input->Head(), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        input->SetTypeAnn(input->Head().GetTypeAnn());
+        return IGraphTransformer::TStatus::Ok;
+    }
+
     TSyncFunctionsMap::TSyncFunctionsMap() {
         Functions["Data"] = &DataWrapper;
         Functions["DataOrOptionalData"] = &DataWrapper;
@@ -11162,6 +11177,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["AssumeSorted"] = &SortWrapper;
         Functions["AssumeUnique"] = &AssumeUniqueWrapper;
         Functions["AssumeAllMembersNullableAtOnce"] = &AssumeAllMembersNullableAtOnceWrapper;
+        Functions["AssumeStrict"] = &AssumeStrictWrapper;
         Functions["Top"] = &TopWrapper;
         Functions["TopSort"] = &TopWrapper;
         Functions["KeepTop"] = &KeepTopWrapper;
@@ -11223,6 +11239,8 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["VariantType"] = &TypeWrapper<ETypeAnnotationKind::Variant>;
         Functions["StreamType"] = &TypeWrapper<ETypeAnnotationKind::Stream>;
         Functions["FlowType"] = &TypeWrapper<ETypeAnnotationKind::Flow>;
+        Functions["BlockType"] = &TypeWrapper<ETypeAnnotationKind::Block>;
+        Functions["ScalarType"] = &TypeWrapper<ETypeAnnotationKind::Scalar>;
         Functions["Nothing"] = &NothingWrapper;
         Functions["AsOptionalType"] = &AsOptionalTypeWrapper;
         Functions["List"] = &ListWrapper;
@@ -11286,6 +11304,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["JoinDict"] = &JoinDictWrapper;
         Functions["MapJoinCore"] = &MapJoinCoreWrapper;
         Functions["CommonJoinCore"] = &CommonJoinCoreWrapper;
+        Functions["GraceJoinCore"] = &GraceJoinCoreWrapper;
         Functions["CombineCore"] = &CombineCoreWrapper;
         Functions["GroupingCore"] = &GroupingCoreWrapper;
         Functions["HoppingTraits"] = &HoppingTraitsWrapper;
@@ -11389,6 +11408,9 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["PgBetween"] = &PgBetweenWrapper;
         Functions["PgBetweenSym"] = &PgBetweenWrapper;
         Functions["PgSubLink"] = &PgSubLinkWrapper;
+        Functions["PgGroupRef"] = &PgGroupRefWrapper;
+        Functions["PgGrouping"] = &PgGroupingWrapper;
+        Functions["PgGroupingSet"] = &PgGroupingSetWrapper;
 
         Functions["AutoDemuxList"] = &AutoDemuxListWrapper;
         Functions["AggrCountInit"] = &AggrCountInitWrapper;
@@ -11506,6 +11528,11 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["NarrowMap"] = &NarrowMapWrapper;
         Functions["NarrowFlatMap"] = &NarrowFlatMapWrapper;
         Functions["NarrowMultiMap"] = &NarrowMultiMapWrapper;
+
+        Functions["WideToBlocks"] = &WideToBlocksWrapper;
+        Functions["WideFromBlocks"] = &WideFromBlocksWrapper;
+        Functions["AsScalar"] = &AsScalarWrapper;
+        ExtFunctions["BlockFunc"] = &BlockFuncWrapper;
 
         Functions["AsRange"] = &AsRangeWrapper;
         Functions["RangeCreate"] = &RangeCreateWrapper;

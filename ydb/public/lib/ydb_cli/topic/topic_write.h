@@ -1,9 +1,10 @@
 #pragma once
 
 #include "ydb/public/lib/ydb_cli/commands/ydb_command.h"
-#include <ydb/public/sdk/cpp/client/ydb_persqueue_public/persqueue.h>
+#include <ydb/public/sdk/cpp/client/ydb_topic/topic.h>
 #include <ydb/public/lib/ydb_cli/common/format.h>
 #include <ydb/public/lib/ydb_cli/common/interruptible.h>
+#include <ydb/public/lib/ydb_cli/topic/topic_metadata_fields.h>
 
 namespace NYdb::NConsoleClient {
 #define GETTER(TYPE, NAME) \
@@ -14,9 +15,10 @@ namespace NYdb::NConsoleClient {
     class TTopicWriterParams {
     public:
         TTopicWriterParams();
-        TTopicWriterParams(EOutputFormat inputFormat, TMaybe<TString> delimiter,
+        TTopicWriterParams(EMessagingFormat inputFormat, TMaybe<TString> delimiter,
                            ui64 messageSizeLimit, TMaybe<TDuration> batchDuration,
-                           TMaybe<ui64> batchSize, TMaybe<ui64> batchMessagesCount);
+                           TMaybe<ui64> batchSize, TMaybe<ui64> batchMessagesCount,
+                           ETransformBody transform);
         TTopicWriterParams(const TTopicWriterParams&) = default;
         TTopicWriterParams(TTopicWriterParams&&) = default;
 
@@ -25,17 +27,21 @@ namespace NYdb::NConsoleClient {
         GETTER(TMaybe<ui64>, BatchSize);
         GETTER(TMaybe<ui64>, BatchMessagesCount);
         GETTER(ui64, MessageSizeLimit);
-        GETTER(EOutputFormat, InputFormat);
+        GETTER(EMessagingFormat, MessagingFormat);
+        GETTER(NTopic::ECodec, Codec);
+        GETTER(ETransformBody, Transform);
 
     private:
         TMaybe<TString> File_;
         TMaybe<char> Delimiter_;
-        EOutputFormat InputFormat_ = EOutputFormat::Default;
+        EMessagingFormat MessagingFormat_ = EMessagingFormat::SingleMessage;
 
         // TODO(shmel1k@): move to 'TWithBatchingCommand' or something like that.
         TMaybe<TDuration> BatchDuration_;
         TMaybe<ui64> BatchSize_;
         TMaybe<ui64> BatchMessagesCount_;
+        NTopic::ECodec Codec_ = NTopic::ECodec::RAW;
+        ETransformBody Transform_ = ETransformBody::None;
 
         ui64 MessageSizeLimit_ = 0;
     };
@@ -48,7 +54,7 @@ namespace NYdb::NConsoleClient {
         TTopicWriter();
         TTopicWriter(const TTopicWriter&) = default;
         TTopicWriter(TTopicWriter&&) = default;
-        TTopicWriter(std::shared_ptr<NPersQueue::IWriteSession>, TTopicWriterParams);
+        TTopicWriter(std::shared_ptr<NTopic::IWriteSession>, TTopicWriterParams);
 
         bool Close(TDuration closeTimeout = TDuration::Max());
         int Init();
@@ -61,19 +67,23 @@ namespace NYdb::NConsoleClient {
             bool ContinueSending = false;
         };
 
-        int HandleEvent(NPersQueue::TWriteSessionEvent::TEvent&);
-        int HandleAcksEvent(const NPersQueue::TWriteSessionEvent::TAcksEvent&);
-        int HandleReadyToAcceptEvent(NPersQueue::TWriteSessionEvent::TReadyToAcceptEvent&);
-        int HandleSessionClosedEvent(const NPersQueue::TSessionClosedEvent&);
+        int HandleEvent(NTopic::TWriteSessionEvent::TEvent&);
+        int HandleAcksEvent(const NTopic::TWriteSessionEvent::TAcksEvent*);
+        int HandleReadyToAcceptEvent(NTopic::TWriteSessionEvent::TReadyToAcceptEvent*);
+        int HandleSessionClosedEvent(const NTopic::TSessionClosedEvent*);
         TTopicWriter::TSendMessageData EnterMessage(IInputStream&); // TODO(shmel1k@): make static or like a helper function
 
-        std::shared_ptr<NPersQueue::IWriteSession> WriteSession_;
+        std::shared_ptr<NTopic::IWriteSession> WriteSession_;
         const TTopicWriterParams WriterParams_;
 
-        TMaybe<NPersQueue::TContinuationToken> ContinuationToken_ = Nothing();
+        TMaybe<NTopic::TContinuationToken> ContinuationToken_ = Nothing();
 
         ui64 CurrentSeqNo_ = 0;
 
         friend class TTopicWriterTests;
+
+    private:
+        static void OnTerminate(int);
+        static void SetInterruptHandlers();
     };
 } // namespace NYdb::NConsoleClient

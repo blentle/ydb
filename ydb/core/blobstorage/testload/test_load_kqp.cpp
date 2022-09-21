@@ -45,7 +45,7 @@ public:
         : WindowHist(60000, 2)
         , WindowErrors(window_errors)
     {
-        WindowHist.Add(hist);    
+        WindowHist.Add(hist);
     }
 
     void Add(const MonitoringData& other) {
@@ -63,7 +63,7 @@ struct TEvKqpWorkerResponse : TEventLocal<TEvKqpWorkerResponse, EvKqpWorkerRespo
 public:
     TEvKqpWorkerResponse(const NHdr::THistogram& hist, ui64 window_errors, ui64 phase, ui64 worker_tag)
         : Data(hist, window_errors)
-        , Phase(phase) 
+        , Phase(phase)
         , WorkerTag(worker_tag) {}
 
 public:
@@ -89,16 +89,16 @@ void ConvertYdbParamsToMiniKQLParams(const NYdb::TParams& input, NKikimrMiniKQL:
 class TKqpLoadWorker : public TActorBootstrapped<TKqpLoadWorker> {
 public:
     TKqpLoadWorker(TActorId parent,
-        TString working_dir, 
-        std::shared_ptr<NYdbWorkload::IWorkloadQueryGenerator> workload_query_gen, 
-        ui64 workload_type, 
-        ui64 parentTag, 
+        TString working_dir,
+        std::shared_ptr<NYdbWorkload::IWorkloadQueryGenerator> workload_query_gen,
+        ui64 workload_type,
+        ui64 parentTag,
         ui64 workerTag,
         ui64 durationSeconds,
         ui64 windowDuration,
-        ui64 windowCount, 
+        ui64 windowCount,
         NMonitoring::TDynamicCounters::TCounterPtr transactions,
-        NMonitoring::TDynamicCounters::TCounterPtr transactionsBytesWritten) 
+        NMonitoring::TDynamicCounters::TCounterPtr transactionsBytesWritten)
         : Parent(std::move(parent))
         , WorkingDir(std::move(working_dir))
         , WorkloadQueryGen(workload_query_gen)
@@ -113,8 +113,8 @@ public:
         , TransactionsBytesWritten(transactionsBytesWritten) {}
 
     void Bootstrap(const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag << " TKqpLoadWorker Bootstrap called");
-        
+        LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag << " TKqpLoadWorker Bootstrap called");
+
         ctx.Schedule(TDuration::Seconds(DurationSeconds), new TEvents::TEvPoisonPill);
         ctx.Schedule(TDuration::Seconds(WindowDuration), new TEvUpdateMonitoring);
 
@@ -139,20 +139,18 @@ private:
         if (Phase < WindowCount) {
             SendMonitoringEvent(ctx);
         }
-        
+
         CloseSession(ctx);
         Die(ctx);
     }
 
     void CloseSession(const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag << " creating event for session close");
+        LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag << " creating event for session close");
 
         auto ev = MakeHolder<NKqp::TEvKqp::TEvCloseSessionRequest>();
         ev->Record.MutableRequest()->SetSessionId(WorkerSession);
-    
+
         auto kqp_proxy = NKqp::MakeKqpProxyID(ctx.SelfID.NodeId());
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag 
-            << " sending session close query to proxy: " + kqp_proxy.ToString());
 
         ctx.Send(kqp_proxy, ev.Release());
     }
@@ -162,15 +160,13 @@ private:
     // working
 
     void CreateWorkingSession(const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag << " creating event for session creation");
+        LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag << " creating event for session creation");
         auto ev = MakeHolder<NKqp::TEvKqp::TEvCreateSessionRequest>();
 
         ev->Record.MutableRequest()->SetDatabase(WorkingDir);
-        
+
         auto kqp_proxy = NKqp::MakeKqpProxyID(ctx.SelfID.NodeId());
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag 
-            << " sending event for session creation to proxy: " << kqp_proxy.ToString());
-        
+
         Send(kqp_proxy, ev.Release());
     }
 
@@ -179,10 +175,10 @@ private:
 
         if (response.GetYdbStatus() == Ydb::StatusIds_StatusCode_SUCCESS) {
             WorkerSession = response.GetResponse().GetSessionId();
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag << " Session is created: " + WorkerSession);
+            LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag << " Session is created: " + WorkerSession);
             CreateDataQuery(ctx);
         } else {
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag 
+            LOG_ERROR_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag
                 << " Session creation failed: " + ev->Get()->ToString());
         }
     }
@@ -195,7 +191,7 @@ private:
         auto q = std::move(queries.front());
         queries.pop_front();
 
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag 
+        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag
             << " query type: " << WorkloadType << ", params size: " << q.Params.GetValues().size());
 
         Transactions->Inc();
@@ -224,13 +220,11 @@ private:
         NKikimrMiniKQL::TParams params;
         ConvertYdbParamsToMiniKQLParams(query_params, params);
         request->Record.MutableRequest()->MutableParameters()->Swap(&params);
-    
+
         auto kqp_proxy = NKqp::MakeKqpProxyID(ctx.SelfID.NodeId());
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag 
-            << " sending data query to proxy: " + kqp_proxy.ToString());
 
         ctx.Send(kqp_proxy, request.Release());
-    
+
     }
 
     void HandleResponse(NKqp::TEvKqp::TEvQueryResponse::TPtr& ev, const TActorContext& ctx) {
@@ -243,7 +237,7 @@ private:
             TransactionsBytesWritten->Add(response.GetResponse().GetQueryStats().ByteSize());
             WindowHist.RecordValue(response.GetResponse().GetQueryStats().GetDurationUs());
         } else {
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag 
+            LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag
                 << " data request status: Fail, Issue: " + ev->Get()->ToString());
             ++WindowErrors;
         }
@@ -258,22 +252,22 @@ private:
     // monitoring
 
     void HandleWindowTimer(TEvUpdateMonitoring::TPtr& /*ev*/, const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag 
+        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag
             << " handle TEvUpdateMonitoring, Phase: " << Phase);
-        
+
         SendMonitoringEvent(ctx);
 
         if (Phase < WindowCount) {
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag 
-                << " reschedule TEvUpdateMonitoring, Phase: " << Phase);            
+            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Worker Tag# " << ParentTag << "." << WorkerTag
+                << " reschedule TEvUpdateMonitoring, Phase: " << Phase);
             ctx.Schedule(TDuration::Seconds(WindowDuration), new TEvUpdateMonitoring);
         }
     }
 
 private:
-    
+
     // common
-    
+
     void SendMonitoringEvent(const TActorContext& ctx) {
         auto ev = MakeHolder<TEvKqpWorkerResponse>(WindowHist, WindowErrors, Phase, WorkerTag);
 
@@ -319,9 +313,9 @@ public:
     }
 
     TKqpWriterTestLoadActor(const NKikimrBlobStorage::TEvTestLoadRequest::TKqpLoadStart& cmd,
-        const TActorId& parent, 
-        const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters, 
-        ui64 index, 
+        const TActorId& parent,
+        const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters,
+        ui64 index,
         ui64 tag)
         : Parent(parent)
         , Tag(tag)
@@ -345,7 +339,7 @@ public:
         for (size_t i = 0; i < WindowCount; ++i) {
             Chunk.push_back(std::make_unique<MonitoringData>());
         }
-        
+
         NYdbWorkload::TWorkloadFactory factory;
 
         if (cmd.Workload_case() == NKikimrBlobStorage::TEvTestLoadRequest_TKqpLoadStart::WorkloadCase::kStock) {
@@ -365,18 +359,21 @@ public:
             params.InitRowCount = cmd.GetKv().GetInitRowCount();
             params.PartitionsByLoad = cmd.GetKv().GetPartitionsByLoad();
             params.MaxFirstKey = cmd.GetKv().GetMaxFirstKey();
+            params.StringLen = cmd.GetKv().GetStringLen();
+            params.ColumnsCnt = cmd.GetKv().GetColumnsCnt();
+            params.RowsCnt = cmd.GetKv().GetRowsCnt();
             params.MinPartitions = UniformPartitionsCount;
             params.DbPath = WorkingDir;
             WorkloadQueryGen = factory.GetWorkloadQueryGenerator(NYdbWorkload::EWorkload::KV, &params);
         } else {
             return;
         }
-        
+
         Y_ASSERT(WorkloadQueryGen.get() != nullptr);
         Y_ASSERT(DurationSeconds > DelayBeforeMeasurements.Seconds());
 
         // Monitoring initialization
-        
+
         LoadCounters = counters->GetSubgroup("tag", Sprintf("%" PRIu64, tag));
         Transactions = LoadCounters->GetCounter("Transactions", true);
         TransactionsBytesWritten = LoadCounters->GetCounter("TransactionsBytesWritten", true);
@@ -389,10 +386,10 @@ public:
     void Bootstrap(const TActorContext& ctx) {
         LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " TKqpWriterTestLoadActor Bootstrap called");
         Become(&TKqpWriterTestLoadActor::StateStart);
-        
+
         if (WorkloadClass == NYdbWorkload::EWorkload::STOCK) {
             NYdbWorkload::TStockWorkloadParams* params = static_cast<NYdbWorkload::TStockWorkloadParams*>(WorkloadQueryGen->GetParams());
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " Starting load actor with workload STOCK, Params: {"
+            LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " Starting load actor with workload STOCK, Params: {"
                 << "PartitionsByLoad: " << params->PartitionsByLoad << " "
                 << "OrderCount: " << params->OrderCount << " "
                 << "ProductCount: " << params->ProductCount << " "
@@ -402,11 +399,14 @@ public:
                 << "MinPartitions: " << params->MinPartitions);
         } else if (WorkloadClass == NYdbWorkload::EWorkload::KV) {
             NYdbWorkload::TKvWorkloadParams* params = static_cast<NYdbWorkload::TKvWorkloadParams*>(WorkloadQueryGen->GetParams());
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " Starting load actor with workload KV, Params: {"
+            LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " Starting load actor with workload KV, Params: {"
                 << "InitRowCount: " << params->InitRowCount << " "
                 << "PartitionsByLoad: " << params->PartitionsByLoad << " "
                 << "MaxFirstKey: " << params->MaxFirstKey << " "
                 << "MinPartitions: " << params->MinPartitions << " "
+                << "StringLen: " << params->StringLen << " "
+                << "ColumnsCnt: " << params->ColumnsCnt << " "
+                << "RowsCnt: " << params->RowsCnt << " "
                 << "DbPath: " << params->DbPath);
         }
 
@@ -456,17 +456,16 @@ private:
     }
 
     void DropTables(const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " creating event for tables drop");
-        
+        LOG_NOTICE_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " creating event for tables drop");
+
         auto ev = MakeHolder<NKqp::TEvKqp::TEvQueryRequest>();
         ev->Record.MutableRequest()->SetDatabase(WorkingDir);
         ev->Record.MutableRequest()->SetSessionId(TableSession);
         ev->Record.MutableRequest()->SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
         ev->Record.MutableRequest()->SetType(NKikimrKqp::QUERY_TYPE_SQL_DDL);
         ev->Record.MutableRequest()->SetQuery(WorkloadQueryGen->GetCleanDDLQueries());
-    
+
         auto kqp_proxy = NKqp::MakeKqpProxyID(ctx.SelfID.NodeId());
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " sending drop tables query to proxy: " + kqp_proxy.ToString());
 
         ctx.Send(kqp_proxy, ev.Release());
     }
@@ -475,21 +474,23 @@ private:
         auto& response = ev->Get()->Record.GetRef();
 
         if (response.GetYdbStatus() == Ydb::StatusIds_StatusCode_SUCCESS) {
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " drop tables status: SUCCESS");
+            LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " drop tables status: SUCCESS");
         } else {
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " drop tables status: FAIL, reason: " + ev->Get()->ToString());
+            LOG_ERROR_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " drop tables status: FAIL, reason: " + ev->Get()->ToString());
         }
 
         DeathReport(ctx);
     }
 
-    void DeathReport(const TActorContext& ctx) {        
+    void DeathReport(const TActorContext& ctx) {
         CloseSession(ctx);
 
         TIntrusivePtr<TLoadReport> Report(new TLoadReport());
         Report->Duration = TDuration::Seconds(DurationSeconds);
-        
-        ctx.Send(Parent, new TEvTestLoadFinished(Tag, Report, "OK called StartDeathProcess"));
+
+        auto* finishEv = new TEvTestLoadFinished(Tag, Report, "OK called StartDeathProcess");
+        finishEv->LastHtmlPage = RenderHTML();
+        ctx.Send(Parent, finishEv);
         Die(ctx);
     }
 
@@ -498,8 +499,8 @@ private:
     // monitoring
     void HandleMonitoring(TEvKqpWorkerResponse::TPtr& ev, const TActorContext& ctx) {
         const auto& response = ev->Get();
-        
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " got monitoring response from worker Tag# " << response->WorkerTag 
+
+        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " got monitoring response from worker Tag# " << response->WorkerTag
             << " Phase: " << response->Phase
             << " Min: " << response->Data.WindowHist.GetMin()
             << " Max: " << response->Data.WindowHist.GetMax()
@@ -517,17 +518,17 @@ private:
     void SendNewRowToParent(const TActorContext& ctx) {
         Phase += 1;
 
-        LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag 
+        LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag
             << " total: Phase: " << Phase << " -> "
             << Total->WindowHist.GetTotalCount() << " | "
             << Total->WindowHist.GetTotalCount() / (WindowDuration * std::max(ui64(1), Phase) * 1.0) << " | "
             << Total->WindowErrors << " | "
-            << Total->WindowHist.GetValueAtPercentile(50.0) / (WindowDuration * 1000.0) << " | "
-            << Total->WindowHist.GetValueAtPercentile(95.0) / (WindowDuration * 1000.0) << " | "
-            << Total->WindowHist.GetValueAtPercentile(99.0) / (WindowDuration * 1000.0) << " | "
-            << Total->WindowHist.GetMax() / (WindowDuration * 1000.0)
+            << Total->WindowHist.GetValueAtPercentile(50.0) / 1000.0 << " | "
+            << Total->WindowHist.GetValueAtPercentile(95.0) / 1000.0 << " | "
+            << Total->WindowHist.GetValueAtPercentile(99.0) / 1000.0 << " | "
+            << Total->WindowHist.GetMax() / 1000.0
         );
-        
+
         if (Phase >= WindowCount) {
             StartDeathProcess(ctx);
         }
@@ -538,14 +539,13 @@ private:
     // creating tables
 
     void CreateSessionForTablesDDL(const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " creating event for session creation");
+        LOG_NOTICE_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " creating event for session creation");
         auto ev = MakeHolder<NKqp::TEvKqp::TEvCreateSessionRequest>();
 
         ev->Record.MutableRequest()->SetDatabase(WorkingDir);
-        
+
         auto kqp_proxy = NKqp::MakeKqpProxyID(ctx.SelfID.NodeId());
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " sending event for session creation to proxy: " << kqp_proxy.ToString());
-        
+
         Send(kqp_proxy, ev.Release());
     }
 
@@ -554,25 +554,24 @@ private:
 
         if (response.GetYdbStatus() == Ydb::StatusIds_StatusCode_SUCCESS) {
             TableSession = response.GetResponse().GetSessionId();
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " Session is created: " + TableSession);
+            LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " Session is created: " + TableSession);
             CreateTables(ctx);
         } else {
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " Session creation failed: " + ev->Get()->ToString());
+            LOG_ERROR_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " Session creation failed: " + ev->Get()->ToString());
         }
     }
 
     void CreateTables(const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " creating event for tables creation");
-        
+        LOG_NOTICE_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " creating event for tables creation");
+
         auto ev = MakeHolder<NKqp::TEvKqp::TEvQueryRequest>();
         ev->Record.MutableRequest()->SetDatabase(WorkingDir);
         ev->Record.MutableRequest()->SetSessionId(TableSession);
         ev->Record.MutableRequest()->SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
         ev->Record.MutableRequest()->SetType(NKikimrKqp::QUERY_TYPE_SQL_DDL);
         ev->Record.MutableRequest()->SetQuery(WorkloadQueryGen->GetDDLQueries());
-    
+
         auto kqp_proxy = NKqp::MakeKqpProxyID(ctx.SelfID.NodeId());
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " sending ddl query to proxy: " + kqp_proxy.ToString());
 
         ctx.Send(kqp_proxy, ev.Release());
     }
@@ -580,14 +579,14 @@ private:
     void HandleCreateTableResponse(NKqp::TEvKqp::TEvQueryResponse::TPtr& ev, const TActorContext& ctx) {
         auto& response = ev->Get()->Record.GetRef();
 
-        Become(&TKqpWriterTestLoadActor::StateMain);
-
         if (response.GetYdbStatus() == Ydb::StatusIds_StatusCode_SUCCESS) {
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " tables are created");
+            Become(&TKqpWriterTestLoadActor::StateMain);
+            LOG_INFO_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " tables are created");
             InitData = WorkloadQueryGen->GetInitialData();
             InsertInitData(ctx);
         } else {
-            LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " tables creation failed: " + ev->Get()->ToString());
+            LOG_ERROR_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " tables creation failed: " + ev->Get()->ToString());
+            CreateTables(ctx);
         }
     }
 
@@ -604,7 +603,7 @@ private:
         auto q = std::move(InitData.front());
         InitData.pop_front();
 
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag 
+        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag
             << " Creating request for init query, need to exec: " << InitData.size() + 1);
 
         TString query_text = TString(q.Query);
@@ -631,10 +630,8 @@ private:
         NKikimrMiniKQL::TParams params;
         ConvertYdbParamsToMiniKQLParams(query_params, params);
         request->Record.MutableRequest()->MutableParameters()->Swap(&params);
-    
+
         auto kqp_proxy = NKqp::MakeKqpProxyID(ctx.SelfID.NodeId());
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag
-            << " sending init query to proxy: " + kqp_proxy.ToString());
 
         ctx.Send(kqp_proxy, request.Release());
     }
@@ -653,9 +650,7 @@ private:
 
 private:
 
-    // html render
-
-    void HandleHTML(NMon::TEvHttpInfo::TPtr& ev, const TActorContext& ctx) {
+    TString RenderHTML() {
         TStringStream str;
         HTML(str) {
             TABLE_CLASS("table table-condensed") {
@@ -693,21 +688,21 @@ private:
                         TABLED() { str << Total->WindowHist.GetTotalCount(); };
                         TABLED() { str << Total->WindowHist.GetTotalCount() / (WindowDuration * std::max(ui64(1), Phase) * 1.0); };
                         TABLED() { str << Total->WindowErrors; };
-                        TABLED() { str << Total->WindowHist.GetValueAtPercentile(50.0) / (WindowDuration * 1000.0); };
-                        TABLED() { str << Total->WindowHist.GetValueAtPercentile(95.0) / (WindowDuration * 1000.0); };
-                        TABLED() { str << Total->WindowHist.GetValueAtPercentile(99.0) / (WindowDuration * 1000.0); };
-                        TABLED() { str << Total->WindowHist.GetMax() / (WindowDuration * 1000.0); };
+                        TABLED() { str << Total->WindowHist.GetValueAtPercentile(50.0) / 1000.0; };
+                        TABLED() { str << Total->WindowHist.GetValueAtPercentile(95.0) / 1000.0; };
+                        TABLED() { str << Total->WindowHist.GetValueAtPercentile(99.0) / 1000.0; };
+                        TABLED() { str << Total->WindowHist.GetMax() / 1000.0; };
                     }
                     for (size_t i = Phase; i >= 1; --i) {
-                        TABLER() {    
+                        TABLER() {
                             TABLED() { str << i; };
                             TABLED() { str << Chunk[i - 1]->WindowHist.GetTotalCount(); };
                             TABLED() { str << Chunk[i - 1]->WindowHist.GetTotalCount() / (WindowDuration * 1.0); };
                             TABLED() { str << Chunk[i - 1]->WindowErrors; };
-                            TABLED() { str << Chunk[i - 1]->WindowHist.GetValueAtPercentile(50.0) / (WindowDuration * 1000.0); };
-                            TABLED() { str << Chunk[i - 1]->WindowHist.GetValueAtPercentile(95.0) / (WindowDuration * 1000.0); };
-                            TABLED() { str << Chunk[i - 1]->WindowHist.GetValueAtPercentile(99.0) / (WindowDuration * 1000.0); };
-                            TABLED() { str << Chunk[i - 1]->WindowHist.GetMax() / (WindowDuration * 1000.0); };
+                            TABLED() { str << Chunk[i - 1]->WindowHist.GetValueAtPercentile(50.0) / 1000.0; };
+                            TABLED() { str << Chunk[i - 1]->WindowHist.GetValueAtPercentile(95.0) / 1000.0; };
+                            TABLED() { str << Chunk[i - 1]->WindowHist.GetValueAtPercentile(99.0) / 1000.0; };
+                            TABLED() { str << Chunk[i - 1]->WindowHist.GetMax() / 1000.0; };
                         }
                     }
                 }
@@ -716,7 +711,11 @@ private:
                 str << "<pre>" << ConfingString << "</pre>";
             }
         }
-        ctx.Send(ev->Sender, new NMon::TEvHttpInfoRes(str.Str(), ev->Get()->SubRequestId));
+        return str.Str();
+    }
+
+    void HandleHTML(NMon::TEvHttpInfo::TPtr& ev, const TActorContext& ctx) {
+        ctx.Send(ev->Sender, new NMon::TEvHttpInfoRes(RenderHTML(), ev->Get()->SubRequestId));
     }
 
 
@@ -727,16 +726,16 @@ private:
     void InitWorkers(const TActorContext& ctx) {
         for (ui64 i = 0; i < NumOfSessions; ++i) {
             auto* worker = new TKqpLoadWorker(
-                SelfId(), 
-                WorkingDir, 
-                WorkloadQueryGen, 
-                WorkloadType, 
-                Tag, 
-                i, 
-                DurationSeconds, 
-                WindowDuration, 
-                WindowCount, 
-                Transactions, 
+                SelfId(),
+                WorkingDir,
+                WorkloadQueryGen,
+                WorkloadType,
+                Tag,
+                i,
+                DurationSeconds,
+                WindowDuration,
+                WindowCount,
+                Transactions,
                 TransactionsBytesWritten);
             Workers.push_back(ctx.Register(worker));
         }
@@ -747,9 +746,8 @@ private:
 
         auto ev = MakeHolder<NKqp::TEvKqp::TEvCloseSessionRequest>();
         ev->Record.MutableRequest()->SetSessionId(TableSession);
-    
+
         auto kqp_proxy = NKqp::MakeKqpProxyID(ctx.SelfID.NodeId());
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_LOAD_TEST, "Tag# " << Tag << " sending session close query to proxy: " + kqp_proxy.ToString());
 
         ctx.Send(kqp_proxy, ev.Release());
     }

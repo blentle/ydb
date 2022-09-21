@@ -68,12 +68,20 @@ namespace NActors {
             LevelReq,
             LevelResp,
             Ignored,
+            Buffer,
             End
         };
 
         static_assert(int(EEv::End) < EventSpaceEnd(TEvents::ES_LOGGER), "");
 
-        class TEvLog: public TEventLocal<TEvLog, int(EEv::Log)> {
+        struct TEvLogBufferMainListTag {};
+        struct TEvLogBufferLevelListTag {};
+
+        class TEvLog
+            : public TEventLocal<TEvLog, int(EEv::Log)> 
+            , public TIntrusiveListItem<TEvLog, TEvLogBufferMainListTag>
+            , public TIntrusiveListItem<TEvLog, TEvLogBufferLevelListTag>
+        {
         public:
             TEvLog(TInstant stamp, TLevel level, EComponent comp, const TString &line)
                 : Stamp(stamp)

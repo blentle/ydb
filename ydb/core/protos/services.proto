@@ -156,8 +156,10 @@ enum EServiceKikimr {
     GRPC_PROXY_NO_CONNECT_ACCESS = 417;
     READ_TABLE_API = 414; // deprecated, use RPC_REQUEST
     RPC_REQUEST = 416;
+
     // KEY VALUE section
     KEYVALUE = 420;
+    KEYVALUE_GC = 421;
 
     WILSON = 430;
 
@@ -306,6 +308,7 @@ enum EServiceKikimr {
     FQ_QUOTA_SERVICE = 1154;
     YQ_RATE_LIMITER = 1155;
     FQ_QUOTA_PROXY = 1156;
+    PUBLIC_HTTP = 1157;
 
     // 1024 - 1099 is reserved for nbs
 
@@ -899,12 +902,18 @@ message TActivity {
         TX_COLUMNSHARD_EXPORT_ACTOR = 568;
         YQ_HEALTH_ACTOR = 569;
         BLOB_DEPOT_ACTOR = 570;
-        BLOB_DEPOT_AGENT = 571;
+        BLOB_DEPOT_AGENT_ACTOR = 571;
         KQP_STREAM_LOOKUP_ACTOR = 572;
         BS_STORAGE_STATS_ACTOR = 573;
         DS_LOAD_ACTOR = 574;
         PQ_META_CACHE = 575;
         BS_GROUP_ASSIMILATE = 576;
         ACTOR_COROUTINE = 577;
+        LB_CM_ABC_ACTOR = 578;
+        LB_CM_FOLDER_ACTOR = 579;
+        BLOB_DEPOT_ASSIMILATOR_ACTOR = 580;
+        BLOB_DEPOT_BLOCKS_PROCESSOR_ACTOR = 581;
+        TEST_SHARD_LOAD_ACTOR = 582;
+        TEST_SHARD_VALIDATION_ACTOR = 583;
     };
 };

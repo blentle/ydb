@@ -1639,11 +1639,16 @@ void TExecutor::ExecuteTransaction(TAutoPtr<TSeat> seat, const TActorContext &ct
         // It may not be safe to call Broken right now, call it later
         Send(SelfId(), new TEvPrivate::TEvBrokenTransaction());
     } else if (done) {
+        Y_VERIFY(!txc.IsRescheduled());
         Y_VERIFY(!seat->RequestedMemory);
         seat->OnCommitted = std::move(txc.OnCommitted_);
         CommitTransactionLog(seat, env, prod.Change, cpuTimer, ctx);
     } else {
         Y_VERIFY(!seat->CapturedMemory);
+        if (!env.ToLoad && !seat->RequestedMemory && !txc.IsRescheduled()) {
+            Y_Fail(NFmt::Do(*this) << " " << NFmt::Do(*seat) << " type "
+                    << NFmt::Do(*seat->Self) << " postoned w/o demands");
+        }
         PostponeTransaction(seat, env, prod.Change, cpuTimer, ctx);
     }
 
@@ -1688,12 +1693,8 @@ void TExecutor::ReleaseTxData(TSeat &seat, ui64 requested, const TActorContext &
 
 void TExecutor::PostponeTransaction(TAutoPtr<TSeat> seat, TPageCollectionTxEnv &env,
                                     TAutoPtr<NTable::TChange> change,
-                                    THPTimer &bookkeepingTimer, const TActorContext &ctx) {
-    if (!env.ToLoad && !seat->RequestedMemory) {
-        Y_Fail(NFmt::Do(*this) << " " << NFmt::Do(*seat) << " type "
-                << NFmt::Do(*seat->Self) << " postoned w/o demands");
-    }
-
+                                    THPTimer &bookkeepingTimer, const TActorContext &ctx)
+{
     TTxType txType = seat->Self->GetTxType();
 
     ui32 touchedPages = 0;
@@ -3865,12 +3866,12 @@ void TExecutor::RenderHtmlCounters(NMon::TEvRemoteHttpInfo::TPtr &ev) const {
             str << "table.metrics td:nth-child(3) { text-align: left; }";
             str << "</style>";
             if (Counters) {
-                H3() {str << "Executor counters";}
+                TAG(TH3) {str << "Executor counters";}
                 Counters->OutputHtml(str);
             }
 
             if (AppCounters) {
-                H3() {str << "App counters";}
+                TAG(TH3) {str << "App counters";}
                 AppCounters->OutputHtml(str);
             }
 
@@ -3926,7 +3927,7 @@ void TExecutor::RenderHtmlPage(NMon::TEvRemoteHttpInfo::TPtr &ev) const {
         }
     } else if (auto *scheme = Database ? &Database->GetScheme() : nullptr) {
         HTML(str) {
-            H3() { str << NFmt::Do(*this) << " tablet synopsis"; }
+            TAG(TH3) { str << NFmt::Do(*this) << " tablet synopsis"; }
 
             if (auto *logic = BootLogic.Get()) {
                  DIV_CLASS("row") {str << NFmt::Do(*logic); }
@@ -3948,14 +3949,14 @@ void TExecutor::RenderHtmlPage(NMon::TEvRemoteHttpInfo::TPtr &ev) const {
                 DIV_CLASS("row") { str << "Booted tablet without dbase"; }
             }
 
-            H3() {str << "Scheme:";}
+            TAG(TH3) {str << "Scheme:";}
             TVector<ui32> tables;
             for (const auto &xtable : scheme->Tables)
                 tables.push_back(xtable.first);
             Sort(tables);
             for (auto itable : tables) {
                 const auto &tinfo = scheme->Tables.find(itable)->second;
-                H4() {str << "<a href='db?TabletID=" << Owner->TabletID() << "&TableID=" << tinfo.Id << "'>Table: \"" << tinfo.Name << "\" id: " << tinfo.Id << "</a>";}
+                TAG(TH4) {str << "<a href='db?TabletID=" << Owner->TabletID() << "&TableID=" << tinfo.Id << "'>Table: \"" << tinfo.Name << "\" id: " << tinfo.Id << "</a>";}
                 TABLE_SORTABLE_CLASS("table") {
                     TABLEHEAD() {
                         TABLER() {
@@ -3984,18 +3985,18 @@ void TExecutor::RenderHtmlPage(NMon::TEvRemoteHttpInfo::TPtr &ev) const {
                 }
             }
 
-            H3() {str << "Storage:";}
+            TAG(TH3) {str << "Storage:";}
             DIV_CLASS("row") {str << "Bytes pinned in cache: " << PrivatePageCache->GetStats().PinnedSetSize << Endl; }
             DIV_CLASS("row") {str << "Bytes pinned to load: " << PrivatePageCache->GetStats().PinnedLoadSize << Endl; }
 
-            H3() {str << "Resource usage:";}
+            TAG(TH3) {str << "Resource usage:";}
             DIV_CLASS("row") {str << "used tablet memory: " << UsedTabletMemory; }
             Memory->DumpStateToHTML(str);
 
             if (CompactionLogic)
                 CompactionLogic->OutputHtml(str, *scheme, cgi);
 
-            H3() {str << "Page collection cache:";}
+            TAG(TH3) {str << "Page collection cache:";}
             DIV_CLASS("row") {str << "fresh bytes: " << CounterCacheFresh->Val(); }
             DIV_CLASS("row") {str << "staging bytes: " << CounterCacheStaging->Val(); }
             DIV_CLASS("row") {str << "warm bytes: " << CounterCacheWarm->Val(); }
@@ -4007,7 +4008,7 @@ void TExecutor::RenderHtmlPage(NMon::TEvRemoteHttpInfo::TPtr &ev) const {
             DIV_CLASS("row") {str << "Total bytes marked as sticky: " << PrivatePageCache->GetStats().TotalSticky; }
 
             if (GcLogic) {
-                H3() {str << "Gc logic:";}
+                TAG(TH3) {str << "Gc logic:";}
                 auto gcInfo = GcLogic->IntrospectStateSize();
                 DIV_CLASS("row") {str << "uncommited entries: " << gcInfo.UncommitedEntries;}
                 DIV_CLASS("row") {str << "uncommited blob ids: " << gcInfo.UncommitedBlobIds; }
@@ -4020,7 +4021,7 @@ void TExecutor::RenderHtmlPage(NMon::TEvRemoteHttpInfo::TPtr &ev) const {
             }
 
             if (BorrowLogic) {
-                H3() {str << "Borrow logic:";}
+                TAG(TH3) {str << "Borrow logic:";}
                 BorrowLogic->OutputHtml(str);
             }
         }
@@ -4233,7 +4234,7 @@ ui64 TExecutor::BeginCompaction(THolder<NTable::TCompactionParams> params)
 
     bool compactTxStatus = false;
     for (const auto& memTableSnapshot : snapshot->Subset->Frozen) {
-        if (memTableSnapshot->GetCommittedTransactions() || memTableSnapshot->GetRemovedTransactions()) {
+        if (!memTableSnapshot->GetCommittedTransactions().empty() || !memTableSnapshot->GetRemovedTransactions().empty()) {
             // We must compact tx status when mem table has changes
             compactTxStatus = true;
         }

@@ -1367,6 +1367,27 @@ void TSchemeShard::TRwTxBase::Complete(const TActorContext &ctx) {
     DoComplete(ctx);
 }
 
+void TSchemeShard::BumpIncompatibleChanges(NIceDb::TNiceDb& db, ui64 incompatibleChange) {
+    if (MaxIncompatibleChange < incompatibleChange) {
+        Y_VERIFY_S(incompatibleChange <= Schema::MaxIncompatibleChangeSupported,
+            "Attempting to bump incompatible changes to " << incompatibleChange <<
+            ", but maximum supported change is " << Schema::MaxIncompatibleChangeSupported);
+        // We add a special path on the first incompatible change, which breaks
+        // all versions that don't know about incompatible changes. Newer
+        // versions will just skip this non-sensical entry.
+        if (MaxIncompatibleChange == 0) {
+            db.Table<Schema::Paths>().Key(0).Update(
+                NIceDb::TUpdate<Schema::Paths::ParentId>(0),
+                NIceDb::TUpdate<Schema::Paths::Name>("/incompatible/"));
+        }
+        // Persist a new maximum incompatible change, this will cause older
+        // versions to stop gracefully instead of working inconsistently.
+        db.Table<Schema::SysParams>().Key(Schema::SysParam_MaxIncompatibleChange).Update(
+            NIceDb::TUpdate<Schema::SysParams::Value>(ToString(incompatibleChange)));
+        MaxIncompatibleChange = incompatibleChange;
+    }
+}
+
 void TSchemeShard::PersistTableIndex(NIceDb::TNiceDb& db, const TPathId& pathId) {
     Y_VERIFY(PathsById.contains(pathId));
     TPathElement::TPtr elemnt = PathsById.at(pathId);
@@ -2085,14 +2106,20 @@ void TSchemeShard::PersistChannelsBinding(NIceDb::TNiceDb& db, const TShardIdx s
 void TSchemeShard::PersistTablePartitioning(NIceDb::TNiceDb& db, const TPathId pathId, const TTableInfo::TPtr tableInfo) {
     for (ui64 pi = 0; pi < tableInfo->GetPartitions().size(); ++pi) {
         const auto& partition = tableInfo->GetPartitions()[pi];
-        if (IsLocalId(pathId)) {
-            Y_VERIFY(IsLocalId(partition.ShardIdx));
+        if (IsLocalId(pathId) && IsLocalId(partition.ShardIdx)) {
             db.Table<Schema::TablePartitions>().Key(pathId.LocalPathId, pi).Update(
                 NIceDb::TUpdate<Schema::TablePartitions::RangeEnd>(partition.EndOfRange),
                 NIceDb::TUpdate<Schema::TablePartitions::DatashardIdx>(partition.ShardIdx.GetLocalId()),
                 NIceDb::TUpdate<Schema::TablePartitions::LastCondErase>(partition.LastCondErase.GetValue()),
                 NIceDb::TUpdate<Schema::TablePartitions::NextCondErase>(partition.NextCondErase.GetValue()));
         } else {
+            if (IsLocalId(pathId)) {
+                // Incompatible change 1:
+                // Store migrated shards of local tables in migrated table partitions
+                // This change is incompatible with older versions because partitions
+                // may no longer be in a single table and will require sorting at load time.
+                BumpIncompatibleChanges(db, 1);
+            }
             db.Table<Schema::MigratedTablePartitions>().Key(pathId.OwnerId, pathId.LocalPathId, pi).Update(
                 NIceDb::TUpdate<Schema::MigratedTablePartitions::RangeEnd>(partition.EndOfRange),
                 NIceDb::TUpdate<Schema::MigratedTablePartitions::OwnerShardIdx>(partition.ShardIdx.GetOwnerId()),
@@ -2124,12 +2151,15 @@ void TSchemeShard::PersistTablePartitioningDeletion(NIceDb::TNiceDb& db, const T
 void TSchemeShard::PersistTablePartitionCondErase(NIceDb::TNiceDb& db, const TPathId& pathId, ui64 id, const TTableInfo::TPtr tableInfo) {
     const auto& partition = tableInfo->GetPartitions()[id];
 
-    if (IsLocalId(pathId)) {
-        Y_VERIFY(IsLocalId(partition.ShardIdx));
+    if (IsLocalId(pathId) && IsLocalId(partition.ShardIdx)) {
         db.Table<Schema::TablePartitions>().Key(pathId.LocalPathId, id).Update(
             NIceDb::TUpdate<Schema::TablePartitions::LastCondErase>(partition.LastCondErase.GetValue()),
             NIceDb::TUpdate<Schema::TablePartitions::NextCondErase>(partition.NextCondErase.GetValue()));
     } else {
+        if (IsLocalId(pathId)) {
+            // Incompatible change 1 (see above)
+            BumpIncompatibleChanges(db, 1);
+        }
         db.Table<Schema::MigratedTablePartitions>().Key(pathId.OwnerId, pathId.LocalPathId, id).Update(
             NIceDb::TUpdate<Schema::MigratedTablePartitions::LastCondErase>(partition.LastCondErase.GetValue()),
             NIceDb::TUpdate<Schema::MigratedTablePartitions::NextCondErase>(partition.NextCondErase.GetValue()));
@@ -3905,6 +3935,7 @@ void TSchemeShard::StateInit(STFUNC_SIG) {
     TRACE_EVENT(NKikimrServices::FLAT_TX_SCHEMESHARD);
     switch (ev->GetTypeRewrite()) {
         HFuncTraced(TEvents::TEvPoisonPill, Handle);
+        HFuncTraced(TEvents::TEvUndelivered, Handle);
 
         //console configs
         HFuncTraced(NConsole::TEvConfigsDispatcher::TEvSetConfigSubscriptionResponse, Handle);
@@ -3920,6 +3951,7 @@ void TSchemeShard::StateConfigure(STFUNC_SIG) {
     TRACE_EVENT(NKikimrServices::FLAT_TX_SCHEMESHARD);
     switch (ev->GetTypeRewrite()) {
         HFuncTraced(TEvents::TEvPoisonPill, Handle);
+        HFuncTraced(TEvents::TEvUndelivered, Handle);
 
         HFuncTraced(TEvSchemeShard::TEvInitRootShard, Handle);
         HFuncTraced(TEvSchemeShard::TEvInitTenantSchemeShard, Handle);
@@ -3960,6 +3992,7 @@ void TSchemeShard::StateWork(STFUNC_SIG) {
     TRACE_EVENT(NKikimrServices::FLAT_TX_SCHEMESHARD);
     switch (ev->GetTypeRewrite()) {
         HFuncTraced(TEvents::TEvPoisonPill, Handle);
+        HFuncTraced(TEvents::TEvUndelivered, Handle);
         HFuncTraced(TEvSchemeShard::TEvInitRootShard, Handle);
 
         HFuncTraced(TEvSchemeShard::TEvMeasureSelfResponseTime, SelfPinger->Handle);
@@ -6098,7 +6131,20 @@ void TSchemeShard::SubscribeConsoleConfigs(const TActorContext &ctx) {
             (ui32)NKikimrConsole::TConfigItem::FeatureFlagsItem,
             (ui32)NKikimrConsole::TConfigItem::CompactionConfigItem,
             (ui32)NKikimrConsole::TConfigItem::SchemeShardConfigItem,
-        }));
+            (ui32)NKikimrConsole::TConfigItem::TableProfilesConfigItem,
+        }),
+        IEventHandle::FlagTrackDelivery
+    );
+}
+
+void TSchemeShard::Handle(TEvents::TEvUndelivered::TPtr&, const TActorContext& ctx) {
+    LOG_WARN_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD, "Cannot subscribe to console configs");
+    TableProfilesLoaded = true;
+
+    auto waiters = std::move(TableProfilesWaiters);
+    for (const auto& [importId, itemIdx] : waiters) {
+        Execute(CreateTxProgressImport(importId, itemIdx), ctx);
+    }
 }
 
 void TSchemeShard::ApplyConsoleConfigs(const NKikimrConfig::TAppConfig& appConfig, const TActorContext& ctx) {
@@ -6115,6 +6161,16 @@ void TSchemeShard::ApplyConsoleConfigs(const NKikimrConfig::TAppConfig& appConfi
         const auto& schemeShardConfig = appConfig.GetSchemeShardConfig();
         ConfigureStatsBatching(schemeShardConfig, ctx);
         ConfigureStatsOperations(schemeShardConfig, ctx);
+    }
+
+    if (appConfig.HasTableProfilesConfig()) {
+        TableProfiles.Load(appConfig.GetTableProfilesConfig());
+        TableProfilesLoaded = true;
+
+        auto waiters = std::move(TableProfilesWaiters);
+        for (const auto& [importId, itemIdx] : waiters) {
+            Execute(CreateTxProgressImport(importId, itemIdx), ctx);
+        }
     }
 
     if (IsShemeShardConfigured()) {

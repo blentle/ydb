@@ -6,6 +6,35 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(testload)
+add_subdirectory(ut_background_compaction)
+add_subdirectory(ut_build_index)
+add_subdirectory(ut_change_collector)
+add_subdirectory(ut_change_exchange)
+add_subdirectory(ut_compaction)
+add_subdirectory(ut_erase_rows)
+add_subdirectory(ut_followers)
+add_subdirectory(ut_init)
+add_subdirectory(ut_keys)
+add_subdirectory(ut_kqp)
+add_subdirectory(ut_kqp_errors)
+add_subdirectory(ut_kqp_scan)
+add_subdirectory(ut_locks)
+add_subdirectory(ut_minikql)
+add_subdirectory(ut_minstep)
+add_subdirectory(ut_order)
+add_subdirectory(ut_range_avl_tree)
+add_subdirectory(ut_range_ops)
+add_subdirectory(ut_range_treap)
+add_subdirectory(ut_read_iterator)
+add_subdirectory(ut_read_table)
+add_subdirectory(ut_reassign)
+add_subdirectory(ut_replication)
+add_subdirectory(ut_rs)
+add_subdirectory(ut_snapshot)
+add_subdirectory(ut_stats)
+add_subdirectory(ut_testload)
+add_subdirectory(ut_upload_rows)
 
 add_library(core-tx-datashard)
 target_compile_options(core-tx-datashard PRIVATE
@@ -120,6 +149,7 @@ target_sources(core-tx-datashard PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard_change_sending.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard_counters.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard_loans.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard_locks_db.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard_locks.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard_split_dst.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard_split_src.cpp
@@ -208,6 +238,7 @@ target_sources(core-tx-datashard PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/export_s3_buffer_raw.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/export_s3_buffer_zstd.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/export_s3_uploader.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/extstorage_usage_config.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/import_s3.cpp
 )
 generate_enum_serilization(core-tx-datashard

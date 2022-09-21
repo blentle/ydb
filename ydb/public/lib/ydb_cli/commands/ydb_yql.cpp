@@ -14,6 +14,7 @@ TCommandYql::TCommandYql()
 
 void TCommandYql::Config(TConfig& config) {
     TYdbOperationCommand::Config(config);
+    AddExamplesOption(config);
     config.Opts->AddLongOption("stats", "Collect statistics mode [none, basic, full]")
         .RequiredArgument("[String]").StoreResult(&CollectStatsMode);
     config.Opts->AddLongOption('s', "script", "Text of script to execute").RequiredArgument("[String]").StoreResult(&Script);
@@ -31,8 +32,12 @@ void TCommandYql::Config(TConfig& config) {
         EOutputFormat::JsonUnicode,
         EOutputFormat::JsonUnicodeArray,
         EOutputFormat::JsonBase64,
-        EOutputFormat::JsonBase64Array
+        EOutputFormat::JsonBase64Array,
+        EOutputFormat::Csv,
+        EOutputFormat::Tsv
         });
+
+    CheckExamples(config);
 
     config.SetFreeArgsNum(0);
 }

@@ -1,39 +1,25 @@
 {
     "meta": {
-        "version": "0.1",
-        "type": "query"
+        "type": "query",
+        "version": "0.2"
     },
     "tables": [
         {
             "name": "/local/base_pk_predicate_pk_predicate_composite_sql_plan/Input1",
             "reads": [
                 {
-                    "type": "Scan",
-                    "scan_by": [
-                        "Group (\"4\", +inf]",
-                        "Name"
-                    ],
                     "columns": [
                         "Amount",
                         "Comment",
                         "Group",
                         "Name"
-                    ]
-                },
-                {
-                    "type": "Lookup",
-                    "lookup_by": [
-                        "Group (\"4\")"
                     ],
+                    "limit": "1001",
                     "scan_by": [
-                        "Name (\"Name1\", +inf]"
+                        "Group (4, +\u221e)",
+                        "Name (Name1, +\u221e)"
                     ],
-                    "columns": [
-                        "Amount",
-                        "Comment",
-                        "Group",
-                        "Name"
-                    ]
+                    "type": "Scan"
                 }
             ]
         }

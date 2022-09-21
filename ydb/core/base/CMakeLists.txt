@@ -6,6 +6,8 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(services)
+add_subdirectory(ut)
 
 add_library(ydb-core-base)
 target_link_libraries(ydb-core-base PUBLIC
@@ -56,7 +58,6 @@ target_sources(ydb-core-base PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/base/quoter.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/base/row_version.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/base/services_assert.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/core/base/shared_data.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/base/statestorage.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/base/statestorage_event_filter.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/base/statestorage_guardian.cpp

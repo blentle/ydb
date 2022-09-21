@@ -12,7 +12,7 @@
 #include <ydb/library/yql/core/yql_gc_transformer.h>
 #include <ydb/library/yql/core/yql_expr_csee.h>
 #include <ydb/library/yql/core/type_ann/type_ann_expr.h>
-#include <ydb/library/yql/core/yql_opt_aggregate.h>
+#include <ydb/library/yql/core/yql_aggregate_expander.h>
 #include <ydb/library/yql/utils/log/log.h>
 #include <ydb/library/yql/core/services/yql_transform_pipeline.h>
 #include <ydb/library/yql/core/services/yql_out_transformers.h>
@@ -33,6 +33,8 @@ using TPeepHoleOptimizerMap = std::unordered_map<std::string_view, TPeepHoleOpti
 
 using TExtPeepHoleOptimizerPtr = TExprNode::TPtr (*const)(const TExprNode::TPtr&, TExprContext&, TTypeAnnotationContext& types);
 using TExtPeepHoleOptimizerMap = std::unordered_map<std::string_view, TExtPeepHoleOptimizerPtr>;
+
+using TBlockFuncMap = std::unordered_map<std::string_view, std::string_view>;
 
 TExprNode::TPtr MakeNothing(TPositionHandle pos, const TTypeAnnotationNode& type, TExprContext& ctx) {
     return ctx.NewCallable(pos, "Nothing", {ExpandType(pos, *ctx.MakeType<TOptionalExprType>(&type), ctx)});
@@ -1903,12 +1905,14 @@ IGraphTransformer::TStatus PeepHoleCommonStage(const TExprNode::TPtr& input, TEx
 
 IGraphTransformer::TStatus PeepHoleFinalStage(const TExprNode::TPtr& input, TExprNode::TPtr& output,
     TExprContext& ctx, TTypeAnnotationContext& types, bool* hasNonDeterministicFunctions,
-    const TPeepHoleOptimizerMap& optimizers, const TExtPeepHoleOptimizerMap& nonDetOptimizers)
+    const TPeepHoleOptimizerMap& optimizers, const TExtPeepHoleOptimizerMap& extOptimizers,
+    const TExtPeepHoleOptimizerMap& nonDetOptimizers)
 {
     TOptimizeExprSettings settings(&types);
     settings.CustomInstantTypeTransformer = types.CustomInstantTypeTransformer.Get();
 
-    return OptimizeExpr(input, output, [hasNonDeterministicFunctions, &types, &nonDetOptimizers, &optimizers](const TExprNode::TPtr& node, TExprContext& ctx) -> TExprNode::TPtr {
+    return OptimizeExpr(input, output, [hasNonDeterministicFunctions, &types, &extOptimizers, &optimizers, &nonDetOptimizers](
+        const TExprNode::TPtr& node, TExprContext& ctx) -> TExprNode::TPtr {
         if (const auto nrule = nonDetOptimizers.find(node->Content()); nonDetOptimizers.cend() != nrule) {
             if (hasNonDeterministicFunctions) {
                 *hasNonDeterministicFunctions = true;
@@ -1916,8 +1920,30 @@ IGraphTransformer::TStatus PeepHoleFinalStage(const TExprNode::TPtr& input, TExp
             return (nrule->second)(node, ctx, types);
         }
 
-        if (const auto rule = optimizers.find(node->Content()); optimizers.cend() != rule)
+        if (const auto xrule = extOptimizers.find(node->Content()); extOptimizers.cend() != xrule) {
+            return (xrule->second)(node, ctx, types);
+        }
+
+        if (const auto rule = optimizers.find(node->Content()); optimizers.cend() != rule) {
             return (rule->second)(node, ctx);
+        }
+
+        return node;
+    }, ctx, settings);
+}
+
+IGraphTransformer::TStatus PeepHoleBlockStage(const TExprNode::TPtr& input, TExprNode::TPtr& output,
+    TExprContext& ctx, TTypeAnnotationContext& types, const TExtPeepHoleOptimizerMap& extOptimizers)
+{
+    TOptimizeExprSettings settings(&types);
+    settings.CustomInstantTypeTransformer = types.CustomInstantTypeTransformer.Get();
+
+    return OptimizeExpr(input, output, [&types, &extOptimizers](
+        const TExprNode::TPtr& node, TExprContext& ctx) -> TExprNode::TPtr {
+        if (const auto xrule = extOptimizers.find(node->Content()); extOptimizers.cend() != xrule) {
+            return (xrule->second)(node, ctx, types);
+        }
+
         return node;
     }, ctx, settings);
 }
@@ -2070,7 +2096,7 @@ TExprNode::TPtr OptimizeMultiMap(const TExprNode::TPtr& node, TExprContext& ctx)
     return node;
 }
 
-TExprNode::TPtr LikelyExclude(const TExprNode::TPtr& node, TExprContext&) {
+TExprNode::TPtr ReplaceWithFirstArg(const TExprNode::TPtr& node, TExprContext&) {
     YQL_CLOG(DEBUG, CorePeepHole) << "Exclude " << node->Content();
     return node->HeadPtr();
 }
@@ -4274,6 +4300,179 @@ TExprNode::TPtr OptimizeWideChopper(const TExprNode::TPtr& node, TExprContext& c
     return node;
 }
 
+
+struct TBlockRules {
+
+    static constexpr std::initializer_list<TBlockFuncMap::value_type> FuncsInit = {
+        {"+", "add" },
+        {"Not", "invert" },
+    };
+
+    TBlockRules()
+        : Funcs(FuncsInit)
+    {}
+
+    static const TBlockRules& Instance() {
+        return *Singleton<TBlockRules>();
+    }
+
+    const TBlockFuncMap Funcs;
+};
+
+TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& types) {
+    const auto& funcs = TBlockRules::Instance().Funcs;
+    if (!types.ArrowResolver) {
+        return node;
+    }
+
+    auto multiInputType = node->Head().GetTypeAnn()->Cast<TFlowExprType>()->GetItemType()->Cast<TMultiExprType>();
+    for (const auto& i : multiInputType->GetItems()) {
+        if (i->GetKind() == ETypeAnnotationKind::Block) {
+            return node;
+        }
+    }
+
+    TExprNode::TListType blockArgs;
+    for (ui32 i = 0; i < multiInputType->GetSize(); ++i) {
+        blockArgs.push_back(ctx.NewArgument(node->Pos(), "arg" + ToString(i)));
+    }
+
+    auto lambda = node->TailPtr();
+    TNodeOnNodeOwnedMap rewrites;
+    for (ui32 i = 0; i < multiInputType->GetSize(); ++i) {
+        rewrites[lambda->Head().Child(i)] = blockArgs[i];
+    }
+
+    ui32 newNodes = 0;
+    VisitExpr(lambda, [&](const TExprNode::TPtr& node) {
+        if (node->IsArguments()) {
+            return false;
+        }
+
+        if (node->IsLambda() && node != lambda) {
+            return false;
+        }
+
+        return true;
+    }, [&](const TExprNode::TPtr& node) {
+        if (rewrites.contains(node.Get())) {
+            return true;
+        }
+
+        if (node->IsArguments() || node->IsLambda()) {
+            return true;
+        }
+
+        if (node->IsComplete()) {
+            return true;
+        }
+
+        if (!node->IsCallable()) {
+            return true;
+        }
+
+        auto fit = funcs.find(node->Content());
+        if (fit == funcs.end()) {
+            return true;
+        }
+
+        TExprNode::TListType funcArgs;
+        funcArgs.push_back(ctx.NewAtom(node->Pos(), fit->second));
+        for (const auto& child : node->Children()) {
+            if (child->IsComplete()) {
+                funcArgs.push_back(ctx.NewCallable(node->Pos(), "AsScalar", { child }));
+            } else {
+                auto rit = rewrites.find(child.Get());
+                if (rit == rewrites.end()) {
+                    return true;
+                }
+
+                funcArgs.push_back(rit->second);
+            }
+        }
+
+        const TTypeAnnotationNode* outType = nullptr;
+        TVector<const TTypeAnnotationNode*> argTypes;
+        for (const auto& child : node->Children()) {
+            if (child->IsComplete()) {
+                argTypes.push_back(ctx.MakeType<TScalarExprType>(child->GetTypeAnn()));
+            } else {
+                argTypes.push_back(ctx.MakeType<TBlockExprType>(child->GetTypeAnn()));
+            }
+        }
+
+        YQL_ENSURE(types.ArrowResolver->LoadFunctionMetadata(ctx.GetPosition(node->Pos()), fit->second, argTypes, outType, ctx));
+        if (!outType) {
+            return true;
+        }
+
+        bool isScalar;
+        if (!IsSameAnnotation(*node->GetTypeAnn(), *GetBlockItemType(*outType, isScalar))) {
+            return true;
+        }
+
+        rewrites[node.Get()] = ctx.NewCallable(node->Pos(), "BlockFunc", std::move(funcArgs));
+        ++newNodes;
+        return true;
+    });
+
+    if (!newNodes) {
+        return node;
+    }
+
+    // calculate extra columns
+    TNodeOnNodeOwnedMap replaces;
+    TExprNode::TListType lambdaArgs, roots;
+
+    for (ui32 i = 1; i < lambda->ChildrenSize(); ++i) {
+        VisitExpr(lambda->ChildPtr(i), [&](const TExprNode::TPtr& node) {
+            auto it = rewrites.find(node.Get());
+            if (it != rewrites.end()) {
+                if (!replaces.contains(node.Get())) {
+                    auto arg = ctx.NewArgument(node->Pos(), "arg" + ToString(lambdaArgs.size()));
+                    lambdaArgs.push_back(arg);
+                    replaces[node.Get()] = arg;
+                    roots.push_back(it->second);
+                }
+
+                return false;
+            }
+
+            return true;
+        });
+    }
+
+    YQL_CLOG(DEBUG, CorePeepHole) << "Convert " << node->Content() << " to blocks, extra nodes: " << newNodes << ", extra columns: " << lambdaArgs.size();
+
+    auto blockLambda = ctx.NewLambda(node->Pos(), ctx.NewArguments(node->Pos(), std::move(blockArgs)), std::move(roots));
+    auto ret = ctx.Builder(node->Pos())
+        .Callable("WideFromBlocks")
+            .Callable(0, "WideMap")
+                .Callable(0, "WideToBlocks")
+                    .Add(0, node->HeadPtr())
+                .Seal()
+                .Add(1, blockLambda)
+            .Seal()
+        .Seal()
+        .Build();
+
+    TExprNode::TListType restRoots;
+    for (ui32 i = 1; i < lambda->ChildrenSize(); ++i) {
+        TExprNode::TPtr newRoot;
+        auto status = RemapExpr(lambda->ChildPtr(i), newRoot, replaces, ctx, TOptimizeExprSettings(&types));
+        YQL_ENSURE(status != IGraphTransformer::TStatus::Error);
+        restRoots.push_back(newRoot);
+    }
+
+    auto restLambda = ctx.NewLambda(node->Pos(), ctx.NewArguments(node->Pos(), std::move(lambdaArgs)), std::move(restRoots));
+    return ctx.Builder(node->Pos())
+        .Callable(node->Content())
+            .Add(0, ret)
+            .Add(1, restLambda)
+        .Seal()
+        .Build();
+}
+
 TExprNode::TPtr OptimizeWideMaps(const TExprNode::TPtr& node, TExprContext& ctx) {
     if (const auto& input = node->Head(); input.IsCallable("ExpandMap")) {
         YQL_CLOG(DEBUG, CorePeepHole) << "Fuse " << node->Content() << " with " << input.Content();
@@ -5872,7 +6071,8 @@ struct TPeepHoleRules {
     static constexpr std::initializer_list<TPeepHoleOptimizerMap::value_type> FinalStageRulesInit = {
         {"Take", &OptimizeTake<EnableNewOptimizers>},
         {"Skip", &OptimizeSkip},
-        {"Likely", &LikelyExclude},
+        {"Likely", &ReplaceWithFirstArg},
+        {"AssumeStrict", &ReplaceWithFirstArg},
         {"GroupByKey", &PeepHoleConvertGroupBySingleKey},
         {"PartitionByKey", &PeepHolePlainKeyForPartitionByKey},
         {"ExtractMembers", &PeepHoleExpandExtractItems},
@@ -5907,15 +6107,18 @@ struct TPeepHoleRules {
         {"WideCombiner", &OptimizeWideCombiner},
         {"WideCondense1", &OptimizeWideCondense1},
         {"WideChopper", &OptimizeWideChopper},
-        {"WideMap", &OptimizeWideMaps},
-        {"NarrowMap", &OptimizeWideMaps},
-        {"NarrowFlatMap", &OptimizeNarrowFlatMap},
-        {"NarrowMultiMap", &OptimizeWideMaps},
         {"MapJoinCore", &OptimizeMapJoinCore},
         {"CommonJoinCore", &OptimizeCommonJoinCore},
         {"BuildTablePath", &DoBuildTablePath},
         {"Exists", &OptimizeExists},
-        {"SqueezeToDict", &OptimizeSqueezeToDict}
+        {"SqueezeToDict", &OptimizeSqueezeToDict},
+        {"NarrowFlatMap", &OptimizeNarrowFlatMap},
+        {"NarrowMultiMap", &OptimizeWideMaps},
+        {"WideMap", &OptimizeWideMaps},
+        {"NarrowMap", &OptimizeWideMaps},
+    };
+
+    static constexpr std::initializer_list<TExtPeepHoleOptimizerMap::value_type> FinalStageExtRulesInit = {
     };
 
     static constexpr std::initializer_list<TExtPeepHoleOptimizerMap::value_type> FinalStageNonDetRulesInit = {
@@ -5928,12 +6131,21 @@ struct TPeepHoleRules {
         {"CurrentUtcTimestamp", &Now0Arg<&ToTimestamp>}
     };
 
+    static constexpr std::initializer_list<TExtPeepHoleOptimizerMap::value_type> BlockStageExtRulesInit = {
+        {"NarrowFlatMap", &OptimizeWideMapBlocks},
+        {"NarrowMultiMap", &OptimizeWideMapBlocks},
+        {"WideMap", &OptimizeWideMapBlocks},
+        {"NarrowMap", &OptimizeWideMapBlocks},
+    };
+
     TPeepHoleRules()
         : CommonStageRules(CommonStageRulesInit)
         , CommonStageExtRules(CommonStageExtRulesInit)
         , FinalStageRules(FinalStageRulesInit)
+        , FinalStageExtRules(FinalStageExtRulesInit)
         , SimplifyStageRules(SimplifyStageRulesInit)
         , FinalStageNonDetRules(FinalStageNonDetRulesInit)
+        , BlockStageExtRules(BlockStageExtRulesInit)
     {}
 
     static const TPeepHoleRules& Instance() {
@@ -5943,8 +6155,10 @@ struct TPeepHoleRules {
     const TPeepHoleOptimizerMap CommonStageRules;
     const TExtPeepHoleOptimizerMap CommonStageExtRules;
     const TPeepHoleOptimizerMap FinalStageRules;
+    const TExtPeepHoleOptimizerMap FinalStageExtRules;
     const TPeepHoleOptimizerMap SimplifyStageRules;
     const TExtPeepHoleOptimizerMap FinalStageNonDetRules;
+    const TExtPeepHoleOptimizerMap BlockStageExtRules;
 };
 
 template <bool EnableNewOptimizers>
@@ -6004,18 +6218,35 @@ THolder<IGraphTransformer> CreatePeepHoleFinalStageTransformer(TTypeAnnotationCo
             [&types, hasNonDeterministicFunctions, withFinalRules = peepholeSettings.WithFinalStageRules,
             withNonDeterministicRules = peepholeSettings.WithNonDeterministicRules](const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) {
                 auto stageRules = TPeepHoleRules<EnableNewOptimizers>::Instance().SimplifyStageRules;
+                auto extStageRules = TExtPeepHoleOptimizerMap{};
                 if (withFinalRules) {
                     const auto& finalRules = TPeepHoleRules<EnableNewOptimizers>::Instance().FinalStageRules;
                     stageRules.insert(finalRules.begin(), finalRules.end());
+
+                    const auto& finalExtRules = TPeepHoleRules<EnableNewOptimizers>::Instance().FinalStageExtRules;
+                    extStageRules.insert(finalExtRules.begin(), finalExtRules.end());
                 }
 
-                const auto& nonDetStageRules = withNonDeterministicRules ?
-                    TPeepHoleRules<EnableNewOptimizers>::Instance().FinalStageNonDetRules : TExtPeepHoleOptimizerMap{};
-
-                return PeepHoleFinalStage(input, output, ctx, types, hasNonDeterministicFunctions, stageRules, nonDetStageRules);
+                const auto& nonDetStageRules = withNonDeterministicRules ? TPeepHoleRules<EnableNewOptimizers>::Instance().FinalStageNonDetRules : TExtPeepHoleOptimizerMap{};
+                return PeepHoleFinalStage(input, output, ctx, types, hasNonDeterministicFunctions, stageRules, extStageRules, nonDetStageRules);
             }
         ),
         "PeepHoleFinal",
+        issueCode);
+
+    pipeline.Add(
+        CreateFunctorTransformer(
+            [&types](const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) -> IGraphTransformer::TStatus {
+                if (types.UseBlocks) {
+                    const auto& extStageRules = TPeepHoleRules<EnableNewOptimizers>::Instance().BlockStageExtRules;
+                    return PeepHoleBlockStage(input, output, ctx, types, extStageRules);
+                } else {
+                    output = input;
+                    return IGraphTransformer::TStatus::Ok;
+                }
+            }
+        ),
+        "PeepHoleBlock",
         issueCode);
 
     if (peepholeSettings.FinalConfig) {

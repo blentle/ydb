@@ -1,6 +1,7 @@
 #include "yql_flatmap_over_join.h"
 #include "yql_co.h"
 
+#include <ydb/library/yql/core/yql_expr_optimize.h>
 #include <ydb/library/yql/core/yql_join.h>
 #include <ydb/library/yql/core/yql_opt_utils.h>
 
@@ -117,11 +118,59 @@ void GatherOptionalKeyColumns(TExprNode::TPtr joinTree, const TJoinLabels& label
     }
 }
 
+bool IsRequiredAndFilteredSide(const TExprNode::TPtr& joinTree, const TJoinLabels& labels, ui32 inputIndex) {
+    TMaybe<bool> isFiltered = IsFilteredSide(joinTree, labels, inputIndex);
+    return isFiltered.Defined() && *isFiltered;
+}
+
 TExprNode::TPtr SingleInputPredicatePushdownOverEquiJoin(TExprNode::TPtr equiJoin, TExprNode::TPtr predicate,
     const TSet<TStringBuf>& usedFields, TExprNode::TPtr args, const TJoinLabels& labels,
-    ui32 firstCandidate, const TMap<TStringBuf, TVector<TStringBuf>>& renameMap, bool ordered, TExprContext& ctx) {
+    ui32 firstCandidate, const TMap<TStringBuf, TVector<TStringBuf>>& renameMap, bool ordered, TExprContext& ctx)
+{
     auto inputsCount = equiJoin->ChildrenSize() - 2;
     auto joinTree = equiJoin->Child(inputsCount);
+
+    if (!IsRequiredSide(joinTree, labels, firstCandidate).first) {
+        return equiJoin;
+    }
+
+    // TODO: derive strictness from constraints
+    bool isStrict = true;
+    {
+        YQL_ENSURE(args->ChildrenSize() == 1);
+        YQL_ENSURE(args->Head().IsArgument());
+        bool withDependsOn = false;
+        size_t insideAssumeStrict = 0;
+        size_t insideDependsOn = 0;
+        VisitExpr(predicate, [&](const TExprNode::TPtr& node) {
+            if (node->IsCallable("AssumeStrict")) {
+                ++insideAssumeStrict;
+            } else if (node->IsCallable("DependsOn")) {
+                ++insideDependsOn;
+            } else if (isStrict && !insideAssumeStrict && node->IsCallable({"Udf", "ScriptUdf", "Unwrap", "Ensure"})) {
+                isStrict = false;
+            } else if (insideDependsOn && node.Get() == args->Child(0)) {
+                withDependsOn = true;
+            }
+            return !withDependsOn;
+        }, [&](const TExprNode::TPtr& node) {
+            if (node->IsCallable("AssumeStrict")) {
+                YQL_ENSURE(insideAssumeStrict > 0);
+                --insideAssumeStrict;
+            } else if (node->IsCallable("DependsOn")) {
+                YQL_ENSURE(insideDependsOn > 0);
+                --insideDependsOn;
+            }
+            return true;
+        });
+        if (withDependsOn) {
+            return equiJoin;
+        }
+    }
+    if (!isStrict && IsRequiredAndFilteredSide(joinTree, labels, firstCandidate)) {
+        return equiJoin;
+    }
+
     TMap<TString, TSet<TString>> aliases;
     GatherKeyAliases(joinTree, aliases, labels);
     MakeTransitiveClosure(aliases);
@@ -162,14 +211,14 @@ TExprNode::TPtr SingleInputPredicatePushdownOverEquiJoin(TExprNode::TPtr equiJoi
         }
     }
 
-    if (!IsRequiredSide(joinTree, labels, firstCandidate).first) {
-        return equiJoin;
-    }
-
     auto ret = ctx.ShallowCopy(*equiJoin);
     for (auto& inputIndex : candidates) {
         auto x = IsRequiredSide(joinTree, labels, inputIndex);
         if (!x.first) {
+            continue;
+        }
+
+        if (!isStrict && IsRequiredAndFilteredSide(joinTree, labels, inputIndex)) {
             continue;
         }
 
@@ -556,7 +605,7 @@ TExprNode::TPtr DecayCrossJoinIntoInner(TExprNode::TPtr equiJoin, const TExprNod
     return ctx.ChangeChild(*equiJoin, inputsCount, std::move(newJoinTree));
 }
 
-}
+} // namespace
 
 TExprBase FlatMapOverEquiJoin(const TCoFlatMapBase& node, TExprContext& ctx, const TParentsMap& parentsMap, bool multiUsage) {
     auto equiJoin = node.Input();

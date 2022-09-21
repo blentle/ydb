@@ -25,12 +25,23 @@ namespace NYdb::NConsoleClient {
         TVector<NTopic::ECodec> SupportedCodecs_;
     };
 
+    class TCommandWithMeteringMode {
+    protected:
+        void AddAllowedMeteringModes(TClientCommand::TConfig& config);
+        void ParseMeteringMode();
+        NTopic::EMeteringMode GetMeteringMode() const;
+
+    private:
+        TString MeteringModeStr_;
+        NTopic::EMeteringMode MeteringMode_ = NTopic::EMeteringMode::Unspecified;
+    };
+
     class TCommandTopic: public TClientCommandTree {
     public:
         TCommandTopic();
     };
 
-    class TCommandTopicCreate: public TYdbCommand, public TCommandWithTopicName, public TCommandWithSupportedCodecs {
+    class TCommandTopicCreate: public TYdbCommand, public TCommandWithTopicName, public TCommandWithSupportedCodecs, public TCommandWithMeteringMode {
     public:
         TCommandTopicCreate();
         void Config(TConfig& config) override;
@@ -39,10 +50,12 @@ namespace NYdb::NConsoleClient {
 
     private:
         ui64 RetentionPeriodHours_;
+        ui64 RetentionStorageMb_;
         ui32 PartitionsCount_;
+        ui32 PartitionWriteSpeedKbps_;
     };
 
-    class TCommandTopicAlter: public TYdbCommand, public TCommandWithTopicName, public TCommandWithSupportedCodecs {
+    class TCommandTopicAlter: public TYdbCommand, public TCommandWithTopicName, public TCommandWithSupportedCodecs, public TCommandWithMeteringMode {
     public:
         TCommandTopicAlter();
         void Config(TConfig& config) override;
@@ -51,7 +64,10 @@ namespace NYdb::NConsoleClient {
 
     private:
         TMaybe<ui64> RetentionPeriodHours_;
+        TMaybe<ui64> RetentionStorageMb_;
         TMaybe<ui32> PartitionsCount_;
+        TMaybe<ui32> PartitionWriteSpeedKbps_;
+
         NYdb::NTopic::TAlterTopicSettings PrepareAlterSettings(NYdb::NTopic::TDescribeTopicResult& describeResult);
     };
 
@@ -92,15 +108,22 @@ namespace NYdb::NConsoleClient {
         TString ConsumerName_;
     };
 
-    class TCommandTopicInternal: public TClientCommandTree {
-    public:
-        TCommandTopicInternal();
+    class TCommandWithTransformBody {
+    protected:
+        void AddTransform(TClientCommand::TConfig& config);
+        void ParseTransform();
+        ETransformBody GetTransform() const;
+
+    private:
+        TString TransformStr_;
+        ETransformBody Transform_ = ETransformBody::None;
     };
 
     class TCommandTopicRead: public TYdbCommand,
                              public TCommandWithFormat,
                              public TInterruptibleCommand,
-                             public TCommandWithTopicName {
+                             public TCommandWithTopicName,
+                             public TCommandWithTransformBody {
     public:
         TCommandTopicRead();
         void Config(TConfig& config) override;
@@ -140,71 +163,24 @@ namespace NYdb::NConsoleClient {
         NTopic::TReadSessionSettings PrepareReadSessionSettings();
     };
 
-    namespace {
-        const THashMap<NYdb::NPersQueue::ECodec, TString> CodecsDescriptionsMigration = {
-            {NYdb::NPersQueue::ECodec::RAW, "Raw codec. No data compression(default)"},
-            {NYdb::NPersQueue::ECodec::GZIP, "GZIP codec. Data is compressed with GZIP compression algorithm"},
-            {NYdb::NPersQueue::ECodec::LZOP, "LZOP codec. Data is compressed with LZOP compression algorithm"},
-            {NYdb::NPersQueue::ECodec::ZSTD, "ZSTD codec. Data is compressed with ZSTD compression algorithm"},
-        };
-    }
-
-    const TVector<NYdb::NPersQueue::ECodec> AllowedCodecsMigration = {
-        NPersQueue::ECodec::RAW,
-        NPersQueue::ECodec::GZIP,
-        NPersQueue::ECodec::ZSTD,
-    };
-
-    class TCommandWithCodecMigration {
-        // TODO(shmel1k@): remove after TopicService C++ SDK supports IWriteSession
+    class TCommandWithCodec {
     protected:
-        void AddAllowedCodecs(TClientCommand::TConfig& config) {
-            TStringStream description;
-            description << "Codec used for writing. Available codecs: ";
-            NColorizer::TColors colors = NColorizer::AutoColors(Cout);
-            for (const auto& codec : AllowedCodecsMigration) {
-                auto findResult = CodecsDescriptionsMigration.find(codec);
-                Y_VERIFY(findResult != CodecsDescriptionsMigration.end(),
-                         "Couldn't find description for %s codec", (TStringBuilder() << codec).c_str());
-                description << "\n  " << colors.BoldColor() << codec << colors.OldColor()
-                            << "\n    " << findResult->second;
-            }
-            config.Opts->AddLongOption("codec", description.Str())
-                .RequiredArgument("STRING")
-                .StoreResult(&CodecStr_);
-        }
-
-        void ParseCodec() {
-            TString codec = to_lower(CodecStr_);
-            if (codec == "raw") {
-                Codec_ = NPersQueue::ECodec::RAW;
-            }
-            if (codec == "gzip") {
-                Codec_ = NPersQueue::ECodec::GZIP;
-            }
-            if (codec = "zstd") {
-                Codec_ = NPersQueue::ECodec::ZSTD;
-            }
-        }
-
-        NPersQueue::ECodec GetCodec() const {
-            if (CodecStr_ == "") {
-                return DefaultCodec_;
-            }
-            return Codec_;
-        }
+        void AddAllowedCodecs(TClientCommand::TConfig& config, const TVector<NTopic::ECodec>& allowedCodecs);
+        void ParseCodec();
+        NTopic::ECodec GetCodec() const;
 
     private:
-        NPersQueue::ECodec DefaultCodec_ = NPersQueue::ECodec::RAW;
+        TVector<NTopic::ECodec> AllowedCodecs_;
         TString CodecStr_;
-        NPersQueue::ECodec Codec_;
+        NTopic::ECodec Codec_ = NTopic::ECodec::RAW;
     };
 
     class TCommandTopicWrite: public TYdbCommand,
                               public TCommandWithFormat,
                               public TInterruptibleCommand,
                               public TCommandWithTopicName,
-                              public TCommandWithCodecMigration {
+                              public TCommandWithCodec,
+                              public TCommandWithTransformBody {
     public:
         TCommandTopicWrite();
         void Config(TConfig& config) override;
@@ -224,9 +200,9 @@ namespace NYdb::NConsoleClient {
 
         ui64 MessageSizeLimit_ = 0;
         void ParseMessageSizeLimit();
-        void CheckOptions(NPersQueue::TPersQueueClient& persQueueClient);
+        void CheckOptions(NTopic::TTopicClient& topicClient);
 
     private:
-        NPersQueue::TWriteSessionSettings PrepareWriteSessionSettings();
+        NTopic::TWriteSessionSettings PrepareWriteSessionSettings();
     };
 } // namespace NYdb::NConsoleClient

@@ -35,8 +35,7 @@ message TValue {
     repeated TValueChain ValueChain = 2;
     optional EKeepState KeepState = 3;
     optional bool Public = 4;
-    optional bool Unconfirmed = 5;
-    optional NKikimrProto.TLogoBlobID OriginalBlobId = 6;
+    optional NKikimrProto.TLogoBlobID OriginalBlobId = 5;
 }
 
 message TGivenIdRange {
@@ -158,7 +157,8 @@ message TEvCommitBlobSeq {
         optional TBlobLocator BlobLocator = 1; // GroupId and Generation are for validation purposes
         optional bytes Key = 2;
         optional bytes Meta = 3;
-        optional bool Unconfirmed = 4; // if true, then write to BS hasn't been actually performed yet
+        optional bool UncertainWrite = 4;
+        optional bool CommitNotify = 5;
     }
 
     repeated TItem Items = 1;
@@ -173,21 +173,33 @@ message TEvCommitBlobSeqResult {
     repeated TItem Items = 1;
 }
 
+message TEvDiscardSpoiledBlobSeq {
+    repeated TBlobSeqId Items = 1;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // TEvResolve -- lookup key in the Data table (and apply noncommitted changes if necessary) and return value chain for
 // each of the found entries.
 
 message TEvResolve {
-    message TItem {
+    message TKeyRange {
         optional bytes BeginningKey = 1; // start from the very first key (if not set)
         optional bool IncludeBeginning = 2 [default = true];
         optional bytes EndingKey = 3; // end with the key beyond the last one (if not set)
         optional bool IncludeEnding = 4 [default = false];
         optional uint32 MaxKeys = 5 [default = 0]; // zero or unset value means infinite amount
-        optional bool ReturnMeta = 6 [default = false];
-        optional bool ReturnOwners = 7 [default = false];
-        optional bool Reverse = 8 [default = false]; // reverse output
-        optional uint64 Cookie = 9; // request cookie to match response item
+        optional bool Reverse = 6 [default = false]; // reverse output
+    }
+    message TItem {
+        oneof KeyDesignator {
+            TKeyRange KeyRange = 1;
+            bytes ExactKey = 2;
+        }
+        optional bool ReturnMeta = 3 [default = false];
+        optional bool ReturnOwners = 4 [default = false];
+        optional uint64 Cookie = 5; // request cookie to match response item
+        optional fixed64 TabletId = 6; // used in virtual group mode to resolve keys of specific tablet
+        optional bool MustRestoreFirst = 7;
     }
 
     repeated TItem Items = 1;

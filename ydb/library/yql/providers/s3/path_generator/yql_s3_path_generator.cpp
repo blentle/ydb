@@ -6,6 +6,7 @@
 #include <util/generic/serialized_enum.h>
 #include <util/string/cast.h>
 #include <util/string/split.h>
+#include <util/string/strip.h>
 
 namespace NYql::NPathGenerator {
 
@@ -212,8 +213,14 @@ struct TPathGenerator: public IPathGenerator {
 public:
     TPathGenerator(const TString& projection, const std::vector<TString>& partitionedBy, size_t pathsLimit)
     {
-        ParsePartitioningRules(projection, partitionedBy);
-        ExpandPartitioningRules(pathsLimit);
+        try {
+            ParsePartitioningRules(projection, partitionedBy);
+            ExpandPartitioningRules(pathsLimit);
+        } catch (const yexception& e) {
+            throw yexception() << "projection error: " << e.what();
+        } catch (...) {
+            throw yexception() << "projection error: " << CurrentExceptionMessage();
+        }
     }
 
     TString Format(const TStringBuf& columnName, const TStringBuf& dataValue) const override {
@@ -368,8 +375,12 @@ private:
             if (p.first == "type") {
                 // already processed
             } else if (p.first == "values") {
-                TString values = GetStringOrThrow(p.second, "The values must be a string");
-                Config.Rules.push_back(IPathGenerator::TColumnPartitioningConfig{.Type=ToType(type), .Name=columnName, .Values=StringSplitter(values).Split(',').ToList<TString>()});
+                TString valuesStr = GetStringOrThrow(p.second, "The values must be a string");
+                auto values = StringSplitter(valuesStr).Split(',').SkipEmpty().ToList<TString>();
+                for (auto& v : values) {
+                    v = StripString(v);
+                }
+                Config.Rules.push_back(IPathGenerator::TColumnPartitioningConfig{.Type=ToType(type), .Name=columnName, .Values=std::move(values)});
             } else {
                 ythrow yexception() << "Invalid projection scheme: enum element must include only type or values (as string) but got " << p.first;
             }
@@ -529,10 +540,9 @@ private:
             TString copyLocationTemplate = locationTemplate;
             const TString time = Strftime(rule.Format.c_str(), current);
             ReplaceAll(copyLocationTemplate, "${" + rule.Name + "}", time);
-            columnsWithValue.push_back(TColumnWithValue{.Name=rule.Name, .Type=NUdf::EDataSlot::String, .Value=time});
+            columnsWithValue.push_back(TColumnWithValue{.Name=rule.Name, .Type=NUdf::EDataSlot::Date, .Value=Strftime("%F", current)});
             DoGenerate(rules, copyLocationTemplate, columnsWithValue, result, pathsLimit, now, p + 1);
             columnsWithValue.pop_back();
-
             if (IsOverflow(current.GetValue(), interval.GetValue())) {
                 return; // correct overflow handling
             }

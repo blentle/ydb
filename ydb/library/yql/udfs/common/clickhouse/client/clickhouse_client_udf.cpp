@@ -98,7 +98,7 @@ TPgConvertInfo GetPgConvertInfo(IFunctionTypeInfoBuilder& typeInfoBuilder, const
     Y_ENSURE(pgDescription);
     info.TypeLen = pgDescription->Typelen;
     info.TypeName = pgDescription->Name;
-    
+
     std::tie(info.SourceLogicalSlot, info.SourceDataType) = InferSlotFromPgType(typeInfoBuilder, pgDescription->Name);
     if (info.SourceDataType) {
         info.SourceDataType = typeInfoBuilder.Optional()->Item(info.SourceDataType).Build();
@@ -156,7 +156,7 @@ NDB::DataTypePtr PgMetaToClickHouse(const TPgConvertInfo& info) {
     if (info.TypeName == TStringRef("int4")) {
         return std::make_shared<NDB::DataTypeInt32>();
     }
-    
+
     if (info.TypeName == TStringRef("int8")) {
         return std::make_shared<NDB::DataTypeInt64>();
     }
@@ -727,8 +727,8 @@ private:
                 if (const auto status = Stream.Fetch(Input); EFetchStatus::Ok != status)
                     return status;
 
-                auto input = TupleSize ? Input.GetElement(0) : Input;
-                const std::string_view buffer = input.AsStringRef();
+                InputElement = TupleSize ? Input.GetElement(0) : Input;
+                const std::string_view buffer = InputElement.AsStringRef();
                 Buffer = std::make_unique<NDB::ReadBufferFromMemory>(buffer.data(), buffer.size());
                 BlockStream = std::make_unique<NDB::InputStreamFromInputFormat>(NDB::FormatFactory::instance().getInputFormat(Type, *Buffer, NDB::Block(Columns), nullptr, buffer.size(),  Settings));
             }
@@ -781,6 +781,7 @@ private:
     TPlainArrayCache TupleCache;
 
     TUnboxedValue Input;
+    TUnboxedValue InputElement;
     const TString Type;
     const NDB::FormatSettings Settings;
 
@@ -1005,9 +1006,9 @@ class TSerializeFormat : public TBoxedValue {
                 it->second.second->writePrefix();
             }
             it->second.second->write(it->second.first);
-            if (IsFinished)
-                it->second.second->writeSuffix();
+            it->second.second->writeSuffix();
             it->second.second->flush();
+            it->second.second.reset();
             it->second.first = HeaderBlock.cloneEmpty();
 
             if (KeysIndexes.empty())

@@ -3488,16 +3488,24 @@ Y_UNIT_TEST_SUITE(TSchemeShardTest) {
         TTestEnv env(runtime);
         ui64 txId = 100;
 
-        // used to sanity check at the end of the test
-        THashSet<ui64> deletedShardIdxs;
+        bool splitStarted = false;
+        THashSet<ui64> deletedShardIdxs; // used to sanity check at the end of the test
+
         runtime.SetObserverFunc([&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) {
-            if (ev->GetTypeRewrite() == TEvHive::EvDeleteTabletReply) {
+            switch (ev->GetTypeRewrite()) {
+            case TEvHive::EvDeleteTabletReply:
                 for (const ui64 shardIdx : ev->Get<TEvHive::TEvDeleteTabletReply>()->Record.GetShardLocalIdx()) {
                     deletedShardIdxs.insert(shardIdx);
                 }
-            }
+                return TTestActorRuntime::EEventAction::PROCESS;
 
-            return TTestActorRuntime::EEventAction::PROCESS;
+            case TEvDataShard::EvGetTableStats:
+                splitStarted = true;
+                return TTestActorRuntime::EEventAction::DROP; // prevent splitting
+
+            default:
+                return TTestActorRuntime::EEventAction::PROCESS;
+            }
         });
 
         // these limits should have no effect on backup tables
@@ -3513,6 +3521,11 @@ Y_UNIT_TEST_SUITE(TSchemeShardTest) {
             Columns { Name: "key" Type: "Uint32"}
             Columns { Name: "value" Type: "Utf8"}
             KeyColumnNames: ["key"]
+            PartitionConfig {
+                PartitioningPolicy {
+                    SizeToSplit: 100
+                }
+            }
         )");
         env.TestWaitNotification(runtime, txId);
 
@@ -3545,6 +3558,30 @@ Y_UNIT_TEST_SUITE(TSchemeShardTest) {
         TestDescribeResult(DescribePath(runtime, "/MyRoot/ConsistentCopyTable", true), {
             NLs::IsBackupTable(true),
         });
+
+        // write some data...
+        for (ui32 i = 0; i < 100; ++i) {
+            const auto query = Sprintf(R"(
+                (
+                    (let key '('('key (Uint32 '%u)) ) )
+                    (let value '('('value (Utf8 'foobar)) ) )
+                    (return (AsList (UpdateRow '__user__Table key value) ))
+                )
+            )", i);
+            NKikimrMiniKQL::TResult result;
+            TString err;
+            const auto status = LocalMiniKQL(runtime, TTestTxConfig::FakeHiveTablets, query, result, err);
+            UNIT_ASSERT_VALUES_EQUAL(status, NKikimrProto::EReplyStatus::OK);
+        }
+
+        // ... and wait for the split to start
+        if (!splitStarted) {
+            TDispatchOptions opts;
+            opts.FinalEvents.emplace_back([&splitStarted](IEventHandle&) {
+                return splitStarted;
+            });
+            runtime.DispatchEvents(opts);
+        }
 
         // negative tests
 
@@ -3684,6 +3721,52 @@ Y_UNIT_TEST_SUITE(TSchemeShardTest) {
             Columns { Name: "key" Type: "Uint32"}
             Columns { Name: "value" Type: "Utf8"}
             KeyColumnNames: ["key"]
+        )");
+        env.TestWaitNotification(runtime, txId);
+    }
+
+    Y_UNIT_TEST(CreateIndexedTableAfterBackup) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        ui64 txId = 100;
+
+        TSchemeLimits limits;
+        limits.MaxShards = 3; // for table + table + index
+        SetSchemeshardSchemaLimits(runtime, limits);
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Uint32"}
+            Columns { Name: "value" Type: "Utf8"}
+            KeyColumnNames: ["key"]
+            PartitionConfig {
+                PartitioningPolicy {
+                    SizeToSplit: 100
+                }
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        for (int i = 1; i <= 2; ++i) {
+            TestCreateTable(runtime, ++txId, "/MyRoot", Sprintf(R"(
+                Name: "CopyTable%i"
+                CopyFromTable: "/MyRoot/Table"
+                IsBackup: true
+            )", i));
+            env.TestWaitNotification(runtime, txId);
+        }
+
+        TestCreateIndexedTable(runtime, ++txId, "/MyRoot", R"(
+            TableDescription {
+              Name: "Table2"
+              Columns { Name: "key" Type: "Uint32"}
+              Columns { Name: "value" Type: "Utf8"}
+              KeyColumnNames: ["key"]
+            }
+            IndexDescription {
+              Name: "UserDefinedIndexByValue"
+              KeyColumnNames: ["value"]
+            }
         )");
         env.TestWaitNotification(runtime, txId);
     }
@@ -6372,6 +6455,74 @@ Y_UNIT_TEST_SUITE(TSchemeShardTest) {
                 PartitionKeySchema { Name: "key2" TypeId: 2 }
             }
         )", {NKikimrScheme::StatusInvalidParameter});
+    }
+
+    Y_UNIT_TEST(TopicMeteringMode) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        ui64 txId = 100;
+
+        TestCreatePQGroup(runtime, ++txId, "/MyRoot", R"(
+            Name: "Topic1"
+            TotalGroupCount: 1
+            PartitionPerTablet: 1
+            PQTabletConfig {
+                PartitionConfig { LifetimeSeconds: 10 }
+                MeteringMode: METERING_MODE_REQUEST_UNITS
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TestDescribeResult(
+            DescribePath(runtime, "/MyRoot/Topic1"), {
+                NLs::PathExist,
+                NLs::Finished, [=] (const NKikimrScheme::TEvDescribeSchemeResult& record) {
+                    const auto& config = record.GetPathDescription().GetPersQueueGroup().GetPQTabletConfig();
+                    UNIT_ASSERT(config.HasMeteringMode());
+                    UNIT_ASSERT(config.GetMeteringMode() == NKikimrPQ::TPQTabletConfig::METERING_MODE_REQUEST_UNITS);
+                }
+            }
+        );
+
+        TestAlterPQGroup(runtime, ++txId, "/MyRoot", R"(
+            Name: "Topic1"
+            PQTabletConfig {
+                PartitionConfig { LifetimeSeconds: 10 }
+                MeteringMode: METERING_MODE_RESERVED_CAPACITY
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TestDescribeResult(
+            DescribePath(runtime, "/MyRoot/Topic1"), {
+                NLs::PathExist,
+                NLs::Finished, [=] (const NKikimrScheme::TEvDescribeSchemeResult& record) {
+                    const auto& config = record.GetPathDescription().GetPersQueueGroup().GetPQTabletConfig();
+                    UNIT_ASSERT(config.HasMeteringMode());
+                    UNIT_ASSERT(config.GetMeteringMode() == NKikimrPQ::TPQTabletConfig::METERING_MODE_RESERVED_CAPACITY);
+                }
+            }
+        );
+
+        TestCreatePQGroup(runtime, ++txId, "/MyRoot", R"(
+            Name: "Topic2"
+            TotalGroupCount: 1
+            PartitionPerTablet: 1
+            PQTabletConfig {
+                PartitionConfig { LifetimeSeconds: 10 }
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TestDescribeResult(
+            DescribePath(runtime, "/MyRoot/Topic2"), {
+                NLs::PathExist,
+                NLs::Finished, [=] (const NKikimrScheme::TEvDescribeSchemeResult& record) {
+                    const auto& config = record.GetPathDescription().GetPersQueueGroup().GetPQTabletConfig();
+                    UNIT_ASSERT(!config.HasMeteringMode());
+                }
+            }
+        );
     }
 
     Y_UNIT_TEST(DropTable) { //+

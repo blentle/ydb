@@ -191,6 +191,7 @@ message TKqpTransaction {
         message TWriteOpMeta {
             optional TKeyRange Range = 1;
             repeated TColumnWriteMeta Columns = 3;
+            optional bool IsPureEraseOp = 4;
         }
 
         optional TTableMeta Table = 1;
@@ -220,6 +221,7 @@ message TKqpTransaction {
          optional EScanDataFormat DataFormat = 9;
          optional NKikimrSSA.TOlapProgram OlapProgram = 10; // Currently only for OLAP tables
          optional bool Sorted = 11;
+         repeated TColumnMeta ResultColumns = 12;
     }
 
     optional EKqpTransactionType Type = 1;
@@ -1424,6 +1426,7 @@ message TEvKqpScan {
     optional NYql.NDqProto.EDqStatsMode StatsMode = 18;
     optional bytes OlapProgram = 19;
     optional NKikimrSchemeOp.EOlapProgramType OlapProgramType = 20;
+    optional bool CostDataOnly = 21[default = false];
 }
 
 message TEvCompactTable {
@@ -1484,7 +1487,7 @@ message TEvGetCompactTableStatsResult {
 // 4. Shard replies with TEvReadResult, which contains:
 //    - ReadId which is the same as in TEvRead. Shard gives no guarantee
 //    that the ReadId will be valid any time.
-//    - Snapshot version, which is useful when it wasn't specified in TEvRead.
+//    - Snapshot version in case of MVCC read or when HEAD read transformed to MVCC, i.e. repeatable read
 //    - SeqNo that should be used by user in TEvReadAck
 //    - ContinuationToken, which user can use to restart the read.
 //    - TxLocks or BrokenTxLocks when user specified LockTxId and LockNodeId.
@@ -1787,33 +1790,4 @@ message TEvReplicationSourceOffsetsAck {
 message TEvReplicationSourceOffsetsCancel {
     // Cancels a previously started read for (Sender, ReadId)
     optional uint64 ReadId = 1;
-}
-
-message TEvTestLoadRequest {
-    message TLoadStop {
-        optional uint64 Tag = 1;
-        optional bool RemoveAllTags = 2;
-    }
-
-    message TUpdateStart {
-        optional uint64 Tag = 1;
-        optional uint64 RowCount = 2;
-        optional uint64 TabletId = 3;
-        optional uint64 TableId = 4;
-        optional uint32 Inflight = 5;
-    }
-
-    optional uint64 Cookie = 1;
-
-    oneof Command {
-        TLoadStop LoadStop = 2;
-        TUpdateStart BulkUpsertStart = 3;
-        TUpdateStart UpsertStart = 4;
-    }
-}
-
-message TEvTestLoadResponse {
-    optional uint32 Status = 1; // EResponseStatus from ydb/core/client/base/msgbus.h
-    optional string ErrorReason = 2;
-    optional uint64 Cookie = 3;
 }

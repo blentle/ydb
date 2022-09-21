@@ -441,7 +441,8 @@ public:
                     }
 
                     newPaths = ctx.ChangeChildren(maybeS3SourceSettings.Cast().Paths().Ref(), std::move(newPathItems));
-                    TExprNode::TPtr newExtra = ctx.ChangeChildren(*originalExtra, std::move(newExtraColumnsExtents));
+
+                    TExprNode::TPtr newExtra = ctx.NewCallable(extraColumnsSetting->Pos(), "OrderedExtend", std::move(newExtraColumnsExtents));
                     newSettings = TExprBase(extraTypeItems.empty() ? RemoveSetting(settings.Cast().Ref(), "extraColumns", ctx) :
                         ReplaceSetting(settings.Cast().Ref(), extraColumnsSetting->Pos(), "extraColumns", newExtra, ctx));
                 }
@@ -468,8 +469,25 @@ public:
         const TStructExprType* readRowType =
             dqSource.Input().Maybe<TS3ParseSettings>().Cast().RowType().Ref().GetTypeAnn()->Cast<TTypeExprType>()->GetType()->Cast<TStructExprType>();
 
-        if (outputRowType->GetSize() == 0 && readRowType->GetSize() != 0) {
-            auto item = GetLightColumn(*readRowType);
+        TVector<const TItemExprType*> readRowDataItems = readRowType->GetItems();
+        TVector<const TItemExprType*> outputRowDataItems = outputRowType->GetItems();
+
+        if (auto settings = dqSource.Input().Maybe<TS3ParseSettings>().Cast().Settings()) {
+            if (auto ps = GetSetting(settings.Cast().Ref(), "partitionedby")) {
+                THashSet<TStringBuf> cols;
+                for (size_t i = 1; i < ps->ChildrenSize(); ++i) {
+                    YQL_ENSURE(ps->Child(i)->IsAtom());
+                    cols.insert(ps->Child(i)->Content());
+                }
+                auto isPartitionedBy = [&](const auto& item) { return cols.contains(item->GetName()); };
+                EraseIf(readRowDataItems, isPartitionedBy);
+                EraseIf(outputRowDataItems, isPartitionedBy);
+            }
+        }
+
+        if (outputRowDataItems.size() == 0 && readRowDataItems.size() != 0) {
+            const TStructExprType* readRowDataType = ctx.MakeType<TStructExprType>(readRowDataItems);
+            auto item = GetLightColumn(*readRowDataType);
             YQL_ENSURE(item);
             readRowType = ctx.MakeType<TStructExprType>(TVector<const TItemExprType*>{item});
         } else {

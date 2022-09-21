@@ -1,8 +1,10 @@
 #pragma once
 
 #include <ydb/core/kqp/expr_nodes/kqp_expr_nodes.h>
+
 #include <ydb/core/kqp/common/kqp_gateway.h>
 #include <ydb/core/kqp/common/kqp_tx_info.h>
+#include <ydb/core/kqp/common/kqp_topic.h>
 
 #include <ydb/core/kqp/provider/yql_kikimr_expr_nodes.h>
 #include <ydb/core/kqp/provider/yql_kikimr_provider.h>
@@ -259,6 +261,7 @@ public:
     TKqpTxLocks Locks;
 
     TDeferredEffects DeferredEffects;
+    NTopic::TTopicOperations TopicOperations;
     TIntrusivePtr<TParamsState> ParamsState;
 
     IKqpGateway::TKqpSnapshotHandle SnapshotHandle;

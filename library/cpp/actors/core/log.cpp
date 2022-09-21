@@ -1,7 +1,4 @@
 #include "log.h"
-#include "log_settings.h"
-
-#include <library/cpp/monlib/service/pages/templates.h>
 
 static_assert(int(NActors::NLog::PRI_EMERG) == int(::TLOG_EMERG), "expect int(NActors::NLog::PRI_EMERG) == int(::TLOG_EMERG)");
 static_assert(int(NActors::NLog::PRI_ALERT) == int(::TLOG_ALERT), "expect int(NActors::NLog::PRI_ALERT) == int(::TLOG_ALERT)");
@@ -33,139 +30,6 @@ namespace {
 }
 
 namespace NActors {
-
-    class TLoggerCounters : public ILoggerMetrics {
-    public:
-        TLoggerCounters(TIntrusivePtr<NMonitoring::TDynamicCounters> counters)
-            : DynamicCounters(counters)
-        {
-            ActorMsgs_ = DynamicCounters->GetCounter("ActorMsgs", true);
-            DirectMsgs_ = DynamicCounters->GetCounter("DirectMsgs", true);
-            LevelRequests_ = DynamicCounters->GetCounter("LevelRequests", true);
-            IgnoredMsgs_ = DynamicCounters->GetCounter("IgnoredMsgs", true);
-            DroppedMsgs_ = DynamicCounters->GetCounter("DroppedMsgs", true);
-
-            AlertMsgs_ = DynamicCounters->GetCounter("AlertMsgs", true);
-            EmergMsgs_ = DynamicCounters->GetCounter("EmergMsgs", true);
-        }
-
-        ~TLoggerCounters() = default;
-
-        void IncActorMsgs() override {
-            ++*ActorMsgs_;
-        }
-        void IncDirectMsgs() override {
-            ++*DirectMsgs_;
-        }
-        void IncLevelRequests() override {
-            ++*LevelRequests_;
-        }
-        void IncIgnoredMsgs() override {
-            ++*IgnoredMsgs_;
-        }
-        void IncAlertMsgs() override {
-            ++*AlertMsgs_;
-        }
-        void IncEmergMsgs() override {
-            ++*EmergMsgs_;
-        }
-        void IncDroppedMsgs() override {
-            DroppedMsgs_->Inc();
-        };
-
-        void GetOutputHtml(IOutputStream& str) override {
-            HTML(str) {
-                DIV_CLASS("row") {
-                    DIV_CLASS("col-md-12") {
-                        H4() {
-                            str << "Counters" << Endl;
-                        }
-                        DynamicCounters->OutputHtml(str);
-                    }
-                }
-            }
-        }
-
-    private:
-        NMonitoring::TDynamicCounters::TCounterPtr ActorMsgs_;
-        NMonitoring::TDynamicCounters::TCounterPtr DirectMsgs_;
-        NMonitoring::TDynamicCounters::TCounterPtr LevelRequests_;
-        NMonitoring::TDynamicCounters::TCounterPtr IgnoredMsgs_;
-        NMonitoring::TDynamicCounters::TCounterPtr AlertMsgs_;
-        NMonitoring::TDynamicCounters::TCounterPtr EmergMsgs_;
-        // Dropped while the logger backend was unavailable
-        NMonitoring::TDynamicCounters::TCounterPtr DroppedMsgs_;
-
-        TIntrusivePtr<NMonitoring::TDynamicCounters> DynamicCounters;
-    };
-
-    class TLoggerMetrics : public ILoggerMetrics {
-    public:
-        TLoggerMetrics(std::shared_ptr<NMonitoring::TMetricRegistry> metrics)
-            : Metrics(metrics)
-        {
-            ActorMsgs_ = Metrics->Rate(NMonitoring::TLabels{{"sensor", "logger.actor_msgs"}});
-            DirectMsgs_ = Metrics->Rate(NMonitoring::TLabels{{"sensor", "logger.direct_msgs"}});
-            LevelRequests_ = Metrics->Rate(NMonitoring::TLabels{{"sensor", "logger.level_requests"}});
-            IgnoredMsgs_ = Metrics->Rate(NMonitoring::TLabels{{"sensor", "logger.ignored_msgs"}});
-            DroppedMsgs_ = Metrics->Rate(NMonitoring::TLabels{{"sensor", "logger.dropped_msgs"}});
-
-            AlertMsgs_ = Metrics->Rate(NMonitoring::TLabels{{"sensor", "logger.alert_msgs"}});
-            EmergMsgs_ = Metrics->Rate(NMonitoring::TLabels{{"sensor", "logger.emerg_msgs"}});
-        }
-
-        ~TLoggerMetrics() = default;
-
-        void IncActorMsgs() override {
-            ActorMsgs_->Inc();
-        }
-        void IncDirectMsgs() override {
-            DirectMsgs_->Inc();
-        }
-        void IncLevelRequests() override {
-            LevelRequests_->Inc();
-        }
-        void IncIgnoredMsgs() override {
-            IgnoredMsgs_->Inc();
-        }
-        void IncAlertMsgs() override {
-            AlertMsgs_->Inc();
-        }
-        void IncEmergMsgs() override {
-            EmergMsgs_->Inc();
-        }
-        void IncDroppedMsgs() override {
-            DroppedMsgs_->Inc();
-        };
-
-        void GetOutputHtml(IOutputStream& str) override {
-            HTML(str) {
-                DIV_CLASS("row") {
-                    DIV_CLASS("col-md-12") {
-                        H4() {
-                            str << "Metrics" << Endl;
-                        }
-                        // TODO: Now, TMetricRegistry does not have the GetOutputHtml function
-                    }
-                }
-            }
-        }
-
-    private:
-        NMonitoring::TRate* ActorMsgs_;
-        NMonitoring::TRate* DirectMsgs_;
-        NMonitoring::TRate* LevelRequests_;
-        NMonitoring::TRate* IgnoredMsgs_;
-        NMonitoring::TRate* AlertMsgs_;
-        NMonitoring::TRate* EmergMsgs_;
-        // Dropped while the logger backend was unavailable
-        NMonitoring::TRate* DroppedMsgs_;
-
-        std::shared_ptr<NMonitoring::TMetricRegistry> Metrics;
-    };
-
-    TAtomic TLoggerActor::IsOverflow = 0;
-
     TLoggerActor::TLoggerActor(TIntrusivePtr<NLog::TSettings> settings,
                                TAutoPtr<TLogBackend> logBackend,
                                TIntrusivePtr<NMonitoring::TDynamicCounters> counters)
@@ -173,6 +37,7 @@ namespace NActors {
         , Settings(settings)
         , LogBackend(logBackend.Release())
         , Metrics(std::make_unique<TLoggerCounters>(counters))
+        , LogBuffer(*Metrics, *Settings)
     {
     }
 
@@ -183,6 +48,7 @@ namespace NActors {
         , Settings(settings)
         , LogBackend(logBackend)
         , Metrics(std::make_unique<TLoggerCounters>(counters))
+        , LogBuffer(*Metrics, *Settings)
     {
     }
 
@@ -193,6 +59,7 @@ namespace NActors {
         , Settings(settings)
         , LogBackend(logBackend.Release())
         , Metrics(std::make_unique<TLoggerMetrics>(metrics))
+        , LogBuffer(*Metrics, *Settings)
     {
     }
 
@@ -203,6 +70,7 @@ namespace NActors {
         , Settings(settings)
         , LogBackend(logBackend)
         , Metrics(std::make_unique<TLoggerMetrics>(metrics))
+        , LogBuffer(*Metrics, *Settings)
     {
     }
 
@@ -224,26 +92,38 @@ namespace NActors {
     }
 
     void TLoggerActor::Throttle(const NLog::TSettings& settings) {
-        if (AtomicGet(IsOverflow))
-            Sleep(settings.ThrottleDelay);
+        // throttling via Sleep was removed since it causes unexpected
+        // incidents when users try to set AllowDrop=false.
+        Y_UNUSED(settings);
     }
 
-    void TLoggerActor::LogIgnoredCount(TInstant now) {
-        TString message = Sprintf("Ignored IgnoredCount# %" PRIu64 " log records due to logger overflow!", IgnoredCount);
-        if (!OutputRecord(now, NActors::NLog::EPrio::Error, Settings->LoggerComponent, message)) {
-            BecomeDefunct();
+    void TLoggerActor::FlushLogBufferMessage() {
+        if (!LogBuffer.IsEmpty()) {
+            NLog::TEvLog *log = LogBuffer.Pop();  
+            if (!OutputRecord(log)) {
+                BecomeDefunct();
+            }
+            delete log;
         }
     }
 
-    void TLoggerActor::HandleIgnoredEvent(TLogIgnored::TPtr& ev, const NActors::TActorContext& ctx) {
+    void TLoggerActor::FlushLogBufferMessageEvent(TFlushLogBuffer::TPtr& ev, const NActors::TActorContext& ctx) {
         Y_UNUSED(ev);
-        LogIgnoredCount(ctx.Now());
-        IgnoredCount = 0;
-        PassedCount = 0;
-    }
+        FlushLogBufferMessage();
+        
+        ui64 ignoredCount = LogBuffer.GetIgnoredCount();
+        if (ignoredCount > 0) {
+            NLog::EPrio prio = LogBuffer.GetIgnoredHighestPrio();
+            TString message = Sprintf("Logger overflow! Ignored %" PRIu64 "  log records with priority [%s] or lower!", ignoredCount, PriorityToString(prio));
+            if (!OutputRecord(ctx.Now(), NActors::NLog::EPrio::Error, Settings->LoggerComponent, message)) {
+                BecomeDefunct();
+            }
+            LogBuffer.ClearIgnoredCount();
+        }
 
-    void TLoggerActor::HandleIgnoredEventDrop() {
-        // logger backend is unavailable, just ignore
+        if (!LogBuffer.IsEmpty()) {
+            ctx.Send(ctx.SelfID, ev->Release().Release());
+        }
     }
 
     void TLoggerActor::WriteMessageStat(const NLog::TEvLog& ev) {
@@ -268,31 +148,23 @@ namespace NActors {
         i64 delayMillisec = (ctx.Now() - ev->Get()->Stamp).MilliSeconds();
         WriteMessageStat(*ev->Get());
         if (Settings->AllowDrop) {
-            // Disable throttling if it was enabled previously
-            if (AtomicGet(IsOverflow))
-                AtomicSet(IsOverflow, 0);
-
-            // Check if some records have to be dropped
-            if ((PassedCount > 10 && delayMillisec > (i64)Settings->TimeThresholdMs) || IgnoredCount > 0) {
-                Metrics->IncIgnoredMsgs();
-                if (IgnoredCount == 0) {
-                    ctx.Send(ctx.SelfID, new TLogIgnored());
+            if (PassedCount > 10 && delayMillisec > (i64)Settings->TimeThresholdMs || !LogBuffer.IsEmpty() || LogBuffer.CheckLogIgnoring()) {
+                if (LogBuffer.IsEmpty() && !LogBuffer.CheckLogIgnoring()) {
+                    ctx.Send(ctx.SelfID, new TFlushLogBuffer());
                 }
-                ++IgnoredCount;
+                LogBuffer.AddLog(ev->Release().Release());
                 PassedCount = 0;
-                return;
+
+                if (delayMillisec < (i64)Settings->TimeThresholdMs && !LogBuffer.CheckLogIgnoring()) {
+                    FlushLogBufferMessage();
+                }
+                return; 
             }
+            
             PassedCount++;
-        } else {
-            // Enable of disable throttling depending on the load
-            if (delayMillisec > (i64)Settings->TimeThresholdMs && !AtomicGet(IsOverflow))
-                AtomicSet(IsOverflow, 1);
-            else if (delayMillisec <= (i64)Settings->TimeThresholdMs && AtomicGet(IsOverflow))
-                AtomicSet(IsOverflow, 0);
         }
 
-        const auto prio = ev->Get()->Level.ToPrio();
-        if (!OutputRecord(ev->Get()->Stamp, prio, ev->Get()->Component, ev->Get()->Line)) {
+        if (!OutputRecord(ev->Get())) {
             BecomeDefunct();
         }
     }
@@ -312,7 +184,7 @@ namespace NActors {
     void TLoggerActor::RenderComponentPriorities(IOutputStream& str) {
         using namespace NLog;
         HTML(str) {
-            H4() {
+            TAG(TH4) {
                 str << "Priority Settings for the Components";
             }
             TABLE_SORTABLE_CLASS("table") {
@@ -415,7 +287,7 @@ namespace NActors {
             HTML(str) {
                 DIV_CLASS("row") {
                     DIV_CLASS("col-md-12") {
-                        H4() {
+                        TAG(TH4) {
                             str << "Current log settings for " << Settings->ComponentName(component) << Endl;
                         }
                         UL() {
@@ -437,7 +309,7 @@ namespace NActors {
 
                 DIV_CLASS("row") {
                     DIV_CLASS("col-md-12") {
-                        H4() {
+                        TAG(TH4) {
                             str << "Change priority" << Endl;
                         }
                         UL() {
@@ -448,7 +320,7 @@ namespace NActors {
                                 }
                             }
                         }
-                        H4() {
+                        TAG(TH4) {
                             str << "Change sampling priority" << Endl;
                         }
                         UL() {
@@ -459,7 +331,7 @@ namespace NActors {
                                 }
                             }
                         }
-                        H4() {
+                        TAG(TH4) {
                             str << "Change sampling rate" << Endl;
                         }
                         str << "<form method=\"GET\">" << Endl;
@@ -467,7 +339,7 @@ namespace NActors {
                         str << "<input type=\"hidden\" name=\"c\" value=\"" << component << "\">" << Endl;
                         str << "<input class=\"btn btn-primary\" type=\"submit\" value=\"Change\"/>" << Endl;
                         str << "</form>" << Endl;
-                        H4() {
+                        TAG(TH4) {
                             str << "<a href='logger'>Cancel</a>" << Endl;
                         }
                     }
@@ -503,7 +375,7 @@ namespace NActors {
                         RenderComponentPriorities(str);
                     }
                     DIV_CLASS("col-md-6") {
-                        H4() {
+                        TAG(TH4) {
                             str << "Change priority for all components";
                         }
                         TABLE_CLASS("table table-condensed") {
@@ -525,7 +397,7 @@ namespace NActors {
                                 }
                             }
                         }
-                        H4() {
+                        TAG(TH4) {
                             str << "Change sampling priority for all components";
                         }
                         TABLE_CLASS("table table-condensed") {
@@ -547,7 +419,7 @@ namespace NActors {
                                 }
                             }
                         }
-                        H4() {
+                        TAG(TH4) {
                             str << "Change sampling rate for all components";
                         }
                         str << "<form method=\"GET\">" << Endl;
@@ -555,7 +427,7 @@ namespace NActors {
                         str << "<input type=\"hidden\" name=\"c\" value=\"-1\">" << Endl;
                         str << "<input class=\"btn btn-primary\" type=\"submit\" value=\"Change\"/>" << Endl;
                         str << "</form>" << Endl;
-                        H4() {
+                        TAG(TH4) {
                             str << "Drop log entries in case of overflow: "
                                 << (Settings->AllowDrop ? "Enabled" : "Disabled");
                         }
@@ -573,6 +445,10 @@ namespace NActors {
     }
 
     constexpr size_t TimeBufSize = 512;
+
+    bool TLoggerActor::OutputRecord(NLog::TEvLog *evLog) noexcept {
+        return OutputRecord(evLog->Stamp, evLog->Level.ToPrio(), evLog->Component, evLog->Line);
+    }
 
     bool TLoggerActor::OutputRecord(TInstant time, NLog::EPrio priority, NLog::EComponent component,
                                     const TString& formatted) noexcept try {

@@ -30,17 +30,24 @@ namespace NKikimr::NTestShard {
 
         enum {
             EvValidationFinished = EventSpaceBegin(TEvents::ES_PRIVATE),
+            EvDoSomeAction,
         };
 
         struct TEvValidationFinished : TEventLocal<TEvValidationFinished, EvValidationFinished> {
             std::unordered_map<TString, TKeyInfo> Keys;
+            bool InitialCheck;
 
-            TEvValidationFinished(std::unordered_map<TString, TKeyInfo> keys)
+            TEvValidationFinished(std::unordered_map<TString, TKeyInfo> keys, bool initialCheck)
                 : Keys(std::move(keys))
+                , InitialCheck(initialCheck)
             {}
         };
 
     public:
+        static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
+            return NKikimrServices::TActivity::TEST_SHARD_LOAD_ACTOR;
+        }
+
         TLoadActor(ui64 tabletId, ui32 generation, const TActorId tablet,
             const NKikimrClient::TTestShardControlRequest::TCmdInitialize& settings);
         void Bootstrap(const TActorId& parentId);
@@ -55,6 +62,7 @@ namespace NKikimr::NTestShard {
             hFunc(TEvStateServerStatus, Handle);
             hFunc(TEvStateServerWriteResult, Handle);
             hFunc(TEvValidationFinished, Handle);
+            cFunc(EvDoSomeAction, Action);
             cFunc(TEvents::TSystem::Poison, PassAway);
             cFunc(TEvents::TSystem::Wakeup, HandleWakeup);
         )

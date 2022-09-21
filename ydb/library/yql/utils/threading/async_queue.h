@@ -6,7 +6,10 @@
 #include <util/thread/pool.h>
 #include <util/generic/ptr.h>
 #include <util/generic/function.h>
+#include <util/system/guard.h>
+#include <util/system/rwlock.h>
 
+#include <exception>
 
 namespace NYql {
 
@@ -17,19 +20,31 @@ public:
     static TPtr Make(size_t numThreads, const TString& poolName);
 
     void Stop() {
-        MtpQueue_->Stop();
+        auto guard = TWriteGuard(Lock_);
+        if (MtpQueue_) {
+            MtpQueue_->Stop();
+            MtpQueue_.Destroy();
+        }
     }
 
     template <typename TCallable>
     [[nodiscard]]
     ::NThreading::TFuture<::NThreading::TFutureType<::TFunctionResult<TCallable>>> Async(TCallable&& func) {
-        return ::NThreading::Async(std::move(func), *MtpQueue_);
+        {
+            auto guard = TReadGuard(Lock_);
+            if (MtpQueue_) {
+                return ::NThreading::Async(std::move(func), *MtpQueue_);
+            }
+        }
+
+        return ::NThreading::MakeErrorFuture<::NThreading::TFutureType<::TFunctionResult<TCallable>>>(std::make_exception_ptr(yexception() << "Thread pool is already stopped"));
     }
 
 private:
     TAsyncQueue(size_t numThreads, const TString& poolName);
 
 private:
+    TRWMutex Lock_;
     THolder<IThreadPool> MtpQueue_;
 };
 

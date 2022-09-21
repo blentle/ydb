@@ -13,15 +13,12 @@ namespace NKikimr::NTestShard {
     {}
 
     void TLoadActor::Bootstrap(const TActorId& parentId) {
+        STLOG(PRI_DEBUG, TEST_SHARD, TS31, "TLoadActor::Bootstrap", (TabletId, TabletId));
         TabletActorId = parentId;
         Send(MakeStateServerInterfaceActorId(), new TEvStateServerConnect(Settings.GetStorageServerHost(),
             Settings.GetStorageServerPort()));
         Send(parentId, new TTestShard::TEvSwitchMode(TTestShard::EMode::STATE_SERVER_CONNECT));
         Become(&TThis::StateFunc);
-        if (Settings.RestartPeriodsSize()) {
-            TActivationContext::Schedule(GenerateRandomInterval(Settings.GetRestartPeriods()), new IEventHandle(
-                TEvents::TSystem::Wakeup, 0, SelfId(), {}, nullptr, 0));
-        }
     }
 
     void TLoadActor::PassAway() {
@@ -57,8 +54,11 @@ namespace NKikimr::NTestShard {
                 RunValidation(false);
             }
         } else { // resume load
-            while (WritesInFlight.size() < Settings.GetMaxInFlight()) { // write until there is space in inflight
+            if (WritesInFlight.size() < Settings.GetMaxInFlight()) { // write until there is space in inflight
                 IssueWrite();
+                if (WritesInFlight.size() < Settings.GetMaxInFlight()) {
+                    TActivationContext::Send(new IEventHandle(EvDoSomeAction, 0, SelfId(), {}, nullptr, 0));
+                }
             }
             if (BytesOfData > Settings.GetMaxDataBytes()) { // delete some data if needed
                 IssueDelete();

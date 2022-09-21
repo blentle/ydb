@@ -4,7 +4,7 @@
 #include "mkql_aggrcount.h"
 #include "mkql_append.h"
 #include "mkql_apply.h"
-#include "mkql_block_add.h"
+#include "mkql_block_func.h"
 #include "mkql_blocks.h"
 #include "mkql_callable.h"
 #include "mkql_chain_map.h"
@@ -44,6 +44,7 @@
 #include "mkql_iterator.h"
 #include "mkql_join.h"
 #include "mkql_join_dict.h"
+#include "mkql_grace_join.h"
 #include "mkql_lazy_list.h"
 #include "mkql_length.h"
 #include "mkql_listfromrange.h"
@@ -218,6 +219,7 @@ struct TCallableComputationNodeBuilderFuncMapFiller {
         {"Nth", &WrapNth},
         {"ToIndexDict", &WrapToIndexDict},
         {"JoinDict", &WrapJoinDict},
+        {"GraceJoin", &WrapGraceJoin},
         {"MapJoinCore", &WrapMapJoinCore},
         {"CommonJoinCore", &WrapCommonJoinCore},
         {"CombineCore", &WrapCombineCore},
@@ -261,9 +263,10 @@ struct TCallableComputationNodeBuilderFuncMapFiller {
         {"FromFlow", &WrapFromFlow},
         {"ToBlocks", &WrapToBlocks},
         {"WideToBlocks", &WrapWideToBlocks},
-        {"BlockAdd", &WrapBlockAdd},
+        {"BlockFunc", &WrapBlockFunc},
         {"FromBlocks", &WrapFromBlocks},
-        {"AsSingle", &WrapAsSingle},
+        {"WideFromBlocks", &WrapWideFromBlocks},
+        {"AsScalar", &WrapAsScalar},
         {"MakeHeap", &WrapMakeHeap},
         {"PushHeap", &WrapPushHeap},
         {"PopHeap", &WrapPopHeap},

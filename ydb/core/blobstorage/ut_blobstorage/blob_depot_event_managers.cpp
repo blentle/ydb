@@ -16,7 +16,7 @@ bool IsCollected(const TLogoBlobID& id, ui32 collectGen, ui32 collectStep) {
 }
 
 bool IsCollected(const TBlobInfo& blob, ui32 softCollectGen, ui32 softCollectStep, ui32 hardCollectGen, ui32 hardCollectStep) {
-    return IsCollected(blob.Id, hardCollectGen, hardCollectStep) || (blob.KeepFlag && IsCollected(blob.Id, softCollectGen, softCollectStep));
+    return IsCollected(blob.Id, hardCollectGen, hardCollectStep) || (!blob.KeepFlag && IsCollected(blob.Id, softCollectGen, softCollectStep));
 }
 
 
@@ -103,7 +103,7 @@ void VerifyTEvPutResult(TAutoPtr<TEventHandle<TEvBlobStorage::TEvPutResult>> res
             UNIT_FAIL("Unexpected status");
         }
     } else if (status != NKikimrProto::OK && status != NKikimrProto::ERROR) {
-        UNIT_FAIL("Unexpected status");
+        UNIT_FAIL(TStringBuilder() << "Unexpected status: " << NKikimrProto::EReplyStatus_Name(status));
     }
 }
 
@@ -129,17 +129,9 @@ void SendTEvGet(TEnvironmentSetup& env, TActorId sender, ui32 groupId, TLogoBlob
 }
 
 TAutoPtr<TEventHandle<TEvBlobStorage::TEvGetResult>> CaptureTEvGetResult(TEnvironmentSetup& env, TActorId sender, bool termOnCapture, bool withDeadline) {
-    TInstant deadline = TInstant::Max();
-    if (withDeadline) {
-        env.Runtime->WrapInActorContext(sender, [&] {
-            deadline = TActivationContext::Now() + TDuration::Seconds(1);
-        });
-    }
-    
+    const TInstant deadline = withDeadline ? env.Runtime->GetClock() + TDuration::Seconds(10) : TInstant::Max();
     auto res = env.WaitForEdgeActorEvent<TEvBlobStorage::TEvGetResult>(sender, termOnCapture, deadline);
-    
     // if (res.Get() == nullptr) { Cerr << "TEvGet didn't return" << Endl; return nullptr; } // <- Temporary solution
-
     UNIT_ASSERT(res);
 
 #ifdef LOG_GET        
@@ -227,17 +219,9 @@ void SendTEvGet(TEnvironmentSetup& env, TActorId sender, ui32 groupId, std::vect
 }
 
 TAutoPtr<TEventHandle<TEvBlobStorage::TEvGetResult>> CaptureMultiTEvGetResult(TEnvironmentSetup& env, TActorId sender, bool termOnCapture, bool withDeadline) {
-    TInstant deadline = TInstant::Max();
-    if (withDeadline) {
-        env.Runtime->WrapInActorContext(sender, [&] {
-            deadline = TActivationContext::Now() + TDuration::Seconds(1);
-        });
-    }
-
+    const TInstant deadline = withDeadline ? env.Runtime->GetClock() + TDuration::Seconds(10) : TInstant::Max();
     auto res = env.WaitForEdgeActorEvent<TEvBlobStorage::TEvGetResult>(sender, termOnCapture, deadline);
-
     // if (!res) { Cerr << "TEvDiscover didn't return" << Endl; return nullptr; } // <- Temporary Solution
-
     UNIT_ASSERT(res);
 
 #ifdef LOG_MULTIGET        
@@ -313,13 +297,7 @@ void SendTEvRange(TEnvironmentSetup& env, TActorId sender, ui32 groupId, ui64 ta
 }
     
 TAutoPtr<TEventHandle<TEvBlobStorage::TEvRangeResult>> CaptureTEvRangeResult(TEnvironmentSetup& env, TActorId sender, bool termOnCapture, bool withDeadline) {
-    TInstant deadline = TInstant::Max();
-    if (withDeadline) {
-        env.Runtime->WrapInActorContext(sender, [&] {
-            deadline = TActivationContext::Now() + TDuration::Seconds(1);
-        });
-    }
-
+    const TInstant deadline = withDeadline ? env.Runtime->GetClock() + TDuration::Seconds(10) : TInstant::Max();
     auto res = env.WaitForEdgeActorEvent<TEvBlobStorage::TEvRangeResult>(sender, termOnCapture, deadline);
 
 #ifdef LOG_RANGE
@@ -414,17 +392,9 @@ void SendTEvDiscover(TEnvironmentSetup& env, TActorId sender, ui32 groupId, ui64
 }
 
 TAutoPtr<TEventHandle<TEvBlobStorage::TEvDiscoverResult>> CaptureTEvDiscoverResult(TEnvironmentSetup& env, TActorId sender, bool termOnCapture, bool withDeadline) {
-    TInstant deadline = TInstant::Max();
-    if (withDeadline) {
-        env.Runtime->WrapInActorContext(sender, [&] {
-            deadline = TActivationContext::Now() + TDuration::Seconds(1);
-        });
-    }
-
+    const TInstant deadline = withDeadline ? env.Runtime->GetClock() + TDuration::Seconds(10) : TInstant::Max();
     auto res = env.WaitForEdgeActorEvent<TEvBlobStorage::TEvDiscoverResult>(sender, termOnCapture, deadline);
-
     // if (!res) { Cerr << "TEvDiscover didn't return" << Endl; return nullptr; } // <- Temporary Solution
-
     UNIT_ASSERT_C(res, "Timeout - no TEvDiscoverResult received");
 
 #ifdef LOG_DISCOVER

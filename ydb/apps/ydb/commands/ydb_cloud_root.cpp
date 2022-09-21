@@ -24,7 +24,7 @@ void TClientCommandRoot::SetCredentialsGetter(TConfig& config) {
             return CreateOAuthCredentialsProviderFactory(config.SecurityToken);
         }
         if (config.UseStaticCredentials) {
-            if (config.StaticCredentials.User && config.StaticCredentials.Password) {
+            if (config.StaticCredentials.User) {
                 return CreateLoginCredentialsProviderFactory(config.StaticCredentials);
             }
         }
@@ -71,18 +71,17 @@ void TYCloudClientCommandRoot::Config(TConfig& config) {
 }
 
 int TYCloudClientCommandRoot::Run(TConfig& config) {
-    if (!config.IsUpdateCommand() && !config.IsSetVersionCheckCommand()) {
+    if (config.NeedToCheckForUpdate) {
         TYdbUpdater updater;
-        bool forceVersionCheck = config.IsVersionForceCheckCommand();
-        if (forceVersionCheck) {
+        if (config.ForceVersionCheck) {
             Cout << "Force checking if there is a newer version..." << Endl;
         }
-        if (updater.CheckIfUpdateNeeded(forceVersionCheck)) {
+        if (updater.CheckIfUpdateNeeded(config.ForceVersionCheck)) {
             NColorizer::TColors colors = NColorizer::AutoColors(Cerr);
             Cerr << colors.RedColor() << "(!) New version of YDB CLI is available. Run 'ydb update' command for update. "
                 << "You can also disable further version checks with 'ydb version --disable-checks' command"
                 << colors.OldColor() << Endl;
-        } else if (forceVersionCheck) {
+        } else if (config.ForceVersionCheck) {
             NColorizer::TColors colors = NColorizer::AutoColors(Cerr);
             Cout << colors.GreenColor() << "Current version is up to date"
                 << colors.OldColor() << Endl;

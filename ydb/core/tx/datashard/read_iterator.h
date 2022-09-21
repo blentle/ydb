@@ -64,8 +64,9 @@ struct TReadIteratorState {
     };
 
 public:
-    explicit TReadIteratorState(const TActorId& sessionId)
-        : SessionId(sessionId)
+    TReadIteratorState(const TActorId& sessionId, bool isHeadRead)
+        : IsHeadRead(isHeadRead)
+        , SessionId(sessionId)
     {}
 
     bool IsExhausted() const { return State == EState::Exhausted; }
@@ -155,9 +156,10 @@ public:
     TPathId PathId;
     std::vector<NTable::TTag> Columns;
     TRowVersion ReadVersion = TRowVersion::Max();
-    ui64 LockTxId = 0;
+    bool IsHeadRead = false;
+    ui64 LockId = 0;
+    ui32 LockNodeId = 0;
     TLockInfo::TPtr Lock;
-    bool ReportedLockBroken = false;
 
     // note that will be always overwritten by values from request
     NKikimrTxDataShard::EScanDataFormat Format = NKikimrTxDataShard::EScanDataFormat::CELLVEC;

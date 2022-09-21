@@ -9,13 +9,24 @@
 #include <google/protobuf/text_format.h>
 #include <library/cpp/monlib/service/pages/templates.h>
 
-namespace NKikimr::NDataShard {
+namespace NKikimr::NDataShardLoad {
 
 class TLoadActor : public TActorBootstrapped<TLoadActor> {
     // per-actor HTTP info
     struct TActorInfo {
         ui64 Tag; // load tag
         TString Data; // HTML response
+    };
+
+    struct TRunningActorInfo {
+        TActorId ActorId;
+        TActorId Parent; // if set we notify parent when actor finishes
+
+        explicit TRunningActorInfo(const TActorId& actorId, const TActorId& parent = {})
+            : ActorId(actorId)
+            , Parent(parent)
+        {
+        }
     };
 
     // per-request info
@@ -31,14 +42,15 @@ class TLoadActor : public TActorBootstrapped<TLoadActor> {
         ui64 Tag;
         TString ErrorReason;
         TInstant FinishTime;
-        std::optional<TLoadReport> Report;
+        std::optional<TEvDataShardLoad::TLoadReport> Report;
     };
 
     // info about finished actors
     TVector<TFinishedTestInfo> FinishedTests;
 
     // currently running load actors
-    TMap<ui64, TActorId> LoadActors;
+    TMap<ui64, TRunningActorInfo> LoadActors;
+    ui64 LastTag = 0; // tags start from 1
 
     // next HTTP request identifier
     ui32 NextRequestId;
@@ -62,19 +74,20 @@ public:
         Become(&TLoadActor::StateFunc);
     }
 
-    void Handle(TEvDataShard::TEvTestLoadRequest::TPtr& ev, const TActorContext& ctx) {
+    void Handle(TEvDataShardLoad::TEvTestLoadRequest::TPtr& ev, const TActorContext& ctx) {
+        const auto& record = ev->Get()->Record;
         ui32 status = NMsgBusProxy::MSTATUS_OK;
         TString error;
-        const auto& record = ev->Get()->Record;
+        ui64 tag = 0;
         try {
-            ProcessCmd(record, ctx);
+            tag = ProcessCmd(ev, ctx);
         } catch (const TLoadActorException& ex) {
             LOG_ERROR_S(ctx, NKikimrServices::DS_LOAD_TEST, "Exception while creating load actor, what# "
                     << ex.what());
             status = NMsgBusProxy::MSTATUS_ERROR;
             error = ex.what();
         }
-        auto response = std::make_unique<TEvDataShard::TEvTestLoadResponse>();
+        auto response = std::make_unique<TEvDataShardLoad::TEvTestLoadResponse>();
         response->Record.SetStatus(status);
         if (error) {
             response->Record.SetErrorReason(error);
@@ -82,88 +95,151 @@ public:
         if (record.HasCookie()) {
             response->Record.SetCookie(record.GetCookie());
         }
+        if (tag) {
+            response->Record.SetTag(tag);
+        }
         ctx.Send(ev->Sender, response.release());
     }
 
-    template<typename T>
-    ui64 GetOrGenerateTag(const T& cmd) {
-        if (cmd.HasTag()) {
-            return cmd.GetTag();
-        } else {
-            if (LoadActors.empty()) {
-                return 1;
-            } else {
-                return LoadActors.rbegin()->first + 1;
-            }
+    ui64 GetTag() {
+        auto tag = ++LastTag;
+
+        // just sanity check
+        if (LoadActors.contains(tag)) {
+            ythrow TLoadActorException() << Sprintf("duplicate load actor with Tag# %" PRIu64, tag);
         }
+
+        return tag;
     }
 
-    void ProcessCmd(const NKikimrTxDataShard::TEvTestLoadRequest& record, const TActorContext& ctx) {
+    ui64 ProcessCmd(TEvDataShardLoad::TEvTestLoadRequest::TPtr& ev, const TActorContext& ctx) {
+        const auto& record = ev->Get()->Record;
         switch (record.Command_case()) {
-            case NKikimrTxDataShard::TEvTestLoadRequest::CommandCase::kBulkUpsertStart: {
-                const auto& cmd = record.GetBulkUpsertStart();
-                const ui64 tag = GetOrGenerateTag(cmd);
-                if (LoadActors.count(tag) != 0) {
-                    ythrow TLoadActorException() << Sprintf("duplicate load actor with Tag# %" PRIu64, tag);
+        case NKikimrDataShardLoad::TEvTestLoadRequest::CommandCase::kUpsertBulkStart: {
+            const auto& cmd = record.GetUpsertBulkStart();
+            const ui64 tag = GetTag();
+            LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Create new bulk upsert load actor with tag# " << tag);
+
+            auto* actor = CreateUpsertBulkActor(cmd, ctx.SelfID, GetServiceCounters(Counters, "load_actor"), tag);
+            TRunningActorInfo actorInfo(ctx.Register(actor));
+            if (record.GetNotifyWhenFinished()) {
+                actorInfo.Parent = ev->Sender;
+            }
+            LoadActors.emplace(tag, std::move(actorInfo));
+            return tag;
+        }
+
+        case NKikimrDataShardLoad::TEvTestLoadRequest::CommandCase::kUpsertLocalMkqlStart: {
+            const auto& cmd = record.GetUpsertLocalMkqlStart();
+            const ui64 tag = GetTag();
+            LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Create new local mkql upsert load actor with tag# " << tag);
+
+            auto* actor = CreateLocalMkqlUpsertActor(cmd, ctx.SelfID, GetServiceCounters(Counters, "load_actor"), tag);
+            TRunningActorInfo actorInfo(ctx.Register(actor));
+            if (record.GetNotifyWhenFinished()) {
+                actorInfo.Parent = ev->Sender;
+            }
+            LoadActors.emplace(tag, std::move(actorInfo));
+
+            return tag;
+        }
+
+        case NKikimrDataShardLoad::TEvTestLoadRequest::CommandCase::kUpsertKqpStart: {
+            const auto& cmd = record.GetUpsertKqpStart();
+            const ui64 tag = GetTag();
+            LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Create new kqp upsert load actor with tag# " << tag);
+
+            auto* actor = CreateKqpUpsertActor(cmd, ctx.SelfID, GetServiceCounters(Counters, "load_actor"), tag);
+            TRunningActorInfo actorInfo(ctx.Register(actor));
+            if (record.GetNotifyWhenFinished()) {
+                actorInfo.Parent = ev->Sender;
+            }
+            LoadActors.emplace(tag, std::move(actorInfo));
+
+            return tag;
+        }
+
+        case NKikimrDataShardLoad::TEvTestLoadRequest::CommandCase::kUpsertProposeStart: {
+            const auto& cmd = record.GetUpsertProposeStart();
+            const ui64 tag = GetTag();
+            LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Create new upsert load actor with tag# " << tag);
+
+            auto* actor = CreateProposeUpsertActor(cmd, ctx.SelfID, GetServiceCounters(Counters, "load_actor"), tag);
+            TRunningActorInfo actorInfo(ctx.Register(actor));
+            if (record.GetNotifyWhenFinished()) {
+                actorInfo.Parent = ev->Sender;
+            }
+            LoadActors.emplace(tag, std::move(actorInfo));
+
+            return tag;
+        }
+
+        case NKikimrDataShardLoad::TEvTestLoadRequest::CommandCase::kReadIteratorStart: {
+            const auto& cmd = record.GetReadIteratorStart();
+            const ui64 tag = GetTag();
+            LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Create new read iterator load actor# " << tag);
+
+            auto* actor = CreateReadIteratorActor(cmd, ctx.SelfID, GetServiceCounters(Counters, "load_actor"), tag);
+            TRunningActorInfo actorInfo(ctx.Register(actor));
+            if (record.GetNotifyWhenFinished()) {
+                actorInfo.Parent = ev->Sender;
+            }
+            LoadActors.emplace(tag, std::move(actorInfo));
+
+            return tag;
+        }
+
+        case NKikimrDataShardLoad::TEvTestLoadRequest::CommandCase::kLoadStop: {
+            const auto& cmd = record.GetLoadStop();
+            if (cmd.HasRemoveAllTags() && cmd.GetRemoveAllTags()) {
+                LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Delete all running load actors");
+                for (auto& actorPair : LoadActors) {
+                    ctx.Send(actorPair.second.ActorId, new TEvents::TEvPoisonPill);
                 }
-                LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Create new bulk upsert load actor with tag# " << tag);
-                LoadActors.emplace(tag, ctx.Register(CreateBulkUpsertActor(cmd, ctx.SelfID,
-                                GetServiceCounters(Counters, "load_actor"), tag)));
-                break;
+                LoadActors.clear();
+            } else {
+                if (!cmd.HasTag()) {
+                    ythrow TLoadActorException() << "Either RemoveAllTags or Tag must present";
+                }
+                const ui64 tag = cmd.GetTag();
+                auto it = LoadActors.find(tag);
+                if (it == LoadActors.end()) {
+                    ythrow TLoadActorException()
+                        << Sprintf("load actor with Tag# %" PRIu64 " not found", tag);
+                }
+                LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Delete running load actor# " << tag);
+                ctx.Send(it->second.ActorId, new TEvents::TEvPoisonPill);
+                LoadActors.erase(it);
             }
 
-            case NKikimrTxDataShard::TEvTestLoadRequest::CommandCase::kUpsertStart: {
-                const auto& cmd = record.GetUpsertStart();
-                const ui64 tag = GetOrGenerateTag(cmd);
-                if (LoadActors.count(tag) != 0) {
-                    ythrow TLoadActorException() << Sprintf("duplicate load actor with Tag# %" PRIu64, tag);
-                }
-                LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Create new upsert load actor with tag# " << tag);
-                LoadActors.emplace(tag, ctx.Register(CreateUpsertActor(cmd, ctx.SelfID,
-                                GetServiceCounters(Counters, "load_actor"), tag)));
-                break;
-            }
+            return 0;
+        }
 
-            case NKikimrTxDataShard::TEvTestLoadRequest::CommandCase::kLoadStop: {
-                const auto& cmd = record.GetLoadStop();
-                if (cmd.HasRemoveAllTags() && cmd.GetRemoveAllTags()) {
-                    LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Delete all running load actors");
-                    for (auto& actorPair : LoadActors) {
-                        ctx.Send(actorPair.second, new TEvents::TEvPoisonPill);
-                    }
-                    LoadActors.clear();
-                } else {
-                    VERIFY_PARAM(Tag);
-                    const ui64 tag = cmd.GetTag();
-                    auto it = LoadActors.find(tag);
-                    if (it == LoadActors.end()) {
-                        ythrow TLoadActorException()
-                            << Sprintf("load actor with Tag# %" PRIu64 " not found", tag);
-                    }
-                    LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Delete running load actor with tag# "
-                            << tag);
-                    ctx.Send(it->second, new TEvents::TEvPoisonPill);
-                    LoadActors.erase(it);
-                }
-                break;
-            }
-
-            default: {
-                TString protoTxt;
-                google::protobuf::TextFormat::PrintToString(record, &protoTxt);
-                ythrow TLoadActorException() << (TStringBuilder()
-                        << "TLoadActor::Handle(TEvDataShard::TEvTestLoadRequest): unexpected command case: "
-                        << ui32(record.Command_case())
-                        << " protoTxt# " << protoTxt.Quote());
-            }
+        default: {
+            TString protoTxt;
+            google::protobuf::TextFormat::PrintToString(record, &protoTxt);
+            ythrow TLoadActorException() << (TStringBuilder()
+                    << "TLoadActor::Handle(TEvDataShardLoad::TEvTestLoadRequest): unexpected command case: "
+                    << ui32(record.Command_case())
+                    << " protoTxt# " << protoTxt.Quote());
+        }
         }
     }
 
-    void Handle(TEvTestLoadFinished::TPtr& ev, const TActorContext& ctx) {
+    void Handle(TEvDataShardLoad::TEvTestLoadFinished::TPtr& ev, const TActorContext& ctx) {
         const auto& msg = ev->Get();
         auto it = LoadActors.find(msg->Tag);
         Y_VERIFY(it != LoadActors.end());
         LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Load actor with tag# " << msg->Tag << " finished");
+
+        if (it->second.Parent) {
+            auto response = std::make_unique<TEvDataShardLoad::TEvTestLoadFinished>();
+            response->Tag = ev->Get()->Tag;
+            response->ErrorReason = ev->Get()->ErrorReason;
+            response->Report = ev->Get()->Report;
+            ctx.Send(it->second.Parent, response.release());
+        }
+
         LoadActors.erase(it);
 
         FinishedTests.push_back({msg->Tag, msg->ErrorReason, TAppData::TimeProvider->Now(), msg->Report});
@@ -199,28 +275,10 @@ public:
 
         info.ErrorMessage.clear();
 
-        const auto& params = ev->Get()->Request.GetParams();
-        if (params.Has("protobuf")) {
-            NKikimrTxDataShard::TEvTestLoadRequest record;
-            bool status = google::protobuf::TextFormat::ParseFromString(params.Get("protobuf"), &record);
-            if (status) {
-                try {
-                    ProcessCmd(record, ctx);
-                } catch (const TLoadActorException& ex) {
-                    info.ErrorMessage = ex.what();
-                }
-            } else {
-                info.ErrorMessage = "bad protobuf";
-            }
-
-            GenerateHttpInfoRes(ctx, id, true);
-            return;
-        }
-
         // send messages to subactors
         for (const auto& kv : LoadActors) {
-            ctx.Send(kv.second, new NMon::TEvHttpInfo(ev->Get()->Request, id));
-            info.ActorMap[kv.second].Tag = kv.first;
+            ctx.Send(kv.second.ActorId, new NMon::TEvHttpInfo(ev->Get()->Request, id));
+            info.ActorMap[kv.second.ActorId].Tag = kv.first;
         }
 
         // record number of responses pending
@@ -259,7 +317,7 @@ public:
         THttpInfoRequest& info = it->second;
 
 #define PROFILE(NAME) \
-                        str << "<option value=\"" << ui32(NKikimrTxDataShard::TEvTestLoadRequest::NAME) << "\">" << #NAME << "</option>";
+                        str << "<option value=\"" << ui32(NKikimrDataShardLoad::TEvTestLoadRequest::NAME) << "\">" << #NAME << "</option>";
 
 #define PUT_HANDLE_CLASS(NAME) \
                         str << "<option value=\"" << ui32(NKikimrTxDataShard::NAME) << "\">" << #NAME << "</option>";
@@ -311,8 +369,8 @@ public:
     }
 
     STRICT_STFUNC(StateFunc,
-        HFunc(TEvDataShard::TEvTestLoadRequest, Handle)
-        HFunc(TEvTestLoadFinished, Handle)
+        HFunc(TEvDataShardLoad::TEvTestLoadRequest, Handle)
+        HFunc(TEvDataShardLoad::TEvTestLoadFinished, Handle)
         HFunc(NMon::TEvHttpInfo, Handle)
         HFunc(NMon::TEvHttpInfoRes, Handle)
     )
@@ -322,4 +380,4 @@ NActors::IActor *CreateTestLoadActor(const TIntrusivePtr<::NMonitoring::TDynamic
     return new TLoadActor(counters);
 }
 
-} // NKikimr::NDataShard
+} // NKikimr::NDataShardLoad

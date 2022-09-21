@@ -4,7 +4,6 @@
 #include <ydb/public/lib/ydb_cli/commands/ydb_command.h>
 #include <ydb/public/lib/ydb_cli/common/command.h>
 #include <ydb/public/lib/ydb_cli/topic/topic_read.h>
-#include <ydb/public/lib/ydb_cli/topic/topic_util.h>
 #include <ydb/public/lib/ydb_cli/topic/topic_write.h>
 
 #include <util/generic/set.h>
@@ -15,10 +14,10 @@
 namespace NYdb::NConsoleClient {
     namespace {
         THashMap<NYdb::NTopic::ECodec, TString> CodecsDescriptions = {
-            {NYdb::NTopic::ECodec::RAW, "Raw codec. No data compression"},
-            {NYdb::NTopic::ECodec::GZIP, "GZIP codec. Data is compressed with GZIP compression algorithm"},
-            {NYdb::NTopic::ECodec::LZOP, "LZOP codec. Data is compressed with LZOP compression algorithm"},
-            {NYdb::NTopic::ECodec::ZSTD, "ZSTD codec. Data is compressed with ZSTD compression algorithm"},
+            {NYdb::NTopic::ECodec::RAW, "Raw codec. No data compression."},
+            {NYdb::NTopic::ECodec::GZIP, "GZIP codec. Data is compressed with GZIP compression algorithm."},
+            {NYdb::NTopic::ECodec::LZOP, "LZOP codec. Data is compressed with LZOP compression algorithm."},
+            {NYdb::NTopic::ECodec::ZSTD, "ZSTD codec. Data is compressed with ZSTD compression algorithm."},
         };
 
         THashMap<TString, NYdb::NTopic::ECodec> ExistingCodecs = {
@@ -28,15 +27,24 @@ namespace NYdb::NConsoleClient {
             std::pair<TString, NYdb::NTopic::ECodec>("zstd", NYdb::NTopic::ECodec::ZSTD),
         };
 
-        // TODO(shmel1k@): improve docs
+        THashMap<TString, NTopic::EMeteringMode> ExistingMeteringModes = {
+            std::pair<TString, NTopic::EMeteringMode>("request-units", NTopic::EMeteringMode::RequestUnits),
+            std::pair<TString, NTopic::EMeteringMode>("reserved-capacity", NTopic::EMeteringMode::ReservedCapacity),
+        };
+
+        THashMap<NTopic::EMeteringMode, TString> MeteringModesDescriptions = {
+            std::pair<NTopic::EMeteringMode, TString>(NTopic::EMeteringMode::ReservedCapacity, "Throughput and storage limits on hourly basis, write operations."),
+            std::pair<NTopic::EMeteringMode, TString>(NTopic::EMeteringMode::RequestUnits, "Read/write operations valued in request units, storage usage on hourly basis."),
+        };
+
         THashMap<ETopicMetadataField, TString> TopicMetadataFieldsDescriptions = {
             {ETopicMetadataField::Body, "Message data"},
-            {ETopicMetadataField::WriteTime, "Message write time. This time defines the UNIX timestamp the messages was written to server"},
-            {ETopicMetadataField::CreateTime, "Message creation time. This time defines the UNIX timestamp the message was created by client"},
-            {ETopicMetadataField::MessageGroupID, "Message group id. This identifier is used to stick to concrete partition using round-robin algorithm. All messages with the same message group id are guaranteed to be read in FIFO order"},
-            {ETopicMetadataField::Offset, "Message offset. Offset defines unique message number in his partition"},
-            {ETopicMetadataField::SeqNo, "Message sequence number, which is used for message deduplication"},
-            {ETopicMetadataField::Meta, "Message additional metadata"},
+            {ETopicMetadataField::WriteTime, "Message write time, a UNIX timestamp the message was written to server."},
+            {ETopicMetadataField::CreateTime, "Message creation time, a UNIX timestamp provided by the publishing client."},
+            {ETopicMetadataField::MessageGroupID, "Message group id. All messages with the same message group id are guaranteed to be read in FIFO order."},
+            {ETopicMetadataField::Offset, "Message offset. Offset orders messages in each partition."},
+            {ETopicMetadataField::SeqNo, "Message sequence number, used for message deduplication when publishing."},
+            {ETopicMetadataField::Meta, "Message additional metadata."},
         };
 
         const TVector<ETopicMetadataField> AllTopicMetadataFields = {
@@ -60,25 +68,65 @@ namespace NYdb::NConsoleClient {
         };
 
         THashMap<ETransformBody, TString> TransformBodyDescriptions = {
-            {ETransformBody::None, "Do not transform body to any format"},
-            {ETransformBody::Base64, "Transform body to base64 format"},
+            {ETransformBody::None, "No conversions, binary data on the client is exactly the same as it is in the topic message."},
+            {ETransformBody::Base64, "Message on the client is a base64-encoded representation of the topic message."},
         };
 
         constexpr TDuration DefaultIdleTimeout = TDuration::Seconds(1);
+
+        bool IsStreamingFormat(EMessagingFormat format) {
+            return format == EMessagingFormat::NewlineDelimited || format == EMessagingFormat::Concatenated;
+        }
+
+        ELogPriority VerbosityLevelToELogPriority(TClientCommand::TConfig::EVerbosityLevel lvl) {
+            switch (lvl) {
+                case TClientCommand::TConfig::EVerbosityLevel::NONE:
+                    return ELogPriority::TLOG_EMERG;
+                case TClientCommand::TConfig::EVerbosityLevel::DEBUG:
+                    return ELogPriority::TLOG_DEBUG;
+                case TClientCommand::TConfig::EVerbosityLevel::INFO:
+                    return ELogPriority::TLOG_INFO;
+                case TClientCommand::TConfig::EVerbosityLevel::WARN:
+                    return ELogPriority::TLOG_WARNING;
+                default:
+                    return ELogPriority::TLOG_EMERG;
+            }
+        }
     } // namespace
 
-    void TCommandWithSupportedCodecs::AddAllowedCodecs(TClientCommand::TConfig& config, const TVector<NYdb::NTopic::ECodec>& supportedCodecs) {
-        TStringStream description;
-        description << "Comma-separated list of supported codecs. Available codecs: ";
-        NColorizer::TColors colors = NColorizer::AutoColors(Cout);
-        for (const auto& codec : supportedCodecs) {
-            auto findResult = CodecsDescriptions.find(codec);
-            Y_VERIFY(findResult != CodecsDescriptions.end(),
-                     "Couldn't find description for %s codec", (TStringBuilder() << codec).c_str());
-            description << "\n  " << colors.BoldColor() << codec << colors.OldColor()
-                        << "\n    " << findResult->second;
+    namespace {
+        TString PrepareAllowedCodecsDescription(const TString& descriptionPrefix, const TVector<NTopic::ECodec>& codecs) {
+            TStringStream description;
+            description << descriptionPrefix << ". Available codecs: ";
+            NColorizer::TColors colors = NColorizer::AutoColors(Cout);
+            for (const auto& codec : codecs) {
+                auto findResult = CodecsDescriptions.find(codec);
+                Y_VERIFY(findResult != CodecsDescriptions.end(),
+                         "Couldn't find description for %s codec", (TStringBuilder() << codec).c_str());
+                description << "\n  " << colors.BoldColor() << codec << colors.OldColor()
+                            << "\n    " << findResult->second;
+            }
+
+            return description.Str();
         }
-        config.Opts->AddLongOption("supported-codecs", description.Str())
+
+        NTopic::ECodec ParseCodec(const TString& codecStr, const TVector<NTopic::ECodec>& allowedCodecs) {
+            auto exists = ExistingCodecs.find(to_lower(codecStr));
+            if (exists == ExistingCodecs.end()) {
+                throw TMisuseException() << "Codec " << codecStr << " is not available for this command";
+            }
+
+            if (std::find(allowedCodecs.begin(), allowedCodecs.end(), exists->second) == allowedCodecs.end()) {
+                throw TMisuseException() << "Codec " << codecStr << " is not available for this command";
+            }
+
+            return exists->second;
+        }
+    }
+
+    void TCommandWithSupportedCodecs::AddAllowedCodecs(TClientCommand::TConfig& config, const TVector<NYdb::NTopic::ECodec>& supportedCodecs) {
+        TString description = PrepareAllowedCodecsDescription("Comma-separated list of supported codecs", supportedCodecs);
+        config.Opts->AddLongOption("supported-codecs", description)
             .RequiredArgument("STRING")
             .StoreResult(&SupportedCodecsStr_);
         AllowedCodecs_ = supportedCodecs;
@@ -92,21 +140,53 @@ namespace NYdb::NConsoleClient {
         TVector<NTopic::ECodec> parsedCodecs;
         TVector<TString> split = SplitString(SupportedCodecsStr_, ",");
         for (const TString& codecStr : split) {
-            auto exists = ExistingCodecs.find(to_lower(codecStr));
-            if (exists == ExistingCodecs.end()) {
-                throw TMisuseException() << "Supported codec " << codecStr << " is not available for this command";
-            }
-
-            if (std::find(AllowedCodecs_.begin(), AllowedCodecs_.end(), exists->second) == AllowedCodecs_.end()) {
-                throw TMisuseException() << "Supported codec " << codecStr << " is not available for this command";
-            }
-
-            SupportedCodecs_.push_back(exists->second);
+            SupportedCodecs_.push_back(::NYdb::NConsoleClient::ParseCodec(codecStr, AllowedCodecs_));
         }
     }
 
     const TVector<NTopic::ECodec> TCommandWithSupportedCodecs::GetCodecs() {
         return SupportedCodecs_;
+    }
+
+    void TCommandWithMeteringMode::AddAllowedMeteringModes(TClientCommand::TConfig& config) {
+        TStringStream description;
+        description << "Topic metering for serverless databases pricing. Available metering modes: ";
+        NColorizer::TColors colors = NColorizer::AutoColors(Cout);
+        for (const auto& mode: ExistingMeteringModes) {
+            auto findResult = MeteringModesDescriptions.find(mode.second);
+            Y_VERIFY(findResult != MeteringModesDescriptions.end(),
+                     "Couldn't find description for %s metering mode", (TStringBuilder() << mode.second).c_str());
+            description << "\n  " << colors.BoldColor() << mode.first << colors.OldColor()
+                        << "\n    " << findResult->second;
+            if (mode.second == NTopic::EMeteringMode::RequestUnits) {
+                description << colors.CyanColor() << " (default)" << colors.OldColor();
+            }
+        }
+        config.Opts->AddLongOption("metering-mode", description.Str())
+            .Optional()
+            .StoreResult(&MeteringModeStr_);
+    }
+
+    void TCommandWithMeteringMode::ParseMeteringMode() {
+        if (MeteringModeStr_.empty()) {
+            return;
+        }
+
+        TString toLowerMeteringMode = to_lower(MeteringModeStr_);
+        if (toLowerMeteringMode == "reserved-capacity") {
+            MeteringMode_ = NTopic::EMeteringMode::ReservedCapacity;
+            return;
+        }
+        if (toLowerMeteringMode == "request-units") {
+            MeteringMode_ = NTopic::EMeteringMode::RequestUnits;
+            return;
+        }
+
+        throw TMisuseException() << "Metering mode " << MeteringModeStr_ << " is not available for this command";
+    }
+
+    NTopic::EMeteringMode TCommandWithMeteringMode::GetMeteringMode() const {
+        return MeteringMode_;
     }
 
     TCommandTopic::TCommandTopic()
@@ -116,6 +196,7 @@ namespace NYdb::NConsoleClient {
         AddCommand(std::make_unique<TCommandTopicDrop>());
         AddCommand(std::make_unique<TCommandTopicConsumer>());
         AddCommand(std::make_unique<TCommandTopicRead>());
+        AddCommand(std::make_unique<TCommandTopicWrite>());
     }
 
     TCommandTopicCreate::TCommandTopicCreate()
@@ -128,37 +209,53 @@ namespace NYdb::NConsoleClient {
             .DefaultValue(1)
             .StoreResult(&PartitionsCount_);
         config.Opts->AddLongOption("retention-period-hours", "Duration in hours for which data in topic is stored")
-            .DefaultValue(18)
+            .DefaultValue(24)
             .Optional()
             .StoreResult(&RetentionPeriodHours_);
+        config.Opts->AddLongOption("partition-write-speed-kbps", "Partition write speed in kilobytes per second")
+            .DefaultValue(1024)
+            .Optional()
+            .StoreResult(&PartitionWriteSpeedKbps_);
+        config.Opts->AddLongOption("retention-storage-mb", "Storage retention in megabytes")
+            .DefaultValue(0)
+            .Optional()
+            .StoreResult(&RetentionStorageMb_);
         config.Opts->SetFreeArgsNum(1);
         SetFreeArgTitle(0, "<topic-path>", "New topic path");
         AddAllowedCodecs(config, AllowedCodecs);
+        AddAllowedMeteringModes(config);
     }
 
     void TCommandTopicCreate::Parse(TConfig& config) {
         TYdbCommand::Parse(config);
         ParseTopicName(config, 0);
         ParseCodecs();
+        ParseMeteringMode();
     }
 
     int TCommandTopicCreate::Run(TConfig& config) {
         TDriver driver = CreateDriver(config);
-        NYdb::NTopic::TTopicClient persQueueClient(driver);
+        NYdb::NTopic::TTopicClient topicClient(driver);
 
         auto settings = NYdb::NTopic::TCreateTopicSettings();
         settings.PartitioningSettings(PartitionsCount_, PartitionsCount_);
-        settings.PartitionWriteBurstBytes(1024 * 1024);
-        settings.PartitionWriteSpeedBytesPerSecond(1024 * 1024);
+        settings.PartitionWriteBurstBytes(PartitionWriteSpeedKbps_ * 1_KB);
+        settings.PartitionWriteSpeedBytesPerSecond(PartitionWriteSpeedKbps_ * 1_KB);
         const auto codecs = GetCodecs();
         if (!codecs.empty()) {
             settings.SetSupportedCodecs(codecs);
         } else {
             settings.SetSupportedCodecs(AllowedCodecs);
         }
-        settings.RetentionPeriod(TDuration::Hours(RetentionPeriodHours_));
 
-        auto status = persQueueClient.CreateTopic(TopicName, settings).GetValueSync();
+        if (GetMeteringMode() != NTopic::EMeteringMode::Unspecified) {
+            settings.MeteringMode(GetMeteringMode());
+        }
+
+        settings.RetentionPeriod(TDuration::Hours(RetentionPeriodHours_));
+        settings.RetentionStorageMb(RetentionStorageMb_ / 1_MB);
+
+        auto status = topicClient.CreateTopic(TopicName, settings).GetValueSync();
         ThrowOnError(status);
         return EXIT_SUCCESS;
     }
@@ -174,15 +271,23 @@ namespace NYdb::NConsoleClient {
         config.Opts->AddLongOption("retention-period-hours", "Duration for which data in topic is stored")
             .Optional()
             .StoreResult(&RetentionPeriodHours_);
+        config.Opts->AddLongOption("partition-write-speed-kbps", "Partition write speed in kilobytes per second")
+            .Optional()
+            .StoreResult(&PartitionWriteSpeedKbps_);
+        config.Opts->AddLongOption("retention-storage-mb", "Storage retention in megabytes")
+            .Optional()
+            .StoreResult(&RetentionStorageMb_);
         config.Opts->SetFreeArgsNum(1);
         SetFreeArgTitle(0, "<topic-path>", "Topic to alter");
         AddAllowedCodecs(config, AllowedCodecs);
+        AddAllowedMeteringModes(config);
     }
 
     void TCommandTopicAlter::Parse(TConfig& config) {
         TYdbCommand::Parse(config);
         ParseTopicName(config, 0);
         ParseCodecs();
+        ParseMeteringMode();
     }
 
     NYdb::NTopic::TAlterTopicSettings TCommandTopicAlter::PrepareAlterSettings(
@@ -202,14 +307,23 @@ namespace NYdb::NConsoleClient {
             settings.SetRetentionPeriod(TDuration::Hours(*RetentionPeriodHours_));
         }
 
+        if (PartitionWriteSpeedKbps_.Defined() && describeResult.GetTopicDescription().GetPartitionWriteSpeedBytesPerSecond() / 1_KB != *PartitionWriteSpeedKbps_) {
+            settings.SetPartitionWriteSpeedBytesPerSecond(*PartitionWriteSpeedKbps_ * 1_KB);
+            settings.SetPartitionWriteBurstBytes(*PartitionWriteSpeedKbps_ * 1_KB);
+        }
+
+        if (GetMeteringMode() != NTopic::EMeteringMode::Unspecified && GetMeteringMode() != describeResult.GetTopicDescription().GetMeteringMode()) {
+            settings.SetMeteringMode(GetMeteringMode());
+        }
+
+        if (RetentionStorageMb_.Defined() && describeResult.GetTopicDescription().GetRetentionStorageMb() != *RetentionStorageMb_) {
+            settings.SetRetentionStorageMb(*RetentionStorageMb_);
+        }
+
         return settings;
     }
 
     int TCommandTopicAlter::Run(TConfig& config) {
-        if (!PartitionsCount_.Defined() && GetCodecs().empty() && !RetentionPeriodHours_.Defined()) {
-            return EXIT_SUCCESS;
-        }
-
         TDriver driver = CreateDriver(config);
         NYdb::NTopic::TTopicClient topicClient(driver);
 
@@ -259,7 +373,7 @@ namespace NYdb::NConsoleClient {
 
     void TCommandTopicConsumerAdd::Config(TConfig& config) {
         TYdbCommand::Config(config);
-        config.Opts->AddLongOption("consumer-name", "New consumer for topic")
+        config.Opts->AddLongOption("consumer", "New consumer for topic")
             .Required()
             .StoreResult(&ConsumerName_);
         config.Opts->AddLongOption("service-type", "Service type of reader")
@@ -306,7 +420,7 @@ namespace NYdb::NConsoleClient {
 
     void TCommandTopicConsumerDrop::Config(TConfig& config) {
         TYdbCommand::Config(config);
-        config.Opts->AddLongOption("consumer-name", "Consumer which will be dropped")
+        config.Opts->AddLongOption("consumer", "Consumer which will be dropped")
             .Required()
             .StoreResult(&ConsumerName_);
         config.Opts->SetFreeArgsNum(1);
@@ -330,18 +444,48 @@ namespace NYdb::NConsoleClient {
         return EXIT_SUCCESS;
     }
 
-    TCommandTopicInternal::TCommandTopicInternal()
-        : TClientCommandTree("topic", {}, "Experimental topic operations") {
-        AddCommand(std::make_unique<TCommandTopicWrite>());
+    void TCommandWithTransformBody::AddTransform(TClientCommand::TConfig& config) {
+        TStringStream description;
+        description << "Conversion between a message data in the topic and the client filesystem/terminal. Available options: ";
+        NColorizer::TColors colors = NColorizer::AutoColors(Cout);
+        for (const auto& iter : TransformBodyDescriptions) {
+            description << "\n  " << colors.BoldColor() << iter.first << colors.OldColor() << "\n    " << iter.second;
+        }
+
+        config.Opts->AddLongOption("transform", description.Str())
+            .Optional()
+            .DefaultValue("none")
+            .StoreResult(&TransformStr_);
+    }
+
+    void TCommandWithTransformBody::ParseTransform() {
+        if (TransformStr_.empty()) {
+            return;
+        }
+
+        TString val = TransformStr_;
+        if (val == (TStringBuilder() << ETransformBody::None)) {
+            return;
+        }
+        if (val == (TStringBuilder() << ETransformBody::Base64)) {
+            Transform_ = ETransformBody::Base64;
+            return;
+        }
+
+        throw TMisuseException() << "Transform " << TransformStr_ << " not found in available \"transform\" values";
+    }
+
+    ETransformBody TCommandWithTransformBody::GetTransform() const {
+        return Transform_;
     }
 
     TCommandTopicRead::TCommandTopicRead()
-        : TYdbCommand("read", {}, "Read from topic command") {
+        : TYdbCommand("read", {}, "Read from a topic to the client filesystem or terminal") {
     }
 
     void TCommandTopicRead::AddAllowedMetadataFields(TConfig& config) {
         TStringStream description;
-        description << "Comma-separated list of message fields to print. Available fields: ";
+        description << "Comma-separated list of message fields to print in Pretty format. If not specified, all fields are printed. Available fields: ";
         NColorizer::TColors colors = NColorizer::AutoColors(Cout);
         for (const auto& iter : TopicMetadataFieldsDescriptions) {
             description << "\n  " << colors.BoldColor() << iter.first << colors.OldColor() << "\n    " << iter.second;
@@ -352,54 +496,26 @@ namespace NYdb::NConsoleClient {
             .StoreResult(&WithMetadataFields_);
     }
 
-    void TCommandTopicRead::AddAllowedTransformFormats(TConfig& config) {
-        TStringStream description;
-        description << "Format to transform received body: Available \"transform\" values: ";
-        NColorizer::TColors colors = NColorizer::AutoColors(Cout);
-        for (const auto& iter : TransformBodyDescriptions) {
-            description << "\n  " << colors.BoldColor() << iter.first << colors.OldColor() << "\n    " << iter.second;
-        }
-
-        config.Opts->AddLongOption("transform", description.Str())
-            .Optional()
-            .StoreResult(&TransformStr_);
-    }
-
     void TCommandTopicRead::Config(TConfig& config) {
         TYdbCommand::Config(config);
         config.Opts->SetFreeArgsNum(1);
-        SetFreeArgTitle(0, "<topic-path>", "Topic to read data");
+        SetFreeArgTitle(0, "<topic-path>", "Topic to read data from");
 
-        AddFormats(config, {
-                               EOutputFormat::Pretty,
-                               EOutputFormat::NewlineDelimited,
-                               EOutputFormat::Concatenated,
+        AddMessagingFormats(config, {
+                               EMessagingFormat::SingleMessage,
+                               EMessagingFormat::Pretty,
+                               EMessagingFormat::NewlineDelimited,
+                               EMessagingFormat::Concatenated,
                            });
 
         // TODO(shmel1k@): improve help.
-        config.Opts->AddLongOption('c', "consumer", "Consumer name")
+        config.Opts->AddLongOption('c', "consumer", "Consumer name.")
             .Required()
             .StoreResult(&Consumer_);
-//        config.Opts->AddLongOption("offset", "Offset to start read from")
-//            .Optional()
-//            .StoreResult(&Offset_);
-//        config.Opts->AddLongOption("partition", "Partition to read from")
-//            .Optional()
-//            .StoreResult(&Partition_);
-        config.Opts->AddLongOption('f', "file", "File to write data to")
+        config.Opts->AddLongOption('f', "file", "File to write data to. In not specified, data is written to the standard output.")
             .Optional()
             .StoreResult(&File_);
-// NOTE(shmel1k@): temporary disabled options
-//        config.Opts->AddLongOption("flush-duration", "Duration for message flushing")
-//            .Optional()
-//            .StoreResult(&FlushDuration_);
-//        config.Opts->AddLongOption("flush-size", "Maximum flush size") // TODO(shmel1k@): improve
-//            .Optional()
-//            .StoreResult(&FlushSize_);
-//        config.Opts->AddLongOption("flush-messages-count", "") // TODO(shmel1k@): improve
-//            .Optional()
-//            .StoreResult(&FlushMessagesCount_);
-        config.Opts->AddLongOption("idle-timeout", "Max wait duration for new messages")
+        config.Opts->AddLongOption("idle-timeout", "Max wait duration for new messages. Topic is considered empty if no new messages arrive within this period.")
             .Optional()
             .DefaultValue(DefaultIdleTimeout)
             .StoreResult(&IdleTimeout_);
@@ -407,26 +523,22 @@ namespace NYdb::NConsoleClient {
             .Optional()
             .DefaultValue(true)
             .StoreResult(&Commit_);
-// NOTE(shmel1k@): temporary disabled option
-//        config.Opts->AddLongOption("message-size-limit", "Maximum message size")
-//            .Optional()
-//            .StoreResult(&MessageSizeLimit_);
-//        config.Opts->AddLongOption("discard-above-limits", "Do not print messages with size more than defined in 'message-size-limit' option")
-//            .Optional()
-//            .StoreResult(&DiscardAboveLimits_);
-        config.Opts->AddLongOption("limit", "Messages count to read")
+        config.Opts->AddLongOption("limit", "Limit on message count to read, 0 - unlimited. "
+                                            "If avobe 0, processing stops when either topic is empty, or the specified limit reached. "
+                                            "Must be above 0 for pretty output format."
+                                            "\nDefault is 10 for pretty format, unlimited for streaming formats.")
             .Optional()
             .StoreResult(&Limit_);
-        config.Opts->AddLongOption('w', "wait", "Wait for infinite time for first message received")
+        config.Opts->AddLongOption('w', "wait", "Wait indefinitely for a first message received. If not specified, command exits on empty topic returning no data to the output.")
             .Optional()
             .NoArgument()
             .StoreValue(&Wait_, true);
-        config.Opts->AddLongOption("timestamp", "Timestamp from which messages will be read")
+        config.Opts->AddLongOption("timestamp", "Timestamp from which messages will be read. If not specified, messages are read from the last commit point for the chosen consumer.")
             .Optional()
             .StoreResult(&Timestamp_);
 
         AddAllowedMetadataFields(config);
-        AddAllowedTransformFormats(config);
+        AddTransform(config);
     }
 
     void TCommandTopicRead::ParseMetadataFields() {
@@ -465,29 +577,12 @@ namespace NYdb::NConsoleClient {
         MetadataFields_ = result;
     }
 
-    void TCommandTopicRead::ParseTransformFormat() {
-        if (!TransformStr_.Defined()) {
-            return;
-        }
-
-        TString val = *TransformStr_;
-        if (val == (TStringBuilder() << ETransformBody::None)) {
-            return;
-        }
-        if (val == (TStringBuilder() << ETransformBody::Base64)) {
-            Transform_ = ETransformBody::Base64;
-            return;
-        }
-
-        throw TMisuseException() << "Transform " << *TransformStr_ << " not found in available \"transform\" values";
-    }
-
     void TCommandTopicRead::Parse(TConfig& config) {
         TYdbCommand::Parse(config);
         ParseTopicName(config, 0);
-        ParseFormats();
+        ParseMessagingFormats();
         ParseMetadataFields();
-        ParseTransformFormat();
+        ParseTransform();
     }
 
     NTopic::TReadSessionSettings TCommandTopicRead::PrepareReadSessionSettings() {
@@ -507,30 +602,28 @@ namespace NYdb::NConsoleClient {
 
     void TCommandTopicRead::ValidateConfig() {
         // TODO(shmel1k@): add more formats.
-        if (OutputFormat != EOutputFormat::Default && (Limit_.Defined() && (Limit_ < 0 || Limit_ > 500))) {
+        if (!IsStreamingFormat(MessagingFormat) && (Limit_.Defined() && (Limit_ <= 0 || Limit_ > 500))) {
             throw TMisuseException() << "OutputFormat " << OutputFormat << " is not compatible with "
-                                     << "limit equal '0' or more than '500': '" << *Limit_ << "' was given";
+                                     << "limit less and equal '0' or more than '500': '" << *Limit_ << "' was given";
         }
     }
 
     int TCommandTopicRead::Run(TConfig& config) {
         ValidateConfig();
 
-        auto driver = std::make_unique<TDriver>(CreateDriver(config));
-        NTopic::TTopicClient persQueueClient(*driver);
-        auto readSession = persQueueClient.CreateReadSession(PrepareReadSessionSettings());
-
-        TTopicInitializationChecker checker = TTopicInitializationChecker(persQueueClient);
-        checker.CheckTopicExistence(TopicName, Consumer_);
+        auto driver =
+            std::make_unique<TDriver>(CreateDriver(config, CreateLogBackend("cerr", VerbosityLevelToELogPriority(config.VerbosityLevel))));
+        NTopic::TTopicClient topicClient(*driver);
+        auto readSession = topicClient.CreateReadSession(PrepareReadSessionSettings());
 
         {
             TTopicReader reader = TTopicReader(std::move(readSession), TTopicReaderSettings(
                                                                            Limit_,
                                                                            Commit_,
                                                                            Wait_,
-                                                                           OutputFormat,
+                                                                           MessagingFormat,
                                                                            MetadataFields_,
-                                                                           Transform_,
+                                                                           GetTransform(),
                                                                            IdleTimeout_));
 
             reader.Init();
@@ -554,6 +647,27 @@ namespace NYdb::NConsoleClient {
         return EXIT_SUCCESS;
     }
 
+    void TCommandWithCodec::AddAllowedCodecs(TClientCommand::TConfig& config, const TVector<NTopic::ECodec>& allowedCodecs) {
+        TString description = PrepareAllowedCodecsDescription("Client-side compression algorithm. When read, data will be uncompressed transparently with a codec used on write", allowedCodecs);
+        config.Opts->AddLongOption("codec", description)
+            .Optional()
+            .DefaultValue((TStringBuilder() << NTopic::ECodec::RAW))
+            .StoreResult(&CodecStr_);
+        AllowedCodecs_ = allowedCodecs;
+    }
+
+    void TCommandWithCodec::ParseCodec() {
+        if (CodecStr_.empty()) {
+            return;
+        }
+
+        Codec_ = ::NYdb::NConsoleClient::ParseCodec(CodecStr_, AllowedCodecs_);
+    }
+
+    NTopic::ECodec TCommandWithCodec::GetCodec() const {
+        return Codec_;
+    }
+
     TCommandTopicWrite::TCommandTopicWrite()
         : TYdbCommand("write", {}, "Write to topic command") {
     }
@@ -563,14 +677,13 @@ namespace NYdb::NConsoleClient {
         config.Opts->SetFreeArgsNum(1);
         SetFreeArgTitle(0, "<topic-path>", "Topic to write data");
 
-        AddInputFormats(config, {
-                                    EOutputFormat::NewlineDelimited,
-                                    EOutputFormat::SingleMessage,
+        AddMessagingFormats(config, {
+                                    EMessagingFormat::NewlineDelimited,
+                                    EMessagingFormat::SingleMessage,
                                     //      EOutputFormat::JsonRawStreamConcat,
                                     //      EOutputFormat::JsonRawArray,
-                                    EOutputFormat::SingleMessage,
                                 });
-        AddAllowedCodecs(config);
+        AddAllowedCodecs(config, AllowedCodecs);
 
         // TODO(shmel1k@): improve help.
         config.Opts->AddLongOption('d', "delimiter", "Delimiter to split messages")
@@ -579,42 +692,30 @@ namespace NYdb::NConsoleClient {
         config.Opts->AddLongOption('f', "file", "File to read data from")
             .Optional()
             .StoreResult(&File_);
-        config.Opts->AddLongOption("message-size-limit", "Size limit for a single message")
-            .Optional()
-            .StoreResult(&MessageSizeLimitStr_);
-        config.Opts->AddLongOption("batch-duration", "Duration for message batching")
-            .Optional()
-            .StoreResult(&BatchDuration_);
-        config.Opts->AddLongOption("batch-size", "Maximum batch size") // TODO(shmel1k@): improve
-            .Optional()
-            .StoreResult(&BatchSize_);
-        config.Opts->AddLongOption("batch-messages-count", "") // TODO(shmel1k@): improve
-            .Optional()
-            .StoreResult(&BatchMessagesCount_);
-        config.Opts->AddLongOption("message-group-id", "Message Group ID") // TODO(shmel1k@): improve
+        config.Opts->AddLongOption("message-group-id", "Message group identifier. If not set, all messages from input will get the same identifier based on hex string\nrepresentation of 3 random bytes")
             .Optional()
             .StoreResult(&MessageGroupId_);
+
+        AddTransform(config);
     }
 
     void TCommandTopicWrite::Parse(TConfig& config) {
         TYdbCommand::Parse(config);
         ParseTopicName(config, 0);
-        ParseFormats();
+        ParseMessagingFormats();
+        ParseTransform();
         ParseCodec();
 
-        if (Delimiter_.Defined() && InputFormat != EOutputFormat::Default) {
+        if (Delimiter_.Defined() && MessagingFormat != EMessagingFormat::SingleMessage) {
             throw TMisuseException() << "Both mutually exclusive options \"delimiter\"(\"--delimiter\", \"-d\" "
                                      << "and \"input format\"(\"--input-format\") were provided.";
         }
     }
 
-    NPersQueue::TWriteSessionSettings TCommandTopicWrite::PrepareWriteSessionSettings() {
-        NPersQueue::TWriteSessionSettings settings;
-        settings.Codec(GetCodec()); // TODO(shmel1k@): codecs?
+    NTopic::TWriteSessionSettings TCommandTopicWrite::PrepareWriteSessionSettings() {
+        NTopic::TWriteSessionSettings settings;
+        settings.Codec(GetCodec());
         settings.Path(TopicName);
-        //settings.BatchFlushInterval(BatchDuration_);
-        //settings.BatchFlushSizeBytes(BatchSize_);
-        settings.ClusterDiscoveryMode(NPersQueue::EClusterDiscoveryMode::Auto);
 
         if (!MessageGroupId_.Defined()) {
             const TString rnd = ToString(TInstant::Now().NanoSeconds());
@@ -630,56 +731,23 @@ namespace NYdb::NConsoleClient {
         }
 
         settings.MessageGroupId(*MessageGroupId_);
+        settings.ProducerId(*MessageGroupId_);
 
         return settings;
-    }
-
-    void TCommandTopicWrite::CheckOptions(NPersQueue::TPersQueueClient& persQueueClient) {
-        NPersQueue::TAsyncDescribeTopicResult descriptionFuture = persQueueClient.DescribeTopic(TopicName);
-        descriptionFuture.Wait(TDuration::Seconds(1));
-        NPersQueue::TDescribeTopicResult description = descriptionFuture.GetValueSync();
-        ThrowOnError(description);
-
-        NPersQueue::ECodec codec = GetCodec();
-        bool exists = false;
-        for (const auto c : description.TopicSettings().SupportedCodecs()) {
-            if (c == codec) {
-                exists = true;
-                break;
-            }
-        }
-        if (exists) {
-            return;
-        }
-        TStringStream errorMessage;
-        errorMessage << "Codec \"" << (TStringBuilder() << codec) << "\" is not available for topic. Available codecs:\n";
-        for (const auto c : description.TopicSettings().SupportedCodecs()) {
-            errorMessage << "    " << (TStringBuilder() << c) << "\n";
-        }
-        throw TMisuseException() << errorMessage.Str();
     }
 
     int TCommandTopicWrite::Run(TConfig& config) {
         SetInterruptHandlers();
 
-        auto driver = std::make_unique<TDriver>(CreateDriver(config));
-        NPersQueue::TPersQueueClient persQueueClient(*driver);
-
-        CheckOptions(persQueueClient);
-
-        // TODO(shmel1k@): return back after IWriteSession in TopicService SDK
-        //        TTopicInitializationChecker checker = TTopicInitializationChecker(persQueueClient);
-        //        checker.CheckTopicExistence(TopicName);
+        auto driver =
+            std::make_unique<TDriver>(CreateDriver(config, CreateLogBackend("cerr", VerbosityLevelToELogPriority(config.VerbosityLevel))));
+        NTopic::TTopicClient topicClient(*driver);
 
         {
-            auto writeSession = NPersQueue::TPersQueueClient(*driver).CreateWriteSession(std::move(PrepareWriteSessionSettings()));
-            auto writer = TTopicWriter(writeSession, std::move(TTopicWriterParams(
-                                                         InputFormat,
-                                                         Delimiter_,
-                                                         MessageSizeLimit_,
-                                                         BatchDuration_,
-                                                         BatchSize_,
-                                                         BatchMessagesCount_)));
+            auto writeSession = NTopic::TTopicClient(*driver).CreateWriteSession(std::move(PrepareWriteSessionSettings()));
+            auto writer =
+                TTopicWriter(writeSession, std::move(TTopicWriterParams(MessagingFormat, Delimiter_, MessageSizeLimit_, BatchDuration_,
+                                                                        BatchSize_, BatchMessagesCount_, GetTransform())));
 
             if (int status = writer.Init(); status) {
                 return status;

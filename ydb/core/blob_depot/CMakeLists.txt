@@ -6,6 +6,7 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(agent)
 
 add_library(ydb-core-blob_depot)
 target_link_libraries(ydb-core-blob_depot PUBLIC
@@ -24,6 +25,7 @@ target_sources(ydb-core-blob_depot PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/blob_depot/data_gc.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/blob_depot/data_load.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/blob_depot/data_resolve.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/blob_depot/data_uncertain.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/blob_depot/garbage_collection.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/blob_depot/given_id_range.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/blob_depot/mon_main.cpp

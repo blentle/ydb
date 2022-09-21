@@ -18,6 +18,7 @@ target_link_libraries(blobstorage-ut_blobstorage-lib PUBLIC
   core-blobstorage-backpressure
   blobstorage-dsproxy-mock
   core-blobstorage-nodewarden
+  core-blobstorage-pdisk
   blobstorage-pdisk-mock
   blobstorage-vdisk-common
   ydb-core-mind

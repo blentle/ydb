@@ -16,9 +16,11 @@
 #include <ydb/core/kqp/node/kqp_node.h>
 #include <ydb/core/kqp/runtime/kqp_transport.h>
 #include <ydb/core/kqp/prepare/kqp_query_plan.h>
+#include <ydb/core/ydb_convert/ydb_convert.h>
 
 #include <ydb/library/yql/dq/runtime/dq_columns_resolve.h>
 #include <ydb/library/yql/dq/tasks/dq_connection_builder.h>
+#include <ydb/library/yql/minikql/mkql_node_serialization.h>
 #include <ydb/library/yql/public/issue/yql_issue_message.h>
 
 #include <library/cpp/actors/core/actor_bootstrapped.h>
@@ -44,7 +46,7 @@ public:
 
     TKqpScanExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
         const TMaybe<TString>& userToken, TKqpRequestCounters::TPtr counters)
-        : TBase(std::move(request), database, userToken, counters)
+        : TBase(std::move(request), database, userToken, counters, TWilsonKqp::ScanExecuter, "ScanExecuter")
     {
         YQL_ENSURE(Request.Transactions.size() == 1);
         YQL_ENSURE(Request.Locks.empty());
@@ -99,6 +101,10 @@ public:
                     shardIds.insert(partition.ShardId);
                 }
             }
+        }
+
+        if (ExecuterTableResolveSpan) {
+            ExecuterTableResolveSpan.End();
         }
 
         if (shardIds.size() > 0) {
@@ -374,7 +380,7 @@ private:
 
 private:
     void FillReadInfo(TTaskMeta& taskMeta, ui64 itemsLimit, bool reverse, bool sorted,
-        const TMaybe<::NKqpProto::TKqpPhyOpReadOlapRanges>& readOlapRange)
+        NKikimr::NMiniKQL::TType* resultType, const TMaybe<::NKqpProto::TKqpPhyOpReadOlapRanges>& readOlapRange)
     {
         if (taskMeta.Reads && !taskMeta.Reads.GetRef().empty()) {
             // Validate parameters
@@ -394,6 +400,26 @@ private:
         taskMeta.ReadInfo.Reverse = reverse;
         taskMeta.ReadInfo.Sorted = sorted;
 
+        if (resultType) {
+            YQL_ENSURE(resultType->GetKind() == NKikimr::NMiniKQL::TType::EKind::Struct
+                || resultType->GetKind() == NKikimr::NMiniKQL::TType::EKind::Tuple);
+
+            auto* resultStructType = static_cast<NKikimr::NMiniKQL::TStructType*>(resultType);
+            ui32 resultColsCount = resultStructType->GetMembersCount();
+
+            taskMeta.ReadInfo.ResultColumnsTypes.reserve(resultColsCount);
+            for (ui32 i = 0; i < resultColsCount; ++i) {
+                auto memberType = resultStructType->GetMemberType(i);
+                if (memberType->GetKind() == NKikimr::NMiniKQL::TType::EKind::Optional) {
+                    memberType = static_cast<NKikimr::NMiniKQL::TOptionalType*>(memberType)->GetItemType();
+                }
+                YQL_ENSURE(memberType->GetKind() == NKikimr::NMiniKQL::TType::EKind::Data,
+                    "Expected simple data types to be read from column shard");
+                auto memberDataType = static_cast<NKikimr::NMiniKQL::TDataType*>(memberType);
+                taskMeta.ReadInfo.ResultColumnsTypes.push_back(memberDataType->GetSchemeType());
+            }
+        }
+
         if (!readOlapRange || readOlapRange->GetOlapProgram().empty()) {
             return;
         }
@@ -408,7 +434,7 @@ private:
     static ui32 GetMaxTasksPerNodeEstimate(TStageInfo& stageInfo) {
         // TODO: take into account number of active scans on node
         const auto& stage = GetStage(stageInfo);
-        bool heavyProgram = stage.GetProgram().GetSettings().GetHasSort() ||
+        const bool heavyProgram = stage.GetProgram().GetSettings().GetHasSort() ||
                             stage.GetProgram().GetSettings().GetHasMapJoin();
 
         if (heavyProgram) {
@@ -419,18 +445,13 @@ private:
     }
 
     TTask& AssignTaskToShard(
-        TStageInfo& stageInfo, ui64 shardId,
+        TStageInfo& stageInfo, const ui64 shardId,
         THashMap<ui64, std::vector<ui64>>& nodeTasks,
         THashMap<ui64, ui64>& assignedShardsCount,
-        bool sorted)
+        const bool sorted, const bool isOlapScan)
     {
         ui64 nodeId = ShardIdToNodeId.at(shardId);
-        bool supportsMultipleOlapShards = AppData()->FeatureFlags.GetEnableKqpScanQueryMultipleOlapShardsReads();
-        if (sorted) {
-            supportsMultipleOlapShards = false;
-        }
-
-        if (stageInfo.Meta.IsOlap() && !supportsMultipleOlapShards) {
+        if (stageInfo.Meta.IsOlap() && sorted) {
             auto& task = TasksGraph.AddTask(stageInfo);
             task.Meta.NodeId = nodeId;
             return task;
@@ -439,7 +460,7 @@ private:
         auto& tasks = nodeTasks[nodeId];
         auto& cnt = assignedShardsCount[nodeId];
 
-        const ui32 maxScansPerNode = GetMaxTasksPerNodeEstimate(stageInfo);
+        const ui32 maxScansPerNode = isOlapScan ? 1 : GetMaxTasksPerNodeEstimate(stageInfo);
         if (cnt < maxScansPerNode) {
             auto& task = TasksGraph.AddTask(stageInfo);
             task.Meta.NodeId = nodeId;
@@ -471,11 +492,13 @@ private:
             THashMap<ui64, TShardInfo> partitions = PrunePartitions(TableKeys, op, stageInfo, holderFactory, typeEnv);
 
             bool reverse = false;
+            const bool isOlapScan = (op.GetTypeCase() == NKqpProto::TKqpPhyTableOperation::kReadOlapRange);
             ui64 itemsLimit = 0;
             bool sorted = true;
             TString itemsLimitParamName;
             NDqProto::TData itemsLimitBytes;
             NKikimr::NMiniKQL::TType* itemsLimitType = nullptr;
+            NKikimr::NMiniKQL::TType* resultType = nullptr;
 
             // TODO: Support reverse, skipnull and limit for kReadRanges
             if (op.GetTypeCase() == NKqpProto::TKqpPhyTableOperation::kReadRange) {
@@ -492,12 +515,15 @@ private:
                 reverse = op.GetReadOlapRange().GetReverse();
                 ExtractItemsLimit(stageInfo, op.GetReadOlapRange().GetItemsLimit(), holderFactory, typeEnv,
                     itemsLimit, itemsLimitParamName, itemsLimitBytes, itemsLimitType);
+                NKikimrMiniKQL::TType minikqlProtoResultType;
+                ConvertYdbTypeToMiniKQLType(op.GetReadOlapRange().GetResultType(), minikqlProtoResultType);
+                resultType = ImportTypeFromProto(minikqlProtoResultType, typeEnv);
             }
 
             for (auto& [shardId, shardInfo] : partitions) {
                 YQL_ENSURE(!shardInfo.KeyWriteRanges);
 
-                auto& task = AssignTaskToShard(stageInfo, shardId, nodeTasks, assignedShardsCount, sorted);
+                auto& task = AssignTaskToShard(stageInfo, shardId, nodeTasks, assignedShardsCount, sorted, isOlapScan);
 
                 for (auto& [name, value] : shardInfo.Params) {
                     auto ret = task.Meta.Params.emplace(name, std::move(value));
@@ -521,9 +547,9 @@ private:
 
                 if (op.GetTypeCase() == NKqpProto::TKqpPhyTableOperation::kReadOlapRange) {
                     const auto& readRange = op.GetReadOlapRange();
-                    FillReadInfo(task.Meta, itemsLimit, reverse, sorted, readRange);
+                    FillReadInfo(task.Meta, itemsLimit, reverse, sorted, resultType, readRange);
                 } else {
-                    FillReadInfo(task.Meta, itemsLimit, reverse, sorted, TMaybe<::NKqpProto::TKqpPhyOpReadOlapRanges>());
+                    FillReadInfo(task.Meta, itemsLimit, reverse, sorted, nullptr, TMaybe<::NKqpProto::TKqpPhyOpReadOlapRanges>());
                 }
 
                 if (!task.Meta.Reads) {
@@ -636,6 +662,8 @@ private:
         NMiniKQL::TScopedAlloc alloc(TAlignedPagePoolCounters(), funcRegistry.SupportsSizedAllocators());
         NMiniKQL::TTypeEnvironment typeEnv(alloc);
 
+        NWilson::TSpan prepareTasksSpan(TWilsonKqp::ScanExecuterPrepareTasks, ExecuterStateSpan.GetTraceId(), "PrepareTasks", NWilson::EFlags::AUTO_END);
+
         NMiniKQL::TMemoryUsageInfo memInfo("PrepareTasks");
         NMiniKQL::THolderFactory holderFactory(alloc.Ref(), memInfo, &funcRegistry);
 
@@ -736,17 +764,16 @@ private:
                 YQL_ENSURE(task.Meta.Reads);
                 YQL_ENSURE(!task.Meta.Writes);
 
-                for (auto& column : task.Meta.Reads->front().Columns) {
-                    auto* protoColumn = protoTaskMeta.AddColumns();
-                    protoColumn->SetId(column.Id);
-                    protoColumn->SetType(column.Type);
-                    protoColumn->SetName(column.Name);
-                }
-
                 if (!task.Meta.Reads->empty()) {
                     protoTaskMeta.SetReverse(task.Meta.ReadInfo.Reverse);
                     protoTaskMeta.SetItemsLimit(task.Meta.ReadInfo.ItemsLimit);
                     protoTaskMeta.SetSorted(task.Meta.ReadInfo.Sorted);
+
+                    for (auto columnType : task.Meta.ReadInfo.ResultColumnsTypes) {
+                        auto* protoResultColumn = protoTaskMeta.AddResultColumns();
+                        protoResultColumn->SetId(0);
+                        protoResultColumn->SetType(columnType);
+                    }
 
                     if (tableInfo.TableKind == ETableKind::Olap) {
                         auto* olapProgram = protoTaskMeta.MutableOlapProgram();
@@ -759,6 +786,13 @@ private:
                         olapProgram->SetParameters(parameters);
                     } else {
                         YQL_ENSURE(task.Meta.ReadInfo.OlapProgram.Program.empty());
+                    }
+
+                    for (auto& column : task.Meta.Reads->front().Columns) {
+                        auto* protoColumn = protoTaskMeta.AddColumns();
+                        protoColumn->SetId(column.Id);
+                        protoColumn->SetType(column.Type);
+                        protoColumn->SetName(column.Name);
                     }
                 }
 
@@ -812,6 +846,10 @@ private:
             return;
         }
 
+        if (prepareTasksSpan) {
+            prepareTasksSpan.End();
+        }
+
         LOG_D("Total tasks: " << TasksGraph.GetTasks().size() << ", readonly: true"
             << ", " << nScanTasks << " scan tasks on " << scanTasks.size() << " nodes"
             << ", totalShardScans: " << nShardScans << ", execType: Scan"
@@ -820,6 +858,11 @@ private:
         ExecuteScanTx(std::move(computeTasks), std::move(scanTasks));
 
         Become(&TKqpScanExecuter::ExecuteState);
+        if (ExecuterStateSpan) {
+            ExecuterStateSpan.End();
+            ExecuterStateSpan = NWilson::TSpan(TWilsonKqp::ScanExecuterExecuteState, ExecuterSpan.GetTraceId(), "ExecuteState", NWilson::EFlags::AUTO_END);
+        }
+
     }
 
     void ExecuteScanTx(TVector<NYql::NDqProto::TDqTask>&& computeTasks, THashMap<ui64, TVector<NYql::NDqProto::TDqTask>>&& scanTasks) {
@@ -838,7 +881,7 @@ private:
         auto planner = CreateKqpPlanner(TxId, SelfId(), std::move(computeTasks),
             std::move(scanTasks), Request.Snapshot,
             Database, UserToken, Deadline.GetOrElse(TInstant::Zero()), Request.StatsMode,
-            Request.DisableLlvmForUdfStages, Request.LlvmEnabled, AppData()->EnableKqpSpilling, Request.RlPath);
+            Request.DisableLlvmForUdfStages, Request.LlvmEnabled, AppData()->EnableKqpSpilling, Request.RlPath, ExecuterSpan.GetTraceId());
         RegisterWithSameMailbox(planner);
     }
 
@@ -876,6 +919,10 @@ private:
         }
 
         LWTRACK(KqpScanExecuterFinalize, ResponseEv->Orbit, TxId, LastTaskId, LastComputeActorId, Results.size());
+
+        if (ExecuterSpan) {
+            ExecuterSpan.EndOk();
+        }
 
         LOG_D("Sending response to: " << Target);
         Send(Target, ResponseEv.release());

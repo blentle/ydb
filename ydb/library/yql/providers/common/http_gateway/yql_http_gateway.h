@@ -49,14 +49,15 @@ public:
     class TContent : public TContentBase {
     friend class TEasyCurl;
     public:
-        TContent(TString&& data, long httpResponseCode = 0LL);
-        TContent(const TString& data, long httpResponseCode = 0LL);
+        TContent(TString&& data, long httpResponseCode = 0LL, TString&& headers = {});
+        TContent(const TString& data, long httpResponseCode = 0LL, const TString& headers = {});
 
         TContent(TContent&& src) = default;
         TContent& operator=(TContent&& src) = default;
 
         using TContentBase::Extract;
     public:
+        TString Headers;
         long HttpResponseCode;
     };
 
@@ -75,7 +76,7 @@ public:
     virtual void Download(
         TString url,
         THeaders headers,
-        std::size_t expectedSize,
+        std::size_t sizeLimit,
         TOnResult callback,
         TString data = {},
         IRetryPolicy</*http response code*/long>::TPtr RetryPolicy = IRetryPolicy<long>::GetNoRetryPolicy()
@@ -103,6 +104,7 @@ public:
         TString url,
         THeaders headers,
         std::size_t offset,
+        std::size_t sizeLimit,
         TOnDownloadStart onStart,
         TOnNewDataPart onNewData,
         TOnDownloadFinish onFinish) = 0;

@@ -171,6 +171,7 @@ def colorize_backtrace(text):
         (re.compile(r"\b(0x[a-f0-9]{6,})\b"), r"[[c:light-grey]]\1[[rst]]"),
     ]
 
+    text = six.ensure_str(text)
     for regex, substitution in filters:
         text = regex.sub(substitution, text)
     return text
@@ -180,8 +181,8 @@ def resolve_addresses(addresses, symbolizer, binary):
     addresses = list(set(addresses))
     cmd = [
         symbolizer,
-        "-demangle",
-        "-obj",
+        "--demangle",
+        "--obj",
         binary,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

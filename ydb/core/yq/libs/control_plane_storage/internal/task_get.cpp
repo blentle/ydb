@@ -277,8 +277,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
                     << " LastSeenAt: " << lastSeenAt);
                 taskInternal.ShouldAbortTask = !taskInternal.RetryLimiter.UpdateOnRetry(lastSeenAt, Config.TaskLeaseRetryPolicy, now);
             }
-
-            *rootCounters->GetSubgroup("scope", task.Scope)->GetSubgroup("query_id", task.QueryId)->GetCounter("RetryCount") = taskInternal.RetryLimiter.RetryCount;
+            task.RetryCount = taskInternal.RetryLimiter.RetryCount;
 
             CPS_LOG_AS_T(*actorSystem, "Task (Query): " << task.QueryId <<  " RetryRate: " << taskInternal.RetryLimiter.RetryRate
                 << " RetryCounter: " << taskInternal.RetryLimiter.RetryCount << " At: " << taskInternal.RetryLimiter.RetryCounterUpdatedAt
@@ -301,7 +300,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
     };
 
     const auto query = queryBuilder.Build();
-    auto [readStatus, resultSets] = Read(query.Sql, query.Params, requestCounters, debugInfo, TTxSettings::StaleRO());
+    auto [readStatus, resultSets] = Read(NActors::TActivationContext::ActorSystem(), query.Sql, query.Params, requestCounters, debugInfo, TTxSettings::StaleRO());
     auto result = readStatus.Apply(
         [=,
         resultSets=resultSets,
@@ -369,8 +368,6 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
                     << " unsupported";
             }
 
-
-
             auto* newTask = result.add_tasks();
             newTask->set_query_type(queryType);
             newTask->set_execute_mode(task.Query.meta().execute_mode());
@@ -395,6 +392,10 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetTaskRequ
             newTask->set_result_limit(task.Internal.result_limit());
             *newTask->mutable_execution_limit() = NProtoInterop::CastToProto(ExtractLimit(task));
             *newTask->mutable_request_started_at() = task.Query.meta().started_at();
+
+            newTask->set_restart_count(task.RetryCount);
+            auto* jobId = newTask->mutable_job_id();
+            jobId->set_value(task.Query.meta().last_job_id());
 
             for (const auto& connection: task.Internal.connection()) {
                 const auto serviceAccountId = ExtractServiceAccountId(connection);

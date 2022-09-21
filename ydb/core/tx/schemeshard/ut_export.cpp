@@ -260,8 +260,8 @@ Y_UNIT_TEST_SUITE(TExportToS3Tests) {
 
         TString scheme;
         runtime.SetObserverFunc([&scheme](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) {
-            if (!scheme && ev->GetTypeRewrite() == NWrappers::TEvS3Wrapper::EvPutObjectRequest) {
-                const auto* msg = ev->Get<NWrappers::TEvS3Wrapper::TEvPutObjectRequest>();
+            if (!scheme && ev->GetTypeRewrite() == NWrappers::NExternalStorage::EvPutObjectRequest) {
+                const auto* msg = ev->Get<NWrappers::NExternalStorage::TEvPutObjectRequest>();
                 scheme = msg->Body;
             }
 
@@ -294,7 +294,7 @@ Y_UNIT_TEST_SUITE(TExportToS3Tests) {
             }
         )"};
 
-        const TString request = Sprintf(R"(
+        Run(runtime, env, tables, Sprintf(R"(
             ExportToS3Settings {
               endpoint: "localhost:%d"
               scheme: HTTP
@@ -303,9 +303,7 @@ Y_UNIT_TEST_SUITE(TExportToS3Tests) {
                 destination_prefix: ""
               }
             }
-        )", port);
-
-        Run(runtime, env, tables, request);
+        )", port));
 
         UNIT_ASSERT_NO_DIFF(scheme, R"(columns {
   name: "key"
@@ -738,8 +736,8 @@ partitioning_settings {
                     return TTestActorRuntime::EEventAction::PROCESS;
                 }
 
-                case NWrappers::TEvS3Wrapper::EvCompleteMultipartUploadRequest:
-                case NWrappers::TEvS3Wrapper::EvAbortMultipartUploadRequest:
+                case NWrappers::NExternalStorage::EvCompleteMultipartUploadRequest:
+                case NWrappers::NExternalStorage::EvAbortMultipartUploadRequest:
                     delayed = true;
                     return TTestActorRuntime::EEventAction::DROP;
 

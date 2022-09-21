@@ -2901,6 +2901,7 @@ struct TBuiltinFuncData {
             {"nvl", BuildNamedArgcBuiltinFactoryCallback<TCallNodeImpl>("Coalesce", 1, -1) },
             {"nanvl", BuildNamedArgcBuiltinFactoryCallback<TCallNodeImpl>("Nanvl", 2, 2) },
             {"likely", BuildNamedArgcBuiltinFactoryCallback<TCallNodeImpl>("Likely", 1, -1)},
+            {"assumestrict", BuildNamedArgcBuiltinFactoryCallback<TCallNodeImpl>("AssumeStrict", 1, 1)},
             {"random", BuildNamedDepsArgcBuiltinFactoryCallback<TCallNodeDepArgs>(0, "Random", 1, -1)},
             {"randomnumber", BuildNamedDepsArgcBuiltinFactoryCallback<TCallNodeDepArgs>(0, "RandomNumber", 1, -1)},
             {"randomuuid", BuildNamedDepsArgcBuiltinFactoryCallback<TCallNodeDepArgs>(0, "RandomUuid", 1, -1) },
@@ -2911,13 +2912,7 @@ struct TBuiltinFuncData {
             {"tablerows", BuildSimpleBuiltinFactoryCallback<TTableRows>() },
             {"weakfield", BuildSimpleBuiltinFactoryCallback<TWeakFieldOp>()},
 
-            // meta fields
-            {"writetime", BuildNamedBuiltinFactoryCallback<TCallDirectRow>("WriteTime")},
-            {"offset", BuildNamedBuiltinFactoryCallback<TCallDirectRow>("Offset")},
-            // {"createtime", BuildNamedBuiltinFactoryCallback<TCallDirectRow>("CreateTime")},
-            // {"partitionid", BuildNamedBuiltinFactoryCallback<TCallDirectRow>("PartitionId")},
-            // {"messagegroupid", BuildNamedBuiltinFactoryCallback<TCallDirectRow>("MessageGroupId")},
-            // {"seqno", BuildNamedBuiltinFactoryCallback<TCallDirectRow>("SeqNo")},
+            {"systemmetadata", BuildNamedArgcBuiltinFactoryCallback<TCallDirectRow>("SystemMetadata", 1, -1)},
 
             // Hint builtins
             {"grouping", BuildSimpleBuiltinFactoryCallback<TGroupingNode>()},
@@ -3300,8 +3295,8 @@ TNodePtr BuildBuiltinFunc(TContext& ctx, TPosition pos, TString name, const TVec
 
         return BuildUdf(ctx, pos, nameSpace, name, makeUdfArgs());
     } else if (scriptType != NKikimr::NMiniKQL::EScriptType::Unknown) {
-        auto scriptName = NKikimr::NMiniKQL::ScriptTypeAsStr(scriptType);
-        return new TScriptUdf(pos, TString(scriptName), name, args);
+        auto scriptName = NKikimr::NMiniKQL::IsCustomPython(scriptType) ? nameSpace : TString(NKikimr::NMiniKQL::ScriptTypeAsStr(scriptType));
+        return new TScriptUdf(pos, scriptName, name, args);
     } else if (ns.empty()) {
         if (auto simpleType = LookupSimpleType(normalizedName, ctx.FlexibleTypes, /* isPgType = */ false)) {
             const auto type = *simpleType;
@@ -3310,11 +3305,12 @@ TNodePtr BuildBuiltinFunc(TContext& ctx, TPosition pos, TString name, const TVec
                 return new TYqlData(pos, type, args);
             }
 
-            if (type.StartsWith("pg")) {
+            if (type.StartsWith("pg") || type.StartsWith("_pg")) {
                 TVector<TNodePtr> pgConstArgs;
                 if (!args.empty()) {
                     pgConstArgs.push_back(args.front());
-                    pgConstArgs.push_back(new TCallNodeImpl(pos, "PgType", { BuildQuotedAtom(pos, type.substr(2), TNodeFlags::Default) }));
+                    pgConstArgs.push_back(new TCallNodeImpl(pos, "PgType", { BuildQuotedAtom(pos,
+                        TString(type.StartsWith("pg") ? "" : "_") + type.substr(type.StartsWith("pg") ? 2 : 3), TNodeFlags::Default) }));
                     pgConstArgs.insert(pgConstArgs.end(), args.begin() + 1, args.end());
                 }
                 return new TYqlPgConst(pos, pgConstArgs);

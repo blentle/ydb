@@ -46,7 +46,7 @@ struct TEnvironmentSetup {
         {}
 
         void Create(const TActorContext& ctx, ui32 pdiskId, const TIntrusivePtr<TPDiskConfig>& cfg,
-                const NPDisk::TKey& /*mainKey*/, ui32 poolId, ui32 nodeId) override {
+                const NPDisk::TMainKey& /*mainKey*/, ui32 poolId, ui32 nodeId) override {
             const auto key = std::make_pair(nodeId, pdiskId);
             TIntrusivePtr<TPDiskMockState>& state = Env.PDiskMockStates[key];
             if (!state) {
@@ -97,13 +97,27 @@ struct TEnvironmentSetup {
         Cerr << "RandomSeed# " << seed << Endl;
     }
 
+    TString GenerateRandomString(ui32 len) {
+        TString res = TString::Uninitialized(len);
+        char *p = res.Detach();
+        char *end = p + len;
+        TReallyFastRng32 rng(RandomNumber<ui64>());
+        for (; p + sizeof(ui32) < end; p += sizeof(ui32)) {
+            *reinterpret_cast<ui32*>(p) = rng();
+        }
+        for (; p < end; ++p) {
+            *p = rng();
+        }
+        return res;
+    }
+
     ui32 GetNumDataCenters() const {
         return Settings.NumDataCenters ? Settings.NumDataCenters :
             Settings.Erasure.GetErasure() == TBlobStorageGroupType::ErasureMirror3dc ? 3 : 1;
     }
 
     void Initialize() {
-        Runtime = std::make_unique<TTestActorSystem>(Settings.NodeCount);
+        Runtime = std::make_unique<TTestActorSystem>(Settings.NodeCount, NLog::PRI_ERROR);
         if (Settings.PrepareRuntime) {
             Settings.PrepareRuntime(*Runtime);
         }
@@ -335,7 +349,8 @@ struct TEnvironmentSetup {
         }
     }
 
-    void CreateBoxAndPool(ui32 numDrivesPerNode = 0, ui32 numGroups = 0, ui32 numStorageNodes = 0) {
+    void CreateBoxAndPool(ui32 numDrivesPerNode = 0, ui32 numGroups = 0, ui32 numStorageNodes = 0,
+            NKikimrBlobStorage::EPDiskType pdiskType = NKikimrBlobStorage::EPDiskType::ROT) {
         NKikimrBlobStorage::TConfigRequest request;
 
         auto *cmd = request.AddCommand()->MutableDefineHostConfig();
@@ -343,7 +358,7 @@ struct TEnvironmentSetup {
         for (ui32 j = 0; j < (numDrivesPerNode ? numDrivesPerNode : DrivesPerNode); ++j) {
             auto *drive = cmd->AddDrive();
             drive->SetPath(Sprintf("SectorMap:%" PRIu32 ":1000", j));
-            drive->SetType(NKikimrBlobStorage::EPDiskType::ROT);
+            drive->SetType(pdiskType);
         }
 
         cmd = request.AddCommand()->MutableDefineHostConfig();
@@ -367,7 +382,7 @@ struct TEnvironmentSetup {
         cmd2->SetErasureSpecies(TBlobStorageGroupType::ErasureSpeciesName(Settings.Erasure.GetErasure()));
         cmd2->SetVDiskKind("Default");
         cmd2->SetNumGroups(numGroups ? numGroups : NumGroups);
-        cmd2->AddPDiskFilter()->AddProperty()->SetType(NKikimrBlobStorage::EPDiskType::ROT);
+        cmd2->AddPDiskFilter()->AddProperty()->SetType(pdiskType);
         if (Settings.Encryption) {
             cmd2->SetEncryptionMode(TBlobStorageGroupInfo::EEncryptionMode::EEM_ENC_V1);
         }
@@ -575,7 +590,7 @@ struct TEnvironmentSetup {
     void PutBlob(const TVDiskID& vdiskId, const TLogoBlobID& blobId, const TString& part) {
         WithQueueId(vdiskId, NKikimrBlobStorage::EVDiskQueueId::PutTabletLog, [&](TActorId queueId) {
             const TActorId& edge = Runtime->AllocateEdgeActor(queueId.NodeId(), __FILE__, __LINE__);
-            Runtime->Send(new IEventHandle(queueId, edge, new TEvBlobStorage::TEvVPut(blobId, part, vdiskId, false, nullptr,
+            Runtime->Send(new IEventHandle(queueId, edge, new TEvBlobStorage::TEvVPut(blobId, TRope(part), vdiskId, false, nullptr,
                 TInstant::Max(), NKikimrBlobStorage::EPutHandleClass::TabletLog)), queueId.NodeId());
             auto r = WaitForEdgeActorEvent<TEvBlobStorage::TEvVPutResult>(edge);
 

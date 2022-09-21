@@ -56,6 +56,12 @@ namespace NKikimr {
     ////////////////////////////////////////////////////////////////////////////
     class TSkeleton : public TActorBootstrapped<TSkeleton> {
 
+        struct TEvPrivate {
+            enum {
+                EvCheckSnapshotExpiration = EventSpaceBegin(TEvents::ES_PRIVATE),
+            };
+        };
+
         ////////////////////////////////////////////////////////////////////////
         // WHITEBOARD SECTOR
         // Update Whiteboard with the current status
@@ -874,7 +880,23 @@ namespace NKikimr {
                 ReplyError(NKikimrProto::RACE, "group generation mismatch", ev, ctx, now);
             } else if (!CheckVGetQuery(record)) {
                 ReplyError(NKikimrProto::ERROR, "get query is invalid", ev, ctx, now);
+            } else if (record.HasReaderTabletId()
+                    && record.HasReaderTabletGeneration()
+                    && Hull->IsBlocked(record.GetReaderTabletId(), {record.GetReaderTabletGeneration(), 0}).Status != TBlocksCache::EStatus::OK) {
+                ReplyError(NKikimrProto::BLOCKED, "tablet's generation is blocked", ev, ctx, now);
             } else {
+                std::optional<THullDsSnap> fullSnap;
+                if (record.HasSnapshotId()) {
+                    const auto it = Snapshots.find(record.GetSnapshotId());
+                    if (it == Snapshots.end()) {
+                        return ReplyError(NKikimrProto::ERROR, "snapshot not found", ev, ctx, now);
+                    } else {
+                        fullSnap.emplace(*it->second.Snap);
+                    }
+                } else {
+                    fullSnap.emplace(Hull->GetSnapshot());
+                }
+
                 TMaybe<ui64> cookie;
                 if (record.HasCookie())
                     cookie = record.GetCookie();
@@ -897,9 +919,8 @@ namespace NKikimr {
                     return hull->FastKeep(id, keepByIngress, explanation);
                 };
                 // create a query actor and pass read-only snapshot to it
-                THullDsSnap fullSnap = Hull->GetSnapshot();
                 IActor *actor = CreateLevelIndexQueryActor(QueryCtx, std::move(keepChecker), ctx,
-                        std::move(fullSnap), ctx.SelfID, ev, std::move(result), Db->ReplID);
+                    std::move(*fullSnap), ctx.SelfID, ev, std::move(result), Db->ReplID);
                 if (actor) {
                     auto aid = ctx.Register(actor);
                     ActiveActors.Insert(aid);
@@ -1943,7 +1964,7 @@ namespace NKikimr {
                     ctx.Send(ev->Sender, new NMon::TEvHttpInfoRes(str.Str(), TDbMon::LocalRecovInfoId));
                     break;
                 }
-                case TDbMon::DelayedHugeBlobDeleterId: {
+                case TDbMon::DelayedCompactionDeleterId: {
                     TStringStream str;
                     if (Hull) {
                         Hull->OutputHtmlForHugeBlobDeleter(str);
@@ -2293,6 +2314,80 @@ namespace NKikimr {
             ctx.Send(ev->Forward(Hull->GetHullDs()->LogoBlobs->LIActor));
         }
 
+        void Handle(NPDisk::TEvChunkForgetResult::TPtr ev) {
+            CHECK_PDISK_RESPONSE(VCtx, ev, TActivationContext::AsActorContext());
+        }
+
+        void Handle(TEvBlobStorage::TEvVTakeSnapshot::TPtr ev, const TActorContext& ctx) {
+            const auto& record = ev->Get()->Record;
+            if (!SelfVDiskId.SameDisk(record.GetVDiskID())) {
+                SendVDiskResponse(ctx, ev->Sender, new TEvBlobStorage::TEvVTakeSnapshotResult(NKikimrProto::RACE,
+                    "group generation race", SelfVDiskId), ev->Cookie);
+            } else {
+                const auto [it, inserted] = Snapshots.try_emplace(record.GetSnapshotId());
+                TSnapshotInfo& snapshot = it->second;
+                const TMonotonic expirationTimestamp = ctx.Monotonic() + TDuration::Seconds(record.GetTimeToLiveSec());
+                NKikimrProto::EReplyStatus status = NKikimrProto::OK;
+                if (inserted) {
+                    snapshot.SnapshotId = it->first;
+                    snapshot.Snap.emplace(Hull->GetSnapshot());
+                    snapshot.ExpirationIt = SnapshotExpirationMap.emplace(expirationTimestamp, &snapshot);
+                } else {
+                    status = NKikimrProto::ALREADY;
+                    auto nh = SnapshotExpirationMap.extract(snapshot.ExpirationIt);
+                    nh.key() = expirationTimestamp;
+                    snapshot.ExpirationIt = SnapshotExpirationMap.insert(std::move(nh));
+                }
+                RescheduleSnapshotExpirationCheck();
+                SendVDiskResponse(ctx, ev->Sender, new TEvBlobStorage::TEvVTakeSnapshotResult(status,
+                    {}, SelfVDiskId), ev->Cookie);
+            }
+        }
+
+        void Handle(TEvBlobStorage::TEvVReleaseSnapshot::TPtr ev, const TActorContext& ctx) {
+            const auto& record = ev->Get()->Record;
+            if (!SelfVDiskId.SameDisk(record.GetVDiskID())) {
+                SendVDiskResponse(ctx, ev->Sender, new TEvBlobStorage::TEvVReleaseSnapshotResult(NKikimrProto::RACE,
+                    "group generation race", SelfVDiskId), ev->Cookie);
+            } else if (const auto it = Snapshots.find(record.GetSnapshotId()); it != Snapshots.end()) {
+                TSnapshotInfo& snapshot = it->second;
+                SnapshotExpirationMap.erase(snapshot.ExpirationIt);
+                Snapshots.erase(it);
+                SendVDiskResponse(ctx, ev->Sender, new TEvBlobStorage::TEvVReleaseSnapshotResult(NKikimrProto::OK,
+                    {}, SelfVDiskId), ev->Cookie);
+            } else {
+                SendVDiskResponse(ctx, ev->Sender, new TEvBlobStorage::TEvVReleaseSnapshotResult(NKikimrProto::NODATA,
+                    {}, SelfVDiskId), ev->Cookie);
+            }
+        }
+
+        void RescheduleSnapshotExpirationCheck() {
+            if (!SnapshotExpirationMap.empty()) {
+                const TMonotonic when = SnapshotExpirationMap.begin()->first;
+                if (SnapshotExpirationCheckSchedule.empty() || when < SnapshotExpirationCheckSchedule.front()) {
+                    TActivationContext::Schedule(when, new IEventHandle(TEvPrivate::EvCheckSnapshotExpiration, 0,
+                        SelfId(), {}, nullptr, when.GetValue()));
+                    SnapshotExpirationCheckSchedule.push_front(when);
+                }
+            }
+        }
+
+        void CheckSnapshotExpiration(TAutoPtr<IEventHandle> ev, const TActorContext& ctx) {
+            auto schedIt = std::find(SnapshotExpirationCheckSchedule.begin(), SnapshotExpirationCheckSchedule.end(),
+                TMonotonic::FromValue(ev->Cookie));
+            Y_VERIFY(schedIt != SnapshotExpirationCheckSchedule.end());
+            SnapshotExpirationCheckSchedule.erase(schedIt);
+
+            const TMonotonic now = ctx.Monotonic();
+            TSnapshotExpirationMap::iterator it;
+            for (it = SnapshotExpirationMap.begin(); it != SnapshotExpirationMap.end() && now <= it->first; ++it) {
+                Snapshots.erase(TString(it->second->SnapshotId));
+            }
+            SnapshotExpirationMap.erase(SnapshotExpirationMap.begin(), it);
+
+            RescheduleSnapshotExpirationCheck();
+        }
+
         // NOTES: we have 4 state functions, one of which is an error state (StateDatabaseError) and
         // others are good: StateLocalRecovery, StateSyncGuidRecovery, StateNormal
         // We switch between states in the following manner:
@@ -2343,6 +2438,8 @@ namespace NKikimr {
             FFunc(TEvBlobStorage::EvRecoverBlob, ForwardToScrubActor)
             FFunc(TEvBlobStorage::EvNonrestoredCorruptedBlobNotify, ForwardToScrubActor)
             HFunc(TEvProxyQueueState, Handle)
+            hFunc(NPDisk::TEvChunkForgetResult, Handle)
+            FFunc(TEvPrivate::EvCheckSnapshotExpiration, CheckSnapshotExpiration)
         )
 
         STRICT_STFUNC(StateSyncGuidRecovery,
@@ -2393,6 +2490,8 @@ namespace NKikimr {
             HFunc(TEvRestoreCorruptedBlob, Handle)
             HFunc(TEvBlobStorage::TEvCaptureVDiskLayout, Handle)
             HFunc(TEvProxyQueueState, Handle)
+            hFunc(NPDisk::TEvChunkForgetResult, Handle)
+            FFunc(TEvPrivate::EvCheckSnapshotExpiration, CheckSnapshotExpiration)
         )
 
         STRICT_STFUNC(StateNormal,
@@ -2434,6 +2533,8 @@ namespace NKikimr {
             HFunc(TEvCompactVDisk, Handle)
             HFunc(TEvHullCompactResult, Handle)
             HFunc(TEvBlobStorage::TEvVBaldSyncLog, Handle)
+            HFunc(TEvBlobStorage::TEvVTakeSnapshot, Handle)
+            HFunc(TEvBlobStorage::TEvVReleaseSnapshot, Handle)
             HFunc(TEvTakeHullSnapshot, Handle)
             HFunc(NMon::TEvHttpInfo, Handle)
             HFunc(TEvVDiskStatRequest, Handle)
@@ -2454,6 +2555,8 @@ namespace NKikimr {
             HFunc(TEvRestoreCorruptedBlob, Handle)
             HFunc(TEvBlobStorage::TEvCaptureVDiskLayout, Handle)
             HFunc(TEvProxyQueueState, Handle)
+            hFunc(NPDisk::TEvChunkForgetResult, Handle)
+            FFunc(TEvPrivate::EvCheckSnapshotExpiration, CheckSnapshotExpiration)
         )
 
         STRICT_STFUNC(StateDatabaseError,
@@ -2478,6 +2581,8 @@ namespace NKikimr {
             HFunc(TEvBlobStorage::TEvCaptureVDiskLayout, Handle)
             HFunc(TEvProxyQueueState, Handle)
             hFunc(TEvVPatchDyingRequest, Handle)
+            hFunc(NPDisk::TEvChunkForgetResult, Handle)
+            FFunc(TEvPrivate::EvCheckSnapshotExpiration, CheckSnapshotExpiration)
         )
 
         PDISK_TERMINATE_STATE_FUNC_DEF;
@@ -2512,6 +2617,16 @@ namespace NKikimr {
 
         virtual ~TSkeleton() {
         }
+
+    private:
+        struct TSnapshotInfo;
+        using TSnapshotExpirationMap = std::multimap<TMonotonic, TSnapshotInfo*>;
+
+        struct TSnapshotInfo {
+            std::string_view SnapshotId;
+            std::optional<THullDsSnap> Snap;
+            TSnapshotExpirationMap::iterator ExpirationIt;
+        };
 
     private:
         TIntrusivePtr<TVDiskConfig> Config;
@@ -2552,6 +2667,10 @@ namespace NKikimr {
         std::unique_ptr<TVDiskCompactionState> VDiskCompactionState;
         TMemorizableControlWrapper EnableVPatch;
         THashMap<TLogoBlobID, TActorId> VPatchActors;
+
+        std::unordered_map<TString, TSnapshotInfo> Snapshots;
+        TSnapshotExpirationMap SnapshotExpirationMap;
+        std::deque<TMonotonic> SnapshotExpirationCheckSchedule;
     };
 
     ////////////////////////////////////////////////////////////////////////////

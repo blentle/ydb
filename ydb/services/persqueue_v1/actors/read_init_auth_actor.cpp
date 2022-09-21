@@ -57,6 +57,10 @@ void TReadInitAndAuthActor::Die(const TActorContext& ctx) {
     for (auto& [_, holder] : Topics) {
         if (holder.PipeClient)
             NTabletPipe::CloseClient(ctx, holder.PipeClient);
+
+        // In case of cdc, primary path (actual cdc stream path) was overwritten, so restore previous value
+        if (holder.CdcStreamPath)
+            holder.DiscoveryConverter->RestorePrimaryPath();
     }
 
     LOG_DEBUG_S(ctx, NKikimrServices::PQ_READ_PROXY, PQ_LOG_PREFIX << " auth is DEAD");
@@ -93,6 +97,7 @@ bool TReadInitAndAuthActor::ProcessTopicSchemeCacheResponse(
     topicsIter->second.CloudId = pqDescr.GetPQTabletConfig().GetYcCloudId();
     topicsIter->second.DbId = pqDescr.GetPQTabletConfig().GetYdbDatabaseId();
     topicsIter->second.FolderId = pqDescr.GetPQTabletConfig().GetYcFolderId();
+    topicsIter->second.MeteringMode = pqDescr.GetPQTabletConfig().GetMeteringMode();
     if (!topicsIter->second.DiscoveryConverter->IsValid()) {
         TString errorReason = Sprintf("Internal server error with topic '%s', Marker# PQ503",
                                       topicsIter->second.DiscoveryConverter->GetPrintableString().c_str());
@@ -257,7 +262,7 @@ void TReadInitAndAuthActor::FinishInitialization(const TActorContext& ctx) {
     TTopicInitInfoMap res;
     for (auto& [name, holder] : Topics) {
         res.insert(std::make_pair(name, TTopicInitInfo{
-            holder.FullConverter, holder.TabletID, holder.CloudId, holder.DbId, holder.FolderId
+            holder.FullConverter, holder.TabletID, holder.CloudId, holder.DbId, holder.FolderId, holder.MeteringMode
         }));
     }
     ctx.Send(ParentId, new TEvPQProxy::TEvAuthResultOk(std::move(res)));

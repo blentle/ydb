@@ -133,6 +133,11 @@ namespace Tests {
         std::function<IActor*(const NKikimrProto::TAuthConfig&)> CreateTicketParser = NKikimr::CreateTicketParser;
         std::shared_ptr<TGrpcServiceFactory> GrpcServiceFactory;
 
+        TServerSettings& SetEnableKqpSessionActor(bool enable) {
+            AppConfig.MutableTableServiceConfig()->SetEnableKqpSessionActor(enable);
+            return *this;
+        }
+
         TServerSettings& SetGrpcPort(ui16 value) { GrpcPort = value; return *this; }
         TServerSettings& SetSupportsRedirect(bool value) { SupportsRedirect = value; return *this; }
         TServerSettings& SetTracePath(const TString& value) { TracePath = value; return *this; }
@@ -198,9 +203,12 @@ namespace Tests {
             , PQConfig(pqConfig)
         {
             AddStoragePool("test", "/" + DomainName + ":test");
+            AppConfig.MutableTableServiceConfig()->MutableResourceManager()->MutableShardsScanningPolicy()->SetParallelScanningAvailable(true);
+            AppConfig.MutableTableServiceConfig()->MutableResourceManager()->MutableShardsScanningPolicy()->SetShardSplitFactor(16);
         }
 
         TServerSettings(const TServerSettings& settings) = default;
+        TServerSettings& operator=(const TServerSettings& settings) = default;
     };
 
     class TServer : public TThrRefBase, TMoveOnly {

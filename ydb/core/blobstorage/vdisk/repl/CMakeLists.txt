@@ -6,6 +6,7 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(ut)
 
 add_library(blobstorage-vdisk-repl)
 target_link_libraries(blobstorage-vdisk-repl PUBLIC
@@ -20,6 +21,7 @@ target_link_libraries(blobstorage-vdisk-repl PUBLIC
   vdisk-hulldb-barriers
   vdisk-hulldb-base
   vdisk-hulldb-generic
+  vdisk-hulldb-bulksst_add
   ydb-core-protos
 )
 target_sources(blobstorage-vdisk-repl PRIVATE

@@ -1,5 +1,7 @@
 #include "ydb_profile.h"
 
+#include <ydb/public/lib/ydb_cli/common/interactive.h>
+
 #include <util/folder/dirut.h>
 
 #if defined(_win32_)
@@ -26,6 +28,12 @@ TCommandConfig::TCommandConfig()
     : TClientCommandTree("config", {}, "Manage YDB CLI configuration")
 {
     AddCommand(std::make_unique<TCommandProfile>());
+}
+
+void TCommandConfig::Config(TConfig& config) {
+    TClientCommandTree::Config(config);
+
+    config.NeedToConnect = false;
 }
 
 TCommandProfile::TCommandProfile()
@@ -189,7 +197,7 @@ namespace {
         Cin >> userName;
         Cout << "Please enter password: ";
         TString userPassword = InputPassword();
-        if (userName && userPassword) {
+        if (userName) {
             Cout << "Setting user & password for profile \"" << profileName << "\"" << Endl;
             profile->RemoveValue("authentication");
             YAML::Node authValue;
@@ -281,21 +289,6 @@ namespace {
         picker.PickOptionAndDoAction();
     }
 
-    bool AskYesOrNo() {
-        TString input;
-        for (;;) {
-            Cin >> input;
-            if (to_lower(input) == "y" || to_lower(input) == "yes") {
-                return true;
-            } else if (to_lower(input) == "n" || to_lower(input) == "n") {
-                return false;
-            } else {
-                Cout << "Type \"y\" (yes) or \"n\" (no): ";
-            }
-        }
-        return false;
-    }
-
     void ConfigureProfile(const TString& profileName, std::shared_ptr<IProfileManager> profileManager,
             TClientCommand::TConfig& config) {
         bool existingProfile = profileManager->HasProfile(profileName);
@@ -367,6 +360,8 @@ TCommandInit::TCommandInit()
 
 void TCommandInit::Config(TConfig& config) {
     TClientCommand::Config(config);
+
+    config.NeedToConnect = false;
 
     config.SetFreeArgsNum(0);
 }

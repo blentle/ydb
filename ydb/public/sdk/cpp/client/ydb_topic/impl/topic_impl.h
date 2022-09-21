@@ -7,6 +7,7 @@
 #include <ydb/public/sdk/cpp/client/ydb_common_client/impl/client.h>
 #include <ydb/public/sdk/cpp/client/ydb_persqueue_core/impl/common.h>
 #include <ydb/public/sdk/cpp/client/ydb_topic/impl/executor.h>
+#include <ydb/public/sdk/cpp/client/ydb_proto/accessor.h>
 
 #include <ydb/public/api/grpc/ydb_topic_v1.grpc.pb.h>
 #include <ydb/public/sdk/cpp/client/ydb_topic/topic.h>
@@ -70,6 +71,7 @@ public:
         request.set_partition_write_speed_bytes_per_second(settings.PartitionWriteSpeedBytesPerSecond_);
         request.set_partition_write_burst_bytes(settings.PartitionWriteBurstBytes_);
         request.set_retention_storage_mb(settings.RetentionStorageMb_);
+        request.set_metering_mode(TProtoAccessor::GetProto(settings.MeteringMode_));
 
         for (auto& pair : settings.Attributes_) {
             (*request.mutable_attributes())[pair.first] = pair.second;
@@ -119,6 +121,9 @@ public:
         }
         if (settings.SetRetentionStorageMb_) {
             request.set_set_retention_storage_mb(*settings.SetRetentionStorageMb_);
+        }
+        if (settings.SetMeteringMode_) {
+            request.set_set_metering_mode(TProtoAccessor::GetProto(*settings.SetMeteringMode_));
         }
 
         for (auto& pair : settings.AlterAttributes_) {
@@ -196,12 +201,20 @@ public:
 
     // Runtime API.
     std::shared_ptr<IReadSession> CreateReadSession(const TReadSessionSettings& settings);
+    std::shared_ptr<ISimpleBlockingWriteSession> CreateSimpleWriteSession(const TWriteSessionSettings& settings);
+    std::shared_ptr<IWriteSession> CreateWriteSession(const TWriteSessionSettings& settings);
 
     using IReadSessionConnectionProcessorFactory =
         NYdb::NPersQueue::ISessionConnectionProcessorFactory<Ydb::Topic::StreamReadMessage::FromClient,
                                                              Ydb::Topic::StreamReadMessage::FromServer>;
 
     std::shared_ptr<IReadSessionConnectionProcessorFactory> CreateReadSessionConnectionProcessorFactory();
+
+    using IWriteSessionConnectionProcessorFactory =
+        NYdb::NPersQueue::ISessionConnectionProcessorFactory<Ydb::Topic::StreamWriteMessage::FromClient,
+                                                             Ydb::Topic::StreamWriteMessage::FromServer>;
+
+    std::shared_ptr<IWriteSessionConnectionProcessorFactory> CreateWriteSessionConnectionProcessorFactory();
 
     NGrpc::IQueueClientContextPtr CreateContext() {
         return Connections_->CreateContext();

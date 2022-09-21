@@ -393,7 +393,9 @@ private:
             TenantName,
             task.result_limit(),
             NProtoInterop::CastFromProto(task.execution_limit()),
-            NProtoInterop::CastFromProto(task.request_started_at())
+            NProtoInterop::CastFromProto(task.request_started_at()),
+            task.restart_count(),
+            task.job_id().value()
             );
 
         auto runActorId = Register(CreateRunActor(SelfId(), queryCounters, std::move(params)));
@@ -410,7 +412,7 @@ private:
         hFunc(TEvInternalService::TEvGetTaskResponse, Handle)
         hFunc(NActors::TEvents::TEvPoisonTaken, HandlePoisonTaken)
         hFunc(TEvPrivate::TEvCleanupCounters, HandleCleanupCounters)
-        hFunc(NMon::TEvHttpInfo, Handle);
+        hFunc(NMon::TEvHttpInfo, Handle)
     );
 
     NYq::TYqSharedResources::TPtr YqSharedResources;

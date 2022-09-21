@@ -16,10 +16,13 @@ TCommandKv::TCommandKv()
 
 TCommandKvInit::TCommandKvInit()
     : TWorkloadCommand("init", {}, "Create and initialize tables for workload")
-    , InitRowCount(1000)
-    , MinPartitions(1)
-    , MaxFirstKey(5000)
-    , PartitionsByLoad(true) 
+    , InitRowCount(NYdbWorkload::KvWorkloadConstants::INIT_ROW_COUNT)
+    , MinPartitions(NYdbWorkload::KvWorkloadConstants::MIN_PARTITIONS)
+    , MaxFirstKey(NYdbWorkload::KvWorkloadConstants::MAX_FIRST_KEY)
+    , StringLen(NYdbWorkload::KvWorkloadConstants::STRING_LEN)
+    , ColumnsCnt(NYdbWorkload::KvWorkloadConstants::COLUMNS_CNT)
+    , RowsCnt(NYdbWorkload::KvWorkloadConstants::ROWS_CNT)
+    , PartitionsByLoad(NYdbWorkload::KvWorkloadConstants::PARTITIONS_BY_LOAD)
 {}
 
 void TCommandKvInit::Config(TConfig& config) {
@@ -27,14 +30,20 @@ void TCommandKvInit::Config(TConfig& config) {
 
     config.SetFreeArgsNum(0);
 
-    config.Opts->AddLongOption("rows-cnt", "count of rows need to Insert while table initialization")
-        .DefaultValue(1000).StoreResult(&InitRowCount);
+    config.Opts->AddLongOption("init-upserts", "count of upserts need to create while table initialization")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::INIT_ROW_COUNT).StoreResult(&InitRowCount);
     config.Opts->AddLongOption("min-partitions", "Minimum partitions for tables.")
-        .DefaultValue(40).StoreResult(&MinPartitions);
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::MIN_PARTITIONS).StoreResult(&MinPartitions);
     config.Opts->AddLongOption("auto-partition", "Enable auto partitioning by load.")
-        .DefaultValue(true).StoreResult(&PartitionsByLoad);
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::PARTITIONS_BY_LOAD).StoreResult(&PartitionsByLoad);
     config.Opts->AddLongOption("max-first-key", "maximum value of first primary key")
-        .DefaultValue(5000).StoreResult(&MaxFirstKey);
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::MAX_FIRST_KEY).StoreResult(&MaxFirstKey);
+    config.Opts->AddLongOption("len", "String len")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::STRING_LEN).StoreResult(&StringLen);
+    config.Opts->AddLongOption("cols", "Number of columns")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::COLUMNS_CNT).StoreResult(&ColumnsCnt);
+    config.Opts->AddLongOption("rows", "Number of rows to upsert")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::ROWS_CNT).StoreResult(&RowsCnt);
 }
 
 void TCommandKvInit::Parse(TConfig& config) {
@@ -50,34 +59,14 @@ int TCommandKvInit::Run(TConfig& config) {
     params.MinPartitions = MinPartitions;
     params.PartitionsByLoad = PartitionsByLoad;
     params.MaxFirstKey = MaxFirstKey;
+    params.StringLen = StringLen;
+    params.ColumnsCnt = ColumnsCnt;
+    params.RowsCnt = RowsCnt;
 
     NYdbWorkload::TWorkloadFactory factory;
     auto workloadGen = factory.GetWorkloadQueryGenerator(NYdbWorkload::EWorkload::KV, &params);
 
-    auto session = GetSession();
-    auto result = session.ExecuteSchemeQuery(workloadGen->GetDDLQueries()).GetValueSync();
-    ThrowOnError(result);
-
-    auto queryInfoList = workloadGen->GetInitialData();
-    for (auto queryInfo : queryInfoList) {
-        auto prepareResult = session.PrepareDataQuery(queryInfo.Query.c_str()).GetValueSync();
-        if (!prepareResult.IsSuccess()) {
-            Cerr << "Prepare failed: " << prepareResult.GetIssues().ToString() << Endl
-                << "Query:\n" << queryInfo.Query << Endl;
-            return EXIT_FAILURE;
-        }
-
-        auto dataQuery = prepareResult.GetQuery();
-        auto result = dataQuery.Execute(NYdb::NTable::TTxControl::BeginTx(NYdb::NTable::TTxSettings::SerializableRW()).CommitTx(),
-                                        std::move(queryInfo.Params)).GetValueSync();
-        if (!result.IsSuccess()) {
-            Cerr << "Query execution failed: " << result.GetIssues().ToString() << Endl
-                << "Query:\n" << queryInfo.Query << Endl;
-            return EXIT_FAILURE;
-        }
-    }
-
-    return EXIT_SUCCESS;
+    return InitTables(workloadGen);
 }
 
 
@@ -102,30 +91,19 @@ int TCommandKvClean::Run(TConfig& config) {
     NYdbWorkload::TWorkloadFactory factory;
     auto workloadGen = factory.GetWorkloadQueryGenerator(NYdbWorkload::EWorkload::KV, &params);
 
-    auto session = GetSession();
-
-    auto query = workloadGen->GetCleanDDLQueries();
-    TStatus result(EStatus::SUCCESS, NYql::TIssues());
-    result = session.ExecuteSchemeQuery(TString(query)).GetValueSync();
-
-    if (!result.IsSuccess()) {
-        Cerr << "Query execution failed: " << result.GetIssues().ToString() << Endl
-            << "Query:\n" << query << Endl;
-        return EXIT_FAILURE;
-    }
-
-    return EXIT_SUCCESS;
+    return CleanTables(workloadGen);
 }
 
 TCommandKvRun::TCommandKvRun()
     : TClientCommandTree("run", {}, "Run YDB KV workload")
 {
     AddCommand(std::make_unique<TCommandKvRunUpsertRandom>());
+    AddCommand(std::make_unique<TCommandKvRunInsertRandom>());
     AddCommand(std::make_unique<TCommandKvRunSelectRandom>());
 }
 
 TCommandKvRunUpsertRandom::TCommandKvRunUpsertRandom()
-    : TWorkloadCommand("upsert", {}, "upsert random pairs (a, b) into table")
+    : TWorkloadCommand("upsert", {}, "upsert random rows into table")
 {}
 
 void TCommandKvRunUpsertRandom::Config(TConfig& config) {
@@ -133,7 +111,13 @@ void TCommandKvRunUpsertRandom::Config(TConfig& config) {
     config.SetFreeArgsNum(0);
 
     config.Opts->AddLongOption("max-first-key", "maximum value of first primary key")
-        .DefaultValue(5000).StoreResult(&MaxFirstKey);
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::MAX_FIRST_KEY).StoreResult(&MaxFirstKey);
+    config.Opts->AddLongOption("len", "String len")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::STRING_LEN).StoreResult(&StringLen);
+    config.Opts->AddLongOption("cols", "Number of columns")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::COLUMNS_CNT).StoreResult(&ColumnsCnt);
+    config.Opts->AddLongOption("rows", "Number of rows to upsert")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::ROWS_CNT).StoreResult(&RowsCnt);
 }
 
 void TCommandKvRunUpsertRandom::Parse(TConfig& config) {
@@ -146,6 +130,9 @@ int TCommandKvRunUpsertRandom::Run(TConfig& config) {
     NYdbWorkload::TKvWorkloadParams params;
     params.DbPath = config.Database;
     params.MaxFirstKey = MaxFirstKey;
+    params.StringLen = StringLen;
+    params.ColumnsCnt = ColumnsCnt;
+    params.RowsCnt = RowsCnt;
 
     NYdbWorkload::TWorkloadFactory factory;
     auto workloadGen = factory.GetWorkloadQueryGenerator(NYdbWorkload::EWorkload::KV, &params);
@@ -153,8 +140,46 @@ int TCommandKvRunUpsertRandom::Run(TConfig& config) {
     return RunWorkload(workloadGen, static_cast<int>(NYdbWorkload::TKvWorkloadGenerator::EType::UpsertRandom));
 }
 
+TCommandKvRunInsertRandom::TCommandKvRunInsertRandom()
+    : TWorkloadCommand("insert", {}, "insert random rows into table")
+{}
+
+void TCommandKvRunInsertRandom::Config(TConfig& config) {
+    TWorkloadCommand::Config(config);
+    config.SetFreeArgsNum(0);
+
+    config.Opts->AddLongOption("max-first-key", "maximum value of first primary key")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::MAX_FIRST_KEY).StoreResult(&MaxFirstKey);
+    config.Opts->AddLongOption("len", "String len")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::STRING_LEN).StoreResult(&StringLen);
+    config.Opts->AddLongOption("cols", "Number of columns")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::COLUMNS_CNT).StoreResult(&ColumnsCnt);
+    config.Opts->AddLongOption("rows", "Number of rows to insert")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::ROWS_CNT).StoreResult(&RowsCnt);
+}
+
+void TCommandKvRunInsertRandom::Parse(TConfig& config) {
+    TClientCommand::Parse(config);
+}
+
+int TCommandKvRunInsertRandom::Run(TConfig& config) {
+    PrepareForRun(config);
+
+    NYdbWorkload::TKvWorkloadParams params;
+    params.DbPath = config.Database;
+    params.MaxFirstKey = MaxFirstKey;
+    params.StringLen = StringLen;
+    params.ColumnsCnt = ColumnsCnt;
+    params.RowsCnt = RowsCnt;
+
+    NYdbWorkload::TWorkloadFactory factory;
+    auto workloadGen = factory.GetWorkloadQueryGenerator(NYdbWorkload::EWorkload::KV, &params);
+
+    return RunWorkload(workloadGen, static_cast<int>(NYdbWorkload::TKvWorkloadGenerator::EType::InsertRandom));
+}
+
 TCommandKvRunSelectRandom::TCommandKvRunSelectRandom()
-    : TWorkloadCommand("select", {}, "select row by exactly matching of a")
+    : TWorkloadCommand("select", {}, "select rows by exactly matching of a")
 {}
 
 void TCommandKvRunSelectRandom::Config(TConfig& config) {
@@ -162,7 +187,11 @@ void TCommandKvRunSelectRandom::Config(TConfig& config) {
     config.SetFreeArgsNum(0);
 
     config.Opts->AddLongOption("max-first-key", "maximum value of first primary key")
-        .DefaultValue(5000).StoreResult(&MaxFirstKey);
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::MAX_FIRST_KEY).StoreResult(&MaxFirstKey);
+    config.Opts->AddLongOption("cols", "Number of columns")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::COLUMNS_CNT).StoreResult(&ColumnsCnt);
+    config.Opts->AddLongOption("rows", "Number of rows to select")
+        .DefaultValue(NYdbWorkload::KvWorkloadConstants::ROWS_CNT).StoreResult(&RowsCnt);
 }
 
 void TCommandKvRunSelectRandom::Parse(TConfig& config) {
@@ -175,6 +204,8 @@ int TCommandKvRunSelectRandom::Run(TConfig& config) {
     NYdbWorkload::TKvWorkloadParams params;
     params.DbPath = config.Database;
     params.MaxFirstKey = MaxFirstKey;
+    params.ColumnsCnt = ColumnsCnt;
+    params.RowsCnt = RowsCnt;
 
     NYdbWorkload::TWorkloadFactory factory;
     auto workloadGen = factory.GetWorkloadQueryGenerator(NYdbWorkload::EWorkload::KV, &params);

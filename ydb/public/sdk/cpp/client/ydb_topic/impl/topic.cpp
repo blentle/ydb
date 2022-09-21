@@ -34,6 +34,7 @@ TTopicDescription::TTopicDescription(Ydb::Topic::DescribeTopicResult&& result)
     , RetentionStorageMb_(Proto_.retention_storage_mb() > 0 ? TMaybe<ui64>(Proto_.retention_storage_mb()) : Nothing())
     , PartitionWriteSpeedBytesPerSecond_(Proto_.partition_write_speed_bytes_per_second())
     , PartitionWriteBurstBytes_(Proto_.partition_write_burst_bytes())
+    , MeteringMode_(TProtoAccessor::FromProto(Proto_.metering_mode()))
 {
     Owner_ = Proto_.self().owner();
     PermissionToSchemeEntry(Proto_.self().permissions(), &Permissions_);
@@ -118,6 +119,10 @@ ui64 TTopicDescription::GetPartitionWriteBurstBytes() const {
     return PartitionWriteBurstBytes_;
 }
 
+EMeteringMode TTopicDescription::GetMeteringMode() const {
+    return MeteringMode_;
+}
+
 const TMap<TString, TString>& TTopicDescription::GetAttributes() const {
     return Attributes_;
 }
@@ -173,6 +178,14 @@ TPartitionInfo::TPartitionInfo(const Ydb::Topic::DescribeTopicResult::PartitionI
     }
 }
 
+bool TPartitionInfo::GetActive() const {
+    return Active_;
+}
+
+ui64 TPartitionInfo::GetPartitionId() const {
+    return PartitionId_;
+}
+
 
 TAsyncStatus TTopicClient::CreateTopic(const TString& path, const TCreateTopicSettings& settings) {
     return Impl_->CreateTopic(path, settings);
@@ -219,6 +232,14 @@ IRetryPolicy::GetFixedIntervalPolicy(TDuration delay, TDuration longRetryDelay, 
 
 std::shared_ptr<IReadSession> TTopicClient::CreateReadSession(const TReadSessionSettings& settings) {
     return Impl_->CreateReadSession(settings);
+}
+
+std::shared_ptr<ISimpleBlockingWriteSession> TTopicClient::CreateSimpleBlockingWriteSession(const TWriteSessionSettings& settings) {
+    return Impl_->CreateSimpleWriteSession(settings);
+}
+
+std::shared_ptr<IWriteSession> TTopicClient::CreateWriteSession(const TWriteSessionSettings& settings) {
+    return Impl_->CreateWriteSession(settings);
 }
 
 } // namespace NYdb::NTopic

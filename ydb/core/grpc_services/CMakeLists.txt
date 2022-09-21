@@ -6,6 +6,10 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(base)
+add_subdirectory(counters)
+add_subdirectory(local_rpc)
+add_subdirectory(ut)
 
 add_library(ydb-core-grpc_services)
 target_compile_options(ydb-core-grpc_services PRIVATE
@@ -49,6 +53,7 @@ target_link_libraries(ydb-core-grpc_services PUBLIC
   cpp-client-resources
 )
 target_sources(ydb-core-grpc_services PRIVATE
+  ${CMAKE_SOURCE_DIR}/ydb/core/grpc_services/audit_log.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/grpc_services/grpc_endpoint_publish_actor.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/grpc_services/grpc_helper.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/grpc_services/grpc_mon.cpp

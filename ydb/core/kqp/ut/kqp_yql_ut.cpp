@@ -2,6 +2,8 @@
 
 #include <ydb/public/sdk/cpp/client/draft/ydb_scripting.h>
 
+#include <library/cpp/testing/unittest/registar.h>
+
 namespace NKikimr {
 namespace NKqp {
 
@@ -356,6 +358,64 @@ Y_UNIT_TEST_SUITE(KqpYql) {
         UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
 
         CompareYson(R"([["Some text";"Some bytes"]])", FormatResultSetYson(result.GetResultSet(0)));
+    }
+
+    Y_UNIT_TEST_NEW_ENGINE(BinaryJsonOffsetBound) {
+        TKikimrRunner kikimr;
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        TString query = Q1_(R"(SELECT Unpickle(JsonDocument, "\x09\x00\x00\x00\x01\xf2\xb7\xff\x8a\xff\xff\xd2\xff");)");
+
+        auto result = session.ExecuteDataQuery(query, TTxControl::BeginTx(TTxSettings::SerializableRW()).CommitTx()).ExtractValueSync();
+
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::INTERNAL_ERROR, result.GetIssues().ToString());
+    }
+
+    Y_UNIT_TEST_NEW_ENGINE(BinaryJsonOffsetNormal) {
+        TKikimrRunner kikimr;
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        TString query = Q1_(R"(select Unpickle(JsonDocument, Pickle(JsonDocument('{"a" : 5, "b" : 0.1, "c" : [1, 2, 3]}')));)");
+
+        auto result = session.ExecuteDataQuery(query, TTxControl::BeginTx(TTxSettings::SerializableRW()).CommitTx()).ExtractValueSync();
+
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+    }
+
+    Y_UNIT_TEST_NEW_ENGINE(JsonNumberPrecision) {
+        TKikimrRunner kikimr;
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        auto result = session.ExecuteDataQuery(Q1_(R"(
+            SELECT
+                JsonDocument("-0.5"),
+                JsonDocument("0.5"),
+                JsonDocument("-16777216"),
+                JsonDocument("16777216"),
+                JsonDocument("-9007199254740992"),
+                JsonDocument("9007199254740992"),
+                JsonDocument("-9223372036854775808"),
+                JsonDocument("9223372036854775807"),
+                JsonDocument("18446744073709551615");
+        )"), TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        // Cerr << FormatResultSetYson(result.GetResultSet(0)) << Endl;
+
+        CompareYson(R"([[
+            "-0.5";
+            "0.5";
+            "-16777216";
+            "16777216";
+            "-9007199254740992";
+            "9007199254740992";
+            "-9.223372036854776e+18";
+            "9.223372036854776e+18";
+            "1.844674407370955e+19"]
+        ])", FormatResultSetYson(result.GetResultSet(0)));
     }
 }
 

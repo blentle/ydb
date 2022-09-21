@@ -9,6 +9,7 @@ namespace NKikimr::NBlobDepot {
         struct TEvPrivate {
             enum {
                 EvResume = EventSpaceBegin(TEvents::ES_PRIVATE),
+                EvTxComplete,
             };
         };
 
@@ -20,7 +21,7 @@ namespace NKikimr::NBlobDepot {
         std::optional<TLogoBlobID> SkipBlobsUpTo;
 
         std::optional<TLogoBlobID> LastScannedKey;
-        std::set<TLogoBlobID> NeedfulBlobs; // in current tablet, original blob ids
+        bool EntriesToProcess = false;
 
         static constexpr ui32 MaxSizeToQuery = 10'000'000;
 
@@ -29,6 +30,10 @@ namespace NKikimr::NBlobDepot {
         TActorId PipeId;
 
     public:
+        static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
+            return NKikimrServices::TActivity::BLOB_DEPOT_ASSIMILATOR_ACTOR;
+        }
+
         TGroupAssimilator(TBlobDepot *self)
             : Token(self->Token)
             , Self(self)
@@ -43,9 +48,11 @@ namespace NKikimr::NBlobDepot {
     private:
         void Action();
         void SendAssimilateRequest();
+        void Handle(TEvents::TEvUndelivered::TPtr ev);
         void Handle(TEvBlobStorage::TEvAssimilateResult::TPtr ev);
         void ScanDataForCopying();
         void Handle(TEvBlobStorage::TEvGetResult::TPtr ev);
+        void HandleTxComplete();
         void Handle(TEvBlobStorage::TEvPutResult::TPtr ev);
         void IssueCollects();
         void Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr ev);

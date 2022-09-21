@@ -895,6 +895,46 @@ TMap<TStringBuf, TVector<TStringBuf>> LoadJoinRenameMap(const TExprNode& setting
     return res;
 }
 
+TCoLambda BuildJoinRenameLambda(TPositionHandle pos, const TMap<TStringBuf, TVector<TStringBuf>>& renameMap,
+    const TStructExprType& joinResultType, TExprContext& ctx)
+{
+    THashMap<TStringBuf, TStringBuf> reverseRenameMap;
+    for (const auto& [oldName , targets] : renameMap) {
+        for (TStringBuf newName : targets) {
+            reverseRenameMap[newName] = oldName;
+        }
+    }
+
+    TCoArgument rowArg = Build<TCoArgument>(ctx, pos)
+        .Name("row")
+        .Done();
+
+    TVector<TExprBase> renameTuples;
+    for (auto& item : joinResultType.GetItems()) {
+        TStringBuf newName = item->GetName();
+        auto renamedFrom = reverseRenameMap.FindPtr(newName);
+        TStringBuf oldName = renamedFrom ? *renamedFrom : newName;
+
+        auto tuple = Build<TCoNameValueTuple>(ctx, pos)
+            .Name().Build(newName)
+            .Value<TCoMember>()
+                .Struct(rowArg)
+                .Name().Build(oldName)
+            .Build()
+            .Done();
+
+        renameTuples.push_back(tuple);
+    }
+
+    return Build<TCoLambda>(ctx, pos)
+        .Args({rowArg})
+        .Body<TCoAsStruct>()
+            .Add(renameTuples)
+        .Build()
+        .Done();
+}
+
+
 TSet<TVector<TStringBuf>> LoadJoinSortSets(const TExprNode& settings) {
     TSet<TVector<TStringBuf>> res;
     for (const auto& child : settings.Children()) {
@@ -1038,6 +1078,48 @@ std::pair<bool, bool> IsRequiredSide(const TExprNode::TPtr& joinTree, const TJoi
     }
 
     return{ false, false };
+}
+
+TMaybe<bool> IsFilteredSide(const TExprNode::TPtr& joinTree, const TJoinLabels& labels, ui32 inputIndex) {
+    auto joinType = joinTree->Child(0)->Content();
+    auto left = joinTree->ChildPtr(1);
+    auto right = joinTree->ChildPtr(2);
+
+    TMaybe<bool> isLeftFiltered;
+    if (!left->IsAtom()) {
+        isLeftFiltered = IsFilteredSide(left, labels, inputIndex);
+    } else {
+        auto table = left->Content();
+        if (*labels.FindInputIndex(table) == inputIndex) {
+            if (joinType == "Inner" || joinType == "LeftOnly" || joinType == "LeftSemi") {
+                isLeftFiltered = true;
+            } else if (joinType != "RightOnly" && joinType != "RightSemi") {
+                isLeftFiltered = false;
+            }
+        }
+    }
+
+    TMaybe<bool> isRightFiltered;
+    if (!right->IsAtom()) {
+        isRightFiltered = IsFilteredSide(right, labels, inputIndex);
+    } else {
+        auto table = right->Content();
+        if (*labels.FindInputIndex(table) == inputIndex) {
+            if (joinType == "Inner" || joinType == "RightOnly" || joinType == "RightSemi") {
+                isRightFiltered = true;
+            } else if (joinType != "LeftOnly" && joinType != "LeftSemi") {
+                isRightFiltered = false;
+            }
+        }
+    }
+
+    YQL_ENSURE(!(isLeftFiltered.Defined() && isRightFiltered.Defined()));
+
+    if (!isLeftFiltered.Defined() && !isRightFiltered.Defined()) {
+        return {};
+    }
+
+    return isLeftFiltered.Defined() ? isLeftFiltered : isRightFiltered;
 }
 
 void AppendEquiJoinRenameMap(TPositionHandle pos, const TMap<TStringBuf, TVector<TStringBuf>>& newRenameMap,
@@ -1228,18 +1310,22 @@ TExprNode::TPtr RemapNonConvertibleMemberForJoin(TPositionHandle pos, const TExp
     }
 
     if (RemoveOptionalType(&unifiedType)->GetKind() != ETypeAnnotationKind::Data) {
-        result = ctx.Builder(pos)
-            .Callable("If")
-                .Callable(0, "HasNull")
-                    .Add(0, result)
+        if (unifiedType.HasOptionalOrNull()) {
+            result = ctx.Builder(pos)
+                .Callable("If")
+                    .Callable(0, "HasNull")
+                        .Add(0, result)
+                    .Seal()
+                    .Callable(1, "Null")
+                    .Seal()
+                    .Callable(2, "StablePickle")
+                        .Add(0, result)
+                    .Seal()
                 .Seal()
-                .Callable(1, "Null")
-                .Seal()
-                .Callable(2, "StablePickle")
-                    .Add(0, result)
-                .Seal()
-            .Seal()
-            .Build();
+                .Build();
+        } else {
+            result = ctx.NewCallable(pos, "StablePickle", { result });
+        }
     }
 
     return result;

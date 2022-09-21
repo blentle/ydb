@@ -6,6 +6,7 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(ut)
 
 add_library(providers-s3-provider)
 target_compile_options(providers-s3-provider PRIVATE
@@ -16,6 +17,7 @@ target_link_libraries(providers-s3-provider PUBLIC
   yutil
   contrib-libs-re2
   library-cpp-json
+  cpp-protobuf-util
   library-cpp-random_provider
   library-cpp-retry
   library-cpp-time_provider
@@ -46,6 +48,7 @@ target_link_libraries(providers-s3-provider PUBLIC
   providers-s3-proto
   providers-s3-range_helpers
   library-yql-utils
+  yql-utils-threading
 )
 target_sources(providers-s3-provider PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/providers/s3/provider/yql_s3_datasink.cpp
@@ -59,6 +62,7 @@ target_sources(providers-s3-provider PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/providers/s3/provider/yql_s3_list.cpp
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/providers/s3/provider/yql_s3_logical_opt.cpp
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/providers/s3/provider/yql_s3_mkql_compiler.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/library/yql/providers/s3/provider/yql_s3_path.cpp
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/providers/s3/provider/yql_s3_phy_opt.cpp
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/providers/s3/provider/yql_s3_provider.cpp
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/providers/s3/provider/yql_s3_provider_impl.cpp

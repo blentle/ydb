@@ -323,6 +323,26 @@ YARD_UNIT_TEST(TestChunkContinuity9000) {
     Run<TTestChunk3WriteRead<9000>>(&tc, 1, MIN_CHUNK_SIZE);
 }
 
+YARD_UNIT_TEST(TestChunkLock) {
+    TTestContext tc(false, true);
+    Run<TTestChunkLock>(&tc, 1, MIN_CHUNK_SIZE);
+}
+
+YARD_UNIT_TEST(TestChunkUnlock) {
+    TTestContext tc(false, true);
+    Run<TTestChunkUnlock>(&tc, 1, MIN_CHUNK_SIZE);
+}
+
+YARD_UNIT_TEST(TestChunkUnlockHarakiri) {
+    TTestContext tc(false, true);
+    Run<TTestChunkUnlockHarakiri>(&tc, 1, MIN_CHUNK_SIZE);
+}
+
+YARD_UNIT_TEST(TestChunkUnlockRestart) {
+    TTestContext tc(false, true);
+    Run<TTestChunkUnlockRestart>(&tc, 1, MIN_CHUNK_SIZE);
+}
+
 YARD_UNIT_TEST(TestChunkReserve) {
     TTestContext tc(false, true);
     Run<TTestChunkReserve>(&tc, 1, MIN_CHUNK_SIZE);
@@ -331,17 +351,6 @@ YARD_UNIT_TEST(TestChunkReserve) {
 YARD_UNIT_TEST(TestCheckSpace) {
     TTestContext tc(false, true);
     Run<TTestCheckSpace>(&tc, 1, MIN_CHUNK_SIZE);
-}
-
-YARD_UNIT_TEST(TestChunksLockByRange) {
-    TTestContext tc(false, true);
-    FillDeviceWithZeroes(&tc, MIN_CHUNK_SIZE);
-    Run<TTestChunksLockByRange>(&tc, 1, MIN_CHUNK_SIZE);
-}
-
-YARD_UNIT_TEST(TestChunksLockUnlockReserve) {
-    TTestContext tc(false, true);
-    Run<TTestChunksLockUnlockReserve>(&tc, 1, MIN_CHUNK_SIZE);
 }
 
 YARD_UNIT_TEST(TestHttpInfo) {
@@ -394,6 +403,11 @@ YARD_UNIT_TEST(TestChunkDelete) {
     TTestContext tc(false, true);
     Run<TTestChunkDelete1>(&tc, 1, MIN_CHUNK_SIZE);
     Run<TTestChunkDelete2>(&tc, 1, MIN_CHUNK_SIZE);
+}
+
+YARD_UNIT_TEST(TestChunkForget) {
+    TTestContext tc(false, true);
+    Run<TTestChunkForget1>(&tc, 1, MIN_CHUNK_SIZE);
 }
 
 YARD_UNIT_TEST(Test3HugeAsyncLog) {
@@ -520,7 +534,8 @@ YARD_UNIT_TEST(TestDamagedFirstRecordToKeep) {
         MakeDirIfNotExist(databaseDirectory.c_str());
     }
     TPDiskInfo info;
-    bool isOk = ReadPDiskFormatInfo(dataPath, NPDisk::YdbDefaultPDiskSequence, info, false, tc.SectorMap);
+    const NPDisk::TMainKey mainKey = {NPDisk::YdbDefaultPDiskSequence};
+    bool isOk = ReadPDiskFormatInfo(dataPath, mainKey, info, false, tc.SectorMap);
     UNIT_ASSERT_VALUES_EQUAL(isOk, true);
 
     ui32 dataSize = info.SystemChunkCount * info.RawChunkSizeBytes;
@@ -866,7 +881,8 @@ YARD_UNIT_TEST(TestFormatInfo) {
     FormatPDiskForTest(dataPath, tc.PDiskGuid, chunkSize, 1 << 30, false, tc.SectorMap);
 
     TPDiskInfo info;
-    bool isOk = ReadPDiskFormatInfo(dataPath, NPDisk::YdbDefaultPDiskSequence, info, false, tc.SectorMap);
+    const NPDisk::TMainKey mainKey = {NPDisk::YdbDefaultPDiskSequence};
+    bool isOk = ReadPDiskFormatInfo(dataPath, mainKey, info, false, tc.SectorMap);
     UNIT_ASSERT_VALUES_EQUAL(isOk, true);
     UNIT_ASSERT_VALUES_EQUAL(info.TextMessage, "Info");
 }
@@ -900,7 +916,8 @@ YARD_UNIT_TEST(TestRestartAtNonceJump) {
         MakeDirIfNotExist(databaseDirectory.c_str());
     }
     TPDiskInfo info;
-    bool isOk = ReadPDiskFormatInfo(dataPath, NPDisk::YdbDefaultPDiskSequence, info, false, tc.SectorMap);
+    const NPDisk::TMainKey mainKey = {NPDisk::YdbDefaultPDiskSequence};
+    bool isOk = ReadPDiskFormatInfo(dataPath, mainKey, info, false, tc.SectorMap);
     UNIT_ASSERT_VALUES_EQUAL(isOk, true);
     // Destroy data in chunks starting at# SystemChunkCount + 1
     ui32 dataSize = 8 * chunkSize;
@@ -929,7 +946,8 @@ YARD_UNIT_TEST(TestRestartAtChunkEnd) {
         MakeDirIfNotExist(databaseDirectory.c_str());
     }
     TPDiskInfo info;
-    bool isOk = ReadPDiskFormatInfo(dataPath, NPDisk::YdbDefaultPDiskSequence, info, false, tc.SectorMap);
+    const NPDisk::TMainKey mainKey = {NPDisk::YdbDefaultPDiskSequence};
+    bool isOk = ReadPDiskFormatInfo(dataPath, mainKey, info, false, tc.SectorMap);
     UNIT_ASSERT_VALUES_EQUAL(isOk, true);
     // Destroy data in chunks starting at# SystemChunkCount + 1
     ui32 dataSize = 8 * chunkSize;

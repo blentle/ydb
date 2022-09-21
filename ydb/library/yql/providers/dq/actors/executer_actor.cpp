@@ -163,6 +163,10 @@ private:
                 *taskMeta.MutableSecureParams() = ev->Get()->Record.GetRequest().GetSecureParams();
             }
 
+            if (ev->Get()->Record.GetRequest().GetCommonTaskParams().size() > 0) {
+                taskMeta.MutableTaskParams()->insert(ev->Get()->Record.GetRequest().GetCommonTaskParams().begin(), ev->Get()->Record.GetRequest().GetCommonTaskParams().end());
+            }
+
             Settings->Save(taskMeta);
 
             task.MutableMeta()->PackFrom(taskMeta);
@@ -261,7 +265,7 @@ private:
     void OnFailure(TEvDqFailure::TPtr& ev, const NActors::TActorContext&) {
         if (!Finished) {
             YQL_LOG_CTX_ROOT_SCOPE(TraceId);
-            YQL_CLOG(DEBUG, ProviderDq) << __FUNCTION__ 
+            YQL_CLOG(DEBUG, ProviderDq) << __FUNCTION__
                             << ", status=" << static_cast<int>(ev->Get()->Record.GetStatusCode())
                             << ", issues size=" << ev->Get()->Record.IssuesSize()
                             << ", sender=" << ev->Sender;
@@ -325,9 +329,9 @@ private:
             case TAllocateWorkersResponse::kError: {
                 YQL_CLOG(ERROR, ProviderDq) << "Error on allocate workers "
                     << ev->Get()->Record.GetError().GetMessage() << ":"
-                    << static_cast<int>(ev->Get()->Record.GetError().GetErrorCode());
+                    << NYql::NDqProto::StatusIds_StatusCode_Name(ev->Get()->Record.GetError().GetStatusCode());
                 Issues.AddIssue(TIssue(ev->Get()->Record.GetError().GetMessage()).SetCode(TIssuesIds::DQ_GATEWAY_NEED_FALLBACK_ERROR, TSeverityIds::S_ERROR));
-                Finish(NYql::NDqProto::StatusIds::CLUSTER_OVERLOADED);
+                Finish(ev->Get()->Record.GetError().GetStatusCode());
                 return;
             }
             case TAllocateWorkersResponse::kNodes:

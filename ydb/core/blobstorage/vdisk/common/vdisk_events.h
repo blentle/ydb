@@ -511,15 +511,6 @@ namespace NKikimr {
         TEvVPut()
         {}
 
-        TEvVPut(const TLogoBlobID &logoBlobId, const TString &buffer, const TVDiskID &vdisk,
-                const bool ignoreBlock, const ui64 *cookie, TInstant deadline,
-                NKikimrBlobStorage::EPutHandleClass cls)
-        {
-            InitWithoutBuffer(logoBlobId, vdisk, ignoreBlock, cookie, deadline, cls);
-            REQUEST_VALGRIND_CHECK_MEM_IS_DEFINED(buffer.Data(), buffer.size());
-            StorePayload(buffer);
-        }
-
         TEvVPut(const TLogoBlobID &logoBlobId, TRope buffer, const TVDiskID &vdisk,
                 const bool ignoreBlock, const ui64 *cookie, TInstant deadline,
                 NKikimrBlobStorage::EPutHandleClass cls)
@@ -561,8 +552,6 @@ namespace NKikimr {
         TRope GetBuffer() const {
             return Record.HasBuffer() ? TRope(Record.GetBuffer()) : GetPayload(0);
         }
-
-        void StorePayload(const TString& buffer);
 
         void StorePayload(TRope&& buffer);
 
@@ -1285,7 +1274,8 @@ namespace NKikimr {
         }
 
         void AddResult(NKikimrProto::EReplyStatus status, const TLogoBlobID &logoBlobId, ui64 sh,
-                       const char *data, size_t size, const ui64 *cookie = nullptr, const ui64 *ingress = nullptr) {
+                       const char *data, size_t size, const ui64 *cookie = nullptr, const ui64 *ingress = nullptr,
+                       bool keep = false, bool doNotKeep = false) {
             IncrementSize(size);
             NKikimrBlobStorage::TQueryResult *r = Record.AddResult();
             r->SetStatus(status);
@@ -1303,10 +1293,18 @@ namespace NKikimr {
             }
             if (ingress)
                 r->SetIngress(*ingress);
+            if (keep) {
+                r->SetKeep(true);
+            }
+            if (doNotKeep) {
+                r->SetDoNotKeep(true);
+            }
+            Y_VERIFY_DEBUG(keep + doNotKeep <= 1);
         }
 
         void AddResult(NKikimrProto::EReplyStatus status, const TLogoBlobID &logoBlobId, const ui64 *cookie = nullptr,
-                       const ui64 *ingress = nullptr, const NMatrix::TVectorType *local = nullptr) {
+                       const ui64 *ingress = nullptr, const NMatrix::TVectorType *local = nullptr, bool keep = false,
+                       bool doNotKeep = false) {
             NKikimrBlobStorage::TQueryResult *r = Record.AddResult();
             r->SetStatus(status);
             LogoBlobIDFromLogoBlobID(logoBlobId, r->MutableBlobID());
@@ -1319,6 +1317,13 @@ namespace NKikimr {
                     r->AddParts(i + 1);
                 }
             }
+            if (keep) {
+                r->SetKeep(true);
+            }
+            if (doNotKeep) {
+                r->SetDoNotKeep(true);
+            }
+            Y_VERIFY_DEBUG(keep + doNotKeep <= 1);
         }
 
         TString ToString() const override {
@@ -2873,6 +2878,49 @@ namespace NKikimr {
         };
 
         std::vector<TLayoutRecord> Layout;
+    };
+
+    struct TEvBlobStorage::TEvVTakeSnapshot : TEventPB<TEvVTakeSnapshot, NKikimrBlobStorage::TEvVTakeSnapshot, EvVTakeSnapshot> {
+        TEvVTakeSnapshot() = default;
+
+        TEvVTakeSnapshot(TVDiskID vdiskId, const TString& snapshotId, ui32 timeToLiveSec) {
+            VDiskIDFromVDiskID(vdiskId, Record.MutableVDiskID());
+            Record.SetSnapshotId(snapshotId);
+            Record.SetTimeToLiveSec(timeToLiveSec);
+        }
+    };
+
+    struct TEvBlobStorage::TEvVTakeSnapshotResult : TEventPB<TEvVTakeSnapshotResult, NKikimrBlobStorage::TEvVTakeSnapshotResult, EvVTakeSnapshotResult> {
+        TEvVTakeSnapshotResult() = default;
+
+        TEvVTakeSnapshotResult(NKikimrProto::EReplyStatus status, const TString& errorReason, TVDiskID vdiskId) {
+            Record.SetStatus(status);
+            if (errorReason) {
+                Record.SetErrorReason(errorReason);
+            }
+            VDiskIDFromVDiskID(vdiskId, Record.MutableVDiskID());
+        }
+    };
+
+    struct TEvBlobStorage::TEvVReleaseSnapshot : TEventPB<TEvVReleaseSnapshot, NKikimrBlobStorage::TEvVReleaseSnapshot, EvVReleaseSnapshot> {
+        TEvVReleaseSnapshot() = default;
+
+        TEvVReleaseSnapshot(TVDiskID vdiskId, const TString& snapshotId) {
+            VDiskIDFromVDiskID(vdiskId, Record.MutableVDiskID());
+            Record.SetSnapshotId(snapshotId);
+        }
+    };
+
+    struct TEvBlobStorage::TEvVReleaseSnapshotResult : TEventPB<TEvVReleaseSnapshotResult, NKikimrBlobStorage::TEvVReleaseSnapshotResult, EvVReleaseSnapshotResult> {
+        TEvVReleaseSnapshotResult() = default;
+
+        TEvVReleaseSnapshotResult(NKikimrProto::EReplyStatus status, const TString& errorReason, TVDiskID vdiskId) {
+            Record.SetStatus(status);
+            if (errorReason) {
+                Record.SetErrorReason(errorReason);
+            }
+            VDiskIDFromVDiskID(vdiskId, Record.MutableVDiskID());
+        }
     };
 
     //////////////////////////////////////////////////////////////////////////////////////////////

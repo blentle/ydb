@@ -23,7 +23,9 @@ class TCommandWithFormat {
 protected:
     void AddInputFormats(TClientCommand::TConfig& config, const TVector<EOutputFormat>& allowedFormats);
     void AddFormats(TClientCommand::TConfig& config, const TVector<EOutputFormat>& allowedFormats);
+    void AddMessagingFormats(TClientCommand::TConfig& config, const TVector<EMessagingFormat>& allowedFormats);
     void ParseFormats();
+    void ParseMessagingFormats();
 
     // Deprecated
     void AddDeprecatedJsonOption(TClientCommand::TConfig& config,
@@ -33,10 +35,12 @@ protected:
 protected:
     EOutputFormat OutputFormat = EOutputFormat::Default;
     EOutputFormat InputFormat = EOutputFormat::Default;
+    EMessagingFormat MessagingFormat = EMessagingFormat::SingleMessage;
 
 private:
     TVector<EOutputFormat> AllowedInputFormats;
     TVector<EOutputFormat> AllowedFormats;
+    TVector<EMessagingFormat> AllowedMessagingFormats;
     bool DeprecatedOptionUsed = false;
 };
 
@@ -57,7 +61,7 @@ private:
 
     void PrintPretty(const TResultSet& resultSet);
     void PrintJsonArray(const TResultSet& resultSet, EBinaryStringEncoding encoding);
-    void PrintCsv(const TResultSet& resultSet);
+    void PrintCsv(const TResultSet& resultSet, const char* delim);
 
     bool FirstPart = true;
     bool PrintedSomething = false;

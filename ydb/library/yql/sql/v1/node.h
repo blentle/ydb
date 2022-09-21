@@ -169,6 +169,7 @@ namespace NSQLTranslationV1 {
         virtual bool IsSelect() const;
         virtual const TString* FuncName() const;
         virtual const TString* ModuleName() const;
+        virtual bool HasSkip() const;
 
         using TVisitFunc = std::function<bool (const INode&)>;
         using TVisitNodeSet = std::unordered_set<const INode*>;
@@ -391,6 +392,7 @@ namespace NSQLTranslationV1 {
     class TCallDirectRow final : public TCallNode {
         TPtr DoClone() const final;
     public:
+        TCallDirectRow(TPosition pos, const TString& opName, i32 minArgs, i32 maxArgs, const TVector<TNodePtr>& args);
         TCallDirectRow(TPosition pos, const TString& opName, const TVector<TNodePtr>& args);
     protected:
         bool DoInit(TContext& ctx, ISource* src) override;

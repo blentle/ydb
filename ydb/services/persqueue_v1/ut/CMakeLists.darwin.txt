@@ -6,6 +6,7 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(new_schemecache_ut)
 
 add_executable(ydb-services-persqueue_v1-ut)
 target_compile_options(ydb-services-persqueue_v1-ut PRIVATE
@@ -47,6 +48,7 @@ target_sources(ydb-services-persqueue_v1-ut PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/services/persqueue_v1/persqueue_compat_ut.cpp
   ${CMAKE_SOURCE_DIR}/ydb/services/persqueue_v1/ut/rate_limiter_test_setup.cpp
   ${CMAKE_SOURCE_DIR}/ydb/services/persqueue_v1/ut/functions_executor_wrapper.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/services/persqueue_v1/ut/topic_service_ut.cpp
 )
 add_test(
   NAME

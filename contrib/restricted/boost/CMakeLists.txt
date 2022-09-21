@@ -6,20 +6,102 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(algorithm)
+add_subdirectory(align)
+add_subdirectory(any)
+add_subdirectory(array)
+add_subdirectory(asio)
+add_subdirectory(assert)
+add_subdirectory(atomic)
+add_subdirectory(bimap)
+add_subdirectory(bind)
+add_subdirectory(chrono)
+add_subdirectory(concept_check)
+add_subdirectory(config)
+add_subdirectory(container)
+add_subdirectory(container_hash)
+add_subdirectory(context)
+add_subdirectory(conversion)
+add_subdirectory(core)
+add_subdirectory(coroutine)
+add_subdirectory(crc)
+add_subdirectory(date_time)
+add_subdirectory(detail)
+add_subdirectory(dynamic_bitset)
+add_subdirectory(endian)
+add_subdirectory(exception)
+add_subdirectory(filesystem)
+add_subdirectory(foreach)
+add_subdirectory(format)
+add_subdirectory(function)
+add_subdirectory(function_types)
+add_subdirectory(functional)
+add_subdirectory(fusion)
+add_subdirectory(graph)
+add_subdirectory(icl)
+add_subdirectory(integer)
+add_subdirectory(interprocess)
+add_subdirectory(interval)
+add_subdirectory(intrusive)
+add_subdirectory(io)
+add_subdirectory(iostreams)
+add_subdirectory(iterator)
+add_subdirectory(lambda)
+add_subdirectory(lexical_cast)
+add_subdirectory(locale)
+add_subdirectory(logic)
+add_subdirectory(math)
+add_subdirectory(move)
+add_subdirectory(mp11)
+add_subdirectory(mpl)
+add_subdirectory(multi_array)
+add_subdirectory(multi_index)
+add_subdirectory(multiprecision)
+add_subdirectory(numeric_conversion)
+add_subdirectory(optional)
+add_subdirectory(parameter)
+add_subdirectory(phoenix)
+add_subdirectory(pool)
+add_subdirectory(predef)
+add_subdirectory(preprocessor)
+add_subdirectory(program_options)
+add_subdirectory(property_map)
+add_subdirectory(property_tree)
+add_subdirectory(proto)
+add_subdirectory(random)
+add_subdirectory(range)
+add_subdirectory(ratio)
+add_subdirectory(rational)
+add_subdirectory(regex)
+add_subdirectory(serialization)
+add_subdirectory(smart_ptr)
+add_subdirectory(spirit)
+add_subdirectory(static_assert)
+add_subdirectory(system)
+add_subdirectory(thread)
+add_subdirectory(throw_exception)
+add_subdirectory(tokenizer)
+add_subdirectory(tti)
+add_subdirectory(tuple)
+add_subdirectory(type_index)
+add_subdirectory(type_traits)
+add_subdirectory(typeof)
+add_subdirectory(ublas)
+add_subdirectory(units)
+add_subdirectory(unordered)
+add_subdirectory(utility)
+add_subdirectory(uuid)
+add_subdirectory(variant)
+add_subdirectory(winapi)
+add_subdirectory(xpressive)
 
 add_library(contrib-restricted-boost INTERFACE)
-target_include_directories(contrib-restricted-boost INTERFACE
-  ${CMAKE_SOURCE_DIR}/contrib/restricted/boost
-)
 target_link_libraries(contrib-restricted-boost INTERFACE
   contrib-libs-cxxsupp
   restricted-boost-algorithm
-  restricted-boost-align
-  restricted-boost-any
   restricted-boost-array
   restricted-boost-assert
   restricted-boost-bind
-  restricted-boost-circular_buffer
   restricted-boost-concept_check
   restricted-boost-config
   restricted-boost-container
@@ -27,40 +109,33 @@ target_link_libraries(contrib-restricted-boost INTERFACE
   restricted-boost-conversion
   restricted-boost-core
   restricted-boost-detail
+  restricted-boost-dynamic_bitset
   restricted-boost-endian
   restricted-boost-exception
   restricted-boost-foreach
-  restricted-boost-format
   restricted-boost-function
   restricted-boost-function_types
   restricted-boost-fusion
   restricted-boost-integer
-  restricted-boost-interval
   restricted-boost-intrusive
-  restricted-boost-io
   restricted-boost-iterator
   restricted-boost-lambda
   restricted-boost-lexical_cast
-  restricted-boost-lockfree
   restricted-boost-math
   restricted-boost-move
-  restricted-boost-mp11
   restricted-boost-mpl
   restricted-boost-multi_array
-  restricted-boost-multiprecision
+  restricted-boost-multi_index
   restricted-boost-numeric_conversion
   restricted-boost-optional
   restricted-boost-parameter
   restricted-boost-phoenix
-  restricted-boost-polygon
-  restricted-boost-pool
   restricted-boost-predef
   restricted-boost-preprocessor
+  restricted-boost-property_tree
   restricted-boost-proto
-  restricted-boost-qvm
   restricted-boost-random
   restricted-boost-range
-  restricted-boost-rational
   restricted-boost-smart_ptr
   restricted-boost-static_assert
   restricted-boost-throw_exception
@@ -70,10 +145,12 @@ target_link_libraries(contrib-restricted-boost INTERFACE
   restricted-boost-type_index
   restricted-boost-type_traits
   restricted-boost-typeof
+  restricted-boost-ublas
+  restricted-boost-units
   restricted-boost-unordered
   restricted-boost-utility
+  restricted-boost-uuid
   restricted-boost-variant
-  restricted-boost-vmd
   restricted-boost-winapi
   restricted-boost-xpressive
 )

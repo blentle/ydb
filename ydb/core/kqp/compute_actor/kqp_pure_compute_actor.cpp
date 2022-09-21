@@ -3,6 +3,7 @@
 
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/protos/tx_datashard.pb.h>
+#include <ydb/core/kqp/rm/kqp_rm.h>
 #include <ydb/core/kqp/runtime/kqp_compute.h>
 #include <ydb/core/kqp/runtime/kqp_scan_data.h>
 #include <ydb/core/sys_view/scan.h>
@@ -35,8 +36,9 @@ public:
     TKqpComputeActor(const TActorId& executerId, ui64 txId, NDqProto::TDqTask&& task,
         IDqAsyncIoFactory::TPtr asyncIoFactory,
         const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
-        const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits)
-        : TBase(executerId, txId, std::move(task), std::move(asyncIoFactory), functionRegistry, settings, memoryLimits, /* ownMemoryQuota = */ true, /* passExceptions = */ true)
+        const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits,
+        NWilson::TTraceId traceId)
+        : TBase(executerId, txId, std::move(task), std::move(asyncIoFactory), functionRegistry, settings, memoryLimits, /* ownMemoryQuota = */ true, /* passExceptions = */ true, /*taskCounters = */ nullptr, std::move(traceId))
         , ComputeCtx(settings.StatsMode)
     {
         if (GetTask().GetMeta().Is<NKikimrTxDataShard::TKqpTransaction::TScanTaskMeta>()) {
@@ -69,6 +71,7 @@ public:
         execCtx.ApplyCtx = nullptr;
         execCtx.Alloc = nullptr;
         execCtx.TypeEnv = nullptr;
+        execCtx.PatternCache = GetKqpResourceManager()->GetComputeActorPatternCache();
 
         TDqTaskRunnerSettings settings;
         settings.CollectBasicStats = RuntimeSettings.StatsMode >= NYql::NDqProto::DQ_STATS_MODE_BASIC;
@@ -124,7 +127,7 @@ public:
             }
 
             SysViewActorId = Register(scanActor.Release());
-            Send(SysViewActorId, new TEvKqpCompute::TEvScanDataAck(MemoryLimits.ScanBufferSize));
+            Send(SysViewActorId, new TEvKqpCompute::TEvScanDataAck(MemoryLimits.ChannelBufferSize));
         }
 
         ContinueExecute();
@@ -156,7 +159,7 @@ public:
 
 protected:
     ui64 CalcMkqlMemoryLimit() override {
-        return TBase::CalcMkqlMemoryLimit() + ComputeCtx.GetTableScans().size() * MemoryLimits.ScanBufferSize;
+        return TBase::CalcMkqlMemoryLimit() + ComputeCtx.GetTableScans().size() * MemoryLimits.ChannelBufferSize;
     }
 
 public:
@@ -218,7 +221,7 @@ private:
         Y_VERIFY_DEBUG(SysViewActorId == ActorIdFromProto(msg.GetScanActorId()));
 
         CA_LOG_D("Got sysview scan initial event, scan actor: " << SysViewActorId << ", scanId: 0");
-        Send(ev->Sender, new TEvKqpCompute::TEvScanDataAck(GetMemoryLimits().ScanBufferSize));
+        Send(ev->Sender, new TEvKqpCompute::TEvScanDataAck(GetMemoryLimits().ChannelBufferSize));
         return;
     }
 
@@ -269,8 +272,8 @@ private:
             }
         }
 
-        ui64 freeSpace = GetMemoryLimits().ScanBufferSize > ScanData->GetStoredBytes()
-            ? GetMemoryLimits().ScanBufferSize - ScanData->GetStoredBytes()
+        ui64 freeSpace = GetMemoryLimits().ChannelBufferSize > ScanData->GetStoredBytes()
+            ? GetMemoryLimits().ChannelBufferSize - ScanData->GetStoredBytes()
             : 0;
 
         if (freeSpace > 0) {
@@ -305,10 +308,11 @@ private:
 IActor* CreateKqpComputeActor(const TActorId& executerId, ui64 txId, NDqProto::TDqTask&& task,
     IDqAsyncIoFactory::TPtr asyncIoFactory,
     const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
-    const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits)
+    const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits,
+    NWilson::TTraceId traceId)
 {
     return new TKqpComputeActor(executerId, txId, std::move(task), std::move(asyncIoFactory),
-        functionRegistry, settings, memoryLimits);
+        functionRegistry, settings, memoryLimits, std::move(traceId));
 }
 
 } // namespace NKqp

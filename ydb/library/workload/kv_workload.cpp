@@ -2,20 +2,30 @@
 
 #include <util/datetime/base.h>
 
+#include <ydb/core/util/lz4_data_generator.h>
+
 #include <cmath>
 #include <iomanip>
 #include <string>
 #include <thread>
 #include <random>
+#include <sstream>
+
+template <>
+void Out<NYdbWorkload::KvWorkloadConstants>(IOutputStream& out, NYdbWorkload::KvWorkloadConstants constant)
+{
+    out << static_cast<ui64>(constant);
+}
 
 namespace NYdbWorkload {
 
 TKvWorkloadGenerator::TKvWorkloadGenerator(const TKvWorkloadParams* params)
     : DbPath(params->DbPath)
     , Params(*params)
+    , BigString(NKikimr::GenDataForLZ4(Params.StringLen))
     , Rd()
     , Gen(Rd())
-    , UniformDistGen(0, Params.MaxFirstKey)
+    , KeyUniformDistGen(0, Params.MaxFirstKey)
 {
     Gen.seed(Now().MicroSeconds());
 }
@@ -26,36 +36,34 @@ TKvWorkloadParams* TKvWorkloadGenerator::GetParams() {
 
 std::string TKvWorkloadGenerator::GetDDLQueries() const {
     std::string partsNum = std::to_string(Params.MinPartitions);
-    std::string KvPartitionsDdl = "";
+
+    std::stringstream ss;
+
+    ss << "--!syntax_v1\n";
+    ss << "CREATE TABLE `" << DbPath << "/kv_test`(c0 Uint64, ";
+
+    for (size_t i = 1; i < Params.ColumnsCnt; ++i) {
+        ss << "c" << i << " " << "String, ";
+    }
+
+    ss << "PRIMARY KEY(c0)) WITH (";
 
     if (Params.PartitionsByLoad) {
-        KvPartitionsDdl = "WITH (AUTO_PARTITIONING_BY_LOAD = ENABLED, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = " + 
-            partsNum + ", UNIFORM_PARTITIONS = " + partsNum + ", AUTO_PARTITIONING_MAX_PARTITIONS_COUNT = 1000)";
-    } else {
-        KvPartitionsDdl = "WITH (AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = " + 
-            partsNum + ", UNIFORM_PARTITIONS = " + partsNum + ", AUTO_PARTITIONING_MAX_PARTITIONS_COUNT = 1000)";
+        ss << "AUTO_PARTITIONING_BY_LOAD = ENABLED, ";
     }
 
-    static const char TablesDdl[] = R"(--!syntax_v1
-        CREATE TABLE `%s/kv_test`(a Uint64, b Uint64, PRIMARY KEY(a, b)) %s;
-    )";
+    ss << "AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = " << partsNum << ", "
+       << "UNIFORM_PARTITIONS = " << partsNum << ", AUTO_PARTITIONING_MAX_PARTITIONS_COUNT = 1000)";
 
-    char buf[sizeof(TablesDdl) + sizeof(KvPartitionsDdl) + 8192*3]; // 32*256 for DbPath
-    int res = std::sprintf(buf, TablesDdl, 
-        DbPath.c_str(), KvPartitionsDdl.c_str()
-    );
-
-    if (res < 0) {
-        return "";
-    }
-
-    return buf;
+    return ss.str();
 }
 
 TQueryInfoList TKvWorkloadGenerator::GetWorkload(int type) {
     switch (static_cast<EType>(type)) {
         case EType::UpsertRandom:
             return UpsertRandom();
+        case EType::InsertRandom:
+            return InsertRandom();
         case EType::SelectRandom:
             return SelectRandom();
         default:
@@ -63,49 +71,99 @@ TQueryInfoList TKvWorkloadGenerator::GetWorkload(int type) {
     }
 }
 
-TQueryInfoList TKvWorkloadGenerator::UpsertRandom() {
-    std::string query = R"(
-        --!syntax_v1
-        DECLARE $a AS Uint64;
-        DECLARE $b AS Uint64;
 
-        UPSERT INTO `kv_test` (a, b) VALUES ($a, $b);
-    )";
-
-    ui64 a = UniformDistGen(Gen);
-    ui64 b = Gen();
+TQueryInfoList TKvWorkloadGenerator::AddOperation(TString operation) {
+    std::stringstream ss;
 
     NYdb::TParamsBuilder paramsBuilder;
-    auto params = paramsBuilder
-        .AddParam("$a")
-            .Uint64(a)
-            .Build()
-        .AddParam("$b")
-            .Uint64(b)
-            .Build()
-        .Build();
 
-    return TQueryInfoList(1, TQueryInfo(query, std::move(params)));
+    ss << "--!syntax_v1\n";
+
+    for (size_t row = 0; row < Params.RowsCnt; ++row) {
+        TString pkname = "$r" + std::to_string(row);
+        ss << "DECLARE " << pkname << " AS Uint64;\n";
+        paramsBuilder.AddParam(pkname).Uint64(KeyUniformDistGen(Gen)).Build();
+
+        for (size_t col = 1; col < Params.ColumnsCnt; ++col) {
+            TString cname = "$c" + std::to_string(row) + std::to_string(col);
+            ss << "DECLARE " << cname << " AS String;\n";
+            paramsBuilder.AddParam(cname).String(BigString).Build();
+        }
+    }
+
+    ss << operation << " INTO `kv_test`(";
+
+    for (size_t col = 0; col < Params.ColumnsCnt; ++col) {
+        ss << "c" << col;
+        if (col + 1 < Params.ColumnsCnt) {
+            ss << ", ";
+        }
+    }
+
+    ss << ") VALUES ";
+
+    for (size_t row = 0; row < Params.RowsCnt; ++row) {
+
+        ss << "(";
+        ss << "$r" << row;
+
+        for (size_t col = 1; col < Params.ColumnsCnt; ++col) {
+            ss << ", $c" << row << col;
+        }
+
+        ss << ")";
+
+        if (row + 1 < Params.RowsCnt) {
+            ss << ", ";
+        }
+
+    }
+
+    auto params = paramsBuilder.Build();
+
+    return TQueryInfoList(1, TQueryInfo(ss.str(), std::move(params)));
+}
+
+TQueryInfoList TKvWorkloadGenerator::UpsertRandom() {
+    return AddOperation("UPSERT");
+}
+
+TQueryInfoList TKvWorkloadGenerator::InsertRandom() {
+    return AddOperation("INSERT");
 }
 
 TQueryInfoList TKvWorkloadGenerator::SelectRandom() {
-    std::string query = R"(
-        --!syntax_v1
-        DECLARE $a AS Uint64;
-
-        SELECT * FROM `kv_test` WHERE a = $a
-    )";
-
-    ui64 a = UniformDistGen(Gen);
+    std::stringstream ss;
 
     NYdb::TParamsBuilder paramsBuilder;
-    auto params = paramsBuilder
-        .AddParam("$a")
-            .Uint64(a)
-            .Build()
-        .Build();
 
-    return TQueryInfoList(1, TQueryInfo(query, std::move(params)));
+    ss << "--!syntax_v1\n";
+
+    for (size_t row = 0; row < Params.RowsCnt; ++row) {
+        ss << "DECLARE $r" << row << " AS Uint64;\n";
+        paramsBuilder.AddParam("$r" + std::to_string(row)).Uint64(KeyUniformDistGen(Gen)).Build();
+    }
+
+    ss << "SELECT ";
+    for (size_t col = 0; col < Params.ColumnsCnt; ++col) {
+        ss << "c" << col;
+        if (col + 1 < Params.ColumnsCnt) {
+            ss << ",";
+        }
+        ss << " ";
+    }
+
+    ss << "FROM `kv_test` WHERE ";
+    for (size_t row = 0; row < Params.RowsCnt; ++row) {
+        ss << "c0 = $r" << row;
+        if (row + 1 < Params.RowsCnt) {
+            ss << " OR ";
+        }
+    }
+
+    auto params = paramsBuilder.Build();
+
+    return TQueryInfoList(1, TQueryInfo(ss.str(), std::move(params)));
 }
 
 TQueryInfoList TKvWorkloadGenerator::GetInitialData() {
@@ -114,7 +172,7 @@ TQueryInfoList TKvWorkloadGenerator::GetInitialData() {
         auto queryInfos = UpsertRandom();
         res.insert(res.end(), queryInfos.begin(), queryInfos.end());
     }
-    
+
     return res;
 }
 

@@ -50,14 +50,14 @@ struct TQuotaCachedUsage {
     bool SyncInProgress = false;
     bool ChangedAfterSync = false;
     TQuotaCachedUsage() = default;
-    TQuotaCachedUsage(ui64 limit) 
+    TQuotaCachedUsage(ui64 limit)
         : Usage(limit) {}
-    TQuotaCachedUsage(ui64 limit, const TInstant& limitUpdatedAt, ui64 usage, const TInstant& usageUpdatedAt) 
+    TQuotaCachedUsage(ui64 limit, const TInstant& limitUpdatedAt, ui64 usage, const TInstant& usageUpdatedAt)
         : Usage(limit, limitUpdatedAt, usage, usageUpdatedAt) {}
 };
 
 struct TQuotaCache {
-    THashMap<NActors::TActorId /* Sender */, ui64 /* Cookie */> PendingUsageRequests; 
+    THashMap<NActors::TActorId /* Sender */, ui64 /* Cookie */> PendingUsageRequests;
     THashMap<TString /* MetricName */, TQuotaCachedUsage> UsageMap;
     THashSet<TString> PendingUsage;
     THashSet<TString> PendingLimit;
@@ -104,7 +104,7 @@ TString ToString(const std::vector<ui32>& v) {
     return builder;
 }
 
-TString ToString(const TQuotaMap& quota){
+TString ToString(const TQuotaMap& quota) {
     if (quota.empty()) {
         return "{}";
     }
@@ -120,7 +120,7 @@ TString ToString(const TQuotaMap& quota){
     return builder;
 }
 
-TString ToString(const THashMap<TString, TQuotaCachedUsage>& usageMap){
+TString ToString(const THashMap<TString, TQuotaCachedUsage>& usageMap) {
     if (usageMap.empty()) {
         return "{}";
     }
@@ -144,15 +144,32 @@ public:
         const TYqSharedResources::TPtr& yqSharedResources,
         NKikimr::TYdbCredentialsProviderFactory credProviderFactory,
         const ::NMonitoring::TDynamicCounterPtr& counters,
-        std::vector<TQuotaDescription> quotaDescriptions)
+        std::vector<TQuotaDescription> quotaDescriptions,
+        NActors::TMon* monitoring)
         : Config(config)
         , StorageConfig(storageConfig)
         , YqSharedResources(yqSharedResources)
         , CredProviderFactory(credProviderFactory)
         , ServiceCounters(counters->GetSubgroup("subsystem", "quota_manager"))
+        , Monitoring(monitoring)
     {
-        for (auto& description : quotaDescriptions) {
+        for (const auto& description : quotaDescriptions) {
             QuotaInfoMap[description.SubjectType].emplace(description.MetricName, description.Info);
+        }
+        // Override static settings with config
+        for (const auto& config : Config.GetQuotaDescriptions()) {
+            Y_VERIFY(config.GetSubjectType());
+            Y_VERIFY(config.GetMetricName());
+            auto& metricsMap = QuotaInfoMap[config.GetSubjectType()];
+            auto infoIt = metricsMap.find(config.GetMetricName());
+            Y_VERIFY(infoIt != metricsMap.end());
+            auto& info = infoIt->second;
+            if (config.GetDefaultLimit()) {
+                info.DefaultLimit = config.GetDefaultLimit();
+            }
+            if (config.GetHardLimit()) {
+                info.HardLimit = config.GetHardLimit();
+            }
         }
         LimitRefreshPeriod = GetDuration(Config.GetLimitRefreshPeriod(), LIMIT_REFRESH_PERIOD);
         UsageRefreshPeriod = GetDuration(Config.GetUsageRefreshPeriod(), USAGE_REFRESH_PERIOD);
@@ -161,6 +178,11 @@ public:
     static constexpr char ActorName[] = "FQ_QUOTA_SERVICE";
 
     void Bootstrap() {
+        if (Monitoring) {
+            Monitoring->RegisterActorPage(Monitoring->RegisterIndexPage("fq_diag", "Federated Query diagnostics"),
+                "quotas", "Quota Manager", false, TActivationContext::ActorSystem(), SelfId());
+        }
+
         YdbConnection = NewYdbConnection(StorageConfig, CredProviderFactory, YqSharedResources->CoreYdbDriver);
         DbPool = YqSharedResources->DbPoolHolder->GetOrCreate(EDbPoolId::MAIN, 10, YdbConnection->TablePathPrefix);
         Send(GetNameserviceActorId(), new NActors::TEvInterconnect::TEvListNodes());
@@ -171,14 +193,17 @@ public:
 private:
     STRICT_STFUNC(StateFunc,
         hFunc(TEvQuotaService::TQuotaGetRequest, Handle)
+        hFunc(TEvQuotaService::TQuotaGetResponse, Handle) // http monitoring
         hFunc(TEvQuotaService::TQuotaChangeNotification, Handle)
         hFunc(TEvQuotaService::TQuotaUsageResponse, Handle)
         hFunc(TEvQuotaService::TQuotaLimitChangeResponse, Handle)
         hFunc(TEvQuotaService::TQuotaSetRequest, Handle)
+        hFunc(TEvQuotaService::TQuotaSetResponse, Handle) // http monitoring
         hFunc(TEvents::TEvCallback, [](TEvents::TEvCallback::TPtr& ev) { ev->Get()->Callback(); } );
         hFunc(NActors::TEvInterconnect::TEvNodesInfo, Handle)
         hFunc(TEvQuotaService::TEvQuotaUpdateNotification, Handle)
         hFunc(NActors::TEvents::TEvUndelivered, Handle)
+        hFunc(NMon::TEvHttpInfo, Handle)
     );
 
     void Handle(NActors::TEvents::TEvUndelivered::TPtr& ev) {
@@ -230,7 +255,7 @@ private:
         }
 
         if (it == subjectMap.end()) {
-            ReadQuota(subjectType, subjectId, 
+            ReadQuota(subjectType, subjectId,
                 [this, ev=ev](TReadQuotaExecuter& executer) {
                     // This block is executed in correct self-context, no locks/syncs required
                     auto& subjectMap = this->QuotaCacheMap[executer.State.SubjectType];
@@ -294,6 +319,13 @@ private:
                 auto itI = infoMap.find(metricName);
                 if (itI != infoMap.end()) {
                     auto& info = itI->second;
+                    if (cached.Usage.Limit.Value == 0 || limit == 0 || limit > cached.Usage.Limit.Value) {
+                        // check hard limit only if quota is increased
+                        if (info.HardLimit != 0 && (limit == 0 || limit > info.HardLimit)) {
+                            limit = info.HardLimit;
+                        }
+                    }
+
                     if (info.QuotaController != NActors::TActorId{}) {
                         pended = true;
                         cache.PendingLimitRequest = ev->Sender;
@@ -301,13 +333,6 @@ private:
                         cache.PendingLimit.insert(metricName);
                         Send(info.QuotaController, new TEvQuotaService::TQuotaLimitChangeRequest(subjectType, subjectId, metricName, cached.Usage.Limit.Value, limit));
                         continue;
-                    } else {
-                        if (cached.Usage.Limit.Value == 0 || limit == 0 || limit > cached.Usage.Limit.Value) {
-                            // check hard limit only if quota is increased
-                            if (info.HardLimit != 0 && (limit == 0 || limit > info.HardLimit)) {
-                                limit = info.HardLimit;
-                            }
-                        }
                     }
                 }
 
@@ -341,7 +366,7 @@ private:
             return;
         }
 
-        auto& cache = it->second;    
+        auto& cache = it->second;
         cache.PendingLimit.erase(metricName);
 
         auto itQ = cache.UsageMap.find(metricName);
@@ -369,7 +394,7 @@ private:
     }
 
     void ReadQuota(const TString& subjectType, const TString& subjectId, TReadQuotaExecuter::TCallback callback) {
-    
+
         TDbExecutable::TPtr executable;
         auto& executer = TReadQuotaExecuter::Create(executable, false, nullptr);
 
@@ -415,7 +440,7 @@ private:
                     cache.UsageMap[itUsage.first].Usage = itUsage.second;
                 }
 
-                // 2. Append from Config 
+                // 2. Append from Config
                 for (const auto& quota : this->Config.GetQuotas()) {
                     if (quota.GetSubjectType() == executer.State.SubjectType && quota.GetSubjectId() == executer.State.SubjectId) {
                         for (const auto& limit : quota.GetLimit()) {
@@ -598,7 +623,7 @@ private:
                             LOG_T(cached.Usage.ToString(executer.State.SubjectType, executer.State.SubjectId, executer.State.MetricName) << " RESYNC");
                             this->SyncQuota(executer.State.SubjectType, executer.State.SubjectId, executer.State.MetricName, cached);
                         }
-                    }                        
+                    }
                 }
             }
         );
@@ -616,7 +641,7 @@ private:
                 auto& cached = itQ->second;
                 cached.Usage.Merge(usage);
                 LOG_T(cached.Usage.ToString(subjectType, subjectId, metricName) << " MERGED " << reinterpret_cast<ui64>(&cached));
-            }                        
+            }
         }
     }
 
@@ -632,7 +657,7 @@ private:
             return;
         }
 
-        auto& cache = it->second;    
+        auto& cache = it->second;
         cache.PendingUsage.erase(metricName);
 
         auto itQ = cache.UsageMap.find(metricName);
@@ -658,7 +683,7 @@ private:
 
         auto it = subjectMap.find(subjectId);
         if (it == subjectMap.end()) {
-            ReadQuota(subjectType, subjectId, 
+            ReadQuota(subjectType, subjectId,
                 [this, ev=ev](TReadQuotaExecuter& executer) {
                     // This block is executed in correct self-context, no locks/syncs required
                     auto& subjectMap = this->QuotaCacheMap[executer.State.SubjectType];
@@ -670,6 +695,136 @@ private:
         } else {
             ChangeLimitsAndReply(subjectType, subjectId, it->second, ev);
         }
+    }
+
+    void Handle(TEvQuotaService::TQuotaSetResponse::TPtr& ev) {
+
+        TStringStream html;
+        html << "<table class='table simple-table1 table-hover table-condensed'>";
+        html << "<thead><tr>";
+        html << "<th>Quota Set Response</th>";
+        html << "<th></th>";
+        html << "</tr></thead><tbody>";
+        html << "<tr><td>Subject Type:</td><td>" << ev->Get()->SubjectType << "</td></tr>";
+        html << "<tr><td>Subject ID:</td><td>" << ev->Get()->SubjectId << "</td></tr>";
+        for (const auto& limit : ev->Get()->Limits) {
+            html << "<tr><td>" << limit.first << "</td><td>" << limit.second << "</td></tr>";
+        }
+        html << "</tbody></table>";
+
+        Send(HttpMonId, new NMon::TEvHttpInfoRes(html.Str()));
+        HttpMonId = NActors::TActorId();
+    }
+
+    void Handle(TEvQuotaService::TQuotaGetResponse::TPtr& ev) {
+
+        TStringStream html;
+        html << "<table class='table simple-table1 table-hover table-condensed'>";
+        html << "<thead><tr>";
+        html << "<th>Quota Get Response</th>";
+        html << "<th></th>";
+        html << "</tr></thead><tbody>";
+        html << "<tr><td>Subject Type:</td><td>" << ev->Get()->SubjectType << "</td></tr>\n";
+        html << "<tr><td>Subject ID:</td><td>" << ev->Get()->SubjectId << "</td></tr>\n";
+        html << "</tbody></table>\n";
+        html << "<br>";
+
+        html << "<table class='table simple-table1 table-hover table-condensed'>";
+        html << "<thead><tr>";
+        html << "<th>Metric Name</th>";
+        html << "<th>Limit Value</th>";
+        html << "<th>Updated At</th>";
+        html << "<th>Usage</th>";
+        html << "</tr></thead><tbody>";
+        for (const auto& [metricName, metricUsageInfo] : ev->Get()->Quotas) {
+            html << "<tr>";
+            html << "<td>" << metricName << "</td>";
+            html << "<td>" << metricUsageInfo.Limit.Value << "</td>";
+            if (metricUsageInfo.Limit.UpdatedAt) {
+                html << "<td>" << metricUsageInfo.Limit.UpdatedAt << "</td>";
+            } else {
+                html << "<td></td>";
+            }
+            if (metricUsageInfo.Usage) {
+                html << "<td>" << metricUsageInfo.Usage->Value << "</td>";
+            } else {
+                html << "<td></td>";
+            }
+            html << "</tr>\n";
+        }
+        html << "</tbody></table>";
+
+        Send(HttpMonId, new NMon::TEvHttpInfoRes(html.Str()));
+        HttpMonId = NActors::TActorId();
+    }
+
+    void Handle(NMon::TEvHttpInfo::TPtr& ev) {
+
+        const auto& params = ev->Get()->Request.GetParams();
+
+        if (params.Has("submit")) {
+            TString subjectId = params.Get("subject_id");
+            TString subjectType = params.Get("subject_type");
+            if (subjectType.empty()) {
+                subjectType = "cloud";
+            }
+            TString metricName = params.Get("metric_name");
+            TString metricValue = params.Get("metric_value");
+
+            auto request = MakeHolder<TEvQuotaService::TQuotaSetRequest>(subjectType, subjectId);
+            request->Limits.emplace(metricName, FromStringWithDefault(metricValue, 0));
+
+            Send(SelfId(), request.Release());
+
+            HttpMonId = ev->Sender;
+            return;
+        } else if (params.Has("get")) {
+            TString subjectId = params.Get("subject_id");
+            TString subjectType = params.Get("subject_type");
+            if (subjectType.empty()) {
+                subjectType = "cloud";
+            }
+
+            auto request = MakeHolder<TEvQuotaService::TQuotaGetRequest>(subjectType, subjectId);
+
+            Send(SelfId(), request.Release());
+
+            HttpMonId = ev->Sender;
+            return;
+        }
+
+        TStringStream html;
+        html << "<form method='get'>";
+        html << "<p>Subject ID (i.e. Cloud ID):<input name='subject_id' type='text'/></p>";
+        html << "<p>Subject Type (defaulted to 'cloud'):<input name='subject_type' type='text'/></p>";
+        html << "<p>Quota Name:<input name='metric_name' type='text'/></p>";
+        html << "<p>New value:<input name='metric_value' type='number'/></p>";
+        html << "<button name='get' type='submit'><b>Get</b></button>";
+        html << "<button name='submit' type='submit'><b>Change</b></button>";
+        html << "</form>";
+
+        // Table with known metrics info
+        html << "<br>";
+        html << "<table class='table simple-table1 table-hover table-condensed'>";
+        html << "<thead><tr>";
+        html << "<th>Metric Name</th>";
+        html << "<th>Subject Type</th>";
+        html << "<th>Default Limit</th>";
+        html << "<th>Hard Limit</th>";
+        html << "</tr></thead><tbody>";
+        for (const auto& [subjectType, subjectMetricsInfo] : QuotaInfoMap) {
+            for (const auto& [metricName, quotaInfo] : subjectMetricsInfo) {
+            html << "<tr>";
+            html << "<td>" << metricName << "</td>";
+            html << "<td>" << subjectType << "</td>";
+            html << "<td>" << quotaInfo.DefaultLimit << "</td>";
+            html << "<td>" << quotaInfo.HardLimit << "</td>";
+            html << "</tr>\n";
+            }
+        }
+        html << "</tbody></table>";
+
+        Send(ev->Sender, new NMon::TEvHttpInfoRes(html.Str()));
     }
 
     NConfig::TQuotasManagerConfig Config;
@@ -684,6 +839,8 @@ private:
     TDuration LimitRefreshPeriod;
     TDuration UsageRefreshPeriod;
     std::vector<ui32> NodeIds;
+    NActors::TMon* Monitoring;
+    NActors::TActorId HttpMonId;
 };
 
 NActors::IActor* CreateQuotaServiceActor(
@@ -692,8 +849,9 @@ NActors::IActor* CreateQuotaServiceActor(
     const TYqSharedResources::TPtr& yqSharedResources,
     NKikimr::TYdbCredentialsProviderFactory credProviderFactory,
     const ::NMonitoring::TDynamicCounterPtr& counters,
-    std::vector<TQuotaDescription> quotaDesc) {
-        return new TQuotaManagementService(config, storageConfig, yqSharedResources, credProviderFactory, counters, quotaDesc);
+    std::vector<TQuotaDescription> quotaDesc,
+    NActors::TMon* monitoring) {
+        return new TQuotaManagementService(config, storageConfig, yqSharedResources, credProviderFactory, counters, quotaDesc, monitoring);
 }
 
 } /* NYq */

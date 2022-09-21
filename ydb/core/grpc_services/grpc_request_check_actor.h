@@ -1,5 +1,6 @@
 #pragma once
 #include "defs.h"
+#include "audit_log.h"
 #include "service_ratelimiter_events.h"
 #include "local_rate_limiter.h"
 #include "operation_helpers.h"
@@ -110,6 +111,8 @@ public:
             }
         }
 
+        AuditLog(GrpcRequestBaseCtx_, CheckedDatabaseName_, GetSubject(), ctx);
+
         // Simple rps limitation
         static NRpcService::TRlConfig rpsRlConfig(
             "serverless_rt_coordination_node_path",
@@ -145,6 +148,14 @@ public:
                 }
             );
 
+        // Just set RlPath
+        static NRpcService::TRlConfig ruRlManualConfig(
+            "serverless_rt_coordination_node_path",
+            "serverless_rt_base_resource_ru",
+                {
+                    // no actions
+                }
+            );
 
         auto rlMode = Request_->Get()->GetRlMode();
         switch (rlMode) {
@@ -156,6 +167,9 @@ public:
                 break;
             case TRateLimiterMode::RuOnProgress:
                 RlConfig = &ruRlProgressConfig;
+                break;
+            case TRateLimiterMode::RuManual:
+                RlConfig = &ruRlManualConfig;
                 break;
             case TRateLimiterMode::Off:
                 break;
@@ -196,6 +210,11 @@ public:
     }
 
 private:
+    TString GetSubject() const {
+        const auto sid = TBase::GetUserSID();
+        return sid ? sid : "no subject";
+    }
+
     static NYql::TIssues GetRlIssues(const Ydb::RateLimiter::AcquireResourceResponse& resp) {
         NYql::TIssues opIssues;
         NYql::IssuesFromMessage(resp.operation().issues(), opIssues);

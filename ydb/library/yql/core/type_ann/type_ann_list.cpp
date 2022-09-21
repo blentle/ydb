@@ -4970,12 +4970,40 @@ namespace {
 
         if (name == "count" || name == "count_all") {
             input->SetTypeAnn(ctx.Expr.MakeType<TDataExprType>(EDataSlot::Uint64));
+        } else if (name == "sum") {
+            bool isOptional;
+            const TDataExprType* lambdaType;
+            if(IsDataOrOptionalOfData(lambda->GetTypeAnn(), isOptional, lambdaType)) {
+                auto lambdaTypeSlot = lambdaType->GetSlot();
+                const TTypeAnnotationNode *sumResultType = nullptr;
+                if (IsDataTypeSigned(lambdaTypeSlot)) {
+                    sumResultType = ctx.Expr.MakeType<TDataExprType>(EDataSlot::Int64);
+                } else if (IsDataTypeUnsigned(lambdaTypeSlot)) {
+                    sumResultType = ctx.Expr.MakeType<TDataExprType>(EDataSlot::Uint64);
+                } else if (IsDataTypeDecimal(lambdaTypeSlot)) {
+                    const auto decimalType = lambdaType->Cast<TDataExprParamsType>();
+                    sumResultType = ctx.Expr.MakeType<TDataExprParamsType>(EDataSlot::Decimal, "35", decimalType->GetParamTwo());
+                } else if (IsDataTypeFloat(lambdaTypeSlot) || IsDataTypeInterval(lambdaTypeSlot)) {
+                    sumResultType = ctx.Expr.MakeType<TDataExprType>(lambdaTypeSlot);
+                } else {
+                    ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                        TStringBuilder() << "Unsupported column type: " << lambdaTypeSlot));
+                    return IGraphTransformer::TStatus::Error;
+                }
+                input->SetTypeAnn(ctx.Expr.MakeType<TOptionalExprType>(sumResultType));
+            } else if (IsNull(*lambda->GetTypeAnn())) {
+                input->SetTypeAnn(ctx.Expr.MakeType<TNullExprType>());
+            } else {
+                ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                    TStringBuilder() << "Unsupported type: " << FormatType(lambda->GetTypeAnn()) << ". Expected Data or Optional of Data."));
+                return IGraphTransformer::TStatus::Error;
+            }
         } else {
             ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
                 TStringBuilder() << "Unsupported agg name: " << name));
             return IGraphTransformer::TStatus::Error;
         }
-        
+
         return IGraphTransformer::TStatus::Ok;
     }
 
@@ -5812,9 +5840,9 @@ namespace {
             return IGraphTransformer::TStatus::Repeat;
         }
 
-        const TTypeAnnotationNode* timeType = ctx.Expr.MakeType<TOptionalExprType>(ctx.Expr.MakeType<TDataExprType>(EDataSlot::Timestamp));
+        const TTypeAnnotationNode* timeType = ctx.Expr.MakeType<TDataExprType>(EDataSlot::Timestamp);
 
-        if (!IsSameAnnotation(*lambdaTimeExtractor->GetTypeAnn(), *timeType)) {
+        if (!IsSameAnnotation(*RemoveOptionalType(lambdaTimeExtractor->GetTypeAnn()), *timeType)) {
             ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(lambdaTimeExtractor->Pos()), TStringBuilder()
                 << "Mismatch hopping window time extractor lambda output type, expected: "
                 << *timeType << ", but got: " << *lambdaTimeExtractor->GetTypeAnn()));
@@ -6025,7 +6053,7 @@ namespace {
 
     IGraphTransformer::TStatus MultiHoppingCoreWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
         Y_UNUSED(output);
-        if (!EnsureArgsCount(*input, 13, ctx.Expr)) {
+        if (!EnsureArgsCount(*input, 14, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
         auto& item = input->ChildRef(0);

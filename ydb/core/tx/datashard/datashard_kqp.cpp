@@ -205,7 +205,7 @@ bool NeedEraseLocks(NKikimrTxDataShard::TKqpLocks_ELocksOp op) {
     }
 }
 
-bool NeedCommitLockChanges(NKikimrTxDataShard::TKqpLocks_ELocksOp op) {
+bool NeedCommitLocks(NKikimrTxDataShard::TKqpLocks_ELocksOp op) {
     switch (op) {
         case NKikimrTxDataShard::TKqpLocks::Commit:
             return true;
@@ -256,6 +256,10 @@ TVector<NKikimrTxDataShard::TLock> ValidateLocks(const NKikimrTxDataShard::TKqpL
 
         auto lock = sysLocks.GetLock(lockKey);
         if (lock.Generation != lockProto.GetGeneration() || lock.Counter != lockProto.GetCounter()) {
+            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD, "ValidateLocks: broken lock "
+                    << lockProto.GetLockId()
+                    << " expected " << lockProto.GetGeneration() << ":" << lockProto.GetCounter()
+                    << " found " << lock.Generation << ":" << lock.Counter);
             brokenLocks.push_back(lockProto);
         }
     }
@@ -357,7 +361,7 @@ void KqpSetTxKeysImpl(ui64 tabletId, ui64 taskId, const TTableId& tableId, const
                         tableInfo->KeyColumnTypes, readMeta->GetItemsLimit(), readMeta->GetReverse());
                 } else {
                     engineBay.AddWriteRange(tableId, tableRange.ToTableRange(), tableInfo->KeyColumnTypes,
-                        GetColumnWrites(*writeMeta));
+                        GetColumnWrites(*writeMeta), writeMeta->GetIsPureEraseOp());
                 }
             }
 
@@ -375,7 +379,7 @@ void KqpSetTxKeysImpl(ui64 tabletId, ui64 taskId, const TTableId& tableId, const
                         tableInfo->KeyColumnTypes, readMeta->GetItemsLimit(), readMeta->GetReverse());
                 } else {
                     engineBay.AddWriteRange(tableId, tablePoint.ToTableRange(), tableInfo->KeyColumnTypes,
-                        GetColumnWrites(*writeMeta));
+                        GetColumnWrites(*writeMeta), writeMeta->GetIsPureEraseOp());
                 }
             }
 
@@ -396,7 +400,7 @@ void KqpSetTxKeysImpl(ui64 tabletId, ui64 taskId, const TTableId& tableId, const
                     tableInfo->KeyColumnTypes, readMeta->GetItemsLimit(), readMeta->GetReverse());
             } else {
                 engineBay.AddWriteRange(tableId, tableRange.ToTableRange(), tableInfo->KeyColumnTypes,
-                    GetColumnWrites(*writeMeta));
+                    GetColumnWrites(*writeMeta), writeMeta->GetIsPureEraseOp());
             }
 
             break;
@@ -412,7 +416,7 @@ void KqpSetTxKeysImpl(ui64 tabletId, ui64 taskId, const TTableId& tableId, const
                     tableInfo->KeyColumnTypes, readMeta->GetItemsLimit(), readMeta->GetReverse());
             } else {
                 engineBay.AddWriteRange(tableId, tableInfo->Range.ToTableRange(), tableInfo->KeyColumnTypes,
-                    GetColumnWrites(*writeMeta));
+                    GetColumnWrites(*writeMeta), writeMeta->GetIsPureEraseOp());
             }
 
             break;
@@ -669,19 +673,26 @@ void KqpEraseLocks(ui64 origin, TActiveTransaction* tx, TSysLocks& sysLocks) {
     }
 }
 
-void KqpCommitLockChanges(ui64 origin, TActiveTransaction* tx, TDataShard& dataShard, TTransactionContext& txc) {
+void KqpCommitLocks(ui64 origin, TActiveTransaction* tx, const TRowVersion& writeVersion, TDataShard& dataShard, TTransactionContext& txc) {
     auto& kqpTx = tx->GetDataTx()->GetKqpTransaction();
 
     if (!kqpTx.HasLocks()) {
         return;
     }
 
-    if (NeedCommitLockChanges(kqpTx.GetLocks().GetOp())) {
+    TSysLocks& sysLocks = dataShard.SysLocksTable();
+
+    if (NeedCommitLocks(kqpTx.GetLocks().GetOp())) {
         // We assume locks have been validated earlier
         for (auto& lockProto : kqpTx.GetLocks().GetLocks()) {
             if (lockProto.GetDataShard() != origin) {
                 continue;
             }
+
+            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD, "KqpCommitLock " << lockProto.ShortDebugString());
+
+            auto lockKey = MakeLockKey(lockProto);
+            sysLocks.CommitLock(lockKey);
 
             TTableId tableId(lockProto.GetSchemeShard(), lockProto.GetPathId());
             auto localTid = dataShard.GetLocalTableId(tableId);
@@ -692,42 +703,11 @@ void KqpCommitLockChanges(ui64 origin, TActiveTransaction* tx, TDataShard& dataS
                 continue;
             }
 
-            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD, "KqpCommitLockChanges: committing txId# " << txId << " in localTid# " << localTid);
-            txc.DB.CommitTx(localTid, txId);
+            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD, "KqpCommitLocks: commit txId# " << txId << " in localTid# " << localTid);
+            txc.DB.CommitTx(localTid, txId, writeVersion);
         }
     } else {
-        KqpRollbackLockChanges(origin, tx, dataShard, txc);
-    }
-}
-
-void KqpRollbackLockChanges(ui64 origin, TActiveTransaction* tx, TDataShard& dataShard, TTransactionContext& txc) {
-    auto& kqpTx = tx->GetDataTx()->GetKqpTransaction();
-
-    if (!kqpTx.HasLocks()) {
-        return;
-    }
-
-    if (NeedEraseLocks(kqpTx.GetLocks().GetOp())) {
-        for (auto& lockProto : kqpTx.GetLocks().GetLocks()) {
-            if (lockProto.GetDataShard() != origin) {
-                continue;
-            }
-
-            TTableId tableId(lockProto.GetSchemeShard(), lockProto.GetPathId());
-            auto localTid = dataShard.GetLocalTableId(tableId);
-            if (!localTid) {
-                // It may have been dropped already
-                continue;
-            }
-
-            auto txId = lockProto.GetLockId();
-            if (!txc.DB.HasOpenTx(localTid, txId)) {
-                continue;
-            }
-
-            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD, "KqpRollbackLockChanges: removing txId# " << txId << " from localTid# " << localTid);
-            txc.DB.RemoveTx(localTid, txId);
-        }
+        KqpEraseLocks(origin, tx, sysLocks);
     }
 }
 

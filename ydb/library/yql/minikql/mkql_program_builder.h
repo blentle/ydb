@@ -85,20 +85,20 @@ inline void AddAnyJoinSide(EAnyJoinSettings& combined, EAnyJoinSettings value) {
 }
 
 #define MKQL_SCRIPT_TYPES(xx) \
-    xx(Unknown, 0, unknown) \
-    xx(Python, 1, python) \
-    xx(Lua, 2, lua) \
-    xx(ArcPython, 3, arcpython) \
-    xx(CustomPython, 4, custompython) \
-    xx(Javascript, 5, javascript) \
-    xx(Python2, 6, python2) \
-    xx(ArcPython2, 7, arcpython2) \
-    xx(CustomPython2, 8, custompython2) \
-    xx(Python3, 9, python3) \
-    xx(ArcPython3, 10, arcpython3) \
-    xx(CustomPython3, 11, custompython3) \
-    xx(SystemPython2, 12, systempython2) \
-    xx(SystemPython3, 13, systempython3) \
+    xx(Unknown, 0, unknown, false) \
+    xx(Python, 1, python, false) \
+    xx(Lua, 2, lua, false) \
+    xx(ArcPython, 3, arcpython, false) \
+    xx(CustomPython, 4, custompython, true) \
+    xx(Javascript, 5, javascript, false) \
+    xx(Python2, 6, python2, false) \
+    xx(ArcPython2, 7, arcpython2, false) \
+    xx(CustomPython2, 8, custompython2, true) \
+    xx(Python3, 9, python3, false) \
+    xx(ArcPython3, 10, arcpython3, false) \
+    xx(CustomPython3, 11, custompython3, true) \
+    xx(SystemPython2, 12, systempython2, false) \
+    xx(SystemPython3, 13, systempython3, false) \
 
 enum class EScriptType {
     MKQL_SCRIPT_TYPES(ENUM_VALUE_GEN)
@@ -237,9 +237,10 @@ public:
     TRuntimeNode ToBlocks(TRuntimeNode flow);
     TRuntimeNode WideToBlocks(TRuntimeNode flow);
     TRuntimeNode FromBlocks(TRuntimeNode flow);
-    TRuntimeNode AsSingle(TRuntimeNode flow);
+    TRuntimeNode WideFromBlocks(TRuntimeNode flow);
+    TRuntimeNode AsScalar(TRuntimeNode value);
 
-    TRuntimeNode BlockAdd(TRuntimeNode data1, TRuntimeNode data2);
+    TRuntimeNode BlockFunc(const std::string_view& funcName, TType* returnType, const TArrayRef<const TRuntimeNode>& args);
 
     // udfs
     TRuntimeNode Udf(
@@ -257,11 +258,11 @@ public:
         const std::string_view& file = std::string_view(""), ui32 row = 0, ui32 column = 0);
 
     TRuntimeNode ScriptUdf(
-            EScriptType scriptType,
-            const std::string_view& funcName,
-            TType* funcType,
-            TRuntimeNode script,
-            const std::string_view& file = std::string_view(""), ui32 row = 0, ui32 column = 0);
+        const std::string_view& moduleName,
+        const std::string_view& funcName,
+        TType* funcType,
+        TRuntimeNode script,
+        const std::string_view& file = std::string_view(""), ui32 row = 0, ui32 column = 0);
 
     typedef std::function<TRuntimeNode ()> TZeroLambda;
     typedef std::function<TRuntimeNode (TRuntimeNode)> TUnaryLambda;
@@ -409,6 +410,9 @@ public:
         ui64 memLimit, std::optional<ui32> sortedTableOrder,
         EAnyJoinSettings anyJoinSettings, const ui32 tableIndexField,
         TType* returnType);
+    TRuntimeNode GraceJoin(TRuntimeNode flowLeft, TRuntimeNode flowRight, EJoinKind joinKind,
+        const TArrayRef<const ui32>& leftKeyColumns, const TArrayRef<const ui32>& rightKeyColumns,
+        const TArrayRef<const ui32>& leftRenames, const TArrayRef<const ui32>& rightRenames, TType* returnType);
     TRuntimeNode CombineCore(TRuntimeNode stream,
         const TUnaryLambda& keyExtractor,
         const TBinaryLambda& init,
@@ -437,7 +441,8 @@ public:
         const TUnaryLambda& load,
         const TBinaryLambda& merge,
         const TTernaryLambda& finish,
-        TRuntimeNode hop, TRuntimeNode interval, TRuntimeNode delay, TRuntimeNode dataWatermarks);
+        TRuntimeNode hop, TRuntimeNode interval, TRuntimeNode delay,
+        TRuntimeNode dataWatermarks, TRuntimeNode watermarksMode);
 
     TRuntimeNode Chopper(TRuntimeNode flow, const TUnaryLambda& keyExtractor, const TBinaryLambda& groupSwitch, const TBinaryLambda& groupHandler);
 

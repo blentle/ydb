@@ -1,6 +1,9 @@
 #include "yql_s3_list.h"
+#include "yql_s3_path.h"
 
+#include <ydb/library/yql/providers/common/http_gateway/yql_http_default_retry_policy.h>
 #include <ydb/library/yql/utils/log/log.h>
+#include <ydb/library/yql/utils/threading/async_semaphore.h>
 #include <ydb/library/yql/utils/url_builder.h>
 #include <ydb/library/yql/utils/yql_panic.h>
 
@@ -10,25 +13,14 @@
 #undef THROW
 #endif
 #include <library/cpp/xml/document/xml-document.h>
-#include <library/cpp/retry/retry_policy.h>
-
 #include <util/string/builder.h>
-
 
 namespace NYql {
 
 namespace {
 
-ERetryErrorClass RetryS3SlowDown(long httpResponseCode) {
-    return httpResponseCode == 503 ? ERetryErrorClass::LongRetry : ERetryErrorClass::NoRetry; // S3 Slow Down == 503
-}
-
-size_t GetFirstWildcardPos(const TString& pattern) {
-    return pattern.find_first_of("*?{");
-}
-
 TString RegexFromWildcards(const std::string_view& pattern) {
-    const auto& escaped = RE2::QuoteMeta(re2::StringPiece(pattern));
+    const auto& escaped = NS3::EscapeRegex(ToString(pattern));
     TStringBuilder result;
     result << "(?s)";
     bool slash = false;
@@ -88,44 +80,45 @@ public:
 private:
     using TResultFilter = std::function<bool (const TString& path, TVector<TString>& matchedGlobs)>;
 
-    static TResultFilter MakeFilter(const TString& pattern, TString& prefix) {
-        prefix.clear();
-        if (auto pos = GetFirstWildcardPos(pattern); pos != TString::npos) {
-            prefix = pattern.substr(0, pos);
-            const auto regex = RegexFromWildcards(pattern);
-            auto re = std::make_shared<RE2>(re2::StringPiece(regex), RE2::Options());
-            YQL_ENSURE(re->ok());
-            YQL_ENSURE(re->NumberOfCapturingGroups() > 0);
-
-            const size_t numGroups = re->NumberOfCapturingGroups();
-            YQL_CLOG(INFO, ProviderS3) << "Got prefix: '" << prefix << "', regex: '" << regex
-                << "' with " << numGroups << " capture groups from original pattern '" << pattern << "'";
-
-            auto groups = std::make_shared<std::vector<std::string>>(numGroups);
-            auto reArgs = std::make_shared<std::vector<re2::RE2::Arg>>(numGroups);
-            auto reArgsPtr = std::make_shared<std::vector<re2::RE2::Arg*>>(numGroups);
-
-            for (size_t i = 0; i < size_t(numGroups); ++i) {
-                (*reArgs)[i] = &(*groups)[i];
-                (*reArgsPtr)[i] = &(*reArgs)[i];
-            }
-
-            return [groups, reArgs, reArgsPtr, re](const TString& path, TVector<TString>& matchedGlobs) {
+    static TResultFilter MakeFilter(const TString& pattern, const TMaybe<TString>& regexPatternPrefix, TString& prefix) {
+        const bool isRegex = regexPatternPrefix.Defined();
+        prefix = isRegex ? *regexPatternPrefix : pattern.substr(0, NS3::GetFirstWildcardPos(pattern));
+        if (!isRegex && prefix == pattern) {
+            // just match for equality
+            return [pattern](const TString& path, TVector<TString>& matchedGlobs) {
                 matchedGlobs.clear();
-                bool matched = re2::RE2::FullMatchN(path, *re, reArgsPtr->data(), reArgsPtr->size());
-                if (matched) {
-                    matchedGlobs.reserve(groups->size());
-                    for (auto& group : *groups) {
-                        matchedGlobs.push_back(ToString(group));
-                    }
-                }
-                return matched;
+                return path == pattern;
             };
         }
-        prefix = pattern;
-        return [pattern](const TString& path, TVector<TString>& matchedGlobs) {
+
+        const auto regex = isRegex ? pattern : RegexFromWildcards(pattern);
+        auto re = std::make_shared<RE2>(re2::StringPiece(regex), RE2::Options());
+        YQL_ENSURE(re->ok());
+        YQL_ENSURE(re->NumberOfCapturingGroups() > 0);
+
+        const size_t numGroups = re->NumberOfCapturingGroups();
+        YQL_CLOG(INFO, ProviderS3) << "Got prefix: '" << prefix << "', regex: '" << regex
+            << "' with " << numGroups << " capture groups from original pattern '" << pattern << "'";
+
+        auto groups = std::make_shared<std::vector<std::string>>(numGroups);
+        auto reArgs = std::make_shared<std::vector<re2::RE2::Arg>>(numGroups);
+        auto reArgsPtr = std::make_shared<std::vector<re2::RE2::Arg*>>(numGroups);
+
+        for (size_t i = 0; i < size_t(numGroups); ++i) {
+            (*reArgs)[i] = &(*groups)[i];
+            (*reArgsPtr)[i] = &(*reArgs)[i];
+        }
+
+        return [groups, reArgs, reArgsPtr, re](const TString& path, TVector<TString>& matchedGlobs) {
             matchedGlobs.clear();
-            return path == pattern;
+            bool matched = re2::RE2::FullMatchN(path, *re, reArgsPtr->data(), reArgsPtr->size());
+            if (matched) {
+                matchedGlobs.reserve(groups->size());
+                for (auto& group : *groups) {
+                    matchedGlobs.push_back(ToString(group));
+                }
+            }
+            return matched;
         };
     }
 
@@ -233,12 +226,11 @@ private:
     }
 
 
-    TFuture<TListResult> List(const TString& token, const TString& urlStr, const TString& pattern) override {
+    TFuture<TListResult> DoList(const TString& token, const TString& urlStr, const TString& pattern, const TMaybe<TString>& pathPrefix) {
         TString prefix;
-        TResultFilter filter = MakeFilter(pattern, prefix);
-        YQL_CLOG(INFO, ProviderS3) << "Enumerate items in " << urlStr << pattern;
+        TResultFilter filter = MakeFilter(pattern, pathPrefix, prefix);
 
-        const auto retryPolicy = IRetryPolicy<long>::GetExponentialBackoffPolicy(RetryS3SlowDown);
+        const auto retryPolicy = GetHTTPDefaultRetryPolicy();
         TUrlBuilder urlBuilder(urlStr);
         const auto url = urlBuilder
             .AddUrlParam("list-type", "2")
@@ -273,19 +265,65 @@ private:
         return future;
     }
 
+    NThreading::TFuture<TListResult> List(const TString& token, const TString& url, const TString& pattern) override {
+        YQL_CLOG(INFO, ProviderS3) << "Enumerating items using glob pattern " << url << pattern;
+        return DoList(token, url, pattern, {});
+    }
+
+    NThreading::TFuture<TListResult> ListRegex(const TString& token, const TString& url, const TString& pattern, const TString& pathPrefix) override {
+        YQL_CLOG(INFO, ProviderS3) << "Enumerating items using RE2 pattern " << url << pattern;
+        return DoList(token, url, pattern, pathPrefix);
+    }
+
     const IHTTPGateway::TPtr Gateway;
     const ui64 MaxFilesPerQuery;
 };
 
+class TS3ParallelLimitedLister : public IS3Lister {
+public:
+    explicit TS3ParallelLimitedLister(const IS3Lister::TPtr& lister, size_t maxParallelOps = 1)
+    : Lister(lister)
+    , Semaphore(TAsyncSemaphore::Make(maxParallelOps))
+    {}
+
+private:
+    TFuture<TListResult> DoList(const TString& token, const TString& url, const TString& pattern, const TMaybe<TString>& pathPrefix) {
+        auto promise = NewPromise<TListResult>();
+        auto future = promise.GetFuture();
+        auto acquired = Semaphore->AcquireAsync();
+        acquired.Subscribe([lister = Lister, promise, token, url, pattern, pathPrefix](const auto& f) {
+            auto lock = std::make_shared<TAsyncSemaphore::TAutoRelease>(f.GetValue()->MakeAutoRelease());
+            TFuture<TListResult> listFuture = pathPrefix.Defined() ?
+                lister->ListRegex(token, url, pattern, *pathPrefix) :
+                lister->List(token, url, pattern);
+            listFuture.Subscribe([promise, lock](const auto& f) mutable {
+                try {
+                    promise.SetValue(f.GetValue());
+                } catch (...) {
+                    promise.SetException(std::current_exception());
+                }
+            });
+        });
+        return future;
+    }
+
+    TFuture<TListResult> List(const TString& token, const TString& url, const TString& pattern) override {
+        return DoList(token, url, pattern, {});
+    }
+
+    TFuture<TListResult> ListRegex(const TString& token, const TString& url, const TString& pattern, const TString& pathPrefix) override {
+        return DoList(token, url, pattern, pathPrefix);
+    }
+
+    const IS3Lister::TPtr Lister;
+    const TAsyncSemaphore::TPtr Semaphore;
+};
 
 }
 
-bool IS3Lister::HasWildcards(const TString& pattern) {
-    return GetFirstWildcardPos(pattern) != TString::npos;
-}
-
-IS3Lister::TPtr IS3Lister::Make(const IHTTPGateway::TPtr& httpGateway, ui64 maxFilesPerQuery) {
-    return IS3Lister::TPtr(new TS3Lister(httpGateway, maxFilesPerQuery));
+IS3Lister::TPtr IS3Lister::Make(const IHTTPGateway::TPtr& httpGateway, ui64 maxFilesPerQuery, ui64 maxInflightListsPerQuery) {
+    auto lister = IS3Lister::TPtr(new TS3Lister(httpGateway, maxFilesPerQuery));
+    return IS3Lister::TPtr(new TS3ParallelLimitedLister(lister, maxInflightListsPerQuery));
 }
 
 }

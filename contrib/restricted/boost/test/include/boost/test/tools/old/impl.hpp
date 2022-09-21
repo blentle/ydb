@@ -104,10 +104,7 @@ BOOST_PP_REPEAT( BOOST_TEST_MAX_PREDICATE_ARITY, IMPL_FRWD, _ )
 template <class Left, class Right>
 inline assertion_result equal_impl( Left const& left, Right const& right )
 {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-compare"
     return left == right;
-#pragma GCC diagnostic pop
 }
 
 //____________________________________________________________________________//
@@ -117,7 +114,7 @@ inline assertion_result equal_impl( char const* left, char* right ) { return equ
 inline assertion_result equal_impl( char* left, char* right )       { return equal_impl( static_cast<char const*>(left), static_cast<char const*>(right) ); }
 
 #if !defined( BOOST_NO_CWCHAR )
-assertion_result        BOOST_TEST_DECL equal_impl( wchar_t const* left, wchar_t const* right );
+BOOST_TEST_DECL assertion_result equal_impl( wchar_t const* left, wchar_t const* right );
 inline assertion_result equal_impl( wchar_t* left, wchar_t const* right ) { return equal_impl( static_cast<wchar_t const*>(left), static_cast<wchar_t const*>(right) ); }
 inline assertion_result equal_impl( wchar_t const* left, wchar_t* right ) { return equal_impl( static_cast<wchar_t const*>(left), static_cast<wchar_t const*>(right) ); }
 inline assertion_result equal_impl( wchar_t* left, wchar_t* right )       { return equal_impl( static_cast<wchar_t const*>(left), static_cast<wchar_t const*>(right) ); }
@@ -161,8 +158,6 @@ struct ne_impl {
 
 //____________________________________________________________________________//
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-compare"
 struct lt_impl {
     template <class Left, class Right>
     assertion_result operator()( Left const& left, Right const& right )
@@ -200,7 +195,6 @@ struct ge_impl {
         return left >= right;
     }
 };
-#pragma GCC diagnostic pop
 
 //____________________________________________________________________________//
 
@@ -212,10 +206,7 @@ struct equal_coll_impl {
         std::size_t         pos = 0;
 
         for( ; left_begin != left_end && right_begin != right_end; ++left_begin, ++right_begin, ++pos ) {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-compare"
             if( *left_begin != *right_begin ) {
-#pragma GCC diagnostic pop
                 pr = false;
                 pr.message() << "\nMismatch at position " << pos << ": "
                   << ::boost::test_tools::tt_detail::print_helper(*left_begin)

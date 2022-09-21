@@ -23,7 +23,6 @@ target_include_directories(restricted-aws-aws-c-common PUBLIC
   ${CMAKE_SOURCE_DIR}/contrib/restricted/aws/aws-c-common/include
 )
 target_sources(restricted-aws-aws-c-common PRIVATE
-  ${CMAKE_SOURCE_DIR}/contrib/restricted/aws/aws-c-common/source/arch/intel/encoding_avx2.c
   ${CMAKE_SOURCE_DIR}/contrib/restricted/aws/aws-c-common/source/allocator.c
   ${CMAKE_SOURCE_DIR}/contrib/restricted/aws/aws-c-common/source/allocator_sba.c
   ${CMAKE_SOURCE_DIR}/contrib/restricted/aws/aws-c-common/source/array_list.c
@@ -79,12 +78,11 @@ target_sources(restricted-aws-aws-c-common PRIVATE
   ${CMAKE_SOURCE_DIR}/contrib/restricted/aws/aws-c-common/source/arch/intel/asm/cpuid.c
   ${CMAKE_SOURCE_DIR}/contrib/restricted/aws/aws-c-common/source/arch/intel/cpuid.c
 )
-set_property(
-  SOURCE
+target_sources_custom(restricted-aws-aws-c-common
+  .avx2
+  SRCS
   ${CMAKE_SOURCE_DIR}/contrib/restricted/aws/aws-c-common/source/arch/intel/encoding_avx2.c
-  APPEND
-  PROPERTY
-  COMPILE_OPTIONS
+  CUSTOM_FLAGS
   -mavx2
   -mfma
   -mbmi

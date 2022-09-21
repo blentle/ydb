@@ -555,10 +555,12 @@ inline EReady TTableItBase<TIteratorOps>::Start() noexcept
 
     if (!Iterators ||
         Iterators.front().IteratorId.Type == EType::Stop ||
-        !(Limit && Limit--))
+        Limit == 0)
     {
         return EReady::Gone;
     }
+
+    --Limit;
 
     auto key = Iterators.front().Key;
     PopHeap(Iterators.begin(), Active--, Comparator);
@@ -881,7 +883,7 @@ inline EReady TTableItBase<TIteratorOps>::Apply() noexcept
                     Uncommitted = false;
                     committed = true;
                 }
-                it.Apply(State, CommittedTransactions);
+                it.Apply(State, CommittedTransactions, TransactionObserver);
                 break;
             }
             case EType::Run: {
@@ -901,7 +903,7 @@ inline EReady TTableItBase<TIteratorOps>::Apply() noexcept
                     Uncommitted = false;
                     committed = true;
                 }
-                it.Apply(State, CommittedTransactions);
+                it.Apply(State, CommittedTransactions, TransactionObserver);
                 break;
             }
             default:

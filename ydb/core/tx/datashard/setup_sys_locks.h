@@ -6,18 +6,40 @@
 namespace NKikimr {
 namespace NDataShard {
 
-struct TSetupSysLocks {
+struct TSetupSysLocks
+    : public TLocksUpdate
+{
     TSysLocks &SysLocksTable;
 
-    TSetupSysLocks(TOperation::TPtr op,
-                   TDataShard &self)
+    TSetupSysLocks(TDataShard& self, ILocksDb* db)
         : SysLocksTable(self.SysLocksTable())
     {
-        TLocksUpdate &update = op->LocksUpdate();
+        CheckVersion = TRowVersion::Max();
+        BreakVersion = TRowVersion::Min();
 
-        update.Clear();
-        update.LockTxId = op->LockTxId();
-        update.LockNodeId = op->LockNodeId();
+        SysLocksTable.SetTxUpdater(this);
+        SysLocksTable.SetDb(db);
+    }
+
+    TSetupSysLocks(ui64 lockTxId, ui32 lockNodeId, TDataShard& self, ILocksDb* db)
+        : SysLocksTable(self.SysLocksTable())
+    {
+        LockTxId = lockTxId;
+        LockNodeId = lockNodeId;
+        CheckVersion = TRowVersion::Max();
+        BreakVersion = TRowVersion::Min();
+
+        SysLocksTable.SetTxUpdater(this);
+        SysLocksTable.SetDb(db);
+    }
+
+    TSetupSysLocks(TOperation::TPtr op,
+                   TDataShard &self,
+                   ILocksDb* db)
+        : SysLocksTable(self.SysLocksTable())
+    {
+        LockTxId = op->LockTxId();
+        LockNodeId = op->LockNodeId();
 
         if (self.IsMvccEnabled()) {
             auto [readVersion, writeVersion] = self.GetReadWriteVersions(op.Get());
@@ -29,21 +51,23 @@ struct TSetupSysLocks {
                     outOfOrder = true;
             }
 
-            update.CheckVersion = readVersion;
-            update.BreakVersion = outOfOrder ? writeVersion : TRowVersion::Min();
+            CheckVersion = readVersion;
+            BreakVersion = outOfOrder ? writeVersion : TRowVersion::Min();
         }
 
-        SysLocksTable.SetTxUpdater(&update);
+        SysLocksTable.SetTxUpdater(this);
         if (!op->LocksCache().Locks.empty())
             SysLocksTable.SetCache(&op->LocksCache());
         else
             SysLocksTable.SetAccessLog(&op->LocksAccessLog());
+        SysLocksTable.SetDb(db);
     }
 
     ~TSetupSysLocks() {
         SysLocksTable.SetTxUpdater(nullptr);
         SysLocksTable.SetCache(nullptr);
         SysLocksTable.SetAccessLog(nullptr);
+        SysLocksTable.SetDb(nullptr);
     }
 };
 

@@ -261,7 +261,10 @@ void TPersQueueBaseRequestProcessor::HandleTimeout(const TActorContext& ctx) {
 }
 
 
-void TPersQueueBaseRequestProcessor::GetTopicsListOrThrow(const ::google::protobuf::RepeatedPtrField<::NKikimrClient::TPersQueueMetaRequest::TTopicRequest>& requests, THashMap<TString, std::shared_ptr<THashSet<ui64>>>& partitionsToRequest) {
+void TPersQueueBaseRequestProcessor::GetTopicsListOrThrow(
+        const ::google::protobuf::RepeatedPtrField<::NKikimrClient::TPersQueueMetaRequest::TTopicRequest>& requests,
+        THashMap<TString, std::shared_ptr<THashSet<ui64>>>& partitionsToRequest
+) {
     for (const auto& topicRequest : requests) {
         if (topicRequest.GetTopic().empty()) {
             throw std::runtime_error("TopicRequest must have Topic field.");
@@ -419,6 +422,12 @@ TPersQueueBaseRequestProcessor::TNodesInfo::TNodesInfo(THolder<TEvInterconnect::
     HostNames.reserve(NodesInfoReply->Nodes.size());
     for (const NActors::TEvInterconnect::TNodeInfo& info : NodesInfoReply->Nodes) {
         HostNames.emplace(info.NodeId, info.Host);
+        auto insRes = MinNodeIdByHost.insert(std::make_pair(info.Host, info.NodeId));
+        if (!insRes.second) {
+            if (insRes.first->second > info.NodeId) {
+                insRes.first->second = info.NodeId;
+            }
+        }
     }
 }
 

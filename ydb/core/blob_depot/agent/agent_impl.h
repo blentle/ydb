@@ -90,6 +90,10 @@ namespace NKikimr::NBlobDepot {
         };
 
     public:
+        static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
+            return NKikimrServices::TActivity::BLOB_DEPOT_AGENT_ACTOR;
+        }
+
         TBlobDepotAgent(ui32 virtualGroupId, TIntrusivePtr<TBlobStorageGroupInfo> info, TActorId proxyId);
         ~TBlobDepotAgent();
 
@@ -133,7 +137,7 @@ namespace NKikimr::NBlobDepot {
                 Y_VERIFY(info->BlobDepotId);
                 if (TabletId != *info->BlobDepotId) {
                     TabletId = *info->BlobDepotId;
-                    if (TabletId) {
+                    if (TabletId && TabletId != Max<ui64>()) {
                         ConnectToBlobDepot();
                     }
                 
@@ -199,11 +203,8 @@ namespace NKikimr::NBlobDepot {
         void Handle(TRequestContext::TPtr context, NKikimrBlobDepot::TEvRegisterAgentResult& msg);
         void Handle(TRequestContext::TPtr context, NKikimrBlobDepot::TEvAllocateIdsResult& msg);
 
-        void Issue(NKikimrBlobDepot::TEvBlock msg, TRequestSender *sender, TRequestContext::TPtr context);
-        void Issue(NKikimrBlobDepot::TEvResolve msg, TRequestSender *sender, TRequestContext::TPtr context);
-        void Issue(NKikimrBlobDepot::TEvQueryBlocks msg, TRequestSender *sender, TRequestContext::TPtr context);
-        void Issue(NKikimrBlobDepot::TEvCollectGarbage msg, TRequestSender *sender, TRequestContext::TPtr context);
-        void Issue(NKikimrBlobDepot::TEvCommitBlobSeq msg, TRequestSender *sender, TRequestContext::TPtr context);
+        template<typename T, typename = typename TEvBlobDepot::TEventFor<T>::Type>
+        void Issue(T msg, TRequestSender *sender, TRequestContext::TPtr context);
 
         void Issue(std::unique_ptr<IEventBase> ev, TRequestSender *sender, TRequestContext::TPtr context);
 
@@ -243,6 +244,7 @@ namespace NKikimr::NBlobDepot {
             virtual void OnUpdateBlock(bool /*success*/) {}
             virtual void OnRead(ui64 /*tag*/, NKikimrProto::EReplyStatus /*status*/, TString /*dataOrErrorReason*/) {}
             virtual void OnIdAllocated() {}
+            virtual void OnDestroy(bool /*success*/) {}
 
         public:
             struct TDeleter {
@@ -269,10 +271,7 @@ namespace NKikimr::NBlobDepot {
 
             bool IdAllocInFlight = false;
 
-            struct TGivenIdRangeHeapComp;
-            using TGivenIdRangePerChannel = THashMap<ui8, TGivenIdRange>;
-            TGivenIdRangePerChannel GivenIdRangePerChannel;
-            std::vector<TGivenIdRangePerChannel::value_type*> GivenIdRangeHeap;
+            THashMap<ui8, TGivenIdRange> GivenIdRangePerChannel;
             ui32 NumAvailableItems = 0;
 
             std::set<TBlobSeqId> WritesInFlight;

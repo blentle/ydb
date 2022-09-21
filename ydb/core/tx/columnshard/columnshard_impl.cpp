@@ -603,19 +603,30 @@ std::unique_ptr<TEvPrivate::TEvIndexing> TColumnShard::SetupIndexation() {
     }
 
     if (bytesToIndex < (ui64)Limits.MinInsertBytes && blobs < TLimits::MIN_SMALL_BLOBS_TO_INSERT) {
-        LOG_S_DEBUG("Indexing not started: less data (" << bytesToIndex << " bytes in " << blobs << " blobs, ignored "
-            << ignored << ") then MIN_BYTES_TO_INSERT / MIN_SMALL_BLOBS_TO_INSERT at tablet " << TabletID());
-        return {};
+        LOG_S_DEBUG("Few data for indexation (" << bytesToIndex << " bytes in " << blobs << " blobs, ignored "
+            << ignored << ") at tablet " << TabletID());
+
+        // Force small indexations simetimes to keep BatchCache smaller
+        if (!bytesToIndex || SkippedIndexations < TSettings::MAX_INDEXATIONS_TO_SKIP) {
+            ++SkippedIndexations;
+            return {};
+        }
     }
+    SkippedIndexations = 0;
 
     LOG_S_DEBUG("Prepare indexing " << bytesToIndex << " bytes in " << dataToIndex.size() << " batches of committed "
         << size << " bytes in " << blobs << " blobs ignored " << ignored
         << " at tablet " << TabletID());
 
     TVector<NOlap::TInsertedData> data;
+    THashMap<TUnifiedBlobId, std::shared_ptr<arrow::RecordBatch>> cachedBlobs;
     data.reserve(dataToIndex.size());
     for (auto& ptr : dataToIndex) {
         data.push_back(*ptr);
+        if (auto inserted = BatchCache.GetInserted(TWriteId(ptr->WriteTxId)); inserted.second) {
+            Y_VERIFY(ptr->BlobId == inserted.first);
+            cachedBlobs.emplace(ptr->BlobId, inserted.second);
+        }
     }
 
     Y_VERIFY(data.size());
@@ -627,7 +638,7 @@ std::unique_ptr<TEvPrivate::TEvIndexing> TColumnShard::SetupIndexation() {
 
     ActiveIndexingOrCompaction = true;
     auto ev = std::make_unique<TEvPrivate::TEvWriteIndex>(PrimaryIndex->GetIndexInfo(), indexChanges,
-        Settings.CacheDataAfterIndexing);
+        Settings.CacheDataAfterIndexing, std::move(cachedBlobs));
     return std::make_unique<TEvPrivate::TEvIndexing>(std::move(ev));
 }
 
@@ -861,12 +872,13 @@ void TColumnShard::MapExternBlobs(const TActorContext& /*ctx*/, NOlap::TReadMeta
     }
 }
 
-TActorId TColumnShard::GetS3ActorForTier(const TString& tierName, const TString& phase) {
-    if (!S3Actors.count(tierName)) {
+TActorId TColumnShard::GetS3ActorForTier(const TString& tierName, const TString& phase) const {
+    auto it = S3Actors.find(tierName);
+    if (it == S3Actors.end()) {
         LOG_S_ERROR("No S3 actor for tier '" << tierName << "' (on " << phase << ") at tablet " << TabletID());
         return {};
     }
-    auto s3 = S3Actors[tierName];
+    auto s3 = it->second;
     if (!s3) {
         LOG_S_ERROR("Not started S3 actor for tier '" << tierName << "' (on " << phase << ") at tablet " << TabletID());
         return {};
@@ -875,15 +887,14 @@ TActorId TColumnShard::GetS3ActorForTier(const TString& tierName, const TString&
 }
 
 void TColumnShard::ExportBlobs(const TActorContext& ctx, ui64 exportNo, const TString& tierName,
-                               THashMap<TUnifiedBlobId, TString>&& blobsIds) {
+    TEvPrivate::TEvExport::TBlobDataMap&& blobsInfo) const {
     if (auto s3 = GetS3ActorForTier(tierName, "export")) {
-        auto event = std::make_unique<TEvPrivate::TEvExport>(exportNo, tierName, s3, std::move(blobsIds));
+        auto event = std::make_unique<TEvPrivate::TEvExport>(exportNo, tierName, s3, std::move(blobsInfo));
         ctx.Register(CreateExportActor(TabletID(), ctx.SelfID, event.release()));
     }
 }
 
-void TColumnShard::ForgetBlobs(const TActorContext& ctx, const TString& tierName,
-                               std::vector<NOlap::TEvictedBlob>&& blobs) {
+void TColumnShard::ForgetBlobs(const TActorContext& ctx, const TString& tierName, std::vector<NOlap::TEvictedBlob>&& blobs) const {
     if (auto s3 = GetS3ActorForTier(tierName, "forget")) {
         auto forget = std::make_unique<TEvPrivate::TEvForget>();
         forget->Evicted = std::move(blobs);

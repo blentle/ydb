@@ -1,8 +1,9 @@
 #include "rope.h"
 #include <library/cpp/testing/unittest/registar.h>
 #include <util/random/random.h>
+#include "ut_helpers.h"
 
-class TRopeStringBackend : public IRopeChunkBackend {
+class TRopeStringBackend : public IContiguousChunk {
     TString Buffer;
 
 public:
@@ -10,8 +11,16 @@ public:
         : Buffer(std::move(buffer))
     {}
 
-    TData GetData() const override {
+    TContiguousSpan GetData() const override {
         return {Buffer.data(), Buffer.size()};
+    }
+
+    TMutableContiguousSpan GetDataMut() override {
+        return {Buffer.Detach(), Buffer.size()};
+    }
+
+    TMutableContiguousSpan UnsafeGetDataMut() override {
+        return {const_cast<char*>(Buffer.data()), Buffer.size()};
     }
 
     size_t GetCapacity() const override {
@@ -53,11 +62,135 @@ TString RopeToString(const TRope& rope) {
 TString Text = "No elements are copied or moved, only the internal pointers of the list nodes are re-pointed.";
 
 Y_UNIT_TEST_SUITE(TRope) {
+    Y_UNIT_TEST(StringCompare) {
+        TRope rope = CreateRope(Text, 10);
+        UNIT_ASSERT_EQUAL(rope, Text);
+        UNIT_ASSERT_EQUAL(Text, rope);
+        rope.Erase(rope.Begin() + 10, rope.Begin() + 11);
+        UNIT_ASSERT_UNEQUAL(rope, Text);
+        UNIT_ASSERT_UNEQUAL(Text, rope);
+        TString str("aa");
+        rope = TRope(TString("ab"));
+        UNIT_ASSERT_LT(str, rope);
+        UNIT_ASSERT_GT(rope, str);
+        str = TString("aa");
+        rope = TRope(TString("a"));
+        UNIT_ASSERT_LT(rope, str);
+        UNIT_ASSERT_GT(str, rope);
+        str = TString("a");
+        rope = TRope(TString("aa"));
+        UNIT_ASSERT_LT(str, rope);
+        UNIT_ASSERT_GT(rope, str);
+    }
 
     Y_UNIT_TEST(Leak) {
         const size_t begin = 10, end = 20;
         TRope rope = CreateRope(Text, 10);
         rope.Erase(rope.Begin() + begin, rope.Begin() + end);
+    }
+
+    Y_UNIT_TEST(Compacted) {
+        TRope rope = CreateRope(Text, 10);
+        UNIT_ASSERT_EQUAL(rope.UnsafeGetContiguousSpanMut().data(), Text);
+        UNIT_ASSERT(rope.IsContiguous());
+    }
+
+#ifndef TSTRING_IS_STD_STRING
+    Y_UNIT_TEST(ExtractZeroCopy) {
+        TString str = Text;
+        TRope packed(str);
+        TString extracted = packed.ExtractUnderlyingContainerOrCopy<TString>();
+        UNIT_ASSERT_EQUAL(str.data(), extracted.data());
+    }
+
+    Y_UNIT_TEST(ExtractZeroCopySlice) {
+        TString str = Text;
+        TRope sliced(str);
+        sliced.EraseFront(1);
+        TString extracted = sliced.ExtractUnderlyingContainerOrCopy<TString>();
+        UNIT_ASSERT_UNEQUAL(str.data(), extracted.data());
+        TRope sliced2(str);
+        sliced2.EraseBack(1);
+        TString extracted2 = sliced2.ExtractUnderlyingContainerOrCopy<TString>();
+        UNIT_ASSERT_UNEQUAL(str.data(), extracted2.data());
+    }
+
+    Y_UNIT_TEST(TStringDetach) {
+        TRope pf;
+        TRope rope;
+        TString string = TString(Text.data(), Text.size());
+        rope = TRope(string);
+        pf = rope;
+        pf.GetContiguousSpanMut();
+        UNIT_ASSERT(!string.IsDetached());
+        rope.GetContiguousSpanMut();
+        UNIT_ASSERT(string.IsDetached());
+    }
+
+    Y_UNIT_TEST(TStringUnsafeShared) {
+        TRope pf;
+        TRope rope;
+        TString string = TString(Text.data(), Text.size());
+        rope = TRope(string);
+        pf = rope;
+        UNIT_ASSERT(pf.IsContiguous());
+        UNIT_ASSERT_EQUAL(pf.UnsafeGetContiguousSpanMut().data(), string.data());
+        UNIT_ASSERT(!string.IsDetached());
+    }
+
+    Y_UNIT_TEST(ContiguousDataInterop) {
+        TString string = "Some long-long text needed for not sharing data and testing";
+        TContiguousData data(string);
+        TRope rope(data); // check operator TRope
+        UNIT_ASSERT_EQUAL(rope.UnsafeGetContiguousSpanMut().data(), string.data());
+        TContiguousData otherData(rope);
+        UNIT_ASSERT_EQUAL(otherData.UnsafeGetDataMut(), string.data());
+        TString extractedBack = otherData.ExtractUnderlyingContainerOrCopy<TString>();
+        UNIT_ASSERT_EQUAL(extractedBack.data(), string.data());
+    }
+#endif
+    Y_UNIT_TEST(CrossCompare) {
+        TString str = "some very long string";
+        const TString constStr(str);
+        TStringBuf strbuf = str;
+        const TStringBuf constStrbuf = str;
+        TContiguousSpan span(str);
+        const TContiguousSpan constSpan(str);
+        TMutableContiguousSpan mutableSpan(const_cast<char*>(str.data()), str.size());
+        const TMutableContiguousSpan constMutableSpan(const_cast<char*>(str.data()), str.size());
+        TContiguousData data(str);
+        const TContiguousData constData(str);
+        TArrayRef<char> arrRef(const_cast<char*>(str.data()), str.size());
+        const TArrayRef<char> constArrRef(const_cast<char*>(str.data()), str.size());
+        TArrayRef<const char> arrConstRef(const_cast<char*>(str.data()), str.size());
+        const TArrayRef<const char> constArrConstRef(const_cast<char*>(str.data()), str.size());
+        NActors::TSharedData sharedData = NActors::TSharedData::Copy(str.data(), str.size());
+        const NActors::TSharedData constSharedData(sharedData);
+        TRope rope(str);
+        const TRope constRope(str);
+
+        Permutate(
+            [](auto& arg1, auto& arg2) {
+                UNIT_ASSERT(arg1 == arg2);
+            },
+            str,
+            constStr,
+            strbuf,
+            constStrbuf,
+            span,
+            constSpan,
+            mutableSpan,
+            constMutableSpan,
+            data,
+            constData,
+            arrRef,
+            constArrRef,
+            arrConstRef,
+            constArrConstRef,
+            sharedData,
+            constSharedData,
+            rope,
+            constRope);
     }
 
     Y_UNIT_TEST(BasicRange) {
@@ -202,11 +335,23 @@ Y_UNIT_TEST_SUITE(TRope) {
             const TRope xRope = CreateRope(x, 7);
             const TRope yRope = CreateRope(y, 11);
             UNIT_ASSERT_VALUES_EQUAL(xRope == yRope, x == y);
+            UNIT_ASSERT_VALUES_EQUAL(xRope == y, x == y);
+            UNIT_ASSERT_VALUES_EQUAL(x == yRope, x == y);
             UNIT_ASSERT_VALUES_EQUAL(xRope != yRope, x != y);
+            UNIT_ASSERT_VALUES_EQUAL(xRope != y, x != y);
+            UNIT_ASSERT_VALUES_EQUAL(x != yRope, x != y);
             UNIT_ASSERT_VALUES_EQUAL(xRope <  yRope, x <  y);
+            UNIT_ASSERT_VALUES_EQUAL(xRope <  y, x <  y);
+            UNIT_ASSERT_VALUES_EQUAL(x <  yRope, x <  y);
             UNIT_ASSERT_VALUES_EQUAL(xRope <= yRope, x <= y);
+            UNIT_ASSERT_VALUES_EQUAL(xRope <= y, x <= y);
+            UNIT_ASSERT_VALUES_EQUAL(x <= yRope, x <= y);
             UNIT_ASSERT_VALUES_EQUAL(xRope >  yRope, x >  y);
+            UNIT_ASSERT_VALUES_EQUAL(xRope >  y, x >  y);
+            UNIT_ASSERT_VALUES_EQUAL(x >  yRope, x >  y);
             UNIT_ASSERT_VALUES_EQUAL(xRope >= yRope, x >= y);
+            UNIT_ASSERT_VALUES_EQUAL(xRope >= y, x >= y);
+            UNIT_ASSERT_VALUES_EQUAL(x >= yRope, x >= y);
         };
 
         TVector<TString> pool;

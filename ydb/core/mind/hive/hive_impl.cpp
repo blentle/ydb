@@ -308,6 +308,10 @@ void THive::Handle(TEvPrivate::TEvProcessPendingOperations::TPtr&) {
     BLOG_D("Handle ProcessPendingOperations");
 }
 
+void THive::Handle(TEvPrivate::TEvBalancerOut::TPtr&) {
+    BLOG_D("Handle BalancerOut");
+}
+
 void THive::Handle(TEvHive::TEvBootTablet::TPtr& ev) {
     TTabletId tabletId = ev->Get()->Record.GetTabletID();
     TTabletInfo* tablet = FindTablet(tabletId);
@@ -415,6 +419,8 @@ void THive::Handle(TEvLocal::TEvTabletStatus::TPtr& ev) {
 
 void THive::Handle(TEvPrivate::TEvBootTablets::TPtr&) {
     BLOG_D("Handle BootTablets");
+    SignalTabletActive(DEPRECATED_CTX);
+    ReadyForConnections = true;
     RequestPoolsInformation();
     for (auto& [id, node] : Nodes) {
         if (node.IsUnknown() && node.Local) {
@@ -439,6 +445,10 @@ void THive::Handle(TEvPrivate::TEvBootTablets::TPtr&) {
             if (!tablet.InitiateBlockStorage(sideEffects, std::numeric_limits<ui32>::max())) {
                 DeleteTabletWithoutStorage(&tablet);
             }
+        } else if (tablet.IsLockedToActor()) {
+            // we are wating for a lock
+        } else if (tablet.IsExternalBoot()) {
+            // we are wating for external boot request
         } else if (tablet.IsStopped() && tablet.State == ETabletState::Stopped) {
             ReportStoppedToWhiteboard(tablet);
             BLOG_D("Report tablet " << tablet.ToString() << " as stopped to Whiteboard");
@@ -458,8 +468,6 @@ void THive::Handle(TEvPrivate::TEvBootTablets::TPtr&) {
         }
     }
     sideEffects.Complete(DEPRECATED_CTX);
-    SignalTabletActive(DEPRECATED_CTX);
-    ReadyForConnections = true;
     if (AreWeRootHive()) {
         BLOG_D("Root Hive is ready");
     } else {
@@ -550,6 +558,14 @@ void THive::BuildCurrentConfig() {
     for (const NKikimrConfig::THiveTabletPreference& tabletPreference : CurrentConfig.GetDefaultTabletPreference()) {
         DefaultDataCentersPreference[tabletPreference.GetType()] = tabletPreference.GetDataCentersPreference();
     }
+    BalancerIgnoreTabletTypes.clear();
+    for (auto i : CurrentConfig.GetBalancerIgnoreTabletTypes()) {
+        const auto type = TTabletTypes::EType(i);
+        if (IsValidTabletType(type)) {
+            BalancerIgnoreTabletTypes.emplace_back(type);
+        }
+    }
+    MakeTabletTypeSet(BalancerIgnoreTabletTypes);
 }
 
 void THive::Cleanup() {
@@ -1608,6 +1624,7 @@ void THive::FillTabletInfo(NKikimrHive::TEvResponseHiveInfo& response, ui64 tabl
         auto& tabletInfo = *response.AddTablets();
         tabletInfo.SetTabletID(tabletId);
         tabletInfo.SetTabletType(info->Type);
+        tabletInfo.SetObjectId(info->ObjectId);
         tabletInfo.SetState(static_cast<ui32>(info->State));
         tabletInfo.SetTabletBootMode(info->BootMode);
         tabletInfo.SetVolatileState(info->GetVolatileState());
@@ -1616,6 +1633,9 @@ void THive::FillTabletInfo(NKikimrHive::TEvResponseHiveInfo& response, ui64 tabl
         tabletInfo.MutableTabletOwner()->SetOwnerIdx(info->Owner.second);
         tabletInfo.SetGeneration(info->KnownGeneration);
         tabletInfo.MutableObjectDomain()->CopyFrom(info->ObjectDomain);
+        if (info->BalancerPolicy != NKikimrHive::EBalancerPolicy::POLICY_BALANCE) {
+            tabletInfo.SetBalancerPolicy(info->BalancerPolicy);
+        }
         if (!info->IsRunning()) {
             tabletInfo.SetLastAliveTimestamp(info->Statistics.GetLastAliveTimestamp());
         }
@@ -2433,6 +2453,7 @@ STFUNC(THive::StateWork) {
         hFunc(NSysView::TEvSysView::TEvGetTabletsRequest, Handle);
         hFunc(TEvHive::TEvRequestTabletOwners, Handle);
         hFunc(TEvHive::TEvTabletOwnersReply, Handle);
+        hFunc(TEvPrivate::TEvBalancerOut, Handle);
     default:
         if (!HandleDefaultEvents(ev, ctx)) {
             BLOG_W("THive::StateWork unhandled event type: " << ev->GetTypeRewrite()
@@ -2462,12 +2483,18 @@ void THive::RequestFreeSequence() {
         size_t sequenceIndex = Sequencer.NextFreeSequenceIndex();
         size_t sequenceSize = GetRequestSequenceSize();
 
+        if (PendingCreateTablets.size() > sequenceSize) {
+            size_t newSequenceSize = ((PendingCreateTablets.size() / sequenceSize) + 1) * sequenceSize;
+            BLOG_W("Increasing sequence size from " << sequenceSize << " to " << newSequenceSize << " due to PendingCreateTablets.size() == " << PendingCreateTablets.size());
+            sequenceSize = newSequenceSize;
+        }
+
         BLOG_D("Requesting free sequence #" << sequenceIndex << " of " << sequenceSize << " from root hive");
         SendToRootHivePipe(new TEvHive::TEvRequestTabletIdSequence(TabletID(), sequenceIndex, sequenceSize));
         RequestingSequenceNow = true;
         RequestingSequenceIndex = sequenceIndex;
     } else {
-        BLOG_ERROR("We run out of tablet ids");
+        BLOG_ERROR("We ran out of tablet ids");
     }
 }
 

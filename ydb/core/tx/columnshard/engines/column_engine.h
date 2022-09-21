@@ -133,6 +133,7 @@ public:
     TVector<TColumnRecord> EvictedRecords;
     TVector<std::pair<TPortionInfo, ui64>> PortionsToMove; // {portion, new granule}
     THashMap<TBlobRange, TString> Blobs;
+    THashMap<TUnifiedBlobId, std::shared_ptr<arrow::RecordBatch>> CachedBlobs;
     bool NeedRepeat{false};
 
     bool IsInsert() const { return Type == INSERT; }
@@ -253,7 +254,7 @@ struct TSelectInfo {
         }
     };
 
-    TVector<TGranuleRecord> Granules; // oredered by key (asc)
+    TVector<TGranuleRecord> Granules; // ordered by key (ascending)
     TVector<TPortionInfo> Portions;
 
     TVector<ui64> GranulesOrder(bool rev = false) const {

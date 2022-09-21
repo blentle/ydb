@@ -84,6 +84,8 @@ TExprNode::TPtr FilterOutNullJoinColumns(TPositionHandle pos, const TExprNode::T
     const TJoinLabel& label, const TSet<TString>& optionalKeyColumns, TExprContext& ctx);
 
 TMap<TStringBuf, TVector<TStringBuf>> LoadJoinRenameMap(const TExprNode& settings);
+NNodes::TCoLambda BuildJoinRenameLambda(TPositionHandle pos, const TMap<TStringBuf, TVector<TStringBuf>>& renameMap,
+    const TStructExprType& joinResultType, TExprContext& ctx);
 TSet<TVector<TStringBuf>> LoadJoinSortSets(const TExprNode& settings);
 
 THashMap<TString, const TTypeAnnotationNode*> GetJoinColumnTypes(const TExprNode& joins,
@@ -95,6 +97,8 @@ THashMap<TString, const TTypeAnnotationNode*> GetJoinColumnTypes(const TExprNode
 bool AreSameJoinKeys(const TExprNode& joins, const TStringBuf& table1, const TStringBuf& column1, const TStringBuf& table2, const TStringBuf& column2);
 // returns (is required side + allow skip nulls);
 std::pair<bool, bool> IsRequiredSide(const TExprNode::TPtr& joinTree, const TJoinLabels& labels, ui32 inputIndex);
+
+TMaybe<bool> IsFilteredSide(const TExprNode::TPtr& joinTree, const TJoinLabels& labels, ui32 inputIndex);
 
 void AppendEquiJoinRenameMap(TPositionHandle pos, const TMap<TStringBuf, TVector<TStringBuf>>& newRenameMap,
     TExprNode::TListType& joinSettingNodes, TExprContext& ctx);

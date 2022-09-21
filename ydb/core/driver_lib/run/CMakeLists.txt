@@ -6,6 +6,7 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(ut)
 
 add_library(run)
 target_compile_options(run PRIVATE
@@ -72,6 +73,7 @@ target_link_libraries(run PUBLIC
   ydb-core-node_whiteboard
   ydb-core-persqueue
   ydb-core-protos
+  ydb-core-public_http
   ydb-core-quoter
   ydb-core-scheme
   ydb-core-scheme_types

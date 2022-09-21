@@ -268,6 +268,7 @@ private:
                                 .InputDesc = input,
                                 .InputIndex = static_cast<ui64>(inputId),
                                 .TxId = TraceId,
+                                .TaskId = Task.GetId(),
                                 .SecureParams = secureParams,
                                 .TaskParams = taskParams,
                                 .ComputeActorId = SelfId(),
@@ -298,8 +299,10 @@ private:
                                 .OutputDesc = output,
                                 .OutputIndex = static_cast<ui64>(outputId),
                                 .TxId = TraceId,
+                                .TaskId = Task.GetId(),
                                 .Callback = this,
                                 .SecureParams = secureParams,
+                                .TaskParams = taskParams,
                                 .TypeEnv = typeEnv,
                                 .HolderFactory = holderFactory
                             });
@@ -555,9 +558,10 @@ private:
                         continue;
                     }
                     auto guard = source.TypeEnv->BindAllocator();
+                    TMaybe<TInstant> watermark;
                     NKikimr::NMiniKQL::TUnboxedValueVector batch;
                     bool finished = false;
-                    const i64 space = source.Source->GetAsyncInputData(batch, finished, freeSpace);
+                    const i64 space = source.Source->GetAsyncInputData(batch, watermark, finished, freeSpace);
                     const ui64 index = inputIndex;
                     if (space <= 0) {
                         continue;

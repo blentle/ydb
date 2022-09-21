@@ -2,6 +2,7 @@
 
 #include "defs.h"
 #include "events.h"
+#include "test_shard_context.h"
 
 namespace NKikimr::NTestShard {
 
@@ -59,6 +60,7 @@ namespace NKikimr::NTestShard {
         }
 
         bool HandleHook(STFUNC_SIG) override {
+            SetActivityType(NKikimrServices::TActivity::TEST_SHARD_ACTOR);
             switch (ev->GetTypeRewrite()) {
                 HFunc(TEvControlRequest, Handle);
                 HFunc(TEvSwitchMode, Handle);
