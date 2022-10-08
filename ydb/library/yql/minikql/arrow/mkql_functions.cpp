@@ -1,57 +1,16 @@
 #include "mkql_functions.h"
 #include <ydb/library/yql/minikql/mkql_node_builder.h>
 #include <ydb/library/yql/minikql/mkql_node_cast.h>
+#include <ydb/library/yql/minikql/mkql_type_builder.h>
+#include <ydb/library/yql/minikql/mkql_function_metadata.h>
 
 #include <arrow/datum.h>
 #include <arrow/visitor.h>
 #include <arrow/compute/registry.h>
 #include <arrow/compute/function.h>
+#include <arrow/compute/cast.h>
 
 namespace NKikimr::NMiniKQL {
-
-bool ConvertArrowType(TType* itemType, bool& isOptional, std::shared_ptr<arrow::DataType>& type) {
-    auto unpacked = UnpackOptional(itemType, isOptional);
-    if (!unpacked->IsData()) {
-        return false;
-    }
-
-    auto slot = AS_TYPE(TDataType, unpacked)->GetDataSlot();
-    if (!slot) {
-        return false;
-    }
-
-    switch (*slot) {
-    case NUdf::EDataSlot::Bool:
-        type = arrow::boolean();
-        return true;
-    case NUdf::EDataSlot::Uint8:
-        type = arrow::uint8();
-        return true;
-    case NUdf::EDataSlot::Int8:
-        type = arrow::int8();
-        return true;
-    case NUdf::EDataSlot::Uint16:
-        type = arrow::uint16();
-        return true;
-    case NUdf::EDataSlot::Int16:
-        type = arrow::int16();
-        return true;
-    case NUdf::EDataSlot::Uint32:
-        type = arrow::uint32();
-        return true;
-    case NUdf::EDataSlot::Int32:
-        type = arrow::int32();
-        return true;
-    case NUdf::EDataSlot::Int64:
-        type = arrow::int64();
-        return true;
-    case NUdf::EDataSlot::Uint64:
-        type = arrow::uint64();
-        return true;
-    default:
-        return false;
-    }
-}
 
 bool ConvertInputArrowType(TType* blockType, bool& isOptional, arrow::ValueDescr& descr) {
     auto asBlockType = AS_TYPE(TBlockType, blockType);
@@ -163,9 +122,8 @@ bool ConvertOutputArrowType(const arrow::compute::OutputType& outType, const std
     }
 }
 
-bool FindArrowFunction(TStringBuf name, const TArrayRef<TType*>& inputTypes, TType*& outputType, TTypeEnvironment& env) {
-    auto registry = arrow::compute::GetFunctionRegistry();
-    auto resFunc = registry->GetFunction(TString(name));
+bool FindArrowFunction(TStringBuf name, const TArrayRef<TType*>& inputTypes, TType*& outputType, TTypeEnvironment& env, const IBuiltinFunctionRegistry& registry) {
+    auto resFunc = registry.GetArrowFunctionRegistry()->GetFunction(TString(name));
     if (!resFunc.ok()) {
         return false;
     }
@@ -196,11 +154,25 @@ bool FindArrowFunction(TStringBuf name, const TArrayRef<TType*>& inputTypes, TTy
     const auto& kernel = static_cast<const arrow::compute::ScalarKernel*>(*resKernel);
     auto notNull = (kernel->null_handling == arrow::compute::NullHandling::OUTPUT_NOT_NULL);
     const auto& outType = kernel->signature->out_type();
-    if (!ConvertOutputArrowType(outType, values, hasOptionals && !notNull, outputType, env)) {
+    if (!ConvertOutputArrowType(outType, values, name.EndsWith("?") || (hasOptionals && !notNull), outputType, env)) {
         return false;
     }
 
     return true;
+}
+
+bool HasArrowCast(TType* from, TType* to) {
+    bool isOptional;
+    std::shared_ptr<arrow::DataType> fromArrowType, toArrowType;
+    if (!ConvertArrowType(from, isOptional, fromArrowType)) {
+        return false;
+    }
+
+    if (!ConvertArrowType(to, isOptional, toArrowType)) {
+        return false;
+    }
+
+    return arrow::compute::CanCast(*fromArrowType, *toArrowType);
 }
 
 }

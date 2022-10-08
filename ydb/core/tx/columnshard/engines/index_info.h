@@ -1,7 +1,7 @@
 #pragma once
 #include "defs.h"
+#include "scalars.h"
 #include <ydb/core/tablet_flat/flat_dbase_scheme.h>
-#include <ydb/core/protos/tx_columnshard.pb.h>
 #include <ydb/core/sys_view/common/schema.h>
 
 namespace arrow {
@@ -15,10 +15,6 @@ namespace NKikimr::NArrow {
 }
 
 namespace NKikimr::NOlap {
-
-void ScalarToConstant(const arrow::Scalar& scalar, NKikimrSSA::TProgram_TConstant& value);
-std::shared_ptr<arrow::Scalar> ConstantToScalar(const NKikimrSSA::TProgram_TConstant& value,
-                                                const std::shared_ptr<arrow::DataType>& type);
 
 template <typename T>
 static std::shared_ptr<arrow::Schema> MakeArrowSchema(const NTable::TScheme::TTableSchema::TColumns& columns, const T& ids) {
@@ -40,9 +36,9 @@ static std::shared_ptr<arrow::Schema> MakeArrowSchema(const NTable::TScheme::TTa
 }
 
 inline
-TVector<std::pair<TString, NScheme::TTypeId>>
+TVector<std::pair<TString, NScheme::TTypeInfo>>
 GetColumns(const NTable::TScheme::TTableSchema& tableSchema, const TVector<ui32>& ids) {
-    TVector<std::pair<TString, NScheme::TTypeId>> out;
+    TVector<std::pair<TString, NScheme::TTypeInfo>> out;
     out.reserve(ids.size());
     for (ui32 id : ids) {
         Y_VERIFY(tableSchema.Columns.count(id));
@@ -127,17 +123,17 @@ struct TIndexInfo : public NTable::TScheme::TTableSchema {
         return out;
     }
 
-    TVector<std::pair<TString, NScheme::TTypeId>> GetColumns(const TVector<ui32>& ids) const {
+    TVector<std::pair<TString, NScheme::TTypeInfo>> GetColumns(const TVector<ui32>& ids) const {
         return NOlap::GetColumns(*this, ids);
     }
 
     // Traditional Primary Key (includes uniqueness, search and sorting logic)
-    TVector<std::pair<TString, NScheme::TTypeId>> GetPK() const {
+    TVector<std::pair<TString, NScheme::TTypeInfo>> GetPK() const {
         return GetColumns(KeyColumns);
     }
 
-    static TVector<std::pair<TString, NScheme::TTypeId>> SchemaIndexStats(ui32 version = 0);
-    static TVector<std::pair<TString, NScheme::TTypeId>> SchemaIndexStatsKey(ui32 version = 0);
+    static TVector<std::pair<TString, NScheme::TTypeInfo>> SchemaIndexStats(ui32 version = 0);
+    static TVector<std::pair<TString, NScheme::TTypeInfo>> SchemaIndexStatsKey(ui32 version = 0);
 
     ui32 GetPKFirstColumnId() const {
         Y_VERIFY(KeyColumns.size());
@@ -153,7 +149,7 @@ struct TIndexInfo : public NTable::TScheme::TTableSchema {
     const std::shared_ptr<arrow::Schema>& GetIndexKey() const { return IndexKey; }
 
     void SetAllKeys(const TVector<TString>& columns, const TVector<int>& indexKeyPos);
-    void SetAllKeys(const TVector<std::pair<TString, NScheme::TTypeId>>& columns, const TVector<int>& indexKeyPos) {
+    void SetAllKeys(const TVector<std::pair<TString, NScheme::TTypeInfo>>& columns, const TVector<int>& indexKeyPos) {
         SetAllKeys(NamesOnly(columns), indexKeyPos);
     }
 
@@ -261,7 +257,7 @@ private:
         }
     }
 
-    static TVector<TString> NamesOnly(const TVector<std::pair<TString, NScheme::TTypeId>>& columns) {
+    static TVector<TString> NamesOnly(const TVector<std::pair<TString, NScheme::TTypeInfo>>& columns) {
         TVector<TString> out;
         out.reserve(columns.size());
         for (auto& [name, type] : columns) {

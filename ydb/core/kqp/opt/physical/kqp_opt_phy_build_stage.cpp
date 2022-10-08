@@ -180,7 +180,7 @@ TExprBase KqpBuildReadTableStage(TExprBase node, TExprContext& ctx, const TKqpOp
 }
 
 TExprBase KqpBuildReadTableRangesStage(TExprBase node, TExprContext& ctx,
-    const TKqpOptimizeContext& kqpCtx)
+    const TKqpOptimizeContext& kqpCtx, const TParentsMap& parents)
 {
     if (!node.Maybe<TKqlReadTableRanges>()) {
         return node;
@@ -227,6 +227,10 @@ TExprBase KqpBuildReadTableRangesStage(TExprBase node, TExprContext& ctx,
                 auto input = TDqConnection(cn);
                 if (!input.Maybe<TDqCnUnionAll>()) {
                     return node;
+                }
+                
+                if (!IsSingleConsumerConnection(input, parents, false)) {
+                    continue;
                 }
 
                 inputs.push_back(input);
@@ -344,9 +348,11 @@ bool RequireLookupPrecomputeStage(const TKqlLookupTable& lookup) {
                 if (tuple.Value().Maybe<TCoParameter>()) {
                     // pass
                 } else if (tuple.Value().Maybe<TCoDataCtor>()) {
+                    // TODO: support pg types
                     auto slot = tuple.Value().Ref().GetTypeAnn()->Cast<TDataExprType>()->GetSlot();
                     auto typeId = NUdf::GetDataTypeInfo(slot).TypeId;
-                    if (NScheme::NTypeIds::IsYqlType(typeId) && NSchemeShard::IsAllowedKeyType(typeId)) {
+                    auto typeInfo = NScheme::TTypeInfo(typeId);
+                    if (NScheme::NTypeIds::IsYqlType(typeId) && NSchemeShard::IsAllowedKeyType(typeInfo)) {
                         // pass
                     } else {
                         return true;

@@ -1,10 +1,4 @@
-#include <ydb/library/yql/sql/pg_sql.h>
-#include <ydb/library/yql/providers/common/codec/yql_pg_codec.h>
-#include <ydb/library/yql/minikql/computation/mkql_computation_node_pack_impl.h>
-#include <ydb/library/yql/minikql/computation/presort_impl.h>
-#include <ydb/library/yql/core/yql_pg_utils.h>
-#include <ydb/library/yql/minikql/mkql_type_builder.h>
-#include <ydb/library/yql/public/udf/udf_value_builder.h>
+#include <ydb/library/yql/parser/pg_wrapper/interface/interface.h>
 
 namespace NSQLTranslationPG {
 
@@ -252,4 +246,60 @@ std::unique_ptr<NUdf::IPgBuilder> CreatePgBuilder() {
     return std::make_unique<TPgDummyBuilder>();
 }
 
+std::function<NKikimr::NMiniKQL::IComputationNode* (NKikimr::NMiniKQL::TCallable&,
+    const NKikimr::NMiniKQL::TComputationNodeFactoryContext&)> GetPgFactory()
+{
+    return {};
+}
+
 } // NYql
+
+namespace NKikimr::NPg {
+
+ui32 PgTypeIdFromTypeDesc(void* typeDesc) {
+    Y_UNUSED(typeDesc);
+    return 0;
+}
+
+void* TypeDescFromPgTypeId(ui32 pgTypeId) {
+    Y_UNUSED(pgTypeId);
+    return {};
+}
+
+const char* PgTypeNameFromTypeDesc(void* typeDesc) {
+    Y_UNUSED(typeDesc);
+    return "";
+}
+
+void* TypeDescFromPgTypeName(const TStringBuf name) {
+    Y_UNUSED(name);
+    return {};
+}
+
+bool TypeDescIsComparable(void* typeDesc) {
+    Y_UNUSED(typeDesc);
+    throw yexception() << "PG types are not supported";
+}
+
+ui32 TypeDescGetTypeLen(void* typeDesc) {
+    Y_UNUSED(typeDesc);
+    throw yexception() << "PG types are not supported";
+}
+
+int PgNativeBinaryCompare(const char* dataL, size_t sizeL, const char* dataR, size_t sizeR, void* typeDesc) {
+    Y_UNUSED(dataL);
+    Y_UNUSED(sizeL);
+    Y_UNUSED(dataR);
+    Y_UNUSED(sizeR);
+    Y_UNUSED(typeDesc);
+    throw yexception() << "PG types are not supported";
+}
+
+ui64 PgNativeBinaryHash(const char* data, size_t size, void* typeDesc) {
+    Y_UNUSED(data);
+    Y_UNUSED(size);
+    Y_UNUSED(typeDesc);
+    throw yexception() << "PG types are not supported";
+}
+
+} // namespace NKikimr::NPg

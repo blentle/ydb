@@ -1,6 +1,7 @@
 #pragma once
 #include "defs.h"
 #include "column_engine.h"
+#include "column_engine_logs.h" // for TColumnEngineForLogs::TMark
 #include "predicate.h"
 
 namespace NKikimr::NColumnShard {
@@ -56,8 +57,8 @@ struct TReadMetadataBase {
     bool IsSorted() const { return IsAscSorted() || IsDescSorted(); }
     void SetDescSorting() { Sorting = ESorting::DESC; }
 
-    virtual TVector<std::pair<TString, NScheme::TTypeId>> GetResultYqlSchema() const = 0;
-    virtual TVector<std::pair<TString, NScheme::TTypeId>> GetKeyYqlSchema() const = 0;
+    virtual TVector<std::pair<TString, NScheme::TTypeInfo>> GetResultYqlSchema() const = 0;
+    virtual TVector<std::pair<TString, NScheme::TTypeInfo>> GetKeyYqlSchema() const = 0;
     virtual std::unique_ptr<NColumnShard::TScanIteratorBase> StartScan() const = 0;
     virtual void Dump(IOutputStream& out) const { Y_UNUSED(out); };
 
@@ -102,7 +103,7 @@ struct TReadMetadata : public TReadMetadataBase, public std::enable_shared_from_
         return IndexInfo.GetReplaceKey();
     }
 
-    TVector<std::pair<TString, NScheme::TTypeId>> GetResultYqlSchema() const override {
+    TVector<std::pair<TString, NScheme::TTypeInfo>> GetResultYqlSchema() const override {
         TVector<NTable::TTag> columnIds;
         columnIds.reserve(ResultSchema->num_fields());
         for (const auto& field: ResultSchema->fields()) {
@@ -112,7 +113,7 @@ struct TReadMetadata : public TReadMetadataBase, public std::enable_shared_from_
         return IndexInfo.GetColumns(columnIds);
     }
 
-    TVector<std::pair<TString, NScheme::TTypeId>> GetKeyYqlSchema() const override {
+    TVector<std::pair<TString, NScheme::TTypeInfo>> GetKeyYqlSchema() const override {
         return IndexInfo.GetPK();
     }
 
@@ -165,9 +166,9 @@ struct TReadStatsMetadata : public TReadMetadataBase, public std::enable_shared_
         : TabletId(tabletId)
     {}
 
-    TVector<std::pair<TString, NScheme::TTypeId>> GetResultYqlSchema() const override;
+    TVector<std::pair<TString, NScheme::TTypeInfo>> GetResultYqlSchema() const override;
 
-    TVector<std::pair<TString, NScheme::TTypeId>> GetKeyYqlSchema() const override;
+    TVector<std::pair<TString, NScheme::TTypeInfo>> GetKeyYqlSchema() const override;
 
     std::unique_ptr<NColumnShard::TScanIteratorBase> StartScan() const override;
 };
@@ -228,7 +229,7 @@ private:
     THashMap<ui64, ui64> PortionGranule; // portion -> granule
     THashMap<ui64, ui32> GranuleWaits; // granule -> num portions to wait
     TDeque<ui64> GranulesOutOrder;
-    TMap<ui64, ui64> TsGranules; // ts (key) -> granule
+    TMap<TColumnEngineForLogs::TMark, ui64> TsGranules; // ts (key) -> granule
     THashSet<ui64> PortionsWithSelfDups;
     std::shared_ptr<NArrow::TSortDescription> SortReplaceDescription;
 

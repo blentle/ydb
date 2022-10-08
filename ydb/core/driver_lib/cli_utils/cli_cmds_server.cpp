@@ -84,9 +84,12 @@ protected:
     TVector<TString> GRpcPublicAddressesV4;
     TVector<TString> GRpcPublicAddressesV6;
     TString GRpcPublicTargetNameOverride;
-    TString PathToCert;
-    TString PathToPKey;
-    TString PathToCA;
+    TString PathToGrpcCertFile;
+    TString PathToInterconnectCertFile;
+    TString PathToGrpcPrivateKeyFile;
+    TString PathToInterconnectPrivateKeyFile;
+    TString PathToGrpcCaFile;
+    TString PathToInterconnectCaFile;
     TVector<TString> YamlConfigFiles;
 
     TClientCommandServerBase(const char *cmd, const char *description)
@@ -224,7 +227,8 @@ protected:
         config.Opts->AddLongOption("cms-file", "CMS config file").OptionalArgument("PATH");
         config.Opts->AddLongOption("alloc-file", "Allocator config file").OptionalArgument("PATH");
         config.Opts->AddLongOption("yql-file", "Yql Analytics config file").OptionalArgument("PATH");
-        config.Opts->AddLongOption("yq-file", "Yandex Query config file").OptionalArgument("PATH");
+        config.Opts->AddLongOption("yq-file", "Yandex Query config file (deprecated)").OptionalArgument("PATH");
+        config.Opts->AddLongOption("fq-file", "Federated Query config file").OptionalArgument("PATH");
         config.Opts->AddLongOption("feature-flags-file", "File with feature flags to turn new features on/off").OptionalArgument("PATH");
         config.Opts->AddLongOption("rb-file", "File with resource broker customizations").OptionalArgument("PATH");
         config.Opts->AddLongOption("metering-file", "File with metering config").OptionalArgument("PATH");
@@ -239,9 +243,15 @@ protected:
                 .RequiredArgument("NAME").StoreResult(&NodeType);
         config.Opts->AddLongOption("ignore-cms-configs", "Don't load configs from CMS")
                 .NoArgument().SetFlag(&IgnoreCmsConfigs);
-        config.Opts->AddLongOption("cert", "Path to client certificate file (PEM)").RequiredArgument("PATH").StoreResult(&PathToCert);
-        config.Opts->AddLongOption("key", "Path to private key file (PEM)").RequiredArgument("PATH").StoreResult(&PathToPKey);
-        config.Opts->AddLongOption("ca", "Path to certificate authority file (PEM)").RequiredArgument("PATH").StoreResult(&PathToCA);
+        config.Opts->AddLongOption("cert", "Path to client certificate file (PEM) for interconnect").RequiredArgument("PATH").StoreResult(&PathToInterconnectCertFile);
+        config.Opts->AddLongOption("grpc-cert", "Path to client certificate file (PEM) for grpc").RequiredArgument("PATH").StoreResult(&PathToGrpcCertFile);
+        config.Opts->AddLongOption("ic-cert", "Path to client certificate file (PEM) for interconnect").RequiredArgument("PATH").StoreResult(&PathToInterconnectCertFile);
+        config.Opts->AddLongOption("key", "Path to private key file (PEM) for interconnect").RequiredArgument("PATH").StoreResult(&PathToInterconnectPrivateKeyFile);
+        config.Opts->AddLongOption("grpc-key", "Path to private key file (PEM) for grpc").RequiredArgument("PATH").StoreResult(&PathToGrpcPrivateKeyFile);
+        config.Opts->AddLongOption("ic-key", "Path to private key file (PEM) for interconnect").RequiredArgument("PATH").StoreResult(&PathToInterconnectPrivateKeyFile);
+        config.Opts->AddLongOption("ca", "Path to certificate authority file (PEM) for interconnect").RequiredArgument("PATH").StoreResult(&PathToInterconnectCaFile);
+        config.Opts->AddLongOption("grpc-ca", "Path to certificate authority file (PEM) for grpc").RequiredArgument("PATH").StoreResult(&PathToGrpcCaFile);
+        config.Opts->AddLongOption("ic-ca", "Path to certificate authority file (PEM) for interconnect").RequiredArgument("PATH").StoreResult(&PathToInterconnectCaFile);
         config.Opts->AddLongOption("data-center", "data center name (used to describe dynamic node location)")
                 .RequiredArgument("NAME").StoreResult(&DataCenter);
         config.Opts->AddLongOption("rack", "rack name (used to describe dynamic node location)")
@@ -251,7 +261,8 @@ protected:
         config.Opts->AddLongOption("yaml-config", "Yaml config").OptionalArgument("PATH").AppendTo(&YamlConfigFiles);
         config.Opts->AddLongOption("cms-config-cache-file", "Path to CMS cache config file").OptionalArgument("PATH")
             .StoreResult(&RunConfig.PathToConfigCacheFile);
-        config.Opts->AddLongOption("http-proxy-file", "Http prox config file").OptionalArgument("PATH");
+        config.Opts->AddLongOption("http-proxy-file", "Http proxy config file").OptionalArgument("PATH");
+        config.Opts->AddLongOption("public-http-file", "Public HTTP config file").OptionalArgument("PATH");
 
         config.Opts->AddHelpOption('h');
 
@@ -450,13 +461,15 @@ protected:
         OPTION("pdisk-key-file", PDiskKeyConfig);
         OPTION("sqs-file", SqsConfig);
         OPTION("http-proxy-file", HttpProxyConfig);
+        OPTION("public-http-file", PublicHttpConfig);
         OPTION("feature-flags-file", FeatureFlags);
         OPTION("rb-file", ResourceBrokerConfig);
         OPTION("metering-file", MeteringConfig);
         OPTION("kqp-file", KQPConfig);
         OPTION("incrhuge-file", IncrHugeConfig);
         OPTION("alloc-file", AllocatorConfig);
-        OPTION("yq-file", YandexQueryConfig);
+        OPTION("yq-file", FederatedQueryConfig); // TODO: remove after migration (YQ-1467)
+        OPTION("fq-file", FederatedQueryConfig);
         OPTION(nullptr, TracingConfig);
         OPTION(nullptr, FailureInjectionConfig);
 
@@ -465,14 +478,40 @@ protected:
         }
 
         // apply certificates, if any
-        if (config.ParseResult->Has("cert")) {
-            AppConfig.MutableInterconnectConfig()->SetPathToCertificateFile(PathToCert);
+        if (!PathToInterconnectCertFile.Empty()) {
+            AppConfig.MutableInterconnectConfig()->SetPathToCertificateFile(PathToInterconnectCertFile);
         }
-        if (config.ParseResult->Has("key")) {
-            AppConfig.MutableInterconnectConfig()->SetPathToPrivateKeyFile(PathToPKey);
+
+        if (!PathToInterconnectPrivateKeyFile.Empty()) {
+            AppConfig.MutableInterconnectConfig()->SetPathToPrivateKeyFile(PathToInterconnectPrivateKeyFile);
         }
-        if (config.ParseResult->Has("ca")) {
-            AppConfig.MutableInterconnectConfig()->SetPathToCaFile(PathToCA);
+
+        if (!PathToInterconnectCaFile.Empty()) {
+            AppConfig.MutableInterconnectConfig()->SetPathToCaFile(PathToInterconnectCaFile);
+        }
+
+        if (AppConfig.HasGRpcConfig() && AppConfig.GetGRpcConfig().HasCert()) {
+            AppConfig.MutableGRpcConfig()->SetPathToCertificateFile(AppConfig.GetGRpcConfig().GetCert());
+        }
+
+        if (!PathToGrpcCertFile.Empty()) {
+            AppConfig.MutableGRpcConfig()->SetPathToCertificateFile(PathToGrpcCertFile);
+        }
+
+        if (AppConfig.HasGRpcConfig() && AppConfig.GetGRpcConfig().HasKey()) {
+            AppConfig.MutableGRpcConfig()->SetPathToPrivateKeyFile(AppConfig.GetGRpcConfig().GetKey());
+        }
+
+        if (!PathToGrpcPrivateKeyFile.Empty()) {
+            AppConfig.MutableGRpcConfig()->SetPathToPrivateKeyFile(PathToGrpcPrivateKeyFile);
+        }
+
+        if (AppConfig.HasGRpcConfig() && AppConfig.GetGRpcConfig().HasCA()) {
+            AppConfig.MutableGRpcConfig()->SetPathToCaFile(AppConfig.GetGRpcConfig().GetCA());
+        }
+
+        if (!PathToGrpcCaFile.Empty()) {
+            AppConfig.MutableGRpcConfig()->SetPathToCaFile(PathToGrpcCaFile);
         }
 
         if (!AppConfig.HasDomainsConfig())
@@ -497,8 +536,8 @@ protected:
             RunConfig.NodeId = NodeId;
 
         if (NodeKind == NODE_KIND_YQ && InterconnectPort) {
-            auto& yqConfig = *AppConfig.MutableYandexQueryConfig();
-            auto& nmConfig = *yqConfig.MutableNodesManager();
+            auto& fqConfig = *AppConfig.MutableFederatedQueryConfig();
+            auto& nmConfig = *fqConfig.MutableNodesManager();
             nmConfig.SetPort(InterconnectPort);
             nmConfig.SetHost(HostName());
         }
@@ -618,8 +657,8 @@ protected:
         }
 
         if (config.ParseResult->Has("data-center")) {
-            if (AppConfig.HasYandexQueryConfig()) {
-                AppConfig.MutableYandexQueryConfig()->MutableNodesManager()->SetDataCenter(to_lower(DataCenter));
+            if (AppConfig.HasFederatedQueryConfig()) {
+                AppConfig.MutableFederatedQueryConfig()->MutableNodesManager()->SetDataCenter(to_lower(DataCenter));
             }
         }
 
@@ -773,6 +812,10 @@ protected:
                     reflection->SwapFields(&AppConfig, &parsedConfig, {fieldDescriptor});
                 }
             }
+        }
+        // TODO: remove after migration (YQ-1467)
+        if (AppConfig.HasYandexQueryConfig()) {
+            AppConfig.MutableFederatedQueryConfig()->MergeFrom(AppConfig.GetYandexQueryConfig());
         }
     }
 
@@ -1118,8 +1161,8 @@ private:
         grpcConfig.LoadBalancingPolicy = "round_robin";
         if (endpoint.EnableSsl.Defined()) {
             grpcConfig.EnableSsl = endpoint.EnableSsl.GetRef();
-            if (PathToCA) {
-                grpcConfig.SslCaCert = ReadFromFile(PathToCA, "CA certificates");
+            if (!PathToInterconnectCaFile.Empty()) {
+                grpcConfig.SslCaCert = ReadFromFile(PathToInterconnectCaFile, "CA certificates");
             }
         }
         return NClient::TKikimr(grpcConfig);

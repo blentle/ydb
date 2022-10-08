@@ -59,8 +59,6 @@ namespace boost { namespace fusion
             : cons(in_cons) {}
         Cons& cons;
 
-        boost_tuple_iterator(const boost_tuple_iterator& other) = default;
-
         template <typename Iterator>
         struct value_of : mpl::identity<typename Iterator::cons_type::head_type> {};
 
@@ -148,6 +146,7 @@ namespace boost { namespace fusion
 
         // silence MSVC warning C4512: assignment operator could not be generated
         BOOST_DELETED_FUNCTION(boost_tuple_iterator& operator= (boost_tuple_iterator const&))
+        boost_tuple_iterator(const boost_tuple_iterator&) = default;
     };
 
     template <typename Null>

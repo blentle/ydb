@@ -367,9 +367,14 @@ namespace NKikimr {
             std::unique_ptr<NSyncLog::TEvSyncLogPut> syncLogMsg(
                 new NSyncLog::TEvSyncLogPut(Db->GType, seg.Point(), TLogoBlobID(id, 0), info.Ingress));
 #endif
+            // FIXME(innokentii) unclear semantics: we make only copy of wrapper here
+            // so, in right scenario we only take underlying container and call .GrowFront() on him
+            // which (if there is headroom) doesn't invalidate anything and change behavior only for wrapper
+            // and even if there is no headroom - copy will occur, making wrappers point to two unrelated memory
+            // regions
 
             // prepare message to recovery log
-            TString dataToWrite = TPutRecoveryLogRecOpt::Serialize(Db->GType, id, buffer);
+            TContiguousData dataToWrite = TPutRecoveryLogRecOpt::SerializeZeroCopy(Db->GType, id, TRope(buffer));
             LOG_DEBUG_S(ctx, BS_VDISK_PUT, VCtx->VDiskLogPrefix
                     << evPrefix << ": userDataSize# " << buffer.GetSize()
                     << " writtenSize# " << dataToWrite.size()
@@ -880,9 +885,8 @@ namespace NKikimr {
                 ReplyError(NKikimrProto::RACE, "group generation mismatch", ev, ctx, now);
             } else if (!CheckVGetQuery(record)) {
                 ReplyError(NKikimrProto::ERROR, "get query is invalid", ev, ctx, now);
-            } else if (record.HasReaderTabletId()
-                    && record.HasReaderTabletGeneration()
-                    && Hull->IsBlocked(record.GetReaderTabletId(), {record.GetReaderTabletGeneration(), 0}).Status != TBlocksCache::EStatus::OK) {
+            } else if (record.HasReaderTabletData()
+                    && Hull->IsBlocked(record.GetReaderTabletData().GetId(), {record.GetReaderTabletData().GetGeneration(), 0}).Status != TBlocksCache::EStatus::OK) {
                 ReplyError(NKikimrProto::BLOCKED, "tablet's generation is blocked", ev, ctx, now);
             } else {
                 std::optional<THullDsSnap> fullSnap;

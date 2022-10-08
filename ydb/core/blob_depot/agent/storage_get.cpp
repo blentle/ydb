@@ -1,5 +1,6 @@
 #include "agent_impl.h"
 #include "blob_mapping_cache.h"
+#include "blocks.h"
 
 namespace NKikimr::NBlobDepot {
 
@@ -36,6 +37,14 @@ namespace NKikimr::NBlobDepot {
                     Agent.VirtualGroupId);
                 AnswersRemain = msg.QuerySize;
 
+                if (msg.ReaderTabletData) {
+                    auto status = Agent.BlocksManager.CheckBlockForTablet(msg.ReaderTabletData->Id, msg.ReaderTabletData->Generation, this, nullptr);
+                    if (status == NKikimrProto::BLOCKED) {
+                        EndWithError(status, "Fail TEvGet due to BLOCKED tablet generation");
+                        return;
+                    }
+                }
+
                 for (ui32 i = 0; i < msg.QuerySize; ++i) {
                     auto& query = msg.Queries[i];
 
@@ -66,9 +75,17 @@ namespace NKikimr::NBlobDepot {
                     Response->Responses[queryIdx].Status = NKikimrProto::OK;
                     --AnswersRemain;
                 } else if (value) {
+                    TReadArg arg{
+                        *value,
+                        msg.GetHandleClass,
+                        msg.MustRestoreFirst,
+                        this,
+                        msg.Queries[queryIdx].Shift,
+                        msg.Queries[queryIdx].Size,
+                        queryIdx,
+                        msg.ReaderTabletData};
                     TString error;
-                    const bool success = Agent.IssueRead(*value, msg.Queries[queryIdx].Shift, msg.Queries[queryIdx].Size,
-                        msg.GetHandleClass, msg.MustRestoreFirst, this, queryIdx, &error);
+                    const bool success = Agent.IssueRead(arg, error);
                     if (!success) {
                         EndWithError(NKikimrProto::ERROR, std::move(error));
                         return false;

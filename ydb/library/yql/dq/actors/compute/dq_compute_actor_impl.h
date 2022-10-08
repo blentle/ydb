@@ -190,9 +190,9 @@ protected:
         , MemoryQuota(ownMemoryQuota ? InitMemoryQuota() : nullptr)
         , WatermarksTracker(this->SelfId(), TxId, Task.GetId())
         , DqComputeActorMetrics(taskCounters)
+        , ComputeActorSpan(NKikimr::TWilsonKqp::ComputeActor, std::move(traceId), "ComputeActor")
         , Running(!Task.GetCreateSuspended())
         , PassExceptions(passExceptions)
-        , ComputeActorSpan(NKikimr::TWilsonKqp::ComputeActor, std::move(traceId), "ComputeActor")
     {
         if (RuntimeSettings.StatsMode >= NDqProto::DQ_STATS_MODE_BASIC) {
             BasicStats = std::make_unique<TBasicStats>();
@@ -220,8 +220,8 @@ protected:
         , MemoryQuota(InitMemoryQuota())
         , WatermarksTracker(this->SelfId(), TxId, Task.GetId())
         , DqComputeActorMetrics(taskCounters)
-        , Running(!Task.GetCreateSuspended())
         , ComputeActorSpan(NKikimr::TWilsonKqp::ComputeActor, std::move(traceId), "ComputeActor")
+        , Running(!Task.GetCreateSuspended())
     {
         if (RuntimeSettings.StatsMode >= NDqProto::DQ_STATS_MODE_BASIC) {
             BasicStats = std::make_unique<TBasicStats>();
@@ -1775,7 +1775,6 @@ private:
         for (ui32 i = 0; i < Task.OutputsSize(); ++i) {
             const auto& outputDesc = Task.GetOutputs(i);
             Y_VERIFY(!outputDesc.HasSink() || outputDesc.ChannelsSize() == 0); // HasSink => no channels
-            Y_VERIFY(outputDesc.HasSink() || outputDesc.ChannelsSize() > 0);
 
             if (outputDesc.HasTransform()) {
                 auto result = OutputTransformsMap.emplace(std::piecewise_construct, std::make_tuple(i), std::make_tuple());
@@ -2003,11 +2002,11 @@ protected:
     THolder<TDqMemoryQuota> MemoryQuota;
     TDqComputeActorWatermarks WatermarksTracker;
     TDqComputeActorMetrics DqComputeActorMetrics;
+    NWilson::TSpan ComputeActorSpan;
 private:
     bool Running = true;
     TInstant LastSendStatsTime;
     bool PassExceptions = false;
-    NWilson::TSpan ComputeActorSpan;
 protected:
     bool MonCountersProvided = false;
     ::NMonitoring::TDynamicCounters::TCounterPtr MkqlMemoryUsage;

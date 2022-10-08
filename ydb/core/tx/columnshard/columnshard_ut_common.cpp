@@ -4,6 +4,7 @@
 
 #include <ydb/core/base/tablet.h>
 #include <ydb/core/base/tablet_resolver.h>
+#include <ydb/core/scheme/scheme_types_proto.h>
 #include <library/cpp/testing/unittest/registar.h>
 
 namespace NKikimr::NTxUT {
@@ -101,7 +102,13 @@ void ScanIndexStats(TTestBasicRuntime& runtime, TActorId& sender, const TVector<
     auto ydbSchema = PrimaryIndexStatsSchema;
     for (const auto& col : ydbSchema.Columns) {
         record.AddColumnTags(col.second.Id);
-        record.AddColumnTypes(col.second.PType);
+        auto columnType = NScheme::ProtoColumnTypeFromTypeInfo(col.second.PType);
+        record.AddColumnTypes(columnType.TypeId);
+        if (columnType.TypeInfo) {
+            *record.AddColumnTypeInfos() = *columnType.TypeInfo;
+        } else {
+            *record.AddColumnTypeInfos() = NKikimrProto::TTypeInfo();
+        }
     }
 
     for (ui64 pathId : pathIds) {
@@ -155,11 +162,12 @@ void PlanCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 planStep, con
     }
 }
 
-TVector<TCell> MakeTestCells(const TVector<TTypeId>& types, ui32 value, TVector<TString>& mem) {
+TVector<TCell> MakeTestCells(const TVector<TTypeInfo>& types, ui32 value, TVector<TString>& mem) {
     TVector<TCell> cells;
     cells.reserve(types.size());
 
-    for (auto& type : types) {
+    for (auto& typeInfo : types) {
+        auto type = typeInfo.GetTypeId();
         if (type == NTypeIds::Utf8 ||
             type == NTypeIds::String ||
             type == NTypeIds::String4k ||
@@ -175,7 +183,8 @@ TVector<TCell> MakeTestCells(const TVector<TTypeId>& types, ui32 value, TVector<
             mem.push_back("{ \"a\" = [ { \"b\" = 1; } ]; }");
             const TString& str = mem.back();
             cells.push_back(TCell(str.data(), str.size()));
-        } else if (type == NTypeIds::Timestamp || type == NTypeIds::Uint64 || type == NTypeIds::Int64) {
+        } else if (type == NTypeIds::Timestamp || type == NTypeIds::Interval ||
+                    type == NTypeIds::Uint64 || type == NTypeIds::Int64) {
             cells.push_back(TCell::Make<ui64>(value));
         } else if (type == NTypeIds::Uint32 || type == NTypeIds::Int32 || type == NTypeIds::Datetime) {
             cells.push_back(TCell::Make<ui32>(value));
@@ -196,7 +205,7 @@ TVector<TCell> MakeTestCells(const TVector<TTypeId>& types, ui32 value, TVector<
     return cells;
 }
 
-TString MakeTestBlob(std::pair<ui64, ui64> range, const TVector<std::pair<TString, TTypeId>>& columns,
+TString MakeTestBlob(std::pair<ui64, ui64> range, const TVector<std::pair<TString, TTypeInfo>>& columns,
                      const THashSet<TString>& nullColumns) {
     TString err;
     NArrow::TArrowBatchBuilder batchBuilder(arrow::Compression::LZ4_FRAME);
@@ -210,7 +219,7 @@ TString MakeTestBlob(std::pair<ui64, ui64> range, const TVector<std::pair<TStrin
     }
 
     TVector<TString> mem;
-    TVector<TTypeId> types = TTestSchema::ExtractTypes(columns);
+    TVector<TTypeInfo> types = TTestSchema::ExtractTypes(columns);
     // insert, not ordered
     for (size_t i = range.first; i < range.second; i += 2) {
         TVector<TCell> cells = MakeTestCells(types, i, mem);
@@ -240,9 +249,9 @@ TString MakeTestBlob(std::pair<ui64, ui64> range, const TVector<std::pair<TStrin
 }
 
 TSerializedTableRange MakeTestRange(std::pair<ui64, ui64> range, bool inclusiveFrom, bool inclusiveTo,
-                                    const TVector<std::pair<TString, TTypeId>>& columns) {
+                                    const TVector<std::pair<TString, TTypeInfo>>& columns) {
     TVector<TString> mem;
-    TVector<TTypeId> types = TTestSchema::ExtractTypes(columns);
+    TVector<TTypeInfo> types = TTestSchema::ExtractTypes(columns);
     TVector<TCell> cellsFrom = MakeTestCells(types, range.first, mem);
     TVector<TCell> cellsTo = MakeTestCells(types, range.second, mem);
 

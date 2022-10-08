@@ -24,8 +24,12 @@ public:
 
 private:
     void ExecuteDataTx(TOperation::TPtr op,
-                       const TActorContext& ctx);
+                       const TActorContext& ctx,
+                       TSetupSysLocks& guardLocks);
     void AddLocksToResult(TOperation::TPtr op, const TActorContext& ctx);
+
+private:
+    class TRescheduleOpException : public yexception {};
 };
 
 TExecuteDataTxUnit::TExecuteDataTxUnit(TDataShard& dataShard,
@@ -121,11 +125,40 @@ EExecutionStatus TExecuteDataTxUnit::Execute(TOperation::TPtr op,
             return EExecutionStatus::Restart;
         }
         engine->SetMemoryLimit(txc.GetMemoryLimit() - tx->GetDataTx()->GetTxSize());
+
+        if (guardLocks.LockTxId) {
+            switch (DataShard.SysLocksTable().EnsureCurrentLock()) {
+                case EEnsureCurrentLock::Success:
+                    // Lock is valid, we may continue with reads and side-effects
+                    break;
+
+                case EEnsureCurrentLock::Broken:
+                    // Lock is valid, but broken, we could abort early in some
+                    // cases, but it doesn't affect correctness.
+                    break;
+
+                case EEnsureCurrentLock::TooMany:
+                    // Lock cannot be created, it's not necessarily a problem
+                    // for read-only transactions, for non-readonly we need to
+                    // abort;
+                    if (op->IsReadOnly()) {
+                        break;
+                    }
+
+                    [[fallthrough]];
+
+                case EEnsureCurrentLock::Abort:
+                    // Lock cannot be created and we must abort
+                    op->SetAbortedFlag();
+                    BuildResult(op, NKikimrTxDataShard::TEvProposeTransactionResult::LOCKS_BROKEN);
+                    return EExecutionStatus::Executed;
+            }
+        }
     }
 
     try {
         try {
-            ExecuteDataTx(op, ctx);
+            ExecuteDataTx(op, ctx, guardLocks);
         } catch (const TNotReadyTabletException&) {
             // We want to try pinning (actually precharging) all required pages
             // before restarting the transaction, to minimize future restarts.
@@ -157,6 +190,14 @@ EExecutionStatus TExecuteDataTxUnit::Execute(TOperation::TPtr op,
         tx->ReleaseTxData(txc, ctx);
 
         return EExecutionStatus::Restart;
+    } catch (const TRescheduleOpException&) {
+        LOG_TRACE_S(ctx, NKikimrServices::TX_DATASHARD, "Tablet " << DataShard.TabletID()
+            << " needs to reschedule " << *op << " for dependencies");
+
+        tx->ReleaseTxData(txc, ctx);
+
+        txc.Reschedule();
+        return EExecutionStatus::Restart;
     }
 
     DataShard.IncCounter(COUNTER_WAIT_EXECUTE_LATENCY_MS, waitExecuteLatency.MilliSeconds());
@@ -175,7 +216,9 @@ EExecutionStatus TExecuteDataTxUnit::Execute(TOperation::TPtr op,
 }
 
 void TExecuteDataTxUnit::ExecuteDataTx(TOperation::TPtr op,
-                                       const TActorContext& ctx) {
+                                       const TActorContext& ctx,
+                                       TSetupSysLocks& guardLocks)
+{
     TActiveTransaction* tx = dynamic_cast<TActiveTransaction*>(op.Get());
     IEngineFlat* engine = tx->GetDataTx()->GetEngine();
 
@@ -203,6 +246,11 @@ void TExecuteDataTxUnit::ExecuteDataTx(TOperation::TPtr op,
     }
 
     IEngineFlat::EResult engineResult = engine->Execute();
+
+    if (Pipeline.AddLockDependencies(op, guardLocks)) {
+        throw TRescheduleOpException();
+    }
+
     if (engineResult != IEngineFlat::EResult::Ok) {
         TString errorMessage = TStringBuilder() << "Datashard execution error for " << *op << " at "
                                                 << DataShard.TabletID() << ": " << engine->GetErrors();
@@ -260,8 +308,8 @@ void TExecuteDataTxUnit::ExecuteDataTx(TOperation::TPtr op,
         KqpFillTxStats(DataShard, counters, *result);
     }
 
-    if (counters.InvisibleRowSkips) {
-        DataShard.SysLocksTable().BreakSetLocks(op->LockTxId(), op->LockNodeId());
+    if (counters.InvisibleRowSkips && op->LockTxId()) {
+        DataShard.SysLocksTable().BreakSetLocks();
     }
 
     AddLocksToResult(op, ctx);

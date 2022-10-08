@@ -17,27 +17,28 @@
 #include <ydb/library/yql/public/issue/yql_issue_message.h>
 #include <ydb/library/yql/public/issue/yql_issue_manager.h>
 
+#include <ydb/core/grpc_services/counters/proxy_counters.h>
 #include <ydb/core/grpc_streaming/grpc_streaming.h>
 #include <ydb/core/tx/scheme_board/events.h>
 #include <ydb/core/base/events.h>
 
+#include <util/stream/str.h>
+
 namespace NKikimrConfig {
-class TAppConfig;
+    class TAppConfig;
 }
 
 namespace NKikimr {
 
 namespace NSchemeCache {
-struct TSchemeCacheNavigate;
+    struct TSchemeCacheNavigate;
 }
 
 namespace NRpcService {
-
-struct TRlPath {
-    TString CoordinationNode;
-    TString ResourcePath;
-};
-
+    struct TRlPath {
+        TString CoordinationNode;
+        TString ResourcePath;
+    };
 }
 
 namespace NGRpcService {
@@ -235,7 +236,7 @@ void FillYdbStatus(T& resp, const NYql::TIssues& issues, Ydb::StatusIds::StatusC
 
 class TProtoResponseHelper {
 public:
-    template<typename T, typename C>
+    template <typename T, typename C>
     static void SendProtoResponse(const T& r, Ydb::StatusIds::StatusCode status, C& ctx) {
         T* resp = google::protobuf::Arena::CreateMessage<T>(ctx->GetArena());
         resp->CopyFrom(r);
@@ -278,6 +279,7 @@ public:
     using TPtr = TIntrusivePtr<TRespHookCtx>;
     using TContextPtr = TIntrusivePtr<NGrpc::IRequestContextBase>;
     using TMessage = NProtoBuf::Message;
+
     TRespHookCtx(TContextPtr ctx, TMessage* data, const TString& requestName, ui64 ru, ui32 status)
         : Ctx_(ctx)
         , RespData_(data)
@@ -337,6 +339,8 @@ struct TRequestAuxSettings {
 class IRequestProxyCtx : public virtual IRequestCtxBase {
 public:
     virtual ~IRequestProxyCtx() = default;
+
+    // auth
     virtual const TMaybe<TString> GetYdbToken() const  = 0;
     virtual void UpdateAuthState(NGrpc::TAuthState::EAuthState state) = 0;
     virtual void SetInternalToken(const TString& token) = 0;
@@ -344,8 +348,15 @@ public:
     virtual void ReplyUnauthenticated(const TString& msg = "") = 0;
     virtual void ReplyUnavaliable() = 0;
 
+    // validation
     virtual bool Validate(TString& error) = 0;
+
+    // counters
+    virtual void SetCounters(IGRpcProxyCounters::TPtr counters) = 0;
+    virtual IGRpcProxyCounters::TPtr GetCounters() const = 0;
     virtual void UseDatabase(const TString& database) = 0;
+
+    // rate limiting
 
     // This method allows to set hook for unary call.
     // The hook will be called at the reply time
@@ -365,6 +376,7 @@ public:
 // The interface is used for rpc_ request actors
 class IRequestCtx : public virtual IRequestCtxBase  {
     friend class TProtoResponseHelper;
+
 public:
     virtual void SetClientLostAction(std::function<void()>&& cb) = 0;
     virtual const google::protobuf::Message* GetRequest() const = 0;
@@ -396,7 +408,6 @@ public:
 };
 
 class IRequestNoOpCtx : public IRequestCtx {
-
 };
 
 struct TCommonResponseFillerImpl {
@@ -428,7 +439,8 @@ struct TCommonResponseFiller<TResp, false> : private TCommonResponseFillerImpl {
 
 class TRefreshTokenImpl
     : public IRequestProxyCtx
-    , public TEventLocal<TRefreshTokenImpl, TRpcServices::EvRefreshTokenRequest> {
+    , public TEventLocal<TRefreshTokenImpl, TRpcServices::EvRefreshTokenRequest>
+{
 public:
     TRefreshTokenImpl(const TString& token, const TString& database, TActorId from)
         : Token_(token)
@@ -469,7 +481,8 @@ public:
         return {};
     }
 
-    void  SetRlPath(TMaybe<NRpcService::TRlPath>&&) override {}
+    void SetRlPath(TMaybe<NRpcService::TRlPath>&&) override {
+    }
 
     TMaybe<NRpcService::TRlPath> GetRlPath() const override {
         return Nothing();
@@ -507,6 +520,13 @@ public:
 
     bool Validate(TString&) override {
         return true;
+    }
+
+    void SetCounters(IGRpcProxyCounters::TPtr) override {
+    }
+
+    IGRpcProxyCounters::TPtr GetCounters() const override {
+        return nullptr;
     }
 
     void UseDatabase(const TString& database) override {
@@ -561,22 +581,51 @@ private:
     NYql::TIssueManager IssueManager_;
 };
 
-inline TMaybe<TString> ToMaybe(const TVector<TStringBuf>& vec) {
-    if (vec.empty()) {
-        return {};
+namespace {
+
+    inline TMaybe<TString> ToMaybe(const TVector<TStringBuf>& vec) {
+        if (vec.empty()) {
+            return {};
+        }
+        return TString{vec[0]};
     }
-    return TString{vec[0]};
+
+    inline const TMaybe<TString> ExtractYdbToken(const TVector<TStringBuf>& authHeadValues) {
+        if (authHeadValues.empty()) {
+            return {};
+        }
+        return TString{authHeadValues[0]};
+    }
+
+    inline const TMaybe<TString> ExtractDatabaseName(const TVector<TStringBuf>& dbHeaderValues) {
+        if (dbHeaderValues.empty()) {
+            return {};
+        }
+        return CGIUnescapeRet(dbHeaderValues[0]);
+    }
+
+    inline TString MakeAuthError(const TString& in, NYql::TIssueManager& issues) {
+        TStringStream out;
+        out << "unauthenticated"
+            << (in ? ", " : "") << in
+            << (issues.GetIssues() ? ": " : "");
+        issues.GetIssues().PrintTo(out, true /* one line */);
+        return out.Str();
+    }
+
 }
 
-template<ui32 TRpcId, typename TReq, typename TResp, TRateLimiterMode RlMode = TRateLimiterMode::Off>
-class TGRpcRequestBiStreamWrapper :
-    public IRequestProxyCtx,
-    public TEventLocal<TGRpcRequestBiStreamWrapper<TRpcId, TReq, TResp, RlMode>, TRpcId> {
+template <ui32 TRpcId, typename TReq, typename TResp, TRateLimiterMode RlMode = TRateLimiterMode::Off>
+class TGRpcRequestBiStreamWrapper
+    : public IRequestProxyCtx
+    , public TEventLocal<TGRpcRequestBiStreamWrapper<TRpcId, TReq, TResp, RlMode>, TRpcId>
+{
 public:
     using TRequest = TReq;
     using TResponse = TResp;
     using IStreamCtx = NGRpcServer::IGRpcStreamingContext<TRequest, TResponse>;
     static constexpr TRateLimiterMode RateLimitMode = RlMode;
+
     TGRpcRequestBiStreamWrapper(TIntrusivePtr<IStreamCtx> ctx, bool rlAllowed = true)
         : Ctx_(ctx)
         , RlAllowed_(rlAllowed)
@@ -591,29 +640,15 @@ public:
     }
 
     const TMaybe<TString> GetYdbToken() const override {
-        const auto& res = Ctx_->GetPeerMetaValues(NYdb::YDB_AUTH_TICKET_HEADER);
-        if (res.empty()) {
-            return {};
-        }
-        return TString{res[0]};
+        return ExtractYdbToken(Ctx_->GetPeerMetaValues(NYdb::YDB_AUTH_TICKET_HEADER));
     }
 
     bool HasClientCapability(const TString& capability) const override {
-        const auto& values = Ctx_->GetPeerMetaValues(NYdb::YDB_CLIENT_CAPABILITIES);
-        for(auto& value: values) {
-            if (value == capability)
-                return true;
-        }
-
-        return false;
+        return FindPtr(Ctx_->GetPeerMetaValues(NYdb::YDB_CLIENT_CAPABILITIES), capability);
     }
 
     const TMaybe<TString> GetDatabaseName() const override {
-        const auto& res = Ctx_->GetPeerMetaValues(NYdb::YDB_DATABASE_HEADER);
-        if (res.empty()) {
-            return {};
-        }
-        return CGIUnescapeRet(res[0]);
+        return ExtractDatabaseName(Ctx_->GetPeerMetaValues(NYdb::YDB_DATABASE_HEADER));
     }
 
     void UpdateAuthState(NGrpc::TAuthState::EAuthState state) override {
@@ -630,12 +665,7 @@ public:
     }
 
     void ReplyUnauthenticated(const TString& in) override {
-        TStringBuilder builder;
-        builder << (in.empty() ? TString("unauthenticated") : TString("unauthenticated, ")) << in;
-        for (const auto& issue: IssueManager_.GetIssues()) {
-            builder << " " << issue.Message;
-        }
-        Ctx_->Finish(grpc::Status(grpc::StatusCode::UNAUTHENTICATED, builder));
+        Ctx_->Finish(grpc::Status(grpc::StatusCode::UNAUTHENTICATED, MakeAuthError(in, IssueManager_)));
     }
 
     void ReplyUnavaliable() override {
@@ -682,6 +712,14 @@ public:
 
     bool Validate(TString&) override {
         return true;
+    }
+
+    void SetCounters(IGRpcProxyCounters::TPtr counters) override {
+        Counters_ = counters;
+    }
+
+    IGRpcProxyCounters::TPtr GetCounters() const override {
+        return Counters_;
     }
 
     void UseDatabase(const TString& database) override {
@@ -746,6 +784,7 @@ private:
     NYql::TIssueManager IssueManager_;
     TMaybe<NRpcService::TRlPath> RlPath_;
     bool RlAllowed_;
+    IGRpcProxyCounters::TPtr Counters_;
 };
 
 template <typename TDerived>
@@ -807,7 +846,9 @@ public:
     }
 
 private:
-    TDerived* Derived() noexcept { return static_cast<TDerived*>(this); }
+    TDerived* Derived() noexcept {
+        return static_cast<TDerived*>(this);
+    }
 };
 
 class TEvProxyRuntimeEvent
@@ -824,7 +865,7 @@ public:
     }
 };
 
-template<ui32 TRpcId, typename TDerived>
+template <ui32 TRpcId, typename TDerived>
 class TEvProxyLegacyEvent
     : public IRequestProxyCtx
     , public TEventLocal<TDerived, TRpcId>
@@ -839,17 +880,18 @@ public:
     }
 };
 
-template<ui32 TRpcId, typename TReq, typename TResp, bool IsOperation, typename TDerived>
-class TGRpcRequestWrapperImpl :
-    public std::conditional_t<IsOperation,
+template <ui32 TRpcId, typename TReq, typename TResp, bool IsOperation, typename TDerived>
+class TGRpcRequestWrapperImpl
+    : public std::conditional_t<IsOperation,
         TGrpcResponseSenderImpl<TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation, TDerived>>,
-        IRequestNoOpCtx>,
-    public std::conditional_t<TRpcId == TRpcServices::EvGrpcRuntimeRequest,
+        IRequestNoOpCtx>
+    , public std::conditional_t<TRpcId == TRpcServices::EvGrpcRuntimeRequest,
         TEvProxyRuntimeEvent,
         TEvProxyLegacyEvent<TRpcId, TDerived>>
 {
     friend class TProtoResponseHelper;
     friend class TGrpcResponseSenderImpl<TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation, TDerived>>;
+
 public:
     using TRequest = TReq;
     using TResponse = TResp;
@@ -859,29 +901,15 @@ public:
     { }
 
     const TMaybe<TString> GetYdbToken() const override {
-        const auto& res = Ctx_->GetPeerMetaValues(NYdb::YDB_AUTH_TICKET_HEADER);
-        if (res.empty()) {
-            return {};
-        }
-        return TString{res[0]};
+        return ExtractYdbToken(Ctx_->GetPeerMetaValues(NYdb::YDB_AUTH_TICKET_HEADER));
     }
 
     bool HasClientCapability(const TString& capability) const override {
-        const auto& values = Ctx_->GetPeerMetaValues(NYdb::YDB_CLIENT_CAPABILITIES);
-        for(auto& value: values) {
-            if (capability == value)
-                return true;
-        }
-
-        return false;
+        return FindPtr(Ctx_->GetPeerMetaValues(NYdb::YDB_CLIENT_CAPABILITIES), capability);
     }
 
     const TMaybe<TString> GetDatabaseName() const override {
-        const auto& res = Ctx_->GetPeerMetaValues(NYdb::YDB_DATABASE_HEADER);
-        if (res.empty()) {
-            return {};
-        }
-        return CGIUnescapeRet(res[0]);
+        return ExtractDatabaseName(Ctx_->GetPeerMetaValues(NYdb::YDB_DATABASE_HEADER));
     }
 
     void UpdateAuthState(NGrpc::TAuthState::EAuthState state) override {
@@ -898,12 +926,7 @@ public:
     }
 
     void ReplyUnauthenticated(const TString& in) override {
-        TStringBuilder builder;
-        builder << in;
-        for (const auto& issue: IssueManager.GetIssues()) {
-            builder << " " << issue.Message;
-        }
-        Ctx_->ReplyUnauthenticated(builder);
+        Ctx_->ReplyUnauthenticated(MakeAuthError(in, IssueManager));
     }
 
     void SetInternalToken(const TString& token) override {
@@ -916,8 +939,7 @@ public:
 
     void SetRuHeader(ui64 ru) override {
         Ru = ru;
-        auto ruStr = Sprintf("%lu", ru);
-        Ctx_->AddTrailingMetadata(NYdb::YDB_CONSUMED_UNITS_HEADER, ruStr);
+        Ctx_->AddTrailingMetadata(NYdb::YDB_CONSUMED_UNITS_HEADER, IntToString<10>(ru));
     }
 
     const TString& GetInternalToken() const override {
@@ -941,6 +963,14 @@ public:
 
     bool Validate(TString&) override {
         return true;
+    }
+
+    void SetCounters(IGRpcProxyCounters::TPtr counters) override {
+        Counters = counters;
+    }
+
+    IGRpcProxyCounters::TPtr GetCounters() const override {
+        return Counters;
     }
 
     void UseDatabase(const TString& database) override {
@@ -967,7 +997,7 @@ public:
         return Ctx_->SslServer();
     }
 
-    template<typename T>
+    template <typename T>
     static const TRequest* GetProtoRequest(const T& req) {
         auto request = dynamic_cast<const TRequest*>(req->GetRequest());
         Y_VERIFY(request != nullptr, "Wrong using of TGRpcRequestWrapper");
@@ -1029,7 +1059,7 @@ public:
     //! The memory will be freed automaticaly after destroying
     //! corresponding request.
     //! Do not call delete for objects allocated here!
-    template<typename TResult, typename T>
+    template <typename TResult, typename T>
     static TResult* AllocateResult(T& ctx) {
         return google::protobuf::Arena::CreateMessage<TResult>(ctx->GetArena());
     }
@@ -1039,7 +1069,7 @@ public:
     }
 
     void SetClientLostAction(std::function<void()>&& cb) override {
-        auto shutdown = [cb{move(cb)}](const NGrpc::IRequestContextBase::TAsyncFinishResult& future) mutable {
+        auto shutdown = [cb = std::move(cb)](const NGrpc::IRequestContextBase::TAsyncFinishResult& future) mutable {
             Y_ASSERT(future.HasValue());
             if (future.GetValue() == NGrpc::IRequestContextBase::EFinishStatus::CANCEL) {
                 cb();
@@ -1093,11 +1123,11 @@ private:
         return Ctx_->Reply(resp, status);
     }
 
-private:
     TResponse* CreateResponseMessage() {
         return google::protobuf::Arena::CreateMessage<TResponse>(Ctx_->GetArena());
     }
 
+private:
     TIntrusivePtr<NGrpc::IRequestContextBase> Ctx_;
     TString InternalToken_;
     NYql::TIssueManager IssueManager;
@@ -1106,14 +1136,14 @@ private:
     ui64 Ru = 0;
     TRespHook RespHook;
     TMaybe<NRpcService::TRlPath> RlPath;
+    IGRpcProxyCounters::TPtr Counters;
 };
 
-template<ui32 TRpcId, typename TReq, typename TResp, bool IsOperation, typename TDerived>
-class TGRpcRequestValidationWrapperImpl :
-    public TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation, TDerived> {
-
+template <ui32 TRpcId, typename TReq, typename TResp, bool IsOperation, typename TDerived>
+class TGRpcRequestValidationWrapperImpl : public TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation, TDerived> {
 public:
     static IActor* CreateRpcActor(typename std::conditional<IsOperation, IRequestOpCtx, IRequestNoOpCtx>::type* msg);
+
     TGRpcRequestValidationWrapperImpl(NGrpc::IRequestContextBase* ctx)
         : TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation, TDerived>(ctx)
     { }
@@ -1125,14 +1155,15 @@ public:
 
 // SFINAE
 // Check protobuf has validate feature
-template<typename TProto>
+template <typename TProto>
 struct TProtoHasValidate {
 private:
     static int Detect(...);
     // validate function has prototype: bool validate(TProtoStringType&) const
     static TProtoStringType Dummy_;
-    template<typename U>
+    template <typename U>
     static decltype(std::declval<U>().validate(Dummy_)) Detect(const U&);
+
 public:
     static constexpr bool Value = std::is_same<bool, decltype(Detect(std::declval<TProto>()))>::value;
 };
@@ -1142,32 +1173,27 @@ class IFacilityProvider;
 template <typename TReq, typename TResp, bool IsOperation>
 class TGrpcRequestCall
     : public std::conditional_t<TProtoHasValidate<TReq>::Value,
-            TGRpcRequestValidationWrapperImpl<
-                TRpcServices::EvGrpcRuntimeRequest, TReq, TResp, IsOperation, TGrpcRequestCall<TReq, TResp, IsOperation>>,
-            TGRpcRequestWrapperImpl<
-                TRpcServices::EvGrpcRuntimeRequest, TReq, TResp, IsOperation, TGrpcRequestCall<TReq, TResp, IsOperation>>>
-    {
-    typedef typename std::conditional<IsOperation, IRequestOpCtx, IRequestNoOpCtx>::type TRequestIface;
+        TGRpcRequestValidationWrapperImpl<
+            TRpcServices::EvGrpcRuntimeRequest, TReq, TResp, IsOperation, TGrpcRequestCall<TReq, TResp, IsOperation>>,
+        TGRpcRequestWrapperImpl<
+            TRpcServices::EvGrpcRuntimeRequest, TReq, TResp, IsOperation, TGrpcRequestCall<TReq, TResp, IsOperation>>>
+{
+    using TRequestIface = typename std::conditional<IsOperation, IRequestOpCtx, IRequestNoOpCtx>::type;
+
 public:
-    static constexpr bool IsOp = IsOperation;
     static IActor* CreateRpcActor(typename std::conditional<IsOperation, IRequestOpCtx, IRequestNoOpCtx>::type* msg);
+    static constexpr bool IsOp = IsOperation;
+
     using TBase = std::conditional_t<TProtoHasValidate<TReq>::Value,
-            TGRpcRequestValidationWrapperImpl<
-                TRpcServices::EvGrpcRuntimeRequest, TReq, TResp, IsOperation, TGrpcRequestCall<TReq, TResp, IsOperation>>,
-            TGRpcRequestWrapperImpl<
-                TRpcServices::EvGrpcRuntimeRequest, TReq, TResp, IsOperation, TGrpcRequestCall<TReq, TResp, IsOperation>>>;
+        TGRpcRequestValidationWrapperImpl<
+            TRpcServices::EvGrpcRuntimeRequest, TReq, TResp, IsOperation, TGrpcRequestCall<TReq, TResp, IsOperation>>,
+        TGRpcRequestWrapperImpl<
+            TRpcServices::EvGrpcRuntimeRequest, TReq, TResp, IsOperation, TGrpcRequestCall<TReq, TResp, IsOperation>>>;
 
-    TGrpcRequestCall(NGrpc::IRequestContextBase* ctx,
-        void (*cb)(std::unique_ptr<TRequestIface>, const IFacilityProvider&), TRequestAuxSettings auxSettings = {})
+    template <typename TCallback>
+    TGrpcRequestCall(NGrpc::IRequestContextBase* ctx, TCallback&& cb, TRequestAuxSettings auxSettings = {})
         : TBase(ctx)
-        , PassMethod(cb)
-        , AuxSettings(std::move(auxSettings))
-    { }
-
-    TGrpcRequestCall(NGrpc::IRequestContextBase* ctx,
-        std::function<void(std::unique_ptr<TRequestIface>, const IFacilityProvider&)> cb, TRequestAuxSettings auxSettings = {})
-        : TBase(ctx)
-        , PassMethod(cb)
+        , PassMethod(std::forward<TCallback>(cb))
         , AuxSettings(std::move(auxSettings))
     { }
 
@@ -1189,6 +1215,7 @@ public:
             return true;
         }
     }
+
 private:
     std::function<void(std::unique_ptr<TRequestIface>, const IFacilityProvider&)> PassMethod;
     const TRequestAuxSettings AuxSettings;
@@ -1200,10 +1227,11 @@ using TGrpcRequestOperationCall = TGrpcRequestCall<TReq, TResp, true>;
 template <typename TReq, typename TResp>
 using TGrpcRequestNoOperationCall = TGrpcRequestCall<TReq, TResp, false>;
 
-template<ui32 TRpcId, typename TReq, typename TResp, bool IsOperation, TRateLimiterMode RlMode = TRateLimiterMode::Off>
-class TGRpcRequestWrapper :
-    public TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation,
-        TGRpcRequestWrapper<TRpcId, TReq, TResp, IsOperation, RlMode>> {
+template <ui32 TRpcId, typename TReq, typename TResp, bool IsOperation, TRateLimiterMode RlMode = TRateLimiterMode::Off>
+class TGRpcRequestWrapper
+    : public TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation,
+        TGRpcRequestWrapper<TRpcId, TReq, TResp, IsOperation, RlMode>>
+{
 public:
     static IActor* CreateRpcActor(typename std::conditional<IsOperation, IRequestOpCtx, IRequestNoOpCtx>::type* msg);
     static constexpr bool IsOp = IsOperation;
@@ -1211,7 +1239,7 @@ public:
 
     TGRpcRequestWrapper(NGrpc::IRequestContextBase* ctx)
         : TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation,
-              TGRpcRequestWrapper<TRpcId, TReq, TResp, IsOperation, RlMode>>(ctx)
+            TGRpcRequestWrapper<TRpcId, TReq, TResp, IsOperation, RlMode>>(ctx)
     { }
 
     TRateLimiterMode GetRlMode() const override {
@@ -1223,16 +1251,19 @@ public:
     }
 };
 
-template<ui32 TRpcId, typename TReq, typename TResp, bool IsOperation = true, TRateLimiterMode RlMode = TRateLimiterMode::Off>
-class TGRpcRequestWrapperNoAuth :
-    public TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation, TGRpcRequestWrapperNoAuth<TRpcId, TReq, TResp, IsOperation, RlMode>> {
+template <ui32 TRpcId, typename TReq, typename TResp, bool IsOperation = true, TRateLimiterMode RlMode = TRateLimiterMode::Off>
+class TGRpcRequestWrapperNoAuth
+    : public TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation,
+        TGRpcRequestWrapperNoAuth<TRpcId, TReq, TResp, IsOperation, RlMode>>
+{
 public:
     static IActor* CreateRpcActor(typename std::conditional<IsOperation, IRequestOpCtx, IRequestNoOpCtx>::type* msg);
     static constexpr bool IsOp = IsOperation;
     static constexpr TRateLimiterMode RateLimitMode = RlMode;
 
     TGRpcRequestWrapperNoAuth(NGrpc::IRequestContextBase* ctx)
-        : TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation, TGRpcRequestWrapperNoAuth<TRpcId, TReq, TResp, IsOperation, RlMode>>(ctx)
+        : TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation,
+            TGRpcRequestWrapperNoAuth<TRpcId, TReq, TResp, IsOperation, RlMode>>(ctx)
     { }
 
     TRateLimiterMode GetRlMode() const override {
@@ -1249,16 +1280,19 @@ public:
     }
 };
 
-template<ui32 TRpcId, typename TReq, typename TResp, bool IsOperation, TRateLimiterMode RlMode = TRateLimiterMode::Off>
-class TGRpcRequestValidationWrapper :
-    public TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation, TGRpcRequestValidationWrapper<TRpcId, TReq, TResp, IsOperation, RlMode>> {
-
+template <ui32 TRpcId, typename TReq, typename TResp, bool IsOperation, TRateLimiterMode RlMode = TRateLimiterMode::Off>
+class TGRpcRequestValidationWrapper
+    : public TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation,
+        TGRpcRequestValidationWrapper<TRpcId, TReq, TResp, IsOperation, RlMode>>
+{
 public:
     static IActor* CreateRpcActor(typename std::conditional<IsOperation, IRequestOpCtx, IRequestNoOpCtx>::type* msg);
     static constexpr bool IsOp = IsOperation;
     static constexpr TRateLimiterMode RateLimitMode = RlMode;
+
     TGRpcRequestValidationWrapper(NGrpc::IRequestContextBase* ctx, bool rlAllowed = true)
-        : TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation, TGRpcRequestValidationWrapper<TRpcId, TReq, TResp, IsOperation, RlMode>>(ctx)
+        : TGRpcRequestWrapperImpl<TRpcId, TReq, TResp, IsOperation,
+            TGRpcRequestValidationWrapper<TRpcId, TReq, TResp, IsOperation, RlMode>>(ctx)
         , RlAllowed(rlAllowed)
     { }
 
@@ -1273,6 +1307,7 @@ public:
     bool Validate(TString& error) override {
         return this->GetProtoRequest()->validate(error);
     }
+
 private:
     bool RlAllowed;
 };

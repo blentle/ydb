@@ -17,7 +17,7 @@ class TJsonLabeledCounters : public TActorBootstrapped<TJsonLabeledCounters> {
     using TBase = TActorBootstrapped<TJsonLabeledCounters>;
     IViewer* Viewer;
     NMon::TEvHttpInfo::TPtr Event;
-    NKikimrTabletCountersAggregator::TEvTabletLabeledCountersResponse LabeledCountersResult;
+    NKikimrLabeledCounters::TEvTabletLabeledCountersResponse LabeledCountersResult;
     TJsonSettings JsonSettings;
     TString Groups;
     TString GroupNames;
@@ -33,9 +33,9 @@ public:
         return NKikimrServices::TActivity::VIEWER_HANDLER;
     }
 
-    TJsonLabeledCounters(IViewer* viewer, const TRequest& request)
+    TJsonLabeledCounters(IViewer* viewer, NMon::TEvHttpInfo::TPtr &ev)
         : Viewer(viewer)
-        , Event(request.Event)
+        , Event(ev)
     {}
 
     void Bootstrap(const TActorContext& ctx) {
@@ -105,7 +105,7 @@ public:
                 }
             }
         } else if (Version >= 2) {
-            const NKikimrTabletCountersAggregator::TEvTabletLabeledCountersResponse& source(ev->Get()->Record);
+            const NKikimrLabeledCounters::TEvTabletLabeledCountersResponse& source(ev->Get()->Record);
             TVector<TMaybe<ui32>> counterNamesMapping;
             counterNamesMapping.reserve(source.CounterNamesSize());
             for (const TString& counterName : source.GetCounterNames()) {

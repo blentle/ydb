@@ -10,6 +10,8 @@ namespace {
 
 template<typename TLeft, typename TRight, typename TOutput>
 struct TMul : public TSimpleArithmeticBinary<TLeft, TRight, TOutput, TMul<TLeft, TRight, TOutput>> {
+    static constexpr bool DefaultNulls = true;
+
     static TOutput Do(TOutput left, TOutput right)
     {
         return left * right;
@@ -93,6 +95,10 @@ void RegisterMul(IBuiltinFunctionRegistry& registry) {
         NUdf::TDataType<NUdf::TInterval>, TNumMulInterval, TBinaryArgsOptWithNullableResult>(registry, "Mul");
     RegisterFunctionBinOpt<NUdf::TDataType<NUdf::TInterval>, NUdf::TDataType<i64>,
         NUdf::TDataType<NUdf::TInterval>, TNumMulInterval, TBinaryArgsOptWithNullableResult>(registry, "Mul");
+}
+
+void RegisterMul(arrow::compute::FunctionRegistry& registry) {
+    AddFunction(registry, std::make_shared<TBinaryNumericFunction<TMul>>("Mul"));
 }
 
 } // namespace NMiniKQL

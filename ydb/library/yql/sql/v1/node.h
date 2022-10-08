@@ -754,7 +754,7 @@ namespace NSQLTranslationV1 {
 
         virtual bool InitAggr(TContext& ctx, bool isFactory, ISource* src, TAstListNode& node, const TVector<TNodePtr>& exprs) = 0;
 
-        virtual TNodePtr AggregationTraits(const TNodePtr& type) const;
+        virtual TNodePtr AggregationTraits(const TNodePtr& type, bool overState) const;
 
         virtual TNodePtr AggregationTraitsFactory() const = 0;
 
@@ -777,6 +777,8 @@ namespace NSQLTranslationV1 {
     protected:
         IAggregation(TPosition pos, const TString& name, const TString& func, EAggregateMode mode);
         TAstNode* Translate(TContext& ctx) const override;
+        TNodePtr WrapIfOverState(const TNodePtr& input, bool overState) const;
+        virtual TNodePtr GetExtractor() const = 0;
 
         TString Name;
         TString Func;
@@ -826,6 +828,7 @@ namespace NSQLTranslationV1 {
         virtual bool AddFilter(TContext& ctx, TNodePtr filter);
         virtual bool AddGroupKey(TContext& ctx, const TString& column);
         virtual void SetCompactGroupBy(bool compactGroupBy);
+        virtual void SetGroupBySuffix(const TString& suffix);
         virtual TString MakeLocalName(const TString& name);
         virtual bool AddAggregation(TContext& ctx, TAggregationPtr aggr);
         virtual bool AddFuncOverWindow(TContext& ctx, TNodePtr expr);
@@ -905,6 +908,7 @@ namespace NSQLTranslationV1 {
         THashMap<TString, TString> GroupByColumnAliases;
         TVector<TNodePtr> Filters;
         bool CompactGroupBy = false;
+        TString GroupBySuffix;
         TSet<TString> GroupKeys;
         TVector<TString> OrderedGroupKeys;
         std::array<TVector<TNodePtr>, static_cast<unsigned>(EExprSeat::Max)> NamedExprs;
@@ -1287,6 +1291,7 @@ namespace NSQLTranslationV1 {
         const TVector<TNodePtr>& groupByExpr,
         const TVector<TNodePtr>& groupBy,
         bool compactGroupBy,
+        const TString& groupBySuffix,
         bool assumeSorted,
         const TVector<TSortSpecificationPtr>& orderBy,
         TNodePtr having,

@@ -35,8 +35,7 @@ Y_UNIT_TEST_SUITE(AsyncIndexChangeExchange) {
         serverSettings
             .SetDomainName(domainName)
             .SetUseRealThreads(false)
-            .SetEnableDataColumnForIndexTable(true)
-            .SetEnableAsyncIndexes(true);
+            .SetEnableDataColumnForIndexTable(true);
 
         TServer::TPtr server = new TServer(serverSettings);
         auto& runtime = *server->GetRuntime();
@@ -124,8 +123,7 @@ Y_UNIT_TEST_SUITE(AsyncIndexChangeExchange) {
         serverSettings
             .SetDomainName(domainName)
             .SetUseRealThreads(false)
-            .SetEnableDataColumnForIndexTable(true)
-            .SetEnableAsyncIndexes(true);
+            .SetEnableDataColumnForIndexTable(true);
 
         TServer::TPtr server = new TServer(serverSettings);
         auto& runtime = *server->GetRuntime();
@@ -195,8 +193,7 @@ Y_UNIT_TEST_SUITE(AsyncIndexChangeExchange) {
         serverSettings
             .SetDomainName(domainName)
             .SetUseRealThreads(false)
-            .SetEnableDataColumnForIndexTable(true)
-            .SetEnableAsyncIndexes(true);
+            .SetEnableDataColumnForIndexTable(true);
 
         TServer::TPtr server = new TServer(serverSettings);
         auto& runtime = *server->GetRuntime();
@@ -275,8 +272,7 @@ Y_UNIT_TEST_SUITE(AsyncIndexChangeExchange) {
         serverSettings
             .SetDomainName("Root")
             .SetUseRealThreads(false)
-            .SetEnableDataColumnForIndexTable(true)
-            .SetEnableAsyncIndexes(true);
+            .SetEnableDataColumnForIndexTable(true);
 
         TServer::TPtr server = new TServer(serverSettings);
         auto& runtime = *server->GetRuntime();
@@ -352,8 +348,7 @@ Y_UNIT_TEST_SUITE(AsyncIndexChangeExchange) {
         serverSettings
             .SetDomainName("Root")
             .SetUseRealThreads(false)
-            .SetEnableDataColumnForIndexTable(true)
-            .SetEnableAsyncIndexes(true);
+            .SetEnableDataColumnForIndexTable(true);
 
         TServer::TPtr server = new TServer(serverSettings);
         auto& runtime = *server->GetRuntime();
@@ -460,8 +455,7 @@ Y_UNIT_TEST_SUITE(AsyncIndexChangeExchange) {
         serverSettings
             .SetDomainName("Root")
             .SetUseRealThreads(false)
-            .SetEnableDataColumnForIndexTable(true)
-            .SetEnableAsyncIndexes(true);
+            .SetEnableDataColumnForIndexTable(true);
 
         TServer::TPtr server = new TServer(serverSettings);
         auto& runtime = *server->GetRuntime();
@@ -617,8 +611,7 @@ Y_UNIT_TEST_SUITE(AsyncIndexChangeExchange) {
         serverSettings
             .SetDomainName("Root")
             .SetUseRealThreads(false)
-            .SetEnableDataColumnForIndexTable(true)
-            .SetEnableAsyncIndexes(true);
+            .SetEnableDataColumnForIndexTable(true);
         setLimit(serverSettings);
 
         TServer::TPtr server = new TServer(serverSettings);
@@ -1528,6 +1521,108 @@ Y_UNIT_TEST_SUITE(Cdc) {
         }, {
             R"(UPSERT INTO `/Root/Table` (key, value) VALUES (2, 20);)",
         }, {
+            R"({"update":{"value":10},"key":[1]})",
+        });
+    }
+
+    Y_UNIT_TEST(RacyRebootAndSplitWithTxInflight) {
+        TTestPqEnv env(SimpleTable(), Updates(NKikimrSchemeOp::ECdcStreamFormatJson), false);
+        auto& runtime = *env.GetServer()->GetRuntime();
+
+        CreateShardedTable(env.GetServer(), env.GetEdgeActor(), "/Root", "TableAux", SimpleTable());
+        ExecSQL(env.GetServer(), env.GetEdgeActor(), R"(
+            UPSERT INTO `/Root/TableAux` (key, value)
+            VALUES (1, 10);
+        )"); 
+
+        SetSplitMergePartCountLimit(&runtime, -1);
+        const auto tabletIds = GetTableShards(env.GetServer(), env.GetEdgeActor(), "/Root/Table");
+        UNIT_ASSERT_VALUES_EQUAL(tabletIds.size(), 1);
+
+        ui32 readSets = 0;
+        auto prevObserver = runtime.SetObserverFunc([&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) {
+            switch (ev->GetTypeRewrite()) {
+            case TEvTxProcessing::EvReadSet:
+                ++readSets;
+                return TTestActorRuntime::EEventAction::DROP;
+            default:
+                return TTestActorRuntime::EEventAction::PROCESS;
+            }
+        });
+
+        SendSQL(env.GetServer(), env.GetEdgeActor(), R"(
+            UPSERT INTO `/Root/Table` (key, value)
+            SELECT key, value FROM `/Root/TableAux` WHERE key = 1;
+        )");
+        if (readSets < 1) {
+            TDispatchOptions opts;
+            opts.FinalEvents.emplace_back([&readSets](IEventHandle&) {
+                return readSets >= 1;
+            });
+            runtime.DispatchEvents(opts);
+        }
+
+        const auto splitTxId = AsyncSplitTable(env.GetServer(), env.GetEdgeActor(), "/Root/Table", tabletIds.at(0), 2);
+        SimulateSleep(env.GetServer(), TDuration::Seconds(1));
+
+        THolder<IEventHandle> getOwnership;
+        bool txCompleted = false;
+        bool splitStarted = false;
+        bool splitAcked = false;
+
+        runtime.SetObserverFunc([&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) {
+            switch (ev->GetTypeRewrite()) {
+            case TEvPersQueue::EvRequest:
+                if (auto* msg = ev->Get<TEvPersQueue::TEvRequest>()) {
+                    if (msg->Record.GetPartitionRequest().HasCmdGetOwnership()) {
+                        getOwnership.Reset(ev.Release());
+                        return TTestActorRuntime::EEventAction::DROP;
+                    } else if (msg->Record.GetPartitionRequest().HasCmdSplitMessageGroup()) {
+                        splitStarted = true;
+                    }
+                }
+                return TTestActorRuntime::EEventAction::PROCESS;
+
+            case TEvDataShard::EvProposeTransactionResult:
+                if (auto* msg = ev->Get<TEvDataShard::TEvProposeTransactionResult>()) {
+                    if (msg->GetStatus() == NKikimrTxDataShard::TEvProposeTransactionResult::COMPLETE) {
+                        txCompleted = true;
+                    }
+                }
+                return TTestActorRuntime::EEventAction::PROCESS;
+
+            case TEvChangeExchange::EvSplitAck:
+                splitAcked = true;
+                return TTestActorRuntime::EEventAction::PROCESS;
+
+            default:
+                return TTestActorRuntime::EEventAction::PROCESS;
+            }
+        });
+
+        RebootTablet(runtime, tabletIds.at(0), env.GetEdgeActor());
+
+        if (!txCompleted) {
+            TDispatchOptions opts;
+            opts.FinalEvents.emplace_back([&txCompleted](IEventHandle&) {
+                return txCompleted;
+            });
+            runtime.DispatchEvents(opts);
+        }
+
+        if (splitStarted && !splitAcked) {
+            TDispatchOptions opts;
+            opts.FinalEvents.emplace_back([&splitAcked](IEventHandle&) {
+                return splitAcked;
+            });
+            runtime.DispatchEvents(opts);
+        }
+
+        runtime.SetObserverFunc(prevObserver);
+        runtime.Send(getOwnership.Release(), 0, true);
+
+        WaitTxNotification(env.GetServer(), env.GetEdgeActor(), splitTxId);
+        WaitForContent(env.GetServer(), env.GetEdgeActor(), "/Root/Table/Stream", {
             R"({"update":{"value":10},"key":[1]})",
         });
     }

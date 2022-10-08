@@ -23,6 +23,7 @@ target_link_libraries(core-kqp-common PUBLIC
   yql-core-issue
   yql-dq-actors
   yql-dq-common
+  parser-pg_wrapper-interface
   library-cpp-lwtrace
   tools-enum_parser-enum_serialization_runtime
 )
@@ -35,6 +36,7 @@ target_sources(core-kqp-common PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/kqp/common/kqp_timeouts.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/kqp/common/kqp_lwtrace_probes.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/kqp/common/kqp_topic.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/kqp/common/kqp_types.cpp
 )
 generate_enum_serilization(core-kqp-common
   ${CMAKE_SOURCE_DIR}/ydb/core/kqp/common/kqp_tx_info.h

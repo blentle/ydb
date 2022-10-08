@@ -1,5 +1,6 @@
 #include "columnshard_impl.h"
 #include "columnshard_schema.h"
+#include <ydb/core/scheme/scheme_types_proto.h>
 #include <ydb/core/tx/columnshard/engines/column_engine_logs.h>
 #include <ydb/core/tablet/tablet_counters_protobuf.h>
 
@@ -21,7 +22,88 @@ NTabletPipe::TClientConfig GetPipeClientConfig() {
     return config;
 }
 
+bool ValidateTableSchema(const NKikimrSchemeOp::TColumnTableSchema& schema) {
+    namespace NTypeIds = NScheme::NTypeIds;
+
+    static const THashSet<NScheme::TTypeId> supportedTypes = {
+        NTypeIds::Timestamp,
+        NTypeIds::Int8,
+        NTypeIds::Int16,
+        NTypeIds::Int32,
+        NTypeIds::Int64,
+        NTypeIds::Uint8,
+        NTypeIds::Uint16,
+        NTypeIds::Uint32,
+        NTypeIds::Uint64,
+        NTypeIds::Date,
+        NTypeIds::Datetime,
+        //NTypeIds::Interval,
+        //NTypeIds::Float,
+        //NTypeIds::Double,
+        NTypeIds::String,
+        NTypeIds::Utf8
+    };
+
+    if (!schema.HasEngine() ||
+        schema.GetEngine() != NKikimrSchemeOp::EColumnTableEngine::COLUMN_ENGINE_REPLACING_TIMESERIES) {
+        return false;
+    }
+
+    if (!schema.KeyColumnNamesSize()) {
+        return false;
+    }
+
+    TString firstKeyColumn = schema.GetKeyColumnNames()[0];
+    THashSet<TString> keyColumns(schema.GetKeyColumnNames().begin(), schema.GetKeyColumnNames().end());
+
+    for (const NKikimrSchemeOp::TOlapColumnDescription& column : schema.GetColumns()) {
+        TString name = column.GetName();
+        keyColumns.erase(name);
+
+        if (name == firstKeyColumn && !supportedTypes.count(column.GetTypeId())) {
+            return false;
+        }
+    }
+
+    if (!keyColumns.empty()) {
+        return false;
+    }
+    return true;
 }
+
+bool ValidateTablePreset(const NKikimrSchemeOp::TColumnTableSchemaPreset& preset) {
+    if (preset.HasName() && preset.GetName() != "default") {
+        return false;
+    }
+    return ValidateTableSchema(preset.GetSchema());
+}
+
+}
+
+bool TColumnShard::TAlterMeta::Validate() const {
+    switch (Body.TxBody_case()) {
+        case NKikimrTxColumnShard::TSchemaTxBody::kInitShard:
+            break;
+        case NKikimrTxColumnShard::TSchemaTxBody::kEnsureTables:
+            for (auto& table : Body.GetEnsureTables().GetTables()) {
+                if (table.HasSchemaPreset() && !ValidateTablePreset(table.GetSchemaPreset())) {
+                    return false;
+                }
+                if (table.HasSchema() && !ValidateTableSchema(table.GetSchema())) {
+                    return false;
+                }
+                // TODO: validate TtlSettings
+            }
+            break;
+        case NKikimrTxColumnShard::TSchemaTxBody::kAlterTable:
+        case NKikimrTxColumnShard::TSchemaTxBody::kDropTable:
+        case NKikimrTxColumnShard::TSchemaTxBody::kAlterStore:
+        case NKikimrTxColumnShard::TSchemaTxBody::TXBODY_NOT_SET:
+            break;
+    }
+    return true;
+}
+
 
 TColumnShard::TColumnShard(TTabletStorageInfo* info, const TActorId& tablet)
     : TActor(&TThis::StateInit)
@@ -809,8 +891,9 @@ NOlap::TIndexInfo TColumnShard::ConvertSchema(const NKikimrSchemeOp::TColumnTabl
     for (const auto& col : schema.GetColumns()) {
         const ui32 id = col.GetId();
         const TString& name = col.GetName();
-
-        indexInfo.Columns[id] = NTable::TColumn(name, id, col.GetTypeId());
+        auto typeInfo = NScheme::TypeInfoFromProtoColumnType(col.GetTypeId(),
+            col.HasTypeInfo() ? &col.GetTypeInfo() : nullptr);
+        indexInfo.Columns[id] = NTable::TColumn(name, id, typeInfo);
         indexInfo.ColumnNames[name] = id;
     }
 

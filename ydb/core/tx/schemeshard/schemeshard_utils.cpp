@@ -289,7 +289,9 @@ NKikimrSchemeOp::TTableDescription CalcImplTableDesc(
             auto item = result.AddColumns();
             item->SetName(column.Name);
 
-            item->SetType(appData->TypeRegistry->GetTypeName(column.PType));
+            // TODO: support pg types
+            Y_VERIFY(column.PType.GetTypeId() != NScheme::NTypeIds::Pg);
+            item->SetType(appData->TypeRegistry->GetTypeName(column.PType.GetTypeId()));
 
             ui32 order = Max<ui32>();
             if (implKeyToImplColumn.contains(column.Name)) {
@@ -473,7 +475,7 @@ NKikimrSchemeOp::TPartitionConfig PartitionConfigForIndexes(
     return PartitionConfigForIndexes(baseTableDesrc.GetPartitionConfig(), indexTableDesc);
 }
 
-bool ExtractTypes(const NKikimrSchemeOp::TTableDescription& baseTableDesrc, TColumnTypes& columsTypes, TString& explain) {
+bool ExtractTypes(const NKikimrSchemeOp::TTableDescription& baseTableDesrc, TColumnTypes& columnTypes, TString& explain) {
     const NScheme::TTypeRegistry* typeRegistry = AppData()->TypeRegistry;
     Y_VERIFY(typeRegistry);
 
@@ -482,28 +484,32 @@ bool ExtractTypes(const NKikimrSchemeOp::TTableDescription& baseTableDesrc, TCol
         auto typeName = NMiniKQL::AdaptLegacyYqlType(column.GetType());
         const NScheme::IType* type = typeRegistry->GetType(typeName);
         if (!type) {
-            explain += TStringBuilder() << "Type '" << column.GetType() << "' specified for column '" << columnName << "' is not supported by storage";
-            return false;
+            auto* typeDesc = NPg::TypeDescFromPgTypeName(typeName);
+            if (!typeDesc) {
+                explain += TStringBuilder() << "Type '" << column.GetType() << "' specified for column '" << columnName << "' is not supported by storage";
+                return false;
+            }
+            columnTypes[columnName] = NScheme::TTypeInfo(NScheme::NTypeIds::Pg, typeDesc);
+        } else {
+            columnTypes[columnName] = NScheme::TTypeInfo(type->GetTypeId());
         }
-        auto typeId = type->GetTypeId();
-        columsTypes[columnName] = typeId;
     }
 
     return true;
 }
 
-TColumnTypes ExtractTypes(const NSchemeShard::TTableInfo::TPtr& baseTableInfo) {
-    TColumnTypes columsTypes;
-    for (auto& column: baseTableInfo->Columns) {
-        auto& columnName = column.second.Name;
-        columsTypes[columnName] = column.second.PType;
+bool ExtractTypes(const NSchemeShard::TTableInfo::TPtr& baseTableInfo, TColumnTypes& columsTypes, TString& explain) {
+    Y_UNUSED(explain);
+
+    for (const auto& [_, column] : baseTableInfo->Columns) {
+        columsTypes[column.Name] = column.PType;
     }
 
-    return columsTypes;
+    return true;
 }
 
 bool IsCompatibleKeyTypes(
-    const TColumnTypes& baseTableColumsTypes,
+    const TColumnTypes& baseTableColumnTypes,
     const TTableColumns& implTableColumns,
     bool uniformTable,
     TString& explain)
@@ -511,41 +517,49 @@ bool IsCompatibleKeyTypes(
     const NScheme::TTypeRegistry* typeRegistry = AppData()->TypeRegistry;
     Y_VERIFY(typeRegistry);
 
-    for (const auto& item: baseTableColumsTypes) {
+    for (const auto& item: baseTableColumnTypes) {
         auto& columnName = item.first;
-        auto& typeId = item.second;
+        auto typeId = item.second.GetTypeId();
 
-        auto typeSP = typeRegistry->GetType(typeId);
-        if (!typeSP) {
-            explain += TStringBuilder() << "unknown typeId '" << typeId << "' for column '" << columnName << "'";
-            return false;
-        }
+        if (typeId == NScheme::NTypeIds::Pg) {
+            if (!item.second.GetTypeDesc()) {
+                explain += TStringBuilder() << "unknown pg type for column '" << columnName << "'";
+                return false;
+            }
 
-        if (!NScheme::NTypeIds::IsYqlType(typeId)) {
-            explain += TStringBuilder() << "Type '" << typeId << "' specified for column '" << columnName << "' is no longer supported";
-            return false;
+        } else {
+            auto typeSP = typeRegistry->GetType(typeId);
+            if (!typeSP) {
+                explain += TStringBuilder() << "unknown typeId '" << typeId << "' for column '" << columnName << "'";
+                return false;
+            }
+
+            if (!NScheme::NTypeIds::IsYqlType(typeId)) {
+                explain += TStringBuilder() << "Type '" << typeId << "' specified for column '" << columnName << "' is no longer supported";
+                return false;
+            }
         }
     }
 
 
     for (auto& keyName: implTableColumns.Keys) {
-        Y_VERIFY(baseTableColumsTypes.contains(keyName));
-        auto typeId = baseTableColumsTypes.at(keyName);
+        Y_VERIFY(baseTableColumnTypes.contains(keyName));
+        auto typeInfo = baseTableColumnTypes.at(keyName);
 
         if (uniformTable) {
-            switch (typeId) {
+            switch (typeInfo.GetTypeId()) {
             case NScheme::NTypeIds::Uint32:
             case NScheme::NTypeIds::Uint64:
                 break;
             default:
                 explain += TStringBuilder() << "Column '" << keyName << "' has wrong key type "
-                                            << NScheme::GetTypeName(typeId) << " for being key of table with uniform partitioning";
+                                            << NScheme::TypeName(typeInfo) << " for being key of table with uniform partitioning";
                 return false;
             }
         }
 
-        if (!NSchemeShard::IsAllowedKeyType(typeId)) {
-            explain += TStringBuilder() << "Column '" << keyName << "' has wrong key type " << NScheme::GetTypeName(typeId) << " for being key";
+        if (!NSchemeShard::IsAllowedKeyType(typeInfo)) {
+            explain += TStringBuilder() << "Column '" << keyName << "' has wrong key type " << NScheme::TypeName(typeInfo) << " for being key";
             return false;
         }
     }

@@ -20,7 +20,7 @@ constexpr ui64 MinRowsPerCheck = 1000;
 class TCellBlockBuilder : public IBlockBuilder {
 public:
     bool Start(
-        const TVector<std::pair<TString,  NScheme::TTypeId>>& columns,
+        const TVector<std::pair<TString, NScheme::TTypeInfo>>& columns,
         ui64 maxRowsInBlock,
         ui64 maxBytesInBlock,
         TString& err) override
@@ -49,7 +49,7 @@ public:
     TVector<TOwnedCellVec> FlushBatch() { return std::move(Rows); }
 
 private:
-    TVector<std::pair<TString,  NScheme::TTypeId>> Columns;
+    TVector<std::pair<TString, NScheme::TTypeInfo>> Columns;
 
     TVector<TOwnedCellVec> Rows;
     ui64 BytesCount = 0;
@@ -61,10 +61,10 @@ private:
 
 struct TShortColumnInfo {
     NTable::TTag Tag;
-    NScheme::TTypeId Type;
+    NScheme::TTypeInfo Type;
     TString Name;
 
-    TShortColumnInfo(NTable::TTag tag, NScheme::TTypeId type, const TString& name)
+    TShortColumnInfo(NTable::TTag tag, NScheme::TTypeInfo type, const TString& name)
         : Tag(tag)
         , Type(type)
         , Name(name)
@@ -72,7 +72,8 @@ struct TShortColumnInfo {
 
     TString Dump() const {
         TStringStream ss;
-        ss << "{Tag: " << Tag << ", Type: " << Type << ", Name: " << Name << "}";
+        // TODO: support pg types
+        ss << "{Tag: " << Tag << ", Type: " << Type.GetTypeId() << ", Name: " << Name << "}";
         return ss.Str();
     }
 };
@@ -98,13 +99,13 @@ struct TShortTableInfo {
         KeyColumnCount = schema.Keys->Types.size();
         KeyColumnTypes.reserve(KeyColumnCount);
         for (auto type: schema.Keys->Types) {
-            KeyColumnTypes.push_back(type.GetTypeId());
+            KeyColumnTypes.push_back(type.ToTypeInfo());
         }
 
         // note that we don't have column names here, but
         // for cellvec we will not need them at all
         for (const auto& col: schema.Cols) {
-            Columns.emplace(col.Tag, TShortColumnInfo(col.Tag, col.TypeId, ""));
+            Columns.emplace(col.Tag, TShortColumnInfo(col.Tag, col.TypeInfo, ""));
         }
     }
 
@@ -123,15 +124,15 @@ struct TShortTableInfo {
     ui32 LocalTid = 0;
     ui64 SchemaVersion = 0;
     size_t KeyColumnCount = 0;
-    TVector<NScheme::TTypeId> KeyColumnTypes;
+    TVector<NScheme::TTypeInfo> KeyColumnTypes;
     TMap<NTable::TTag, TShortColumnInfo> Columns;
 };
 
-TVector<std::pair<TString, NScheme::TTypeId>> GetNameTypeColumns(
+TVector<std::pair<TString, NScheme::TTypeInfo>> GetNameTypeColumns(
     const std::vector<NTable::TTag>& tags,
     const TShortTableInfo& tableInfo)
 {
-    TVector<std::pair<TString, NScheme::TTypeId>> result;
+    TVector<std::pair<TString, NScheme::TTypeInfo>> result;
     for (auto tag: tags) {
         auto it = tableInfo.Columns.find(tag);
         if (it == tableInfo.Columns.end()) {
@@ -227,7 +228,7 @@ class TReader {
     const TShortTableInfo& TableInfo;
     TDataShard* Self;
 
-    std::vector<NKikimr::NScheme::TTypeId> ColumnTypes;
+    std::vector<NScheme::TTypeInfo> ColumnTypes;
 
     ui32 FirstUnprocessedQuery;
     TString LastProcessedKey;
@@ -284,7 +285,6 @@ public:
             keyFromCells = range.From;
         }
         const auto keyFrom = ToRawTypeValue(keyFromCells, TableInfo, fromInclusive);
-
         const TSerializedCellVec keyToCells(range.To);
         const auto keyTo = ToRawTypeValue(keyToCells, TableInfo, !range.ToInclusive);
 
@@ -300,10 +300,10 @@ public:
         EReadStatus result;
         if (!reverse) {
             auto iter = txc.DB.IterateRange(TableInfo.LocalTid, iterRange, State.Columns, State.ReadVersion, GetReadTxMap(), GetReadTxObserver());
-            result = Iterate(iter.Get(), true, ctx);
+            result = IterateRange(iter.Get(), ctx);
         } else {
             auto iter = txc.DB.IterateRangeReverse(TableInfo.LocalTid, iterRange, State.Columns, State.ReadVersion, GetReadTxMap(), GetReadTxObserver());
-            result = Iterate(iter.Get(), true, ctx);
+            result = IterateRange(iter.Get(), ctx);
         }
 
         if (result == EReadStatus::NeedData) {
@@ -385,6 +385,8 @@ public:
             case EReadStatus::StoppedByLimit:
                 return true;
             case EReadStatus::NeedData:
+                if (RowsRead)
+                    return true;
                 return false;
             }
         }
@@ -405,6 +407,8 @@ public:
             case EReadStatus::StoppedByLimit:
                 return true;
             case EReadStatus::NeedData:
+                if (RowsRead)
+                    return true;
                 return false;
             }
         }
@@ -555,14 +559,12 @@ private:
     }
 
     template <typename TIterator>
-    EReadStatus Iterate(TIterator* iter, bool isRange, const TActorContext& ctx) {
+    EReadStatus IterateRange(TIterator* iter, const TActorContext& ctx) {
         Y_UNUSED(ctx);
         while (iter->Next(NTable::ENext::Data) == NTable::EReady::Data) {
             TDbTupleRef rowKey = iter->GetKey();
 
-            if (isRange) {
-                LastProcessedKey = TSerializedCellVec::Serialize(rowKey.Cells());
-            }
+            LastProcessedKey = TSerializedCellVec::Serialize(rowKey.Cells());
 
             TDbTupleRef rowValues = iter->GetValues();
 
@@ -584,12 +586,12 @@ private:
 
         // TODO: consider restart when Page and too few data read
         // (how much is too few, less than user's limit?)
-        if (iter->Last() == NTable::EReady::Page && RowsRead == 0) {
+        if (iter->Last() == NTable::EReady::Page) {
             return EReadStatus::NeedData;
         }
 
         // range fully read, no reason to keep LastProcessedKey
-        if (isRange && iter->Last() == NTable::EReady::Gone)
+        if (iter->Last() == NTable::EReady::Gone)
             LastProcessedKey.clear();
 
         return EReadStatus::Done;
@@ -599,7 +601,7 @@ private:
         if (!TxMap &&
             State.LockId &&
             !TSysTables::IsSystemTable(State.PathId) &&
-            Self->SysLocksTable().HasWriteLock(State.LockId, State.PathId))
+            Self->SysLocksTable().HasCurrentWriteLock(State.PathId))
         {
             TxMap = new NTable::TSingleTransactionMap(State.LockId, TRowVersion::Min());
         }
@@ -655,7 +657,7 @@ private:
         // We have skipped uncommitted changes in txId, which would affect
         // the read result when it commits. Add a conflict edge that breaks
         // our lock when txId is committed.
-        Self->SysLocksTable().AddReadConflict(txId, State.LockId, State.LockNodeId);
+        Self->SysLocksTable().AddReadConflict(txId);
     }
 
     void CheckReadConflict(const TRowVersion& rowVersion) {
@@ -729,6 +731,12 @@ public:
         }
         Y_VERIFY(it->second);
         auto& state = *it->second;
+
+        if (Result->Record.HasStatus()) {
+            // error happened on check phase
+            return EExecutionStatus::DelayComplete;
+        }
+
         Y_VERIFY(state.State == TReadIteratorState::EState::Executing);
 
         ++ExecuteCount;
@@ -790,9 +798,8 @@ public:
             auto tableId = state.PathId.LocalPathId;
             auto it = Self->TableInfos.find(tableId);
             if (it == Self->TableInfos.end()) {
-                SendErrorAndAbort(
-                    ctx,
-                    state,
+                SetStatusError(
+                    Result->Record,
                     Ydb::StatusIds::NOT_FOUND,
                     TStringBuilder() << "Unknown table id: " << tableId);
                 return EExecutionStatus::DelayComplete;
@@ -817,9 +824,8 @@ public:
             }
 
             if (!snapshotFound) {
-                SendErrorAndAbort(
-                    ctx,
-                    state,
+                SetStatusError(
+                    Result->Record,
                     Ydb::StatusIds::NOT_FOUND,
                     TStringBuilder() << "Table id " << tableId << " lost snapshot at "
                          << state.ReadVersion << " shard " << Self->TabletID()
@@ -829,9 +835,8 @@ public:
             }
 
             if (state.SchemaVersion != userTableInfo->GetTableSchemaVersion()) {
-                SendErrorAndAbort(
-                    ctx,
-                    state,
+                SetStatusError(
+                    Result->Record,
                     Ydb::StatusIds::SCHEME_ERROR,
                     TStringBuilder() << "Schema changed, current " << userTableInfo->GetTableSchemaVersion()
                         << ", requested table schemaversion " << state.SchemaVersion);
@@ -843,7 +848,33 @@ public:
         state.LockNodeId = state.Request->Record.GetLockNodeId();
 
         TDataShardLocksDb locksDb(*Self, txc);
-        TSetupSysLocks guard(state.LockId, state.LockNodeId, *Self, &locksDb);
+        TSetupSysLocks guardLocks(state.LockId, state.LockNodeId, *Self, &locksDb);
+
+        if (guardLocks.LockTxId) {
+            switch (Self->SysLocksTable().EnsureCurrentLock()) {
+                case EEnsureCurrentLock::Success:
+                    // Lock is valid, we may continue with reads and side-effects
+                    break;
+
+                case EEnsureCurrentLock::Broken:
+                    // Lock is valid, but broken, we could abort early in some
+                    // cases, but it doesn't affect correctness.
+                    break;
+
+                case EEnsureCurrentLock::TooMany:
+                    // Lock cannot be created, it's not necessarily a problem
+                    // for read-only transactions.
+                    break;
+
+                case EEnsureCurrentLock::Abort:
+                    // Lock cannot be created and we must abort
+                    SetStatusError(
+                        Result->Record,
+                        Ydb::StatusIds::ABORTED,
+                        TStringBuilder() << "Transaction was already committed or aborted");
+                    return EExecutionStatus::DelayComplete;
+            }
+        }
 
         if (!Read(txc, ctx, state))
             return EExecutionStatus::Restart;
@@ -891,7 +922,7 @@ public:
             hadWrites |= locksDb.HasChanges();
 
             // We remember acquired lock for faster checking
-            state.Lock = guard.Lock;
+            state.Lock = guardLocks.Lock;
         }
 
         if (!Self->IsFollower()) {
@@ -899,7 +930,14 @@ public:
             hadWrites |= res.HadWrites;
         }
 
-        return hadWrites ? EExecutionStatus::DelayCompleteNoMoreRestarts : EExecutionStatus::DelayComplete;
+        if (hadWrites)
+            return EExecutionStatus::DelayCompleteNoMoreRestarts;
+
+        if (Self->Pipeline.HasCommittingOpsBelow(state.ReadVersion))
+            return EExecutionStatus::DelayComplete;
+
+        Complete(ctx);
+        return EExecutionStatus::Executed;
     }
 
     void CheckRequestAndInit(TTransactionContext& txc, const TActorContext& ctx) override {
@@ -907,7 +945,6 @@ public:
         auto it = Self->ReadIterators.find(readId);
         if (it == Self->ReadIterators.end()) {
             // iterator has been aborted
-            Abort(EExecutionUnitKind::CompletedOperations);
             return;
         }
         Y_VERIFY(it->second);
@@ -945,9 +982,8 @@ public:
         if (state.PathId.OwnerId != Self->TabletID()) {
             // owner is schemeshard, read user table
             if (state.PathId.OwnerId != Self->GetPathOwnerId()) {
-                SendErrorAndAbort(
-                    ctx,
-                    state,
+                SetStatusError(
+                    Result->Record,
                     Ydb::StatusIds::BAD_REQUEST,
                     TStringBuilder() << "Requesting ownerId: " << state.PathId.OwnerId
                         << ", tableId: " << state.PathId.LocalPathId
@@ -958,9 +994,8 @@ public:
             const auto tableId = state.PathId.LocalPathId;
             auto it = Self->TableInfos.find(tableId);
             if (it == Self->TableInfos.end()) {
-                SendErrorAndAbort(
-                    ctx,
-                    state,
+                SetStatusError(
+                    Result->Record,
                     Ydb::StatusIds::NOT_FOUND,
                     TStringBuilder() << "Unknown table id: " << tableId);
                 return;
@@ -970,9 +1005,8 @@ public:
             TableInfo = TShortTableInfo(userTableInfo);
 
             if (userTableInfo->IsBackup) {
-                SendErrorAndAbort(
-                    ctx,
-                    state,
+                SetStatusError(
+                    Result->Record,
                     Ydb::StatusIds::BAD_REQUEST,
                     "Can't read from a backup table");
                 return;
@@ -1002,9 +1036,8 @@ public:
             }
 
             if (!snapshotFound) {
-                SendErrorAndAbort(
-                    ctx,
-                    state,
+                SetStatusError(
+                    Result->Record,
                     Ydb::StatusIds::NOT_FOUND,
                     TStringBuilder() << "Table id " << tableId << " has no snapshot at "
                          << state.ReadVersion << " shard " << Self->TabletID()
@@ -1016,9 +1049,8 @@ public:
             state.SchemaVersion = userTableInfo->GetTableSchemaVersion();
             if (record.GetTableId().HasSchemaVersion()) {
                 if (state.SchemaVersion != record.GetTableId().GetSchemaVersion()) {
-                    SendErrorAndAbort(
-                        ctx,
-                        state,
+                    SetStatusError(
+                        Result->Record,
                         Ydb::StatusIds::SCHEME_ERROR,
                         TStringBuilder() << "Wrong schemaversion " << record.GetTableId().GetSchemaVersion()
                             << " requested, table schemaversion " << state.SchemaVersion);
@@ -1032,9 +1064,8 @@ public:
 
             auto schema = txc.DB.GetRowScheme(state.PathId.LocalPathId);
             if (!schema) {
-                SendErrorAndAbort(
-                    ctx,
-                    state,
+                SetStatusError(
+                    Result->Record,
                     Ydb::StatusIds::NOT_FOUND,
                     TStringBuilder() << "Failed to get scheme for table local id: "
                         << state.PathId.LocalPathId);
@@ -1077,9 +1108,8 @@ public:
         for (auto col: record.GetColumns()) {
             auto it = TableInfo.Columns.find(col);
             if (it == TableInfo.Columns.end()) {
-                SendErrorAndAbort(
-                    ctx,
-                    state,
+                SetStatusError(
+                    Result->Record,
                     Ydb::StatusIds::SCHEME_ERROR,
                     TStringBuilder() << "Unknown column: " << col);
                 return;
@@ -1101,7 +1131,7 @@ public:
         }
     }
 
-    void SendResult(const TActorContext& ctx) override {
+    void SendResult(const TActorContext& ctx) {
         if (ResultSent)
             return;
         ResultSent = true;
@@ -1196,29 +1226,6 @@ public:
     }
 
 private:
-    void SendErrorAndAbort(
-        const TActorContext& ctx,
-        TReadIteratorState& state,
-        Ydb::StatusIds::StatusCode code,
-        const TString& msg)
-    {
-        LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, Self->TabletID() << " aborted read iterator# "
-            << state.ReadId << " with msg " << msg);
-
-        if (!Result)
-            Result.reset(new TEvDataShard::TEvReadResult());
-
-        SetStatusError(Result->Record, code, msg);
-        Result->Record.SetReadId(state.ReadId);
-        Self->SendImmediateReadResult(Sender, Result.release(), 0, state.SessionId);
-
-        // note that we don't need to execute any other unit
-        Abort(EExecutionUnitKind::CompletedOperations);
-
-        TReadIteratorId readId(Sender, state.ReadId);
-        Self->DeleteReadIterator(readId);
-    }
-
     // return semantics is like in Execute()
     bool Read(TTransactionContext& txc, const TActorContext& ctx, TReadIteratorState& state) {
         const auto& tableId = state.PathId.LocalPathId;
@@ -1299,7 +1306,7 @@ private:
     void PrepareValidationInfo(const TActorContext&, const TReadIteratorState& state) {
         TTableId tableId(state.PathId.OwnerId, state.PathId.LocalPathId, state.SchemaVersion);
 
-        TVector<NScheme::TTypeId> keyTypes;
+        TVector<NScheme::TTypeInfo> keyTypes;
 
         TVector<TKeyDesc::TColumnOp> columnOps;
         columnOps.reserve(TableInfo.Columns.size());
@@ -1392,21 +1399,21 @@ private:
                         true,
                         key.GetCells(),
                         true);
-                    sysLocks.SetLock(tableId, lockRange, state.LockId, state.LockNodeId);
+                    sysLocks.SetLock(tableId, lockRange);
                 } else {
-                    sysLocks.SetLock(tableId, key.GetCells(), state.LockId, state.LockNodeId);
+                    sysLocks.SetLock(tableId, key.GetCells());
                 }
             }
         } else {
             // no keys, so we must have ranges (has been checked initially)
             for (size_t i = 0; i < state.Request->Ranges.size(); ++i) {
                 auto range = state.Request->Ranges[i].ToTableRange();
-                sysLocks.SetLock(tableId, range, state.LockId, state.LockNodeId);
+                sysLocks.SetLock(tableId, range);
             }
         }
 
         if (Reader->HadInvisibleRowSkips() || Reader->HadInconsistentResult()) {
-            sysLocks.BreakSetLocks(state.LockId, state.LockNodeId);
+            sysLocks.BreakSetLocks();
         }
 
         auto locks = sysLocks.ApplyLocks();
@@ -1684,7 +1691,7 @@ public:
             << ", FirstUnprocessedQuery# " << state.FirstUnprocessedQuery);
 
         TDataShardLocksDb locksDb(*Self, txc);
-        TSetupSysLocks guard(state.LockId, state.LockNodeId, *Self, &locksDb);
+        TSetupSysLocks guardLocks(state.LockId, state.LockNodeId, *Self, &locksDb);
 
         Reader.reset(new TReader(state, *BlockBuilder, TableInfo, Self));
         if (Reader->Read(txc, ctx)) {
@@ -1775,6 +1782,10 @@ public:
                 Y_VERIFY(locks.empty(), "ApplyLocks acquired unexpected locks");
             }
         }
+
+        LOG_TRACE_S(ctx, NKikimrServices::TX_DATASHARD, Self->TabletID() << " readContinue iterator# " << readId
+            << " sends rowCount# " << Reader->GetRowsRead() << ", hasUnreadQueries# " << Reader->HasUnreadQueries()
+            << ", firstUnprocessed# " << state.FirstUnprocessedQuery);
 
         Reader->FillResult(*Result);
         Self->SendImmediateReadResult(request->Reader, Result.release(), 0, state.SessionId);

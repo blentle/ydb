@@ -57,6 +57,7 @@ target_proto_messages(ydb-core-protos PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/console_tenant.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/counters_tx_allocator.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/counters_bs_controller.proto
+  ${CMAKE_SOURCE_DIR}/ydb/core/protos/counters_cms.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/counters_coordinator.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/counters_columnshard.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/counters_datashard.proto
@@ -89,6 +90,7 @@ target_proto_messages(ydb-core-protos PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/kqp_physical.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/kqp_stats.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/kqp.proto
+  ${CMAKE_SOURCE_DIR}/ydb/core/protos/labeled_counters.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/local.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/long_tx_service.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/metrics.proto
@@ -137,6 +139,7 @@ target_proto_messages(ydb-core-protos PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/tx_proxy.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/tx_scheme.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/tx_sequenceshard.proto
+  ${CMAKE_SOURCE_DIR}/ydb/core/protos/type_info.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/pdiskfit.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/pqconfig.proto
   ${CMAKE_SOURCE_DIR}/ydb/core/protos/auth.proto

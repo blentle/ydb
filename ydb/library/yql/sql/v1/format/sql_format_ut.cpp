@@ -587,6 +587,8 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
              "SELECT\n\t1\nFROM user\nGROUP BY\n\tkey;\n"},
             {"select 1 from user group compact by key, value as v",
              "SELECT\n\t1\nFROM user\nGROUP COMPACT BY\n\tkey,\n\tvalue AS v;\n"},
+            {"select 1 from user group by key with combine",
+             "SELECT\n\t1\nFROM user\nGROUP BY\n\tkey\n\tWITH combine;\n"},
             {"select 1 from user order by key asc",
              "SELECT\n\t1\nFROM user\nORDER BY\n\tkey ASC;\n"},
             {"select 1 from user order by key, value desc",
@@ -710,6 +712,16 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
             {"select * from plato.T with (format= csv_with_names, schema=(year int32 Null, month String, day String not   null, a Utf8, b Uint16));",
              "SELECT\n\t*\nFROM plato.T\n\tWITH (format = csv_with_names, SCHEMA = (year int32 NULL, month String, day String NOT NULL, a Utf8, b Uint16));\n"},
              };
+
+        TSetup setup;
+        setup.Run(cases);
+    }
+
+    Y_UNIT_TEST(SquareBrackets) {
+        TCases cases = {
+            {"select a[0]",
+             "SELECT\n\ta[0];\n"},
+        };
 
         TSetup setup;
         setup.Run(cases);

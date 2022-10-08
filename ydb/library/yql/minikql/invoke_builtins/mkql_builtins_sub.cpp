@@ -11,6 +11,8 @@ namespace {
 
 template<typename TLeft, typename TRight, typename TOutput>
 struct TSub : public TSimpleArithmeticBinary<TLeft, TRight, TOutput, TSub<TLeft, TRight, TOutput>> {
+    static constexpr bool DefaultNulls = true;
+
     static TOutput Do(TOutput left, TOutput right)
     {
         return left - right;
@@ -285,6 +287,10 @@ void RegisterSub(IBuiltinFunctionRegistry& registry) {
         NUdf::TDataType<NUdf::TTzDatetime>, TAnyDateTimeSubIntervalTz, TBinaryArgsOptWithNullableResult>(registry, "Sub");
     RegisterFunctionBinOpt<NUdf::TDataType<NUdf::TTzTimestamp>, NUdf::TDataType<NUdf::TInterval>,
         NUdf::TDataType<NUdf::TTzTimestamp>, TAnyDateTimeSubIntervalTz, TBinaryArgsOptWithNullableResult>(registry, "Sub");
+}
+
+void RegisterSub(arrow::compute::FunctionRegistry& registry) {
+    AddFunction(registry, std::make_shared<TBinaryNumericFunction<TSub>>("Sub"));
 }
 
 } // namespace NMiniKQL

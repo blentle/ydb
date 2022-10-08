@@ -58,6 +58,11 @@ public:
                 return EExecutionStatus::Restart;
             }
 
+            if (Pipeline.AddLockDependencies(op, guardLocks)) {
+                txc.Reschedule();
+                return EExecutionStatus::Restart;
+            }
+
             if (changeCollector) {
                 op->ChangeRecords() = std::move(changeCollector->GetCollected());
             }
@@ -77,6 +82,11 @@ public:
                     const bool ok = Execute(txc, request, presentRows.at(rs.Origin), DeserializeBitMap<TDynBitMap>(body.GetConfirmedRows()), writeVersion);
                     Y_VERIFY(ok);
                 }
+            }
+
+            if (Pipeline.AddLockDependencies(op, guardLocks)) {
+                txc.Reschedule();
+                return EExecutionStatus::Restart;
             }
         } else {
             Y_FAIL_S("Invalid distributed erase tx: " << eraseTx->GetBody().ShortDebugString());
@@ -100,6 +110,8 @@ public:
         Y_VERIFY(DataShard.GetUserTables().contains(tableId));
         const TUserTable& tableInfo = *DataShard.GetUserTables().at(tableId);
 
+        const bool breakWriteConflicts = DataShard.SysLocksTable().HasWriteLocks(fullTableId);
+
         size_t row = 0;
         bool pageFault = false;
         Y_FOR_EACH_BIT(i, presentRows) {
@@ -117,7 +129,6 @@ public:
             for (size_t ki : xrange(tableInfo.KeyColumnTypes.size())) {
                 const auto& kt = tableInfo.KeyColumnTypes[ki];
                 const TCell& cell = keyCells.GetCells()[ki];
-
                 key.emplace_back(TRawTypeValue(cell.AsRef(), kt));
             }
 
@@ -128,11 +139,17 @@ public:
                 }
             }
 
+            if (breakWriteConflicts) {
+                if (!DataShard.BreakWriteConflicts(txc.DB, fullTableId, keyCells.GetCells())) {
+                    pageFault = true;
+                }
+            }
+
             if (pageFault) {
                 continue;
             }
 
-            DataShard.SysLocksTable().BreakLock(fullTableId, keyCells.GetCells());
+            DataShard.SysLocksTable().BreakLocks(fullTableId, keyCells.GetCells());
             txc.DB.Update(tableInfo.LocalTid, NTable::ERowOp::Erase, key, {}, writeVersion);
         }
 

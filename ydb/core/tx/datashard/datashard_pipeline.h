@@ -349,6 +349,7 @@ public:
     void AddCommittingOp(const TOperation::TPtr& op);
     void RemoveCommittingOp(const TOperation::TPtr& op);
     bool WaitCompletion(const TOperation::TPtr& op) const;
+    bool HasCommittingOpsBelow(TRowVersion upperBound) const;
 
     /**
      * Promotes the mvcc complete edge to the last distributed transaction less than version
@@ -364,6 +365,13 @@ public:
      * Marks all active planned transactions before and including this version as logically "incomplete"
      */
     bool MarkPlannedLogicallyIncompleteUpTo(const TRowVersion& version, TTransactionContext& txc);
+
+    /**
+     * Adds new runtime dependencies to op based on its buffered lock updates.
+     *
+     * Returns true when new dependencies were added and op must be rescheduled.
+     */
+    bool AddLockDependencies(const TOperation::TPtr& op, TLocksUpdate& guardLocks);
 
 private:
     struct TStoredExecutionProfile {

@@ -75,6 +75,8 @@ TDirectTxErase::EStatus TDirectTxErase::CheckedExecute(
         }
     }
 
+    const bool breakWriteConflicts = self->SysLocksTable().HasWriteLocks(fullTableId);
+
     bool pageFault = false;
     for (const auto& serializedKey : request.GetKeyColumns()) {
         TSerializedCellVec keyCells;
@@ -96,7 +98,7 @@ TDirectTxErase::EStatus TDirectTxErase::CheckedExecute(
             const auto& kt = tableInfo.KeyColumnTypes[ki];
             const TCell& cell = keyCells.GetCells()[ki];
 
-            if (kt == NScheme::NTypeIds::Uint8 && !cell.IsNull() && cell.AsValue<ui8>() > 127) {
+            if (kt.GetTypeId() == NScheme::NTypeIds::Uint8 && !cell.IsNull() && cell.AsValue<ui8>() > 127) {
                 status = NKikimrTxDataShard::TEvEraseRowsResponse::BAD_REQUEST;
                 error = "Keys with Uint8 column values >127 are currently prohibited";
                 return EStatus::Error;
@@ -142,11 +144,17 @@ TDirectTxErase::EStatus TDirectTxErase::CheckedExecute(
             }
         }
 
+        if (breakWriteConflicts) {
+            if (!self->BreakWriteConflicts(params.Txc->DB, fullTableId, keyCells.GetCells())) {
+                pageFault = true;
+            }
+        }
+
         if (pageFault) {
             continue;
         }
 
-        self->SysLocksTable().BreakLock(fullTableId, keyCells.GetCells());
+        self->SysLocksTable().BreakLocks(fullTableId, keyCells.GetCells());
         params.Txc->DB.Update(localTableId, NTable::ERowOp::Erase, key, {}, params.WriteVersion);
     }
 

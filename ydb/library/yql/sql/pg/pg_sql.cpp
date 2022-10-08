@@ -1,4 +1,5 @@
-#include <ydb/library/yql/sql/pg_sql.h>
+#include <ydb/library/yql/sql/settings/partitioning.h>
+#include <ydb/library/yql/parser/pg_wrapper/interface/parser.h>
 #include <ydb/library/yql/parser/pg_wrapper/parser.h>
 #include <ydb/library/yql/providers/common/provider/yql_provider_names.h>
 #include <ydb/library/yql/core/yql_callable_names.h>
@@ -1229,6 +1230,14 @@ public:
             return { view->Source, alias, colnames.empty() ? view->ColNames : colnames, false };
         }
 
+        if (!StrCompare(value->schemaname, "bindings")) {
+            auto s = BuildBindingSource(value);
+            if (!s) {
+                return {};
+            }
+            return { s, alias, colnames, true };
+        }
+
         auto p = Settings.ClusterMapping.FindPtr(value->schemaname);
         if (!p) {
             AddError(TStringBuilder() << "Unknown cluster: " << value->schemaname);
@@ -1240,6 +1249,54 @@ public:
             QL(QA("table"), L(A("String"), QAX(TablePathPrefix + value->relname)))),
             L(A("Void")),
             QL()), alias, colnames, true };
+    }
+
+    TAstNode* BuildBindingSource(const RangeVar* value) {
+        const TString binding = value->relname;
+        NSQLTranslation::TBindingInfo bindingInfo;
+        if (const auto& error = ExtractBindingInfo(Settings, binding, bindingInfo)) {
+            AddError(error);
+            return nullptr;
+        }
+        TVector<TAstNode*> hints;
+        if (bindingInfo.Schema) {
+            auto schema = QA(bindingInfo.Schema);
+
+            auto type = L(A("SqlTypeFromYson"), schema);
+            auto columns = L(A("SqlColumnOrderFromYson"), schema);
+            hints.emplace_back(QL(QA("userschema"), type, columns));
+        }
+
+        for (auto& [key, value] : bindingInfo.Attributes) {
+            TVector<TAstNode*> hintValues;
+            hintValues.push_back(QA(key));
+            for (auto& v : value) {
+                hintValues.push_back(QA(v));
+            }
+            hints.emplace_back(QVL(hintValues.data(), hintValues.size()));
+        }
+
+        auto source = L(A("DataSource"), QAX(bindingInfo.ClusterType), QAX(bindingInfo.Cluster));
+        return L(
+                  A("Read!"),
+                  A("world"),
+                  source,
+                  L(
+                    A("MrTableConcat"),
+                    L(
+                      A("Key"),
+                      QL(
+                        QA("table"),
+                        L(
+                          A("String"),
+                          QAX(bindingInfo.Path)
+                        )
+                      )
+                    )
+                  ),
+                  L(A("Void")),
+                  QVL(hints.data(), hints.size())
+                );
     }
 
     TFromDesc ParseRangeFunction(const RangeFunction* value) {

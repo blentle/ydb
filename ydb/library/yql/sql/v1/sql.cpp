@@ -19,6 +19,7 @@
 #include <ydb/library/yql/minikql/mkql_program_builder.h>
 #include <ydb/library/yql/providers/common/provider/yql_provider_names.h>
 #include <ydb/library/yql/core/yql_expr_type_annotation.h>
+#include <ydb/library/yql/sql/settings/partitioning.h>
 #include <ydb/library/yql/sql/settings/translation_settings.h>
 #include <ydb/library/yql/core/yql_atom_enums.h>
 
@@ -834,6 +835,7 @@ protected:
     TMaybe<TSourcePtr> AsTableImpl(const TRule_table_ref& node);
     bool ClusterExpr(const TRule_cluster_expr& node, bool allowWildcard, TString& service, TDeferredAtom& cluster);
     bool ClusterExprOrBinding(const TRule_cluster_expr& node, TString& service, TDeferredAtom& cluster, bool& isBinding);
+    bool ApplyTableBinding(const TString& binding, TTableRef& tr, TTableHints& hints);
 
     TMaybe<TColumnSchema> ColumnSchemaImpl(const TRule_column_schema& node);
     bool CreateTableEntry(const TRule_create_table_entry& node, TCreateTableParameters& params);
@@ -884,8 +886,6 @@ private:
     bool SortSpecification(const TRule_sort_specification& node, TVector<TSortSpecificationPtr>& sortSpecs);
 
     bool ClusterExpr(const TRule_cluster_expr& node, bool allowWildcard, bool allowBinding, TString& service, TDeferredAtom& cluster, bool& isBinding);
-    bool ApplyTableBinding(const TString& binding, TTableRef& tr, TTableHints& hints);
-    bool ParsePartitionedByBinding(const TString& name, const TString& value, TVector<TString>& columns);
     bool StructLiteralItem(TVector<TNodePtr>& labels, const TRule_expr& label, TVector<TNodePtr>& values, const TRule_expr& value);
 protected:
     NSQLTranslation::ESqlMode Mode;
@@ -1468,119 +1468,34 @@ bool TSqlTranslation::ClusterExpr(const TRule_cluster_expr& node, bool allowWild
 bool ExprList(TSqlExpression& sqlExpr, TVector<TNodePtr>& exprNodes, const TRule_expr_list& node);
 
 bool TSqlTranslation::ApplyTableBinding(const TString& binding, TTableRef& tr, TTableHints& hints) {
-    const auto& settings = Context().Settings;
-    auto pit = settings.PrivateBindings.find(binding);
-    auto sit = settings.ScopedBindings.find(binding);
-
-    if (pit == settings.PrivateBindings.end() && sit == settings.ScopedBindings.end()) {
-        Ctx.Error() << "Table binding `" << binding << "` is not defined";
+    NSQLTranslation::TBindingInfo bindingInfo;
+    if (const auto& error = ExtractBindingInfo(Context().Settings, binding, bindingInfo)) {
+        Ctx.Error() << error;
         return false;
     }
 
-    if (pit != settings.PrivateBindings.end() && sit != settings.ScopedBindings.end()) {
-        //  warn
-        Ctx.Warning(Ctx.Pos(),
-            TIssuesIds::YQL_TABLE_BINDING_DUPLICATE) << "Table binding `" << binding << "` is defined both as private and scoped binding";
-    }
-
-    const auto& bindSettings = (pit != settings.PrivateBindings.end()) ? pit->second : sit->second;
-
-    if (!IsIn({S3ProviderName, PqProviderName}, bindSettings.ClusterType)) {
-        Ctx.Error() << "Cluster type " << bindSettings.ClusterType << " is not supported for table bindings";
-        return false;
-    }
-
-    // ordered map ensures AST stability
-    TMap<TString, TString> kvs(bindSettings.Settings.begin(), bindSettings.Settings.end());
-    auto pullSettingOrFail = [&](const TString& name, TString& value) -> bool {
-        auto it = kvs.find(name);
-        if (it == kvs.end()) {
-            Ctx.Error() << name << " is not found for " << binding;
-            return false;
-        }
-        value = it->second;
-        kvs.erase(it);
-        return true;
-    };
-
-    TString cluster;
-    TString path;
-    TString format;
-
-    if (!pullSettingOrFail("cluster", cluster) ||
-        !pullSettingOrFail("path", path) ||
-        !pullSettingOrFail("format", format))
-    {
-        return false;
-    }
-
-    if (auto it = kvs.find("schema"); it != kvs.end()) {
-        TNodePtr schema = BuildQuotedAtom(Ctx.Pos(), it->second);
+    if (bindingInfo.Schema) {
+        TNodePtr schema = BuildQuotedAtom(Ctx.Pos(), bindingInfo.Schema);
 
         TNodePtr type = new TCallNodeImpl(Ctx.Pos(), "SqlTypeFromYson", { schema });
         TNodePtr columns = new TCallNodeImpl(Ctx.Pos(), "SqlColumnOrderFromYson", { schema });
 
         hints["user_schema"] = { type, columns };
-        kvs.erase(it);
     }
 
-    if (auto it = kvs.find("partitioned_by"); it != kvs.end()) {
-        TVector<TString> columns;
-        if (!ParsePartitionedByBinding(it->first, it->second, columns)) {
-            return false;
-        }
+    for (auto& [key, values] : bindingInfo.Attributes) {
         TVector<TNodePtr> hintValue;
-        for (auto& column : columns) {
+        for (auto& column : values) {
             hintValue.push_back(BuildQuotedAtom(Ctx.Pos(), column));
         }
-        hints[it->first] = std::move(hintValue);
-        kvs.erase(it);
+        hints[key] = std::move(hintValue);
     }
 
-    tr.Service = bindSettings.ClusterType;
-    tr.Cluster = TDeferredAtom(Ctx.Pos(), cluster);
-    // put format back to hints
-    kvs["format"] = format;
-
-    for (auto& [key, value] : kvs) {
-        YQL_ENSURE(!key.empty());
-        hints[key] = { BuildQuotedAtom(Ctx.Pos(), value) };
-    }
+    tr.Service = bindingInfo.ClusterType;
+    tr.Cluster = TDeferredAtom(Ctx.Pos(), bindingInfo.Cluster);
 
     const TString view = "";
-    tr.Keys = BuildTableKey(Ctx.Pos(), tr.Service, tr.Cluster, TDeferredAtom(Ctx.Pos(), path), view);
-
-    return true;
-}
-
-bool TSqlTranslation::ParsePartitionedByBinding(const TString& name, const TString& value, TVector<TString>& columns) {
-    using namespace NJson;
-    TJsonValue json;
-    bool throwOnError = false;
-    if (!ReadJsonTree(value, &json, throwOnError)) {
-        Ctx.Error() << "Binding setting " << name << " is not a valid JSON";
-        return false;
-    }
-
-    const TJsonValue::TArray* arr = nullptr;
-    if (!json.GetArrayPointer(&arr)) {
-        Ctx.Error() << "Binding setting " << name << ": expecting array";
-        return false;
-    }
-
-    if (arr->empty()) {
-        Ctx.Error() << "Binding setting " << name << ": expecting non-empty array";
-        return false;
-    }
-
-    for (auto& item : *arr) {
-        TString str;
-        if (!item.GetString(&str)) {
-            Ctx.Error() << "Binding setting " << name << ": expecting non-empty array of strings";
-            return false;
-        }
-        columns.push_back(std::move(str));
-    }
+    tr.Keys = BuildTableKey(Ctx.Pos(), tr.Service, tr.Cluster, TDeferredAtom(Ctx.Pos(), bindingInfo.Path), view);
 
     return true;
 }
@@ -3686,6 +3601,7 @@ public:
     TMap<TString, TNodePtr>& Aliases();
     THoppingWindowSpecPtr GetHoppingWindow() const;
     bool IsCompactGroupBy() const;
+    TString GetSuffix() const;
 
 private:
     TMaybe<TVector<TNodePtr>> MultiplyGroupingSets(const TVector<TNodePtr>& lhs, const TVector<TNodePtr>& rhs) const;
@@ -3709,6 +3625,7 @@ private:
     THoppingWindowSpecPtr HoppingWindowSpec; // stream queries
     static const TString AutogenerateNamePrefix;
     bool CompactGroupBy;
+    TString Suffix;
 };
 
 const TString TGroupByClause::AutogenerateNamePrefix = "group";
@@ -6795,6 +6712,7 @@ TSourcePtr TSqlSelect::SelectCore(const TRule_select_core& node, const TWriteSet
     TVector<TNodePtr> groupByExpr, groupBy;
     THoppingWindowSpecPtr hoppingWindowSpec;
     bool compactGroupBy = false;
+    TString groupBySuffix;
     if (node.HasBlock11()) {
         TGroupByClause clause(Ctx, Mode);
         if (!clause.Build(node.GetBlock11().GetRule_group_by_clause1(), source->IsStream())) {
@@ -6808,6 +6726,7 @@ TSourcePtr TSqlSelect::SelectCore(const TRule_select_core& node, const TWriteSet
         clause.SetFeatures("sql_features");
         hoppingWindowSpec = clause.GetHoppingWindow();
         compactGroupBy = clause.IsCompactGroupBy();
+        groupBySuffix = clause.GetSuffix();
     }
 
     TNodePtr having;
@@ -6895,7 +6814,7 @@ TSourcePtr TSqlSelect::SelectCore(const TRule_select_core& node, const TWriteSet
     if (!ValidateSelectColumns(terms)) {
         return nullptr;
     }
-    return BuildSelectCore(Ctx, startPos, std::move(source), groupByExpr, groupBy, compactGroupBy, assumeSorted, orderBy, having,
+    return BuildSelectCore(Ctx, startPos, std::move(source), groupByExpr, groupBy, compactGroupBy, groupBySuffix, assumeSorted, orderBy, having,
         std::move(windowSpec), hoppingWindowSpec, std::move(terms), distinct, std::move(without), selectStream, settings);
 }
 
@@ -7270,7 +7189,7 @@ bool TSqlTranslation::OrderByClause(const TRule_order_by_clause& node, TVector<T
 }
 
 bool TGroupByClause::Build(const TRule_group_by_clause& node, bool stream) {
-    // group_by_clause: GROUP COMPACT? BY opt_set_quantifier grouping_element_list;
+    // group_by_clause: GROUP COMPACT? BY opt_set_quantifier grouping_element_list (WITH an_id)?;
     CompactGroupBy = node.HasBlock2();
     if (!CompactGroupBy) {
         auto hints = Ctx.PullHintForToken(Ctx.TokenPosition(node.GetToken1()));
@@ -7285,6 +7204,33 @@ bool TGroupByClause::Build(const TRule_group_by_clause& node, bool stream) {
     if (!ParseList(node.GetRule_grouping_element_list5(), EGroupByFeatures::Ordinary)) {
         return false;
     }
+
+    if (node.HasBlock6()) {
+        TString mode = Id(node.GetBlock6().GetRule_an_id2(), *this);
+        TMaybe<TIssue> normalizeError = NormalizeName(Ctx.Pos(), mode);
+        if (!normalizeError.Empty()) {
+            Error() << normalizeError->Message;
+            Ctx.IncrementMonCounter("sql_errors", "NormalizeGroupByModeError");
+            return false;
+        }
+
+        if (mode == "combine") {
+            Suffix = "Combine";
+        } else if (mode == "combinestate") {
+            Suffix = "CombineState";
+        } else if (mode == "mergestate") {
+            Suffix = "MergeState";
+        } else if (mode == "finalize") {
+            Suffix = "Finalize";
+        } else if (mode == "mergefinalize") {
+            Suffix = "MergeFinalize";
+        } else {
+            Ctx.Error() << "Unsupported group by mode: " << mode;
+            Ctx.IncrementMonCounter("sql_errors", "GroupByModeUnknown");
+            return false;
+        }
+    }
+
     if (!ResolveGroupByAndGrouping()) {
         return false;
     }
@@ -7346,6 +7292,10 @@ THoppingWindowSpecPtr TGroupByClause::GetHoppingWindow() const {
 
 bool TGroupByClause::IsCompactGroupBy() const {
     return CompactGroupBy;
+}
+
+TString TGroupByClause::GetSuffix() const {
+    return Suffix;
 }
 
 TMaybe<TVector<TNodePtr>> TGroupByClause::MultiplyGroupingSets(const TVector<TNodePtr>& lhs, const TVector<TNodePtr>& rhs) const {
@@ -7931,6 +7881,7 @@ TSourcePtr TSqlSelect::Build(const TRule& node, TPosition pos, TSelectKindResult
         TVector<TNodePtr> groupByExpr;
         TVector<TNodePtr> groupBy;
         bool compactGroupBy = false;
+        TString groupBySuffix = "";
         TNodePtr having;
         TWinSpecs winSpecs;
         THoppingWindowSpecPtr hoppingWindowSpec;
@@ -7941,7 +7892,7 @@ TSourcePtr TSqlSelect::Build(const TRule& node, TPosition pos, TSelectKindResult
         TVector<TNodePtr> terms;
         terms.push_back(BuildColumn(unionPos, "*", ""));
 
-        result = BuildSelectCore(Ctx, unionPos, std::move(result), groupByExpr, groupBy, compactGroupBy,
+        result = BuildSelectCore(Ctx, unionPos, std::move(result), groupByExpr, groupBy, compactGroupBy, groupBySuffix,
             assumeOrderBy, orderBy, having, std::move(winSpecs), hoppingWindowSpec, std::move(terms),
             distinct, std::move(without), stream, settings);
     } else {
@@ -8220,15 +8171,20 @@ TNodePtr TSqlIntoTable::Build(const TRule_into_table_stmt& node) {
     auto service = Ctx.Scoped->CurrService;
     auto cluster = Ctx.Scoped->CurrCluster;
     std::pair<bool, TDeferredAtom> nameOrAt;
+    bool isBinding = false;
     switch (tableRefCore.Alt_case()) {
         case TRule_simple_table_ref_core::AltCase::kAltSimpleTableRefCore1: {
             if (tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().HasBlock1()) {
-                if (!ClusterExpr(tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().GetBlock1().GetRule_cluster_expr1(), false, service, cluster)) {
+                const auto& clusterExpr = tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().GetBlock1().GetRule_cluster_expr1();
+                bool hasAt = tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().GetRule_id_or_at2().HasBlock1();
+                bool result = !hasAt ?
+                    ClusterExprOrBinding(clusterExpr, service, cluster, isBinding) : ClusterExpr(clusterExpr, false, service, cluster);
+                if (!result) {
                     return nullptr;
                 }
             }
 
-            if (cluster.Empty()) {
+            if (!isBinding && cluster.Empty()) {
                 Ctx.Error() << "No cluster name given and no default cluster is selected";
                 return nullptr;
             }
@@ -8304,9 +8260,17 @@ TNodePtr TSqlIntoTable::Build(const TRule_into_table_stmt& node) {
     const auto SqlIntoMode = iterMode->second;
 
     TPosition pos(Ctx.Pos());
-    TNodePtr tableKey = BuildTableKey(pos, service, cluster, nameOrAt.second, nameOrAt.first ? "@" : "");
-
-    TTableRef table(Ctx.MakeName("table"), service, cluster, tableKey);
+    TTableRef table(Ctx.MakeName("table"), service, cluster, nullptr);
+    if (isBinding) {
+        const TString* binding = nameOrAt.second.GetLiteral();
+        YQL_ENSURE(binding);
+        YQL_ENSURE(!nameOrAt.first);
+        if (!ApplyTableBinding(*binding, table, tableHints)) {
+            return nullptr;
+        }
+    } else {
+        table.Keys = BuildTableKey(pos, service, cluster, nameOrAt.second, nameOrAt.first ? "@" : "");
+    }
 
     Ctx.IncrementMonCounter("sql_insert_clusters", table.Cluster.GetLiteral() ? *table.Cluster.GetLiteral() : "unknown");
 

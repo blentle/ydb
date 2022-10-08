@@ -71,12 +71,13 @@ struct Schema : NIceDb::Schema {
         struct BlobDepotId       : Column<109, NScheme::NTypeIds::Uint64> {}; // created blobdepot tablet id
         struct ErrorReason       : Column<110, NScheme::NTypeIds::Utf8>   {}; // creation error reason
         struct NeedAlter         : Column<111, NScheme::NTypeIds::Bool>   {}; // did the BlobDepotConfig change?
+        struct Metrics           : Column<114, NScheme::NTypeIds::String> {}; // for virtual groups only
 
         using TKey = TableKey<ID>;
         using TColumns = TableColumns<ID, Generation, ErasureSpecies, Owner, DesiredPDiskCategory, DesiredVDiskCategory,
               EncryptionMode, LifeCyclePhase, MainKeyId, EncryptedGroupKey, GroupKeyNonce, MainKeyVersion, Down,
               SeenOperational, DecommitStatus, VirtualGroupName, VirtualGroupState, HiveId, BlobDepotConfig,
-              BlobDepotId, ErrorReason, NeedAlter>;
+              BlobDepotId, ErrorReason, NeedAlter, Metrics>;
     };
 
     struct State : Table<1> {
@@ -87,7 +88,7 @@ struct Schema : NIceDb::Schema {
         struct NextOperationLogIndex : Column<5, NScheme::NTypeIds::Uint64> {};
         struct DefaultMaxSlots : Column<6, NScheme::NTypeIds::Uint32> { static constexpr Type Default = 16; };
         struct InstanceId : Column<7, NScheme::NTypeIds::String> {};
-        struct SelfHealEnable : Column<8, NScheme::NTypeIds::Bool> { static constexpr Type Default = false; };
+        struct SelfHealEnable : Column<8, NScheme::NTypeIds::Bool> { static constexpr Type Default = true; };
         struct DonorModeEnable : Column<9, NScheme::NTypeIds::Bool> { static constexpr Type Default = true; };
         struct ScrubPeriodicity : Column<10, NScheme::NTypeIds::Uint32> { static constexpr Type Default = 86400 * 30; };
         struct SerialManagementStage : Column<11, NScheme::NTypeIds::Uint32> { using Type = NKikimrBlobStorage::TSerialManagementStage::E; };

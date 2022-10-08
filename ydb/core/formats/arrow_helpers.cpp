@@ -5,6 +5,7 @@
 
 #include <ydb/library/binary_json/write.h>
 #include <ydb/library/dynumber/dynumber.h>
+#include <ydb/core/util/yverify_stream.h>
 #include <util/memory/pool.h>
 #include <util/system/yassert.h>
 #include <contrib/libs/apache/arrow/cpp/src/arrow/io/memory.h>
@@ -205,7 +206,7 @@ std::shared_ptr<arrow::DataType> CreateEmptyArrowImpl<arrow::DurationType>() {
     return arrow::duration(arrow::TimeUnit::TimeUnit::MICRO);
 }
 
-std::shared_ptr<arrow::DataType> GetArrowType(NScheme::TTypeId typeId) {
+std::shared_ptr<arrow::DataType> GetArrowType(NScheme::TTypeInfo typeId) {
     std::shared_ptr<arrow::DataType> result;
     bool success = SwitchYqlTypeToArrowType(typeId, [&]<typename TType>(TTypeWrapper<TType> typeHolder) {
         Y_UNUSED(typeHolder);
@@ -218,7 +219,7 @@ std::shared_ptr<arrow::DataType> GetArrowType(NScheme::TTypeId typeId) {
     return std::make_shared<arrow::NullType>();
 }
 
-std::vector<std::shared_ptr<arrow::Field>> MakeArrowFields(const TVector<std::pair<TString, NScheme::TTypeId>>& columns) {
+std::vector<std::shared_ptr<arrow::Field>> MakeArrowFields(const TVector<std::pair<TString, NScheme::TTypeInfo>>& columns) {
     std::vector<std::shared_ptr<arrow::Field>> fields;
     fields.reserve(columns.size());
     for (auto& [name, ydbType] : columns) {
@@ -228,7 +229,7 @@ std::vector<std::shared_ptr<arrow::Field>> MakeArrowFields(const TVector<std::pa
     return fields;
 }
 
-std::shared_ptr<arrow::Schema> MakeArrowSchema(const TVector<std::pair<TString, NScheme::TTypeId>>& ydbColumns) {
+std::shared_ptr<arrow::Schema> MakeArrowSchema(const TVector<std::pair<TString, NScheme::TTypeInfo>>& ydbColumns) {
     return std::make_shared<arrow::Schema>(MakeArrowFields(ydbColumns));
 }
 
@@ -356,11 +357,12 @@ std::shared_ptr<arrow::RecordBatch> ExtractColumns(const std::shared_ptr<arrow::
 
     auto srcSchema = srcBatch->schema();
     for (auto& name : columnNames) {
-        fields.push_back(srcSchema->GetFieldByName(name));
-        columns.push_back(srcBatch->GetColumnByName(name));
-        if (!columns.back()) {
+        int pos = srcSchema->GetFieldIndex(name);
+        if (pos < 0) {
             return {};
         }
+        fields.push_back(srcSchema->field(pos));
+        columns.push_back(srcBatch->column(pos));
     }
 
     return arrow::RecordBatch::Make(std::make_shared<arrow::Schema>(fields), srcBatch->num_rows(), columns);
@@ -374,6 +376,10 @@ std::shared_ptr<arrow::RecordBatch> ExtractColumns(const std::shared_ptr<arrow::
 
     for (auto& field : dstSchema->fields()) {
         columns.push_back(srcBatch->GetColumnByName(field->name()));
+        if (!columns.back()->type()->Equals(field->type())) {
+            columns.back() = {};
+        }
+
         if (!columns.back()) {
             if (addNotExisted) {
                 auto result = arrow::MakeArrayOfNull(field->type(), srcBatch->num_rows());
@@ -709,6 +715,40 @@ ui64 GetArrayDataSize(const std::shared_ptr<arrow::Array>& column) {
     return bytes;
 }
 
+i64 LowerBound(const std::shared_ptr<arrow::Array>& array, const arrow::Scalar& border, i64 offset) {
+    i64 pos = 0;
+    SwitchType(array->type_id(), [&](const auto& type) {
+        using TWrap = std::decay_t<decltype(type)>;
+        using T = typename TWrap::T;
+        using TArray = typename arrow::TypeTraits<T>::ArrayType;
+        using TScalar = typename arrow::TypeTraits<T>::ScalarType;
+
+        auto& column = static_cast<const TArray&>(*array);
+
+        if constexpr (arrow::is_number_type<T>() || arrow::is_timestamp_type<T>()) {
+            const auto* start = column.raw_values() + offset;
+            const auto* end = column.raw_values() + column.length();
+            pos = offset;
+            pos += std::lower_bound(start, end, static_cast<const TScalar&>(border).value) - start;
+        } else if constexpr (arrow::has_string_view<T>()) {
+            arrow::util::string_view value(*static_cast<const TScalar&>(border).value);
+
+            // TODO: binary search
+            for (pos = offset; pos < column.length(); ++pos) {
+                if (!(column.GetView(pos) < value)) {
+                    return true;
+                }
+            }
+        } else {
+            Y_VERIFY(false); // not implemented
+        }
+
+        return true;
+    });
+
+    return pos;
+}
+
 std::shared_ptr<arrow::UInt64Array> MakeUI64Array(ui64 value, i64 size) {
     auto res = arrow::MakeArrayFromScalar(arrow::UInt64Scalar(value), size);
     Y_VERIFY(res.ok());
@@ -742,27 +782,63 @@ std::pair<int, int> FindMinMaxPosition(const std::shared_ptr<arrow::Array>& arra
     return {minPos, maxPos};
 }
 
-std::shared_ptr<arrow::Scalar> GetScalar(const std::shared_ptr<arrow::Array>& array, int position) {
+std::shared_ptr<arrow::Scalar> MinScalar(const std::shared_ptr<arrow::DataType>& type) {
     std::shared_ptr<arrow::Scalar> out;
-    SwitchType(array->type_id(), [&](const auto& type) {
-        using TWrap = std::decay_t<decltype(type)>;
-        using TArray = typename arrow::TypeTraits<typename TWrap::T>::ArrayType;
-        using TScalar = typename arrow::TypeTraits<typename TWrap::T>::ScalarType;
+    SwitchType(type->id(), [&](const auto& t) {
+        using TWrap = std::decay_t<decltype(t)>;
+        using T = typename TWrap::T;
+        using TScalar = typename arrow::TypeTraits<T>::ScalarType;
 
-        auto& column = static_cast<const TArray&>(*array);
-        if constexpr (std::is_same_v<TScalar, arrow::StringScalar> ||
-                      std::is_same_v<TScalar, arrow::BinaryScalar> ||
-                      std::is_same_v<TScalar, arrow::FixedSizeBinaryScalar> ||
-                      std::is_same_v<TScalar, arrow::Decimal128Scalar> ||
-                      std::is_same_v<TScalar, arrow::LargeStringScalar> ||
-                      std::is_same_v<TScalar, arrow::LargeBinaryScalar>) {
-            // TODO
+        if constexpr (std::is_same_v<T, arrow::StringType> ||
+                      std::is_same_v<T, arrow::BinaryType> ||
+                      std::is_same_v<T, arrow::LargeStringType> ||
+                      std::is_same_v<T, arrow::LargeBinaryType>) {
+            out = std::make_shared<TScalar>(arrow::Buffer::FromString(""), type);
+        } else if constexpr (std::is_same_v<T, arrow::FixedSizeBinaryType>) {
+            std::string s(static_cast<arrow::FixedSizeBinaryType&>(*type).byte_width(), '\0');
+            out = std::make_shared<TScalar>(arrow::Buffer::FromString(s), type);
+        } else if constexpr (std::is_same_v<T, arrow::HalfFloatType>) {
+            return false;
+        } else if constexpr (arrow::is_temporal_type<T>::value) {
+            using TCType = typename arrow::TypeTraits<T>::CType;
+            out = std::make_shared<TScalar>(Min<TCType>(), type);
+        } else if constexpr (arrow::has_c_type<T>::value) {
+            using TCType = typename arrow::TypeTraits<T>::CType;
+            out = std::make_shared<TScalar>(Min<TCType>());
         } else {
-            out = std::make_shared<TScalar>(column.GetView(position), array->type());
+            return false;
         }
         return true;
     });
+    Y_VERIFY(out);
     return out;
+}
+
+std::shared_ptr<arrow::Scalar> GetScalar(const std::shared_ptr<arrow::Array>& array, int position) {
+    auto res = array->GetScalar(position);
+    Y_VERIFY(res.ok());
+    return *res;
+}
+
+bool IsGoodScalar(const std::shared_ptr<arrow::Scalar>& x) {
+    if (!x) {
+        return false;
+    }
+
+    return SwitchType(x->type->id(), [&](const auto& type) {
+        using TWrap = std::decay_t<decltype(type)>;
+        using TScalar = typename arrow::TypeTraits<typename TWrap::T>::ScalarType;
+        using TValue = std::decay_t<decltype(static_cast<const TScalar&>(*x).value)>;
+
+        if constexpr (arrow::has_string_view<typename TWrap::T>()) {
+            const auto& xval = static_cast<const TScalar&>(*x).value;
+            return xval && xval->data();
+        }
+        if constexpr (std::is_arithmetic_v<TValue>) {
+            return true;
+        }
+        return false;
+    });
 }
 
 bool ScalarLess(const std::shared_ptr<arrow::Scalar>& x, const std::shared_ptr<arrow::Scalar>& y) {
@@ -772,16 +848,21 @@ bool ScalarLess(const std::shared_ptr<arrow::Scalar>& x, const std::shared_ptr<a
 }
 
 bool ScalarLess(const arrow::Scalar& x, const arrow::Scalar& y) {
-    Y_VERIFY(x.type->Equals(y.type));
+    Y_VERIFY_S(x.type->Equals(y.type), x.type->ToString() + " vs " + y.type->ToString());
 
     return SwitchType(x.type->id(), [&](const auto& type) {
         using TWrap = std::decay_t<decltype(type)>;
         using TScalar = typename arrow::TypeTraits<typename TWrap::T>::ScalarType;
         using TValue = std::decay_t<decltype(static_cast<const TScalar&>(x).value)>;
+
         if constexpr (arrow::has_string_view<typename TWrap::T>()) {
             const auto& xval = static_cast<const TScalar&>(x).value;
             const auto& yval = static_cast<const TScalar&>(y).value;
-            return TStringBuf((char*)xval->data(), xval->size()) < TStringBuf((char*)yval->data(), yval->size());
+            Y_VERIFY(xval);
+            Y_VERIFY(yval);
+            TStringBuf xBuf(reinterpret_cast<const char*>(xval->data()), xval->size());
+            TStringBuf yBuf(reinterpret_cast<const char*>(yval->data()), yval->size());
+            return xBuf < yBuf;
         }
         if constexpr (std::is_arithmetic_v<TValue>) {
             const auto& xval = static_cast<const TScalar&>(x).value;
@@ -953,8 +1034,8 @@ std::shared_ptr<arrow::RecordBatch> SortBatch(const std::shared_ptr<arrow::Recor
     return Reorder(batch, sortPermutation);
 }
 
-static bool ConvertData(TCell& cell, const NScheme::TTypeId& colType, TMemoryPool& memPool, TString& errorMessage) {
-    switch (colType) {
+static bool ConvertData(TCell& cell, const NScheme::TTypeInfo& colType, TMemoryPool& memPool, TString& errorMessage) {
+    switch (colType.GetTypeId()) {
         case NScheme::NTypeIds::DyNumber: {
             const auto dyNumber = NDyNumber::ParseDyNumberString(cell.AsBuf());
             if (!dyNumber.Defined()) {
@@ -985,8 +1066,8 @@ static bool ConvertData(TCell& cell, const NScheme::TTypeId& colType, TMemoryPoo
 }
 
 static std::shared_ptr<arrow::Array> ConvertColumn(const std::shared_ptr<arrow::Array>& column,
-                                                   NScheme::TTypeId colType) {
-    if (colType == NScheme::NTypeIds::Decimal) {
+                                                   NScheme::TTypeInfo colType) {
+    if (colType.GetTypeId() == NScheme::NTypeIds::Decimal) {
         return {};
     }
 
@@ -999,7 +1080,7 @@ static std::shared_ptr<arrow::Array> ConvertColumn(const std::shared_ptr<arrow::
     builder.Reserve(binaryArray.length()).ok();
     // TODO: ReserveData
 
-    switch (colType) {
+    switch (colType.GetTypeId()) {
         case NScheme::NTypeIds::DyNumber: {
             for (i32 i = 0; i < binaryArray.length(); ++i) {
                 auto value = binaryArray.Value(i);
@@ -1030,7 +1111,7 @@ static std::shared_ptr<arrow::Array> ConvertColumn(const std::shared_ptr<arrow::
 }
 
 std::shared_ptr<arrow::RecordBatch> ConvertColumns(const std::shared_ptr<arrow::RecordBatch>& batch,
-                                                   const THashMap<TString, NScheme::TTypeId>& columnsToConvert)
+                                                   const THashMap<TString, NScheme::TTypeInfo>& columnsToConvert)
 {
     std::vector<std::shared_ptr<arrow::Array>> columns = batch->columns();
     for (i32 i = 0; i < batch->num_columns(); ++i) {
@@ -1076,6 +1157,9 @@ bool TArrowToYdbConverter::Process(const arrow::RecordBatch& batch, TString& err
     for (; row < rowsUnroll; row += unroll) {
         ui32 col = 0;
         for (auto& [colName, colType] : YdbSchema) {
+            // TODO: support pg types
+            Y_VERIFY(colType.GetTypeId() != NScheme::NTypeIds::Pg, "pg types are not supported");
+
             auto& column = allColumns[col];
             bool success = SwitchYqlTypeToArrowType(colType, [&]<typename TType>(TTypeWrapper<TType> typeHolder) {
                 Y_UNUSED(typeHolder);
@@ -1091,7 +1175,7 @@ bool TArrowToYdbConverter::Process(const arrow::RecordBatch& batch, TString& err
             });
 
             if (!success) {
-                errorMessage = TStringBuilder() << "No arrow conversion for type Yql::" << NScheme::TypeName(colType)
+                errorMessage = TStringBuilder() << "No arrow conversion for type Yql::" << NScheme::TypeName(colType.GetTypeId())
                         << " at column '" << colName << "'";
                 return false;
             }
@@ -1123,6 +1207,9 @@ bool TArrowToYdbConverter::Process(const arrow::RecordBatch& batch, TString& err
 
         ui32 col = 0;
         for (auto& [colName, colType] : YdbSchema) {
+            // TODO: support pg types
+            Y_VERIFY(colType.GetTypeId() != NScheme::NTypeIds::Pg, "pg types are not supported");
+
             auto& column = allColumns[col];
             auto& curCell = cells[0][col];
             if (column->IsNull(row)) {
@@ -1137,7 +1224,7 @@ bool TArrowToYdbConverter::Process(const arrow::RecordBatch& batch, TString& err
             });
 
             if (!success) {
-                errorMessage = TStringBuilder() << "No arrow conversion for type Yql::" << NScheme::TypeName(colType)
+                errorMessage = TStringBuilder() << "No arrow conversion for type Yql::" << NScheme::TypeName(colType.GetTypeId())
                         << " at column '" << colName << "'";
                 return false;
             }

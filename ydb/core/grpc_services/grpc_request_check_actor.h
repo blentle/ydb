@@ -103,6 +103,8 @@ public:
             Counters_ = WrapGRpcProxyDbCounters(Counters_);
         }
 
+        GrpcRequestBaseCtx_->SetCounters(Counters_);
+
         {
             auto [error, issue] = CheckConnectRight();
             if (error) {
@@ -111,7 +113,9 @@ public:
             }
         }
 
-        AuditLog(GrpcRequestBaseCtx_, CheckedDatabaseName_, GetSubject(), ctx);
+        if (AppData(ctx)->FeatureFlags.GetEnableGrpcAudit()) {
+            AuditLog(GrpcRequestBaseCtx_, CheckedDatabaseName_, GetSubject(), ctx);
+        }
 
         // Simple rps limitation
         static NRpcService::TRlConfig rpsRlConfig(
@@ -193,10 +197,6 @@ public:
         GrpcRequestBaseCtx_->UseDatabase(database);
         Counters_->UseDatabase(database);
         ReplyBackAndDie();
-    }
-
-    void SetRlPath(TMaybe<NRpcService::TRlPath>&& rlPath) {
-        GrpcRequestBaseCtx_->SetRlPath(std::move(rlPath));
     }
 
     STATEFN(DbAccessStateFunc) {
@@ -299,7 +299,7 @@ private:
             return SetTokenAndDie(CheckedDatabaseName_);
         } else {
             auto actions = NRpcService::MakeRequests(*RlConfig, rlPath.GetRef());
-            SetRlPath(std::move(rlPath));
+            GrpcRequestBaseCtx_->SetRlPath(std::move(rlPath));
 
             Ydb::RateLimiter::AcquireResourceRequest req;
             bool hasOnReqAction = false;

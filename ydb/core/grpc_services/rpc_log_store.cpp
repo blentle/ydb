@@ -76,6 +76,34 @@ void ConvertCompressionFromInternalToPublic(const NKikimrSchemeOp::TCompressionO
     to.set_compression_level(from.GetCompressionLevel());
 }
 
+static bool IsAllowedFirstPkField(ui32 typeId) {
+    switch (typeId) {
+        //case NYql::NProto::Bool
+        case NYql::NProto::Uint8: // Byte
+        case NYql::NProto::Int32:
+        case NYql::NProto::Uint32:
+        case NYql::NProto::Int64:
+        case NYql::NProto::Uint64:
+        //case NYql::NProto::Float:
+        //case NYql::NProto::Double:
+        case NYql::NProto::String:
+        case NYql::NProto::Utf8:
+        //case NYql::NProto::Yson:
+        //case NYql::NProto::Json:
+        //case NYql::NProto::JsonDocument:
+        case NYql::NProto::Date:
+        case NYql::NProto::Datetime:
+        case NYql::NProto::Timestamp:
+        //case NYql::NProto::Interval:
+        //case NYql::NProto::Decimal:
+        //case NYql::NProto::DyNumber:
+            return true;
+        default:
+            break;
+    }
+    return false;
+}
+
 bool ConvertSchemaFromPublicToInternal(const Ydb::LogStore::Schema& from, NKikimrSchemeOp::TColumnTableSchema& to,
     Ydb::StatusIds::StatusCode& status, TString& error)
 {
@@ -95,16 +123,16 @@ bool ConvertSchemaFromPublicToInternal(const Ydb::LogStore::Schema& from, NKikim
     for (const auto& column : from.columns()) {
         auto* col = to.AddColumns();
         col->SetName(column.name());
-        ui32 typeId;
-        if (!ExtractColumnTypeId(typeId, column.type(), status, error)) {
+        NScheme::TTypeInfo typeInfo;
+        if (!ExtractColumnTypeInfo(typeInfo, column.type(), status, error)) {
             return false;
         }
-        auto typeName = NScheme::TypeName(typeId);
+        auto typeName = NScheme::TypeName(typeInfo);
         col->SetType(typeName);
 
         key.erase(column.name());
-        if (column.name() == firstKeyColumn && typeId != NYql::NProto::Timestamp) {
-            error = "not supported first PK column type for LogStore. Only Timestamp columns are allowed for now.";
+        if (column.name() == firstKeyColumn && !IsAllowedFirstPkField(typeInfo.GetTypeId())) {
+            error = "not supported first PK column type for LogStore";
             return false;
         }
     }
@@ -205,7 +233,7 @@ private:
         modifyScheme->SetOperationType(NKikimrSchemeOp::EOperationType::ESchemeOpCreateColumnStore);
         auto create = modifyScheme->MutableCreateColumnStore();
         create->SetName(name);
-        create->SetColumnShardCount(req->column_shard_count());
+        create->SetColumnShardCount(req->shards_count());
         for (const auto& schemaPreset : req->schema_presets()) {
             auto* toSchemaPreset = create->AddSchemaPresets();
             toSchemaPreset->SetName(schemaPreset.name());
@@ -267,7 +295,7 @@ private:
                 }
                 ConvertDirectoryEntry(pathDescription.GetSelf(), selfEntry, true);
                 const auto& storeDescription = pathDescription.GetColumnStoreDescription();
-                describeLogStoreResult.set_column_shard_count(storeDescription.GetColumnShardCount());
+                describeLogStoreResult.set_shards_count(storeDescription.GetColumnShardCount());
 
                 bool firstPreset = true;
                 for (const auto& schemaPreset : storeDescription.GetSchemaPresets()) {
@@ -455,9 +483,16 @@ private:
             }
         }
 
-        create->SetColumnShardCount(req->column_shard_count());
+        create->SetColumnShardCount(req->shards_count());
         auto* sharding = create->MutableSharding()->MutableHashSharding();
-        sharding->SetFunction(NKikimrSchemeOp::TColumnTableSharding::THashSharding::HASH_FUNCTION_CLOUD_LOGS);
+        if (req->sharding_type() == Ydb::LogStore::ShardingHashType::HASH_TYPE_MODULO_N) {
+            sharding->SetFunction(NKikimrSchemeOp::TColumnTableSharding::THashSharding::HASH_FUNCTION_MODULO_N);
+        } else {
+            sharding->SetFunction(NKikimrSchemeOp::TColumnTableSharding::THashSharding::HASH_FUNCTION_CLOUD_LOGS);
+            if (req->active_shards_count()) {
+                sharding->SetActiveShardsCount(req->active_shards_count());
+            }
+        }
         sharding->MutableColumns()->CopyFrom(req->sharding_columns());
         ctx.Send(MakeTxProxyID(), proposeRequest.release());
     }
@@ -504,7 +539,7 @@ private:
                 }
                 ConvertDirectoryEntry(pathDescription.GetSelf(), selfEntry, true);
                 const auto& tableDescription = pathDescription.GetColumnTableDescription();
-                describeLogTableResult.set_column_shard_count(tableDescription.GetColumnShardCount());
+                describeLogTableResult.set_shards_count(tableDescription.GetColumnShardCount());
                 Ydb::StatusIds::StatusCode status;
                 TString error;
                 if (!ConvertSchemaFromInternalToPublic(tableDescription.GetSchema(), *describeLogTableResult.mutable_schema(), status, error)) {

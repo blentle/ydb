@@ -1,4 +1,5 @@
 #include "schemeshard_info_types.h"
+#include "schemeshard_path.h"
 #include "schemeshard_utils.h"
 
 #include <ydb/core/base/appdata.h>
@@ -6,6 +7,7 @@
 #include <ydb/core/base/tx_processing.h>
 #include <ydb/core/engine/minikql/flat_local_tx_factory.h>
 #include <ydb/core/engine/mkql_proto.h>
+#include <ydb/core/scheme/scheme_types_proto.h>
 #include <ydb/core/tablet/tablet_counters_aggregator.h>
 #include <ydb/core/tablet/tablet_counters_protobuf.h>
 #include <ydb/core/util/pb.h>
@@ -120,15 +122,21 @@ TTableInfo::TAlterDataPtr TTableInfo::CreateAlterData(
                 return nullptr;
             }
 
-            if (!type) {
-                errStr = Sprintf("Type '%s' specified for column '%s' is not supported by storage", col.GetType().data(), colName.data());
-                return nullptr;
-            }
-
-            // Only allow YQL types
-            if (!NScheme::NTypeIds::IsYqlType(type->GetTypeId())) {
-                errStr = Sprintf("Type '%s' specified for column '%s' is no longer supported", col.GetType().data(), colName.data());
-                return nullptr;
+            NScheme::TTypeInfo typeInfo;
+            if (type) {
+                // Only allow YQL types
+                if (!NScheme::NTypeIds::IsYqlType(type->GetTypeId())) {
+                    errStr = Sprintf("Type '%s' specified for column '%s' is no longer supported", col.GetType().data(), colName.data());
+                    return nullptr;
+                }
+                typeInfo = NScheme::TTypeInfo(type->GetTypeId());
+            } else {
+                auto* typeDesc = NPg::TypeDescFromPgTypeName(typeName);
+                if (!typeDesc) {
+                    errStr = Sprintf("Type '%s' specified for column '%s' is not supported by storage", col.GetType().data(), colName.data());
+                    return nullptr;
+                }
+                typeInfo = NScheme::TTypeInfo(NScheme::NTypeIds::Pg, typeDesc);
             }
 
             ui32 colId = col.HasId() ? col.GetId() : alterData->NextColumnId;
@@ -146,7 +154,7 @@ TTableInfo::TAlterDataPtr TTableInfo::CreateAlterData(
 
             colName2Id[colName] = colId;
             TTableInfo::TColumn& column = alterData->Columns[colId];
-            column = TTableInfo::TColumn(colName, colId, type->GetTypeId());
+            column = TTableInfo::TColumn(colName, colId, typeInfo);
             column.Family = columnFamily ? columnFamily->GetId() : 0;
             column.NotNull = col.GetNotNull();
             if (source)
@@ -310,7 +318,11 @@ TVector<ui32> TTableInfo::FillDescriptionCache(TPathElement::TPtr pathInfo) {
             auto colDescr = TableDescription.AddColumns();
             colDescr->SetName(column.Name);
             colDescr->SetId(column.Id);
-            colDescr->SetTypeId(column.PType);
+            auto columnType = NScheme::ProtoColumnTypeFromTypeInfo(column.PType);
+            colDescr->SetTypeId(columnType.TypeId);
+            if (columnType.TypeInfo) {
+                *colDescr->MutableTypeInfo() = *columnType.TypeInfo;
+            }
             colDescr->SetFamily(column.Family);
         }
         for (auto ci : keyColumnIds) {
@@ -1703,6 +1715,25 @@ TIndexBuildInfo::TShardStatus::TShardStatus(TSerializedTableRange range, TString
     , LastKeyAck(std::move(lastKeyAck))
 {}
 
+NKikimrSchemeOp::TIndexBuildConfig TIndexBuildInfo::SerializeToProto(TSchemeShard* ss) const {
+    NKikimrSchemeOp::TIndexBuildConfig result;
+    result.SetTable(TPath::Init(TablePathId, ss).PathString());
+
+    auto& index = *result.MutableIndex();
+    index.SetName(IndexName);
+    index.SetType(IndexType);
+
+    for (const auto& x : IndexColumns) {
+        *index.AddKeyColumnNames() = x;
+    }
+
+    for (const auto& x : DataColumns) {
+        *index.AddDataColumnNames() = x;
+    }
+
+    return result;
+}
+
 TColumnFamiliesMerger::TColumnFamiliesMerger(NKikimrSchemeOp::TPartitionConfig &container)
     : Container(container)
     , DeduplicationById(TPartitionConfigMerger::DeduplicateColumnFamiliesById(Container))
@@ -1836,14 +1867,15 @@ bool TPersQueueGroupInfo::FillKeySchema(const NKikimrPQ::TPQTabletConfig& tablet
     KeySchema.reserve(tabletConfig.PartitionKeySchemaSize());
 
     for (const auto& component : tabletConfig.GetPartitionKeySchema()) {
-        if (!NScheme::NTypeIds::IsYqlType(component.GetTypeId())) {
+        // TODO: support pg types
+        auto typeId = component.GetTypeId();
+        if (!NScheme::NTypeIds::IsYqlType(typeId)) {
             error = TStringBuilder() << "TypeId is not supported"
-                << ": typeId# " << component.GetTypeId()
+                << ": typeId# " << typeId
                 << ", component# " << component.GetName();
             return false;
         }
-
-        KeySchema.push_back(component.GetTypeId());
+        KeySchema.push_back(NScheme::TTypeInfo(typeId));
     }
 
     return true;
@@ -1980,7 +2012,8 @@ TOlapStoreInfo::TOlapStoreInfo(
             auto& col = preset.Columns[colProto.GetId()];
             col.Id = colProto.GetId();
             col.Name = colProto.GetName();
-            col.TypeId = colProto.GetTypeId();
+            col.Type = NScheme::TypeInfoFromProtoColumnType(colProto.GetTypeId(),
+                colProto.HasTypeInfo() ? &colProto.GetTypeInfo() : nullptr);
             preset.ColumnsByName[col.Name] = col.Id;
         }
         for (const auto& keyName : presetProto.GetSchema().GetKeyColumnNames()) {

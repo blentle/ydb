@@ -75,7 +75,11 @@ NNodes::TExprBase DqRewriteLeftPureJoin(const NNodes::TExprBase node, TExprConte
 NNodes::TExprBase DqBuildPhyJoin(const NNodes::TDqJoin& join, bool pushLeftStage, TExprContext& ctx,
     IOptimizationContext& optCtx);
 
-NNodes::TExprBase DqBuildJoin(const NNodes::TExprBase& node, TExprContext& ctx, IOptimizationContext& optCtx, const TParentsMap& parentsMap, bool allowStageMultiUsage, bool pushLeftStage);
+NNodes::TExprBase DqBuildJoin(const NNodes::TExprBase& node, TExprContext& ctx, 
+    IOptimizationContext& optCtx, const TParentsMap& parentsMap, bool allowStageMultiUsage, bool pushLeftStage, bool useGraceJoin = false);
+
+NNodes::TExprBase DqBuildGraceJoin(const NNodes::TDqJoin& join, TExprContext& ctx);
+
 
 bool DqValidateJoinInputs(
     const NNodes::TExprBase& left, const NNodes::TExprBase& right, const TParentsMap& parentsMap,
@@ -89,6 +93,10 @@ TMaybe<std::pair<NNodes::TExprBase, NNodes::TDqConnection>>  ExtractPureExprStag
     TExprContext& ctx);
 
 NNodes::TExprBase DqBuildPureExprStage(NNodes::TExprBase node, TExprContext& ctx);
+
+NNodes::TExprBase DqBuildOrderedLMapOverMuxStage(NNodes::TExprBase node, TExprContext& ctx, IOptimizationContext& optCtx, const TParentsMap& parentsMap);
+
+NNodes::TExprBase DqBuildLMapOverMuxStage(NNodes::TExprBase node, TExprContext& ctx, IOptimizationContext& optCtx, const TParentsMap& parentsMap);
 
 NNodes::TExprBase DqBuildExtendStage(NNodes::TExprBase node, TExprContext& ctx);
 

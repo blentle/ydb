@@ -1,4 +1,5 @@
 import "ydb/core/protos/base.proto";
+import "ydb/core/protos/type_info.proto";
 import "ydb/core/protos/bind_channel_storage_pool.proto";
 import "ydb/core/protos/pqconfig.proto";
 import "ydb/core/protos/replication.proto";
@@ -76,6 +77,7 @@ message TColumnDescription {
     optional string Name = 1;
     optional string Type = 2;
     optional uint32 TypeId = 3;
+    optional NKikimrProto.TTypeInfo TypeInfo = 9;
     optional uint32 Id = 4;
     optional uint32 Family = 5; // On default place column to default(0) family
     optional string FamilyName = 6; // set Family by name (0 - "default")
@@ -372,6 +374,7 @@ message TOlapColumnDescription {
 
     optional string Type = 3;
     optional uint32 TypeId = 4; // TypeId cannot be set explicitly, use Type
+    optional NKikimrProto.TTypeInfo TypeInfo = 6;
 
     // TODO: Intermediate codecs such as Delta, DubleDelta, dictionary encoding, etc.
     //TCompressionOptions Compression = 5;
@@ -590,7 +593,7 @@ message TColumnTableSharding {
     message THashSharding {
         enum EHashFunction {
             // A simple hash modulo number of shards
-            HASH_FUNCTION_DEFAULT = 0;
+            HASH_FUNCTION_MODULO_N = 0;
             HASH_FUNCTION_CLOUD_LOGS = 1;
         }
 
@@ -605,6 +608,9 @@ message TColumnTableSharding {
         // changed and older data with the same column values may be left on
         // a different shard.
         optional bool UniqueShardKey = 3;
+
+        // Argument for HASH_FUNCTION_CLOUD_LOGS
+        optional uint32 ActiveShardsCount = 4;
     }
 
     oneof Method {
@@ -1170,7 +1176,7 @@ enum EOperationType {
     ESchemeOpUpgradeSubDomainDecision = 37;
     ESchemeOpCreateIndexBuild = 38;
     ESchemeOpInitiateBuildIndexMainTable = 39;
-    ESchemeOpCreateLockForIndexBuild = 40;
+    ESchemeOpCreateLock = 40;
     ESchemeOpApplyIndexBuild = 41;
     ESchemeOpFinalizeBuildIndexMainTable = 42;
     ESchemeOpAlterTableIndex = 43;

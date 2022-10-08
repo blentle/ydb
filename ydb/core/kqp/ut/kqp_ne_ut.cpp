@@ -1145,6 +1145,32 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         ])", FormatResultSetYson(result.GetResultSet(0)));
     }
 
+    Y_UNIT_TEST_TWIN(PureTxMixedWithDeferred, UseSessionActor) {
+        auto settings = TKikimrSettings()
+            .SetEnableKqpSessionActor(UseSessionActor);
+        auto kikimr = TKikimrRunner{settings};
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        auto result = session.ExecuteDataQuery(R"(
+            PRAGMA kikimr.UseNewEngine = "true";
+            UPSERT INTO `/Root/KeyValue` (Key, Value) VALUES (3u, "Three")
+        )", TTxControl::BeginTx(TTxSettings::SerializableRW())).ExtractValueSync();
+        AssertSuccessResult(result);
+
+        auto tx = result.GetTransaction();
+
+        result = session.ExecuteDataQuery(R"(
+            PRAGMA kikimr.UseNewEngine = "true";
+            SELECT 1=1;
+        )", TTxControl::Tx(*tx).CommitTx()).ExtractValueSync();
+        AssertSuccessResult(result);
+
+        CompareYson(R"(
+            [ [%true]; ]
+        )", FormatResultSetYson(result.GetResultSet(0)));
+    }
+
     Y_UNIT_TEST_TWIN(PrunePartitionsByLiteral, UseSessionActor) {
         auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
         auto db = kikimr.GetTableClient();
@@ -3455,8 +3481,143 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
                 ON l.Key = r.Key;
             SELECT * FROM `/Root/TwoShard` WHERE $count1 = $count2;
 
-        )", TTxControl::BeginTx()).ExtractValueSync();
+        )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
         UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+    }
+
+    Y_UNIT_TEST(StreamLookupForDataQuery) {
+        auto settings = TKikimrSettings()
+            .SetEnableKqpDataQueryStreamLookup(true)
+            .SetEnablePredicateExtractForDataQueries(false);
+        TKikimrRunner kikimr{settings};
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        {
+            auto result = db.CreateSession().GetValueSync().GetSession().ExecuteDataQuery(R"(
+                REPLACE INTO `/Root/EightShard` (Key, Text, Data) VALUES
+                    (1u, "Value1",  1),
+                    (2u, "Value2",  1),
+                    (3u, "Value3",  1),
+                    (4u, "Value4",  1),
+                    (5u, "Value5",  1);
+            )", TTxControl::BeginTx().CommitTx()).GetValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        }
+
+        TExecDataQuerySettings querySettings;
+        querySettings.CollectQueryStats(ECollectQueryStatsMode::Full);
+
+        {
+            auto result = session.ExecuteDataQuery(R"(
+                --!syntax_v1
+                PRAGMA kikimr.UseNewEngine = "true";
+                $subquery = SELECT Key FROM `/Root/EightShard`;
+
+                SELECT * FROM `/Root/KeyValue`
+                WHERE Key IN $subquery ORDER BY Key;
+            )", TTxControl::BeginTx().CommitTx(), querySettings).ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CompareYson(R"([[[1u];["One"]];[[2u];["Two"]]])", FormatResultSetYson(result.GetResultSet(0)));
+
+            NJson::TJsonValue plan;
+            NJson::ReadJsonTree(result.GetQueryPlan(), &plan, true);
+            auto streamLookup = FindPlanNodeByKv(plan, "Node Type", "TableLookup");
+            UNIT_ASSERT(streamLookup.IsDefined());
+        }
+
+        {
+            auto params = kikimr.GetTableClient().GetParamsBuilder()
+                .AddParam("$keys").BeginList()
+                    .AddListItem()
+                        .Uint64(1)
+                    .AddListItem()
+                        .Uint64(2)
+                    .EndList()
+                    .Build()
+                    .Build();
+
+            auto result = session.ExecuteDataQuery(R"(
+                --!syntax_v1
+                PRAGMA kikimr.UseNewEngine = "true";
+                DECLARE $keys AS List<Uint64>;
+
+                SELECT * FROM `/Root/KeyValue`
+                WHERE Key IN $keys ORDER BY Key;
+            )", TTxControl::BeginTx().CommitTx(), params, querySettings).ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CompareYson(R"([[[1u];["One"]];[[2u];["Two"]]])", FormatResultSetYson(result.GetResultSet(0)));
+
+            NJson::TJsonValue plan;
+            NJson::ReadJsonTree(result.GetQueryPlan(), &plan, true);
+            auto streamLookup = FindPlanNodeByKv(plan, "Node Type", "TableLookup");
+            UNIT_ASSERT(streamLookup.IsDefined());
+        }
+
+        {
+            auto result = session.ExecuteDataQuery(R"(
+                --!syntax_v1
+                PRAGMA kikimr.UseNewEngine = "true";
+
+                SELECT * FROM `/Root/KeyValue`
+                WHERE Key = 1;
+            )", TTxControl::BeginTx().CommitTx(), querySettings).ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CompareYson(R"([[[1u];["One"]]])", FormatResultSetYson(result.GetResultSet(0)));
+
+            NJson::TJsonValue plan;
+            NJson::ReadJsonTree(result.GetQueryPlan(), &plan, true);
+            auto streamLookup = FindPlanNodeByKv(plan, "Node Type", "TableLookup");
+            UNIT_ASSERT(streamLookup.IsDefined());
+        }
+    }
+
+    Y_UNIT_TEST(FlatmapLambdaMutiusedConnections) {
+        auto settings = TKikimrSettings()
+            .SetEnablePredicateExtractForDataQueries(false);
+        TKikimrRunner kikimr{settings};
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        auto result = session.ExecuteDataQuery(R"(
+            --!syntax_v1
+            PRAGMA kikimr.UseNewEngine = "true";
+
+            $values = SELECT Value2 AS Value FROM TwoShard;
+
+            $values_filtered = SELECT * FROM $values WHERE Value < 5;
+
+            SELECT Key FROM `/Root/EightShard`
+            WHERE Data IN $values_filtered OR Data = 0
+            ORDER BY Key;
+
+            SELECT * FROM $values
+            ORDER BY Value;
+        )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        CompareYson(R"([[[101u]];[[202u]];[[303u]];[[401u]];[[502u]];[[603u]];[[701u]];[[802u]]])",
+            FormatResultSetYson(result.GetResultSet(0)));
+        CompareYson(R"([[[-1]];[[-1]];[[0]];[[0]];[[1]];[[1]]])",
+            FormatResultSetYson(result.GetResultSet(1)));
+    }
+
+    Y_UNIT_TEST(EmptyMapWithBroadcast) {
+        TKikimrRunner kikimr;
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        auto result = session.ExecuteDataQuery(R"(
+            --!syntax_v1
+            PRAGMA kikimr.UseNewEngine = "true";
+
+            SELECT ts.Value1 AS c1, kv.Value AS c2, t.Name AS c3
+            FROM TwoShard AS ts
+            INNER JOIN KeyValue AS kv ON ts.Value2 = kv.Key
+            INNER JOIN Test AS t ON ts.Key = t.Group
+            WHERE ts.Key = 30;
+        )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        CompareYson(R"([])", FormatResultSetYson(result.GetResultSet(0)));
     }
 }
 

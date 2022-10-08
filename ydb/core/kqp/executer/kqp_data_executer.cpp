@@ -1226,7 +1226,8 @@ private:
                     break;
                 }
 
-                case NKqpProto::TKqpPhyConnection::kMap: {
+                case NKqpProto::TKqpPhyConnection::kMap:
+                case NKqpProto::TKqpPhyConnection::kStreamLookup: {
                     partitionsCount = originStageInfo.Tasks.size();
                     break;
                 }
@@ -1344,7 +1345,7 @@ private:
             return false;
         };
 
-        auto computeActor = CreateKqpComputeActor(SelfId(), TxId, std::move(taskDesc), nullptr, nullptr, settings, limits, ExecuterSpan.GetTraceId());
+        auto computeActor = CreateKqpComputeActor(SelfId(), TxId, std::move(taskDesc), CreateKqpAsyncIoFactory(), nullptr, settings, limits);
         auto computeActorId = Register(computeActor);
         task.ComputeActorId = computeActorId;
 
@@ -1455,7 +1456,11 @@ private:
                         for (auto& column : read.Columns) {
                             auto* protoColumn = protoReadMeta->AddColumns();
                             protoColumn->SetId(column.Id);
-                            protoColumn->SetType(column.Type);
+                            auto columnType = NScheme::ProtoColumnTypeFromTypeInfo(column.Type);
+                            protoColumn->SetType(columnType.TypeId);
+                            if (columnType.TypeInfo) {
+                                *protoColumn->MutableTypeInfo() = *columnType.TypeInfo;
+                            }
                             protoColumn->SetName(column.Name);
                         }
                         protoReadMeta->SetItemsLimit(task.Meta.ReadInfo.ItemsLimit);
@@ -1474,7 +1479,11 @@ private:
 
                         auto& protoColumn = *protoColumnWrite.MutableColumn();
                         protoColumn.SetId(columnWrite.Column.Id);
-                        protoColumn.SetType(columnWrite.Column.Type);
+                        auto columnType = NScheme::ProtoColumnTypeFromTypeInfo(columnWrite.Column.Type);
+                        protoColumn.SetType(columnType.TypeId);
+                        if (columnType.TypeInfo) {
+                            *protoColumn.MutableTypeInfo() = *columnType.TypeInfo;
+                        }
                         protoColumn.SetName(columnWrite.Column.Name);
 
                         protoColumnWrite.SetMaxValueSizeBytes(columnWrite.MaxValueSizeBytes);
@@ -1493,7 +1502,11 @@ private:
                 const auto& tableInfo = TableKeys.GetTable(stageInfo.Meta.TableId);
                 for (const auto& keyColumnName : tableInfo.KeyColumns) {
                     const auto& keyColumn = tableInfo.Columns.at(keyColumnName);
-                    protoTaskMeta.AddKeyColumnTypes(keyColumn.Type);
+                    auto columnType = NScheme::ProtoColumnTypeFromTypeInfo(keyColumn.Type);
+                    protoTaskMeta.AddKeyColumnTypes(columnType.TypeId);
+                    if (columnType.TypeInfo) {
+                        *protoTaskMeta.AddKeyColumnTypeInfos() = *columnType.TypeInfo;
+                    }
                 }
 
                 for (bool skipNullKey : stageInfo.Meta.SkipNullKeys) {
@@ -1506,7 +1519,11 @@ private:
                 for (auto& column : task.Meta.Reads->front().Columns) {
                     auto* protoColumn = protoTaskMeta.AddColumns();
                     protoColumn->SetId(column.Id);
-                    protoColumn->SetType(column.Type);
+                    auto columnType = NScheme::ProtoColumnTypeFromTypeInfo(column.Type);
+                    protoColumn->SetType(columnType.TypeId);
+                    if (columnType.TypeInfo) {
+                        *protoColumn->MutableTypeInfo() = *columnType.TypeInfo;
+                    }
                     protoColumn->SetName(column.Name);
                 }
 
@@ -1518,7 +1535,7 @@ private:
                     YQL_ENSURE((int) read.Columns.size() == protoTaskMeta.GetColumns().size());
                     for (ui64 i = 0; i < read.Columns.size(); ++i) {
                         YQL_ENSURE(read.Columns[i].Id == protoTaskMeta.GetColumns()[i].GetId());
-                        YQL_ENSURE(read.Columns[i].Type == protoTaskMeta.GetColumns()[i].GetType());
+                        YQL_ENSURE(read.Columns[i].Type.GetTypeId() == protoTaskMeta.GetColumns()[i].GetType());
                     }
                 }
 
@@ -1793,6 +1810,7 @@ private:
         TVector<ui64> computeTaskIds{Reserve(computeTasks.size())};
         for (auto&& taskDesc : computeTasks) {
             computeTaskIds.emplace_back(taskDesc.GetId());
+            FillInputSettings(taskDesc, lockTxId);
             ExecuteDataComputeTask(std::move(taskDesc));
         }
 
@@ -2044,6 +2062,36 @@ private:
             issue.AddSubIssue(new TIssue(message));
             issue.GetSubIssues()[0]->SetCode(NKikimrIssues::TIssuesIds::TX_STATE_UNKNOWN, TSeverityIds::S_ERROR);
             ReplyErrorAndDie(Ydb::StatusIds::UNDETERMINED, issue);
+        }
+    }
+
+    void FillInputSettings(NYql::NDqProto::TDqTask& task, const TMaybe<ui64> lockTxId) {
+        for (auto& input : *task.MutableInputs()) {
+            if (input.HasTransform()) {
+                auto transform = input.MutableTransform();
+                YQL_ENSURE(transform->GetType() == "StreamLookupInputTransformer",
+                    "Unexpected input transform type: " << transform->GetType());
+
+                const google::protobuf::Any& settingsAny = transform->GetSettings();
+                YQL_ENSURE(settingsAny.Is<NKikimrKqp::TKqpStreamLookupSettings>(), "Expected settings type: "
+                    << NKikimrKqp::TKqpStreamLookupSettings::descriptor()->full_name()
+                    << " , but got: " << settingsAny.type_url());
+
+                NKikimrKqp::TKqpStreamLookupSettings settings;
+                YQL_ENSURE(settingsAny.UnpackTo(&settings), "Failed to unpack settings");
+
+                if (Snapshot.IsValid()) {
+                    settings.MutableSnapshot()->SetStep(Snapshot.Step);
+                    settings.MutableSnapshot()->SetTxId(Snapshot.TxId);
+                }
+
+                if (lockTxId.Defined()) {
+                    settings.SetLockTxId(*lockTxId);
+                }
+
+                settings.SetImmediateTx(ImmediateTx);
+                transform->MutableSettings()->PackFrom(settings);
+            }
         }
     }
 

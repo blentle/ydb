@@ -6,13 +6,37 @@
 #include "udf_type_size_check.h"
 #include "udf_version.h"
 
+struct ArrowSchema;
+
 namespace NYql {
 namespace NUdf {
 
 // opaque type info
 using TType = void;
 
-#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 25)
+#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 26)
+
+#define UDF_TYPE_KIND_MAP(XX) \
+    XX(Unknown)               \
+    XX(Data)                  \
+    XX(Struct)                \
+    XX(List)                  \
+    XX(Optional)              \
+    XX(Tuple)                 \
+    XX(Dict)                  \
+    XX(Callable)              \
+    XX(Resource)              \
+    XX(Void)                  \
+    XX(Variant)               \
+    XX(Stream)                \
+    XX(Null)                  \
+    XX(EmptyList)             \
+    XX(EmptyDict)             \
+    XX(Tagged)                \
+    XX(Pg)                    \
+    XX(Block)
+
+#elif UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 25)
 
 #define UDF_TYPE_KIND_MAP(XX) \
     XX(Unknown)               \
@@ -183,7 +207,16 @@ public:
 };
 #endif
 
-#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 25)
+#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 26)
+class ITypeVisitor6: public ITypeVisitor5 {
+public:
+    virtual void OnBlock(const TType* itemType, bool isScalar) = 0;
+};
+#endif
+
+#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 26)
+using ITypeVisitor = ITypeVisitor6;
+#elif UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 25)
 using ITypeVisitor = ITypeVisitor5;
 #elif UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 21)
 using ITypeVisitor = ITypeVisitor4;
@@ -245,7 +278,35 @@ public:
     virtual const TPgTypeDescription* FindPgTypeDescription(ui32 typeId) const = 0;
 };
 
-#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 25)
+//////////////////////////////////////////////////////////////////////////////
+// IArrowType
+//////////////////////////////////////////////////////////////////////////////
+class IArrowType
+{
+public:
+    using TPtr = TUniquePtr<IArrowType>;
+
+    virtual ~IArrowType() = default;
+
+    virtual void Export(ArrowSchema* out) const = 0;
+};
+
+UDF_ASSERT_TYPE_SIZE(IArrowType, 8);
+
+class ITypeInfoHelper3 : public ITypeInfoHelper2 {
+public:
+    using TPtr = TRefCountedPtr<ITypeInfoHelper3>;
+
+public:
+    // returns nullptr if type isn't supported
+    virtual IArrowType::TPtr MakeArrowType(const TType* type) const = 0;
+    // The given ArrowSchema struct is released, even if this function fails. 
+    virtual IArrowType::TPtr ImportArrowType(ArrowSchema* schema) const = 0;
+};
+
+#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 26)
+using ITypeInfoHelper = ITypeInfoHelper3;
+#elif UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 25)
 using ITypeInfoHelper = ITypeInfoHelper2;
 #else
 using ITypeInfoHelper = ITypeInfoHelper1;

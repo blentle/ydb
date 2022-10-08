@@ -25,20 +25,20 @@ public:
     FEATURE_FLAG_SETTER(AllowUpdateChannelsBindingOfSolomonPartitions)
     FEATURE_FLAG_SETTER(EnableDataColumnForIndexTable)
     FEATURE_FLAG_SETTER(EnableClockGettimeForUserCpuAccounting)
-    FEATURE_FLAG_SETTER(EnableAsyncIndexes)
     FEATURE_FLAG_SETTER(EnableOlapSchemaOperations)
     FEATURE_FLAG_SETTER(EnableMvccSnapshotReads)
     FEATURE_FLAG_SETTER(EnableBackgroundCompaction)
     FEATURE_FLAG_SETTER(EnableBackgroundCompactionServerless)
     FEATURE_FLAG_SETTER(EnableNotNullColumns)
-    FEATURE_FLAG_SETTER(EnableTtlOnAsyncIndexedTables)
     FEATURE_FLAG_SETTER(EnableBulkUpsertToAsyncIndexedTables)
     FEATURE_FLAG_SETTER(EnableChangefeeds)
     FEATURE_FLAG_SETTER(EnableKqpScanQueryStreamLookup)
+    FEATURE_FLAG_SETTER(EnableKqpDataQueryStreamLookup)
     FEATURE_FLAG_SETTER(EnableMoveIndex)
     FEATURE_FLAG_SETTER(EnablePredicateExtractForDataQueries)
     FEATURE_FLAG_SETTER(EnableNotNullDataColumns)
     FEATURE_FLAG_SETTER(EnableArrowFormatAtDatashard)
+    FEATURE_FLAG_SETTER(EnableGrpcAudit)
 
     TDerived& SetEnableMvcc(std::optional<bool> value) {
         if (value) {

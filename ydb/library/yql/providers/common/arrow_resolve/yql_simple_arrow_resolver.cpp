@@ -2,6 +2,8 @@
 
 #include <ydb/library/yql/minikql/arrow/mkql_functions.h>
 #include <ydb/library/yql/minikql/mkql_program_builder.h>
+#include <ydb/library/yql/minikql/mkql_type_builder.h>
+#include <ydb/library/yql/minikql/mkql_function_registry.h>
 #include <ydb/library/yql/providers/common/mkql/yql_type_mkql.h>
 
 #include <util/stream/null.h>
@@ -32,11 +34,56 @@ private:
                 mkqlInputTypes.emplace_back(mkqlType);
             }
 
-            if (!FindArrowFunction(name, mkqlInputTypes, mkqlOutputType, env)) {
+            if (!FindArrowFunction(name, mkqlInputTypes, mkqlOutputType, env, *FunctionRegistry_.GetBuiltins())) {
                 return true;
             }
 
             returnType = NCommon::ConvertMiniKQLType(pos, mkqlOutputType, ctx);
+            return true;
+        } catch (const std::exception& e) {
+            ctx.AddError(TIssue(pos, e.what()));
+            return false;
+        }
+    }
+
+    bool HasCast(const TPosition& pos, const TTypeAnnotationNode* from, const TTypeAnnotationNode* to, bool& has, TExprContext& ctx) const override {
+        try {
+            has = false;
+            TScopedAlloc alloc;
+            TTypeEnvironment env(alloc);
+            TProgramBuilder pgmBuilder(env, FunctionRegistry_);
+            TNullOutput null;
+            auto mkqlFromType = NCommon::BuildType(*from, pgmBuilder, null);
+            auto mkqlToType = NCommon::BuildType(*to, pgmBuilder, null);
+            if (!HasArrowCast(mkqlFromType, mkqlToType)) {
+                return true;
+            }
+
+            has = true;
+            return true;
+        } catch (const std::exception& e) {
+            ctx.AddError(TIssue(pos, e.what()));
+            return false;
+        }
+    }
+
+    bool AreTypesSupported(const TPosition& pos, const TVector<const TTypeAnnotationNode*>& types, bool& supported, TExprContext& ctx) const override {
+        try {
+            supported = false;
+            TScopedAlloc alloc;
+            TTypeEnvironment env(alloc);
+            TProgramBuilder pgmBuilder(env, FunctionRegistry_);
+            for (const auto& type : types) {
+                TNullOutput null;
+                auto mkqlType = NCommon::BuildType(*type, pgmBuilder, null);
+                bool isOptional;
+                std::shared_ptr<arrow::DataType> arrowType;
+                if (!ConvertArrowType(mkqlType, isOptional, arrowType)) {
+                    return true;
+                }
+            }
+
+            supported = true;
             return true;
         } catch (const std::exception& e) {
             ctx.AddError(TIssue(pos, e.what()));

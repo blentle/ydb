@@ -100,14 +100,14 @@ const NDataShard::TUserTable::TUserColumn& TKqpDatashardComputeContext::GetKeyCo
     return col;
 }
 
-THashMap<TString, NScheme::TTypeId> TKqpDatashardComputeContext::GetKeyColumnsMap(const TTableId &tableId) const {
+THashMap<TString, NScheme::TTypeInfo> TKqpDatashardComputeContext::GetKeyColumnsMap(const TTableId &tableId) const {
     MKQL_ENSURE_S(Shard);
     const NDataShard::TUserTable::TCPtr* tablePtr = Shard->GetUserTables().FindPtr(tableId.PathId.LocalPathId);
     MKQL_ENSURE_S(tablePtr);
     const NDataShard::TUserTable::TCPtr table = *tablePtr;
     MKQL_ENSURE_S(table);
 
-    THashMap<TString, NScheme::TTypeId> columnsMap;
+    THashMap<TString, NScheme::TTypeInfo> columnsMap;
     for (size_t i = 0 ; i < table->KeyColumnTypes.size(); i++) {
         auto col = table->Columns.at(table->KeyColumnIds[i]);
         MKQL_ENSURE_S(col.IsKey);
@@ -137,17 +137,23 @@ const NDataShard::TUserTable* TKqpDatashardComputeContext::GetTable(const TTable
 }
 
 void TKqpDatashardComputeContext::TouchTableRange(const TTableId& tableId, const TTableRange& range) const {
-    Shard->SysLocksTable().SetLock(tableId, range, LockTxId, LockNodeId);
+    if (LockTxId) {
+        Shard->SysLocksTable().SetLock(tableId, range);
+    }
     Shard->SetTableAccessTime(tableId, Now);
 }
 
 void TKqpDatashardComputeContext::TouchTablePoint(const TTableId& tableId, const TArrayRef<const TCell>& key) const {
-    Shard->SysLocksTable().SetLock(tableId, key, LockTxId, LockNodeId);
+    if (LockTxId) {
+        Shard->SysLocksTable().SetLock(tableId, key);
+    }
     Shard->SetTableAccessTime(tableId, Now);
 }
 
 void TKqpDatashardComputeContext::BreakSetLocks() const {
-    Shard->SysLocksTable().BreakSetLocks(LockTxId, LockNodeId);
+    if (LockTxId) {
+        Shard->SysLocksTable().BreakSetLocks();
+    }
 }
 
 void TKqpDatashardComputeContext::SetLockTxId(ui64 lockTxId, ui32 lockNodeId) {
@@ -400,14 +406,15 @@ bool TKqpDatashardComputeContext::ReadRow(const TTableId& tableId, TArrayRef<con
             EngineHost.GetReadTxMap(tableId),
             EngineHost.GetReadTxObserver(tableId));
 
+    if (InconsistentReads) {
+        return false;
+    }
+
     kqpStats.NSelectRow = 1;
     kqpStats.InvisibleRowSkips = stats.InvisibleRowSkips;
 
     switch (ready) {
         case EReady::Page:
-            if (auto collector = EngineHost.GetChangeCollector(tableId)) {
-                collector->Reset();
-            }
             SetTabletNotReady();
             return false;
         case EReady::Gone:
@@ -418,7 +425,7 @@ bool TKqpDatashardComputeContext::ReadRow(const TTableId& tableId, TArrayRef<con
 
     MKQL_ENSURE_S(columnTags.size() == dbRow.Size(), "Invalid local db row size.");
 
-    TVector<NScheme::TTypeId> types(columnTags.size());
+    TVector<NScheme::TTypeInfo> types(columnTags.size());
     for (size_t i = 0; i < columnTags.size(); ++i) {
         types[i] = tableInfo->Columns.at(columnTags[i]).PType;
     }
@@ -485,6 +492,10 @@ bool TKqpDatashardComputeContext::ReadRowImpl(const TTableId& tableId, TReadTabl
     const THolderFactory& holderFactory, NUdf::TUnboxedValue& result, TKqpTableStats& stats)
 {
     while (iterator.Next(NTable::ENext::Data) == NTable::EReady::Data) {
+        if (InconsistentReads) {
+            return false;
+        }
+
         TDbTupleRef rowKey = iterator.GetKey();
         MKQL_ENSURE_S(skipNullKeys.size() <= rowKey.ColumnCount);
 
@@ -521,9 +532,6 @@ bool TKqpDatashardComputeContext::ReadRowImpl(const TTableId& tableId, TReadTabl
     }
 
     if (iterator.Last() == NTable::EReady::Page) {
-        if (auto collector = EngineHost.GetChangeCollector(tableId)) {
-            collector->Reset();
-        }
         SetTabletNotReady();
     }
 
@@ -536,6 +544,10 @@ bool TKqpDatashardComputeContext::ReadRowWideImpl(const TTableId& tableId, TRead
     NUdf::TUnboxedValue* const* result, TKqpTableStats& stats)
 {
     while (iterator.Next(NTable::ENext::Data) == NTable::EReady::Data) {
+        if (InconsistentReads) {
+            return false;
+        }
+
         TDbTupleRef rowKey = iterator.GetKey();
         MKQL_ENSURE_S(skipNullKeys.size() <= rowKey.ColumnCount);
 
@@ -572,9 +584,6 @@ bool TKqpDatashardComputeContext::ReadRowWideImpl(const TTableId& tableId, TRead
     }
 
     if (iterator.Last() == NTable::EReady::Page) {
-        if (auto collector = EngineHost.GetChangeCollector(tableId)) {
-            collector->Reset();
-        }
         SetTabletNotReady();
     }
 

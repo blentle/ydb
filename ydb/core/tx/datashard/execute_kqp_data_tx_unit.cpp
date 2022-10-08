@@ -121,7 +121,6 @@ EExecutionStatus TExecuteKqpDataTxUnit::Execute(TOperation::TPtr op, TTransactio
         return EExecutionStatus::Executed;
     }
 
-
     try {
         auto& kqpTx = dataTx->GetKqpTransaction();
         auto& tasksRunner = dataTx->GetKqpTasksRunner();
@@ -133,6 +132,38 @@ EExecutionStatus TExecuteKqpDataTxUnit::Execute(TOperation::TPtr op, TTransactio
 
             DataShard.IncCounter(COUNTER_TX_WAIT_RESOURCE);
             return EExecutionStatus::Restart;
+        }
+
+        if (guardLocks.LockTxId) {
+            switch (DataShard.SysLocksTable().EnsureCurrentLock()) {
+                case EEnsureCurrentLock::Success:
+                    // Lock is valid, we may continue with reads and side-effects
+                    break;
+
+                case EEnsureCurrentLock::Broken:
+                    // Lock is valid, but broken, we could abort early in some
+                    // cases, but it doesn't affect correctness.
+                    break;
+
+                case EEnsureCurrentLock::TooMany:
+                    // Lock cannot be created, it's not necessarily a problem
+                    // for read-only transactions, for non-readonly we need to
+                    // abort;
+                    if (op->IsReadOnly()) {
+                        break;
+                    }
+
+                    [[fallthrough]];
+
+                case EEnsureCurrentLock::Abort:
+                    // Lock cannot be created and we must abort
+                    LOG_T("Operation " << *op << " (execute_kqp_data_tx) at " << tabletId
+                        << " aborting because it cannot acquire locks");
+
+                    op->SetAbortedFlag();
+                    BuildResult(op, NKikimrTxDataShard::TEvProposeTransactionResult::LOCKS_BROKEN);
+                    return EExecutionStatus::Executed;
+            }
         }
 
         if (!KqpValidateLocks(tabletId, tx, DataShard.SysLocksTable())) {
@@ -175,17 +206,70 @@ EExecutionStatus TExecuteKqpDataTxUnit::Execute(TOperation::TPtr op, TTransactio
         auto result = KqpCompleteTransaction(ctx, tabletId, op->GetTxId(),
             op->HasKqpAttachedRSFlag() ? nullptr : &op->InReadSets(), dataTx->GetKqpTasks(), tasksRunner, computeCtx);
 
+        if (!result && computeCtx.HadInconsistentReads()) {
+            LOG_T("Operation " << *op << " (execute_kqp_data_tx) at " << tabletId
+                << " detected inconsistent reads and is going to abort");
+
+            allocGuard.Release();
+
+            dataTx->ResetCollectedChanges();
+
+            op->SetAbortedFlag();
+
+            // NOTE: we don't actually break locks, and rollback everything
+            // instead, so transaction may continue with different reads that
+            // won't conflict. This should not be considered a feature though,
+            // it's just that actually breaking this (potentially persistent)
+            // lock and rolling back changes will be unnecessarily complicated.
+            BuildResult(op, NKikimrTxDataShard::TEvProposeTransactionResult::LOCKS_BROKEN);
+
+            // Add a list of "broken" table locks to the result. It may be the
+            // case that the lock is not even set yet (write + read with conflicts),
+            // but we want kqp to have a list of affected tables, which is used
+            // when generating error messages.
+            // TODO: we would want an actual table id that caused inconsistency,
+            //       relevant for future multi-table shards only.
+            // NOTE: generation may not match an existing lock, but it's not a problem.
+            for (auto& table : guardLocks.AffectedTables) {
+                Y_VERIFY(guardLocks.LockTxId);
+                op->Result()->AddTxLock(
+                    guardLocks.LockTxId,
+                    DataShard.TabletID(),
+                    DataShard.Generation(),
+                    Max<ui64>(),
+                    table.GetTableId().OwnerId,
+                    table.GetTableId().LocalPathId);
+            }
+
+            tx->ReleaseTxData(txc, ctx);
+
+            // Transaction may have made some changes before it detected
+            // inconsistency, so we need to roll them back. We do this by
+            // marking transaction for reschedule and restarting. The next
+            // cycle will detect aborted operation and move along.
+            txc.Reschedule();
+            return EExecutionStatus::Restart;
+        }
+
         if (!result && computeCtx.IsTabletNotReady()) {
             allocGuard.Release();
             return OnTabletNotReady(*tx, *dataTx, txc, ctx);
+        }
+
+        if (Pipeline.AddLockDependencies(op, guardLocks)) {
+            allocGuard.Release();
+            dataTx->ResetCollectedChanges();
+            tx->ReleaseTxData(txc, ctx);
+            txc.Reschedule();
+            return EExecutionStatus::Restart;
         }
 
         Y_VERIFY(result);
         op->Result().Swap(result);
         op->SetKqpAttachedRSFlag();
 
-        if (dataTx->GetCounters().InvisibleRowSkips) {
-            DataShard.SysLocksTable().BreakSetLocks(op->LockTxId(), op->LockNodeId());
+        if (dataTx->GetCounters().InvisibleRowSkips && op->LockTxId()) {
+            DataShard.SysLocksTable().BreakSetLocks();
         }
 
         AddLocksToResult(op, ctx);
@@ -196,6 +280,8 @@ EExecutionStatus TExecuteKqpDataTxUnit::Execute(TOperation::TPtr op, TTransactio
         auto statsMode = kqpTx.GetRuntimeSettings().GetStatsMode();
         KqpFillStats(DataShard, tasksRunner, computeCtx, statsMode, *op->Result());
     } catch (const TMemoryLimitExceededException&) {
+        dataTx->ResetCollectedChanges();
+
         txc.NotEnoughMemory();
 
         LOG_T("Operation " << *op << " at " << tabletId
@@ -263,6 +349,8 @@ EExecutionStatus TExecuteKqpDataTxUnit::OnTabletNotReady(TActiveTransaction& tx,
     LOG_T("Tablet " << DataShard.TabletID() << " is not ready for " << tx << " execution");
 
     DataShard.IncCounter(COUNTER_TX_TABLET_NOT_READY);
+
+    dataTx.ResetCollectedChanges();
 
     ui64 pageFaultCount = tx.IncrementPageFaultCount();
     dataTx.GetKqpComputeCtx().PinPages(dataTx.TxInfo().Keys, pageFaultCount);

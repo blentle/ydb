@@ -66,9 +66,9 @@ public:
     }
 
     void AddReadRange(const TTableId& tableId, const TVector<NTable::TColumn>& columns, const TTableRange& range,
-        const TVector<NScheme::TTypeId>& keyTypes, ui64 itemsLimit = 0, bool reverse = false);
+        const TVector<NScheme::TTypeInfo>& keyTypes, ui64 itemsLimit = 0, bool reverse = false);
 
-    void AddWriteRange(const TTableId& tableId, const TTableRange& range, const TVector<NScheme::TTypeId>& keyTypes,
+    void AddWriteRange(const TTableId& tableId, const TTableRange& range, const TVector<NScheme::TTypeInfo>& keyTypes,
         const TVector<TColumnWriteMeta>& columns, bool isPureEraseOp);
 
     void MarkTxLoaded() {
@@ -101,6 +101,7 @@ public:
     void SetIsRepeatableSnapshot();
 
     TVector<NMiniKQL::IChangeCollector::TChange> GetCollectedChanges() const;
+    void ResetCollectedChanges();
 
     void ResetCounters() { EngineHostCounters = TEngineHostCounters(); }
     const TEngineHostCounters& GetCounters() const { return EngineHostCounters; }

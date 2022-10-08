@@ -958,7 +958,9 @@ private:
             && str != "}" && str != "|>" && str != "::" && !AfterNamespace && !AfterBracket
             && !AfterInvokeExpr && !AfterDollarOrAt && !AfterDot && (!AfterQuestion || str != "?")
             && (!InsideType || (str != "<" && str != ">" && str != "<>"))
-            && (!InsideType || !AfterLess)) {
+            && (!InsideType || !AfterLess)
+            && (!AfterKeyExpr || str != "[")
+            ) {
             Out(' ');
         }
 
@@ -969,6 +971,7 @@ private:
         AfterDigits = !str.Empty() && AllOf(str, [](char c) { return c >= '0' && c <= '9'; });
         AfterQuestion = (str == "?");
         AfterLess = (str == "<");
+        AfterKeyExpr = false;
 
         if (forceKeyword) {
             str = to_upper(str);
@@ -1479,6 +1482,23 @@ private:
         PopCurrentIndent();
     }
 
+    void VisitGroupByClause(const TRule_group_by_clause& msg) {
+        Visit(msg.GetToken1());
+        if (msg.HasBlock2()) {
+            Visit(msg.GetBlock2());
+        }
+
+        Visit(msg.GetToken3());
+        Visit(msg.GetRule_opt_set_quantifier4());
+        Visit(msg.GetRule_grouping_element_list5());
+        if (msg.HasBlock6()) {
+            NewLine();
+            PushCurrentIndent();
+            Visit(msg.GetBlock6());
+            PopCurrentIndent();
+        }
+    }
+
     void VisitWindowDefinitionList(const TRule_window_definition_list& msg) {
         NewLine();
         PushCurrentIndent();
@@ -1623,6 +1643,11 @@ private:
         Visit(msg.GetRule_order_by_clause2());
     }
 
+    void VisitKeyExpr(const TRule_key_expr& msg) {
+        AfterKeyExpr = true;
+        VisitAllFields(TRule_key_expr::GetDescriptor(), msg);
+    }
+
     void PushCurrentIndent() {
         CurrentIndent += OneIndent;
     }
@@ -1651,6 +1676,7 @@ private:
     bool AfterDigits = false;
     bool AfterQuestion = false;
     bool AfterLess = false;
+    bool AfterKeyExpr = false;
 };
 
 template <typename T>
@@ -1698,6 +1724,7 @@ TStaticData::TStaticData()
         {TRule_without_column_list::GetDescriptor(), MakeFunctor(&TVisitor::VisitWithoutColumnList)},
         {TRule_table_ref::GetDescriptor(), MakeFunctor(&TVisitor::VisitTableRef)},
         {TRule_grouping_element_list::GetDescriptor(), MakeFunctor(&TVisitor::VisitGroupingElementList)},
+        {TRule_group_by_clause::GetDescriptor(), MakeFunctor(&TVisitor::VisitGroupByClause)},
         {TRule_window_definition_list::GetDescriptor(), MakeFunctor(&TVisitor::VisitWindowDefinitionList)},
         {TRule_window_specification::GetDescriptor(), MakeFunctor(&TVisitor::VisitWindowSpecification)},
         {TRule_window_partition_clause::GetDescriptor(), MakeFunctor(&TVisitor::VisitWindowParitionClause)},
@@ -1707,6 +1734,7 @@ TStaticData::TStaticData()
         {TRule_cast_expr::GetDescriptor(), MakeFunctor(&TVisitor::VisitCastExpr)},
         {TRule_bitcast_expr::GetDescriptor(), MakeFunctor(&TVisitor::VisitBitCastExpr)},
         {TRule_ext_order_by_clause::GetDescriptor(), MakeFunctor(&TVisitor::VisitExtOrderByClause)},
+        {TRule_key_expr::GetDescriptor(), MakeFunctor(&TVisitor::VisitKeyExpr)},
 
         {TRule_pragma_stmt::GetDescriptor(), MakeFunctor(&TVisitor::VisitPragma)},
         {TRule_select_stmt::GetDescriptor(), MakeFunctor(&TVisitor::VisitSelect)},

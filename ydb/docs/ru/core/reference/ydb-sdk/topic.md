@@ -4,7 +4,182 @@
 
 Перед выполнением примеров [создайте топик](../ydb-cli/topic-create.md) и [добавьте читателя](../ydb-cli/topic-consumer-add.md).
 
-## Подключение к топику {#start-reader}
+## Управление топиками
+### Создание топика
+
+{% list tabs %}
+
+Единственный обязательный параметр для создания топика - это его путь, остальные параметры - опциональны.
+
+- Go
+
+  Полный список поддерживаемых параметров можно посмотреть в [документации SDK](https://pkg.go.dev/github.com/ydb-platform/ydb-go-sdk/v3/topic/topicoptions#CreateOption).
+
+  Пример создания тописка со списком поддерживаемых кодеков и минимальным количество партиций
+  ```go
+  err := db.Topic().Create(ctx, "topic-path",
+      // optional
+	  topicoptions.CreateWithSupportedCodecs(topictypes.CodecRaw, topictypes.CodecGzip),
+
+	  // optional
+	  topicoptions.CreateWithMinActivePartitions(3),
+  )
+  ```
+
+{% endlist %}
+
+### Изменение топика
+
+При изменении топика в параметрах нужно указать путь топика и те параметры, которые будут изменяться.
+
+{% list tabs %}
+- Go
+
+  Полный список поддерживаемых параметров можно посмотреть в [документации SDK](https://pkg.go.dev/github.com/ydb-platform/ydb-go-sdk/v3/topic/topicoptions#AlterOption).
+
+  Пример добавления читателя к топику
+
+  ```go
+   err := db.Topic().Alter(ctx, "topic-path",
+		topicoptions.AlterWithAddConsumers(topictypes.Consumer{
+			Name:            "new-consumer",
+			SupportedCodecs: []topictypes.Codec{topictypes.CodecRaw, topictypes.CodecGzip}, // optional
+		}),
+	)
+  ```
+{% endlist %}
+
+### Получение информации о топике
+
+{% list tabs %}
+
+- Go
+
+  ```go
+    descResult, err := db.Topic().Describe(ctx, "topic-path")
+	if err != nil {
+		log.Fatalf("failed drop topic: %v", err)
+		return
+	}
+	fmt.Printf("describe: %#v\n", descResult)
+  ```
+
+{% endlist %}
+
+### Удаление топика
+
+Для удаления топика достаточно указать путь к нему.
+
+{% list tabs %}
+
+- Go
+
+  ```go
+    err := db.Topic().Drop(ctx, "topic-path")
+  ```
+
+{% endlist %}
+
+
+## Запись сообщений
+### Подключение к топику для записи сообщений {#start-writer}
+
+На данный момент поддерживается подключение только с совпадающими producer_id и message_group_id, в будущем это ограничение будет снято.
+
+{% list tabs %}
+
+- Go
+
+  ```go
+  producerAndGroupID := "group-id"
+  writer, err := db.Topic().StartWriter(producerAndGroupID, "topicName",
+    topicoptions.WithMessageGroupID(producerAndGroupID),
+  )
+  if err != nil {
+      return err
+  }
+  ```
+
+{% endlist %}
+
+
+### Асинхронная запись сообщений
+
+{% list tabs %}
+
+- Go
+
+  Для отправки сообщения - достаточно в поле Data сохранить Reader, из которого можно будет прочитать данные. Можно рассчитывать на то что данные каждого сообщения читаются один раз (или до первой ошибки), к моменту возврата из Write данные будут уже прочитаны и сохранены во внутренний буфер.
+
+  SeqNo и дата создания сообщений по умолчанию проставляются автоматически.
+
+  По умолчанию Write выполняется асинхронно - данные из сообщений вычитываются и сохраняются во внутренний буфер, отправка происходит в фоне. Writer сам переподключается к YDB при обрывах связи и повторяет отправку сообщений пока это возможно. При получении ошибки, которую невозможно повторить Writer останавливается и следующие вызовы Write будут завершаться с ошибкой.
+
+  ```go
+  err := writer.Write(ctx,
+    topicwriter.Message{Data: strings.NewReader("1")},
+    topicwriter.Message{Data: bytes.NewReader([]byte{1,2,3})},
+    topicwriter.Message{Data: strings.NewReader("3")},
+  )
+  if err == nil {
+    return err
+  }
+  ```
+
+{% endlist %}
+
+
+### Запись сообщений с подтверждением о сохранении на сервере
+
+{% list tabs %}
+
+- Go
+
+  При подключении можно указать опцию синхронной записи сообщений - topicoptions.WithSyncWrite(true). Тогда Write будет возвращаться только после того как получит подтверждение с сервера о сохранении всех, сообщений переданных в вызове. При этом SDK так же как и обычно будет при необходимости переподключаться и повторять отправку сообщений. В этом режиме контекст управляет только временем ожидания ответа из SDK, т.е. даже после отмены контекста SDK продолжит попытки отправить сообщения.
+
+  ```go
+
+  producerAndGroupID := "group-id"
+  writer, _ := db.Topic().StartWriter(producerAndGroupID, "topicName",
+    topicoptions.WithMessageGroupID(producerAndGroupID),
+    topicoptions.WithSyncWrite(true),
+  )
+
+  err = writer.Write(ctx,
+    topicwriter.Message{Data: strings.NewReader("1")},
+    topicwriter.Message{Data: bytes.NewReader([]byte{1,2,3})},
+    topicwriter.Message{Data: strings.NewReader("3")},
+  )
+  if err == nil {
+    return err
+  }
+  ```
+
+{% endlist %}
+
+### Выбор кодека для сжатия сообщений
+
+{% list tabs %}
+
+- Go
+
+  По умолчанию SDK выбирает кодек автоматически (с учётом настроек топика). В автоматическом режиме SDK сначала отправляет по одной группе сообщений каждым из разрешённых кодеков, затем иногда будет пробовать сжать сообщения всеми доступными кодеками и выбирать кодек, дающий наименьший размер сообщения. Если для топика список разрешённых кодеков пуст, то автовыбор производится между Raw и Gzip-кодеками.
+  При необходимости можно задать фиксированный кодек в опциях подключения. Тогда будет использоваться именно он и замеры проводиться не будут.
+
+  ```go
+  producerAndGroupID := "group-id"
+  writer, _ := db.Topic().StartWriter(producerAndGroupID, "topicName",
+    topicoptions.WithMessageGroupID(producerAndGroupID),
+    topicoptions.WithCodec(topictypes.CodecGzip),
+  )
+  ```
+
+{% endlist %}
+
+
+
+## Чтение сообщений
+### Подключение к топику для чтения сообщений {#start-reader}
 
 Чтобы создать подключение к существующему топику `my-topic` через добавленного ранее читателя `my-consumer`, используйте следующий код:
 
@@ -45,7 +220,7 @@
 
 {% endlist %}
 
-## Чтение сообщений {#reading-messages}
+### Чтение сообщений {#reading-messages}
 
 Сервер хранит [позицию чтения сообщений](../../concepts/topic.md#consumer-offset). После вычитывания очередного сообщения клиент может [отправить на сервер подтверждение обработки](#commit). Позиция чтения изменится, а при новом подключении будут вычитаны только неподтвержденные сообщения.
 
@@ -97,7 +272,7 @@ SDK получает данные с сервера партиями и буфе
 
 {% endlist %}
 
-### Чтение с подтверждением обработки сообщений {#commit}
+#### Чтение с подтверждением обработки сообщений {#commit}
 
 Чтобы подтверждать обработку сообщений по одному, используйте следующий код:
 
@@ -112,7 +287,7 @@ SDK получает данные с сервера партиями и буфе
         if err != nil {
             return err
         }
-        processMessage(mess)          
+        processMessage(mess)
         r.Commit(mess.Context(), mess)
       }
   }
@@ -141,7 +316,7 @@ SDK получает данные с сервера партиями и буфе
 
 {% endlist %}
 
-### Чтение с хранением позиции на клиентской стороне {#client-commit}
+#### Чтение с хранением позиции на клиентской стороне {#client-commit}
 
 При начале чтения клиентский код должен сообщить серверу стартовую позицию чтения:
 
@@ -191,7 +366,7 @@ SDK получает данные с сервера партиями и буфе
 
 {% endlist %}
 
-## Обработка серверного прерывания чтения {#stop}
+### Обработка серверного прерывания чтения {#stop}
 
 В {{ ydb-short-name }} используется серверная балансировка партиций между клиентами. Это означает, что сервер может прерывать чтение сообщений из произвольных партиций.
 
@@ -199,7 +374,7 @@ SDK получает данные с сервера партиями и буфе
 
 В случае _жесткого прерывания_ клиент получает уведомление, что работать с сообщениями партиции больше нельзя. Клиент должен прекратить обработку прочитанных сообщений. Неподтвержденные сообщения будут переданы другому читателю.
 
-### Мягкое прерывание чтения {#soft-stop}
+#### Мягкое прерывание чтения {#soft-stop}
 
 {% list tabs %}
 
@@ -222,7 +397,7 @@ SDK получает данные с сервера партиями и буфе
 
 {% endlist %}
 
-### Жесткое прерывание чтения {#hard-stop}
+#### Жесткое прерывание чтения {#hard-stop}
 
 {% list tabs %}
 

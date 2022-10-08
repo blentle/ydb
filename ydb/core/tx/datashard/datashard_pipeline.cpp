@@ -1820,7 +1820,11 @@ bool TPipeline::WaitCompletion(const TOperation::TPtr& op) const {
     if(!op->Result() || op->Result()->GetStatus() != NKikimrTxDataShard::TEvProposeTransactionResult::COMPLETE)
         return true;
 
-    return CommittingOps.HasOpsBelow(op->GetMvccSnapshot());
+    return HasCommittingOpsBelow(op->GetMvccSnapshot());
+}
+
+bool TPipeline::HasCommittingOpsBelow(TRowVersion upperBound) const {
+    return CommittingOps.HasOpsBelow(upperBound);
 }
 
 bool TPipeline::PromoteCompleteEdgeUpTo(const TRowVersion& version, TTransactionContext& txc) {
@@ -1898,6 +1902,27 @@ bool TPipeline::MarkPlannedLogicallyIncompleteUpTo(const TRowVersion& version, T
         ActivePlannedOpsLogicallyIncompleteEnd = ++it;
     }
     return hadWrites;
+}
+
+bool TPipeline::AddLockDependencies(const TOperation::TPtr& op, TLocksUpdate& guardLocks) {
+    bool addedDependencies = false;
+
+    guardLocks.FlattenBreakLocks();
+    for (auto& lock : guardLocks.BreakLocks) {
+        // We cannot break frozen locks
+        // Find their corresponding operations and reschedule
+        if (lock.IsFrozen()) {
+            if (auto conflictOp = FindOp(lock.GetLastOpId())) {
+                if (conflictOp != op) {
+                    // FIXME: make sure this op is not complete
+                    op->AddDependency(conflictOp);
+                    addedDependencies = true;
+                }
+            }
+        }
+    }
+
+    return addedDependencies;
 }
 
 }}

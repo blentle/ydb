@@ -3,9 +3,30 @@
 #include "mkql_node.h"
 
 #include <ydb/library/yql/public/udf/udf_type_builder.h>
+#include <ydb/library/yql/parser/pg_wrapper/interface/compare.h>
+
+#include <arrow/datum.h>
 
 namespace NKikimr {
 namespace NMiniKQL {
+
+bool ConvertArrowType(TType* itemType, bool& isOptional, std::shared_ptr<arrow::DataType>& type);
+
+class TArrowType : public NUdf::IArrowType {
+public:
+    TArrowType(const std::shared_ptr<arrow::DataType>& type)
+        : Type(type)
+    {}
+
+    std::shared_ptr<arrow::DataType> GetType() const {
+        return Type;
+    }
+
+    void Export(ArrowSchema* out) const final;
+
+private:
+    const std::shared_ptr<arrow::DataType> Type;
+};
 
 //////////////////////////////////////////////////////////////////////////////
 // TFunctionTypeInfo
@@ -118,6 +139,10 @@ public:
     NUdf::IEnumTypeBuilder::TPtr Enum(ui32 expectedItems = 10) const override;
     NUdf::TType* Tagged(const NUdf::TType* baseType, const NUdf::TStringRef& tag) const override;
     NUdf::TType* Pg(ui32 typeId) const override;
+    NUdf::IBlockTypeBuilder::TPtr Block(bool isScalar) const override;
+    void Unused1() override;
+    void Unused2() override;
+
     bool GetSecureParam(NUdf::TStringRef key, NUdf::TStringRef& value) const override;
 
 private:
@@ -148,6 +173,8 @@ public:
     void VisitType(const NUdf::TType* type, NUdf::ITypeVisitor* visitor) const override;
     bool IsSameType(const NUdf::TType* type1, const NUdf::TType* type2) const override;
     const NYql::NUdf::TPgTypeDescription* FindPgTypeDescription(ui32 typeId) const override;
+    NUdf::IArrowType::TPtr MakeArrowType(const NUdf::TType* type) const override;
+    NUdf::IArrowType::TPtr ImportArrowType(ArrowSchema* schema) const override;
 
 private:
     static void DoData(const NMiniKQL::TDataType* dt, NUdf::ITypeVisitor* v);
@@ -162,15 +189,12 @@ private:
     static void DoResource(const NMiniKQL::TResourceType* rt, NUdf::ITypeVisitor* v);
     static void DoTagged(const NMiniKQL::TTaggedType* tt, NUdf::ITypeVisitor* v);
     static void DoPg(const NMiniKQL::TPgType* tt, NUdf::ITypeVisitor* v);
+    static void DoBlock(const NMiniKQL::TBlockType* tt, NUdf::ITypeVisitor* v);
 };
 
 NUdf::IHash::TPtr MakeHashImpl(const NMiniKQL::TType* type);
 NUdf::ICompare::TPtr MakeCompareImpl(const NMiniKQL::TType* type);
 NUdf::IEquate::TPtr MakeEquateImpl(const NMiniKQL::TType* type);
-
-NUdf::IHash::TPtr MakePgHash(const NMiniKQL::TPgType* type);
-NUdf::ICompare::TPtr MakePgCompare(const NMiniKQL::TPgType* type);
-NUdf::IEquate::TPtr MakePgEquate(const NMiniKQL::TPgType* type);
 
 } // namespace NMiniKQL
 } // namespace Nkikimr

@@ -11,6 +11,8 @@ namespace {
 
 template<typename TLeft, typename TRight, typename TOutput>
 struct TAdd : public TSimpleArithmeticBinary<TLeft, TRight, TOutput, TAdd<TLeft, TRight, TOutput>> {
+    static constexpr bool DefaultNulls = true;
+
     static TOutput Do(TOutput left, TOutput right)
     {
         return left + right;
@@ -188,6 +190,10 @@ void RegisterAdd(IBuiltinFunctionRegistry& registry) {
 
     RegisterFunctionBinOpt<NUdf::TDataType<NUdf::TInterval>, NUdf::TDataType<NUdf::TInterval>,
         NUdf::TDataType<NUdf::TInterval>, TDateTimeAdd, TBinaryArgsOptWithNullableResult>(registry, "Add");
+}
+
+void RegisterAdd(arrow::compute::FunctionRegistry& registry) {
+    AddFunction(registry, std::make_shared<TBinaryNumericFunction<TAdd>>("Add"));
 }
 
 void RegisterAggrAdd(IBuiltinFunctionRegistry& registry) {

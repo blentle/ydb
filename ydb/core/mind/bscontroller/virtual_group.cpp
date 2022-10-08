@@ -88,7 +88,7 @@ namespace NKikimr::NBsController {
         group->CalculateGroupStatus();
 
         NKikimrBlobDepot::TBlobDepotConfig config;
-        config.SetOperationMode(NKikimrBlobDepot::EOperationMode::VirtualGroup);
+        config.SetVirtualGroupId(group->ID);
         config.MutableChannelProfiles()->CopyFrom(cmd.GetChannelProfiles());
 
         const bool success = config.SerializeToString(&group->BlobDepotConfig.ConstructInPlace());
@@ -110,15 +110,26 @@ namespace NKikimr::NBsController {
                 throw TExError() << "group is already being decommitted" << TErrorParams::GroupId(groupId);
             }
 
+            auto& sp = StoragePools.Get();
+            const auto it = sp.find(group->StoragePoolId);
+            if (it == sp.end()) {
+                throw TExError() << "invalid storage pool for decommitted group";
+            }
+            for (const auto& ch : cmd.GetChannelProfiles()) {
+                if (ch.GetStoragePoolName() == it->second.Name) {
+                    throw TExError() << "BlobDepot can't reside on the same Storage Pool as the decommitted group itself";
+                }
+            }
+
             group->DecommitStatus = NKikimrBlobStorage::TGroupDecommitStatus::PENDING;
             group->VirtualGroupState = NKikimrBlobStorage::EVirtualGroupState::NEW;
             group->HiveId = cmd.GetHiveId();
             group->NeedAlter = true;
 
             NKikimrBlobDepot::TBlobDepotConfig config;
-            config.SetOperationMode(NKikimrBlobDepot::EOperationMode::VirtualGroup);
+            config.SetVirtualGroupId(groupId);
+            config.SetIsDecommittingGroup(true);
             config.MutableChannelProfiles()->CopyFrom(cmd.GetChannelProfiles());
-            config.SetDecommitGroupId(groupId);
 
             const bool success = config.SerializeToString(&group->BlobDepotConfig.ConstructInPlace());
             Y_VERIFY(success);

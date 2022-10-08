@@ -21,14 +21,16 @@
 namespace NKikimr {
 namespace NSchemeShard {
 
-inline bool IsAllowedKeyType(NScheme::TTypeId typeId) {
-    switch (typeId) {
+inline bool IsAllowedKeyType(NScheme::TTypeInfo typeInfo) {
+    switch (typeInfo.GetTypeId()) {
         case NScheme::NTypeIds::Json:
         case NScheme::NTypeIds::Yson:
         case NScheme::NTypeIds::Float:
         case NScheme::NTypeIds::Double:
         case NScheme::NTypeIds::JsonDocument:
             return false;
+        case NScheme::NTypeIds::Pg:
+            return NPg::TypeDescIsComparable(typeInfo.GetTypeDesc());
         default:
             return true;
     }
@@ -52,7 +54,7 @@ inline NKikimrSchemeOp::TModifyScheme TransactionTemplate(const TString& working
 }
 
 TSerializedCellVec ChooseSplitKeyByHistogram(const NKikimrTableStats::THistogram& histogram,
-                                  const TConstArrayRef<NScheme::TTypeId>& keyColumnTypes);
+                                  const TConstArrayRef<NScheme::TTypeInfo>& keyColumnTypes);
 
 class TShardDeleter {
     struct TPerHiveDeletions {
@@ -121,7 +123,7 @@ private:
     bool SelfPingWakeupScheduled;
 };
 
-}
+} // NSchemeShard
 
 namespace NTableIndex {
 
@@ -131,7 +133,7 @@ NKikimrSchemeOp::TTableDescription CalcImplTableDesc(
     const NKikimrSchemeOp::TTableDescription& indexTableDesc);
 
 NKikimrSchemeOp::TTableDescription CalcImplTableDesc(
-    const NKikimrSchemeOp::TTableDescription& baseTableDesrc,
+    const NKikimrSchemeOp::TTableDescription& baseTableDesc,
     const NTableIndex::TTableColumns& implTableColumns,
     const NKikimrSchemeOp::TTableDescription& indexTableDesc);
 
@@ -140,23 +142,82 @@ NKikimrSchemeOp::TPartitionConfig PartitionConfigForIndexes(
     const NKikimrSchemeOp::TTableDescription& indexTableDesc);
 
 NKikimrSchemeOp::TPartitionConfig PartitionConfigForIndexes(
-    const NKikimrSchemeOp::TTableDescription& baseTableDesrc,
+    const NKikimrSchemeOp::TTableDescription& baseTableDesc,
     const NKikimrSchemeOp::TTableDescription& indexTableDesc);
 
-TTableColumns ExtractInfo(const NKikimrSchemeOp::TTableDescription& tableDesrc);
-TIndexColumns ExtractInfo(const NKikimrSchemeOp::TIndexCreationConfig& indexDesc);
 TTableColumns ExtractInfo(const NSchemeShard::TTableInfo::TPtr& tableInfo);
+TTableColumns ExtractInfo(const NKikimrSchemeOp::TTableDescription& tableDesc);
+TIndexColumns ExtractInfo(const NKikimrSchemeOp::TIndexCreationConfig& indexDesc);
 
-using TColumnTypes = THashMap<TString, NScheme::TTypeId>;
+using TColumnTypes = THashMap<TString, NScheme::TTypeInfo>;
 
-bool ExtractTypes(const NKikimrSchemeOp::TTableDescription& baseTableDesrc, TColumnTypes& columsTypes, TString& explain);
-TColumnTypes ExtractTypes(const NSchemeShard::TTableInfo::TPtr& baseTableInfo);
+bool ExtractTypes(const NSchemeShard::TTableInfo::TPtr& baseTableInfo, TColumnTypes& columsTypes, TString& explain);
+bool ExtractTypes(const NKikimrSchemeOp::TTableDescription& baseTableDesc, TColumnTypes& columsTypes, TString& explain);
 
 bool IsCompatibleKeyTypes(
     const TColumnTypes& baseTableColumsTypes,
     const TTableColumns& implTableColumns,
     bool uniformTable,
     TString& explain);
+
+template <typename TTableDesc>
+bool CommonCheck(const TTableDesc& tableDesc, const NKikimrSchemeOp::TIndexCreationConfig& indexDesc,
+        const NSchemeShard::TSchemeLimits& schemeLimits, bool uniformTable,
+        TTableColumns& implTableColumns, NKikimrScheme::EStatus& status, TString& error)
+{
+    const TTableColumns baseTableColumns = ExtractInfo(tableDesc);
+    const TIndexColumns indexKeys = ExtractInfo(indexDesc);
+
+    if (indexKeys.KeyColumns.empty()) {
+        status = NKikimrScheme::EStatus::StatusInvalidParameter;
+        error = "No key colums in index creation config";
+        return false;
+    }
+
+    if (!indexKeys.DataColumns.empty() && !AppData()->FeatureFlags.GetEnableDataColumnForIndexTable()) {
+        status = NKikimrScheme::EStatus::StatusPreconditionFailed;
+        error = "It is not allowed to create index with data column";
+        return false;
+    }
+
+    if (!IsCompatibleIndex(baseTableColumns, indexKeys, error)) {
+        status = NKikimrScheme::EStatus::StatusInvalidParameter;
+        return false;
+    }
+
+    TColumnTypes columnsTypes;
+    if (!ExtractTypes(tableDesc, columnsTypes, error)) {
+        status = NKikimrScheme::EStatus::StatusInvalidParameter;
+        return false;
+    }
+
+    implTableColumns = CalcTableImplDescription(baseTableColumns, indexKeys);
+    if (!IsCompatibleKeyTypes(columnsTypes, implTableColumns, uniformTable, error)) {
+        status = NKikimrScheme::EStatus::StatusInvalidParameter;
+        return false;
+    }
+
+    if (implTableColumns.Keys.size() > schemeLimits.MaxTableKeyColumns) {
+        status = NKikimrScheme::EStatus::StatusSchemeError;
+        error = TStringBuilder()
+            << "Too many keys indexed, index table reaches the limit of the maximum key colums count"
+            << ": indexing colums: " << indexKeys.KeyColumns.size()
+            << ", requested keys colums for index table: " << implTableColumns.Keys.size()
+            << ", limit: " << schemeLimits.MaxTableKeyColumns;
+        return false;
+    }
+
+    return true;
 }
 
+template <typename TTableDesc>
+bool CommonCheck(const TTableDesc& tableDesc, const NKikimrSchemeOp::TIndexCreationConfig& indexDesc,
+        const NSchemeShard::TSchemeLimits& schemeLimits, TString& error)
+{
+    TTableColumns implTableColumns;
+    NKikimrScheme::EStatus status;
+    return CommonCheck(tableDesc, indexDesc, schemeLimits, false, implTableColumns, status, error);
 }
+
+} // NTableIndex
+} // NKikimr

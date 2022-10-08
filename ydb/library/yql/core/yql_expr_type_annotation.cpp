@@ -3,12 +3,12 @@
 #include "yql_opt_rewrite_io.h"
 #include "yql_opt_utils.h"
 #include "yql_expr_optimize.h"
-#include "yql_pg_utils.h"
 
 #include <ydb/library/yql/public/udf/udf_data_type.h>
 #include <ydb/library/yql/minikql/dom/json.h>
 #include <ydb/library/yql/minikql/dom/yson.h>
 #include <ydb/library/yql/core/sql_types/simple_types.h>
+#include <ydb/library/yql/parser/pg_wrapper/interface/utils.h>
 #include <ydb/library/yql/public/decimal/yql_decimal.h>
 #include <ydb/library/yql/utils/yql_panic.h>
 #include <ydb/library/yql/utils/utf8.h>
@@ -1476,6 +1476,8 @@ NUdf::TCastResultOptions CastResult(const TTypeAnnotationNode* source, const TTy
         switch (sKind) {
             case ETypeAnnotationKind::Void:
             case ETypeAnnotationKind::Null:
+            case ETypeAnnotationKind::EmptyList:
+            case ETypeAnnotationKind::EmptyDict:
                 return NUdf::ECastOptions::Complete;
             case ETypeAnnotationKind::Optional:
                 return CastResult<Strong>(source->Cast<TOptionalExprType>(), target->Cast<TOptionalExprType>());
@@ -1499,6 +1501,10 @@ NUdf::TCastResultOptions CastResult(const TTypeAnnotationNode* source, const TTy
                 return CastResult<Strong>(source->Cast<TFlowExprType>(), target->Cast<TFlowExprType>());
             case ETypeAnnotationKind::Resource:
                 return source->Cast<TResourceExprType>()->GetTag() == target->Cast<TResourceExprType>()->GetTag() ? NUdf::ECastOptions::Complete : NUdf::ECastOptions::Impossible;
+            case ETypeAnnotationKind::Tagged:
+                return source->Cast<TTaggedExprType>()->GetTag() == target->Cast<TTaggedExprType>()->GetTag() ?
+                    CastResult<Strong>(source->Cast<TTaggedExprType>()->GetBaseType(), target->Cast<TTaggedExprType>()->GetBaseType()) :
+                    NUdf::ECastOptions::Impossible;
             default: break;
         }
     } else if (sKind == ETypeAnnotationKind::Null) {
@@ -1630,6 +1636,10 @@ const TTypeAnnotationNode* CommonType(TPositionHandle pos, const TTypeAnnotation
     if (!(one && two))
         return nullptr;
 
+    if (HasError(one, ctx) || HasError(two, ctx)) {
+        return nullptr;
+    }
+
     if (IsSameAnnotation(*one, *two))
         return two;
 
@@ -1660,6 +1670,8 @@ const TTypeAnnotationNode* CommonType(TPositionHandle pos, const TTypeAnnotation
             default:
                 break;
         }
+
+        ctx.AddError(TIssue(ctx.GetPosition(pos), TStringBuilder() << "Cannot infer common type for " << kindOne));
     } else {
         if constexpr (!Strict) {
             if (ETypeAnnotationKind::Pg == kindOne) {
@@ -4885,6 +4897,20 @@ TExprNode::TPtr ExpandTypeNoCache(TPositionHandle position, const TTypeAnnotatio
         auto ret = ctx.NewCallable(position, "TaggedType",
             { ExpandType(position, *taggedType->GetBaseType(), ctx),
             ctx.NewAtom(position, taggedType->GetTag()) });
+        return ret;
+    }
+
+    case ETypeAnnotationKind::Block:
+    {
+        auto ret = ctx.NewCallable(position, "BlockType",
+            { ExpandType(position, *type.Cast<TBlockExprType>()->GetItemType(), ctx) });
+        return ret;
+    }
+
+    case ETypeAnnotationKind::Scalar:
+    {
+        auto ret = ctx.NewCallable(position, "ScalarType",
+            { ExpandType(position, *type.Cast<TScalarExprType>()->GetItemType(), ctx) });
         return ret;
     }
 

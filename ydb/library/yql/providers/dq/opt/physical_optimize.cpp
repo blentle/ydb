@@ -44,6 +44,8 @@ public:
         AddHandler(0, &TCoAssumeSorted::Match, HNDL(BuildSortStage<false>));
         AddHandler(0, &TCoOrderedLMap::Match, HNDL(PushOrderedLMapToStage<false>));
         AddHandler(0, &TCoLMap::Match, HNDL(PushLMapToStage<false>));
+        AddHandler(0, &TCoOrderedLMap::Match, HNDL(BuildOrderedLMapOverMuxStage));
+        AddHandler(0, &TCoLMap::Match, HNDL(BuildLMapOverMuxStage));
         if (enablePrecompute) {
             AddHandler(0, &TCoHasItems::Match, HNDL(BuildHasItems));
             AddHandler(0, &TCoSqlIn::Match, HNDL(BuildSqlIn<false>));
@@ -244,6 +246,14 @@ protected:
         return DqPushLMapToStage(node, ctx, optCtx, *getParents(), IsGlobal);
     }
 
+    TMaybeNode<TExprBase> BuildOrderedLMapOverMuxStage(TExprBase node, TExprContext& ctx, IOptimizationContext& optCtx, const TGetParents& getParents) {
+        return DqBuildOrderedLMapOverMuxStage(node, ctx, optCtx, *getParents());
+    }
+
+    TMaybeNode<TExprBase> BuildLMapOverMuxStage(TExprBase node, TExprContext& ctx, IOptimizationContext& optCtx, const TGetParents& getParents) {
+        return DqBuildLMapOverMuxStage(node, ctx, optCtx, *getParents());
+    }
+
     template <bool IsGlobal>
     TMaybeNode<TExprBase> PushCombineToStage(TExprBase node, TExprContext& ctx, IOptimizationContext& optCtx, const TGetParents& getParents) {
         return DqPushCombineToStage(node, ctx, optCtx, *getParents(), IsGlobal);
@@ -301,7 +311,8 @@ protected:
     TMaybeNode<TExprBase> BuildJoin(TExprBase node, TExprContext& ctx, IOptimizationContext& optCtx, const TGetParents& getParents) {
         auto join = node.Cast<TDqJoin>();
         const TParentsMap* parentsMap = getParents();
-        return DqBuildJoin(join, ctx, optCtx, *parentsMap, IsGlobal, /* pushLeftStage = */ false /* TODO */);
+        bool enableGraceJoin = Config->EnableGraceJoin.Get().GetOrElse(false);
+        return DqBuildJoin(join, ctx, optCtx, *parentsMap, IsGlobal, /* pushLeftStage = */ false /* TODO */, enableGraceJoin);
     }
 
     TMaybeNode<TExprBase> BuildHasItems(TExprBase node, TExprContext& ctx, IOptimizationContext& optCtx) {

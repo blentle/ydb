@@ -21,6 +21,7 @@ target_link_libraries(ydb-core-scheme PUBLIC
   ydb-core-scheme_types
   ydb-core-util
   ydb-library-aclib
+  parser-pg_wrapper-interface
   public-lib-scheme_types
 )
 target_sources(ydb-core-scheme PRIVATE
@@ -28,4 +29,6 @@ target_sources(ydb-core-scheme PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/scheme/scheme_tablecell.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/scheme/scheme_tabledefs.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/scheme/scheme_types_defs.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/scheme/scheme_type_info.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/scheme/scheme_types_proto.cpp
 )

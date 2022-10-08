@@ -187,6 +187,11 @@ bool TAsyncIndexChangeCollector::Collect(const TTableId& tableId, ERowOp rop,
     return true;
 }
 
+void TAsyncIndexChangeCollector::Reset() {
+    TBaseChangeCollector::Reset();
+    RowsCache.Reset();
+}
+
 auto TAsyncIndexChangeCollector::CacheTags(const TTableId& tableId) const {
     Y_VERIFY(Self->GetUserTables().contains(tableId.PathId.LocalPathId));
     auto userTable = Self->GetUserTables().at(tableId.PathId.LocalPathId);
@@ -232,7 +237,7 @@ TArrayRef<TTag> TAsyncIndexChangeCollector::GetTagsToSelect(const TTableId& tabl
     }
 }
 
-void TAsyncIndexChangeCollector::FillKeyFromRowState(TTag tag, TPos pos, const TRowState& rowState, NScheme::TTypeId type) {
+void TAsyncIndexChangeCollector::FillKeyFromRowState(TTag tag, TPos pos, const TRowState& rowState, NScheme::TTypeInfo type) {
     Y_VERIFY(pos < rowState.Size());
 
     IndexKeyVals.emplace_back(rowState.Get(pos).AsRef(), type);
@@ -262,7 +267,7 @@ void TAsyncIndexChangeCollector::FillKeyFromUpdate(TTag tag, TPos pos, TArrayRef
     TagsSeen.insert(tag);
 }
 
-void TAsyncIndexChangeCollector::FillKeyWithNull(TTag tag, NScheme::TTypeId type) {
+void TAsyncIndexChangeCollector::FillKeyWithNull(TTag tag, NScheme::TTypeInfo type) {
     IndexKeyVals.emplace_back(TRawTypeValue({}, type));
     IndexKeyTags.emplace_back(tag);
     TagsSeen.insert(tag);
@@ -277,7 +282,7 @@ void TAsyncIndexChangeCollector::FillDataFromUpdate(TTag tag, TPos pos, TArrayRe
     IndexDataVals.emplace_back(tag, ECellOp::Set, update.Value);
 }
 
-void TAsyncIndexChangeCollector::FillDataWithNull(TTag tag, NScheme::TTypeId type) {
+void TAsyncIndexChangeCollector::FillDataWithNull(TTag tag, NScheme::TTypeInfo type) {
     IndexDataVals.emplace_back(tag, ECellOp::Set, TRawTypeValue({}, type));
 }
 

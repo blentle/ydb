@@ -21,6 +21,7 @@ bool TDataShard::TTxInit::Execute(TTransactionContext& txc, const TActorContext&
     try {
         Self->State = TShardState::Unknown;
         Self->LastLocalTid = Schema::MinLocalTid;
+        Self->LastLoanTableTid = 0;
         Self->LastSeqno = 1;
         Self->NextChangeRecordOrder = 1;
         Self->LastChangeRecordGroup = 1;
@@ -178,6 +179,7 @@ bool TDataShard::TTxInit::ReadEverything(TTransactionContext &txc) {
     // Reads from Sys table
     LOAD_SYS_UI64(db, Schema::Sys_State, Self->State);
     LOAD_SYS_UI64(db, Schema::Sys_LastLocalTid, Self->LastLocalTid);
+    LOAD_SYS_UI64(db, Schema::Sys_LastLoanTableTid, Self->LastLoanTableTid);
     LOAD_SYS_UI64(db, Schema::Sys_LastSeqno, Self->LastSeqno);
     LOAD_SYS_UI64(db, Schema::Sys_NextChangeRecordOrder, Self->NextChangeRecordOrder);
     LOAD_SYS_UI64(db, Schema::Sys_LastChangeRecordGroup, Self->LastChangeRecordGroup);
@@ -350,9 +352,17 @@ bool TDataShard::TTxInit::ReadEverything(TTransactionContext &txc) {
             bool parseOk = ParseFromStringNoSizeLimit(*Self->SrcSplitDescription, splitDescr);
             Y_VERIFY(parseOk);
 
-            for (ui32 i = 0; i < Self->SrcSplitDescription->DestinationRangesSize(); ++i) {
-                ui64 dstTablet = Self->SrcSplitDescription->GetDestinationRanges(i).GetTabletID();
-                Self->ChangeExchangeSplitter.AddDst(dstTablet);
+            switch (Self->State) {
+            case TShardState::SplitSrcWaitForNoTxInFlight:
+            case TShardState::SplitSrcMakeSnapshot:
+                // split just started, there might be in-flight transactions
+                break;
+            default:
+                for (ui32 i = 0; i < Self->SrcSplitDescription->DestinationRangesSize(); ++i) {
+                    ui64 dstTablet = Self->SrcSplitDescription->GetDestinationRanges(i).GetTabletID();
+                    Self->ChangeExchangeSplitter.AddDst(dstTablet);
+                }
+                break;
             }
         }
     }

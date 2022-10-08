@@ -26,7 +26,7 @@ using namespace NTabletFlatExecutor;
 namespace {
 
 NUdf::TUnboxedValue CreateRow(const TVector<TCell>& inRow,
-                              const TVector<NScheme::TTypeId>& inType,
+                              const TVector<NScheme::TTypeInfo>& inType,
                               const THolderFactory& holderFactory) {
     NUdf::TUnboxedValue* rowItems = nullptr;
     auto row = holderFactory.CreateDirectArrayHolder(inRow.size(), rowItems);
@@ -43,10 +43,10 @@ NUdf::TUnboxedValue CreateRow(const TVector<TCell>& inRow,
 ///
 struct ItemInfo {
     ui32 ColumnId;
-    NScheme::TTypeId SchemeType;
+    NScheme::TTypeInfo SchemeType;
     TOptionalType* OptType;
 
-    ItemInfo(ui32 colId, NScheme::TTypeId schemeType, TOptionalType* optType)
+    ItemInfo(ui32 colId, NScheme::TTypeInfo schemeType, TOptionalType* optType)
         : ColumnId(colId)
         , SchemeType(schemeType)
         , OptType(optType)
@@ -88,7 +88,7 @@ struct TRowResultInfo {
 
         // reorder columns
         TVector<TCell> outRow(Reserve(ItemInfos.size()));
-        TVector<NScheme::TTypeId> outTypes(Reserve(ItemInfos.size()));
+        TVector<NScheme::TTypeInfo> outTypes(Reserve(ItemInfos.size()));
         for (ui32 i = 0; i < ItemInfos.size(); ++i) {
             ui32 colId = ItemInfos[i].ColumnId;
             outRow.emplace_back(std::move(inRow[colId]));
@@ -96,93 +96,6 @@ struct TRowResultInfo {
         }
 
         return CreateRow(outRow, outTypes, holderFactory);
-    }
-};
-
-///
-struct TRangeResultInfo {
-    TStructType* ResultType;
-    TStructType* RowType;
-    TSmallVec<ItemInfo> ItemInfos;
-    mutable ui64 Bytes = 0;
-    TDefaultListRepresentation Rows;
-    TString FirstKey;
-
-    // optimisation: reuse vectors
-    TVector<TCell> TmpRow;
-    TVector<NScheme::TTypeId> TmpTypes;
-
-    TListType* RowsListType() const { return AS_TYPE(TListType, ResultType->GetMemberType(0)); }
-    TDataType* TruncType() const { return AS_TYPE(TDataType, ResultType->GetMemberType(1)); }
-
-    TRangeResultInfo(const TStructLiteral* columnIds, const THashMap<ui32, TSysTables::TTableColumnInfo>& columns,
-                     TStructType* returnType)
-    {
-        ResultType = AS_TYPE(TStructType, returnType);
-        Y_VERIFY_DEBUG(ResultType->GetMembersCount() == 2);
-        Y_VERIFY_DEBUG(ResultType->GetMemberName(0) == "List");
-        Y_VERIFY_DEBUG(ResultType->GetMemberName(1) == "Truncated");
-
-        RowType = AS_TYPE(TStructType, RowsListType()->GetItemType());
-
-        ItemInfos.reserve(columnIds->GetValuesCount());
-        for (ui32 i = 0; i < columnIds->GetValuesCount(); ++i) {
-            TOptionalType * optType = AS_TYPE(TOptionalType, RowType->GetMemberType(i));
-            TDataLiteral* literal = AS_VALUE(TDataLiteral, columnIds->GetValue(i));
-            ui32 colId = literal->AsValue().Get<ui32>();
-
-            const TSysTables::TTableColumnInfo * colInfo = columns.FindPtr(colId);
-            Y_VERIFY(colInfo && (colInfo->Id == colId), "No column info for column");
-            ItemInfos.emplace_back(ItemInfo(colId, colInfo->PType, optType));
-        }
-    }
-
-    static TString Serialize(const TVector<TCell>& row, const TVector<NScheme::TTypeId>& types) {
-        Y_VERIFY(row.size() == types.size());
-
-        ui32 count = row.size();
-        TString str((const char*)&count, sizeof(ui32));
-        str.append((const char*)&types[0], count * sizeof(NScheme::TTypeId));
-
-        TConstArrayRef<TCell> array(&row[0], row.size());
-        return str + TSerializedCellVec::Serialize(array);
-    }
-
-    void AppendRow(const TVector<TCell>& inRow, const THolderFactory& holderFactory) {
-        if (inRow.empty())
-            return;
-
-        Y_VERIFY(inRow.size() >= ItemInfos.size());
-
-        TmpRow.clear();
-        TmpTypes.clear();
-        TmpRow.reserve(ItemInfos.size());
-        TmpTypes.reserve(ItemInfos.size());
-
-        for (ui32 i = 0; i < ItemInfos.size(); ++i) {
-            ui32 colId = ItemInfos[i].ColumnId;
-            TmpRow.push_back(inRow[colId]);
-            TmpTypes.push_back(ItemInfos[i].SchemeType);
-        }
-
-        Bytes += 8; // per row overhead
-        Rows = Rows.Append(CreateRow(TmpRow, TmpTypes, holderFactory));
-
-        if (!FirstKey) {
-            FirstKey = Serialize(TmpRow, TmpTypes);
-        }
-    }
-
-    NUdf::TUnboxedValue CreateResult(const THolderFactory& holderFactory) {
-        NUdf::TUnboxedValue* resultItems = nullptr;
-        auto result = holderFactory.CreateDirectArrayHolder(4, resultItems);
-
-        resultItems[0] = holderFactory.CreateDirectListHolder(std::move(Rows));
-        resultItems[1] = NUdf::TUnboxedValuePod(false);
-        resultItems[2] = MakeString(FirstKey);
-        resultItems[3] = NUdf::TUnboxedValuePod(Bytes);
-
-        return std::move(result);
     }
 };
 
@@ -249,7 +162,7 @@ private:
     const TTableId TableId;
     TDataShard* Self;
     THashMap<ui32, TSysTables::TTableColumnInfo> Columns;
-    TVector<ui32> KeyTypes;
+    TVector<NScheme::TTypeInfo> KeyTypes;
 };
 
 
@@ -280,13 +193,14 @@ TIntrusivePtr<TThrRefBase> InitDataShardSysTables(TDataShard* self) {
 ///
 class TDataShardEngineHost : public TEngineHost {
 public:
-    TDataShardEngineHost(TDataShard* self, NTable::TDatabase& db, TEngineHostCounters& counters, ui64& lockTxId, ui32& lockNodeId, TInstant now)
+    TDataShardEngineHost(TDataShard* self, TEngineBay& engineBay, NTable::TDatabase& db, TEngineHostCounters& counters, ui64& lockTxId, ui32& lockNodeId, TInstant now)
         : TEngineHost(db, counters,
             TEngineHostSettings(self->TabletID(),
                 (self->State == TShardState::Readonly || self->State == TShardState::Frozen),
                 self->ByKeyFilterDisabled(),
                 self->GetKeyAccessSampler()))
         , Self(self)
+        , EngineBay(engineBay)
         , DB(db)
         , LockTxId(lockTxId)
         , LockNodeId(lockNodeId)
@@ -351,6 +265,14 @@ public:
         return total;
     }
 
+    void ResetCollectedChanges() {
+        for (auto& pr : ChangeCollectors) {
+            if (pr.second) {
+                pr.second->Reset();
+            }
+        }
+    }
+
     bool IsValidKey(TKeyDesc& key, std::pair<ui64, ui64>& maxSnapshotTime) const override {
         if (TSysTables::IsSystemTable(key.TableId))
             return DataShardSysTable(key.TableId).IsValidKey(key);
@@ -382,7 +304,9 @@ public:
             return DataShardSysTable(tableId).SelectRow(row, columnIds, returnType, readTarget, holderFactory);
         }
 
-        Self->SysLocksTable().SetLock(tableId, row, LockTxId, LockNodeId);
+        if (LockTxId) {
+            Self->SysLocksTable().SetLock(tableId, row);
+        }
 
         Self->SetTableAccessTime(tableId, Now);
         return TEngineHost::SelectRow(tableId, row, columnIds, returnType, readTarget, holderFactory);
@@ -395,7 +319,9 @@ public:
     {
         Y_VERIFY(!TSysTables::IsSystemTable(tableId), "SelectRange no system table is not supported");
 
-        Self->SysLocksTable().SetLock(tableId, range, LockTxId, LockNodeId);
+        if (LockTxId) {
+            Self->SysLocksTable().SetLock(tableId, range);
+        }
 
         Self->SetTableAccessTime(tableId, Now);
         return TEngineHost::SelectRange(tableId, range, columnIds, skipNullKeys, returnType, readTarget,
@@ -411,9 +337,9 @@ public:
         CheckWriteConflicts(tableId, row);
 
         if (LockTxId) {
-            Self->SysLocksTable().SetWriteLock(tableId, row, LockTxId, LockNodeId);
+            Self->SysLocksTable().SetWriteLock(tableId, row);
         } else {
-            Self->SysLocksTable().BreakLock(tableId, row);
+            Self->SysLocksTable().BreakLocks(tableId, row);
         }
         Self->SetTableUpdateTime(tableId, Now);
 
@@ -469,9 +395,9 @@ public:
         CheckWriteConflicts(tableId, row);
 
         if (LockTxId) {
-            Self->SysLocksTable().SetWriteLock(tableId, row, LockTxId, LockNodeId);
+            Self->SysLocksTable().SetWriteLock(tableId, row);
         } else {
-            Self->SysLocksTable().BreakLock(tableId, row);
+            Self->SysLocksTable().BreakLocks(tableId, row);
         }
 
         Self->SetTableUpdateTime(tableId, Now);
@@ -532,7 +458,7 @@ public:
 
         // Don't use tx map when we know there's no write lock for a table
         // Note: currently write lock implies uncommitted changes
-        if (!Self->SysLocksTable().HasWriteLock(LockTxId, tableId)) {
+        if (!Self->SysLocksTable().HasCurrentWriteLock(tableId)) {
             return nullptr;
         }
 
@@ -601,16 +527,18 @@ public:
 
     void AddReadConflict(const TTableId& tableId, ui64 txId) const {
         Y_UNUSED(tableId);
-        if (LockTxId) {
-            // We have detected uncommitted changes in txId that could affect
-            // our read result. We arrange a conflict that breaks our lock
-            // when txId commits.
-            Self->SysLocksTable().AddReadConflict(txId, LockTxId, LockNodeId);
-        }
+        Y_VERIFY(LockTxId);
+
+        // We have detected uncommitted changes in txId that could affect
+        // our read result. We arrange a conflict that breaks our lock
+        // when txId commits.
+        Self->SysLocksTable().AddReadConflict(txId);
     }
 
     void CheckReadConflict(const TTableId& tableId, const TRowVersion& rowVersion) const {
         Y_UNUSED(tableId);
+        Y_VERIFY(LockTxId);
+
         if (rowVersion > ReadVersion) {
             // We are reading from snapshot at ReadVersion and should not normally
             // observe changes with a version above that. However, if we have an
@@ -619,7 +547,8 @@ public:
             // snapshot. This is a clear indication of a conflict between read
             // and that future conflict, hence we must break locks and abort.
             // TODO: add an actual abort
-            Self->SysLocksTable().BreakSetLocks(LockTxId, LockNodeId);
+            Self->SysLocksTable().BreakSetLocks();
+            EngineBay.GetKqpComputeCtx().SetInconsistentReads();
         }
     }
 
@@ -686,7 +615,7 @@ public:
     void AddWriteConflict(const TTableId& tableId, ui64 txId) const {
         Y_UNUSED(tableId);
         if (LockTxId) {
-            Self->SysLocksTable().AddWriteConflict(txId, LockTxId, LockNodeId);
+            Self->SysLocksTable().AddWriteConflict(txId);
         } else {
             Self->SysLocksTable().BreakLock(txId);
         }
@@ -698,6 +627,7 @@ private:
     }
 
     TDataShard* Self;
+    TEngineBay& EngineBay;
     NTable::TDatabase& DB;
     const ui64& LockTxId;
     const ui32& LockNodeId;
@@ -720,7 +650,7 @@ TEngineBay::TEngineBay(TDataShard * self, TTransactionContext& txc, const TActor
     , LockNodeId(0)
 {
     auto now = TAppData::TimeProvider->Now();
-    EngineHost = MakeHolder<TDataShardEngineHost>(self, txc.DB, EngineHostCounters, LockTxId, LockNodeId, now);
+    EngineHost = MakeHolder<TDataShardEngineHost>(self, *this, txc.DB, EngineHostCounters, LockTxId, LockNodeId, now);
 
     EngineSettings = MakeHolder<TEngineFlatSettings>(IEngineFlat::EProtocol::V1, AppData(ctx)->FunctionRegistry,
         *TAppData::RandomProvider, *TAppData::TimeProvider, EngineHost.Get(), self->AllocCounters);
@@ -780,7 +710,7 @@ TEngineBay::~TEngineBay() {
 }
 
 void TEngineBay::AddReadRange(const TTableId& tableId, const TVector<NTable::TColumn>& columns,
-    const TTableRange& range, const TVector<NScheme::TTypeId>& keyTypes, ui64 itemsLimit, bool reverse)
+    const TTableRange& range, const TVector<NScheme::TTypeInfo>& keyTypes, ui64 itemsLimit, bool reverse)
 {
     TVector<TKeyDesc::TColumnOp> columnOps;
     columnOps.reserve(columns.size());
@@ -804,7 +734,7 @@ void TEngineBay::AddReadRange(const TTableId& tableId, const TVector<NTable::TCo
 }
 
 void TEngineBay::AddWriteRange(const TTableId& tableId, const TTableRange& range,
-    const TVector<NScheme::TTypeId>& keyTypes, const TVector<TColumnWriteMeta>& columns,
+    const TVector<NScheme::TTypeInfo>& keyTypes, const TVector<TColumnWriteMeta>& columns,
     bool isPureEraseOp)
 {
     TVector<TKeyDesc::TColumnOp> columnOps;
@@ -898,6 +828,11 @@ TVector<IChangeCollector::TChange> TEngineBay::GetCollectedChanges() const {
 
     auto* host = static_cast<TDataShardEngineHost*>(EngineHost.Get());
     return host->GetCollectedChanges();
+}
+
+void TEngineBay::ResetCollectedChanges() {
+    auto* host = static_cast<TDataShardEngineHost*>(EngineHost.Get());
+    host->ResetCollectedChanges();
 }
 
 IEngineFlat * TEngineBay::GetEngine() {

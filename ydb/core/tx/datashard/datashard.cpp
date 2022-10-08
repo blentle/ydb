@@ -964,6 +964,11 @@ void TDataShard::AddSchemaSnapshot(const TPathId& pathId, ui64 tableSchemaVersio
     SchemaSnapshotManager.AddSnapshot(txc.DB, key, TSchemaSnapshot(tableInfo, step, txId));
 }
 
+void TDataShard::PersistLastLoanTableTid(NIceDb::TNiceDb& db, ui32 localTid) {
+    LastLoanTableTid = localTid;
+    PersistSys(db, Schema::Sys_LastLoanTableTid, LastLoanTableTid);
+}
+
 TUserTable::TPtr TDataShard::CreateUserTable(TTransactionContext& txc,
     const NKikimrSchemeOp::TTableDescription& tableScheme)
 {
@@ -2761,7 +2766,6 @@ void TDataShard::ResolveTablePath(const TActorContext &ctx)
 
 void TDataShard::SerializeHistogram(const TUserTable &tinfo,
                                            const NTable::THistogram &histogram,
-                                           const NScheme::TTypeRegistry &typeRegistry,
                                            NKikimrTxDataShard::TEvGetDataHistogramResponse::THistogram &hist)
 {
     for (auto &item : histogram) {
@@ -2770,15 +2774,13 @@ void TDataShard::SerializeHistogram(const TUserTable &tinfo,
 
         TSerializedCellVec key(item.EndKey);
         for (ui32 ki = 0; ki < tinfo.KeyColumnIds.size(); ++ki) {
-            NScheme::ITypeSP t = typeRegistry.GetType(tinfo.KeyColumnTypes[ki]);
-            DbgPrintValue(*rec.AddKeyValues(), key.GetCells()[ki], t.GetTypeId());
+            DbgPrintValue(*rec.AddKeyValues(), key.GetCells()[ki], tinfo.KeyColumnTypes[ki]);
         }
     }
 }
 
 void TDataShard::SerializeKeySample(const TUserTable &tinfo,
                                            const NTable::TKeyAccessSample &keySample,
-                                           const NScheme::TTypeRegistry &typeRegistry,
                                            NKikimrTxDataShard::TEvGetDataHistogramResponse::THistogram &hist)
 {
     THashMap<TString, ui64> accessCounts;
@@ -2794,8 +2796,7 @@ void TDataShard::SerializeKeySample(const TUserTable &tinfo,
 
         TSerializedCellVec key(item.first);
         for (ui32 ki = 0; ki < tinfo.KeyColumnIds.size() && ki < key.GetCells().size(); ++ki) {
-            NScheme::ITypeSP t = typeRegistry.GetType(tinfo.KeyColumnTypes[ki]);
-            DbgPrintValue(*rec.AddKeyValues(), key.GetCells()[ki], t.GetTypeId());
+            DbgPrintValue(*rec.AddKeyValues(), key.GetCells()[ki], tinfo.KeyColumnTypes[ki]);
         }
     }
     Sort(hist.MutableItems()->begin(), hist.MutableItems()->end(),
@@ -2867,7 +2868,6 @@ void TDataShard::Handle(TEvDataShard::TEvGetDataHistogramRequest::TPtr &ev,
         }
     }
 
-    auto &reg = *AppData(ctx)->TypeRegistry;
     for (const auto &pr : TableInfos) {
         const auto &tinfo = *pr.second;
         const NTable::TStats &stats = tinfo.Stats.DataStats;
@@ -2876,9 +2876,9 @@ void TDataShard::Handle(TEvDataShard::TEvGetDataHistogramRequest::TPtr &ev,
         hist.SetTableName(pr.second->Name);
         for (ui32 ki : tinfo.KeyColumnIds)
             hist.AddKeyNames(tinfo.Columns.FindPtr(ki)->Name);
-        SerializeHistogram(tinfo, stats.DataSizeHistogram, reg, *hist.MutableSizeHistogram());
-        SerializeHistogram(tinfo, stats.RowCountHistogram, reg, *hist.MutableCountHistogram());
-        SerializeKeySample(tinfo, tinfo.Stats.AccessStats, reg, *hist.MutableKeyAccessSample());
+        SerializeHistogram(tinfo, stats.DataSizeHistogram, *hist.MutableSizeHistogram());
+        SerializeHistogram(tinfo, stats.RowCountHistogram, *hist.MutableCountHistogram());
+        SerializeKeySample(tinfo, tinfo.Stats.AccessStats, *hist.MutableKeyAccessSample());
     }
 
     ctx.Send(ev->Sender, response);
@@ -3270,6 +3270,95 @@ void SendViaSession(const TActorId& sessionId,
 
     TActivationContext::Send(ev.Release());
 }
+
+class TBreakWriteConflictsTxObserver : public NTable::ITransactionObserver {
+public:
+    TBreakWriteConflictsTxObserver(TDataShard* self)
+        : Self(self)
+    {
+    }
+
+    void OnSkipUncommitted(ui64 txId) override {
+        Self->SysLocksTable().BreakLock(txId);
+    }
+
+    void OnSkipCommitted(const TRowVersion&) override {
+        // nothing
+    }
+
+    void OnSkipCommitted(const TRowVersion&, ui64) override {
+        // nothing
+    }
+
+    void OnApplyCommitted(const TRowVersion&) override {
+        // nothing
+    }
+
+    void OnApplyCommitted(const TRowVersion&, ui64) override {
+        // nothing
+    }
+
+private:
+    TDataShard* Self;
+};
+
+bool TDataShard::BreakWriteConflicts(NTable::TDatabase& db, const TTableId& tableId, TArrayRef<const TCell> keyCells) {
+    const auto localTid = GetLocalTableId(tableId);
+    Y_VERIFY(localTid);
+    const NTable::TScheme& scheme = db.GetScheme();
+    const NTable::TScheme::TTableInfo* tableInfo = scheme.GetTableInfo(localTid);
+    TSmallVec<TRawTypeValue> key;
+    NMiniKQL::ConvertTableKeys(scheme, tableInfo, keyCells, key, nullptr);
+
+    if (!BreakWriteConflictsTxObserver) {
+        BreakWriteConflictsTxObserver = new TBreakWriteConflictsTxObserver(this);
+    }
+
+    // We are not actually interested in the row version, we only need to
+    // detect uncommitted transaction skips on the path to that version.
+    auto res = db.SelectRowVersion(
+        localTid, key, /* readFlags */ 0,
+        nullptr,
+        BreakWriteConflictsTxObserver);
+
+    if (res.Ready == NTable::EReady::Page) {
+        return false;
+    }
+
+    return true;
+}
+
+class TDataShard::TTxGetOpenTxs : public NTabletFlatExecutor::TTransactionBase<TDataShard> {
+public:
+    TTxGetOpenTxs(TDataShard* self, TEvDataShard::TEvGetOpenTxs::TPtr&& ev)
+        : TTransactionBase(self)
+        , Ev(std::move(ev))
+    { }
+
+    bool Execute(TTransactionContext& txc, const TActorContext&) override {
+        auto pathId = Ev->Get()->PathId;
+        auto it = pathId ? Self->GetUserTables().find(pathId.LocalPathId) : Self->GetUserTables().begin();
+        Y_VERIFY(it != Self->GetUserTables().end());
+
+        auto txs = txc.DB.GetOpenTxs(it->second->LocalTid);
+
+        Reply = MakeHolder<TEvDataShard::TEvGetOpenTxsResult>(pathId, std::move(txs));
+        return true;
+    }
+
+    void Complete(const TActorContext& ctx) override {
+        ctx.Send(Ev->Sender, Reply.Release(), 0, Ev->Cookie);
+    }
+
+private:
+    TEvDataShard::TEvGetOpenTxs::TPtr Ev;
+    THolder<TEvDataShard::TEvGetOpenTxsResult> Reply;
+};
+
+void TDataShard::Handle(TEvDataShard::TEvGetOpenTxs::TPtr& ev, const TActorContext& ctx) {
+    Execute(new TTxGetOpenTxs(this, std::move(ev)), ctx);
+}
+
 
 } // NDataShard
 

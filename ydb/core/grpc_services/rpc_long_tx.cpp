@@ -10,10 +10,12 @@
 #include <ydb/core/tablet/tablet_pipe_client_cache.h>
 #include <ydb/core/formats/arrow_helpers.h>
 #include <ydb/core/formats/sharding.h>
+#include <ydb/core/scheme/scheme_types_proto.h>
 #include <ydb/core/tx/schemeshard/schemeshard.h>
 #include <ydb/core/tx/columnshard/columnshard.h>
 #include <ydb/core/tx/long_tx_service/public/events.h>
 
+#include <library/cpp/actors/wilson/wilson_profile_span.h>
 #include <contrib/libs/apache/arrow/cpp/src/arrow/compute/api.h>
 
 namespace NKikimr {
@@ -32,16 +34,61 @@ using TEvLongTxReadRequest = NGRpcService::TGrpcRequestOperationCall<Ydb::LongTx
     Ydb::LongTx::ReadResponse>;
 
 std::shared_ptr<arrow::Schema> ExtractArrowSchema(const NKikimrSchemeOp::TColumnTableSchema& schema) {
-    TVector<std::pair<TString,  NScheme::TTypeId>> columns;
+    TVector<std::pair<TString, NScheme::TTypeInfo>> columns;
     for (auto& col : schema.GetColumns()) {
         Y_VERIFY(col.HasTypeId());
-        columns.emplace_back(col.GetName(), (NScheme::TTypeId)col.GetTypeId());
+        auto typeInfo = NScheme::TypeInfoFromProtoColumnType(col.GetTypeId(),
+            col.HasTypeInfo() ? &col.GetTypeInfo() : nullptr);
+        columns.emplace_back(col.GetName(), typeInfo);
     }
 
     return NArrow::MakeArrowSchema(columns);
 }
 
-THashMap<ui64, TString> SplitData(const std::shared_ptr<arrow::RecordBatch>& batch,
+class TShardInfo {
+private:
+    const TString Data;
+    const ui32 RowsCount;
+public:
+    TShardInfo(const TString& data, const ui32 rowsCount)
+        : Data(data)
+        , RowsCount(rowsCount)
+    {
+
+    }
+    const TString& GetData() const {
+        return Data;
+    }
+    ui32 GetRowsCount() const {
+        return RowsCount;
+    }
+};
+
+class TFullSplitData {
+private:
+    ui32 ShardsCount = 0;
+    THashMap<ui64, TShardInfo> ShardsInfo;
+public:
+    TFullSplitData(const ui32 shardsCount)
+        : ShardsCount(shardsCount)
+    {
+
+    }
+
+    const THashMap<ui64, TShardInfo>& GetShardsInfo() const {
+        return ShardsInfo;
+    }
+
+    ui32 GetShardsCount() const {
+        return ShardsCount;
+    }
+
+    void AddShardInfo(const ui64 tabletId, TShardInfo&& info) {
+        ShardsInfo.emplace(tabletId, std::move(info));
+    }
+};
+
+TFullSplitData SplitData(const std::shared_ptr<arrow::RecordBatch>& batch,
     const NKikimrSchemeOp::TColumnTableDescription& description)
 {
     Y_VERIFY(batch);
@@ -54,24 +101,29 @@ THashMap<ui64, TString> SplitData(const std::shared_ptr<arrow::RecordBatch>& bat
     TVector<TString> shardingColumns(hashSharding.GetColumns().begin(), hashSharding.GetColumns().end());
     ui32 numShards = tabletIds.size();
     Y_VERIFY(numShards);
+    TFullSplitData result(numShards);
 
     if (numShards == 1) {
-        THashMap<ui64, TString> out;
-        out.emplace(tabletIds[0], NArrow::SerializeBatchNoCompression(batch));
-        return out;
+        TShardInfo splitInfo(NArrow::SerializeBatchNoCompression(batch), batch->num_rows());
+        result.AddShardInfo(tabletIds[0], std::move(splitInfo));
+        return result;
     }
 
     std::vector<ui32> rowSharding;
-    if (hashSharding.GetFunction() == NKikimrSchemeOp::TColumnTableSharding::THashSharding::HASH_FUNCTION_DEFAULT) {
+    if (hashSharding.GetFunction() == NKikimrSchemeOp::TColumnTableSharding::THashSharding::HASH_FUNCTION_MODULO_N) {
         NArrow::THashSharding sharding(numShards);
         rowSharding = sharding.MakeSharding(batch, shardingColumns);
     } else if (hashSharding.GetFunction() == NKikimrSchemeOp::TColumnTableSharding::THashSharding::HASH_FUNCTION_CLOUD_LOGS) {
-        NArrow::TLogsSharding sharding(numShards);
+        ui32 activeShards = NArrow::TLogsSharding::DEFAULT_ACITVE_SHARDS;
+        if (hashSharding.HasActiveShardsCount()) {
+            activeShards = hashSharding.GetActiveShardsCount();
+        }
+        NArrow::TLogsSharding sharding(numShards, activeShards);
         rowSharding = sharding.MakeSharding(batch, shardingColumns);
     }
 
     if (rowSharding.empty()) {
-        return {};
+        return result;
     }
 
     std::vector<std::shared_ptr<arrow::RecordBatch>> sharded = NArrow::ShardingSplit(batch, rowSharding, numShards);
@@ -80,16 +132,17 @@ THashMap<ui64, TString> SplitData(const std::shared_ptr<arrow::RecordBatch>& bat
     THashMap<ui64, TString> out;
     for (size_t i = 0; i < sharded.size(); ++i) {
         if (sharded[i]) {
-            out.emplace(tabletIds[i], NArrow::SerializeBatchNoCompression(sharded[i]));
+            TShardInfo splitInfo(NArrow::SerializeBatchNoCompression(sharded[i]), sharded[i]->num_rows());
+            result.AddShardInfo(tabletIds[i], std::move(splitInfo));
         }
     }
 
-    Y_VERIFY(!out.empty());
-    return out;
+    Y_VERIFY(result.GetShardsInfo().size());
+    return result;
 }
 
-// Deserailizes arrow batch and splits it
-THashMap<ui64, TString> SplitData(const TString& data, const NKikimrSchemeOp::TColumnTableDescription& description) {
+// Deserialize arrow batch and splits it
+TFullSplitData SplitData(const TString& data, const NKikimrSchemeOp::TColumnTableDescription& description) {
     Y_VERIFY(description.HasSchema());
     auto& olapSchema = description.GetSchema();
     Y_VERIFY(olapSchema.GetEngine() == NKikimrSchemeOp::COLUMN_ENGINE_REPLACING_TIMESERIES);
@@ -97,9 +150,8 @@ THashMap<ui64, TString> SplitData(const TString& data, const NKikimrSchemeOp::TC
     std::shared_ptr<arrow::Schema> schema = ExtractArrowSchema(olapSchema);
     std::shared_ptr<arrow::RecordBatch> batch = NArrow::DeserializeBatch(data, schema);
     if (!batch || !batch->ValidateFull().ok()) {
-        return {};
+        return TFullSplitData(0);
     }
-
     return SplitData(batch, description);
 }
 
@@ -343,6 +395,7 @@ public:
         , DedupId(dedupId)
         , LongTxId(longTxId)
         , LeaderPipeCache(MakePipePeNodeCacheID(false))
+        , ActorSpan(0, NWilson::TTraceId::NewTraceId(0, Max<ui32>()), "TLongTxWriteBase")
     {
         if (token) {
             UserToken.emplace(token);
@@ -360,6 +413,7 @@ protected:
     }
 
     void ProceedWithSchema(const NSchemeCache::TSchemeCacheNavigate& resp) {
+        NWilson::TProfileSpan pSpan = ActorSpan.BuildChildrenSpan("ProceedWithSchema");
         if (resp.ErrorCount > 0) {
             // TODO: map to a correct error
             return ReplyError(Ydb::StatusIds::SCHEME_ERROR, "There was an error during table query");
@@ -407,15 +461,23 @@ protected:
             SendWriteRequest(shard, tableId, DedupId, GetSerializedData());
         } else if (sharding.HasHashSharding()) {
 
-            auto batches = HasDeserializedBatch() ?
+            const TFullSplitData batches = HasDeserializedBatch() ?
                 SplitData(GetDeserializedBatch(), description) :
                 SplitData(GetSerializedData(), description);
-            if (batches.empty()) {
+            if (batches.GetShardsInfo().empty()) {
                 return ReplyError(Ydb::StatusIds::SCHEME_ERROR, "Cannot deserialize or split input data");
             }
-            for (auto& [shard, batch] : batches) {
-                SendWriteRequest(shard, tableId, DedupId, batch);
+            ui32 sumBytes = 0;
+            ui32 rowsCount = 0;
+            for (auto& [shard, info] : batches.GetShardsInfo()) {
+                sumBytes += info.GetData().size();
+                rowsCount += info.GetRowsCount();
+                SendWriteRequest(shard, tableId, DedupId, info.GetData());
             }
+            pSpan.Attribute("affected_shards_count", (long)batches.GetShardsInfo().size());
+            pSpan.Attribute("bytes", (long)sumBytes);
+            pSpan.Attribute("rows", (long)rowsCount);
+            pSpan.Attribute("shards_count", (long)batches.GetShardsCount());
         } else {
             return ReplyError(Ydb::StatusIds::SCHEME_ERROR, "Sharding method is not supported");
         }
@@ -469,6 +531,7 @@ private:
     }
 
     void Handle(TEvColumnShard::TEvWriteResult::TPtr& ev) {
+        auto gProfile = ActorSpan.StartStackTimeGuard("WriteResult");
         const auto* msg = ev->Get();
         ui64 shardId = msg->Record.GetOrigin();
         Y_VERIFY(WaitShards.count(shardId) || ShardsWrites.count(shardId));
@@ -491,6 +554,7 @@ private:
     }
 
     void Handle(TEvPipeCache::TEvDeliveryProblem::TPtr& ev) {
+        NWilson::TProfileSpan pSpan(0, ActorSpan.GetTraceId(), "DeliveryProblem");
         const auto* msg = ev->Get();
 
         if (msg->NotDelivered) {
@@ -519,6 +583,7 @@ private:
     }
 
     void Handle(TEvLongTxService::TEvAttachColumnShardWritesResult::TPtr& ev) {
+        NWilson::TProfileSpan pSpan(0, ActorSpan.GetTraceId(), "AttachColumnShardWritesResult");
         const auto* msg = ev->Get();
 
         if (msg->Record.GetStatus() != Ydb::StatusIds::SUCCESS) {
@@ -536,7 +601,7 @@ private:
 private:
     void SendToTablet(ui64 tabletId, THolder<IEventBase> event) {
         this->Send(LeaderPipeCache, new TEvPipeCache::TEvForward(event.Release(), tabletId, true),
-                IEventHandle::FlagTrackDelivery);
+                IEventHandle::FlagTrackDelivery, 0, ActorSpan.GetTraceId());
     }
 
 protected:
@@ -547,7 +612,6 @@ protected:
     virtual std::shared_ptr<arrow::RecordBatch> GetDeserializedBatch() const {
         return nullptr;
     }
-
     virtual TString GetSerializedData() = 0;
     virtual void RaiseIssue(const NYql::TIssue& issue) = 0;
     virtual void ReplyError(Ydb::StatusIds::StatusCode status, const TString& message = TString()) = 0;
@@ -563,6 +627,7 @@ private:
     std::optional<NACLib::TUserToken> UserToken;
     THashSet<ui64> WaitShards;
     THashMap<ui64, ui64> ShardsWrites;
+    NWilson::TProfileSpan ActorSpan;
 };
 
 

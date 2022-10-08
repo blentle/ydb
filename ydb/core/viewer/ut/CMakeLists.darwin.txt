@@ -20,7 +20,7 @@ target_link_libraries(ydb-core-viewer-ut PUBLIC
   library-cpp-cpuid_check
   cpp-testing-unittest_main
   ydb-core-viewer
-  ydb-core-testlib
+  core-testlib-default
 )
 target_link_options(ydb-core-viewer-ut PRIVATE
   -Wl,-no_deduplicate
@@ -31,7 +31,6 @@ target_link_options(ydb-core-viewer-ut PRIVATE
   CoreFoundation
 )
 target_sources(ydb-core-viewer-ut PRIVATE
-  ${CMAKE_SOURCE_DIR}/ydb/core/viewer/http_router_ut.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/viewer/viewer_ut.cpp
 )
 add_test(

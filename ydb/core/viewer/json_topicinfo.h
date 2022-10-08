@@ -16,7 +16,7 @@ class TJsonTopicInfo : public TActorBootstrapped<TJsonTopicInfo> {
     using TBase = TActorBootstrapped<TJsonTopicInfo>;
     IViewer* Viewer;
     NMon::TEvHttpInfo::TPtr Event;
-    NKikimrTabletCountersAggregator::TEvTabletLabeledCountersResponse TopicInfoResult;
+    NKikimrLabeledCounters::TEvTabletLabeledCountersResponse TopicInfoResult;
     TJsonSettings JsonSettings;
     TString Topic;
     TString Client;
@@ -29,9 +29,9 @@ public:
         return NKikimrServices::TActivity::VIEWER_HANDLER;
     }
 
-    TJsonTopicInfo(IViewer* viewer, const TRequest& request)
+    TJsonTopicInfo(IViewer* viewer, NMon::TEvHttpInfo::TPtr &ev)
         : Viewer(viewer)
-        , Event(request.Event)
+        , Event(ev)
     {}
 
     void Bootstrap(const TActorContext& ctx) {

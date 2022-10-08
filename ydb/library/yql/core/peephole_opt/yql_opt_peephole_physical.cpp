@@ -34,7 +34,11 @@ using TPeepHoleOptimizerMap = std::unordered_map<std::string_view, TPeepHoleOpti
 using TExtPeepHoleOptimizerPtr = TExprNode::TPtr (*const)(const TExprNode::TPtr&, TExprContext&, TTypeAnnotationContext& types);
 using TExtPeepHoleOptimizerMap = std::unordered_map<std::string_view, TExtPeepHoleOptimizerPtr>;
 
-using TBlockFuncMap = std::unordered_map<std::string_view, std::string_view>;
+struct TBlockFuncRule {
+    std::string_view Name;
+};
+
+using TBlockFuncMap = std::unordered_map<std::string_view, TBlockFuncRule>;
 
 TExprNode::TPtr MakeNothing(TPositionHandle pos, const TTypeAnnotationNode& type, TExprContext& ctx) {
     return ctx.NewCallable(pos, "Nothing", {ExpandType(pos, *ctx.MakeType<TOptionalExprType>(&type), ctx)});
@@ -4303,9 +4307,14 @@ TExprNode::TPtr OptimizeWideChopper(const TExprNode::TPtr& node, TExprContext& c
 
 struct TBlockRules {
 
+    // all kernels whose name begins with capital letter are YQL kernel
     static constexpr std::initializer_list<TBlockFuncMap::value_type> FuncsInit = {
-        {"+", "add" },
-        {"Not", "invert" },
+        {"+", { "Add" } },
+        {"-", { "Sub" } },
+        {"*", { "Mul" } },
+        {"/", { "Div?" } }, // kernel produces optional output on non-optional inputs
+        {"%", { "Mod?" } }, // kernel produces optional output on non-optional inputs
+        {"Not", { "invert" }},
     };
 
     TBlockRules()
@@ -4371,18 +4380,43 @@ TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext&
             return true;
         }
 
-        auto fit = funcs.find(node->Content());
-        if (fit == funcs.end()) {
-            return true;
+        TExprNode::TListType funcArgs;
+        std::string_view arrowFunctionName;
+        if (node->IsCallable("Apply") && node->Head().IsCallable("Udf")) {
+            auto func = node->Head().Head().Content();
+            if (!func.StartsWith("ClickHouse.")) {
+                return true;
+            }
+
+            TVector<const TTypeAnnotationNode*> allTypes;
+            allTypes.push_back(node->GetTypeAnn());
+            for (ui32 i = 1; i < node->ChildrenSize(); ++i) {
+                allTypes.push_back(node->Child(i)->GetTypeAnn());
+            }
+
+            bool supported = false;
+            YQL_ENSURE(types.ArrowResolver->AreTypesSupported(ctx.GetPosition(node->Pos()), allTypes, supported, ctx));
+            if (!supported) {
+                return true;
+            }
+
+            funcArgs.push_back(nullptr);
+        } else {
+            auto fit = funcs.find(node->Content());
+            if (fit == funcs.end()) {
+                return true;
+            }
+
+            arrowFunctionName = fit->second.Name;
+            funcArgs.push_back(ctx.NewAtom(node->Pos(), arrowFunctionName));
         }
 
-        TExprNode::TListType funcArgs;
-        funcArgs.push_back(ctx.NewAtom(node->Pos(), fit->second));
-        for (const auto& child : node->Children()) {
+        for (ui32 i = arrowFunctionName.empty() ? 1 : 0; i < node->ChildrenSize(); ++i) {
+            auto child = node->Child(i);
             if (child->IsComplete()) {
-                funcArgs.push_back(ctx.NewCallable(node->Pos(), "AsScalar", { child }));
+                funcArgs.push_back(ctx.NewCallable(node->Pos(), "AsScalar", { node->ChildPtr(i) }));
             } else {
-                auto rit = rewrites.find(child.Get());
+                auto rit = rewrites.find(child);
                 if (rit == rewrites.end()) {
                     return true;
                 }
@@ -4393,7 +4427,8 @@ TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext&
 
         const TTypeAnnotationNode* outType = nullptr;
         TVector<const TTypeAnnotationNode*> argTypes;
-        for (const auto& child : node->Children()) {
+        for (ui32 i = arrowFunctionName.empty() ? 1 : 0; i < node->ChildrenSize(); ++i) {
+            auto child = node->Child(i);
             if (child->IsComplete()) {
                 argTypes.push_back(ctx.MakeType<TScalarExprType>(child->GetTypeAnn()));
             } else {
@@ -4401,17 +4436,49 @@ TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext&
             }
         }
 
-        YQL_ENSURE(types.ArrowResolver->LoadFunctionMetadata(ctx.GetPosition(node->Pos()), fit->second, argTypes, outType, ctx));
-        if (!outType) {
-            return true;
+        if (!arrowFunctionName.empty()) {
+            YQL_ENSURE(types.ArrowResolver->LoadFunctionMetadata(ctx.GetPosition(node->Pos()), arrowFunctionName, argTypes, outType, ctx));
+            if (!outType) {
+                return true;
+            }
+
+            bool isScalar;
+            if (!IsSameAnnotation(*node->GetTypeAnn(), *GetBlockItemType(*outType, isScalar))) {
+                return true;
+            }
+
+            rewrites[node.Get()] = ctx.NewCallable(node->Pos(), "BlockFunc", std::move(funcArgs));
+        } else {
+            funcArgs[0] = ctx.Builder(node->Head().Pos())
+                .Callable("Udf")
+                    .Add(0, node->Head().ChildPtr(0))
+                    .Add(1, node->Head().ChildPtr(1))
+                    .Callable(2, "TupleType")
+                        .Callable(0, "TupleType")
+                                .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
+                                    for (ui32 i = 1; i < node->ChildrenSize(); ++i) {
+                                        auto child = node->Child(i);
+                                        auto originalTypeNode = node->Head().Child(2)->Head().Child(i - 1);
+                                        parent.Callable(i - 1, child->IsComplete() ? "ScalarType" : "BlockType")
+                                            .Add(0, originalTypeNode)
+                                            .Seal();
+                                    }
+
+                                    return parent;
+                                })
+                        .Seal()
+                        .Callable(1, "StructType")
+                        .Seal()
+                        .Callable(2, "TupleType")
+                        .Seal()
+                    .Seal()
+                    .Add(3, node->Head().ChildPtr(3))
+                .Seal()
+                .Build();
+
+            rewrites[node.Get()] = ctx.NewCallable(node->Pos(), "Apply", std::move(funcArgs));
         }
 
-        bool isScalar;
-        if (!IsSameAnnotation(*node->GetTypeAnn(), *GetBlockItemType(*outType, isScalar))) {
-            return true;
-        }
-
-        rewrites[node.Get()] = ctx.NewCallable(node->Pos(), "BlockFunc", std::move(funcArgs));
         ++newNodes;
         return true;
     });

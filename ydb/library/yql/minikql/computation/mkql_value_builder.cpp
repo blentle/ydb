@@ -3,13 +3,15 @@
 
 #include <ydb/library/yql/minikql/mkql_node_cast.h>
 #include <ydb/library/yql/minikql/mkql_string_util.h>
+#include <ydb/library/yql/minikql/mkql_type_builder.h>
+#include <ydb/library/yql/parser/pg_wrapper/interface/utils.h>
 #include <library/cpp/yson/node/node_io.h>
 
-#include <util/system/env.h>
+#include <arrow/array/array_base.h>
+#include <arrow/array/util.h>
+#include <arrow/c/bridge.h>
 
-namespace NYql {
-    std::unique_ptr<NUdf::IPgBuilder> CreatePgBuilder();
-}
+#include <util/system/env.h>
 
 namespace NKikimr {
 namespace NMiniKQL {
@@ -202,16 +204,58 @@ NUdf::TUnboxedValue TDefaultValueBuilder::Run(const NUdf::TSourcePosition& calle
     return ret;
 }
 
-NUdf::TFlatDataBlockPtr TDefaultValueBuilder::NewFlatDataBlock(ui32 initialSize, ui32 initialCapacity) const {
-    return HolderFactory_.CreateFlatDataBlock(initialSize, initialCapacity);
+
+void TDefaultValueBuilder::ExportArrowBlock(NUdf::TUnboxedValuePod value, bool& isScalar, ArrowArray* out) const {
+    const auto datum = TArrowBlock::From(value).GetDatum();
+    std::shared_ptr<arrow::Array> arr;
+    if (datum.is_scalar()) {
+        isScalar = true;
+        auto arrRes = arrow::MakeArrayFromScalar(*datum.scalar(), 1);
+        if (!arrRes.status().ok()) {
+            UdfTerminate(arrRes.status().ToString().c_str());
+        }
+
+        arr = std::move(arrRes).ValueOrDie();
+    } else if (datum.is_array()) {
+        isScalar = false;
+        arr = datum.make_array();
+    } else {
+        UdfTerminate("Unexpected kind of arrow::Datum");
+    }
+
+    auto status = arrow::ExportArray(*arr, out);
+    if (!status.ok()) {
+        UdfTerminate(status.ToString().c_str());
+    }
 }
 
-NUdf::TFlatArrayBlockPtr TDefaultValueBuilder::NewFlatArrayBlock(ui32 count) const {
-    return HolderFactory_.CreateFlatArrayBlock(count);
+NUdf::TUnboxedValue TDefaultValueBuilder::ImportArrowBlock(ArrowArray* array, const NUdf::IArrowType& type, bool isScalar) const {
+    const auto dataType = static_cast<const TArrowType&>(type).GetType();
+    auto arrRes = arrow::ImportArray(array, dataType);
+    if (!arrRes.status().ok()) {
+        UdfTerminate(arrRes.status().ToString().c_str());
+    }
+
+    auto arr = std::move(arrRes).ValueOrDie();
+    if (isScalar) {
+        if (arr->length() != 1) {
+            UdfTerminate("Expected array with one element");
+        }
+
+        auto scalarRes = arr->GetScalar(0);
+        if (!scalarRes.status().ok()) {
+            UdfTerminate(scalarRes.status().ToString().c_str());
+        }
+
+        auto scalar = std::move(scalarRes).ValueOrDie();
+        return HolderFactory_.CreateArrowBlock(std::move(scalar));
+    } else {
+        return HolderFactory_.CreateArrowBlock(std::move(arr));
+    }
 }
 
-NUdf::TSingleBlockPtr TDefaultValueBuilder::NewSingleBlock(const NUdf::TUnboxedValue& value) const {
-    return HolderFactory_.CreateSingleBlock(value);
+void TDefaultValueBuilder::Unused3() const {
+    Y_FAIL("Not implemented");
 }
 
 bool TDefaultValueBuilder::FindTimezoneName(ui32 id, NUdf::TStringRef& name) const {

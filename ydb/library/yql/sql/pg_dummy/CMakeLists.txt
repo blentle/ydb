@@ -14,13 +14,7 @@ target_compile_options(yql-sql-pg_dummy PRIVATE
 target_link_libraries(yql-sql-pg_dummy PUBLIC
   contrib-libs-cxxsupp
   yutil
-  library-yql-ast
-  library-yql-core
-  library-yql-minikql
-  yql-minikql-computation
-  providers-common-codec
-  yql-public-udf
-  yql-sql-settings
+  parser-pg_wrapper-interface
 )
 target_sources(yql-sql-pg_dummy PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/sql/pg_dummy/pg_sql_dummy.cpp

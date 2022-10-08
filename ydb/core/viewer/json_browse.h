@@ -14,17 +14,6 @@
 #include "viewer.h"
 #include "wb_aggregate.h"
 
-namespace std {
-
-template <>
-struct hash<NActors::TActorId> {
-    size_t operator ()(const NActors::TActorId& actorId) const {
-        return actorId.Hash();
-    }
-};
-
-}
-
 namespace NKikimr {
 namespace NViewer {
 
@@ -70,9 +59,9 @@ public:
         return NKikimrServices::TActivity::VIEWER_HANDLER;
     }
 
-    TJsonBrowse(IViewer* viewer, const TRequest& request)
+    TJsonBrowse(IViewer *viewer, NMon::TEvHttpInfo::TPtr &ev)
         : Viewer(viewer)
-        , Event(request.Event)
+        , Event(ev)
     {}
 
     void ParsePath(const TString& path, const TActorContext& ctx) {

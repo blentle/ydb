@@ -5,6 +5,7 @@
 #include "yql_type_helpers.h"
 
 #include <ydb/library/yql/ast/yql_constraint.h>
+#include <ydb/library/yql/parser/pg_catalog/catalog.h>
 #include <ydb/library/yql/utils/log/log.h>
 
 #include <util/generic/set.h>
@@ -338,7 +339,6 @@ const TTypeAnnotationNode* GetSeqItemType(const TTypeAnnotationNode* type) {
         case ETypeAnnotationKind::Optional: return type->Cast<TOptionalExprType>()->GetItemType();
         default: break;
     }
-
     THROW yexception() << "Impossible to get item type from " << *type;
 }
 
@@ -1189,7 +1189,7 @@ TExprNode::TPtr OptimizeIfPresent(const TExprNode::TPtr& node, TExprContext& ctx
 
         auto simplify = ctx.Builder(node->Pos())
             .Lambda()
-                .Params("items", optionals.size() - args.size())
+                .Params("items", args.size())
                 .Apply(lambda)
                     .Do([&](TExprNodeReplaceBuilder& parent) -> TExprNodeReplaceBuilder& {
                         for (auto i = 0U, j = 0U; i < optionals.size(); ++i) {
@@ -1474,8 +1474,12 @@ ui8 GetTypeWeight(const TTypeAnnotationNode& type) {
 
                 default: return 32;
             }
-            case ETypeAnnotationKind::Optional: return 1 + GetTypeWeight(*type.Cast<TOptionalExprType>()->GetItemType());
-            default: return 255;
+        case ETypeAnnotationKind::Optional:
+            return 1 + GetTypeWeight(*type.Cast<TOptionalExprType>()->GetItemType());
+        case ETypeAnnotationKind::Pg:
+            return ui8(ClampVal(NPg::LookupType(type.Cast<TPgExprType>()->GetId()).TypeLen, 1, 255));
+        default:
+            return 255;
     }
 }
 
@@ -1485,13 +1489,55 @@ const TItemExprType* GetLightColumn(const TStructExprType& type) {
     ui8 weight = 255;
     const TItemExprType* field = nullptr;
     for (const auto& item : type.GetItems()) {
-
         if (const auto w = GetTypeWeight(*item->GetItemType()); w < weight) {
             weight = w;
             field = item;
         }
     }
+    if (const auto& items = type.GetItems(); !items.empty() && !field) {
+        field = items[0];
+    }
     return field;
 }
 
+TVector<TStringBuf> GetCommonKeysFromVariantSelector(const NNodes::TCoLambda& lambda) {
+    if (auto maybeVisit = lambda.Body().Maybe<TCoVisit>()) {
+        if (maybeVisit.Input().Raw() == lambda.Args().Arg(0).Raw()) {
+            TVector<TStringBuf> members;
+            for (ui32 index = 1; index < maybeVisit.Raw()->ChildrenSize(); ++index) {
+                if (maybeVisit.Raw()->Child(index)->IsAtom()) {
+                    ++index;
+                    auto visitLambda = maybeVisit.Raw()->Child(index);
+                    auto arg = visitLambda->Child(0)->Child(0);
+
+                    TVector<TStringBuf> visitMembers;
+                    if (TMaybeNode<TCoMember>(visitLambda->Child(1)).Struct().Raw() == arg) {
+                        visitMembers.push_back(TCoMember(visitLambda->Child(1)).Name().Value());
+                    }
+                    else if (auto maybeList = TMaybeNode<TExprList>(visitLambda->Child(1))) {
+                        for (auto item: maybeList.Cast()) {
+                            if (item.Maybe<TCoMember>().Struct().Raw() == arg) {
+                                visitMembers.push_back(item.Cast<TCoMember>().Name().Value());
+                            } else {
+                                return {};
+                            }
+                        }
+                    }
+                    if (visitMembers.empty()) {
+                        return {};
+                    } else if (members.empty()) {
+                        members = visitMembers;
+                    } else if (members != visitMembers) {
+                        return {};
+                    }
+                } else {
+                    return {};
+                }
+            }
+            return members;
+        }
+        return {};
+    }
+    return {};
+}
 }
