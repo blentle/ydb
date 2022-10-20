@@ -15,6 +15,7 @@
 #include "skeleton_events.h"
 #include "skeleton_capturevdisklayout.h"
 #include "skeleton_compactionstate.h"
+#include "skeleton_block_and_get.h"
 #include <ydb/core/blobstorage/groupinfo/blobstorage_groupinfo_iter.h>
 #include <ydb/core/blobstorage/vdisk/localrecovery/localrecovery_public.h>
 #include <ydb/core/blobstorage/vdisk/hullop/blobstorage_hull.h>
@@ -889,6 +890,28 @@ namespace NKikimr {
                     && Hull->IsBlocked(record.GetReaderTabletData().GetId(), {record.GetReaderTabletData().GetGeneration(), 0}).Status != TBlocksCache::EStatus::OK) {
                 ReplyError(NKikimrProto::BLOCKED, "tablet's generation is blocked", ev, ctx, now);
             } else {
+                if (ev->Get()->Record.HasForceBlockTabletData() && ev->Get()->Record.GetForceBlockTabletData().GetGeneration() > 0) {
+                    IFaceMonGroup->BlockAndGetMsgs()++;
+
+                    auto tabletId = ev->Get()->Record.GetForceBlockTabletData().GetId();
+                    auto requiredTabletGeneration = ev->Get()->Record.GetForceBlockTabletData().GetGeneration();
+                    ui32 blockedTabletGeneration = 0;
+                    if (!Hull->GetBlocked(tabletId, &blockedTabletGeneration) || blockedTabletGeneration < requiredTabletGeneration) {
+                        // block vdisk and do a get from it
+                        auto actor = CreateBlockAndGetActor(
+                            std::move(ev),
+                            SelfId(),
+                            VCtx,
+                            SkeletonFrontIDPtr,
+                            SelfVDiskId,
+                            Db->GetVDiskIncarnationGuid(),
+                            GInfo
+                        );
+                        ctx.Register(actor.release());
+                        return;
+                    }
+                }
+
                 std::optional<THullDsSnap> fullSnap;
                 if (record.HasSnapshotId()) {
                     const auto it = Snapshots.find(record.GetSnapshotId());

@@ -193,8 +193,7 @@ struct TGroupResponseTracker {
             "Success# %" PRIu32 " RequestsSent# %" PRIu32,
             (ui32)domain.GetSuccess(), (ui32)domain.GetRequestsSent());
         bool isDomain = false;
-        if (status != NKikimrProto::ERROR && status != NKikimrProto::VDISK_ERROR_STATE &&
-                status != NKikimrProto::OUT_OF_SPACE) {
+        if (status != NKikimrProto::ERROR && status != NKikimrProto::VDISK_ERROR_STATE) {
             Y_VERIFY(status == NKikimrProto::OK || status == NKikimrProto::NOT_YET);
             isDomain = domain.GotSuccessReply(vDiskIdx);
         } else {
@@ -704,7 +703,7 @@ class TBlobStorageGroupDiscoverRequest : public TBlobStorageGroupRequestActor<TB
                     auto msg = TEvBlobStorage::TEvVGet::CreateRangeIndexQuery(vDiskId, Deadline,
                             NKikimrBlobStorage::EGetHandleClass::Discover, TEvBlobStorage::TEvVGet::EFlags::ShowInternals,
                             {}, curVDisk.nextLogoBlobId, to, GroupResponseTracker.CurrentRequestSize, nullptr,
-                            ForceBlockedGeneration);
+                            TEvBlobStorage::TEvVGet::TForceBlockTabletData(TabletId, ForceBlockedGeneration));
                     msg->Record.SetSuppressBarrierCheck(true);
                     const ui64 cookie = TVDiskIdShort(vDiskId).GetRaw();
                     A_LOG_DEBUG_S("BSD15", "Request more data sending TEvVGet Tablet# " << TabletId
@@ -908,6 +907,7 @@ public:
             << " MinGeneration# " << MinGeneration
             << " ReadBody# " << (ReadBody ? "true" : "false")
             << " Deadline# " << Deadline
+            << " ForceBlockedGeneration# " << ForceBlockedGeneration
             << " FromLeader# " << (FromLeader ? "true" : "false")
             << " RestartCounter# " << RestartCounter);
 
@@ -930,7 +930,7 @@ public:
 
             auto msg = TEvBlobStorage::TEvVGet::CreateRangeIndexQuery(vd, Deadline,
                 NKikimrBlobStorage::EGetHandleClass::Discover, TEvBlobStorage::TEvVGet::EFlags::ShowInternals,
-                {}, from, to, GroupResponseTracker.CurrentRequestSize, nullptr, ForceBlockedGeneration);
+                {}, from, to, GroupResponseTracker.CurrentRequestSize, nullptr, TEvBlobStorage::TEvVGet::TForceBlockTabletData(TabletId, ForceBlockedGeneration));
             msg->Record.SetTabletId(TabletId);
             msg->Record.SetAcquireBlockedGeneration(true);
             const ui64 cookie = TVDiskIdShort(vd).GetRaw();
@@ -938,7 +938,8 @@ public:
                 << " vDiskId# " << vd
                 << " node# " << Info->GetActorId(vd).NodeId()
                 << " msg# " << msg->ToString()
-                << " cookie# " << cookie);
+                << " cookie# " << cookie
+                << " ForceBlockedGeneration# " << msg->Record.GetForceBlockedGeneration());
             CountEvent(*msg);
             SendToQueue(std::move(msg), cookie);
             TotalSent++;

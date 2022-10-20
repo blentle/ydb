@@ -8,13 +8,15 @@ namespace NYql {
 
 class TAggregateExpander {
 public:
-    TAggregateExpander(bool allowPickle, const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& typesCtx, bool forceCompact = false, bool compactForDistinct = false)
+    TAggregateExpander(bool allowPickle, const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& typesCtx,
+        bool forceCompact = false, bool compactForDistinct = false, bool usePhases = false)
         : Node(node)
         , Ctx(ctx)
         , TypesCtx(typesCtx)
         , AllowPickle(allowPickle)
         , ForceCompact(forceCompact)
         , CompactForDistinct(compactForDistinct)
+        , UsePhases(usePhases)
         , AggregatedColumns(nullptr)
         , VoidNode(ctx.NewCallable(node->Pos(), "Void", {}))
         , HaveDistinct(false)
@@ -37,6 +39,8 @@ public:
     TExprNode::TPtr ExpandAggregate();
 
 private:
+    using TIdxSet = std::set<ui32>;
+
     TExprNode::TPtr ExpandAggApply(const TExprNode::TPtr& node);
     bool CollectTraits();
     TExprNode::TPtr RebuildAggregate();
@@ -46,6 +50,7 @@ private:
     bool IsNeedPickle(const TVector<const TTypeAnnotationNode*>& keyItemTypes);
     TExprNode::TPtr GetKeyExtractor(bool needPickle);
     void CollectColumnsSpecs();
+    void BuildNothingStates();
 
     // Partial aggregate generation
     TExprNode::TPtr GeneratePartialAggregate(const TExprNode::TPtr keyExtractor, const TVector<const TTypeAnnotationNode*>& keyItemTypes, bool needPickle);
@@ -64,6 +69,13 @@ private:
     TExprNode::TPtr GeneratePostAggregateSavePhase();
     TExprNode::TPtr GeneratePostAggregateMergePhase();
 
+    std::function<TExprNodeBuilder& (TExprNodeBuilder&)> GetPartialAggArgExtractor(ui32 i, bool deserialize);
+    TExprNode::TPtr GetFinalAggStateExtractor(ui32 i);
+
+    TExprNode::TPtr GeneratePhases();
+    void GenerateInitForDistinct(TExprNodeBuilder& parent, ui32& ndx, const TIdxSet& indicies, const TExprNode::TPtr& distinctField);
+    TExprNode::TPtr GenerateJustOverStates(const TExprNode::TPtr& input, const TIdxSet& indicies);
+
 private:
     static constexpr TStringBuf SessionStartMemberName = "_yql_group_session_start";
 
@@ -73,6 +85,8 @@ private:
     bool AllowPickle;
     bool ForceCompact;
     bool CompactForDistinct;
+    bool UsePhases;
+    TStringBuf Suffix;
 
     TSessionWindowParams SessionWindowParams;
     TExprNode::TPtr AggList;
@@ -95,7 +109,6 @@ private:
     TExprNode::TListType DistinctFields;
     TExprNode::TListType NothingStates;
 
-    using TIdxSet = std::set<ui32>;
     std::unordered_map<std::string_view, TIdxSet> Distinct2Columns;
     TIdxSet NonDistinctColumns;
 

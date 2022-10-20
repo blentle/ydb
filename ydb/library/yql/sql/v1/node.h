@@ -606,17 +606,17 @@ namespace NSQLTranslationV1 {
     };
     typedef TIntrusivePtr<TFrameSpecification> TFrameSpecificationPtr;
 
-    struct THoppingWindowSpec: public TSimpleRefCount<THoppingWindowSpec> {
+    struct TLegacyHoppingWindowSpec: public TSimpleRefCount<TLegacyHoppingWindowSpec> {
         TNodePtr TimeExtractor;
         TNodePtr Hop;
         TNodePtr Interval;
         TNodePtr Delay;
         bool DataWatermarks;
 
-        TIntrusivePtr<THoppingWindowSpec> Clone() const;
-        ~THoppingWindowSpec() {}
+        TIntrusivePtr<TLegacyHoppingWindowSpec> Clone() const;
+        ~TLegacyHoppingWindowSpec() {}
     };
-    typedef TIntrusivePtr<THoppingWindowSpec> THoppingWindowSpecPtr;
+    typedef TIntrusivePtr<TLegacyHoppingWindowSpec> TLegacyHoppingWindowSpecPtr;
 
     struct TWindowSpecification: public TSimpleRefCount<TWindowSpecification> {
         TMaybe<TString> ExistingWindowName;
@@ -754,7 +754,7 @@ namespace NSQLTranslationV1 {
 
         virtual bool InitAggr(TContext& ctx, bool isFactory, ISource* src, TAstListNode& node, const TVector<TNodePtr>& exprs) = 0;
 
-        virtual TNodePtr AggregationTraits(const TNodePtr& type, bool overState) const;
+        virtual std::pair<TNodePtr, bool> AggregationTraits(const TNodePtr& type, bool overState, bool many, TContext& ctx) const;
 
         virtual TNodePtr AggregationTraitsFactory() const = 0;
 
@@ -762,7 +762,7 @@ namespace NSQLTranslationV1 {
 
         virtual void AddFactoryArguments(TNodePtr& apply) const;
 
-        virtual TNodePtr WindowTraits(const TNodePtr& type) const;
+        virtual TNodePtr WindowTraits(const TNodePtr& type, TContext& ctx) const;
 
         const TString& GetName() const;
 
@@ -772,13 +772,13 @@ namespace NSQLTranslationV1 {
         virtual void Join(IAggregation* aggr);
 
     private:
-        virtual TNodePtr GetApply(const TNodePtr& type) const = 0;
+        virtual TNodePtr GetApply(const TNodePtr& type, bool many, TContext& ctx) const = 0;
 
     protected:
         IAggregation(TPosition pos, const TString& name, const TString& func, EAggregateMode mode);
         TAstNode* Translate(TContext& ctx) const override;
-        TNodePtr WrapIfOverState(const TNodePtr& input, bool overState) const;
-        virtual TNodePtr GetExtractor() const = 0;
+        TNodePtr WrapIfOverState(const TNodePtr& input, bool overState, bool many, TContext& ctx) const;
+        virtual TNodePtr GetExtractor(bool many, TContext& ctx) const = 0;
 
         TString Name;
         TString Func;
@@ -838,9 +838,10 @@ namespace NSQLTranslationV1 {
         virtual void AddWindowSpecs(TWinSpecs winSpecs);
         virtual bool AddAggregationOverWindow(TContext& ctx, const TString& windowName, TAggregationPtr func);
         virtual bool AddFuncOverWindow(TContext& ctx, const TString& windowName, TNodePtr func);
-        virtual void SetHoppingWindowSpec(THoppingWindowSpecPtr spec);
-        virtual THoppingWindowSpecPtr GetHoppingWindowSpec() const;
+        virtual void SetLegacyHoppingWindowSpec(TLegacyHoppingWindowSpecPtr spec);
+        virtual TLegacyHoppingWindowSpecPtr GetLegacyHoppingWindowSpec() const;
         virtual TNodePtr GetSessionWindowSpec() const;
+        virtual TNodePtr GetHoppingWindowSpec() const;
         virtual bool IsCompositeSource() const;
         virtual bool IsGroupByColumn(const TString& column) const;
         virtual bool IsFlattenByColumns() const;
@@ -860,7 +861,7 @@ namespace NSQLTranslationV1 {
         virtual TNodePtr BuildPreaggregatedMap(TContext& ctx);
         virtual TNodePtr BuildPreFlattenMap(TContext& ctx);
         virtual TNodePtr BuildPrewindowMap(TContext& ctx);
-        virtual TNodePtr BuildAggregation(const TString& label);
+        virtual std::pair<TNodePtr, bool> BuildAggregation(const TString& label, TContext& ctx);
         virtual TNodePtr BuildCalcOverWindow(TContext& ctx, const TString& label);
         virtual TNodePtr BuildSort(TContext& ctx, const TString& label);
         virtual TNodePtr BuildCleanupColumns(TContext& ctx, const TString& label);
@@ -916,8 +917,9 @@ namespace NSQLTranslationV1 {
         TMap<TString, TVector<TAggregationPtr>> AggregationOverWindow;
         TMap<TString, TVector<TNodePtr>> FuncOverWindow;
         TWinSpecs WinSpecs;
-        THoppingWindowSpecPtr HoppingWindowSpec;
+        TLegacyHoppingWindowSpecPtr LegacyHoppingWindowSpec;
         TNodePtr SessionWindow;
+        TNodePtr HoppingWindow;
         TVector<ISource*> UsedSources;
         TString FlattenMode;
         bool FlattenColumns = false;
@@ -1049,6 +1051,28 @@ namespace NSQLTranslationV1 {
         bool Valid;
     };
 
+    class THoppingWindow final : public INode {
+    public:
+        THoppingWindow(TPosition pos, const TVector<TNodePtr>& args);
+        void MarkValid();
+        TNodePtr BuildTraits(const TString& label) const;
+    public:
+        TNodePtr Hop;
+        TNodePtr Interval;
+    private:
+        bool DoInit(TContext& ctx, ISource* src) override;
+        TAstNode* Translate(TContext&) const override;
+        void DoUpdateState() const override;
+        TNodePtr DoClone() const override;
+        TString GetOpName() const override;
+        TNodePtr ProcessIntervalParam(const TNodePtr& val) const;
+
+        TVector<TNodePtr> Args;
+        TSourcePtr FakeSource;
+        TNodePtr Node;
+        bool Valid;
+    };
+
     struct TStringContent {
         TString Content;
         NYql::NUdf::EDataSlot Type = NYql::NUdf::EDataSlot::String;
@@ -1078,11 +1102,13 @@ namespace NSQLTranslationV1 {
         TMaybe<TIdentifier> KeyBloomFilter;
         TNodePtr ReadReplicasSettings;
         NYql::TResetableSetting<TTtlSettings, void> TtlSettings;
+        TMaybe<TIdentifier> StoreType;
+        TNodePtr PartitionByHashFunction;
 
         bool IsSet() const {
             return CompactionPolicy || AutoPartitioningBySize || PartitionSizeMb || AutoPartitioningByLoad
                 || MinPartitions || MaxPartitions || UniformPartitions || PartitionAtKeys || KeyBloomFilter
-                || ReadReplicasSettings || TtlSettings;
+                || ReadReplicasSettings || TtlSettings || StoreType || PartitionByHashFunction;
         }
     };
 
@@ -1296,7 +1322,7 @@ namespace NSQLTranslationV1 {
         const TVector<TSortSpecificationPtr>& orderBy,
         TNodePtr having,
         TWinSpecs&& windowSpec,
-        THoppingWindowSpecPtr hoppingWindowSpec,
+        TLegacyHoppingWindowSpecPtr legacyHoppingWindowSpec,
         TVector<TNodePtr>&& terms,
         bool distinct,
         TVector<TNodePtr>&& without,

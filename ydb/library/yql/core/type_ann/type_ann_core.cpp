@@ -869,11 +869,11 @@ namespace NTypeAnnImpl {
         return result;
     }
 
-    TMaybe<ui32> FindOrReportMissingMember(TStringBuf memberName, TPositionHandle pos, const TStructExprType& structType, TContext& ctx) {
+    TMaybe<ui32> FindOrReportMissingMember(TStringBuf memberName, TPositionHandle pos, const TStructExprType& structType, TExprContext& ctx) {
         TString errStr;
         auto result = FindOrReportMissingMember(memberName, structType, errStr);
         if (!result) {
-            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(pos), errStr));
+            ctx.AddError(TIssue(ctx.GetPosition(pos), errStr));
         }
         return result;
     }
@@ -913,7 +913,7 @@ namespace NTypeAnnImpl {
         }
 
         auto memberName = input->Tail().Content();
-        auto pos = FindOrReportMissingMember(memberName, input->Pos(), *structType, ctx);
+        auto pos = FindOrReportMissingMember(memberName, input->Pos(), *structType, ctx.Expr);
         if (!pos) {
             return IGraphTransformer::TStatus::Error;
         }
@@ -1095,7 +1095,7 @@ namespace NTypeAnnImpl {
         bool isOptional = input->Head().GetTypeAnn()->GetKind() == ETypeAnnotationKind::Optional;
         const TStructExprType& structType = *RemoveAllOptionals(input->Head().GetTypeAnn())->Cast<TStructExprType>();
 
-        auto pos = FindOrReportMissingMember(columnNameNode->Content(), input->Pos(), structType, ctx);
+        auto pos = FindOrReportMissingMember(columnNameNode->Content(), input->Pos(), structType, ctx.Expr);
         if (!pos) {
             return IGraphTransformer::TStatus::Error;
         }
@@ -1706,7 +1706,7 @@ namespace NTypeAnnImpl {
         TVector<const TItemExprType*> newItems = structType->GetItems();
         EraseIf(newItems, [&](const auto& item) { return item->GetName() == memberName; });
 
-        if (!Forced && !FindOrReportMissingMember(memberName, input->Pos(), *structType, ctx)) {
+        if (!Forced && !FindOrReportMissingMember(memberName, input->Pos(), *structType, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
 
@@ -1744,7 +1744,7 @@ namespace NTypeAnnImpl {
             auto memberName = child->Content();
             EraseIf(newItems, [&](const auto& item) { return item->GetName() == memberName; });
 
-            if (!Forced && !FindOrReportMissingMember(memberName, input->Pos(), *structType, ctx)) {
+            if (!Forced && !FindOrReportMissingMember(memberName, input->Pos(), *structType, ctx.Expr)) {
                 return IGraphTransformer::TStatus::Error;
             }
         }
@@ -1927,7 +1927,7 @@ namespace NTypeAnnImpl {
 
         auto memberName = input->Child(1)->Content();
         auto structType = input->Head().GetTypeAnn()->Cast<TStructExprType>();
-        auto pos = FindOrReportMissingMember(memberName, input->Pos(), *structType, ctx);
+        auto pos = FindOrReportMissingMember(memberName, input->Pos(), *structType, ctx.Expr);
         if (!pos) {
             return IGraphTransformer::TStatus::Error;
         }
@@ -2237,10 +2237,10 @@ namespace NTypeAnnImpl {
             bool first_signed = IsDataTypeSigned(first);
             bool second_signed = IsDataTypeSigned(second);
             if (first_width > second_width && !first_signed && second_signed ||
-                first_width == second_width && first_signed != second_signed) 
+                first_width == second_width && first_signed != second_signed)
             {
                 auto issue = TIssue(
-                        ctx.Expr.GetPosition(input->Pos()), 
+                        ctx.Expr.GetPosition(input->Pos()),
                         TStringBuilder() << "Integral type implicit bitcast: " << *input->Head().GetTypeAnn() << " and " << *input->Tail().GetTypeAnn()
                     );
                 SetIssueCode(EYqlIssueCode::TIssuesIds_EIssueCode_CORE_IMPLICIT_BITCAST, issue);
@@ -2278,7 +2278,7 @@ namespace NTypeAnnImpl {
         if (check_result != IGraphTransformer::TStatus::Ok) {
             return check_result;
         }
-        
+
         const bool isLeftNumeric = IsDataTypeNumeric(dataType[0]->GetSlot());
         const bool isRightNumeric = IsDataTypeNumeric(dataType[1]->GetSlot());
         // bool isOk = false;
@@ -2354,7 +2354,7 @@ namespace NTypeAnnImpl {
         if (check_result != IGraphTransformer::TStatus::Ok) {
             return check_result;
         }
-        
+
         const bool isLeftNumeric = IsDataTypeNumeric(dataType[0]->GetSlot());
         const bool isRightNumeric = IsDataTypeNumeric(dataType[1]->GetSlot());
         // bool isOk = false;
@@ -2428,7 +2428,7 @@ namespace NTypeAnnImpl {
         if (check_result != IGraphTransformer::TStatus::Ok) {
             return check_result;
         }
-        
+
         if (IsDataTypeNumeric(dataType[0]->GetSlot()) && IsDataTypeNumeric(dataType[1]->GetSlot())) {
             auto commonTypeSlot = GetNumericDataTypeByLevel(Max(GetNumericDataTypeLevel(dataType[0]->GetSlot()),
                 GetNumericDataTypeLevel(dataType[1]->GetSlot())));
@@ -2484,7 +2484,7 @@ namespace NTypeAnnImpl {
 
             haveOptional |= isOptional[i];
         }
-        
+
         auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
         if (check_result != IGraphTransformer::TStatus::Ok) {
             return check_result;
@@ -2547,7 +2547,7 @@ namespace NTypeAnnImpl {
         if (check_result != IGraphTransformer::TStatus::Ok) {
             return check_result;
         }
-        
+
         if (IsDataTypeNumeric(dataType[0]->GetSlot()) && IsDataTypeNumeric(dataType[1]->GetSlot())) {
             auto commonTypeSlot = GetNumericDataTypeByLevel(Max(GetNumericDataTypeLevel(dataType[0]->GetSlot()),
                 GetNumericDataTypeLevel(dataType[1]->GetSlot())));
@@ -5032,7 +5032,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         const TTypeAnnotationNode* itemType;
         if (varType->GetUnderlyingType()->GetKind() == ETypeAnnotationKind::Struct) {
             auto structType = varType->GetUnderlyingType()->Cast<TStructExprType>();
-            auto pos = FindOrReportMissingMember(input->Child(1)->Content(), input->Pos(), *structType, ctx);
+            auto pos = FindOrReportMissingMember(input->Child(1)->Content(), input->Pos(), *structType, ctx.Expr);
             if (!pos) {
                 return IGraphTransformer::TStatus::Error;
             }
@@ -7904,7 +7904,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
             input->SetTypeAnn(tupleType->GetItems()[index]);
         } else {
             auto structType = variantType->GetUnderlyingType()->Cast<TStructExprType>();
-            auto pos = FindOrReportMissingMember(input->Child(1)->Content(), input->Pos(), *structType, ctx);
+            auto pos = FindOrReportMissingMember(input->Child(1)->Content(), input->Pos(), *structType, ctx.Expr);
             if (!pos) {
                 return IGraphTransformer::TStatus::Error;
             }
@@ -8023,7 +8023,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                     itemType = tupleType->GetItems()[index];
                     itemIndex = index;
                 } else {
-                    auto pos = FindOrReportMissingMember(child->Content(), child->Pos(), *structType, ctx);
+                    auto pos = FindOrReportMissingMember(child->Content(), child->Pos(), *structType, ctx.Expr);
                     if (!pos) {
                         return IGraphTransformer::TStatus::Error;
                     }
@@ -8934,6 +8934,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
             return IGraphTransformer::TStatus::Error;
         }
 
+        THashSet<TStringBuf> addedInProjectionFields;
         TVector<const TItemExprType*> allItems;
         for (auto& item : input->Child(1)->Children()) {
             if (!item->IsCallable({"SqlProjectItem", "SqlProjectStarItem"})) {
@@ -8944,11 +8945,57 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
 
             if (item->IsCallable("SqlProjectStarItem")) {
                 auto& structItems = item->GetTypeAnn()->Cast<TStructExprType>()->GetItems();
-                allItems.insert(allItems.end(), structItems.begin(), structItems.end());
+                for (const auto& item : structItems) {
+                    allItems.emplace_back(item);
+                    addedInProjectionFields.emplace(item->GetName());
+                }
             } else {
                 YQL_ENSURE(item->Child(1)->IsAtom());
-                allItems.push_back(ctx.Expr.MakeType<TItemExprType>(item->Child(1)->Content(), item->GetTypeAnn()));
+                const auto fieldName = item->Child(1)->Content();
+                allItems.push_back(ctx.Expr.MakeType<TItemExprType>(fieldName, item->GetTypeAnn()));
+                addedInProjectionFields.emplace(fieldName);
             }
+        }
+
+        TVector<TStringBuf> transparentFields;
+        for (auto& inputItem : itemType->Cast<TStructExprType>()->GetItems()) {
+            if (!inputItem->GetName().StartsWith("_yql_sys_tsp_") ||
+                addedInProjectionFields.contains(inputItem->GetName()))
+            {
+                continue;
+            }
+
+            transparentFields.push_back(inputItem->GetName());
+        }
+
+        if (!transparentFields.empty()) {
+            TVector<TExprNode::TPtr> newProjectItems;
+            for (const auto& item : input->Child(1)->Children()) {
+                newProjectItems.push_back(item);
+            }
+
+            for (const auto& fieldName : transparentFields) {
+                auto lambdaArg = ctx.Expr.NewArgument(input->Pos(), "row");
+                auto lambdaBody = ctx.Expr.NewCallable(input->Pos(), "Member", {
+                    lambdaArg,
+                    ctx.Expr.NewAtom(input->Pos(), fieldName)
+                });
+                newProjectItems.push_back(ctx.Expr.NewCallable(
+                    input->Pos(),
+                    "SqlProjectItem",
+                    {
+                        ctx.Expr.NewCallable(input->Pos(), "TypeOf", {
+                            input->Child(0)
+                        }),
+                        ctx.Expr.NewAtom(input->Pos(), fieldName),
+                        ctx.Expr.NewLambda(
+                            input->Pos(),
+                            ctx.Expr.NewArguments(input->Pos(), {std::move(lambdaArg)}),
+                            std::move(lambdaBody))
+                    }));
+            }
+            output = ctx.Expr.ChangeChild(*input, 1, ctx.Expr.NewList(input->Pos(), std::move(newProjectItems)));
+            return IGraphTransformer::TStatus::Repeat;
         }
 
         auto resultStructType = ctx.Expr.MakeType<TStructExprType>(allItems);
@@ -10983,7 +11030,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                 return IGraphTransformer::TStatus::Error;
             }
 
-            auto pos = FindOrReportMissingMember(key, keyNode->Pos(), structType, ctx);
+            auto pos = FindOrReportMissingMember(key, keyNode->Pos(), structType, ctx.Expr);
             if (!pos) {
                 return IGraphTransformer::TStatus::Error;
             }
@@ -11444,6 +11491,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["AggregateMergeState"] = &AggregateWrapper;
         Functions["AggregateFinalize"] = &AggregateWrapper;
         Functions["AggregateMergeFinalize"] = &AggregateWrapper;
+        Functions["AggregateMergeManyFinalize"] = &AggregateWrapper;
         Functions["AggOverState"] = &AggOverStateWrapper;
         Functions["SqlAggregateAll"] = &SqlAggregateAllWrapper;
         Functions["CountedAggregateAll"] = &CountedAggregateAllWrapper;
@@ -11507,6 +11555,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["PgOr"] = &PgBoolOpWrapper;
         Functions["PgNot"] = &PgBoolOpWrapper;
         Functions["PgAggregationTraits"] = &PgAggregationTraitsWrapper;
+        Functions["PgAggregationTraitsOverState"] = &PgAggregationTraitsWrapper;
         Functions["PgWindowTraits"] = &PgAggregationTraitsWrapper;
         Functions["PgAggregationTraitsTuple"] = &PgAggregationTraitsWrapper;
         Functions["PgWindowTraitsTuple"] = &PgAggregationTraitsWrapper;

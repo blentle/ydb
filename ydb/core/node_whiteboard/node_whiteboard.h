@@ -57,6 +57,7 @@ struct TEvWhiteboard{
         EvSignalBodyResponse,
         EvPDiskStateDelete,
         EvVDiskStateGenerationChange,
+        EvVDiskDropDonors,
         EvEnd
     };
 
@@ -220,6 +221,27 @@ struct TEvWhiteboard{
         {}
     };
 
+    struct TEvVDiskDropDonors : TEventLocal<TEvVDiskDropDonors, EvVDiskDropDonors> {
+        const TVDiskID VDiskId;
+        const ui64 InstanceGuid;
+        const std::vector<NKikimrBlobStorage::TVSlotId> DropDonors;
+        const bool DropAllDonors = false;
+
+        TEvVDiskDropDonors(TVDiskID vdiskId, ui64 instanceGuid, std::vector<NKikimrBlobStorage::TVSlotId> dropDonors)
+            : VDiskId(vdiskId)
+            , InstanceGuid(instanceGuid)
+            , DropDonors(std::move(dropDonors))
+        {}
+
+        struct TDropAllDonors {};
+
+        TEvVDiskDropDonors(TVDiskID vdiskId, ui64 instanceGuid, TDropAllDonors)
+            : VDiskId(vdiskId)
+            , InstanceGuid(instanceGuid)
+            , DropAllDonors(true)
+        {}
+    };
+
     struct TEvPDiskStateDelete : TEventPB<TEvPDiskStateDelete, NKikimrWhiteboard::TPDiskStateInfo, EvPDiskStateDelete> {
         TEvPDiskStateDelete() = default;
 
@@ -244,6 +266,9 @@ struct TEvWhiteboard{
                 VDiskIDFromVDiskID(groupInfo->GetVDiskId(i), Record.AddVDiskIds());
             }
             Record.SetStoragePoolName(groupInfo->GetStoragePoolName());
+            if (groupInfo->GetEncryptionMode() != TBlobStorageGroupInfo::EEM_NONE) {
+                Record.SetEncryption(true);
+            }
         }
     };
 

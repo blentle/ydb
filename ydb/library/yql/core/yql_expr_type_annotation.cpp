@@ -1955,6 +1955,62 @@ bool EnsureValidSettings(const TExprNode& node,
     return true;
 }
 
+
+bool EnsureValidUserSchemaSetting(const TExprNode& node, TExprContext& ctx) {
+    if (!EnsureTupleMinSize(node, 2, ctx)) {
+        return false;
+    }
+
+    if (!EnsureTupleMaxSize(node, 3, ctx)) {
+        return false;
+    }
+
+    if (!EnsureAtom(node.Head(), ctx)) {
+        return false;
+    }
+
+    if (node.Head().Content() != "userschema") {
+        ctx.AddError(TIssue(ctx.GetPosition(node.Head().Pos()), TStringBuilder() << "Expecting userschema, but got '" << node.Head().Content() << "'"));
+        return false;
+    }
+
+    if (!EnsureTypeWithStructType(*node.Child(1), ctx)) {
+        return false;
+    }
+
+    if (node.ChildrenSize() == 3) {
+        if (!EnsureTupleOfAtoms(*node.Child(2), ctx)) {
+            return false;
+        }
+        const TStructExprType* s = node.Child(1)->GetTypeAnn()->Cast<TTypeExprType>()->GetType()->Cast<TStructExprType>();
+        THashSet<TStringBuf> items;
+        for (auto child : node.Child(2)->ChildrenList()) {
+            if (!items.insert(child->Content()).second) {
+                ctx.AddError(TIssue(ctx.GetPosition(node.Head().Pos()),
+                                    TStringBuilder() << "Invalid positional userschema: got duplicated field  '" << child->Content() << "'"));
+                return false;
+
+            }
+            if (!s->FindItem(child->Content())) {
+                ctx.AddError(TIssue(ctx.GetPosition(node.Head().Pos()),
+                                    TStringBuilder() << "Invalid positional userschema: field  '" << child->Content() << "'"
+                                                     << " is not found in type " << *(const TTypeAnnotationNode*)s));
+                return false;
+            }
+        }
+
+        if (node.Child(2)->ChildrenSize() < s->GetSize()) {
+            ctx.AddError(TIssue(ctx.GetPosition(node.Head().Pos()),
+                                TStringBuilder() << "Invalid positional userschema of size " << node.Child(2)->ChildrenSize()
+                                                 << " with struct type of size " << s->GetSize()));
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
 TSettingNodeValidator RequireSingleValueSettings(const TSettingNodeValidator& validator) {
     return [validator](TStringBuf name, const TExprNode& setting, TExprContext& ctx) {
         if (setting.ChildrenSize() != 2) {
@@ -5135,6 +5191,16 @@ const TTypeAnnotationNode* GetBlockItemType(const TTypeAnnotationNode& type, boo
     } else {
         isScalar = true;
         return type.Cast<TScalarExprType>()->GetItemType();
+    }
+}
+
+const TTypeAnnotationNode* AggApplySerializedStateType(const TExprNode::TPtr& input, TExprContext& ctx) {
+    Y_UNUSED(ctx);
+    auto name = input->Child(0)->Content();
+    if (name == "count" || name == "count_all" || name == "sum") {
+        return input->GetTypeAnn();
+    } else {
+        YQL_ENSURE(false, "Unknown AggApply: " << name);
     }
 }
 

@@ -19,6 +19,7 @@
 #include "utils/s2n_result.h"
 #include "utils/s2n_safety.h"
 #include "crypto/s2n_fips.h"
+#include "pq-crypto/s2n_pq_asm.h"
 
 bool s2n_kyber512r3_is_avx2_bmi2_enabled(void);
 S2N_RESULT s2n_try_enable_kyber512r3_opt_avx2_bmi2(void);

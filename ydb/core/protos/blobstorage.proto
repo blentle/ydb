@@ -139,13 +139,14 @@ message TEvVWindowChange {
 enum EStatusFlags {  // Never use this type for storage, use ui32 bitset
     StatusIsValid = 1;                          // 0000 0000 0001, if not set, status flags could not be obtained
     StatusDiskSpaceCyan = 128;                  // 0000 1000 0000
-    StatusDiskSpaceLightYellowMove = 2;  // 0010 0000 0000
-    StatusDiskSpaceYellowStop = 512;        // 0000 0000 0010
+    StatusDiskSpaceLightYellowMove = 2;         // 0000 0000 0010
+    StatusDiskSpaceYellowStop = 512;            // 0010 0000 0000
     StatusDiskSpaceLightOrange = 256;           // 0001 0000 0000
+    StatusDiskSpacePreOrange = 1024;            // 0100 0000 0000
     StatusDiskSpaceOrange = 4;                  // 0000 0000 0100
     StatusDiskSpaceRed = 8;                     // 0000 0000 1000
     StatusDiskSpaceBlack = 64;                  // 0000 0100 0000
-    StatusMaskDiskSpace = 974;                  // 0011 1100 1110
+    StatusMaskDiskSpace = 1998;                 // 0111 1100 1110
     StatusNewOwner = 16;                        // 0000 0001 0000
     StatusNotEnoughDiskSpaceForOperation = 32;  // 0000 0010 0000
 }
@@ -492,12 +493,13 @@ message TEvVGet {
     optional TTimestamps Timestamps = 23;
     optional uint32 ForceBlockedGeneration = 24 [default = 0]; // non-zero means a successfull block must be done first
 
-    message TReaderTabletData {
+    message TTabletData {
         optional uint64 Id = 1;
         optional uint32 Generation = 2;
     }
 
-    optional TReaderTabletData ReaderTabletData = 25;
+    optional TTabletData ReaderTabletData = 25;
+    optional TTabletData ForceBlockTabletData = 26;
 
     optional bytes SnapshotId = 30; // read data from specific snapshot (if set)
 }
@@ -933,6 +935,7 @@ message TEvVStatusResult {
     optional uint32 StatusFlags = 9; // flags from EStatusFlags
     optional bool JoinedGroup = 10;
     optional bool Replicated = 11 [default = false];
+    optional float ApproximateFreeSpaceShare = 12; // must contain valid value if set
     optional fixed64 IncarnationGuid = 30;
     optional TGroupInfo RecentGroup = 100; // filled in by VDisk on RACE when VDisk has newer generation
 }

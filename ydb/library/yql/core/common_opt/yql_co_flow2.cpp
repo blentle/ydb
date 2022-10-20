@@ -33,9 +33,19 @@ TExprNode::TPtr AggregateSubsetFieldsAnalyzer(const TCoAggregate& node, TExprCon
         sessionColumn = sessionSetting->Child(1)->Child(0)->Content();
     }
 
+    TMaybe<TStringBuf> hoppingColumn;
+    auto hoppingSetting = GetSetting(node.Settings().Ref(), "hopping");
+    if (hoppingSetting) {
+        auto traitsNode = hoppingSetting->ChildPtr(1);
+        if (traitsNode->IsList()) {
+            YQL_ENSURE(traitsNode->Child(0)->IsAtom());
+            hoppingColumn = traitsNode->Child(0)->Content();
+        }
+    }
+
     TSet<TStringBuf> usedFields;
     for (const auto& x : node.Keys()) {
-        if (x.Value() != sessionColumn) {
+        if (x.Value() != sessionColumn && x.Value() != hoppingColumn) {
             usedFields.insert(x.Value());
         }
     }
@@ -71,10 +81,13 @@ TExprNode::TPtr AggregateSubsetFieldsAnalyzer(const TCoAggregate& node, TExprCon
         }
     }
 
-    auto settings = node.Settings();
-    auto hoppingSetting = GetSetting(settings.Ref(), "hopping");
     if (hoppingSetting) {
-        auto traits = TCoHoppingTraits(hoppingSetting->Child(1));
+        auto traitsNode = hoppingSetting->ChildPtr(1);
+        if (traitsNode->IsList()) {
+            traitsNode = traitsNode->ChildPtr(1);
+        }
+        auto traits = TCoHoppingTraits(traitsNode);
+
         auto timeExtractor = traits.TimeExtractor();
 
         auto usedType = traits.ItemType().Ref().GetTypeAnn()->Cast<TTypeExprType>()->GetType()->Cast<TStructExprType>();
@@ -83,10 +96,9 @@ TExprNode::TPtr AggregateSubsetFieldsAnalyzer(const TCoAggregate& node, TExprCon
         }
 
         TSet<TStringBuf> lambdaSubset;
-        if (!HaveFieldsSubset(timeExtractor.Body().Ptr(), *timeExtractor.Args().Arg(0).Raw(), lambdaSubset, parentsMap)) {
-            return node.Ptr();
+        if (HaveFieldsSubset(timeExtractor.Body().Ptr(), *timeExtractor.Args().Arg(0).Raw(), lambdaSubset, parentsMap)) {
+            usedFields.insert(lambdaSubset.cbegin(), lambdaSubset.cend());
         }
-        usedFields.insert(lambdaSubset.cbegin(), lambdaSubset.cend());
 
         if (usedFields.size() == structType->GetSize()) {
             return node.Ptr();
@@ -1468,6 +1480,20 @@ void RegisterCoFlowCallables2(TCallableOptimizerMap& map) {
             return node;
         }
 
+        if (self.Input().Maybe<TCoChain1Map>()) {
+            if (auto res = ApplyExtractMembersToChain1Map(self.Input().Ptr(), self.Members().Ptr(), *optCtx.ParentsMap, ctx, {})) {
+                return res;
+            }
+            return node;
+        }
+
+        if (self.Input().Maybe<TCoCondense1>()) {
+            if (auto res = ApplyExtractMembersToCondense1(self.Input().Ptr(), self.Members().Ptr(), *optCtx.ParentsMap, ctx, {})) {
+                return res;
+            }
+            return node;
+        }
+
         return node;
     };
 
@@ -1860,6 +1886,39 @@ void RegisterCoFlowCallables2(TCallableOptimizerMap& map) {
                 .Build()
                 .InitHandler(ctx.DeepCopyLambda(self.InitHandler().Ref()))
                 .SwitchHandler(ctx.DeepCopyLambda(self.SwitchHandler().Ref()))
+                .UpdateHandler(ctx.DeepCopyLambda(self.UpdateHandler().Ref()))
+                .Done().Ptr();
+        }
+        return node;
+    };
+
+    map[TCoChain1Map::CallableName()] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext& optCtx) {
+        const TCoChain1Map self(node);
+        if (!optCtx.IsSingleUsage(self.Input().Ref())) {
+            return node;
+        }
+
+        std::map<std::string_view, TExprNode::TPtr> usedFields;
+        if (HaveFieldsSubset(self.InitHandler().Body().Ptr(), self.InitHandler().Args().Arg(0).Ref(), usedFields, *optCtx.ParentsMap, false)
+            && !usedFields.empty()
+            && HaveFieldsSubset(self.UpdateHandler().Body().Ptr(), self.UpdateHandler().Args().Arg(0).Ref(), usedFields, *optCtx.ParentsMap, false)
+            && !usedFields.empty()
+            && usedFields.size() < GetSeqItemType(self.Input().Ref().GetTypeAnn())->Cast<TStructExprType>()->GetSize())
+        {
+            TExprNode::TListType fields;
+            fields.reserve(usedFields.size());
+            std::transform(usedFields.begin(), usedFields.end(), std::back_inserter(fields),
+                [](std::pair<const std::string_view, TExprNode::TPtr>& item){ return std::move(item.second); });
+
+            YQL_CLOG(DEBUG, Core) << node->Content() << "SubsetFields";
+            return Build<TCoChain1Map>(ctx, node->Pos())
+                .Input<TCoExtractMembers>()
+                    .Input(self.Input())
+                    .Members()
+                        .Add(std::move(fields))
+                    .Build()
+                .Build()
+                .InitHandler(ctx.DeepCopyLambda(self.InitHandler().Ref()))
                 .UpdateHandler(ctx.DeepCopyLambda(self.UpdateHandler().Ref()))
                 .Done().Ptr();
         }

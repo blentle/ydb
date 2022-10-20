@@ -1002,8 +1002,8 @@ TWindowSpecificationPtr TWindowSpecification::Clone() const {
     return res;
 }
 
-THoppingWindowSpecPtr THoppingWindowSpec::Clone() const {
-    auto res = MakeIntrusive<THoppingWindowSpec>();
+TLegacyHoppingWindowSpecPtr TLegacyHoppingWindowSpec::Clone() const {
+    auto res = MakeIntrusive<TLegacyHoppingWindowSpec>();
     res->TimeExtractor = TimeExtractor->Clone();
     res->Hop = Hop->Clone();
     res->Interval = Interval->Clone();
@@ -1246,20 +1246,35 @@ TAstNode* IAggregation::Translate(TContext& ctx) const {
     return nullptr;
 }
 
-TNodePtr IAggregation::AggregationTraits(const TNodePtr& type, bool overState) const {
+std::pair<TNodePtr, bool> IAggregation::AggregationTraits(const TNodePtr& type, bool overState, bool many, TContext& ctx) const {
     const bool distinct = AggMode == EAggregateMode::Distinct;
     const auto listType = distinct ? Y("ListType", Y("StructMemberType", Y("ListItemType", type), BuildQuotedAtom(Pos, DistinctKey))) : type;
-    return distinct ?
-        Q(Y(Q(Name), WrapIfOverState(GetApply(listType), overState), BuildQuotedAtom(Pos, DistinctKey))) :
-        Q(Y(Q(Name), WrapIfOverState(GetApply(listType), overState)));
+    auto apply = GetApply(listType, many, ctx);
+    if (!apply) {
+        return { nullptr, false };
+    }
+
+    auto wrapped = WrapIfOverState(apply, overState, many, ctx);
+    if (!wrapped) {
+        return { nullptr, false };
+    }
+
+    return { distinct ?
+        Q(Y(Q(Name), wrapped, BuildQuotedAtom(Pos, DistinctKey))) :
+        Q(Y(Q(Name), wrapped)), true };
 }
 
-TNodePtr IAggregation::WrapIfOverState(const TNodePtr& input, bool overState) const {
+TNodePtr IAggregation::WrapIfOverState(const TNodePtr& input, bool overState, bool many, TContext& ctx) const {
     if (!overState) {
         return input;
     }
 
-    return Y("AggOverState", GetExtractor(), BuildLambda(Pos, Y(), input));
+    auto extractor = GetExtractor(many, ctx);
+    if (!extractor) {
+        return nullptr;
+    }
+
+    return Y(ToString("AggOverState"), extractor, BuildLambda(Pos, Y(), input));
 }
 
 void IAggregation::AddFactoryArguments(TNodePtr& apply) const {
@@ -1270,9 +1285,9 @@ std::vector<ui32> IAggregation::GetFactoryColumnIndices() const {
     return {0u};
 }
 
-TNodePtr IAggregation::WindowTraits(const TNodePtr& type) const {
+TNodePtr IAggregation::WindowTraits(const TNodePtr& type, TContext& ctx) const {
     YQL_ENSURE(AggMode == EAggregateMode::OverWindow, "Windows traits is unavailable");
-    return Q(Y(Q(Name), GetApply(type)));
+    return Q(Y(Q(Name), GetApply(type, false, ctx)));
 }
 
 ISource::ISource(TPosition pos)
@@ -1408,6 +1423,14 @@ bool ISource::AddExpressions(TContext& ctx, const TVector<TNodePtr>& expressions
                 }
                 SessionWindow = expr;
             }
+            if (auto hoppingWindow = dynamic_cast<THoppingWindow*>(expr.Get())) {
+                if (HoppingWindow) {
+                    ctx.Error(expr->GetPos()) << "Duplicate hopping window specification:";
+                    ctx.Error(HoppingWindow->GetPos()) << "Previous hopping window is declared here";
+                    return false;
+                }
+                HoppingWindow = expr;
+            }
         }
         Expressions(exprSeat).emplace_back(expr);
     }
@@ -1466,16 +1489,20 @@ const TVector<TString>& ISource::GetTmpWindowColumns() const {
     return TmpWindowColumns;
 }
 
-void ISource::SetHoppingWindowSpec(THoppingWindowSpecPtr spec) {
-    HoppingWindowSpec = spec;
+void ISource::SetLegacyHoppingWindowSpec(TLegacyHoppingWindowSpecPtr spec) {
+    LegacyHoppingWindowSpec = spec;
 }
 
-THoppingWindowSpecPtr ISource::GetHoppingWindowSpec() const {
-    return HoppingWindowSpec;
+TLegacyHoppingWindowSpecPtr ISource::GetLegacyHoppingWindowSpec() const {
+    return LegacyHoppingWindowSpec;
 }
 
 TNodePtr ISource::GetSessionWindowSpec() const {
     return SessionWindow;
+}
+
+TNodePtr ISource::GetHoppingWindowSpec() const {
+    return HoppingWindow;
 }
 
 TWindowSpecificationPtr ISource::FindWindowSpecification(TContext& ctx, const TString& windowName) const {
@@ -1693,6 +1720,9 @@ TNodePtr BuildLambdaBodyForExprAliases(TPosition pos, const TVector<TNodePtr>& e
         if (dynamic_cast<const TSessionWindow*>(exprNode.Get())) {
             continue;
         }
+        if (dynamic_cast<const THoppingWindow*>(exprNode.Get())) {
+            continue;
+        }
         structObj = structObj->Y("AddMember", structObj, structObj->Q(name), exprNode);
     }
     return structObj->Y("AsList", structObj);
@@ -1759,9 +1789,9 @@ bool ISource::SetSamplingRate(TContext& ctx, TNodePtr samplingRate) {
     return true;
 }
 
-TNodePtr ISource::BuildAggregation(const TString& label) {
-    if (GroupKeys.empty() && Aggregations.empty() && !IsCompositeSource() && !HoppingWindowSpec) {
-        return nullptr;
+std::pair<TNodePtr, bool> ISource::BuildAggregation(const TString& label, TContext& ctx) {
+    if (GroupKeys.empty() && Aggregations.empty() && !IsCompositeSource() && !LegacyHoppingWindowSpec) {
+        return { nullptr, true };
     }
 
     auto keysTuple = Y();
@@ -1786,10 +1816,16 @@ TNodePtr ISource::BuildAggregation(const TString& label) {
 
     const auto listType = Y("TypeOf", label);
     auto aggrArgs = Y();
-    const bool overState = GroupBySuffix == "CombineState" || GroupBySuffix == "MergeState" || GroupBySuffix == "MergeFinalize";
+    const bool overState = GroupBySuffix == "CombineState" || GroupBySuffix == "MergeState" ||
+        GroupBySuffix == "MergeFinalize" || GroupBySuffix == "MergeManyFinalize";
     for (const auto& aggr: Aggregations) {
-        if (const auto traits = aggr->AggregationTraits(listType, overState)) {
-            aggrArgs = L(aggrArgs, traits);
+        auto res = aggr->AggregationTraits(listType, overState, GroupBySuffix == "MergeManyFinalize", ctx);
+        if (!res.second) {
+           return { nullptr, false };
+        }
+
+        if (res.first) {
+            aggrArgs = L(aggrArgs, res.first);
         }
     }
 
@@ -1798,15 +1834,15 @@ TNodePtr ISource::BuildAggregation(const TString& label) {
         options = L(options, Q(Y(Q("compact"))));
     }
 
-    if (HoppingWindowSpec) {
+    if (LegacyHoppingWindowSpec) {
         auto hoppingTraits = Y(
             "HoppingTraits",
             Y("ListItemType", listType),
-            BuildLambda(Pos, Y("row"), HoppingWindowSpec->TimeExtractor),
-            HoppingWindowSpec->Hop,
-            HoppingWindowSpec->Interval,
-            HoppingWindowSpec->Delay,
-            HoppingWindowSpec->DataWatermarks ? Q("true") : Q("false"));
+            BuildLambda(Pos, Y("row"), LegacyHoppingWindowSpec->TimeExtractor),
+            LegacyHoppingWindowSpec->Hop,
+            LegacyHoppingWindowSpec->Interval,
+            LegacyHoppingWindowSpec->Delay,
+            LegacyHoppingWindowSpec->DataWatermarks ? Q("true") : Q("false"));
 
         options = L(options, Q(Y(Q("hopping"), hoppingTraits)));
     }
@@ -1819,7 +1855,15 @@ TNodePtr ISource::BuildAggregation(const TString& label) {
             Q(Y(BuildQuotedAtom(Pos, SessionWindow->GetLabel()), sessionWindow->BuildTraits(label))))));
     }
 
-    return Y("AssumeColumnOrderPartial", Y("Aggregate" + GroupBySuffix, label, Q(keysTuple), Q(aggrArgs), Q(options)), Q(keysTuple));
+    if (HoppingWindow) {
+        YQL_ENSURE(HoppingWindow->GetLabel());
+        auto hoppingWindow = dynamic_cast<THoppingWindow*>(HoppingWindow.Get());
+        YQL_ENSURE(hoppingWindow);
+        options = L(options, Q(Y(Q("hopping"),
+            Q(Y(BuildQuotedAtom(Pos, HoppingWindow->GetLabel()), hoppingWindow->BuildTraits(label))))));
+    }
+
+    return { Y("AssumeColumnOrderPartial", Y("Aggregate" + GroupBySuffix, label, Q(keysTuple), Q(aggrArgs), Q(options)), Q(keysTuple)), true };
 }
 
 TMaybe<TString> ISource::FindColumnMistype(const TString& name) const {
@@ -1990,7 +2034,7 @@ TNodePtr ISource::BuildCalcOverWindow(TContext& ctx, const TString& label) {
         YQL_ENSURE(frameType);
         auto callOnFrame = Y(frameType, BuildWindowFrame(*spec->Frame, spec->IsCompact));
         for (auto& agg : aggs) {
-            auto winTraits = agg->WindowTraits(listType);
+            auto winTraits = agg->WindowTraits(listType, ctx);
             callOnFrame = L(callOnFrame, winTraits);
         }
         for (auto& func : funcs) {

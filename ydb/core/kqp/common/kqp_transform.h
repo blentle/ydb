@@ -156,7 +156,7 @@ private:
     friend class TKqpTransactionContext;
 };
 
-class TKqpTransactionContext : public NYql::TKikimrTransactionContextBase {
+class TKqpTransactionContext : public NYql::TKikimrTransactionContextBase, public NYql::TTimeAndRandomProvider {
 public:
     explicit TKqpTransactionContext(bool implicit)
         : Implicit(implicit)
@@ -216,6 +216,7 @@ public:
 
     void Reset() {
         TKikimrTransactionContextBase::Reset();
+        TTimeAndRandomProvider::Reset();
 
         DeferredEffects.Clear();
         ParamsState = MakeIntrusive<TParamsState>();
@@ -241,13 +242,43 @@ public:
         ForceNewEngineSettings.ForceNewEngineLevel = level;
     }
 
+    void SetIsolationLevel(const Ydb::Table::TransactionSettings& settings) {
+        switch (settings.tx_mode_case()) {
+            case Ydb::Table::TransactionSettings::kSerializableReadWrite:
+                EffectiveIsolationLevel = NKikimrKqp::ISOLATION_LEVEL_SERIALIZABLE;
+                Readonly = false;
+                break;
+
+            case Ydb::Table::TransactionSettings::kOnlineReadOnly:
+                EffectiveIsolationLevel = settings.online_read_only().allow_inconsistent_reads()
+                    ? NKikimrKqp::ISOLATION_LEVEL_READ_UNCOMMITTED
+                    : NKikimrKqp::ISOLATION_LEVEL_READ_COMMITTED;
+                Readonly = true;
+                break;
+
+            case Ydb::Table::TransactionSettings::kStaleReadOnly:
+                EffectiveIsolationLevel = NKikimrKqp::ISOLATION_LEVEL_READ_STALE;
+                Readonly = true;
+                break;
+
+            case Ydb::Table::TransactionSettings::kSnapshotReadOnly:
+                // TODO: (KIKIMR-3374) Use separate isolation mode to avoid optimistic locks.
+                EffectiveIsolationLevel = NKikimrKqp::ISOLATION_LEVEL_SERIALIZABLE;
+                Readonly = true;
+                break;
+
+            case Ydb::Table::TransactionSettings::TX_MODE_NOT_SET:
+                YQL_ENSURE(false, "tx_mode not set, settings: " << settings);
+                break;
+        };
+    }
+
 public:
     struct TParamsState : public TThrRefBase {
         TParamValueMap Values;
         ui32 LastIndex = 0;
     };
 
-public:
     const bool Implicit;
 
     TInstant CreationTime;
@@ -293,7 +324,7 @@ private:
     NYql::NLog::ELevel Level;
 };
 
-TMaybe<NYql::NDq::TMkqlValueRef> GetParamValue(bool ensure, NYql::TKikimrQueryContext& queryCtx,
+TMaybe<NYql::NDq::TMkqlValueRef> GetParamValue(bool ensure, NYql::TTimeAndRandomProvider& randomCtx, NYql::TKikimrParamsMap& parameters,
     const TVector<TVector<NKikimrMiniKQL::TResult>>& txResults, const NKqpProto::TKqpPhyParamBinding& paramBinding);
 
 } // namespace NKqp

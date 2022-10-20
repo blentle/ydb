@@ -72,6 +72,7 @@ bool EnsureValidSettings(const TExprNode& node,
     const THashSet<TStringBuf>& supportedSettings,
     const TSettingNodeValidator& validator,
     TExprContext& ctx);
+bool EnsureValidUserSchemaSetting(const TExprNode& node, TExprContext& ctx);
 TSettingNodeValidator RequireSingleValueSettings(const TSettingNodeValidator& validator);
 
 bool EnsureLambda(const TExprNode& node, TExprContext& ctx);
@@ -294,5 +295,7 @@ bool HasContextFuncs(const TExprNode& input);
 bool EnsureBlockOrScalarType(const TExprNode& node, TExprContext& ctx);
 bool EnsureBlockOrScalarType(TPositionHandle position, const TTypeAnnotationNode& type, TExprContext& ctx);
 const TTypeAnnotationNode* GetBlockItemType(const TTypeAnnotationNode& type, bool& isScalar);
+
+const TTypeAnnotationNode* AggApplySerializedStateType(const TExprNode::TPtr& input, TExprContext& ctx);
 
 }

@@ -5,11 +5,7 @@
 #include "clock.h"
 #endif
 
-#ifdef _WIN32
-#   include <intrin.h>
-#else
-#   include <x86intrin.h>
-#endif
+#include <util/system/datetime.h>
 
 namespace NYT {
 
@@ -17,7 +13,7 @@ namespace NYT {
 
 inline TCpuInstant GetCpuInstant()
 {
-    return __rdtsc();
+    return static_cast<TCpuInstant>(GetCycleCount());
 }
 
 ////////////////////////////////////////////////////////////////////////////////

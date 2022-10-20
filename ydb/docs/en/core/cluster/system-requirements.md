@@ -8,7 +8,7 @@ The number of servers and disks is determined by the fault-tolerance requirement
 
 * **Processor**
 
-   A {{ ydb-short-name }} server can only run on x86-64 processors with AVX2 instruction support (Intel Haswell (4th generation) and later, AMD EPYC and later).
+   A {{ ydb-short-name }} server can only run on x86-64 processors with AVX2 instruction support: Intel Haswell (4th generation) and later, AMD EPYC and later.
 
    The ARM architecture is currently not supported.
 
@@ -30,6 +30,6 @@ The number of servers and disks is determined by the fault-tolerance requirement
 
 ## Software configuration {#software}
 
-A {{ ydb-short-name }} server can run on servers with Linux kernel 4.4 or higher.
+A {{ ydb-short-name }} server can run on servers with Linux kernel 4.4 or higher and libc 2.30 (Ubuntu 20.04, Debian 11, Fedora34).
 
 MacOS and Windows operating systems are currently not supported.

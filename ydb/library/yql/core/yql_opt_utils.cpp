@@ -11,6 +11,8 @@
 #include <util/generic/set.h>
 #include <util/string/type.h>
 
+#include <limits>
+
 namespace NYql {
 
 using namespace NNodes;
@@ -255,6 +257,52 @@ bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, TField
 template bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, TSet<TStringBuf>& usedFields, const TParentsMap& parentsMap, bool allowDependsOn);
 template bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, TSet<TString>& usedFields, const TParentsMap& parentsMap, bool allowDependsOn);
 template bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, std::map<std::string_view, TExprNode::TPtr>& usedFields, const TParentsMap& parentsMap, bool allowDependsOn);
+
+TExprNode::TPtr AddMembersUsedInside(const TExprNode::TPtr& start, const TExprNode& arg, TExprNode::TPtr&& members, const TParentsMap& parentsMap, TExprContext& ctx) {
+    if (!members || !start || &arg == start.Get()) {
+        return {};
+    }
+
+    if (RemoveOptionalType(arg.GetTypeAnn())->GetKind() != ETypeAnnotationKind::Struct) {
+        return {};
+    }
+
+    if (!IsDepended(*start, arg)) {
+        return std::move(members);
+    }
+
+    TNodeSet nodes;
+    VisitExpr(start, [&](const TExprNode::TPtr& node) {
+        if (!node->IsCallable("DependsOn"))
+            nodes.emplace(node.Get());
+        return true;
+    });
+
+    std::unordered_set<std::string_view> names(members->ChildrenSize());
+    members->ForEachChild([&names](const TExprNode& name){ names.emplace(name.Content()); });
+
+
+    const auto parents = parentsMap.find(&arg);
+    YQL_ENSURE(parents != parentsMap.cend());
+    TExprNode::TListType extra;
+    for (const auto& parent : parents->second) {
+        if (nodes.cend() == nodes.find(parent))
+            continue;
+        if (!parent->IsCallable("Member"))
+            return {};
+        if (names.emplace(parent->Tail().Content()).second)
+            extra.emplace_back(parent->TailPtr());
+    }
+
+
+    if (!extra.empty()) {
+        auto children = members->ChildrenList();
+        std::move(extra.begin(), extra.end(), std::back_inserter(children));
+        members = ctx.ChangeChildren(*members, std::move(children));
+    }
+
+    return std::move(members);
+}
 
 template<class TFieldsSet>
 TExprNode::TPtr FilterByFields(TPositionHandle position, const TExprNode::TPtr& input, const TFieldsSet& subsetFields,
@@ -1440,7 +1488,10 @@ TStringBuf GetEmptyCollectionName(ETypeAnnotationKind kind) {
 
 namespace {
 
-ui8 GetTypeWeight(const TTypeAnnotationNode& type) {
+constexpr ui64 MaxWeight = std::numeric_limits<ui64>::max();
+constexpr ui64 UnknownWeight = std::numeric_limits<ui32>::max();
+
+ui64 GetTypeWeight(const TTypeAnnotationNode& type) {
     switch (type.GetKind()) {
         case ETypeAnnotationKind::Data:
             switch (type.Cast<TDataExprType>()->GetSlot()) {
@@ -1476,26 +1527,28 @@ ui8 GetTypeWeight(const TTypeAnnotationNode& type) {
             }
         case ETypeAnnotationKind::Optional:
             return 1 + GetTypeWeight(*type.Cast<TOptionalExprType>()->GetItemType());
-        case ETypeAnnotationKind::Pg:
-            return ui8(ClampVal(NPg::LookupType(type.Cast<TPgExprType>()->GetId()).TypeLen, 1, 255));
+        case ETypeAnnotationKind::Pg: {
+            const auto& typeDesc = NPg::LookupType(type.Cast<TPgExprType>()->GetId());
+            if (typeDesc.TypeLen > 0 && typeDesc.PassByValue) {
+                return typeDesc.TypeLen;
+            }
+            return UnknownWeight;
+        }
         default:
-            return 255;
+            return UnknownWeight;
     }
 }
 
 } // namespace
 
 const TItemExprType* GetLightColumn(const TStructExprType& type) {
-    ui8 weight = 255;
+    ui64 weight = MaxWeight;
     const TItemExprType* field = nullptr;
     for (const auto& item : type.GetItems()) {
         if (const auto w = GetTypeWeight(*item->GetItemType()); w < weight) {
             weight = w;
             field = item;
         }
-    }
-    if (const auto& items = type.GetItems(); !items.empty() && !field) {
-        field = items[0];
     }
     return field;
 }
@@ -1540,4 +1593,9 @@ TVector<TStringBuf> GetCommonKeysFromVariantSelector(const NNodes::TCoLambda& la
     }
     return {};
 }
+
+bool IsIdentityLambda(const TExprNode& lambda) {
+    return lambda.IsLambda() && &lambda.Head().Head() == &lambda.Tail();
+}
+
 }

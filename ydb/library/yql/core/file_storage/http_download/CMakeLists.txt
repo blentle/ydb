@@ -19,11 +19,9 @@ target_link_libraries(core-file_storage-http_download PUBLIC
   yql-utils-fetch
   yql-utils-log
   library-yql-utils
-  cpp-regex-pcre
   cpp-digest-md5
   cpp-http-misc
 )
 target_sources(core-file_storage-http_download PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/core/file_storage/http_download/http_download.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/library/yql/core/file_storage/http_download/pattern_group.cpp
 )

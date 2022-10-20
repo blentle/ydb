@@ -754,6 +754,11 @@ namespace {
             return IGraphTransformer::TStatus::Repeat;
         }
 
+        if (IsIdentityLambda(input->Tail())) {
+            output = input->HeadPtr();
+            return IGraphTransformer::TStatus::Repeat;
+        }
+
         const TTypeAnnotationNode* itemType = nullptr;
         if (!EnsureNewSeqType<true>(input->Head(), ctx.Expr, &itemType)) {
             return IGraphTransformer::TStatus::Error;
@@ -1003,13 +1008,18 @@ namespace {
             return IGraphTransformer::TStatus::Repeat;
         }
 
-        auto& initLambda = input->ChildRef(1);
-        auto& updateLambda = input->ChildRef(2);
+        if (IsIdentityLambda(input->Tail()) && IsIdentityLambda(*input->Child(1))) {
+            output = input->HeadPtr();
+            return IGraphTransformer::TStatus::Repeat;
+        }
 
         const TTypeAnnotationNode* itemType = nullptr;
         if (!EnsureNewSeqType<false>(input->Head(), ctx.Expr, &itemType)) {
             return IGraphTransformer::TStatus::Error;
         }
+
+        auto& initLambda = input->ChildRef(1);
+        auto& updateLambda = input->ChildRef(2);
 
         auto status = ConvertToLambda(initLambda, ctx.Expr, 1);
         status = status.Combine(ConvertToLambda(updateLambda, ctx.Expr, 2));
@@ -4213,7 +4223,7 @@ namespace {
         TVector<const TItemExprType*> resItems;
         for (auto& x : input->Tail().Children()) {
             YQL_ENSURE(x->IsAtom());
-            auto pos = FindOrReportMissingMember(x->Content(), input->Head().Pos(), *structType, ctx);
+            auto pos = FindOrReportMissingMember(x->Content(), input->Head().Pos(), *structType, ctx.Expr);
             if (!pos) {
                 return IGraphTransformer::TStatus::Error;
             }
@@ -4252,7 +4262,7 @@ namespace {
         const auto structType = inputItemType->Cast<TStructExprType>();
         for (auto& x : input->Tail().Children()) {
             YQL_ENSURE(x->IsAtom());
-            auto pos = FindOrReportMissingMember(x->Content(), input->Head().Pos(), *structType, ctx);
+            auto pos = FindOrReportMissingMember(x->Content(), input->Head().Pos(), *structType, ctx.Expr);
             if (!pos) {
                 return IGraphTransformer::TStatus::Error;
             }
@@ -4306,7 +4316,7 @@ namespace {
 
         for (auto& column : columnOrder) {
             YQL_ENSURE(column->IsAtom());
-            auto pos = FindOrReportMissingMember(column->Content(), input->Head().Pos(), *structType, ctx);
+            auto pos = FindOrReportMissingMember(column->Content(), input->Head().Pos(), *structType, ctx.Expr);
             if (!pos) {
                 return IGraphTransformer::TStatus::Error;
             }
@@ -4398,21 +4408,21 @@ namespace {
             return IGraphTransformer::TStatus::Error;
         }
 
+        if (lambdaUpdate->Head().ChildrenSize() == 2U) {
+            if (!UpdateLambdaAllArgumentsTypes(lambdaUpdate, { itemType, combineStateType }, ctx.Expr)) {
+                return IGraphTransformer::TStatus::Error;
+            }
+        } else {
+            if (!UpdateLambdaAllArgumentsTypes(lambdaUpdate, { itemType, combineStateType, ui32Type }, ctx.Expr)) {
+                return IGraphTransformer::TStatus::Error;
+            }
+        }
+
+        if (!lambdaUpdate->GetTypeAnn()) {
+            return IGraphTransformer::TStatus::Repeat;
+        }
+
         if (!overState) {
-            if (lambdaUpdate->Head().ChildrenSize() == 2U) {
-                if (!UpdateLambdaAllArgumentsTypes(lambdaUpdate, { itemType, combineStateType }, ctx.Expr)) {
-                    return IGraphTransformer::TStatus::Error;
-                }
-            } else {
-                if (!UpdateLambdaAllArgumentsTypes(lambdaUpdate, { itemType, combineStateType, ui32Type }, ctx.Expr)) {
-                    return IGraphTransformer::TStatus::Error;
-                }
-            }
-
-            if (!lambdaUpdate->GetTypeAnn()) {
-                return IGraphTransformer::TStatus::Repeat;
-            }
-
             if (!IsSameAnnotation(*lambdaUpdate->GetTypeAnn(), *combineStateType)) {
                 ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(lambdaUpdate->Pos()), TStringBuilder() << "Mismatch update lambda result type, expected: "
                     << *combineStateType << ", but got: " << *lambdaUpdate->GetTypeAnn()));
@@ -4582,14 +4592,11 @@ namespace {
             return IGraphTransformer::TStatus::Repeat;
         }
 
-        bool isStream;
-        if (!EnsureSeqType(input->Head(), ctx.Expr, &isStream)) {
+        const TTypeAnnotationNode* inputItemType = nullptr;
+        if (!EnsureNewSeqType<false, true>(input->Head(), ctx.Expr, &inputItemType)) {
             return IGraphTransformer::TStatus::Error;
         }
-
-        auto inputItemType = isStream
-            ? input->Head().GetTypeAnn()->Cast<TStreamExprType>()->GetItemType()
-            : input->Head().GetTypeAnn()->Cast<TListExprType>()->GetItemType();
+        auto inputTypeKind = input->Head().GetTypeAnn()->GetKind();
 
         if (!EnsureStructType(input->Head().Pos(), *inputItemType, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
@@ -4637,6 +4644,7 @@ namespace {
 
         TVector<const TItemExprType*> rowColumns;
         TMaybe<TStringBuf> sessionColumnName;
+        TMaybe<TStringBuf> hoppingColumnName;
         for (const auto& setting : settings->Children()) {
             if (!EnsureTupleMinSize(*setting, 1, ctx.Expr)) {
                 return IGraphTransformer::TStatus::Error;
@@ -4653,13 +4661,52 @@ namespace {
                     return IGraphTransformer::TStatus::Error;
                 }
 
-                if (!setting->Child(1)->IsCallable("HoppingTraits")) {
+                auto value = setting->ChildPtr(1);
+                if (value->Type() == TExprNode::List) {
+                    if (!EnsureTupleSize(*value, 2, ctx.Expr)) {
+                        return IGraphTransformer::TStatus::Error;
+                    }
+
+                    auto hoppingOutputColumn = value->Child(0);
+                    if (!EnsureAtom(*hoppingOutputColumn, ctx.Expr)) {
+                        return IGraphTransformer::TStatus::Error;
+                    }
+
+                    if (hoppingOutputColumn->Content().Empty()) {
+                        ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(hoppingOutputColumn->Pos()),
+                            TStringBuilder() << "Hopping output column name can not be empty"));
+                        return IGraphTransformer::TStatus::Error;
+                    }
+
+                    hoppingColumnName = hoppingOutputColumn->Content();
+
+                    auto traits = value->Child(1);
+                    if (!traits->IsCallable("HoppingTraits")) {
+                        ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(setting->Child(1)->Pos()),
+                            TStringBuilder() << "Expected HoppingTraits callable"));
+                        return IGraphTransformer::TStatus::Error;
+                    }
+
+                    bool seenAsKeyColumn = AnyOf(input->Child(1)->ChildrenList(), [&](const auto& keyColum) {
+                        return hoppingColumnName == keyColum->Content();
+                    });
+
+                    if (!seenAsKeyColumn) {
+                        ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(setting->Child(1)->Pos()),
+                            TStringBuilder() << "Hopping column " << *hoppingColumnName << " is not listed in key columns"));
+                        return IGraphTransformer::TStatus::Error;
+                    }
+                } else if (setting->Child(1)->IsCallable("HoppingTraits")) {
+                    hoppingColumnName = "_yql_time"; // legacy hopping
+                } else {
                     ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(setting->Child(1)->Pos()),
                         TStringBuilder() << "Expected HoppingTraits callable"));
                     return IGraphTransformer::TStatus::Error;
                 }
-                rowColumns.push_back(ctx.Expr.MakeType<TItemExprType>("_yql_time",
-                    ctx.Expr.MakeType<TOptionalExprType>(ctx.Expr.MakeType<TDataExprType>(EDataSlot::Timestamp))));
+
+                rowColumns.push_back(ctx.Expr.MakeType<TItemExprType>(
+                        *hoppingColumnName,
+                        ctx.Expr.MakeType<TOptionalExprType>(ctx.Expr.MakeType<TDataExprType>(EDataSlot::Timestamp))));
             } else if (settingName == "session") {
                 if (!EnsureTupleSize(*setting, 2, ctx.Expr)) {
                     return IGraphTransformer::TStatus::Error;
@@ -4718,11 +4765,11 @@ namespace {
                 return IGraphTransformer::TStatus::Error;
             }
 
-            if (sessionColumnName == child->Content()) {
+            if (sessionColumnName == child->Content() || hoppingColumnName == child->Content()) {
                 continue;
             }
 
-            auto item = FindOrReportMissingMember(child->Content(), child->Pos(), *inputStructType, ctx);
+            auto item = FindOrReportMissingMember(child->Content(), child->Pos(), *inputStructType, ctx.Expr);
             if (!item) {
                 return IGraphTransformer::TStatus::Error;
             }
@@ -4774,6 +4821,11 @@ namespace {
 
             const TTypeAnnotationNode* distinctColumnType = nullptr;
             if (child->ChildrenSize() == 3) {
+                if (suffix != "" && suffix != "Finalize") {
+                    ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(child->Pos()), TStringBuilder() << "DISTINCT aggregation is not supported for mode: " << suffix));
+                    return IGraphTransformer::TStatus::Error;
+                }
+
                 if (!EnsureAtom(*child->Child(2), ctx.Expr)) {
                     return IGraphTransformer::TStatus::Error;
                 }
@@ -4866,9 +4918,7 @@ namespace {
             return IGraphTransformer::TStatus::Error;
         }
 
-        input->SetTypeAnn(isStream
-            ? (const TTypeAnnotationNode*)ctx.Expr.MakeType<TStreamExprType>(rowType)
-            : (const TTypeAnnotationNode*)ctx.Expr.MakeType<TListExprType>(rowType));
+        input->SetTypeAnn(MakeSequenceType(inputTypeKind, *rowType, ctx.Expr));
         return IGraphTransformer::TStatus::Ok;
     }
 
@@ -5054,16 +5104,6 @@ namespace {
         return IGraphTransformer::TStatus::Ok;
     }
 
-    const TTypeAnnotationNode* AggApplySerializedStateType(const TExprNode::TPtr& input, TExprContext& ctx) {
-        Y_UNUSED(ctx);
-        auto name = input->Child(0)->Content();
-        if (name == "count" || name == "count_all" || name == "sum") {
-            return input->GetTypeAnn();
-        } else {
-            YQL_ENSURE(false, "Unknown AggApply: " << name);
-        }
-    }
-
     IGraphTransformer::TStatus AggApplyWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
         Y_UNUSED(output);
         if (!EnsureArgsCount(*input, 3, ctx.Expr)) {
@@ -5116,6 +5156,11 @@ namespace {
                         TStringBuilder() << "Unsupported column type: " << lambdaTypeSlot));
                     return IGraphTransformer::TStatus::Error;
                 }
+
+                if (isOptional) {
+                    sumResultType = ctx.Expr.MakeType<TOptionalExprType>(sumResultType);
+                }
+
                 input->SetTypeAnn(sumResultType);
             } else if (IsNull(*lambda->GetTypeAnn())) {
                 input->SetTypeAnn(ctx.Expr.MakeType<TNullExprType>());
@@ -5966,12 +6011,7 @@ namespace {
             return IGraphTransformer::TStatus::Repeat;
         }
 
-        const TTypeAnnotationNode* timeType = ctx.Expr.MakeType<TDataExprType>(EDataSlot::Timestamp);
-
-        if (!IsSameAnnotation(*RemoveOptionalType(lambdaTimeExtractor->GetTypeAnn()), *timeType)) {
-            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(lambdaTimeExtractor->Pos()), TStringBuilder()
-                << "Mismatch hopping window time extractor lambda output type, expected: "
-                << *timeType << ", but got: " << *lambdaTimeExtractor->GetTypeAnn()));
+        if (!EnsureSpecificDataType(*lambdaTimeExtractor, EDataSlot::Timestamp, ctx.Expr, true)) {
             return IGraphTransformer::TStatus::Error;
         }
 

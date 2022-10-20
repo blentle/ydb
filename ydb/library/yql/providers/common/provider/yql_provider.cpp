@@ -41,18 +41,12 @@ namespace {
         "json_each_row"sv,
         "parquet"sv
     };
-    constexpr std::array<std::string_view, 6> CompressionsForInput = {
+    constexpr std::array<std::string_view, 6> Compressions = {
         "gzip"sv,
         "zstd"sv,
         "lz4"sv,
         "brotli"sv,
         "bzip2"sv,
-        "xz"sv
-    };
-    constexpr std::array<std::string_view, 4> CompressionsForOutput = {
-        "gzip"sv,
-        "brotli"sv,
-        "zstd"sv,
         "xz"sv
     };
     constexpr std::array<std::string_view, 10> IntervalUnits = {
@@ -557,7 +551,6 @@ bool FillUsedFilesImpl(
                 const auto it = crutches.find(geobase);
                 if (crutches.cend() != it) {
                     auto pragma = it->second;
-                    types.UserDataStorage->TryFillUserDataToken(pragma);
                     types.UserDataStorage->AddUserDataBlock(geobase, pragma);
                     files.emplace(geobase, pragma).first->second.Usage.Set(EUserDataBlockUsage::Path);
                 }
@@ -1105,20 +1098,20 @@ void WriteStatistics(NYson::TYsonWriter& writer, bool totalOnly, const THashMap<
 }
 
 bool ValidateCompressionForInput(std::string_view compression, TExprContext& ctx) {
-    if (compression.empty() || IsIn(CompressionsForInput, compression)) {
+    if (compression.empty() || IsIn(Compressions, compression)) {
         return true;
     }
     ctx.AddError(TIssue(TStringBuilder() << "Unknown compression: " << compression
-        << ". Use one of: " << JoinSeq(", ", CompressionsForInput)));
+        << ". Use one of: " << JoinSeq(", ", Compressions)));
     return false;
 }
 
 bool ValidateCompressionForOutput(std::string_view compression, TExprContext& ctx) {
-    if (compression.empty() || IsIn(CompressionsForOutput, compression)) {
+    if (compression.empty() || IsIn(Compressions, compression)) {
         return true;
     }
     ctx.AddError(TIssue(TStringBuilder() << "Unknown compression: " << compression
-        << ". Use one of: " << JoinSeq(", ", CompressionsForOutput)));
+        << ". Use one of: " << JoinSeq(", ", Compressions)));
     return false;
 }
 

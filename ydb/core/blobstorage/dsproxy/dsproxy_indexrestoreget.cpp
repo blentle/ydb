@@ -17,6 +17,7 @@ class TBlobStorageGroupIndexRestoreGetRequest
     TArrayHolder<TEvBlobStorage::TEvGet::TQuery> Queries;
     const TInstant Deadline;
     const bool IsInternal;
+    const std::optional<TEvBlobStorage::TEvGet::TForceBlockTabletData> ForceBlockTabletData;
 
     THashMap<ui64, TGroupQuorumTracker> QuorumTracker;
     TVector<TBlobStatusTracker> BlobStatus;
@@ -244,7 +245,7 @@ class TBlobStorageGroupIndexRestoreGetRequest
     std::unique_ptr<IEventBase> RestartQuery(ui32 counter) {
         ++*Mon->NodeMon->RestartIndexRestoreGet;
         auto ev = std::make_unique<TEvBlobStorage::TEvGet>(Queries, QuerySize, Deadline, GetHandleClass,
-            true /*mustRestoreFirst*/, true /*isIndexOnly*/, 0u /*forceBlockedGeneration*/, IsInternal);
+            true /*mustRestoreFirst*/, true /*isIndexOnly*/, std::nullopt /*forceBlockTabletData*/, IsInternal);
         ev->RestartCounter = counter;
         return ev;
     }
@@ -274,6 +275,7 @@ public:
         , Queries(ev->Queries.Release())
         , Deadline(ev->Deadline)
         , IsInternal(ev->IsInternal)
+        , ForceBlockTabletData(ev->ForceBlockTabletData)
         , VGetsInFlight(0)
         , StartTime(now)
         , GetHandleClass(ev->GetHandleClass)
@@ -309,7 +311,9 @@ public:
             << " QuerySize# " << QuerySize
             << " Queries# " << makeQueriesList()
             << " Deadline# " << Deadline
-            << " RestartCounter# " << RestartCounter);
+            << " RestartCounter# " << RestartCounter
+            << " ForceBlockTabletId# " << (ForceBlockTabletData ? ToString(ForceBlockTabletData->Id) : "")
+            << " ForceBlockTabletGeneration# " << (ForceBlockTabletData ? ToString(ForceBlockTabletData->Generation) : ""));
 
         for (const auto& vdisk : Info->GetVDisks()) {
             auto vd = Info->GetVDiskId(vdisk.OrderNumber);
@@ -337,11 +341,18 @@ public:
                             QuorumTracker.emplace(cookie, Info.Get());
                         }
 
-                        vget = TEvBlobStorage::TEvVGet::CreateExtremeIndexQuery(vd, Deadline,
-                                NKikimrBlobStorage::EGetHandleClass::FastRead,
-                                TEvBlobStorage::TEvVGet::EFlags::ShowInternals, cookie);
+                        vget = TEvBlobStorage::TEvVGet::CreateExtremeIndexQuery(
+                                    vd,
+                                    Deadline,
+                                    NKikimrBlobStorage::EGetHandleClass::FastRead,
+                                    TEvBlobStorage::TEvVGet::EFlags::ShowInternals,
+                                    cookie,
+                                    {},
+                                    ForceBlockTabletData
+                                );
 
                         vget->Record.SetSuppressBarrierCheck(IsInternal);
+                        vget->Record.SetTabletId(TabletId);
                     }
                     const ui64 cookie = queryIdx;
                     vget->AddExtremeQuery(id, 0, 0, &cookie);

@@ -2241,6 +2241,24 @@ bool TSqlTranslation::StoreTableSettingsEntry(const TIdentifier& id, const TRule
         } else {
             settings.TtlSettings.Reset();
         }
+    } else if (to_lower(id.Name) == "store") {
+        if (reset) {
+            Ctx.Error() << to_upper(id.Name) << " reset is not supported";
+            return false;
+        }
+        if (!StoreId(*value, settings.StoreType, *this)) {
+            Ctx.Error() << to_upper(id.Name) << " value should be an identifier";
+            return false;
+        }
+    } else if (to_lower(id.Name) == "partition_by_hash_function") {
+        if (reset) {
+            Ctx.Error() << to_upper(id.Name) << " reset is not supported";
+            return false;
+        }
+        if (!StoreString(*value, settings.PartitionByHashFunction, Ctx)) {
+            Ctx.Error() << to_upper(id.Name) << " value should be a string literal";
+            return false;
+        }
     } else {
         Ctx.Error() << "Unknown table setting: " << id.Name;
         return false;
@@ -3593,13 +3611,13 @@ public:
         , CompactGroupBy(false)
     {}
 
-    bool Build(const TRule_group_by_clause& node, bool stream);
+    bool Build(const TRule_group_by_clause& node);
     bool ParseList(const TRule_grouping_element_list& groupingListNode, EGroupByFeatures featureContext);
 
     void SetFeatures(const TString& field) const;
     TVector<TNodePtr>& Content();
     TMap<TString, TNodePtr>& Aliases();
-    THoppingWindowSpecPtr GetHoppingWindow() const;
+    TLegacyHoppingWindowSpecPtr GetLegacyHoppingWindow() const;
     bool IsCompactGroupBy() const;
     TString GetSuffix() const;
 
@@ -3622,7 +3640,7 @@ private:
 
     TVector<TNodePtr> GroupBySet;
     TGroupByClauseCtx::TPtr GroupSetContext;
-    THoppingWindowSpecPtr HoppingWindowSpec; // stream queries
+    TLegacyHoppingWindowSpecPtr LegacyHoppingWindowSpec; // stream queries
     static const TString AutogenerateNamePrefix;
     bool CompactGroupBy;
     TString Suffix;
@@ -6710,23 +6728,30 @@ TSourcePtr TSqlSelect::SelectCore(const TRule_select_core& node, const TWriteSet
 
     /// \todo merge gtoupByExpr and groupBy in one
     TVector<TNodePtr> groupByExpr, groupBy;
-    THoppingWindowSpecPtr hoppingWindowSpec;
+    TLegacyHoppingWindowSpecPtr legacyHoppingWindowSpec;
     bool compactGroupBy = false;
     TString groupBySuffix;
     if (node.HasBlock11()) {
         TGroupByClause clause(Ctx, Mode);
-        if (!clause.Build(node.GetBlock11().GetRule_group_by_clause1(), source->IsStream())) {
+        if (!clause.Build(node.GetBlock11().GetRule_group_by_clause1())) {
             return nullptr;
         }
+        bool hasHopping = (bool)clause.GetLegacyHoppingWindow();
         for (const auto& exprAlias: clause.Aliases()) {
             YQL_ENSURE(exprAlias.first == exprAlias.second->GetLabel());
             groupByExpr.emplace_back(exprAlias.second);
+            hasHopping |= (bool)dynamic_cast<THoppingWindow*>(exprAlias.second.Get());
         }
         groupBy = std::move(clause.Content());
         clause.SetFeatures("sql_features");
-        hoppingWindowSpec = clause.GetHoppingWindow();
+        legacyHoppingWindowSpec = clause.GetLegacyHoppingWindow();
         compactGroupBy = clause.IsCompactGroupBy();
         groupBySuffix = clause.GetSuffix();
+
+        if (source->IsStream() && !hasHopping) {
+            Ctx.Error() << "Streaming group by query must have a hopping window specification.";
+            return nullptr;
+        }
     }
 
     TNodePtr having;
@@ -6815,7 +6840,7 @@ TSourcePtr TSqlSelect::SelectCore(const TRule_select_core& node, const TWriteSet
         return nullptr;
     }
     return BuildSelectCore(Ctx, startPos, std::move(source), groupByExpr, groupBy, compactGroupBy, groupBySuffix, assumeSorted, orderBy, having,
-        std::move(windowSpec), hoppingWindowSpec, std::move(terms), distinct, std::move(without), selectStream, settings);
+        std::move(windowSpec), legacyHoppingWindowSpec, std::move(terms), distinct, std::move(without), selectStream, settings);
 }
 
 TString TSqlTranslation::FrameSettingsToString(EFrameSettings settings, bool isUnbounded) {
@@ -7188,7 +7213,7 @@ bool TSqlTranslation::OrderByClause(const TRule_order_by_clause& node, TVector<T
     return SortSpecificationList(node.GetRule_sort_specification_list3(), orderBy);
 }
 
-bool TGroupByClause::Build(const TRule_group_by_clause& node, bool stream) {
+bool TGroupByClause::Build(const TRule_group_by_clause& node) {
     // group_by_clause: GROUP COMPACT? BY opt_set_quantifier grouping_element_list (WITH an_id)?;
     CompactGroupBy = node.HasBlock2();
     if (!CompactGroupBy) {
@@ -7224,6 +7249,8 @@ bool TGroupByClause::Build(const TRule_group_by_clause& node, bool stream) {
             Suffix = "Finalize";
         } else if (mode == "mergefinalize") {
             Suffix = "MergeFinalize";
+        } else if (mode == "mergemanyfinalize") {
+            Suffix = "MergeManyFinalize";
         } else {
             Ctx.Error() << "Unsupported group by mode: " << mode;
             Ctx.IncrementMonCounter("sql_errors", "GroupByModeUnknown");
@@ -7233,12 +7260,6 @@ bool TGroupByClause::Build(const TRule_group_by_clause& node, bool stream) {
 
     if (!ResolveGroupByAndGrouping()) {
         return false;
-    }
-    if (stream) {
-        if (!HoppingWindowSpec) {
-            Ctx.Error() << "Streaming group by query must have a hopping window specification.";
-            return false;
-        }
     }
     return true;
 }
@@ -7286,8 +7307,8 @@ TMap<TString, TNodePtr>& TGroupByClause::Aliases() {
     return GroupSetContext->NodeAliases;
 }
 
-THoppingWindowSpecPtr TGroupByClause::GetHoppingWindow() const {
-    return HoppingWindowSpec;
+TLegacyHoppingWindowSpecPtr TGroupByClause::GetLegacyHoppingWindow() const {
+    return LegacyHoppingWindowSpec;
 }
 
 bool TGroupByClause::IsCompactGroupBy() const {
@@ -7541,16 +7562,16 @@ bool TGroupByClause::OrdinaryGroupingSetList(const TRule_ordinary_grouping_set_l
 }
 
 bool TGroupByClause::HoppingWindow(const TRule_hopping_window_specification& node) {
-    if (HoppingWindowSpec) {
+    if (LegacyHoppingWindowSpec) {
         Ctx.Error() << "Duplicate hopping window specification.";
         return false;
     }
-    HoppingWindowSpec = new THoppingWindowSpec;
+    LegacyHoppingWindowSpec = new TLegacyHoppingWindowSpec;
     {
         TColumnRefScope scope(Ctx, EColumnRefState::Allow);
         TSqlExpression expr(Ctx, Mode);
-        HoppingWindowSpec->TimeExtractor = expr.Build(node.GetRule_expr3());
-        if (!HoppingWindowSpec->TimeExtractor) {
+        LegacyHoppingWindowSpec->TimeExtractor = expr.Build(node.GetRule_expr3());
+        if (!LegacyHoppingWindowSpec->TimeExtractor) {
             return false;
         }
     }
@@ -7589,19 +7610,19 @@ bool TGroupByClause::HoppingWindow(const TRule_hopping_window_specification& nod
         });
     };
 
-    HoppingWindowSpec->Hop = processIntervalParam(node.GetRule_expr5());
-    if (!HoppingWindowSpec->Hop) {
+    LegacyHoppingWindowSpec->Hop = processIntervalParam(node.GetRule_expr5());
+    if (!LegacyHoppingWindowSpec->Hop) {
         return false;
     }
-    HoppingWindowSpec->Interval = processIntervalParam(node.GetRule_expr7());
-    if (!HoppingWindowSpec->Interval) {
+    LegacyHoppingWindowSpec->Interval = processIntervalParam(node.GetRule_expr7());
+    if (!LegacyHoppingWindowSpec->Interval) {
         return false;
     }
-    HoppingWindowSpec->Delay = processIntervalParam(node.GetRule_expr9());
-    if (!HoppingWindowSpec->Delay) {
+    LegacyHoppingWindowSpec->Delay = processIntervalParam(node.GetRule_expr9());
+    if (!LegacyHoppingWindowSpec->Delay) {
         return false;
     }
-    HoppingWindowSpec->DataWatermarks = Ctx.PragmaDataWatermarks;
+    LegacyHoppingWindowSpec->DataWatermarks = Ctx.PragmaDataWatermarks;
 
     return true;
 }
@@ -7884,7 +7905,7 @@ TSourcePtr TSqlSelect::Build(const TRule& node, TPosition pos, TSelectKindResult
         TString groupBySuffix = "";
         TNodePtr having;
         TWinSpecs winSpecs;
-        THoppingWindowSpecPtr hoppingWindowSpec;
+        TLegacyHoppingWindowSpecPtr legacyHoppingWindowSpec;
         bool distinct = false;
         TVector<TNodePtr> without;
         bool stream = false;
@@ -7893,7 +7914,7 @@ TSourcePtr TSqlSelect::Build(const TRule& node, TPosition pos, TSelectKindResult
         terms.push_back(BuildColumn(unionPos, "*", ""));
 
         result = BuildSelectCore(Ctx, unionPos, std::move(result), groupByExpr, groupBy, compactGroupBy, groupBySuffix,
-            assumeOrderBy, orderBy, having, std::move(winSpecs), hoppingWindowSpec, std::move(terms),
+            assumeOrderBy, orderBy, having, std::move(winSpecs), legacyHoppingWindowSpec, std::move(terms),
             distinct, std::move(without), stream, settings);
     } else {
         result = BuildUnionAll(unionPos, std::move(sources), settings);
@@ -9500,8 +9521,8 @@ TNodePtr TSqlQuery::PragmaStatement(const TRule_pragma_stmt& stmt, bool& success
             success = true;
             return BuildPragma(Ctx.Pos(), TString(ConfigProviderName), "SetPackageVersion", TVector<TDeferredAtom>{ values[0], TDeferredAtom(values[1].Build()->GetPos(), ToString(version)) }, false);
         } else if (normalizedPragma == "file") {
-            if (values.size() != 2U || pragmaValueDefault) {
-                Error() << "Expected file alias and url as pragma values";
+            if (values.size() < 2U || values.size() > 3U || pragmaValueDefault) {
+                Error() << "Expected file alias, url and optional token name as pragma values";
                 Ctx.IncrementMonCounter("sql_errors", "BadPragmaValue");
                 return {};
             }
@@ -9510,8 +9531,8 @@ TNodePtr TSqlQuery::PragmaStatement(const TRule_pragma_stmt& stmt, bool& success
             success = true;
             return BuildPragma(Ctx.Pos(), TString(ConfigProviderName), "AddFileByUrl", values, false);
         } else if (normalizedPragma == "folder") {
-            if (values.size() != 2U || pragmaValueDefault) {
-                Error() << "Expected folder alias as url as pragma values";
+            if (values.size() < 2U || values.size() > 3U || pragmaValueDefault) {
+                Error() << "Expected folder alias, url and optional token name as pragma values";
                 Ctx.IncrementMonCounter("sql_errors", "BadPragmaValue");
                 return {};
             }

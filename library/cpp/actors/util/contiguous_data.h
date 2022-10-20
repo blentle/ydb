@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <new>
+
 #include <util/generic/ptr.h>
 #include <util/generic/string.h>
 #include <util/generic/hash_set.h>
@@ -10,6 +13,10 @@
 #include <util/generic/array_ref.h>
 
 #include "shared_data.h"
+
+#ifdef KIKIMR_TRACE_CONTIGUOUS_DATA_GROW
+#include "shared_data_backtracing_owner.h"
+#endif
 
 namespace NContiguousDataDetails {
     template<typename TContainer>
@@ -287,7 +294,7 @@ class TContiguousData {
         enum class EType : uintptr_t {
             STRING,
             SHARED_DATA,
-            SHARED_DATA_OWNED,
+            SHARED_DATA_CONTROLLED,
             ROPE_CHUNK_BACKEND,
         };
 
@@ -308,9 +315,22 @@ class TContiguousData {
         TBackendHolder Owner = TBackend::Empty; // lower bits contain type of the owner
 
     public:
+        struct TCookies {
+            using TSelf = TCookies;
+            std::atomic<const char*> Begin;
+            std::atomic<const char*> End;
 
-        static constexpr struct TOwnerToken {} OwnerToken;
-    static constexpr size_t CookiesSize = 2 * sizeof(void*);
+            static size_t BytesToAligned(size_t size) {
+                bool misaligned = size % alignof(TSelf);
+                return misaligned ? alignof(TSelf) - size % alignof(TSelf) : 0;
+            }
+
+            static size_t BytesToAlloc(size_t size) {
+                return size + BytesToAligned(size) + sizeof(TSelf);
+            }
+        };
+        static constexpr struct TControlToken {} ControlToken;
+        static constexpr size_t CookiesSize = sizeof(TCookies);
 
         TBackend() = default;
 
@@ -326,8 +346,8 @@ class TContiguousData {
             : Owner(Construct<TString>(EType::STRING, std::move(s)))
         {}
 
-        TBackend(NActors::TSharedData s, TOwnerToken)
-            : Owner(Construct<NActors::TSharedData>(EType::SHARED_DATA_OWNED, std::move(s)))
+        TBackend(NActors::TSharedData s, TControlToken)
+            : Owner(Construct<NActors::TSharedData>(EType::SHARED_DATA_CONTROLLED, std::move(s)))
         {}
 
         TBackend(NActors::TSharedData s)
@@ -389,7 +409,7 @@ class TContiguousData {
                 if constexpr (std::is_same_v<T, TString>) {
                     return {&(*value.cbegin()), value.size()};
                 } else if constexpr (std::is_same_v<T, NActors::TSharedData>) {
-                    if (type == EType::SHARED_DATA_OWNED) {
+                    if (type == EType::SHARED_DATA_CONTROLLED) {
                         return {value.data(), value.size() - CookiesSize};
                     } else {
                         return {value.data(), value.size()};
@@ -414,7 +434,7 @@ class TContiguousData {
                     if (value.IsShared()) {
                         value = NActors::TSharedData::Copy(value.data(), value.size());
                     }
-                    if (type == EType::SHARED_DATA_OWNED) {
+                    if (type == EType::SHARED_DATA_CONTROLLED) {
                         return {value.mutable_data(), value.size() - CookiesSize};
                     } else {
                         return {value.mutable_data(), value.size()};
@@ -436,7 +456,7 @@ class TContiguousData {
                 if constexpr (std::is_same_v<T, TString>) {
                     return {const_cast<char*>(value.data()), value.size()};
                 } else if constexpr (std::is_same_v<T, NActors::TSharedData>) {
-                    if (type == EType::SHARED_DATA_OWNED) {
+                    if (type == EType::SHARED_DATA_CONTROLLED) {
                         return {const_cast<char*>(value.data()), value.size() - CookiesSize};
                     } else {
                         return {const_cast<char*>(value.data()), value.size()};
@@ -478,45 +498,133 @@ class TContiguousData {
             });
         }
 
-        bool OwnsContainer(const char* Begin, const char* End) const {
+        bool CanGrowFront(const char* begin) const {
             if (!Owner) {
                 return false;
             }
-            return Visit(Owner, [Begin, End](EType type, auto& value) {
+            return Visit(Owner, [contBegin = begin](EType type, auto& value) {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<T, NActors::TSharedData>) {
-                    if (type == EType::SHARED_DATA_OWNED) {
+                    if (type == EType::SHARED_DATA_CONTROLLED) {
                         auto* begin = value.data() + value.size() - CookiesSize;
-                        return std::memcmp(begin,                 (char*)&(Begin), sizeof(char*)) == 0
-                            && std::memcmp(begin + sizeof(char*), (char*)&(End),   sizeof(char*)) == 0;
-                        // TODO(innokentii) value.IsPrivate(); Think about this case - it could mean that it is ok to overwrite
+                        const TCookies* cookies = reinterpret_cast<const TCookies*>(begin);
+                        return value.IsPrivate() || cookies->Begin.load() == contBegin;
                     }
                 }
                 return false;
             });
         }
 
-        void UpdateCookies(const char* Begin, const char* End) {
+        bool CanGrowBack(const char* end) const {
+            if (!Owner) {
+                return false;
+            }
+            return Visit(Owner, [contEnd = end](EType type, auto& value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, NActors::TSharedData>) {
+                    if (type == EType::SHARED_DATA_CONTROLLED) {
+                        auto* begin = value.data() + value.size() - CookiesSize;
+                        const TCookies* cookies = reinterpret_cast<const TCookies*>(begin);
+                        return value.IsPrivate() || cookies->End.load() == contEnd;
+                    }
+                }
+                return false;
+            });
+        }
+
+        void UpdateCookiesUnsafe(const char* contBegin, const char* contEnd) {
             if (!Owner) {
                 return;
             }
-            return Visit(Owner, [Begin, End](EType type, auto& value) {
+            return Visit(Owner, [contBegin, contEnd](EType type, auto& value) {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<T, NActors::TSharedData>) {
-                    if (type == EType::SHARED_DATA_OWNED) {
+                    if (type == EType::SHARED_DATA_CONTROLLED) {
                         auto* begin = const_cast<char*>(value.data() + value.size() - CookiesSize);
-                        std::memcpy(begin,                 (char*)&(Begin), sizeof(char*));
-                        std::memcpy(begin + sizeof(char*), (char*)&(End),   sizeof(char*));
+                        TCookies* cookies = reinterpret_cast<TCookies*>(begin);
+                        cookies->Begin.store(contBegin);
+                        cookies->End.store(contEnd);
                     }
                 }
+            });
+        }
+
+        bool UpdateCookies(const char* curBegin, const char* contBegin, const char* curEnd, const char* contEnd) {
+            if (!Owner) {
+                return false;
+            }
+            return Visit(Owner, [curBegin, contBegin, curEnd, contEnd](EType type, auto& value) mutable {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, NActors::TSharedData>) {
+                    if (type == EType::SHARED_DATA_CONTROLLED) {
+                        auto* begin = const_cast<char*>(value.data() + value.size() - CookiesSize);
+                        TCookies* cookies = reinterpret_cast<TCookies*>(begin);
+                        if(cookies->Begin.compare_exchange_weak(curBegin, contBegin)) {
+                            if(!cookies->End.compare_exchange_weak(curEnd, contEnd)) {
+                                cookies->Begin.store(curBegin); // rollback
+                                return false;
+                            }
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                return false;
+            });
+        }
+
+        bool UpdateCookiesBegin(const char* curBegin, const char* contBegin) {
+            if (!Owner) {
+                return false;
+            }
+            return Visit(Owner, [curBegin, contBegin](EType type, auto& value) mutable {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, NActors::TSharedData>) {
+                    if (type == EType::SHARED_DATA_CONTROLLED) {
+                        auto* begin = const_cast<char*>(value.data() + value.size() - CookiesSize);
+                        TCookies* cookies = reinterpret_cast<TCookies*>(begin);
+                        return cookies->Begin.compare_exchange_weak(curBegin, contBegin);
+                    }
+                }
+                return false;
+            });
+        }
+
+        bool UpdateCookiesEnd(const char* curEnd, const char* contEnd) {
+            if (!Owner) {
+                return false;
+            }
+            return Visit(Owner, [curEnd, contEnd](EType type, auto& value) mutable {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, NActors::TSharedData>) {
+                    if (type == EType::SHARED_DATA_CONTROLLED) {
+                        auto* begin = const_cast<char*>(value.data() + value.size() - CookiesSize);
+                        TCookies* cookies = reinterpret_cast<TCookies*>(begin);
+                        return cookies->End.compare_exchange_weak(curEnd, contEnd);
+                    }
+                }
+                return false;
             });
         }
 
         void Disown() {
             if (Owner) {
                 const EType type = static_cast<EType>(Owner.Data[0] & TypeMask);
-                if (type == EType::SHARED_DATA_OWNED) {
-                    Owner.Data[0] = (Owner.Data[0] & ValueMask) | static_cast<uintptr_t>(EType::SHARED_DATA);
+
+                if (type == EType::SHARED_DATA_CONTROLLED) {
+                    bool isPrivate = Visit(Owner, [](EType type, auto& value) {
+                        using T = std::decay_t<decltype(value)>;
+                        if constexpr (std::is_same_v<T, NActors::TSharedData>) {
+                            if (type == EType::SHARED_DATA_CONTROLLED) {
+                                return value.IsPrivate();
+                            }
+                        }
+                        return false;
+                    });
+                    if (!isPrivate) {
+                        Owner.Data[0] = (Owner.Data[0] & ValueMask) | static_cast<uintptr_t>(EType::SHARED_DATA);
+                    }
                 }
             }
         }
@@ -530,7 +638,7 @@ class TContiguousData {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<T, TResult>) {
                     if constexpr (std::is_same_v<T, NActors::TSharedData>) {
-                        if (type == EType::SHARED_DATA_OWNED) {
+                        if (type == EType::SHARED_DATA_CONTROLLED) {
                             NActors::TSharedData data = value;
                             data.Trim(data.size() - CookiesSize);
                             return data;
@@ -542,6 +650,12 @@ class TContiguousData {
                     return TResult{}; // unreachable
                 }
             });
+        }
+
+        NActors::TSharedData GetRawTrimmed(size_t size) const {
+            NActors::TSharedData result = GetRaw<NActors::TSharedData>();
+            result.Trim(size);
+            return result;
         }
 
         explicit operator bool() const {
@@ -607,10 +721,10 @@ class TContiguousData {
                 }
             };
             switch (type) {
-                case EType::STRING:             return wrapper(reinterpret_cast<std::conditional_t<IsConst, const TString&, TString&>>(value));
-                case EType::SHARED_DATA_OWNED:  [[fallthrough]];
-                case EType::SHARED_DATA:        return wrapper(reinterpret_cast<std::conditional_t<IsConst, const NActors::TSharedData&, NActors::TSharedData&>>(value));
-                case EType::ROPE_CHUNK_BACKEND: return wrapper(reinterpret_cast<std::conditional_t<IsConst, const IContiguousChunk::TPtr&, IContiguousChunk::TPtr&>>(value));
+                case EType::STRING:                  return wrapper(reinterpret_cast<std::conditional_t<IsConst, const TString&, TString&>>(value));
+                case EType::SHARED_DATA_CONTROLLED:  [[fallthrough]];
+                case EType::SHARED_DATA:             return wrapper(reinterpret_cast<std::conditional_t<IsConst, const NActors::TSharedData&, NActors::TSharedData&>>(value));
+                case EType::ROPE_CHUNK_BACKEND:      return wrapper(reinterpret_cast<std::conditional_t<IsConst, const IContiguousChunk::TPtr&, IContiguousChunk::TPtr&>>(value));
             }
             Y_FAIL("Unexpected type# %" PRIu64, static_cast<ui64>(type));
         }
@@ -648,14 +762,14 @@ class TContiguousData {
     const char *Begin; // data start
     const char *End; // data end
 
-    explicit TContiguousData(NActors::TSharedData s, TBackend::TOwnerToken)
-        : Backend(std::move(s), TBackend::OwnerToken)
+    explicit TContiguousData(NActors::TSharedData s, TBackend::TCookies* cookies, TBackend::TControlToken)
+        : Backend(std::move(s), TBackend::ControlToken)
     {
         auto span = Backend.GetData();
         Begin = span.data();
         End = Begin + span.size();
-        std::memcpy(const_cast<char*>(End), (&Begin), sizeof(Begin));
-        std::memcpy(const_cast<char*>(End) + sizeof(Begin), (&End), sizeof(End));
+        cookies->Begin.store(Begin);
+        cookies->End.store(End);
     }
 
     TContiguousData(TOwnedSlice, const char *data, size_t size, const TContiguousData& from)
@@ -664,7 +778,7 @@ class TContiguousData {
         Y_VERIFY(data >= from.GetData());
         Y_VERIFY(data < from.GetData() + from.GetSize());
         Y_VERIFY(data + size <= from.GetData() + from.GetSize());
-        Backend.UpdateCookies(Begin, End);
+        Backend.UpdateCookiesUnsafe(Begin, End);
     }
 
     TContiguousData(TOwnedSlice, const char *begin, const char *end, const TContiguousData& from)
@@ -673,6 +787,11 @@ class TContiguousData {
 
 public:
     static constexpr struct TSlice {} Slice{};
+
+    enum class EResizeResult {
+        NoAlloc,
+        Alloc,
+    };
 
     enum class EResizeStrategy {
         KeepRooms,
@@ -693,16 +812,29 @@ public:
     {}
 
     explicit TContiguousData(TString s)
+#ifndef KIKIMR_TRACE_CONTIGUOUS_DATA_GROW
         : Backend(std::move(s))
+#endif
     {
+#ifdef KIKIMR_TRACE_CONTIGUOUS_DATA_GROW
+        auto ss = NActors::TSharedData::Copy(s.data(), s.size());
+        TBackTracingOwner::FakeOwner(ss, TBackTracingOwner::INFO_COPIED_STRING);
+        Backend = TBackend(std::move(ss));
+#endif
         auto span = Backend.GetData();
         Begin = span.data();
         End = Begin + span.size();
     }
 
     explicit TContiguousData(NActors::TSharedData s)
+#ifndef KIKIMR_TRACE_CONTIGUOUS_DATA_GROW
         : Backend(std::move(s))
+#endif
     {
+#ifdef KIKIMR_TRACE_CONTIGUOUS_DATA_GROW
+        TBackTracingOwner::FakeOwner(s, TBackTracingOwner::INFO_FROM_SHARED_DATA);
+        Backend = TBackend(std::move(s));
+#endif
         auto span = Backend.GetData();
         Begin = span.data();
         End = Begin + span.size();
@@ -746,19 +878,35 @@ public:
             return TContiguousData();
         }
         if (headroom == 0 && tailroom == 0) {
-            NActors::TSharedData res = NActors::TSharedData::Uninitialized(size + headroom + tailroom);
+#ifdef KIKIMR_TRACE_CONTIGUOUS_DATA_GROW
+            NActors::TSharedData res = TBackTracingOwner::Allocate(size, TBackTracingOwner::INFO_ALLOC_UNINITIALIZED);
+#else
+            NActors::TSharedData res = NActors::TSharedData::Uninitialized(size);
+#endif
             return TContiguousData(
                 OwnedSlice,
-                res.data() + headroom,
-                res.data() + res.size() - tailroom,
+                res.data(),
+                res.data() + res.size(),
                 TContiguousData(res));
         } else {
-            NActors::TSharedData res = NActors::TSharedData::Uninitialized(size + headroom + tailroom + TBackend::CookiesSize);
+#ifdef KIKIMR_TRACE_CONTIGUOUS_DATA_GROW
+            NActors::TSharedData res = TBackTracingOwner::Allocate(TBackend::TCookies::BytesToAlloc(size + headroom + tailroom), TBackTracingOwner::INFO_ALLOC_UNINIT_ROOMS);
+#else
+            NActors::TSharedData res = NActors::TSharedData::Uninitialized(TBackend::TCookies::BytesToAlloc(size + headroom + tailroom));
+#endif
+            auto isAligned = [](const void * ptr, std::uintptr_t alignment) noexcept {
+                auto iptr = reinterpret_cast<std::uintptr_t>(ptr);
+                return !(iptr % alignment);
+            };
+            char* place = res.mutable_data() + res.size() - sizeof(TBackend::TCookies);
+            Y_VERIFY(isAligned(place, alignof(TBackend::TCookies)));
+            TBackend::TCookies* cookies = new(place) TBackend::TCookies();
+
             return TContiguousData(
                 OwnedSlice,
                 res.data() + headroom,
-                res.data() + res.size() - tailroom - TBackend::CookiesSize,
-                TContiguousData(res, TBackend::OwnerToken));
+                res.data() + headroom + size,
+                TContiguousData(res, cookies, TBackend::ControlToken));
         }
     }
 
@@ -772,12 +920,29 @@ public:
         return Backend.GetRaw<TResult>();
     }
 
+    NActors::TSharedData GetRawTrimmed(size_t size) const {
+        return Backend.GetRawTrimmed(size);
+    }
+
     bool ReferencesWholeContainer() const {
         return Backend.GetData().size() == GetSize();
     }
 
-    bool OwnsContainer() const noexcept {
-        return Backend.OwnsContainer(Begin, End);
+
+    bool ReferencesTrimableToWholeContainer() const {
+        if (ContainsNativeType<NActors::TSharedData>()) {
+            return Backend.GetData().size() == (GetSize() + UnsafeTailroom());
+        } else {
+            return ReferencesWholeContainer();
+        }
+    }
+
+    bool CanGrowFront() const noexcept {
+        return Backend.CanGrowFront(Begin);
+    }
+
+    bool CanGrowBack() const noexcept {
+        return Backend.CanGrowBack(End);
     }
 
     size_t GetSize() const {
@@ -818,8 +983,13 @@ public:
 
     template <class TResult>
     TResult ExtractUnderlyingContainerOrCopy() const {
-        if (ContainsNativeType<TResult>() && ReferencesWholeContainer()) {
-            return GetRaw<TResult>();
+        if (ContainsNativeType<TResult>() && (ReferencesWholeContainer() || ReferencesTrimableToWholeContainer())) {
+            using T = std::decay_t<TResult>;
+            if constexpr (std::is_same_v<T, NActors::TSharedData>) {
+                return GetRawTrimmed(GetSize());
+            } else {
+                return GetRaw<TResult>();
+            }
         }
 
         TResult res = TResult::Uninitialized(GetSize());
@@ -868,12 +1038,18 @@ public:
         return End;
     }
 
-    void GrowFront(size_t size, EResizeStrategy strategy = EResizeStrategy::KeepRooms) {
-        Y_UNUSED(strategy);
-        if (Headroom() >= size) {
+    EResizeResult GrowFront(size_t size, EResizeStrategy strategy = EResizeStrategy::KeepRooms) {
+        if (Headroom() >= size && Backend.UpdateCookiesBegin(Begin, Begin - size)) {
             Begin -= size;
-            Backend.UpdateCookies(Begin, End);
+            return EResizeResult::NoAlloc;
         } else {
+#ifdef KIKIMR_TRACE_CONTIGUOUS_DATA_GROW
+            if (Backend.ContainsNativeType<NActors::TSharedData>()) {
+                Cerr << "GrowFront# " << size;
+                NActors::TSharedData data = GetRaw<NActors::TSharedData>();
+                TBackTracingOwner::UnsafePrintBackTrace(data);
+            }
+#endif
             if (strategy == EResizeStrategy::FailOnCopy && static_cast<bool>(Backend)) {
                 Y_FAIL("Fail on grow");
             }
@@ -882,15 +1058,22 @@ public:
                 std::memcpy(newData.UnsafeGetDataMut() + size, GetData(), GetSize());
             }
             *this = std::move(newData);
+            return EResizeResult::Alloc;
         }
     }
 
-    void GrowBack(size_t size, EResizeStrategy strategy = EResizeStrategy::KeepRooms) {
-        Y_UNUSED(strategy);
-        if (Tailroom() > size) {
+    EResizeResult GrowBack(size_t size, EResizeStrategy strategy = EResizeStrategy::KeepRooms) {
+        if (Tailroom() > size && Backend.UpdateCookiesEnd(End, End + size)) {
             End += size;
-            Backend.UpdateCookies(Begin, End);
+            return EResizeResult::NoAlloc;
         } else {
+#ifdef KIKIMR_TRACE_CONTIGUOUS_DATA_GROW
+            if (Backend.ContainsNativeType<NActors::TSharedData>()) {
+                Cerr << "GrowBack# " << size;
+                NActors::TSharedData data = GetRaw<NActors::TSharedData>();
+                TBackTracingOwner::UnsafePrintBackTrace(data);
+            }
+#endif
             if (strategy == EResizeStrategy::FailOnCopy && static_cast<bool>(Backend)) {
                 Y_FAIL("Fail on grow");
             }
@@ -899,6 +1082,7 @@ public:
                 std::memcpy(newData.UnsafeGetDataMut(), GetData(), GetSize());
             }
             *this = std::move(newData);
+            return EResizeResult::Alloc;
         }
     }
 
@@ -919,7 +1103,7 @@ public:
     }
 
     size_t Headroom() const {
-        if (Backend.OwnsContainer(Begin, End)) {
+        if (Backend.CanGrowFront(Begin)) {
             return UnsafeHeadroom();
         }
 
@@ -927,7 +1111,7 @@ public:
     }
 
     size_t Tailroom() const {
-        if (Backend.OwnsContainer(Begin, End)) {
+        if (Backend.CanGrowBack(End)) {
             return UnsafeTailroom();
         }
 

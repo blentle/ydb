@@ -32,7 +32,6 @@
 #include <library/cpp/actors/core/log.h>
 
 #include <util/string/printf.h>
-#include <util/string/escape.h>
 
 #include <library/cpp/actors/wilson/wilson_span.h>
 #include <library/cpp/actors/wilson/wilson_trace.h>
@@ -77,7 +76,9 @@ struct TKqpQueryState {
     TKqpCompileResult::TConstPtr CompileResult;
     NKqpProto::TKqpStatsCompile CompileStats;
     TIntrusivePtr<TKqpTransactionContext> TxCtx;
-    std::shared_ptr<TKikimrQueryContext> QueryCtx = std::make_shared<TKikimrQueryContext>();
+    NYql::TKikimrParamsMap Parameters;
+    TVector<TVector<NKikimrMiniKQL::TResult>> TxResults;
+
     TActorId RequestActorId;
 
     ui64 CurrentTx = 0;
@@ -110,35 +111,6 @@ struct TKqpCleanupCtx {
     bool Final = false;
     TInstant Start = TInstant::Now();
 };
-
-EKikimrStatsMode GetStatsModeInt(const NKikimrKqp::TQueryRequest& queryRequest) {
-    switch (queryRequest.GetCollectStats()) {
-        case Ydb::Table::QueryStatsCollection::STATS_COLLECTION_NONE:
-            return EKikimrStatsMode::None;
-        case Ydb::Table::QueryStatsCollection::STATS_COLLECTION_BASIC:
-            return EKikimrStatsMode::Basic;
-        case Ydb::Table::QueryStatsCollection::STATS_COLLECTION_FULL:
-            return EKikimrStatsMode::Full;
-        case Ydb::Table::QueryStatsCollection::STATS_COLLECTION_PROFILE:
-            return EKikimrStatsMode::Profile;
-        default:
-            return EKikimrStatsMode::None;
-    }
-}
-
-TKikimrQueryLimits GetQueryLimits(const TKqpWorkerSettings& settings) {
-    const auto& queryLimitsProto = settings.Service.GetQueryLimits();
-    const auto& phaseLimitsProto = queryLimitsProto.GetPhaseLimits();
-
-    TKikimrQueryLimits queryLimits;
-    auto& phaseLimits = queryLimits.PhaseLimits;
-    phaseLimits.AffectedShardsLimit = phaseLimitsProto.GetAffectedShardsLimit();
-    phaseLimits.ReadsetCountLimit = phaseLimitsProto.GetReadsetCountLimit();
-    phaseLimits.ComputeNodeMemoryLimitBytes = phaseLimitsProto.GetComputeNodeMemoryLimitBytes();
-    phaseLimits.TotalReadSizeLimitBytes = phaseLimitsProto.GetTotalReadSizeLimitBytes();
-
-    return queryLimits;
-}
 
 class TKqpSessionActor : public TActorBootstrapped<TKqpSessionActor> {
 public:
@@ -196,7 +168,7 @@ public:
     void MakeNewQueryState() {
         ++QueryId;
         YQL_ENSURE(!QueryState);
-        QueryState = std::make_unique<TKqpQueryState>();
+        QueryState = std::make_shared<TKqpQueryState>();
     }
 
     void ForwardRequest(TEvKqp::TEvQueryRequest::TPtr& ev) {
@@ -627,39 +599,6 @@ public:
         ExecuteOrDefer();
     }
 
-    void SetIsolationLevel(const Ydb::Table::TransactionSettings& settings) {
-        YQL_ENSURE(QueryState->TxCtx);
-        auto& txCtx = QueryState->TxCtx;
-        switch (settings.tx_mode_case()) {
-            case Ydb::Table::TransactionSettings::kSerializableReadWrite:
-                txCtx->EffectiveIsolationLevel = NKikimrKqp::ISOLATION_LEVEL_SERIALIZABLE;
-                txCtx->Readonly = false;
-                break;
-
-            case Ydb::Table::TransactionSettings::kOnlineReadOnly:
-                txCtx->EffectiveIsolationLevel = settings.online_read_only().allow_inconsistent_reads()
-                    ? NKikimrKqp::ISOLATION_LEVEL_READ_UNCOMMITTED
-                    : NKikimrKqp::ISOLATION_LEVEL_READ_COMMITTED;
-                txCtx->Readonly = true;
-                break;
-
-            case Ydb::Table::TransactionSettings::kStaleReadOnly:
-                txCtx->EffectiveIsolationLevel = NKikimrKqp::ISOLATION_LEVEL_READ_STALE;
-                txCtx->Readonly = true;
-                break;
-
-            case Ydb::Table::TransactionSettings::kSnapshotReadOnly:
-                // TODO: (KIKIMR-3374) Use separate isolation mode to avoid optimistic locks.
-                txCtx->EffectiveIsolationLevel = NKikimrKqp::ISOLATION_LEVEL_SERIALIZABLE;
-                txCtx->Readonly = true;
-                break;
-
-            case Ydb::Table::TransactionSettings::TX_MODE_NOT_SET:
-                YQL_ENSURE(false, "tx_mode not set, settings: " << settings);
-                break;
-        };
-    }
-
     void RemoveOldTransactions() {
         if (ExplicitTransactions.Size() == *Config->_KqpMaxActiveTxPerSession.Get()) {
             auto it = ExplicitTransactions.FindOldest();
@@ -691,7 +630,7 @@ public:
         QueryState->TxId = UlidGen.Next();
         QueryState->TxId_Human = QueryState->TxId.ToString();
         QueryState->TxCtx = MakeIntrusive<TKqpTransactionContext>(false);
-        SetIsolationLevel(settings);
+        QueryState->TxCtx->SetIsolationLevel(settings);
         CreateNewTx();
 
         Counters->ReportTxCreated(Settings.DbCounters);
@@ -756,9 +695,9 @@ public:
             return false;
         }
 
-        auto& queryCtx = QueryState->QueryCtx;
-        queryCtx->TimeProvider = TAppData::TimeProvider;
-        queryCtx->RandomProvider = TAppData::RandomProvider;
+        auto& txCtx = QueryState->TxCtx;
+        txCtx->TimeProvider = TAppData::TimeProvider;
+        txCtx->RandomProvider = TAppData::RandomProvider;
 
         const NKqpProto::TKqpPhyQuery& phyQuery = QueryState->PreparedQuery->GetPhysicalQuery();
         auto [success, issues] = ApplyTableOperations(QueryState->TxCtx.Get(), phyQuery);
@@ -781,7 +720,7 @@ public:
             || action == NKikimrKqp::QUERY_ACTION_EXECUTE_PREPARED && type == NKikimrKqp::QUERY_TYPE_PREPARED_DML,
             "Unexpected query action: " << action << " and type: " << type);
 
-        ParseParameters(std::move(*QueryState->Request.MutableParameters()), queryCtx->Parameters);
+        ParseParameters(std::move(*QueryState->Request.MutableParameters()), QueryState->Parameters);
         return true;
     }
 
@@ -879,13 +818,13 @@ public:
     }
 
     NKikimrMiniKQL::TParams* ValidateParameter(const TString& name, const NKikimrMiniKQL::TType& type) {
-        auto& queryCtx = QueryState->QueryCtx;
-        YQL_ENSURE(queryCtx);
+        auto& txCtx = QueryState->TxCtx;
+        YQL_ENSURE(txCtx);
         auto requestInfo = TKqpRequestInfo(QueryState->TraceId, SessionId);
-        auto parameter = queryCtx->Parameters.FindPtr(name);
+        auto parameter = QueryState->Parameters.FindPtr(name);
         if (!parameter) {
             if (type.GetKind() == NKikimrMiniKQL::ETypeKind::Optional) {
-                auto& newParameter = queryCtx->Parameters[name];
+                auto& newParameter = QueryState->Parameters[name];
                 newParameter.MutableType()->SetKind(NKikimrMiniKQL::ETypeKind::Optional);
                 *newParameter.MutableType()->MutableOptional()->MutableItem() = type.GetOptional().GetItem();
 
@@ -909,13 +848,13 @@ public:
             ValidateParameter(paramDesc.GetName(), paramDesc.GetType());
         }
 
-        TKqpParamsMap paramsMap(QueryState->QueryCtx);
+        TKqpParamsMap paramsMap(QueryState);
 
         for (const auto& paramBinding : tx.GetParamBindings()) {
             try {
-                auto& qCtx = QueryState->QueryCtx;
+                auto& txCtx = QueryState->TxCtx;
                 auto it = paramsMap.Values.emplace(paramBinding.GetName(),
-                    *GetParamValue(/*ensure*/ true, *qCtx, qCtx->TxResults, paramBinding));
+                    *GetParamValue(/*ensure*/ true, *txCtx, QueryState->Parameters, QueryState->TxResults, paramBinding));
                 YQL_ENSURE(it.second);
             } catch (const yexception& ex) {
                 auto requestInfo = TKqpRequestInfo(QueryState->TraceId, SessionId);
@@ -959,7 +898,7 @@ public:
     }
 
     TKqpParamsMap GetParamsRefMap(const TParamValueMap& map) {
-        TKqpParamsMap paramsMap(QueryState->QueryCtx);
+        TKqpParamsMap paramsMap(QueryState);
         for (auto& [k, v] : map) {
             auto res = paramsMap.Values.emplace(k, NYql::NDq::TMkqlValueRef(v));
             YQL_ENSURE(res.second);
@@ -971,9 +910,8 @@ public:
     TParamValueMap CreateKqpValueMap(const NKqpProto::TKqpPhyTx& tx) {
         TParamValueMap paramsMap;
         for (const auto& paramBinding : tx.GetParamBindings()) {
-            auto& qCtx = QueryState->QueryCtx;
-            auto paramValueRef = *GetParamValue(/*ensure*/ true, *qCtx, qCtx->TxResults,
-                    paramBinding);
+            auto& txCtx = QueryState->TxCtx;
+            auto paramValueRef = *GetParamValue(/*ensure*/ true, *txCtx, QueryState->Parameters, QueryState->TxResults, paramBinding);
 
             NKikimrMiniKQL::TParams param;
             param.MutableType()->CopyFrom(paramValueRef.GetType());
@@ -1284,7 +1222,7 @@ public:
         LWTRACK(KqpSessionPhyQueryTxResponse, QueryState->Orbit, QueryState->CurrentTx, response->GetResult().ResultsSize());
 
         auto& txResult = *response->MutableResult();
-        QueryState->QueryCtx->TxResults.emplace_back(ExtractTxResults(txResult));
+        QueryState->TxResults.emplace_back(ExtractTxResults(txResult));
 
         if (ev->Get()->LockHandle) {
             QueryState->TxCtx->Locks.LockHandle = std::move(ev->Get()->LockHandle);
@@ -1360,57 +1298,6 @@ public:
         }
     }
 
-    void SlowLogQuery(const TActorContext &ctx, const TKqpRequestInfo& requestInfo, const TDuration& duration,
-        Ydb::StatusIds::StatusCode status, const std::function<ui64()>& resultsSizeFunc)
-    {
-        auto logSettings = ctx.LoggerSettings();
-        if (!logSettings) {
-            return;
-        }
-
-        ui32 thresholdMs = 0;
-        NActors::NLog::EPriority priority;
-
-        if (logSettings->Satisfies(NActors::NLog::PRI_TRACE, NKikimrServices::KQP_SLOW_LOG)) {
-            priority = NActors::NLog::PRI_TRACE;
-            thresholdMs = Config->_KqpSlowLogTraceThresholdMs.Get().GetRef();
-        } else if (logSettings->Satisfies(NActors::NLog::PRI_NOTICE, NKikimrServices::KQP_SLOW_LOG)) {
-            priority = NActors::NLog::PRI_NOTICE;
-            thresholdMs = Config->_KqpSlowLogNoticeThresholdMs.Get().GetRef();
-        } else if (logSettings->Satisfies(NActors::NLog::PRI_WARN, NKikimrServices::KQP_SLOW_LOG)) {
-            priority = NActors::NLog::PRI_WARN;
-            thresholdMs = Config->_KqpSlowLogWarningThresholdMs.Get().GetRef();
-        } else {
-            return;
-        }
-
-        if (duration >= TDuration::MilliSeconds(thresholdMs)) {
-            auto username = NACLib::TUserToken(QueryState->UserToken).GetUserSID();
-            if (username.empty()) {
-                username = "UNAUTHENTICATED";
-            }
-
-            auto queryText = ExtractQueryText();
-
-            auto paramsText = TStringBuilder()
-                << ToString(QueryState->ParametersSize)
-                << 'b';
-
-            ui64 resultsSize = 0;
-            if (resultsSizeFunc) {
-                resultsSize = resultsSizeFunc();
-            }
-
-            LOG_LOG_S(ctx, priority, NKikimrServices::KQP_SLOW_LOG, requestInfo
-                << "Slow query, duration: " << duration.ToString()
-                << ", status: " << status
-                << ", user: " << username
-                << ", results: " << resultsSize << 'b'
-                << ", text: \"" << EscapeC(queryText) << '"'
-                << ", parameters: " << paramsText);
-        }
-    }
-
     void FillStats(NKikimrKqp::TEvQueryResponse* record) {
         auto *response = record->MutableResponse();
         auto* stats = &QueryState->Stats;
@@ -1432,15 +1319,9 @@ public:
             auto now = TInstant::Now();
             auto queryDuration = now - QueryState->StartTime;
             CollectSystemViewQueryStats(stats, queryDuration, queryRequest.GetDatabase(), ru);
-            SlowLogQuery(TlsActivationContext->AsActorContext(), requestInfo, queryDuration, record->GetYdbStatus(),
-                [record]() {
-                    ui64 resultsSize = 0;
-                    for (auto& result : record->GetResponse().GetResults()) {
-                        resultsSize += result.ByteSize();
-                    }
-                    return resultsSize;
-                }
-            );
+            SlowLogQuery(TlsActivationContext->AsActorContext(), Config.Get(), requestInfo, queryDuration,
+                record->GetYdbStatus(), QueryState->UserToken, QueryState->ParametersSize, record,
+                [this]() { return this->ExtractQueryText(); });
         }
 
         bool reportStats = (GetStatsModeInt(queryRequest) != EKikimrStatsMode::None);
@@ -1586,7 +1467,7 @@ public:
                 auto txIndex = rb.GetTxResultBinding().GetTxIndex();
                 auto resultIndex = rb.GetTxResultBinding().GetResultIndex();
 
-                auto& txResults = QueryState->QueryCtx->TxResults;
+                auto& txResults = QueryState->TxResults;
                 YQL_ENSURE(txIndex < txResults.size());
                 YQL_ENSURE(resultIndex < txResults[txIndex].size());
 
@@ -2292,7 +2173,7 @@ private:
     std::optional<TActorId> WorkerId;
     TActorId ExecuterId;
 
-    std::unique_ptr<TKqpQueryState> QueryState;
+    std::shared_ptr<TKqpQueryState> QueryState;
     std::unique_ptr<TKqpCleanupCtx> CleanupCtx;
     ui32 QueryId = 0;
     TKikimrConfiguration::TPtr Config;

@@ -208,10 +208,13 @@ void TClientCommandRootCommon::Config(TConfig& config) {
     }
 
     if (config.UseIamAuth) {
-        opts.AddLongOption("iam-endpoint", "Endpoint of IAM service")
+        TStringBuilder iamEndpointHelp;
+        NColorizer::TColors colors = NColorizer::AutoColors(Cout);
+        iamEndpointHelp << "Endpoint of IAM service (default: " << colors.Cyan();
+        iamEndpointHelp << "\"" << config.IamEndpoint << "\"" << colors.OldColor() << ")";
+        opts.AddLongOption("iam-endpoint", iamEndpointHelp)
             .RequiredArgument("STR")
-            .StoreResult(&IamEndpoint)
-            .DefaultValue(config.IamEndpoint);
+            .StoreResult(&IamEndpoint);
     }
 
     opts.AddLongOption('p', "profile", "Profile name to use configuration parameters from.")
@@ -235,6 +238,7 @@ void TClientCommandRootCommon::Parse(TConfig& config) {
     TClientCommandRootBase::Parse(config);
     ParseDatabase(config);
     ParseCaCerts(config);
+    ParseIamEndpoint(config);
 
     config.VerbosityLevel = std::min(static_cast<TConfig::EVerbosityLevel>(VerbosityLevel), TConfig::EVerbosityLevel::DEBUG);
 }
@@ -255,7 +259,10 @@ void TClientCommandRootCommon::ParseAddress(TConfig& config) {
 
     if (!Address.empty()) {
         config.EnableSsl = Settings.EnableSsl.GetRef();
-        ParseProtocol(config);
+        TString message;
+        if (!ParseProtocol(config, message)) {
+            MisuseErrors.push_back(message);
+        }
         auto colon_pos = Address.find(":");
         if (colon_pos == TString::npos) {
             config.Address = Address + ":" + port;
@@ -263,7 +270,8 @@ void TClientCommandRootCommon::ParseAddress(TConfig& config) {
             if (colon_pos == Address.rfind(":")) {
                 config.Address = Address;
             } else {
-                throw TMisuseException() << "Wrong format for option 'endpoint': more than one colon found.";
+                MisuseErrors.push_back("Wrong format for option 'endpoint': more than one colon found.");
+                return;
             }
         }
     }
@@ -274,8 +282,9 @@ void TClientCommandRootCommon::ParseProfile() {
         if (ProfileManager->HasProfile(ProfileName)) {
             Profile = ProfileManager->GetProfile(ProfileName);
         } else {
-            throw TMisuseException() << "Profile " << ProfileName << " does not exist." << Endl
-                << "Run \"ydb config profile list\" to see existing profiles";
+            MisuseErrors.push_back(TStringBuilder() << "Profile " << ProfileName << " does not exist." << Endl
+                << "Run \"ydb config profile list\" to see existing profiles");
+            return;
         }
     }
 }
@@ -294,19 +303,47 @@ void TClientCommandRootCommon::ParseDatabase(TConfig& config) {
     config.Database = Database;
 }
 
+void TClientCommandRootCommon::ParseIamEndpoint(TConfig& config) {
+    if (IamEndpoint.empty()) {
+        auto profile = Profile;
+        if (!profile) {
+            profile = ProfileManager->GetActiveProfile();
+        }
+        if (profile && profile->Has("iam-endpoint")) {
+            IamEndpoint = profile->GetValue("iam-endpoint").as<TString>();
+        }
+    }
+    if (!IamEndpoint.empty()) {
+        config.IamEndpoint = IamEndpoint;
+    }
+}
+
 void TClientCommandRootCommon::Validate(TConfig& config) {
     TClientCommandRootBase::Validate(config);
+    if (!config.NeedToConnect) {
+        return;
+    }
 
-    if (Address.empty() && config.NeedToConnect) {
+    if (!MisuseErrors.empty()) {
+        TStringBuilder errors;
+        for (auto it = MisuseErrors.begin(); it != MisuseErrors.end(); ++it) {
+            if (it != MisuseErrors.begin()) {
+                errors << Endl;
+            }
+            errors << *it;
+        }
+
+        throw TMisuseException() << errors;
+    }
+
+    if (Address.empty()) {
         throw TMisuseException()
             << "Missing required option 'endpoint'.";
     }
 
     if (Database.empty()) {
-        if (config.NeedToConnect) {
-            throw TMisuseException()
-                << "Missing required option 'database'.";
-        }
+        throw TMisuseException()
+            << "Missing required option 'database'.";
     } else if (!Database.StartsWith('/')) {
         throw TMisuseException() << "Path to a database \"" << Database
             << "\" is incorrect. It must be absolute and thus must begin with '/'.";
@@ -320,20 +357,14 @@ namespace {
     }
 }
 
-void TClientCommandRootCommon::CheckForIamEndpoint(TConfig& config, std::shared_ptr<IProfile> profile) {
-    if (profile->Has("iam-endpoint")) {
-        config.IamEndpoint = profile->GetValue("iam-endpoint").as<TString>();
-    }
-}
-
 bool TClientCommandRootCommon::GetCredentialsFromProfile(std::shared_ptr<IProfile> profile, TConfig& config, bool explicitOption) {
     if (!profile || !profile->Has("authentication")) {
         return false;
     }
     auto authValue = profile->GetValue("authentication");
     if (!authValue["method"]) {
-        throw TMisuseException()
-            << "Configuration profile has \"authentication\" but does not has \"method\" in it";
+        MisuseErrors.push_back("Configuration profile has \"authentication\" but does not has \"method\" in it");
+        return false;
     }
     TString authMethod = authValue["method"].as<TString>();
 
@@ -356,11 +387,14 @@ bool TClientCommandRootCommon::GetCredentialsFromProfile(std::shared_ptr<IProfil
         knownMethod |= (authMethod == "static-credentials");
     }
     if (!knownMethod) {
-        throw TMisuseException() << "Unknown authentication method in configuration profile: \"" << authMethod << "\"";
+        MisuseErrors.push_back(TStringBuilder() << "Unknown authentication method in configuration profile: \""
+            << authMethod << "\"");
+        return false;
     }
     if (!authValue["data"]) {
-        throw TMisuseException() << "Active configuration profile has \"authentication\" with method \""
-            << authMethod << "\" in it, but no \"data\"";
+        MisuseErrors.push_back(TStringBuilder() << "Active configuration profile has \"authentication\" with method \""
+            << authMethod << "\" in it, but no \"data\"");
+        return false;
     }
     auto authData = authValue["data"];
 
@@ -374,26 +408,41 @@ bool TClientCommandRootCommon::GetCredentialsFromProfile(std::shared_ptr<IProfil
             PrintSettingFromProfile("token file", profile, explicitOption);
         }
         TString filename = authData.as<TString>();
-        config.SecurityToken = ReadFromFile(filename, "token");
+        TString fileContent;
+        if (!ReadFromFileIfExists(filename, "token", fileContent, true)) {
+            MisuseErrors.push_back(TStringBuilder() << "Couldn't read token from file " << filename);
+            return false;
+        }
+        if (!fileContent) {
+            MisuseErrors.push_back(TStringBuilder() << "Empty token file " << filename << " provided");
+            return false;
+        }
+        config.SecurityToken = fileContent;
     } else if (authMethod == "yc-token") {
         if (IsVerbose()) {
             PrintSettingFromProfile("Yandex.Cloud Passport token (yc-token)", profile, explicitOption);
         }
         config.YCToken = authData.as<TString>();
-        CheckForIamEndpoint(config, profile);
     } else if (authMethod == "yc-token-file") {
         if (IsVerbose()) {
             PrintSettingFromProfile("Yandex.Cloud Passport token file (yc-token-file)", profile, explicitOption);
         }
         TString filename = authData.as<TString>();
-        config.YCToken = ReadFromFile(filename, "token");
-        CheckForIamEndpoint(config, profile);
+        TString fileContent;
+        if (!ReadFromFileIfExists(filename, "token", fileContent, true)) {
+            MisuseErrors.push_back(TStringBuilder() << "Couldn't read token from file " << filename);
+            return false;
+        }
+        if (!fileContent) {
+            MisuseErrors.push_back(TStringBuilder() << "Empty token file " << filename << " provided");
+            return false;
+        }
+        config.YCToken = fileContent;
     } else if (authMethod == "sa-key-file") {
         if (IsVerbose()) {
             PrintSettingFromProfile("service account key file (sa-key-file)", profile, explicitOption);
         }
         config.SaKeyFile = authData.as<TString>();
-        CheckForIamEndpoint(config, profile);
     } else if (authMethod == "ydb-token") {
         if (IsVerbose()) {
             PrintSettingFromProfile("OAuth token (ydb-token)", profile, explicitOption);
@@ -414,7 +463,13 @@ bool TClientCommandRootCommon::GetCredentialsFromProfile(std::shared_ptr<IProfil
         }
         if (authData["password-file"]) {
             TString filename = authData["password-file"].as<TString>();
-            config.StaticCredentials.Password = ReadFromFile(filename, "password", true);
+            TString fileContent;
+            if (!ReadFromFileIfExists(filename, "password", fileContent, true)) {
+                MisuseErrors.push_back(TStringBuilder() << "Couldn't read password from file " << filename);
+                DoNotAskForPassword = true;
+                return false;
+            }
+            config.StaticCredentials.Password = fileContent;
             if (!config.StaticCredentials.Password) {
                 DoNotAskForPassword = true;
             }
@@ -582,7 +637,8 @@ void TClientCommandRootCommon::ParseCredentials(TConfig& config) {
             str << " UseMetadataCredentials (true)";
         }
 
-        throw TMisuseException() << str << ". Choose exactly one of them";
+        MisuseErrors.push_back(TStringBuilder() << str << ". Choose exactly one of them");
+        return;
     }
 
     if (config.UseStaticCredentials) {
@@ -593,13 +649,10 @@ void TClientCommandRootCommon::ParseCredentials(TConfig& config) {
             }
         } else {
             if (config.StaticCredentials.Password) {
-                throw TMisuseException() << "User password was provided without user name";
+                MisuseErrors.push_back("User password was provided without user name");
+                return;
             }
         }
-    }
-
-    if (!config.IamEndpoint && config.UseIamAuth && IamEndpoint) {
-        config.IamEndpoint = IamEndpoint;
     }
 }
 
