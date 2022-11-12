@@ -5,6 +5,7 @@
 
 #include <ydb/core/yq/libs/audit/yq_audit_service.h>
 #include <ydb/core/yq/libs/checkpoint_storage/storage_service.h>
+#include <ydb/core/yq/libs/control_plane_config/control_plane_config.h>
 #include <ydb/core/yq/libs/control_plane_proxy/control_plane_proxy.h>
 #include <ydb/core/yq/libs/health/health.h>
 #include <ydb/core/yq/libs/checkpoint_storage/storage_service.h>
@@ -83,6 +84,11 @@ void Init(
                 credentialsProviderFactory,
                 tenant);
         actorRegistrator(NYq::ControlPlaneStorageServiceActorId(), controlPlaneStorage);
+
+        actorRegistrator(NYq::ControlPlaneConfigActorId(),
+            CreateControlPlaneConfigActor(yqSharedResources, credentialsProviderFactory, protoConfig.GetControlPlaneStorage(),
+                appData->Counters->GetSubgroup("counters", "yq")->GetSubgroup("subsystem", "ControlPlaneConfig"))
+        );
     }
 
     if (protoConfig.GetControlPlaneProxy().GetEnabled()) {
@@ -155,11 +161,16 @@ void Init(
     }
 
     if (protoConfig.GetPrivateApi().GetEnabled()) {
-        auto s3HttpRetryPolicy = NYql::GetHTTPDefaultRetryPolicy(TDuration::MilliSeconds(protoConfig.GetReadActorsFactoryConfig().GetS3ReadActorFactoryConfig().GetRetryConfig().GetMaxRetryTimeMs())); // if MaxRetryTimeMs is not set, default http gateway will use the default one
+        const auto& s3readConfig = protoConfig.GetReadActorsFactoryConfig().GetS3ReadActorFactoryConfig();
+        auto s3HttpRetryPolicy = NYql::GetHTTPDefaultRetryPolicy(TDuration::MilliSeconds(s3readConfig.GetRetryConfig().GetMaxRetryTimeMs())); // if MaxRetryTimeMs is not set, default http gateway will use the default one
+        NYql::NDq::TS3ReadActorFactoryConfig readActorFactoryCfg;
+        if (const ui64 rowsInBatch = s3readConfig.GetRowsInBatch()) {
+            readActorFactoryCfg.RowsInBatch = rowsInBatch;
+        }
         RegisterDqPqReadActorFactory(*asyncIoFactory, yqSharedResources->UserSpaceYdbDriver, credentialsFactory, !protoConfig.GetReadActorsFactoryConfig().GetPqReadActorFactoryConfig().GetCookieCommitMode());
         RegisterYdbReadActorFactory(*asyncIoFactory, yqSharedResources->UserSpaceYdbDriver, credentialsFactory);
         RegisterS3ReadActorFactory(*asyncIoFactory, credentialsFactory,
-            httpGateway, s3HttpRetryPolicy);
+            httpGateway, s3HttpRetryPolicy, readActorFactoryCfg);
         RegisterS3WriteActorFactory(*asyncIoFactory, credentialsFactory,
             httpGateway, s3HttpRetryPolicy);
         RegisterClickHouseReadActorFactory(*asyncIoFactory, credentialsFactory, httpGateway);

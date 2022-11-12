@@ -23,9 +23,18 @@ public:
     TTxType GetTxType() const override { return TXTYPE_WRITE_INDEX; }
 
 private:
+    struct TPathIdBlobs {
+        THashSet<TUnifiedBlobId> Blobs;
+        ui64 PathId;
+        TPathIdBlobs(const ui64 pathId)
+            : PathId(pathId) {
+
+        }
+    };
+
     TEvPrivate::TEvWriteIndex::TPtr Ev;
-    THashMap<TUnifiedBlobId, TString> BlobsToExport;
-    THashMap<TString, THashSet<TUnifiedBlobId>> ExportTierBlobs;
+    THashMap<TUnifiedBlobId, NOlap::TPortionEvictionFeatures> BlobsToExport;
+    THashMap<TString, TPathIdBlobs> ExportTierBlobs;
     THashMap<TString, std::vector<NOlap::TEvictedBlob>> TierBlobsToForget;
     ui64 ExportNo = 0;
 };
@@ -121,21 +130,19 @@ bool TTxWriteIndex::Execute(TTransactionContext& txc, const TActorContext& ctx) 
             }
 
             Self->IncCounter(COUNTER_EVICTION_PORTIONS_WRITTEN, changes->PortionsToEvict.size());
-            for (auto& [portionInfo, _] : changes->PortionsToEvict) {
+            for (auto& [portionInfo, evictionFeatures] : changes->PortionsToEvict) {
                 auto& tierName = portionInfo.TierName;
                 if (tierName.empty()) {
                     continue;
                 }
 
                 // Mark exported blobs
-                Y_VERIFY(Self->TierConfigs.count(tierName));
-                auto& config = Self->TierConfigs[tierName];
-
-                if (config.NeedExport()) {
+                auto& tManager = Self->GetTierManagerVerified(NTiers::TGlobalTierId(Self->OwnerPath, tierName));
+                if (tManager.NeedExport()) {
                     for (auto& rec : portionInfo.Records) {
                         auto& blobId = rec.BlobRange.BlobId;
                         if (!BlobsToExport.count(blobId)) {
-                            BlobsToExport.emplace(blobId, tierName);
+                            BlobsToExport.emplace(blobId, evictionFeatures);
 
                             NKikimrTxColumnShard::TEvictMetadata meta;
                             meta.SetTierName(tierName);
@@ -217,8 +224,12 @@ bool TTxWriteIndex::Execute(TTransactionContext& txc, const TActorContext& ctx) 
 
     if (BlobsToExport.size()) {
         size_t numBlobs = BlobsToExport.size();
-        for (auto& [blobId, tierName] : BlobsToExport) {
-            ExportTierBlobs[tierName].emplace(blobId);
+        for (auto& [blobId, evFeatures] : BlobsToExport) {
+            auto it = ExportTierBlobs.find(evFeatures.TargetTierName);
+            if (it == ExportTierBlobs.end()) {
+                it = ExportTierBlobs.emplace(evFeatures.TargetTierName, TPathIdBlobs(evFeatures.PathId)).first;
+            }
+            it->second.Blobs.emplace(blobId);
         }
         BlobsToExport.clear();
 
@@ -285,8 +296,8 @@ void TTxWriteIndex::Complete(const TActorContext& ctx) {
         Y_VERIFY(ExportNo);
 
         TEvPrivate::TEvExport::TBlobDataMap blobsData;
-        for (auto&& i : blobIds) {
-            TEvPrivate::TEvExport::TExportBlobInfo info;
+        for (auto&& i : blobIds.Blobs) {
+            TEvPrivate::TEvExport::TExportBlobInfo info(blobIds.PathId);
             info.Evicting = Self->BlobManager->IsEvicting(i);
             blobsData.emplace(i, std::move(info));
         }

@@ -20,9 +20,18 @@
 
 #include <ydb/library/yql/udfs/common/clickhouse/client/src/Formats/FormatFactory.h>
 #include <ydb/library/yql/udfs/common/clickhouse/client/src/Processors/Formats/InputStreamFromInputFormat.h>
+#include <ydb/library/yql/udfs/common/clickhouse/client/src/Processors/Formats/Impl/ArrowBufferedStreams.h>
+
+#include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <arrow/status.h>
+#include <parquet/arrow/reader.h>
+#include <parquet/file_reader.h>
+
 #endif
 
 #include "yql_s3_read_actor.h"
+#include "yql_s3_source_factory.h"
 #include "yql_s3_actors_util.h"
 
 #include <ydb/core/protos/services.pb.h>
@@ -39,6 +48,7 @@
 #include <ydb/library/yql/providers/common/schema/mkql/yql_mkql_schema.h>
 #include <ydb/library/yql/utils/yql_panic.h>
 
+#include <ydb/library/yql/providers/s3/common/util.h>
 #include <ydb/library/yql/providers/s3/compressors/factory.h>
 #include <ydb/library/yql/providers/s3/proto/range.pb.h>
 #include <ydb/library/yql/providers/s3/range_helpers/path_list_reader.h>
@@ -84,6 +94,13 @@
 #define LOG_CORO_T(name, stream) \
     LOG_TRACE_S(GetActorContext(), NKikimrServices::KQP_COMPUTE, name << ": " << SelfActorId << ", CA: " << ComputeActorId << ", TxId: " << TxId << ". " << stream)
 
+#define THROW_ARROW_NOT_OK(status)                                     \
+    do                                                                 \
+    {                                                                  \
+        if (::arrow::Status _s = (status); !_s.ok())                   \
+            throw yexception() << _s.ToString(); \
+    } while (false)
+
 namespace NYql::NDq {
 
 using namespace ::NActors;
@@ -107,6 +124,7 @@ struct TEvPrivate {
         EvReadError,
         EvRetry,
         EvNextBlock,
+        EvNextRecordBatch,
         EvBlockProcessed,
 
         EvEnd
@@ -116,8 +134,14 @@ struct TEvPrivate {
 
     // Events
     struct TEvReadResult : public TEventLocal<TEvReadResult, EvReadResult> {
-        TEvReadResult(IHTTPGateway::TContent&& result, size_t pathInd): Result(std::move(result)), PathIndex(pathInd) {}
+        TEvReadResult(IHTTPGateway::TContent&& result, const TString& requestId, size_t pathInd)
+            : Result(std::move(result))
+            , RequestId(requestId)
+            , PathIndex(pathInd)
+        {}
+
         IHTTPGateway::TContent Result;
+        const TString RequestId;
         const size_t PathIndex;
     };
 
@@ -143,8 +167,14 @@ struct TEvPrivate {
     };
 
     struct TEvReadError : public TEventLocal<TEvReadError, EvReadError> {
-        TEvReadError(TIssues&& error, size_t pathInd = std::numeric_limits<size_t>::max()) : Error(std::move(error)), PathIndex(pathInd) {}
+        TEvReadError(TIssues&& error, const TString& requestId, size_t pathInd = std::numeric_limits<size_t>::max())
+            : Error(std::move(error))
+            , RequestId(requestId)
+            , PathIndex(pathInd)
+        {}
+
         const TIssues Error;
+        const TString RequestId;
         const size_t PathIndex;
     };
 
@@ -156,6 +186,13 @@ struct TEvPrivate {
     struct TEvNextBlock : public NActors::TEventLocal<TEvNextBlock, EvNextBlock> {
         TEvNextBlock(NDB::Block& block, size_t pathInd, std::function<void()> functor = [](){}) : PathIndex(pathInd), Functor(functor) { Block.swap(block); }
         NDB::Block Block;
+        const size_t PathIndex;
+        std::function<void()> Functor;
+    };
+
+    struct TEvNextRecordBatch : public NActors::TEventLocal<TEvNextRecordBatch, EvNextRecordBatch> {
+        TEvNextRecordBatch(const std::shared_ptr<arrow::RecordBatch>& batch, size_t pathInd, std::function<void()> functor = []() {}) : Batch(batch), PathIndex(pathInd), Functor(functor) { }
+        std::shared_ptr<arrow::RecordBatch> Batch;
         const size_t PathIndex;
         std::function<void()> Functor;
     };
@@ -190,7 +227,7 @@ public:
         , RetryPolicy(retryPolicy)
         , ActorSystem(TActivationContext::ActorSystem())
         , Url(url)
-        , Headers(MakeHeader(token))
+        , Token(token)
         , Paths(std::move(paths))
         , AddPathIndex(addPathIndex)
         , StartPathIndex(startPathIndex)
@@ -204,9 +241,10 @@ public:
             const TPath& path = Paths[pathInd];
             auto url = Url + std::get<TString>(path);
             auto id = pathInd + StartPathIndex;
-            LOG_D("TS3ReadActor", "Download: " << url << ", ID: " << id);
-            Gateway->Download(url, Headers, std::min(std::get<size_t>(path), SizeLimit),
-                std::bind(&TS3ReadActor::OnDownloadFinished, ActorSystem, SelfId(), std::placeholders::_1, id), {}, RetryPolicy);
+            const TString requestId = CreateGuidAsString();
+            LOG_D("TS3ReadActor", "Download: " << url << ", ID: " << id << ", request id: [" << requestId << "]");
+            Gateway->Download(url, MakeHeaders(Token, requestId), std::min(std::get<size_t>(path), SizeLimit),
+                std::bind(&TS3ReadActor::OnDownloadFinished, ActorSystem, SelfId(), requestId, std::placeholders::_1, id), {}, RetryPolicy);
         };
     }
 
@@ -223,13 +261,13 @@ private:
         hFunc(TEvPrivate::TEvReadError, Handle);
     )
 
-    static void OnDownloadFinished(TActorSystem* actorSystem, TActorId selfId, IHTTPGateway::TResult&& result, size_t pathInd) {
+    static void OnDownloadFinished(TActorSystem* actorSystem, TActorId selfId, const TString& requestId, IHTTPGateway::TResult&& result, size_t pathInd) {
         switch (result.index()) {
         case 0U:
-            actorSystem->Send(new IEventHandle(selfId, TActorId(), new TEvPrivate::TEvReadResult(std::get<IHTTPGateway::TContent>(std::move(result)), pathInd)));
+            actorSystem->Send(new IEventHandle(selfId, TActorId(), new TEvPrivate::TEvReadResult(std::get<IHTTPGateway::TContent>(std::move(result)), requestId, pathInd)));
             return;
         case 1U:
-            actorSystem->Send(new IEventHandle(selfId, TActorId(), new TEvPrivate::TEvReadError(std::get<TIssues>(std::move(result)), pathInd)));
+            actorSystem->Send(new IEventHandle(selfId, TActorId(), new TEvPrivate::TEvReadError(std::get<TIssues>(std::move(result)), requestId, pathInd)));
             return;
         default:
             break;
@@ -270,8 +308,10 @@ private:
     void Handle(TEvPrivate::TEvReadResult::TPtr& result) {
         ++IsDoneCounter;
         const auto id = result->Get()->PathIndex;
+        const auto path = std::get<TString>(Paths[id - StartPathIndex]);
         const auto httpCode = result->Get()->Result.HttpResponseCode;
-        LOG_D("TS3ReadActor", "ID: " << id << ", TEvReadResult size: " << result->Get()->Result.size() << ", HTTP response code: " << httpCode);
+        const auto requestId = result->Get()->RequestId;
+        LOG_D("TS3ReadActor", "ID: " << id << ", Path: " << path << ", read size: " << result->Get()->Result.size() << ", HTTP response code: " << httpCode << ", request id: [" << requestId << "]");
         if (200 == httpCode || 206 == httpCode) {
             Blocks.emplace(std::make_tuple(std::move(result->Get()->Result), id));
             Send(ComputeActorId, new TEvNewAsyncInputDataArrived(InputIndex));
@@ -282,6 +322,7 @@ private:
             if (!ParseS3ErrorResponse(errorText, errorCode, message)) {
                 message = errorText;
             }
+            message = TStringBuilder{} << "Error while reading file " << path << ", details: " << message << ", request id: [" << requestId << "]";
             Send(ComputeActorId, new TEvAsyncInputError(InputIndex, BuildIssues(httpCode, errorCode, message), NYql::NDqProto::StatusIds::EXTERNAL_ERROR));
         }
     }
@@ -289,8 +330,11 @@ private:
     void Handle(TEvPrivate::TEvReadError::TPtr& result) {
         ++IsDoneCounter;
         auto id = result->Get()->PathIndex;
-        LOG_W("TS3ReadActor", "ID: " << id << ", TEvReadError: " << result->Get()->Error.ToOneLineString());
-        Send(ComputeActorId, new TEvAsyncInputError(InputIndex, result->Get()->Error, NYql::NDqProto::StatusIds::EXTERNAL_ERROR));
+        const auto requestId = result->Get()->RequestId;
+        const auto path = std::get<TString>(Paths[id - StartPathIndex]);
+        LOG_W("TS3ReadActor", "Error while reading file " << path << ", details: ID: " << id << ", TEvReadError: " << result->Get()->Error.ToOneLineString() << ", request id: [" << requestId << "]");
+        auto issues = NS3Util::AddParentIssue(TStringBuilder{} << "Error while reading file " << path << " with request id [" << requestId << "]", TIssues{result->Get()->Error});
+        Send(ComputeActorId, new TEvAsyncInputError(InputIndex, std::move(issues), NYql::NDqProto::StatusIds::EXTERNAL_ERROR));
     }
 
     // IActor & IDqComputeActorAsyncInput
@@ -300,8 +344,12 @@ private:
         TActorBootstrapped<TS3ReadActor>::PassAway();
     }
 
-    static IHTTPGateway::THeaders MakeHeader(const TString& token) {
-        return token.empty() ? IHTTPGateway::THeaders() : IHTTPGateway::THeaders{TString("X-YaCloud-SubjectToken:") += token};
+    static IHTTPGateway::THeaders MakeHeaders(const TString& token, const TString& requestId) {
+        IHTTPGateway::THeaders headers{TString{"X-Request-ID:"} += requestId};
+        if (token) {
+            headers.emplace_back(TString("X-YaCloud-SubjectToken:") += token);
+        }
+        return headers;
     }
 
 private:
@@ -319,7 +367,7 @@ private:
     TActorSystem* const ActorSystem;
 
     const TString Url;
-    const IHTTPGateway::THeaders Headers;
+    const TString Token;
     const TPathList Paths;
     const bool AddPathIndex;
     const ui64 StartPathIndex;
@@ -331,7 +379,9 @@ private:
 struct TReadSpec {
     using TPtr = std::shared_ptr<TReadSpec>;
 
-    NDB::ColumnsWithTypeAndName Columns;
+    bool Arrow = false;
+    NDB::ColumnsWithTypeAndName CHColumns;
+    std::shared_ptr<arrow::Schema> ArrowSchema;
     NDB::FormatSettings Settings;
     TString Format, Compression;
     ui64 SizeLimit = 0;
@@ -346,8 +396,17 @@ struct TRetryStuff {
         const IHTTPGateway::THeaders& headers,
         std::size_t sizeLimit,
         const TTxId& txId,
+        const TString& requestId,
         const IRetryPolicy<long>::TPtr& retryPolicy
-    ) : Gateway(std::move(gateway)), Url(std::move(url)), Headers(headers), Offset(0U), SizeLimit(sizeLimit), TxId(txId), RetryState(retryPolicy->CreateRetryState()), Cancelled(false)
+    ) : Gateway(std::move(gateway))
+      , Url(std::move(url))
+      , Headers(headers)
+      , Offset(0U)
+      , SizeLimit(sizeLimit)
+      , TxId(txId)
+      , RequestId(requestId)
+      , RetryState(retryPolicy->CreateRetryState())
+      , Cancelled(false)
     {}
 
     const IHTTPGateway::TPtr Gateway;
@@ -355,6 +414,7 @@ struct TRetryStuff {
     const IHTTPGateway::THeaders Headers;
     std::size_t Offset, SizeLimit;
     const TTxId TxId;
+    const TString RequestId;
     const IRetryPolicy<long>::IRetryState::TPtr RetryState;
     IHTTPGateway::TCancelHook CancelHook;
     TMaybe<TDuration> NextRetryDelay;
@@ -393,6 +453,68 @@ void DownloadStart(const TRetryStuff::TPtr& retryStuff, TActorSystem* actorSyste
         std::bind(&OnDownloadFinished, actorSystem, self, parent, std::placeholders::_1));
 }
 
+template <typename T>
+class IBatchReader {
+public:
+    virtual ~IBatchReader() = default;
+
+    virtual bool Next(T& value) = 0;
+};
+
+class TBlockReader : public IBatchReader<NDB::Block> {
+public:
+    TBlockReader(std::unique_ptr<NDB::IBlockInputStream>&& stream)
+        : Stream(std::move(stream))
+    {}
+
+    bool Next(NDB::Block& value) final {
+        value = Stream->read();
+        return !!value;
+    }
+
+private:
+    std::unique_ptr<NDB::IBlockInputStream> Stream;
+};
+
+class TArrowParquetBatchReader : public IBatchReader<std::shared_ptr<arrow::RecordBatch>> {
+public:
+    TArrowParquetBatchReader(std::unique_ptr<parquet::arrow::FileReader>&& fileReader, std::vector<int>&& columnIndices)
+        : FileReader(std::move(fileReader))
+        , ColumnIndices(std::move(columnIndices))
+        , TotalGroups(FileReader->num_row_groups())
+        , CurrentGroup(0)
+    {}
+
+    bool Next(std::shared_ptr<arrow::RecordBatch>& value) final {
+        for (;;) {
+            if (CurrentGroup == TotalGroups) {
+                return false;
+            }
+
+            if (!CurrentBatchReader) {
+                THROW_ARROW_NOT_OK(FileReader->ReadRowGroup(CurrentGroup++, ColumnIndices, &CurrentTable));
+                CurrentBatchReader = std::make_unique<arrow::TableBatchReader>(*CurrentTable);
+            }
+
+            THROW_ARROW_NOT_OK(CurrentBatchReader->ReadNext(&value));
+            if (value) {
+                return true;
+            }
+
+            CurrentBatchReader = nullptr;
+            CurrentTable = nullptr;
+        }
+    }
+
+private:
+    std::unique_ptr<parquet::arrow::FileReader> FileReader;
+    const std::vector<int> ColumnIndices;
+    const int TotalGroups;
+    int CurrentGroup;
+    std::shared_ptr<arrow::Table> CurrentTable;
+    std::unique_ptr<arrow::TableBatchReader> CurrentBatchReader;
+};
+
 class TS3ReadCoroImpl : public TActorCoroImpl {
 private:
     class TReadBufferFromStream : public NDB::ReadBuffer {
@@ -417,8 +539,8 @@ private:
 
     static constexpr std::string_view TruncatedSuffix = "... [truncated]"sv;
 public:
-    TS3ReadCoroImpl(ui64 inputIndex, const TTxId& txId, const NActors::TActorId& computeActorId, const TRetryStuff::TPtr& retryStuff, const TReadSpec::TPtr& readSpec, size_t pathIndex, const TString& path, const TString& url, const std::size_t maxBlocksInFly)
-        : TActorCoroImpl(256_KB), InputIndex(inputIndex), TxId(txId), RetryStuff(retryStuff), ReadSpec(readSpec), ComputeActorId(computeActorId), PathIndex(pathIndex), Path(path), Url(url), MaxBlocksInFly(maxBlocksInFly)
+    TS3ReadCoroImpl(ui64 inputIndex, const TTxId& txId, const NActors::TActorId& computeActorId, const TRetryStuff::TPtr& retryStuff, const TReadSpec::TPtr& readSpec, size_t pathIndex, const TString& path, const TString& url, const std::size_t maxBlocksInFly, const TS3ReadActorFactoryConfig& readActorFactoryCfg)
+        : TActorCoroImpl(256_KB), ReadActorFactoryCfg(readActorFactoryCfg), InputIndex(inputIndex), TxId(txId), RetryStuff(retryStuff), ReadSpec(readSpec), ComputeActorId(computeActorId), PathIndex(pathIndex), Path(path), Url(url), MaxBlocksInFly(maxBlocksInFly)
     {}
 
     bool Next(TString& value) {
@@ -432,23 +554,23 @@ public:
                 Issues.Clear();
                 value.clear();
                 RetryStuff->NextRetryDelay = RetryStuff->RetryState->GetNextRetryDelay(HttpResponseCode = ev->Get<TEvPrivate::TEvReadStarted>()->HttpResponseCode);
-                LOG_CORO_D("TS3ReadCoroImpl", "TEvReadStarted, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", Http code: " << HttpResponseCode << ", retry after: " << RetryStuff->NextRetryDelay);
+                LOG_CORO_D("TS3ReadCoroImpl", "TEvReadStarted, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", Http code: " << HttpResponseCode << ", retry after: " << RetryStuff->NextRetryDelay << ", request id: [" << RetryStuff->RequestId << "]");
                 return true;
             case TEvPrivate::TEvReadFinished::EventType:
                 Issues = std::move(ev->Get<TEvPrivate::TEvReadFinished>()->Issues);
                 if (Issues) {
                     if (RetryStuff->NextRetryDelay = RetryStuff->RetryState->GetNextRetryDelay(0L); !RetryStuff->NextRetryDelay) {
                         InputFinished = true;
-                        LOG_CORO_W("TS3ReadCoroImpl", "ReadError: " << Issues.ToOneLineString() << ", Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", LastOffset: " << LastOffset << ", LastData: " << GetLastDataAsText());
+                        LOG_CORO_W("TS3ReadCoroImpl", "ReadError: " << Issues.ToOneLineString() << ", Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", LastOffset: " << LastOffset << ", LastData: " << GetLastDataAsText() << ", request id: [" << RetryStuff->RequestId << "]");
                         throw TS3ReadError(); // Don't pass control to data parsing, because it may validate eof and show wrong issues about incorrect data format
                     }
                 }
 
                 if (!RetryStuff->IsCancelled() && RetryStuff->NextRetryDelay && RetryStuff->SizeLimit > 0ULL) {
-                    LOG_CORO_D("TS3ReadCoroImpl", "TS3ReadCoroActor" << ": " << SelfActorId << ", TxId: " << RetryStuff->TxId << ". Retry Download, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset);
+                    LOG_CORO_D("TS3ReadCoroImpl", "TS3ReadCoroActor" << ": " << SelfActorId << ", TxId: " << RetryStuff->TxId << ". Retry Download, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", request id: [" << RetryStuff->RequestId << "]");
                     GetActorSystem()->Schedule(*RetryStuff->NextRetryDelay, new IEventHandle(ParentActorId, SelfActorId, new TEvPrivate::TEvRetryEventFunc(std::bind(&DownloadStart, RetryStuff, GetActorSystem(), SelfActorId, ParentActorId))));
                 } else {
-                    LOG_CORO_D("TS3ReadCoroImpl", "TEvReadFinished, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", LastOffset: " << LastOffset << ", Error: " << ServerReturnedError << ", LastData: " << GetLastDataAsText());
+                    LOG_CORO_D("TS3ReadCoroImpl", "TEvReadFinished, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", LastOffset: " << LastOffset << ", Error: " << ServerReturnedError << ", LastData: " << GetLastDataAsText() << ", request id: [" << RetryStuff->RequestId << "]");
                     InputFinished = true;
                     if (ServerReturnedError) {
                         throw TS3ReadError(); // Don't pass control to data parsing, because it may validate eof and show wrong issues about incorrect data format
@@ -463,7 +585,7 @@ public:
                     RetryStuff->SizeLimit -= value.size();
                     LastOffset = RetryStuff->Offset;
                     LastData = value;
-                    LOG_CORO_T("TS3ReadCoroImpl", "TEvDataPart, size: " << value.size() << ", Url: " << RetryStuff->Url << ", Offset (updated): " << RetryStuff->Offset);
+                    LOG_CORO_T("TS3ReadCoroImpl", "TEvDataPart, size: " << value.size() << ", Url: " << RetryStuff->Url << ", Offset (updated): " << RetryStuff->Offset << ", request id: [" << RetryStuff->RequestId << "]");
                     Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvNewAsyncInputDataArrived(InputIndex));
                 } else if (HttpResponseCode && !RetryStuff->IsCancelled() && !RetryStuff->NextRetryDelay) {
                     ServerReturnedError = true;
@@ -472,7 +594,7 @@ public:
                     else if (!ErrorText.EndsWith(TruncatedSuffix))
                         ErrorText.append(TruncatedSuffix);
                     value.clear();
-                    LOG_CORO_W("TS3ReadCoroImpl", "TEvDataPart, ERROR: " << ErrorText << ", Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", LastOffset: " << LastOffset << ", LastData: " << GetLastDataAsText());
+                    LOG_CORO_W("TS3ReadCoroImpl", "TEvDataPart, ERROR: " << ErrorText << ", Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", LastOffset: " << LastOffset << ", LastData: " << GetLastDataAsText() << ", request id: [" << RetryStuff->RequestId << "]");
                 }
                 return true;
             default:
@@ -491,7 +613,7 @@ private:
             switch (etype) {
                 case TEvPrivate::TEvReadFinished::EventType:
                     Issues = std::move(ev->Get<TEvPrivate::TEvReadFinished>()->Issues);
-                    LOG_CORO_D("TS3ReadCoroImpl", "TEvReadFinished: " << Issues.ToOneLineString());
+                    LOG_CORO_D("TS3ReadCoroImpl", "TEvReadFinished: " << Path << " " << Issues.ToOneLineString());
                     break;
                 default:
                     continue;
@@ -516,37 +638,41 @@ private:
             } else {
                 buffer = std::make_unique<TReadBufferFromStream>(this);
             }
+
             const auto decompress(MakeDecompressor(*buffer, ReadSpec->Compression));
             YQL_ENSURE(ReadSpec->Compression.empty() == !decompress, "Unsupported " << ReadSpec->Compression << " compression.");
-            NDB::InputStreamFromInputFormat stream(NDB::FormatFactory::instance().getInputFormat(ReadSpec->Format, decompress ? *decompress : *buffer, NDB::Block(ReadSpec->Columns), nullptr, 1_MB, ReadSpec->Settings));
-            auto actorSystem = GetActorSystem();
-            auto selfActorId = SelfActorId;
-            size_t cntBlocksInFly = 0;
-            if (isLocal) {
-                while (auto block = stream.read()) {
-                    if (++cntBlocksInFly > MaxBlocksInFly) {
-                        WaitForSpecificEvent<TEvPrivate::TEvBlockProcessed>();
-                        --cntBlocksInFly;
-                    }
-                    Send(ParentActorId, new TEvPrivate::TEvNextBlock(block, PathIndex, [actorSystem, selfActorId]() {
-                        actorSystem->Send(new IEventHandle(selfActorId, selfActorId, new TEvPrivate::TEvBlockProcessed()));
-                    }));
-                }
-                while (cntBlocksInFly--) {
-                    WaitForSpecificEvent<TEvPrivate::TEvBlockProcessed>();
-                }
-            } else {
-                while (auto block = stream.read()) {
-                    Send(ParentActorId, new TEvPrivate::TEvNextBlock(block, PathIndex));
-                }
-            }
+            if (ReadSpec->Arrow) {
+                YQL_ENSURE(ReadSpec->Format == "parquet");
+                std::unique_ptr<parquet::arrow::FileReader> fileReader;
+                auto arrowFile = NDB::asArrowFile(decompress ? *decompress : *buffer);
 
+                THROW_ARROW_NOT_OK(parquet::arrow::OpenFile(arrowFile, arrow::default_memory_pool(), &fileReader));
+                std::shared_ptr<arrow::Schema> schema;
+                THROW_ARROW_NOT_OK(fileReader->GetSchema(&schema));
+
+                std::vector<int> columnIndices;
+                for (int i = 0; i < ReadSpec->ArrowSchema->num_fields(); ++i) {
+                    const auto& targetField = ReadSpec->ArrowSchema->field(i);
+                    auto srcFieldIndex = schema->GetFieldIndex(targetField->name());
+                    YQL_ENSURE(srcFieldIndex != -1, "Missing field: " << targetField->name());
+                    YQL_ENSURE(targetField->type()->Equals(schema->field(srcFieldIndex)->type()), "Mismatch type for field: " << targetField->name() << ", expected: "
+                        << targetField->type()->ToString() << ", got: " << schema->field(srcFieldIndex)->type()->ToString());
+                    columnIndices.push_back(srcFieldIndex);
+                }
+
+                TArrowParquetBatchReader reader(std::move(fileReader), std::move(columnIndices));
+                ProcessBatches<std::shared_ptr<arrow::RecordBatch>, TEvPrivate::TEvNextRecordBatch>(reader, isLocal);
+            } else {
+                auto stream = std::make_unique<NDB::InputStreamFromInputFormat>(NDB::FormatFactory::instance().getInputFormat(ReadSpec->Format, decompress ? *decompress : *buffer, NDB::Block(ReadSpec->CHColumns), nullptr, ReadActorFactoryCfg.RowsInBatch, ReadSpec->Settings));
+                TBlockReader reader(std::move(stream));
+                ProcessBatches<NDB::Block, TEvPrivate::TEvNextBlock>(reader, isLocal);
+            }
         } catch (const TS3ReadError&) {
             // Finish reading. Add error from server to issues
         } catch (const TDtorException&) {
             throw;
         } catch (const std::exception& err) {
-            exceptIssue.Message = TStringBuilder() << "Error while reading file " << Path << ", details: " << err.what();
+            exceptIssue.SetMessage(err.what());
             fatalCode = NYql::NDqProto::StatusIds::INTERNAL_ERROR;
             RetryStuff->Cancel();
         }
@@ -564,12 +690,13 @@ private:
             Issues.AddIssues(BuildIssues(HttpResponseCode, errorCode, message));
         }
 
-        if (exceptIssue.Message) {
+        if (exceptIssue.GetMessage()) {
             Issues.AddIssue(exceptIssue);
         }
 
-        if (Issues)
-            Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, std::move(Issues), fatalCode));
+        auto issues = NS3Util::AddParentIssue(TStringBuilder{} << "Error while reading file " << Path, std::move(Issues));
+        if (issues)
+            Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, std::move(issues), fatalCode));
         else
             Send(ParentActorId, new TEvPrivate::TEvReadFinished);
     } catch (const TDtorException&) {
@@ -579,9 +706,45 @@ private:
         return;
     }
 
+    template <typename T, typename TEv>
+    void ProcessBatches(IBatchReader<T>& reader, bool isLocal) {
+        auto actorSystem = GetActorSystem();
+        auto selfActorId = SelfActorId;
+        size_t cntBlocksInFly = 0;
+        if (isLocal) {
+            for (;;) {
+                T batch;
+                if (!reader.Next(batch)) {
+                    break;
+                }
+
+                if (++cntBlocksInFly > MaxBlocksInFly) {
+                    WaitForSpecificEvent<TEvPrivate::TEvBlockProcessed>();
+                    --cntBlocksInFly;
+                }
+                Send(ParentActorId, new TEv(batch, PathIndex, [actorSystem, selfActorId]() {
+                    actorSystem->Send(new IEventHandle(selfActorId, selfActorId, new TEvPrivate::TEvBlockProcessed()));
+                }));
+            }
+            while (cntBlocksInFly--) {
+                WaitForSpecificEvent<TEvPrivate::TEvBlockProcessed>();
+            }
+        } else {
+            for (;;) {
+                T batch;
+                if (!reader.Next(batch)) {
+                    break;
+                }
+
+                Send(ParentActorId, new TEv(batch, PathIndex));
+            }
+        }
+    }
+
     void ProcessUnexpectedEvent(TAutoPtr<IEventHandle> ev) final {
         TStringBuilder message;
-        message << "S3 read. Unexpected message type " << Hex(ev->GetTypeRewrite());
+        message << "Error while reading file " << Path << ", details: "
+                << "S3 read. Unexpected message type " << Hex(ev->GetTypeRewrite());
         if (auto* eventBase = ev->GetBase()) {
             message << " (" << eventBase->ToStringHeader() << ")";
         }
@@ -621,6 +784,7 @@ private:
     }
 
 private:
+    const TS3ReadActorFactoryConfig ReadActorFactoryCfg;
     const ui64 InputIndex;
     const TTxId TxId;
     const TRetryStuff::TPtr RetryStuff;
@@ -652,17 +816,42 @@ private:
     void Registered(TActorSystem* actorSystem, const TActorId& parent) override {
         TActorCoro::Registered(actorSystem, parent); // Calls TActorCoro::OnRegister and sends bootstrap event to ourself.
         if (RetryStuff->Url.substr(0, 6) != "file://") {
-            LOG_DEBUG_S(*actorSystem, NKikimrServices::KQP_COMPUTE, "TS3ReadCoroActor" << ": " << SelfId() << ", TxId: " << RetryStuff->TxId << ". " << "Start Download, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset);
+            LOG_DEBUG_S(*actorSystem, NKikimrServices::KQP_COMPUTE, "TS3ReadCoroActor" << ": " << SelfId() << ", TxId: " << RetryStuff->TxId << ". " << "Start Download, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", request id: [" << RetryStuff->RequestId << "]");
             DownloadStart(RetryStuff, actorSystem, SelfId(), parent);
         }
     }
 
-    static IHTTPGateway::THeaders MakeHeader(const TString& token) {
-        return token.empty() ? IHTTPGateway::THeaders() : IHTTPGateway::THeaders{TString("X-YaCloud-SubjectToken:") += token};
-    }
-
     const TRetryStuff::TPtr RetryStuff;
 };
+
+ui64 GetSizeOfData(const arrow::ArrayData& data) {
+    ui64 size = sizeof(data);
+    size += data.buffers.size() * sizeof(void*);
+    size += data.child_data.size() * sizeof(void*);
+    for (const auto& b : data.buffers) {
+        if (b) {
+            size += b->size();
+        }
+    }
+
+    for (const auto& c : data.child_data) {
+        if (c) {
+            size += GetSizeOfData(*c);
+        }
+    }
+
+    return size;
+}
+
+ui64 GetSizeOfBatch(const arrow::RecordBatch& batch) {
+    ui64 size = sizeof(batch);
+    size += batch.num_columns() * sizeof(void*);
+    for (int i = 0; i < batch.num_columns(); ++i) {
+        size += GetSizeOfData(*batch.column_data(i));
+    }
+
+    return size;
+}
 
 class TS3StreamReadActor : public TActorBootstrapped<TS3StreamReadActor>, public IDqComputeActorAsyncInput {
 public:
@@ -679,15 +868,17 @@ public:
         const TReadSpec::TPtr& readSpec,
         const NActors::TActorId& computeActorId,
         const IRetryPolicy<long>::TPtr& retryPolicy,
-        const std::size_t maxBlocksInFly
-    )   : Gateway(std::move(gateway))
+        const std::size_t maxBlocksInFly,
+        const TS3ReadActorFactoryConfig& readActorFactoryCfg
+    )   : ReadActorFactoryCfg(readActorFactoryCfg)
+        , Gateway(std::move(gateway))
         , HolderFactory(holderFactory)
         , InputIndex(inputIndex)
         , TxId(txId)
         , ComputeActorId(computeActorId)
         , RetryPolicy(retryPolicy)
         , Url(url)
-        , Headers(MakeHeader(token))
+        , Token(token)
         , Paths(std::move(paths))
         , AddPathIndex(addPathIndex)
         , StartPathIndex(startPathIndex)
@@ -700,11 +891,11 @@ public:
         LOG_D("TS3StreamReadActor", "Bootstrap");
         Become(&TS3StreamReadActor::StateFunc);
         for (size_t pathInd = 0; pathInd < Paths.size(); ++pathInd) {
-            
             const TPath& path = Paths[pathInd];
-            auto stuff = std::make_shared<TRetryStuff>(Gateway, Url + std::get<TString>(path), Headers, std::get<std::size_t>(path), TxId, RetryPolicy);
+            const TString requestId = CreateGuidAsString();
+            auto stuff = std::make_shared<TRetryStuff>(Gateway, Url + std::get<TString>(path), MakeHeaders(Token, requestId), std::get<std::size_t>(path), TxId, requestId, RetryPolicy);
             RetryStuffForFile.push_back(stuff);
-            auto impl = MakeHolder<TS3ReadCoroImpl>(InputIndex, TxId, ComputeActorId, stuff, ReadSpec, pathInd + StartPathIndex, std::get<TString>(path), Url, MaxBlocksInFly);
+            auto impl = MakeHolder<TS3ReadCoroImpl>(InputIndex, TxId, ComputeActorId, stuff, ReadSpec, pathInd + StartPathIndex, std::get<TString>(path), Url, MaxBlocksInFly, ReadActorFactoryCfg);
             RegisterWithSameMailbox(std::make_unique<TS3ReadCoroActor>(std::move(impl), std::move(stuff)).release());
         }
     }
@@ -714,8 +905,8 @@ public:
 private:
     class TBoxedBlock : public TComputationValue<TBoxedBlock> {
     public:
-        TBoxedBlock(TMemoryUsageInfo* memInfo, NDB::Block& block, std::function<void()> functor)
-            : TComputationValue(memInfo), OnDestroyFunctor(functor)
+        TBoxedBlock(TMemoryUsageInfo* memInfo, NDB::Block& block)
+            : TComputationValue(memInfo)
         {
             Block.swap(block);
         }
@@ -728,20 +919,15 @@ private:
             return &Block;
         }
 
-        ~TBoxedBlock() {
-            if (OnDestroyFunctor) {
-                OnDestroyFunctor();
-            }
-        }
-
         NDB::Block Block;
-        std::function<void()> OnDestroyFunctor;
     };
 
     class TReadyBlock {
     public:
         TReadyBlock(TEvPrivate::TEvNextBlock::TPtr& event) : PathInd(event->Get()->PathIndex), Functor (std::move(event->Get()->Functor)) { Block.swap(event->Get()->Block); }
+        TReadyBlock(TEvPrivate::TEvNextRecordBatch::TPtr& event) : Batch(event->Get()->Batch), PathInd(event->Get()->PathIndex), Functor(std::move(event->Get()->Functor)) {}
         NDB::Block Block;
+        std::shared_ptr<arrow::RecordBatch> Batch;
         size_t PathInd;
         std::function<void()> Functor;
     };
@@ -754,9 +940,29 @@ private:
     i64 GetAsyncInputData(TUnboxedValueVector& output, TMaybe<TInstant>&, bool& finished, i64 free) final {
         i64 total = 0LL;
         if (!Blocks.empty()) do {
-            const i64 s = Blocks.front().Block.bytes();
+            const i64 s = ReadSpec->Arrow ? GetSizeOfBatch(*Blocks.front().Batch) : Blocks.front().Block.bytes();
 
-            auto value = HolderFactory.Create<TBoxedBlock>(Blocks.front().Block, Blocks.front().Functor);
+            NUdf::TUnboxedValue value;
+            if (ReadSpec->Arrow) {
+                const auto& batch = *Blocks.front().Batch;
+
+                NUdf::TUnboxedValue* structItems = nullptr;
+                auto structObj = ArrowRowContainerCache.NewArray(HolderFactory, batch.num_columns(), structItems);
+                for (int i = 0; i < batch.num_columns(); ++i) {
+                    structItems[i] = HolderFactory.CreateArrowBlock(arrow::Datum(batch.column_data(i)));
+                }
+
+                NUdf::TUnboxedValue* tupleItems = nullptr;
+                auto tuple = ArrowTupleContainerCache.NewArray(HolderFactory, 2, tupleItems);
+                *tupleItems++ = structObj;
+                *tupleItems++ = HolderFactory.CreateArrowBlock(arrow::Datum(std::make_shared<arrow::UInt64Scalar>(batch.num_rows())));
+                value = tuple;
+            } else {
+                value = HolderFactory.Create<TBoxedBlock>(Blocks.front().Block);
+            }
+
+            Blocks.front().Functor();
+
             if (AddPathIndex) {
                 NUdf::TUnboxedValue* tupleItems = nullptr;
                 auto tuple = ContainerCache.NewArray(HolderFactory, 2, tupleItems);
@@ -769,11 +975,13 @@ private:
             total += s;
             output.emplace_back(std::move(value));
             Blocks.pop_front();
-        } while (!Blocks.empty() && free > 0LL && Blocks.front().Block.bytes() <= size_t(free));
+        } while (!Blocks.empty() && free > 0LL && (ReadSpec->Arrow ? GetSizeOfBatch(*Blocks.front().Batch) : Blocks.front().Block.bytes()) <= size_t(free));
 
         finished = Blocks.empty() && !Count;
         if (finished) {
             ContainerCache.Clear();
+            ArrowTupleContainerCache.Clear();
+            ArrowRowContainerCache.Clear();
         }
         return total;
     }
@@ -788,13 +996,18 @@ private:
         TActorBootstrapped<TS3StreamReadActor>::PassAway();
     }
 
-    static IHTTPGateway::THeaders MakeHeader(const TString& token) {
-        return token.empty() ? IHTTPGateway::THeaders() : IHTTPGateway::THeaders{TString("X-YaCloud-SubjectToken:") += token};
+    static IHTTPGateway::THeaders MakeHeaders(const TString& token, const TString& requestId) {
+        IHTTPGateway::THeaders headers{TString{"X-Request-ID:"} += requestId};
+        if (token) {
+            headers.emplace_back(TString("X-YaCloud-SubjectToken:") += token);
+        }
+        return headers;
     }
 
     STRICT_STFUNC(StateFunc,
         hFunc(TEvPrivate::TEvRetryEventFunc, HandleRetry);
         hFunc(TEvPrivate::TEvNextBlock, HandleNextBlock);
+        hFunc(TEvPrivate::TEvNextRecordBatch, HandleNextRecordBatch);
         cFunc(TEvPrivate::EvReadFinished, HandleReadFinished);
     )
 
@@ -803,6 +1016,13 @@ private:
     }
 
     void HandleNextBlock(TEvPrivate::TEvNextBlock::TPtr& next) {
+        YQL_ENSURE(!ReadSpec->Arrow);
+        Blocks.emplace_back(next);
+        Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvNewAsyncInputDataArrived(InputIndex));
+    }
+
+    void HandleNextRecordBatch(TEvPrivate::TEvNextRecordBatch::TPtr& next) {
+        YQL_ENSURE(ReadSpec->Arrow);
         Blocks.emplace_back(next);
         Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvNewAsyncInputDataArrived(InputIndex));
     }
@@ -820,10 +1040,13 @@ private:
         }
     }
 
+    const TS3ReadActorFactoryConfig ReadActorFactoryCfg;
     const IHTTPGateway::TPtr Gateway;
     std::vector<TRetryStuff::TPtr> RetryStuffForFile;
     const THolderFactory& HolderFactory;
     TPlainContainerCache ContainerCache;
+    TPlainContainerCache ArrowTupleContainerCache;
+    TPlainContainerCache ArrowRowContainerCache;
 
     const ui64 InputIndex;
     const TTxId TxId;
@@ -831,7 +1054,7 @@ private:
     const IRetryPolicy<long>::TPtr RetryPolicy;
 
     const TString Url;
-    const IHTTPGateway::THeaders Headers;
+    const TString Token;
     const TPathList Paths;
     const bool AddPathIndex;
     const ui64 StartPathIndex;
@@ -960,7 +1183,8 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
     const THashMap<TString, TString>& taskParams,
     const NActors::TActorId& computeActorId,
     ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory,
-    const IRetryPolicy<long>::TPtr& retryPolicy)
+    const IRetryPolicy<long>::TPtr& retryPolicy,
+    const TS3ReadActorFactoryConfig& cfg)
 {
     const IFunctionRegistry& functionRegistry = *holderFactory.GetFunctionRegistry();
 
@@ -989,16 +1213,37 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
         const auto structType = static_cast<TStructType*>(outputItemType);
 
         const auto readSpec = std::make_shared<TReadSpec>();
-        readSpec->Columns.resize(structType->GetMembersCount());
-        for (ui32 i = 0U; i < structType->GetMembersCount(); ++i) {
-            auto& column = readSpec->Columns[i];
-            column.type = MetaToClickHouse(structType->GetMemberType(i), intervalUnit);
-            column.name = structType->GetMemberName(i);
+        readSpec->Arrow = params.GetArrow();
+        if (readSpec->Arrow) {
+            arrow::SchemaBuilder builder;
+            for (ui32 i = 0U; i < structType->GetMembersCount(); ++i) {
+                auto memberType = structType->GetMemberType(i);
+                bool isOptional;
+                std::shared_ptr<arrow::DataType> dataType;
+
+                YQL_ENSURE(ConvertArrowType(memberType, isOptional, dataType), "Unsupported arrow type");
+                THROW_ARROW_NOT_OK(builder.AddField(std::make_shared<arrow::Field>(std::string(structType->GetMemberName(i)), dataType, isOptional)));
+            }
+
+            auto res = builder.Finish();
+            THROW_ARROW_NOT_OK(res.status());
+            readSpec->ArrowSchema = std::move(res).ValueOrDie();
+        } else {
+            readSpec->CHColumns.resize(structType->GetMembersCount());
+            for (ui32 i = 0U; i < structType->GetMembersCount(); ++i) {
+                auto& column = readSpec->CHColumns[i];
+                column.type = MetaToClickHouse(structType->GetMemberType(i), intervalUnit);
+                column.name = structType->GetMemberName(i);
+            }
         }
+
         readSpec->Format = params.GetFormat();
 
         if (const auto it = settings.find("compression"); settings.cend() != it)
             readSpec->Compression = it->second;
+
+        if (const auto it = settings.find("csvdelimiter"); settings.cend() != it && !it->second.empty())
+            readSpec->Settings.csv.delimiter = it->second[0];
 
 #define SUPPORTED_FLAGS(xx) \
         xx(skip_unknown_fields, true) \
@@ -1020,8 +1265,8 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
         if (const auto it = settings.find("fileReadBlocksInFly"); settings.cend() != it)
             maxBlocksInFly = FromString<ui64>(it->second);
         const auto actor = new TS3StreamReadActor(inputIndex, txId, std::move(gateway), holderFactory, params.GetUrl(), authToken,
-                                                  std::move(paths), addPathIndex, startPathIndex, readSpec, computeActorId, retryPolicy, maxBlocksInFly);
-        
+                                                  std::move(paths), addPathIndex, startPathIndex, readSpec, computeActorId, retryPolicy, maxBlocksInFly, cfg);
+
         return {actor, actor};
     } else {
         ui64 sizeLimit = std::numeric_limits<ui64>::max();

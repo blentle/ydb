@@ -23,8 +23,8 @@
 namespace NYdb {
 namespace NConsoleClient {
 
-TClientCommandRootCommon::TClientCommandRootCommon(const TClientSettings& settings)
-    : TClientCommandRootBase("ydb")
+TClientCommandRootCommon::TClientCommandRootCommon(const TString& name, const TClientSettings& settings)
+    : TClientCommandRootBase(name)
     , Settings (settings)
 {
     ValidateSettings();
@@ -485,7 +485,7 @@ bool TClientCommandRootCommon::GetCredentialsFromProfile(std::shared_ptr<IProfil
 void TClientCommandRootCommon::ParseCredentials(TConfig& config) {
     size_t explicitAuthMethodCount = (size_t)(!TokenFile.empty()) + (size_t)(!YCTokenFile.empty())
         + (size_t)UseMetadataCredentials + (size_t)(!SaKeyFile.empty())
-        + (size_t)(!UserName.empty() || !PasswordFile.empty());
+        + (size_t)(!UserName.empty() || !PasswordFile.empty() || DoNotAskForPassword);
 
     switch (explicitAuthMethodCount) {
     case 0:

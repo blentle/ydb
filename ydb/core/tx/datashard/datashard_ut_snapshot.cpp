@@ -978,7 +978,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             "key = 3, value = 3\n");
     }
 
-    Y_UNIT_TEST_TWIN(MvccSnapshotTailCleanup, UseNewEngine) {
+    Y_UNIT_TEST(MvccSnapshotTailCleanup) {
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -988,7 +988,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetKeepSnapshotTimeout(TDuration::Seconds(2))
             .SetControls(controls);
 
@@ -1009,32 +1008,17 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         SimulateSleep(server, TDuration::Seconds(1));
 
         auto beginSnapshotRequest = [&](TString& sessionId, TString& txId, const TString& query) -> TString {
-            auto reqSender = runtime.AllocateEdgeActor();
-            sessionId = CreateSession(runtime, reqSender);
-            auto ev = ExecRequest(runtime, reqSender, MakeBeginRequest(sessionId, query));
-            auto& response = ev->Get()->Record.GetRef();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-            txId = response.GetResponse().GetTxMeta().id();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+            return KqpSimpleBegin(runtime, sessionId, txId, query);
         };
 
         auto continueSnapshotRequest = [&](const TString& sessionId, const TString& txId, const TString& query) -> TString {
-            auto reqSender = runtime.AllocateEdgeActor();
-            auto ev = ExecRequest(runtime, reqSender, MakeContinueRequest(sessionId, txId, query));
-            auto& response = ev->Get()->Record.GetRef();
-            if (response.GetYdbStatus() != Ydb::StatusIds::SUCCESS) {
-                return TStringBuilder() << "ERROR: " << response.GetYdbStatus();
-            }
-            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+            return KqpSimpleContinue(runtime, sessionId, txId, query);
         };
 
         auto execSnapshotRequest = [&](const TString& query) -> TString {
-            auto reqSender = runtime.AllocateEdgeActor();
             TString sessionId, txId;
             TString result = beginSnapshotRequest(sessionId, txId, query);
-            CloseSession(runtime, reqSender, sessionId);
+            CloseSession(runtime, sessionId);
             return result;
         };
 
@@ -1044,9 +1028,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 SELECT key, value FROM `/Root/table-1`
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
         SimulateSleep(runtime, TDuration::Seconds(2));
 
         // Create a new snapshot, it should still observe the same state
@@ -1056,9 +1038,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 SELECT key, value FROM `/Root/table-1`
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // Insert a new row and wait for result, this will roll over into a new step
         ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 2)"));
@@ -1078,15 +1058,13 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             }
             UNIT_ASSERT_VALUES_EQUAL(
                 result,
-                "Struct { "
-                "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-                "} Struct { Bool: false }");
+                "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
         }
 
         UNIT_ASSERT_C(failed, "Snapshot was not cleaned up");
     }
 
-    Y_UNIT_TEST_TWIN(MvccSnapshotAndSplit, UseNewEngine) {
+    Y_UNIT_TEST(MvccSnapshotAndSplit) {
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -1096,7 +1074,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1116,41 +1093,21 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         SimulateSleep(server, TDuration::Seconds(1));
 
         auto execSimpleRequest = [&](const TString& query) -> TString {
-            auto reqSender = runtime.AllocateEdgeActor();
-            auto ev = ExecRequest(runtime, reqSender, MakeSimpleRequest(query));
-            auto& response = ev->Get()->Record.GetRef();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+            return KqpSimpleExec(runtime, query);
         };
 
         auto beginSnapshotRequest = [&](TString& sessionId, TString& txId, const TString& query) -> TString {
-            auto reqSender = runtime.AllocateEdgeActor();
-            sessionId = CreateSession(runtime, reqSender);
-            auto ev = ExecRequest(runtime, reqSender, MakeBeginRequest(sessionId, query));
-            auto& response = ev->Get()->Record.GetRef();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-            txId = response.GetResponse().GetTxMeta().id();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+            return KqpSimpleBegin(runtime, sessionId, txId, query);
         };
 
         auto continueSnapshotRequest = [&](const TString& sessionId, const TString& txId, const TString& query) -> TString {
-            auto reqSender = runtime.AllocateEdgeActor();
-            auto ev = ExecRequest(runtime, reqSender, MakeContinueRequest(sessionId, txId, query));
-            auto& response = ev->Get()->Record.GetRef();
-            if (response.GetYdbStatus() != Ydb::StatusIds::SUCCESS) {
-                return TStringBuilder() << "ERROR: " << response.GetYdbStatus();
-            }
-            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+            return KqpSimpleContinue(runtime, sessionId, txId, query);
         };
 
         auto execSnapshotRequest = [&](const TString& query) -> TString {
-            auto reqSender = runtime.AllocateEdgeActor();
             TString sessionId, txId;
             TString result = beginSnapshotRequest(sessionId, txId, query);
-            CloseSession(runtime, reqSender, sessionId);
+            CloseSession(runtime, sessionId);
             return result;
         };
 
@@ -1172,9 +1129,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 SELECT key, value FROM `/Root/table-1`
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
         SimulateSleep(runtime, TDuration::Seconds(2));
 
         bool captureSplit = true;
@@ -1222,14 +1177,14 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         // Create a new snapshot and verify initial state
         // This snapshot must be lightweight and must not advance any edges
         TString sessionId, txId;
+        TString senderImmediateWriteSessionId = CreateSessionRPC(runtime);
+        TString senderImmediateWriteTxId;
         UNIT_ASSERT_VALUES_EQUAL(
             beginSnapshotRequest(sessionId, txId, Q_(R"(
                 SELECT key, value FROM `/Root/table-1`
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // Finish the split
         captureSplit = false;
@@ -1241,10 +1196,9 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
 
         // Send an immediate write after the finished split
         // In a buggy case it starts executing despite a blocked timecast
-        auto senderImmediateWrite = runtime.AllocateEdgeActor();
-        SendRequest(runtime, senderImmediateWrite, MakeSimpleRequest(Q_(R"(
+        auto f = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
             UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 2)
-            )")));
+            )"), senderImmediateWriteSessionId, senderImmediateWriteTxId, true));
 
         // We sleep a little so datashard commits changes in buggy case
         SimulateSleep(runtime, TDuration::MicroSeconds(1));
@@ -1254,9 +1208,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
 
         // Wait for the commit result
         {
-            auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(senderImmediateWrite);
-            auto& response = ev->Get()->Record.GetRef();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+            auto response = AwaitResponse(runtime, f);
+            UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
         }
 
         // Snapshot must not have been damaged by the write above
@@ -1265,9 +1218,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 SELECT key, value FROM `/Root/table-1`
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // But new immediate read must observe all writes we have performed
         UNIT_ASSERT_VALUES_EQUAL(
@@ -1276,13 +1227,11 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key in (1, 2, 3)
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
     }
 
-    Y_UNIT_TEST_TWIN(MvccSnapshotReadWithLongPlanQueue, UseNewEngine) {
+    Y_UNIT_TEST(MvccSnapshotReadWithLongPlanQueue) {
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -1293,7 +1242,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1315,25 +1263,11 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         SimulateSleep(server, TDuration::Seconds(1));
 
         auto beginSnapshotRequest = [&](TString& sessionId, TString& txId, const TString& query) -> TString {
-            auto reqSender = runtime.AllocateEdgeActor();
-            sessionId = CreateSession(runtime, reqSender);
-            auto ev = ExecRequest(runtime, reqSender, MakeBeginRequest(sessionId, query));
-            auto& response = ev->Get()->Record.GetRef();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-            txId = response.GetResponse().GetTxMeta().id();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+            return KqpSimpleBegin(runtime, sessionId, txId, query);
         };
 
         auto continueSnapshotRequest = [&](const TString& sessionId, const TString& txId, const TString& query) -> TString {
-            auto reqSender = runtime.AllocateEdgeActor();
-            auto ev = ExecRequest(runtime, reqSender, MakeContinueRequest(sessionId, txId, query));
-            auto& response = ev->Get()->Record.GetRef();
-            if (response.GetYdbStatus() != Ydb::StatusIds::SUCCESS) {
-                return TStringBuilder() << "ERROR: " << response.GetYdbStatus();
-            }
-            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-            return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+            return KqpSimpleContinue(runtime, sessionId, txId, query);
         };
 
         // Prime table1 with a snapshot read
@@ -1345,24 +1279,21 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                     WHERE key in (1, 2, 3)
                     ORDER BY key
                     )")),
-                "Struct { "
-                "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-                "} Struct { Bool: false }");
+                "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
         }
 
         // Arrange for a distributed tx stuck at readset exchange
-        auto senderBlocker = runtime.AllocateEdgeActor();
-        TString sessionIdBlocker = CreateSession(runtime, senderBlocker);
+        TString sessionIdBlocker = CreateSessionRPC(runtime);
         TString txIdBlocker;
         {
-            auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionIdBlocker, Q_(R"(
+            auto result = KqpSimpleBegin(runtime, sessionIdBlocker, txIdBlocker, Q_(R"(
                 SELECT * FROM `/Root/table-1`
                 UNION ALL
-                SELECT * FROM `/Root/table-2`)")));
-            auto& response = ev->Get()->Record.GetRef();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-            txIdBlocker = response.GetResponse().GetTxMeta().id();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+                SELECT * FROM `/Root/table-2`)"));
+            UNIT_ASSERT_VALUES_EQUAL(
+                result,
+                "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+                "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
         }
 
         auto waitFor = [&](const auto& condition, const TString& description) {
@@ -1402,9 +1333,9 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
         // Send a commit request, it would block on readset exchange
-        SendRequest(runtime, senderBlocker, MakeCommitRequest(sessionIdBlocker, txIdBlocker, Q_(R"(
+        SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
             UPSERT INTO `/Root/table-1` (key, value) VALUES (99, 99);
-            UPSERT INTO `/Root/table-2` (key, value) VALUES (99, 99))")));
+            UPSERT INTO `/Root/table-2` (key, value) VALUES (99, 99); )"), sessionIdBlocker, txIdBlocker, true));
 
         waitFor([&] { return readSets.size() >= 2; }, "2 blocked readsets");
 
@@ -1432,10 +1363,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key in (1, 2, 3)
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
 
         // Now schedule creation of 10 more snapshots
         for (int i = 0; i < 10; ++i) {
@@ -1452,10 +1381,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key in (1, 2, 3)
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
 
         // Insert one more row, in a buggy case it would be assigned a version below the snapshot
         ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 3)"));
@@ -1467,10 +1394,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key in (1, 2, 3)
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
     }
 
     struct TLockSnapshot {
@@ -1486,6 +1411,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         ui64 Counter;
         ui64 SchemeShard;
         ui64 PathId;
+
+        friend bool operator==(const TLockInfo& a, const TLockInfo& b) = default;
     };
 
     struct TInjectLocks {
@@ -1524,7 +1451,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                         Cerr << tx.DebugString() << Endl;
                         if (tx.HasMiniKQL()) {
                             using namespace NKikimr::NMiniKQL;
-                            TScopedAlloc alloc;
+                            TScopedAlloc alloc(__LOCATION__);
                             TTypeEnvironment typeEnv(alloc);
                             auto node = DeserializeRuntimeNode(tx.GetMiniKQL(), typeEnv);
                             Cerr << "MiniKQL:" << Endl;
@@ -1566,7 +1493,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                             for (const auto& task : tx.GetKqpTransaction().GetTasks()) {
                                 if (task.HasProgram() && task.GetProgram().GetRaw()) {
                                     using namespace NKikimr::NMiniKQL;
-                                    TScopedAlloc alloc;
+                                    TScopedAlloc alloc(__LOCATION__);
                                     TTypeEnvironment typeEnv(alloc);
                                     auto node = DeserializeRuntimeNode(task.GetProgram().GetRaw(), typeEnv);
                                     Cerr << "Task program:" << Endl;
@@ -1623,6 +1550,14 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                     }
                     break;
                 }
+                case TEvChangeExchange::TEvApplyRecords::EventType: {
+                    if (BlockApplyRecords) {
+                        Cerr << "... blocked ApplyRecords" << Endl;
+                        BlockedApplyRecords.push_back(THolder(ev.Release()));
+                        return TTestActorRuntime::EEventAction::DROP;
+                    }
+                    break;
+                }
             }
             return PrevObserver(Runtime, ev);
         }
@@ -1646,9 +1581,11 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         bool InjectClearTasks = false;
         bool BlockReadSets = false;
         TVector<THolder<IEventHandle>> BlockedReadSets;
+        bool BlockApplyRecords = false;
+        TVector<THolder<IEventHandle>> BlockedApplyRecords;
     };
 
-    Y_UNIT_TEST_TWIN(MvccSnapshotLockedWrites, UseNewEngine) {
+    Y_UNIT_TEST(MvccSnapshotLockedWrites) {
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -1660,7 +1597,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1670,7 +1606,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
         runtime.SetLogPriority(NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
 
-        InitRoot(server, sender);
+        server->SetupRootStoragePools(sender);
 
         TDisableDataShardLogBatching disableDataShardLogBatching;
         CreateShardedTable(server, sender, "/Root", "table-1", 1);
@@ -1689,9 +1625,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We should have been acquiring locks
         TLockSnapshot snapshot = observer.Last;
@@ -1703,15 +1637,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         UNIT_ASSERT_VALUES_EQUAL(
             KqpSimpleExec(runtime, Q_(R"(
                 UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 2)
-                )")),
-            UseNewEngine ? "<empty>" : "ERROR: UNAVAILABLE");
+                )")), "<empty>");
         observer.Inject = {};
-
-        // Old engine doesn't support LockNodeId
-        // There's nothing to test unless we can write uncommitted data 
-        if (!UseNewEngine) {
-            return;
-        }
 
         // Start another snapshot read, it should not see above write (it's uncommitted)
         TString sessionId2, txId2;
@@ -1721,9 +1648,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // Perform another read using the first snapshot tx, it must see its own writes
         UNIT_ASSERT_VALUES_EQUAL(
@@ -1732,10 +1657,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
 
         // Now commit with additional changes (temporarily needed to trigger lock commits)
         UNIT_ASSERT_VALUES_EQUAL(
@@ -1744,27 +1667,21 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 )")),
             "<empty>");
 
-        if (UseNewEngine) {
-            // Verify new snapshots observe all committed changes
-            // This is only possible with new engine at this time
-            TString sessionId3, txId3;
-            UNIT_ASSERT_VALUES_EQUAL(
-                KqpSimpleBegin(runtime, sessionId3, txId3, Q_(R"(
-                    SELECT key, value FROM `/Root/table-1`
-                    WHERE key >= 1 AND key <= 3
-                    ORDER BY key
-                    )")),
-                "Struct { "
-                "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-                "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
-                "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 3 } } } "
-                "} Struct { Bool: false }");
-        }
+        // Verify new snapshots observe all committed changes
+        // This is only possible with new engine at this time
+        TString sessionId3, txId3;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleBegin(runtime, sessionId3, txId3, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                WHERE key >= 1 AND key <= 3
+                ORDER BY key
+                )")),
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }, "
+            "{ items { uint32_value: 3 } items { uint32_value: 3 } }");
     }
 
     Y_UNIT_TEST(MvccSnapshotLockedWritesRestart) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -1776,7 +1693,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1807,9 +1723,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We should have been acquiring locks
         TLockSnapshot snapshot = observer.Last;
@@ -1837,9 +1751,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // Perform another read using the first snapshot tx, it must see its own writes
         UNIT_ASSERT_VALUES_EQUAL(
@@ -1848,10 +1760,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
 
         // Now commit with additional changes (temporarily needed to trigger lock commits)
         UNIT_ASSERT_VALUES_EQUAL(
@@ -1869,16 +1779,12 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
-            "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 3 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }, "
+            "{ items { uint32_value: 3 } items { uint32_value: 3 } }");
     }
 
     Y_UNIT_TEST(MvccSnapshotLockedWritesWithoutConflicts) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -1890,7 +1796,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1919,9 +1824,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -1961,9 +1864,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // Send a dummy upsert that we will be used as commit carrier for tx 123
         observer.InjectClearTasks = true;
@@ -1983,10 +1884,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 21 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, { items { uint32_value: 2 } items { uint32_value: 21 } }");
 
         // Send a dummy upsert that we will be used as commit carrier for tx 234
         observer.InjectClearTasks = true;
@@ -2006,10 +1904,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 22 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 22 } }");
 
         // The still open read tx must have broken locks now
         UNIT_ASSERT_VALUES_EQUAL(
@@ -2020,8 +1916,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
     }
 
     Y_UNIT_TEST(MvccSnapshotLockedWritesWithConflicts) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -2033,7 +1927,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2062,9 +1955,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -2104,9 +1995,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // Verify the open tx can commit writes (not broken yet)
         UNIT_ASSERT_VALUES_EQUAL(
@@ -2133,11 +2022,9 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 22 } } } "
-            "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 3 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 22 } }, "
+            "{ items { uint32_value: 3 } items { uint32_value: 3 } }");
 
         // Send a dummy upsert that we will be used as commit carrier for tx 123
         // It must not be able to commit, since it was broken by tx 234
@@ -2197,8 +2084,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
     }
 
     Y_UNIT_TEST(MvccSnapshotReadLockedWrites) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -2210,7 +2095,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2244,9 +2128,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -2362,8 +2244,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
     }
 
     Y_UNIT_TEST(MvccSnapshotLockedWritesWithReadConflicts) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -2375,7 +2255,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2409,9 +2288,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -2454,10 +2331,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 21 } } Struct { Optional { Uint32: 201 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 21 } items { uint32_value: 201 } }");
         observer.Inject = {};
 
         // Commit changes in tx 123
@@ -2482,10 +2357,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 22 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 22 } }");
         observer.Inject = {};
 
         // Read uncommitted rows in tx 234 with the limit 1
@@ -2500,9 +2373,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 ORDER BY key
                 LIMIT 1
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } items { uint32_value: 1 } }");
         observer.Inject = {};
 
         // Read uncommitted rows in tx 234 with the limit 1
@@ -2521,8 +2392,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
     }
 
     Y_UNIT_TEST(LockedWriteBulkUpsertConflict) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -2534,7 +2403,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2563,9 +2431,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -2626,8 +2492,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
     }
 
     Y_UNIT_TEST(LockedWriteReuseAfterCommit) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -2639,7 +2503,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2668,9 +2531,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -2718,8 +2579,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
     }
 
     Y_UNIT_TEST(LockedWriteDistributedCommitSuccess) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -2731,7 +2590,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2762,9 +2620,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -2817,25 +2673,21 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 21 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 21 } }");
+
         UNIT_ASSERT_VALUES_EQUAL(
             KqpSimpleExec(runtime, Q_(R"(
                 SELECT key, value FROM `/Root/table-2`
                 WHERE key >= 10 AND key <= 30
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 10 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 20 } } Struct { Optional { Uint32: 21 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 10 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 20 } items { uint32_value: 21 } }");
+
     }
 
     Y_UNIT_TEST(LockedWriteDistributedCommitAborted) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -2847,7 +2699,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2878,9 +2729,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -2940,24 +2789,19 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
+
         UNIT_ASSERT_VALUES_EQUAL(
             KqpSimpleExec(runtime, Q_(R"(
                 SELECT key, value FROM `/Root/table-2`
                 WHERE key >= 10 AND key <= 30
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 10 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 20 } } Struct { Optional { Uint32: 22 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 10 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 20 } items { uint32_value: 22 } }");
     }
 
     Y_UNIT_TEST(LockedWriteDistributedCommitFreeze) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -2969,7 +2813,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3000,9 +2843,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -3040,20 +2881,23 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         observer.InjectLocks.emplace();
         observer.InjectLocks->AddLocks(locks1);
         observer.InjectLocks->AddLocks(locks2);
-        auto commitSender = runtime.AllocateEdgeActor();
-        SendRequest(runtime, commitSender, MakeSimpleRequest(Q_(R"(
+        auto commitSender = CreateSessionRPC(runtime);
+        auto writeSender = CreateSessionRPC(runtime);
+        TString commitSenderTxId;
+        TString writeSenderTxId;
+        auto commitFuture = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
             UPSERT INTO `/Root/table-1` (key, value) VALUES (0, 0);
             UPSERT INTO `/Root/table-2` (key, value) VALUES (0, 0);
-            )")));
+            )"), commitSender, commitSenderTxId, true));
+ 
         runtime.SimulateSleep(TDuration::Seconds(1));
         UNIT_ASSERT(!observer.BlockedReadSets.empty());
         observer.InjectClearTasks = false;
         observer.InjectLocks.reset();
 
-        auto writeSender = runtime.AllocateEdgeActor();
-        SendRequest(runtime, writeSender, MakeSimpleRequest(Q_(R"(
+        auto writeFuture = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
             UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 22)
-            )")));
+            )"), writeSender, writeSenderTxId, true));
         runtime.SimulateSleep(TDuration::Seconds(1));
 
         // Verify changes are not visible yet
@@ -3063,28 +2907,23 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         observer.UnblockReadSets();
 
         {
-            auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(commitSender);
-            auto& response = ev->Get()->Record.GetRef();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+
+            auto response = AwaitResponse(runtime, commitFuture);
+            UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
         }
 
         {
-            auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(writeSender);
-            auto& response = ev->Get()->Record.GetRef();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+            auto response = AwaitResponse(runtime, writeFuture);
+            UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
         }
     }
 
     Y_UNIT_TEST(LockedWriteDistributedCommitCrossConflict) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -3096,7 +2935,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3127,9 +2965,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -3192,11 +3028,14 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         observer.InjectLocks.emplace();
         observer.InjectLocks->AddLocks(locks1);
         observer.InjectLocks->AddLocks(locks2);
-        auto commitSender1 = runtime.AllocateEdgeActor();
-        SendRequest(runtime, commitSender1, MakeSimpleRequest(Q_(R"(
+        TString commitSender1 = CreateSessionRPC(runtime);
+        TString commitSender1TxId;
+        TString commitSender2 = CreateSessionRPC(runtime);
+        TString commitSender2TxId;
+        auto commitSender1Future = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
             UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 21);
             UPSERT INTO `/Root/table-2` (key, value) VALUES (30, 21);
-            )")));
+            )"), commitSender1, commitSender1TxId, true));
         runtime.SimulateSleep(TDuration::Seconds(1));
         UNIT_ASSERT(!observer.BlockedReadSets.empty());
         //observer.InjectClearTasks = false;
@@ -3208,11 +3047,10 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
         observer.InjectLocks.emplace();
         observer.InjectLocks->AddLocks(locks3);
         observer.InjectLocks->AddLocks(locks4);
-        auto commitSender2 = runtime.AllocateEdgeActor();
-        SendRequest(runtime, commitSender2, MakeSimpleRequest(Q_(R"(
+        auto commitSender2Future = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
             UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 22);
             UPSERT INTO `/Root/table-2` (key, value) VALUES (20, 22);
-            )")));
+            )"), commitSender2, commitSender2TxId, true));
         runtime.SimulateSleep(TDuration::Seconds(1));
         UNIT_ASSERT(!observer.BlockedReadSets.empty());
         //observer.InjectClearTasks = false;
@@ -3225,22 +3063,18 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         observer.UnblockReadSets();
 
         {
-            auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(commitSender1);
-            auto& response = ev->Get()->Record.GetRef();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+            auto response = AwaitResponse(runtime, commitSender1Future);
+            UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
         }
 
         {
-            auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(commitSender2);
-            auto& response = ev->Get()->Record.GetRef();
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::ABORTED);
+            auto response = AwaitResponse(runtime, commitSender2Future);
+            UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::ABORTED);
         }
 
         // Verify only changes from commit 123 are visible
@@ -3250,27 +3084,22 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 21 } } } "
-            "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 21 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 21 } }, "
+            "{ items { uint32_value: 3 } items { uint32_value: 21 } }");
+
         UNIT_ASSERT_VALUES_EQUAL(
             KqpSimpleExec(runtime, Q_(R"(
                 SELECT key, value FROM `/Root/table-2`
                 WHERE key >= 10 AND key <= 30
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 10 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 20 } } Struct { Optional { Uint32: 21 } } } "
-            "List { Struct { Optional { Uint32: 30 } } Struct { Optional { Uint32: 21 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 10 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 20 } items { uint32_value: 21 } }, "
+            "{ items { uint32_value: 30 } items { uint32_value: 21 } }");
     }
 
     Y_UNIT_TEST(LockedWriteCleanupOnSplit) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -3282,7 +3111,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3311,9 +3139,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -3373,8 +3199,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
     }
 
     Y_UNIT_TEST(LockedWriteCleanupOnCopyTable) {
-        constexpr bool UseNewEngine = true;
-
         TPortManager pm;
         TServerSettings::TControls controls;
         controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -3386,7 +3210,6 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
             .SetUseRealThreads(false)
             .SetEnableMvcc(true)
             .SetEnableMvccSnapshotReads(true)
-            .SetEnableKqpSessionActor(UseNewEngine)
             .SetControls(controls);
 
         Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3415,9 +3238,7 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
         // We will reuse this snapshot
         auto snapshot = observer.Last.MvccSnapshot;
@@ -3488,10 +3309,8 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 21 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 21 } }");
 
         // Check table copy does not have those changes
         UNIT_ASSERT_VALUES_EQUAL(
@@ -3500,9 +3319,292 @@ Y_UNIT_TEST_SUITE(DataShardSnapshots) {
                 WHERE key >= 1 AND key <= 3
                 ORDER BY key
                 )")),
-            "Struct { "
-            "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-            "} Struct { Bool: false }");
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
+    }
+
+    Y_UNIT_TEST_TWIN(LockedWriteWithAsyncIndex, WithRestart) {
+        TPortManager pm;
+        TServerSettings::TControls controls;
+        controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
+        controls.MutableDataShardControls()->SetUnprotectedMvccSnapshotReads(1);
+        controls.MutableDataShardControls()->SetEnableLockedWrites(1);
+
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableMvcc(true)
+            .SetEnableMvccSnapshotReads(true)
+            .SetControls(controls);
+
+        Tests::TServer::TPtr server = new TServer(serverSettings);
+        auto &runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+
+        runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
+        runtime.SetLogPriority(NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+
+        InitRoot(server, sender);
+
+        TDisableDataShardLogBatching disableDataShardLogBatching;
+        CreateShardedTable(server, sender, "/Root", "table-1", 1);
+        WaitTxNotification(server, sender,
+            AsyncAlterAddIndex(server, "/Root", "/Root/table-1",
+                TShardedTableOptions::TIndex{"by_value", {"value"}, {}, NKikimrSchemeOp::EIndexTypeGlobalAsync}));
+
+        ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1)"));
+
+        SimulateSleep(server, TDuration::Seconds(1));
+
+        TInjectLockSnapshotObserver observer(runtime);
+
+        // Start a snapshot read transaction
+        TString sessionId, txId;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                WHERE key >= 1 AND key <= 3
+                ORDER BY key
+                )")),
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
+
+        // We will reuse this snapshot
+        auto snapshot = observer.Last.MvccSnapshot;
+
+        using NLongTxService::TLockHandle;
+        TLockHandle lock1handle(123, runtime.GetActorSystem(0));
+        TLockHandle lock2handle(234, runtime.GetActorSystem(0));
+
+        // Write uncommitted changes to keys 1 and 2 using tx 123
+        observer.Inject.LockId = 123;
+        observer.Inject.LockNodeId = runtime.GetNodeId(0);
+        observer.Inject.MvccSnapshot = snapshot;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 11), (2, 21)
+                )")),
+            "<empty>");
+        auto locks1 = observer.LastLocks;
+        observer.Inject = {};
+
+        // Write uncommitted changes to keys 1 and 2 using tx 234
+        observer.Inject.LockId = 234;
+        observer.Inject.LockNodeId = runtime.GetNodeId(0);
+        observer.Inject.MvccSnapshot = snapshot;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 12), (2, 22)
+                )")),
+            "<empty>");
+        auto locks2 = observer.LastLocks;
+        observer.Inject = {};
+
+        SimulateSleep(server, TDuration::Seconds(1));
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleStaleRoExec(runtime, Q_(R"(
+                SELECT key, value
+                FROM `/Root/table-1` VIEW by_value
+                WHERE value in (1, 11, 21, 12, 22)
+                ORDER BY key
+                )")),
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
+
+        if (WithRestart) {
+            observer.BlockApplyRecords = true;
+        }
+
+        // Commit changes in tx 123
+        observer.InjectClearTasks = true;
+        observer.InjectLocks.emplace().Locks = locks1;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (0, 0)
+                )")),
+            "<empty>");
+        observer.InjectClearTasks = false;
+        observer.InjectLocks.reset();
+
+        SimulateSleep(server, TDuration::Seconds(1));
+
+        if (WithRestart) {
+            UNIT_ASSERT(!observer.BlockedApplyRecords.empty());
+            observer.BlockedApplyRecords.clear();
+            observer.BlockApplyRecords = false;
+
+            auto shards = GetTableShards(server, sender, "/Root/table-1");
+            RebootTablet(runtime, shards.at(0), sender);
+
+            SimulateSleep(server, TDuration::Seconds(1));
+        }
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleStaleRoExec(runtime, Q_(R"(
+                SELECT key, value
+                FROM `/Root/table-1` VIEW by_value
+                WHERE value in (1, 11, 21, 12, 22)
+                ORDER BY key
+                )")),
+            "{ items { uint32_value: 1 } items { uint32_value: 11 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 21 } }");
+
+        // Commit changes in tx 234
+        observer.InjectClearTasks = true;
+        observer.InjectLocks.emplace().Locks = locks2;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (0, 0)
+                )")),
+            "ERROR: ABORTED");
+        observer.InjectClearTasks = false;
+        observer.InjectLocks.reset();
+    }
+
+    Y_UNIT_TEST(LockedWritesLimitedPerKey) {
+        TPortManager pm;
+        TServerSettings::TControls controls;
+        controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
+        controls.MutableDataShardControls()->SetUnprotectedMvccSnapshotReads(1);
+        controls.MutableDataShardControls()->SetEnableLockedWrites(1);
+        controls.MutableDataShardControls()->SetMaxLockedWritesPerKey(2);
+
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableMvcc(true)
+            .SetEnableMvccSnapshotReads(true)
+            .SetControls(controls);
+
+        Tests::TServer::TPtr server = new TServer(serverSettings);
+        auto &runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+
+        runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
+        runtime.SetLogPriority(NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+
+        InitRoot(server, sender);
+
+        TDisableDataShardLogBatching disableDataShardLogBatching;
+        CreateShardedTable(server, sender, "/Root", "table-1", 1);
+
+        ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1)"));
+
+        SimulateSleep(server, TDuration::Seconds(1));
+
+        TInjectLockSnapshotObserver observer(runtime);
+
+        // Start a snapshot read transaction
+        TString sessionId, txId;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                WHERE key >= 1 AND key <= 3
+                ORDER BY key
+                )")),
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
+
+        // We will reuse this snapshot
+        auto snapshot = observer.Last.MvccSnapshot;
+
+        using NLongTxService::TLockHandle;
+        std::optional<TLockHandle> lock1handle(std::in_place, 123, runtime.GetActorSystem(0));
+        std::optional<TLockHandle> lock2handle(std::in_place, 234, runtime.GetActorSystem(0));
+        std::optional<TLockHandle> lock3handle(std::in_place, 345, runtime.GetActorSystem(0));
+
+        // Write uncommitted changes to key 2 with tx 123
+        observer.Inject.LockId = 123;
+        observer.Inject.LockNodeId = runtime.GetNodeId(0);
+        observer.Inject.MvccSnapshot = snapshot;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 21)
+                )")),
+            "<empty>");
+        auto locks1 = observer.LastLocks;
+        observer.Inject = {};
+
+        // Write uncommitted changes to key 2 with tx 234
+        observer.Inject.LockId = 234;
+        observer.Inject.LockNodeId = runtime.GetNodeId(0);
+        observer.Inject.MvccSnapshot = snapshot;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 22)
+                )")),
+            "<empty>");
+        auto locks2 = observer.LastLocks;
+        observer.Inject = {};
+
+        // Write uncommitted changes to key 2 with tx 345
+        observer.Inject.LockId = 345;
+        observer.Inject.LockNodeId = runtime.GetNodeId(0);
+        observer.Inject.MvccSnapshot = snapshot;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 23)
+                )")),
+            "ERROR: GENERIC_ERROR");
+        observer.Inject = {};
+
+        // Abort tx 234, this would allow adding one more change to key 2
+        lock2handle.reset();
+        SimulateSleep(server, TDuration::Seconds(1));
+
+        // Write uncommitted changes to key 2 with tx 345
+        observer.Inject.LockId = 345;
+        observer.Inject.LockNodeId = runtime.GetNodeId(0);
+        observer.Inject.MvccSnapshot = snapshot;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 23)
+                )")),
+            "<empty>");
+        auto locks3 = observer.LastLocks;
+        observer.Inject = {};
+
+        // Write uncommitted changes to key 3 with tx 123
+        observer.Inject.LockId = 123;
+        observer.Inject.LockNodeId = runtime.GetNodeId(0);
+        observer.Inject.MvccSnapshot = snapshot;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 31)
+                )")),
+            "<empty>");
+        UNIT_ASSERT(locks1 == observer.LastLocks);
+        observer.Inject = {};
+
+        // Commit changes in tx 123
+        observer.InjectClearTasks = true;
+        observer.InjectLocks.emplace().Locks = locks1;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (0, 0)
+                )")),
+            "<empty>");
+        observer.InjectClearTasks = false;
+        observer.InjectLocks.reset();
+
+        // Commit changes in tx 345
+        observer.InjectClearTasks = true;
+        observer.InjectLocks.emplace().Locks = locks3;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                UPSERT INTO `/Root/table-1` (key, value) VALUES (0, 0)
+                )")),
+            "<empty>");
+        observer.InjectClearTasks = false;
+        observer.InjectLocks.reset();
+
+        // Check table has those changes visible
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, Q_(R"(
+                SELECT key, value FROM `/Root/table-1`
+                WHERE key >= 1 AND key <= 3
+                ORDER BY key
+                )")),
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 23 } }, "
+            "{ items { uint32_value: 3 } items { uint32_value: 31 } }");
     }
 
 }

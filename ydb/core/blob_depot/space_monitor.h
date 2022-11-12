@@ -15,6 +15,8 @@ namespace NKikimr::NBlobDepot {
         };
 
         std::unordered_map<ui32, TGroupRecord> Groups;
+        NKikimrBlobStorage::TPDiskSpaceColor::E SpaceColor = {};
+        float ApproximateFreeSpaceShare = 0.0f;
 
         friend class TBlobDepot;
 
@@ -24,6 +26,11 @@ namespace NKikimr::NBlobDepot {
 
         void Handle(TEvBlobStorage::TEvStatusResult::TPtr ev);
         void Kick();
+
+        ui64 GetGroupAllocationWeight(ui32 groupId) const;
+        void SetSpaceColor(NKikimrBlobStorage::TPDiskSpaceColor::E spaceColor, float approximateFreeSpaceShare);
+        NKikimrBlobStorage::TPDiskSpaceColor::E GetSpaceColor() const;
+        float GetApproximateFreeSpaceShare() const;
 
     private:
         void Init();

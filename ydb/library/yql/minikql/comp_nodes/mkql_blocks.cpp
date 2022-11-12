@@ -17,6 +17,8 @@ namespace NMiniKQL {
 
 namespace {
 
+constexpr size_t MaxBlockSizeInBytes = 1_MB;
+
 class TBlockBuilderBase {
 public:
     TBlockBuilderBase(TComputationContext& ctx, const std::shared_ptr<arrow::DataType>& itemType)
@@ -32,15 +34,13 @@ public:
     }
 
     virtual void Add(NUdf::TUnboxedValue& value) = 0;
-    virtual NUdf::TUnboxedValuePod Build() = 0;
+    virtual NUdf::TUnboxedValuePod Build(bool finish) = 0;
 
 private:
     static int64_t TypeSize(arrow::DataType& itemType) {
         const auto bits = static_cast<const arrow::FixedWidthType&>(itemType).bit_width();
         return arrow::BitUtil::BytesForBits(bits);
     }
-
-    static constexpr size_t MaxBlockSizeInBytes = 1_MB;
 
 protected:
     TComputationContext& Ctx_;
@@ -53,33 +53,39 @@ class TFixedSizeBlockBuilder : public TBlockBuilderBase {
 public:
     TFixedSizeBlockBuilder(TComputationContext& ctx, const std::shared_ptr<arrow::DataType>& itemType)
         : TBlockBuilderBase(ctx, itemType)
-        , Builder_(&Ctx_.ArrowMemoryPool)
+        , Builder_(std::make_unique<TBuilder>(&Ctx_.ArrowMemoryPool))
     {
         this->Reserve();
     }
 
     void Add(NUdf::TUnboxedValue& value) override {
-        Y_VERIFY_DEBUG(Builder_.length() < MaxLength_);
+        Y_VERIFY_DEBUG(Builder_->length() < MaxLength_);
         if (value) {
-            this->Builder_.UnsafeAppend(value.Get<T>());
+            this->Builder_->UnsafeAppend(value.Get<T>());
         } else {
-            this->Builder_.UnsafeAppendNull();
+            this->Builder_->UnsafeAppendNull();
         }
     }
 
-    NUdf::TUnboxedValuePod Build() override {
+    NUdf::TUnboxedValuePod Build(bool finish) override {
         std::shared_ptr<arrow::ArrayData> result;
-        ARROW_OK(this->Builder_.FinishInternal(&result));
+        ARROW_OK(this->Builder_->FinishInternal(&result));
+        Builder_.reset();
+        if (!finish) {
+            Builder_ = std::make_unique<TBuilder>(&Ctx_.ArrowMemoryPool);
+            Reserve();
+        }
+
         return this->Ctx_.HolderFactory.CreateArrowBlock(std::move(result));
     }
 
 private:
     void Reserve() {
-        ARROW_OK(this->Builder_.Reserve(MaxLength_));
+        ARROW_OK(this->Builder_->Reserve(MaxLength_));
     }
 
 private:
-    TBuilder Builder_;
+    std::unique_ptr<TBuilder> Builder_;
 };
 
 std::unique_ptr<TBlockBuilderBase> MakeBlockBuilder(TComputationContext& ctx, NUdf::EDataSlot slot) {
@@ -130,7 +136,7 @@ public:
             builder->Add(result);
         }
 
-        return builder->Build();
+        return builder->Build(true);
     }
 
 private:
@@ -160,12 +166,20 @@ public:
         NUdf::TUnboxedValue*const* output) const
     {
         auto& s = GetState(state, ctx);
-        size_t rows = 0;
-        for (; rows < s.MaxLength_; ++rows) {
+        if (s.IsFinished_) {
+            return EFetchResult::Finish;
+        }
+
+        for (; s.Rows_ < s.MaxLength_; ++s.Rows_) {
             if (const auto result = Flow_->FetchValues(ctx, s.ValuePointers_.data()); EFetchResult::One != result) {
-                if (rows == 0) {
+                if (EFetchResult::Finish == result) {
+                    s.IsFinished_ = true;
+                }
+
+                if (EFetchResult::Yield == result || s.Rows_ == 0) {
                     return result;
                 }
+
                 break;
             }
             for (size_t j = 0; j < Width_; ++j) {
@@ -177,14 +191,15 @@ public:
 
         for (size_t i = 0; i < Width_; ++i) {
             if (auto* out = output[i]; out != nullptr) {
-                *out = s.Builders_[i]->Build();
+                *out = s.Builders_[i]->Build(s.IsFinished_);
             }
         }
 
         if (auto* out = output[Width_]; out != nullptr) {
-            *out = ctx.HolderFactory.CreateArrowBlock(arrow::Datum(std::make_shared<arrow::UInt64Scalar>(rows)));
+            *out = ctx.HolderFactory.CreateArrowBlock(arrow::Datum(std::make_shared<arrow::UInt64Scalar>(s.Rows_)));
         }
 
+        s.Rows_ = 0;
         return EFetchResult::One;
     }
 
@@ -194,6 +209,8 @@ private:
         std::vector<NUdf::TUnboxedValue*> ValuePointers_;
         std::vector<std::unique_ptr<TBlockBuilderBase>> Builders_;
         size_t MaxLength_;
+        size_t Rows_ = 0;
+        bool IsFinished_ = false;
 
         TState(TMemoryUsageInfo* memInfo, TComputationContext& ctx, const TVector<NUdf::EDataSlot>& slots)
             : TComputationValue(memInfo)
@@ -205,8 +222,8 @@ private:
                 Builders_.push_back(MakeBlockBuilder(ctx, slots[i]));
             }
 
-            MaxLength_ = Builders_.front()->MaxLength();
-            for (size_t i = 1; i < slots.size(); ++i) {
+            MaxLength_ = MaxBlockSizeInBytes;
+            for (size_t i = 0; i < slots.size(); ++i) {
                 MaxLength_ = Min(MaxLength_, Builders_[i]->MaxLength());
             }
         }
@@ -235,20 +252,30 @@ public:
     virtual ~TBlockReaderBase() = default;
 
     virtual NUdf::TUnboxedValuePod Get(const arrow::ArrayData& data, size_t index) = 0;
+
+    virtual NUdf::TUnboxedValuePod GetScalar(const arrow::Scalar& scalar) = 0;
 };
 
 template <typename T>
 class TFixedSizeBlockReader : public TBlockReaderBase {
 public:
-    NUdf::TUnboxedValuePod Get(const arrow::ArrayData& data, size_t index) override {
+    NUdf::TUnboxedValuePod Get(const arrow::ArrayData& data, size_t index) final {
         return NUdf::TUnboxedValuePod(data.GetValues<T>(1)[index]);
+    }
+
+    NUdf::TUnboxedValuePod GetScalar(const arrow::Scalar& scalar) final {
+        return NUdf::TUnboxedValuePod(*static_cast<const T*>(arrow::internal::checked_cast<const arrow::internal::PrimitiveScalarBase&>(scalar).data()));
     }
 };
 
 class TBoolBlockReader : public TBlockReaderBase {
 public:
-    NUdf::TUnboxedValuePod Get(const arrow::ArrayData& data, size_t index) override {
+    NUdf::TUnboxedValuePod Get(const arrow::ArrayData& data, size_t index) final {
         return NUdf::TUnboxedValuePod(arrow::BitUtil::GetBit(data.GetValues<uint8_t>(1), index));
+    }
+
+    NUdf::TUnboxedValuePod GetScalar(const arrow::Scalar& scalar) final {
+        return NUdf::TUnboxedValuePod(arrow::internal::checked_cast<const arrow::BooleanScalar&>(scalar).value);
     }
 };
 
@@ -379,6 +406,7 @@ public:
         while (s.Index_ == s.Count_) {
             for (size_t i = 0; i < Width_; ++i) {
                 s.Arrays_[i] = nullptr;
+                s.Scalars_[i] = nullptr;
             }
 
             auto result = Flow_->FetchValues(ctx, s.ValuePointers_.data());
@@ -388,7 +416,12 @@ public:
 
             s.Index_ = 0;
             for (size_t i = 0; i < Width_; ++i) {
-                s.Arrays_[i] = TArrowBlock::From(s.Values_[i]).GetDatum().array();
+                const auto& datum = TArrowBlock::From(s.Values_[i]).GetDatum();
+                if (datum.is_scalar()) {
+                    s.Scalars_[i] = datum.scalar();
+                } else {
+                    s.Arrays_[i] = datum.array();
+                }
             }
 
             s.Count_ = TArrowBlock::From(s.Values_[Width_]).GetDatum().scalar_as<arrow::UInt64Scalar>().value;
@@ -400,11 +433,20 @@ public:
             }
 
             const auto& array = s.Arrays_[i];
-            const auto nullCount = array->GetNullCount();
-            if (nullCount == array->length || (nullCount > 0 && !arrow::BitUtil::GetBit(array->GetValues<uint8_t>(0), s.Index_ + array->offset))) {
-                *(output[i]) = NUdf::TUnboxedValue();
+            if (array) {
+                const auto nullCount = array->GetNullCount();
+                if (nullCount == array->length || (nullCount > 0 && !arrow::BitUtil::GetBit(array->GetValues<uint8_t>(0), s.Index_ + array->offset))) {
+                    *(output[i]) = NUdf::TUnboxedValue();
+                } else {
+                    *(output[i]) = s.Readers_[i]->Get(*array, s.Index_);
+                }
             } else {
-                *(output[i]) = s.Readers_[i]->Get(*array, s.Index_);
+                const auto& scalar = s.Scalars_[i];
+                if (!scalar->is_valid) {
+                    *(output[i]) = NUdf::TUnboxedValue();
+                } else {
+                    *(output[i]) = s.Readers_[i]->GetScalar(*scalar);
+                }
             }
         }
 
@@ -417,6 +459,7 @@ private:
         TVector<NUdf::TUnboxedValue> Values_;
         TVector<NUdf::TUnboxedValue*> ValuePointers_;
         TVector<std::shared_ptr<arrow::ArrayData>> Arrays_;
+        TVector<std::shared_ptr<arrow::Scalar>> Scalars_;
         TVector<std::unique_ptr<TBlockReaderBase>> Readers_;
         size_t Count_ = 0;
         size_t Index_ = 0;
@@ -426,6 +469,7 @@ private:
             , Values_(slots.size() + 1)
             , ValuePointers_(slots.size() + 1)
             , Arrays_(slots.size())
+            , Scalars_(slots.size())
         {
             for (size_t i = 0; i < slots.size() + 1; ++i) {
                 ValuePointers_[i] = &Values_[i];

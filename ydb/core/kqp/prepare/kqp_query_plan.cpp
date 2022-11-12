@@ -1,4 +1,6 @@
-#include "kqp_prepare_impl.h"
+#include "kqp_prepare.h"
+
+#include "kqp_query_plan.h"
 
 #include <ydb/core/kqp/common/kqp_yql.h>
 #include <ydb/core/kqp/provider/yql_kikimr_provider_impl.h>
@@ -30,7 +32,7 @@ using namespace NClient;
 namespace {
 
 struct TTableRead {
-    ETableReadType Type = ETableReadType::Unspecified;
+    EPlanTableReadType Type = EPlanTableReadType::Unspecified;
     TVector<TString> LookupBy;
     TVector<TString> ScanBy;
     TVector<TString> Columns;
@@ -39,7 +41,7 @@ struct TTableRead {
 };
 
 struct TTableWrite {
-    ETableWriteType Type = ETableWriteType::Unspecified;
+    EPlanTableWriteType Type = EPlanTableWriteType::Unspecified;
     TVector<TString> Keys;
     TVector<TString> Columns;
 };
@@ -47,6 +49,17 @@ struct TTableWrite {
 struct TTableInfo {
     TVector<TTableRead> Reads;
     TVector<TTableWrite> Writes;
+};
+
+struct TExprScope {
+    NYql::NNodes::TCallable Callable;
+    NYql::NNodes::TCoLambda Lambda;
+    ui32 Depth;
+
+    TExprScope(NYql::NNodes::TCallable callable, NYql::NNodes::TCoLambda Lambda, ui32 depth)
+        : Callable(callable)
+        , Lambda(Lambda)
+        , Depth(depth) {}
 };
 
 struct TSerializerCtx {
@@ -95,197 +108,6 @@ TString GetExprStr(const TExprBase& scalar, bool quoteStr = true) {
 
     return "expr";
 }
-
-void FillTablesInfo(const TExprNode::TPtr& query, TMap<TString, TTableInfo>& tables) {
-    TNodeSet visitedNodes;
-    TQueue<TMaybe<TExprScope>> scopesQueue;
-    scopesQueue.push(TMaybe<TExprScope>());
-
-    while (!scopesQueue.empty()) {
-        auto scope = scopesQueue.front();
-        scopesQueue.pop();
-
-        auto scopeRoot = scope
-            ? scope->Lambda.Body()
-            : TExprBase(query);
-
-        VisitExpr(scopeRoot.Ptr(), [scope, &scopesQueue, &tables] (const TExprNode::TPtr& exprNode) {
-            auto node = TExprBase(exprNode);
-            auto mapDepth = scope ? scope->Depth : 0;
-
-            if (node.Maybe<TCoLambda>()) {
-                return false;
-            }
-
-            if (auto callable = node.Maybe<TCallable>()) {
-                bool isMap = callable.Maybe<TCoMapBase>().IsValid() ||
-                             callable.Maybe<TCoFlatMapBase>().IsValid() ||
-                             callable.Maybe<TCoFilterBase>().IsValid();
-
-                for (const auto& arg : node.Cast<TVarArgCallable<TExprBase>>()) {
-                    if (auto lambda = arg.Maybe<TCoLambda>()) {
-                        TExprScope newScope(callable.Cast(), lambda.Cast(), isMap ? mapDepth + 1 : mapDepth);
-                        scopesQueue.push(newScope);
-                    }
-                }
-            }
-
-            if (auto maybeSelectRange = node.Maybe<TKiSelectRange>()) {
-                auto selectRange = maybeSelectRange.Cast();
-
-                TTableRead read;
-
-                auto isBoundDefined = [](const TExprBase& bound) -> bool {
-                    return !bound.Maybe<TCoNothing>() && !bound.Maybe<TCoVoid>();
-                };
-
-                auto getBoundStr = [](const TExprBase& bound) -> TString {
-                    if (bound.Maybe<TCoNothing>()) {
-                        return "-inf";
-                    }
-
-                    if (bound.Maybe<TCoVoid>()) {
-                        return "+inf";
-                    }
-
-                    return GetExprStr(bound);
-                };
-
-                bool incFrom = false;
-                bool incTo = false;
-                for (const auto& node : selectRange.Range()) {
-                    if (auto maybeAtom = node.Maybe<TCoAtom>()) {
-                        auto value = maybeAtom.Cast().Value();
-
-                        if (value == "IncFrom") {
-                            incFrom = true;
-                        }
-
-                        if (value == "IncTo") {
-                            incTo = true;
-                        }
-                    }
-                }
-
-                bool isScan = false;
-                for (const auto& node : selectRange.Range()) {
-                    if (auto maybeColumnRange = node.Maybe<TKiColumnRangeTuple>()) {
-                        auto columnRange = maybeColumnRange.Cast();
-
-                        if (!isScan && columnRange.From().Raw() == columnRange.To().Raw()) {
-                            auto lookup = TStringBuilder() << columnRange.Column().Value()
-                                << " (" << GetExprStr(columnRange.From()) << ")";
-                            read.LookupBy.push_back(lookup);
-                        } else {
-                            isScan = true;
-
-                            TStringBuilder scanBuilder;
-                            scanBuilder << columnRange.Column().Value();
-
-                            if (isBoundDefined(columnRange.From()) || isBoundDefined(columnRange.To())) {
-                                scanBuilder
-                                    << (incFrom ? " [" : " (")
-                                    << getBoundStr(columnRange.From()) << ", "
-                                    << getBoundStr(columnRange.To())
-                                    << (incTo ? "]" : ")");
-                            }
-
-                            read.ScanBy.push_back(scanBuilder);
-                        }
-                    }
-                }
-
-                auto limitSetting = GetSetting(selectRange.Settings().Ref(), "ItemsLimit");
-                if (limitSetting && TMaybeNode<TCoNameValueTuple>(limitSetting)) {
-                    read.Limit = GetExprStr(TCoNameValueTuple(limitSetting).Value().Cast());
-                }
-
-                auto reverseSettings = GetSetting(selectRange.Settings().Ref(), "Reverse");
-                if (reverseSettings) {
-                    read.Reverse = true;
-                }
-
-                for (const auto& column : selectRange.Select()) {
-                    read.Columns.emplace_back(column);
-                }
-
-                if (read.LookupBy.empty()) {
-                    read.Type = TKikimrKeyRange::IsFull(selectRange.Range())
-                        ? ETableReadType::FullScan
-                        : ETableReadType::Scan;
-                } else {
-                    read.Type = mapDepth > 0
-                        ? ETableReadType::MultiLookup
-                        : ETableReadType::Lookup;
-                }
-
-                tables[TString(selectRange.Table().Path())].Reads.push_back(read);
-            }
-
-            if (auto maybeSelectRow = node.Maybe<TKiSelectRow>()) {
-                auto selectRow = maybeSelectRow.Cast();
-
-                TTableRead read;
-                read.Type = mapDepth > 0
-                    ? ETableReadType::MultiLookup
-                    : ETableReadType::Lookup;
-
-                for (const auto& key : selectRow.Key()) {
-                    auto lookup = TStringBuilder() << key.Name().Value()
-                        << " (" << GetExprStr(key.Value().Cast()) << ")";
-                    read.LookupBy.push_back(lookup);
-                }
-
-                for (const auto& column : selectRow.Select()) {
-                    read.Columns.emplace_back(column);
-                }
-
-                tables[TString(selectRow.Table().Path())].Reads.push_back(read);
-            }
-
-            if (auto maybeUpdateRow = node.Maybe<TKiUpdateRow>()) {
-                auto updateRow = maybeUpdateRow.Cast();
-
-                TTableWrite write;
-                write.Type = mapDepth > 0
-                    ? ETableWriteType::MultiUpsert
-                    : ETableWriteType::Upsert;
-
-
-                for (const auto& tuple : updateRow.Key()) {
-                    auto key = TStringBuilder() << tuple.Name().Value()
-                        << " (" << GetExprStr(tuple.Value().Cast()) << ")";
-                    write.Keys.push_back(key);
-                }
-
-                for (const auto& tuple : updateRow.Update()) {
-                    write.Columns.emplace_back(tuple.Name());
-                }
-
-                tables[TString(updateRow.Table().Path())].Writes.push_back(write);
-            }
-
-            if (auto maybeEraseRow = node.Maybe<TKiEraseRow>()) {
-                auto eraseRow = maybeEraseRow.Cast();
-
-                TTableWrite write;
-                write.Type = mapDepth > 0
-                    ? ETableWriteType::MultiErase
-                    : ETableWriteType::Erase;
-
-                for (const auto& tuple : eraseRow.Key()) {
-                    auto key = TStringBuilder() << tuple.Name().Value()
-                        << " (" << GetExprStr(tuple.Value().Cast()) << ")";
-                    write.Keys.push_back(key);
-                }
-
-                tables[TString(eraseRow.Table().Path())].Writes.push_back(write);
-            }
-
-            return true;
-        }, visitedNodes);
-    }
-};
 
 class TxPlanSerializer {
 public:
@@ -336,8 +158,9 @@ public:
         }
 
         /* set NodeId using reverse order */
+        ui64 firstPlanNodeId = SerializerCtx.PlanNodeId - QueryPlanNodes.size() + 1;
         for (auto& [id, planNode] : QueryPlanNodes) {
-            planNode.NodeId = SerializerCtx.PlanNodeId - id + 1;
+            planNode.NodeId = firstPlanNodeId + SerializerCtx.PlanNodeId - id;
         }
     }
 
@@ -682,7 +505,7 @@ private:
             auto tableLookup = maybeTableLookup.Cast();
 
             TTableRead readInfo;
-            readInfo.Type = ETableReadType::Lookup;
+            readInfo.Type = EPlanTableReadType::Lookup;
             planNode.TypeName = "TableLookup";
             TString table(tableLookup.Table().Path().Value());
             auto& tableData = SerializerCtx.TablesData->GetTable(SerializerCtx.Cluster, table);
@@ -934,7 +757,7 @@ private:
         op.Properties["Table"] = tableData.RelativePath ? *tableData.RelativePath : table;
 
         TTableWrite writeInfo;
-        writeInfo.Type = ETableWriteType::MultiUpsert;
+        writeInfo.Type = EPlanTableWriteType::MultiUpsert;
         for (const auto& column : upsert.Columns()) {
             writeInfo.Columns.push_back(TString(column.Value()));
         }
@@ -953,7 +776,7 @@ private:
         op.Properties["Table"] = tableData.RelativePath ? *tableData.RelativePath : table;
 
         TTableWrite writeInfo;
-        writeInfo.Type = ETableWriteType::MultiErase;
+        writeInfo.Type = EPlanTableWriteType::MultiErase;
 
         SerializerCtx.Tables[table].Writes.push_back(writeInfo);
         planNode.NodeInfo["Tables"].AppendValue(op.Properties["Table"]);
@@ -1028,7 +851,7 @@ private:
     ui32 Visit(const TKqlLookupTableBase& lookup, TQueryPlanNode& planNode) {
         auto table = TString(lookup.Table().Path().Value());
         TTableRead readInfo;
-        readInfo.Type = ETableReadType::Lookup;
+        readInfo.Type = EPlanTableReadType::Lookup;
 
         TOperator op;
         op.Properties["Name"] = "TablePointLookup";
@@ -1058,7 +881,7 @@ private:
 
         auto rangesDesc = PrettyExprStr(read.Ranges());
         if (rangesDesc == "Void" || explainPrompt.UsedKeyColumns.empty()) {
-            readInfo.Type = ETableReadType::FullScan;
+            readInfo.Type = EPlanTableReadType::FullScan;
 
             auto& ranges = op.Properties["ReadRanges"];
             for (const auto& col : tableData.Metadata->KeyColumnNames) {
@@ -1068,7 +891,7 @@ private:
                 ranges.AppendValue(rangeDesc);
             }
         } else if (auto maybeResultBinding = ContainResultBinding(rangesDesc)) {
-            readInfo.Type = ETableReadType::Scan;
+            readInfo.Type = EPlanTableReadType::Scan;
 
             auto [txId, resId] = *maybeResultBinding;
             if (auto result = GetResult(txId, resId)) {
@@ -1142,7 +965,7 @@ private:
         }
 
         ui32 operatorId;
-        if (readInfo.Type == ETableReadType::FullScan) {
+        if (readInfo.Type == EPlanTableReadType::FullScan) {
             op.Properties["Name"] = "TableFullScan";
             operatorId = AddOperator(planNode, "TableFullScan", std::move(op));
         } else {
@@ -1243,9 +1066,9 @@ private:
             // Scan which fixes only few first members of compound primary key were called "Lookup"
             // by older explain version. We continue to do so.
             if (readInfo.LookupBy.size() > 0) {
-                readInfo.Type = ETableReadType::Lookup;
+                readInfo.Type = EPlanTableReadType::Lookup;
             } else {
-                readInfo.Type = hasRangeScans ? ETableReadType::Scan : ETableReadType::FullScan;
+                readInfo.Type = hasRangeScans ? EPlanTableReadType::Scan : EPlanTableReadType::FullScan;
             }
         }
 
@@ -1276,13 +1099,13 @@ private:
         SerializerCtx.Tables[table].Reads.push_back(readInfo);
 
         ui32 operatorId;
-        if (readInfo.Type == ETableReadType::Scan) {
+        if (readInfo.Type == EPlanTableReadType::Scan) {
             op.Properties["Name"] = "TableRangeScan";
             operatorId = AddOperator(planNode, "TableRangeScan", std::move(op));
-        } else if (readInfo.Type == ETableReadType::FullScan) {
+        } else if (readInfo.Type == EPlanTableReadType::FullScan) {
             op.Properties["Name"] = "TableFullScan";
             operatorId = AddOperator(planNode, "TableFullScan", std::move(op));
-        } else if (readInfo.Type == ETableReadType::Lookup) {
+        } else if (readInfo.Type == EPlanTableReadType::Lookup) {
             op.Properties["Name"] = "TablePointLookup";
             operatorId = AddOperator(planNode, "TablePointLookup", std::move(op));
         } else {
@@ -1435,24 +1258,6 @@ void SetNonZero(NJson::TJsonValue& node, const TStringBuf& name, T value) {
 }
 
 } // namespace
-
-void WriteKqlPlan(NJsonWriter::TBuf& writer, const TExprNode::TPtr& query) {
-    TMap<TString, TTableInfo> tables;
-
-    writer.BeginObject();
-    writer.WriteKey("meta");
-
-    writer.BeginObject();
-    writer.WriteKey("version").WriteString("0.1");
-    writer.WriteKey("type").WriteString("query");
-    writer.EndObject();
-
-    writer.WriteKey("tables");
-    FillTablesInfo(query, tables);
-    WriteCommonTablesInfo(writer, tables);
-
-    writer.EndObject();
-}
 
 // TODO(sk): check prepared statements params in read ranges
 // TODO(sk): check params from correlated subqueries // lookup join

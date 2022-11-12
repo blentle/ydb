@@ -279,6 +279,10 @@ std::tuple<TString, TParams, const std::function<std::pair<TString, NYdb::TParam
             internal.set_dq_graph_index(request.dq_graph_index());
         }
 
+        if (request.has_resources()) {
+            *internal.mutable_resources() = request.resources();
+        }
+
         if (job.ByteSizeLong() > maxRequestSize) {
             ythrow TControlPlaneStorageException(TIssuesIds::BAD_REQUEST) << "Job proto exceeded the size limit: " << job.ByteSizeLong() << " of " << maxRequestSize << " " << TSizeFormatPrinter(job).ToString();
         }
@@ -451,10 +455,17 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvPingTaskReq
     const TString queryId = request.query_id().value();
     const TString owner = request.owner_id();
     const TInstant deadline = NProtoInterop::CastFromProto(request.deadline());
+    const TString tenant = request.tenant();
 
     CPS_LOG_T("PingTaskRequest: {" << request.DebugString() << "}");
 
-    NYql::TIssues issues = ValidatePingTask(scope, queryId, owner, deadline, Config.ResultSetsTtl);
+    NYql::TIssues issues = ValidatePingTask(scope, queryId, owner, deadline, Config->ResultSetsTtl);
+
+    auto tenantInfo = ev->Get()->TenantInfo;
+    if (tenantInfo && tenantInfo->TenantState.Value(tenant, TenantState::Active) == TenantState::Idle) {
+        issues.AddIssue("Tenant is idle, no processing is allowed");
+    }
+
     if (issues) {
         CPS_LOG_W("PingTaskRequest: {" << request.DebugString() << "} validation FAILED: " << issues.ToOneLineString());
         const TDuration delta = TInstant::Now() - startTime;
@@ -465,16 +476,22 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvPingTaskReq
 
     std::shared_ptr<Fq::Private::PingTaskResult> response = std::make_shared<Fq::Private::PingTaskResult>();
 
-    if (request.status())
+    if (request.status()) {
         Counters.GetFinalStatusCounters(cloudId, scope)->IncByStatus(request.status());
+    }
+
+    if (IsTerminalStatus(request.status())) {
+        LOG_YQ_AUDIT_SERVICE_INFO("FinalStatus: cloud id: [" << cloudId  << "], scope: [" << scope << "], query id: [" << request.query_id() << "], job id: [" << request.job_id() << "], status: " << YandexQuery::QueryMeta::ComputeStatus_Name(request.status()));
+    }
+
     auto pingTaskParams = DoesPingTaskUpdateQueriesTable(request) ?
-        ConstructHardPingTask(request, response, YdbConnection->TablePathPrefix, Config.AutomaticQueriesTtl, Config.TaskLeaseTtl, Config.RetryPolicies, Counters.Counters, Config.Proto.GetMaxRequestSize()) :
-        ConstructSoftPingTask(request, response, YdbConnection->TablePathPrefix, Config.TaskLeaseTtl);
+        ConstructHardPingTask(request, response, YdbConnection->TablePathPrefix, Config->AutomaticQueriesTtl, Config->TaskLeaseTtl, Config->RetryPolicies, Counters.Counters, Config->Proto.GetMaxRequestSize()) :
+        ConstructSoftPingTask(request, response, YdbConnection->TablePathPrefix, Config->TaskLeaseTtl);
     auto readQuery = std::get<0>(pingTaskParams); // Use std::get for win compiler
     auto readParams = std::get<1>(pingTaskParams);
     auto prepareParams = std::get<2>(pingTaskParams);
 
-    auto debugInfo = Config.Proto.GetEnableDebugMode() ? std::make_shared<TDebugInfo>() : TDebugInfoPtr{};
+    auto debugInfo = Config->Proto.GetEnableDebugMode() ? std::make_shared<TDebugInfo>() : TDebugInfoPtr{};
     auto result = ReadModifyWrite(readQuery, readParams, prepareParams, requestCounters, debugInfo);
     auto prepare = [response] { return *response; };
     auto success = SendResponse<TEvControlPlaneStorage::TEvPingTaskResponse, Fq::Private::PingTaskResult>(

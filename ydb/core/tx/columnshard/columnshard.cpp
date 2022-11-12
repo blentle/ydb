@@ -17,7 +17,9 @@ void TColumnShard::BecomeBroken(const TActorContext& ctx)
     ctx.Send(IndexingActor, new TEvents::TEvPoisonPill);
     ctx.Send(CompactionActor, new TEvents::TEvPoisonPill);
     ctx.Send(EvictionActor, new TEvents::TEvPoisonPill);
-    StopS3Actors(ctx);
+    if (Tiers) {
+        Tiers->Stop();
+    }
 }
 
 void TColumnShard::SwitchToWork(const TActorContext& ctx) {
@@ -27,7 +29,6 @@ void TColumnShard::SwitchToWork(const TActorContext& ctx) {
     IndexingActor = ctx.Register(CreateIndexingActor(TabletID(), ctx.SelfID));
     CompactionActor = ctx.Register(CreateCompactionActor(TabletID(), ctx.SelfID));
     EvictionActor = ctx.Register(CreateEvictionActor(TabletID(), ctx.SelfID));
-    InitS3Actors(ctx, true);
 
     SignalTabletActive(ctx);
 }
@@ -275,7 +276,7 @@ void TColumnShard::UpdateResourceMetrics(const TActorContext& ctx, const TUsage&
 }
 
 void TColumnShard::SendPeriodicStats() {
-    if (!CurrentSchemeShardId || !StorePathId) {
+    if (!CurrentSchemeShardId || !OwnerPathId) {
         LOG_S_DEBUG("Disabled periodic stats at tablet " << TabletID());
         return;
     }
@@ -293,7 +294,7 @@ void TColumnShard::SendPeriodicStats() {
         StatsReportPipe = ctx.Register(NTabletPipe::CreateClient(ctx.SelfID, CurrentSchemeShardId, clientConfig));
     }
 
-    auto ev = std::make_unique<TEvDataShard::TEvPeriodicTableStats>(TabletID(), StorePathId);
+    auto ev = std::make_unique<TEvDataShard::TEvPeriodicTableStats>(TabletID(), OwnerPathId);
     {
         ev->Record.SetShardState(2); // NKikimrTxDataShard.EDatashardState.Ready
         ev->Record.SetGeneration(Executor()->Generation());

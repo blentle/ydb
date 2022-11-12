@@ -33,6 +33,7 @@ TRunActorParams::TRunActorParams(
     NYql::ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory,
     THashMap<TString, TString> accountIdSignatures,
     YandexQuery::QueryContent::QueryType queryType,
+    YandexQuery::QueryContent::QuerySyntax querySyntax,
     YandexQuery::ExecuteMode executeMode,
     const TString& resultId,
     const YandexQuery::StateLoadMode stateLoadMode,
@@ -53,7 +54,8 @@ TRunActorParams::TRunActorParams(
     TDuration executionTtl,
     TInstant requestStartedAt,
     ui32 restartCount,
-    const TString& jobId
+    const TString& jobId,
+    const Fq::Private::TaskResources& resources
     )
     : YqSharedResources(yqSharedResources)
     , CredentialsProviderFactory(credentialsProviderFactory)
@@ -83,6 +85,7 @@ TRunActorParams::TRunActorParams(
     , CredentialsFactory(std::move(credentialsFactory))
     , AccountIdSignatures(std::move(accountIdSignatures))
     , QueryType(queryType)
+    , QuerySyntax(querySyntax)
     , ExecuteMode(executeMode)
     , ResultId(resultId)
     , StateLoadMode(stateLoadMode)
@@ -104,6 +107,7 @@ TRunActorParams::TRunActorParams(
     , RequestStartedAt(requestStartedAt)
     , RestartCount(restartCount)
     , JobId(jobId)
+    , Resources(resources)
     {
     }
 

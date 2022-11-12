@@ -1,5 +1,5 @@
 items:
-- name: Создание профиля
+- name: Создание и изменение профиля
   href: create.md
 - name: Использование профиля в запросах
   href: use.md
@@ -9,6 +9,3 @@ items:
   href: delete.md
 - name: Активированный профиль
   href: activate.md
-
-
-

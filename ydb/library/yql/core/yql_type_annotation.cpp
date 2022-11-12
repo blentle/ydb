@@ -136,28 +136,6 @@ IGraphTransformer::TStatus TTypeAnnotationContext::SetColumnOrder(const TExprNod
     return IGraphTransformer::TStatus::Ok;
 }
 
-const TCredential* TTypeAnnotationContext::FindCredential(const TStringBuf& name) const {
-    for (auto& x : Credentials) {
-        auto data = x->FindPtr(name);
-        if (data) {
-            return data;
-        }
-    }
-    return nullptr;
-}
-
-TString TTypeAnnotationContext::FindCredentialContent(const TStringBuf& name1, const TStringBuf& name2, const TString& defaultContent) const {
-    if (auto cred = FindCredential(name1)) {
-        return cred->Content;
-    }
-
-    if (auto cred = FindCredential(name2)) {
-        return cred->Content;
-    }
-
-    return defaultContent;
-}
-
 TString TTypeAnnotationContext::GetDefaultDataSource() const {
     if (!PureResultDataSource.empty()) {
         YQL_ENSURE(Find(AvailablePureResultDataSources.begin(),
@@ -208,7 +186,7 @@ const TExportTable* TModuleResolver::GetModule(const TString& module) const {
     return Modules.FindPtr(normalizedModuleName);
 }
 
-bool TModuleResolver::AddFromUrl(const TStringBuf& file, const TStringBuf& url, TExprContext& ctx, ui16 syntaxVersion, ui32 packageVersion) {
+bool TModuleResolver::AddFromUrl(const TStringBuf& file, const TStringBuf& url, const TStringBuf& tokenName, TExprContext& ctx, ui16 syntaxVersion, ui32 packageVersion) {
     if (!UserData) {
         ctx.AddError(TIssue(TPosition(), "Loading libraries is prohibited"));
         return false;
@@ -218,6 +196,18 @@ bool TModuleResolver::AddFromUrl(const TStringBuf& file, const TStringBuf& url, 
     block.Type = EUserDataType::URL;
     block.Data = url;
     block.Data = SubstParameters(block.Data);
+    if (tokenName) {
+        if (!Credentials) {
+            ctx.AddError(TIssue(TPosition(), "Missing credentials"));
+            return false;
+        }
+        auto cred = Credentials->FindCredential(tokenName);
+        if (!cred) {
+            ctx.AddError(TIssue(TPosition(), TStringBuilder() << "Unknown token name: " << tokenName));
+            return false;
+        }
+        block.UrlToken = cred->Content;
+    }
     UserData->AddUserDataBlock(file, block);
 
     return AddFromFile(file, ctx, syntaxVersion, packageVersion);

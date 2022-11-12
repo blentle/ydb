@@ -48,6 +48,7 @@ namespace NSQLTranslationV1 {
         TString CurrService;
         TDeferredAtom CurrCluster;
         bool PragmaClassicDivision = true;
+        bool PragmaCheckedOps = false;
         bool StrictJoinKeyTypes = false;
         TNamedNodesMap NamedNodes;
 
@@ -271,7 +272,7 @@ namespace NSQLTranslationV1 {
         // see YQL-10265
         bool AnsiCurrentRow = false;
         TMaybe<bool> YsonCastToString;
-        THashMap<TString, TMaybe<TString>> Libraries; // alias -> optional file
+        THashMap<TString, TMaybe<std::pair<TString, TString>>> Libraries; // alias -> optional file with token
         THashMap<TString, ui32> PackageVersions;
         NYql::TWarningPolicy WarningPolicy;
         TString PqReadByRtmrCluster;

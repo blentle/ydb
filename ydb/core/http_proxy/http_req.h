@@ -18,6 +18,7 @@
 #include <util/string/builder.h>
 
 
+
 namespace NKikimr::NHttpProxy {
 
 HttpCodes StatusToHttpCode(NYdb::EStatus status);
@@ -49,7 +50,7 @@ private:
 struct THttpResponseData {
     NYdb::EStatus Status{NYdb::EStatus::SUCCESS};
     NJson::TJsonValue Body;
-    TString ErrorText;
+    TString ErrorText{"OK"};
 
     TString DumpBody(MimeTypes contentType);
 };
@@ -87,7 +88,6 @@ struct THttpRequestContext {
     }
 
     THolder<NKikimr::NSQS::TAwsRequestSignV4> GetSignature();
-    void SendBadRequest(NYdb::EStatus status, const TString& errorText, const TActorContext& ctx);
     void DoReply(const TActorContext& ctx);
     void ParseHeaders(TStringBuf headers);
     void RequestBodyToProto(NProtoBuf::Message* request);
@@ -118,4 +118,10 @@ private:
     THashMap<TString, THolder<IHttpRequestProcessor>> Name2Processor;
 };
 
+NActors::IActor* CreateAccessServiceActor(const NKikimrConfig::TServerlessProxyConfig& config);
+NActors::IActor* CreateIamTokenServiceActor(const NKikimrConfig::TServerlessProxyConfig& config);
+NActors::IActor* CreateIamAuthActor(const TActorId sender, THttpRequestContext& context, THolder<NKikimr::NSQS::TAwsRequestSignV4>&& signature);
+
+
 } // namespace NKinesis::NHttpProxy
+

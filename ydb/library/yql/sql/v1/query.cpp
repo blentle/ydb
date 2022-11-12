@@ -123,6 +123,9 @@ static INode::TPtr CreateChangefeedDesc(const TChangefeedDescription& desc, cons
     if (desc.Settings.Format) {
         settings = node.L(settings, node.Q(node.Y(node.Q("format"), desc.Settings.Format)));
     }
+    if (desc.Settings.InitialScan) {
+        settings = node.L(settings, node.Q(node.Y(node.Q("initial_scan"), desc.Settings.InitialScan)));
+    }
     if (const auto& sink = desc.Settings.SinkSettings) {
         switch (sink->index()) {
             case 0: // local
@@ -477,7 +480,7 @@ public:
             TString hintName = hint.first;
             TMaybe<TIssue> normalizeError = NormalizeName(Pos, hintName);
             if (!normalizeError.Empty()) {
-                ctx.Error() << normalizeError->Message;
+                ctx.Error() << normalizeError->GetMessage();
                 ctx.IncrementMonCounter("sql_errors", "NormalizeHintError");
                 return false;
             }
@@ -536,7 +539,7 @@ public:
             TString hintName = hint.first;
             TMaybe<TIssue> normalizeError = NormalizeName(Pos, hintName);
             if (!normalizeError.Empty()) {
-                ctx.Error() << normalizeError->Message;
+                ctx.Error() << normalizeError->GetMessage();
                 ctx.IncrementMonCounter("sql_errors", "NormalizeHintError");
                 return false;
             }
@@ -873,6 +876,11 @@ public:
             opts = L(opts, Q(Y(Q("tableSettings"), Q(settings))));
         }
 
+
+        if (Params.TableType == ETableType::TableStore) {
+            opts = L(opts, Q(Y(Q("tableType"), Q("tableStore"))));
+        }
+
         Add("block", Q(Y(
             Y("let", "sink", Y("DataSink", BuildQuotedAtom(Pos, Table.Service), Scoped->WrapCluster(Table.Cluster, ctx))),
             Y("let", "world", Y(TString(WriteName), "world", "sink", keys, Y("Void"), Q(opts))),
@@ -1085,6 +1093,10 @@ public:
         opts = L(opts, Q(Y(Q("mode"), Q("alter"))));
         opts = L(opts, Q(Y(Q("actions"), Q(actions))));
 
+        if (Params.TableType == ETableType::TableStore) {
+            opts = L(opts, Q(Y(Q("tableType"), Q("tableStore"))));
+        }
+
         Add("block", Q(Y(
             Y("let", "sink", Y("DataSink", BuildQuotedAtom(Pos, Table.Service), Scoped->WrapCluster(Table.Cluster, ctx))),
             Y("let", "world", Y(TString(WriteName), "world", "sink", keys, Y("Void"), Q(opts))),
@@ -1109,9 +1121,10 @@ TNodePtr BuildAlterTable(TPosition pos, const TTableRef& tr, const TAlterTablePa
 
 class TDropTableNode final: public TAstListNode {
 public:
-    TDropTableNode(TPosition pos, const TTableRef& tr, TScopedStatePtr scoped)
+    TDropTableNode(TPosition pos, const TTableRef& tr, bool isTabletore, TScopedStatePtr scoped)
         : TAstListNode(pos)
         , Table(tr)
+        , TableType(isTabletore ? ETableType::TableStore : ETableType::Table)
         , Scoped(scoped)
     {
         FakeSource = BuildFakeSource(pos);
@@ -1125,9 +1138,17 @@ public:
             return false;
         }
 
+        auto opts = Y();
+
+        opts = L(opts, Q(Y(Q("mode"), Q("drop"))));
+        
+        if (TableType == ETableType::TableStore) {
+            opts = L(opts, Q(Y(Q("tableType"), Q("tableStore"))));
+        }
+
         Add("block", Q(Y(
             Y("let", "sink", Y("DataSink", BuildQuotedAtom(Pos, Table.Service), Scoped->WrapCluster(Table.Cluster, ctx))),
-            Y("let", "world", Y(TString(WriteName), "world", "sink", keys, Y("Void"), Q(Y(Q(Y(Q("mode"), Q("drop"))))))),
+            Y("let", "world", Y(TString(WriteName), "world", "sink", keys, Y("Void"), Q(opts))),
             Y("return", ctx.PragmaAutoCommit ? Y(TString(CommitName), "world", "sink") : AstNode("world"))
         )));
 
@@ -1139,12 +1160,13 @@ public:
     }
 private:
     TTableRef Table;
+    ETableType TableType;
     TScopedStatePtr Scoped;
     TSourcePtr FakeSource;
 };
 
-TNodePtr BuildDropTable(TPosition pos, const TTableRef& tr, TScopedStatePtr scoped) {
-    return new TDropTableNode(pos, tr, scoped);
+TNodePtr BuildDropTable(TPosition pos, const TTableRef& tr, bool isTabletore, TScopedStatePtr scoped) {
+    return new TDropTableNode(pos, tr, isTabletore, scoped);
 }
 
 class TCreateRole final: public TAstListNode {
@@ -1688,7 +1710,10 @@ public:
             for (const auto& lib : ctx.Libraries) {
                 auto node = Y("library", new TAstAtomNodeImpl(Pos, lib.first, TNodeFlags::ArbitraryContent));
                 if (lib.second) {
-                    node = L(node, new TAstAtomNodeImpl(Pos, *lib.second, TNodeFlags::ArbitraryContent));
+                    node = L(node, new TAstAtomNodeImpl(Pos, lib.second->first, TNodeFlags::ArbitraryContent));
+                    if (lib.second->second) {
+                        node = L(node, new TAstAtomNodeImpl(Pos, lib.second->second, TNodeFlags::ArbitraryContent));
+                    }
                 }
 
                 Add(node);

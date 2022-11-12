@@ -4,8 +4,9 @@
 #include <library/cpp/lwtrace/shuttle.h>
 #include <ydb/core/kqp/common/kqp_common.h>
 #include <ydb/core/kqp/counters/kqp_counters.h>
-#include <ydb/core/kqp/provider/yql_kikimr_query_traits.h>
 #include <ydb/public/api/protos/ydb_status_codes.pb.h>
+
+#include <ydb/core/grpc_services/base/base.h>
 
 #include <ydb/library/yql/dq/actors/dq.h>
 #include <ydb/library/yql/public/issue/yql_issue.h>
@@ -15,6 +16,16 @@
 
 namespace NKikimr {
 namespace NKqp {
+
+void ConvertKqpQueryResultToDbResult(const NKikimrMiniKQL::TResult& from, Ydb::ResultSet* to);
+
+template<typename TFrom, typename TTo>
+inline void ConvertKqpQueryResultsToDbResult(const TFrom& from, TTo* to) {
+    const auto& results = from.GetResults();
+    for (const auto& result : results) {
+        ConvertKqpQueryResultToDbResult(result, to->add_result_sets());
+    }
+}
 
 enum class ETableReadType {
     Other = 0,
@@ -139,15 +150,34 @@ struct TKqpQueryId {
     TString UserSid;
     TString Text;
     TKqpQuerySettings Settings;
-    bool Scan;
+    NKikimrKqp::EQueryType QueryType;
 
 public:
-    TKqpQueryId(const TString& cluster, const TString& database, const TString& text, bool scan)
+    TKqpQueryId(const TString& cluster, const TString& database, const TString& text, NKikimrKqp::EQueryType type)
         : Cluster(cluster)
         , Database(database)
         , Text(text)
-        , Scan(scan)
-    {}
+        , QueryType(type)
+    {
+        switch (QueryType) {
+            case NKikimrKqp::QUERY_TYPE_SQL_DML:
+            case NKikimrKqp::QUERY_TYPE_SQL_SCAN:
+            case NKikimrKqp::QUERY_TYPE_AST_DML:
+            case NKikimrKqp::QUERY_TYPE_AST_SCAN:
+            break;
+            default:
+            Y_ENSURE(false, "Unsupported request type");
+        }
+
+    }
+
+    bool IsScan() const {
+        return QueryType == NKikimrKqp::QUERY_TYPE_SQL_SCAN || QueryType == NKikimrKqp::QUERY_TYPE_AST_SCAN;
+    }
+
+    bool IsSql() const {
+        return QueryType == NKikimrKqp::QUERY_TYPE_SQL_DML || QueryType == NKikimrKqp::QUERY_TYPE_SQL_SCAN;
+    }
 
     bool operator==(const TKqpQueryId& other) const {
         return
@@ -156,7 +186,7 @@ public:
             UserSid == other.UserSid &&
             Text == other.Text &&
             Settings == other.Settings &&
-            Scan == other.Scan;
+            QueryType == other.QueryType;
     }
 
     bool operator!=(const TKqpQueryId& other) {
@@ -169,7 +199,7 @@ public:
     bool operator>=(const TKqpQueryId&) = delete;
 
     size_t GetHash() const noexcept {
-        auto tuple = std::make_tuple(Cluster, Database, UserSid, Text, Settings, Scan);
+        auto tuple = std::make_tuple(Cluster, Database, UserSid, Text, Settings, QueryType);
         return THash<decltype(tuple)>()(tuple);
     }
 };
@@ -215,13 +245,60 @@ struct TKqpCompileResult {
     ETableReadType MaxReadType;
 
     TPreparedQueryConstPtr PreparedQuery;
-    TPreparedQueryConstPtr PreparedQueryNewEngine;
-    std::optional<TQueryTraits> QueryTraits;
 };
 
 struct TEvKqp {
-    struct TEvQueryRequest : public TEventPB<TEvQueryRequest, NKikimrKqp::TEvQueryRequest,
+    struct TEvQueryRequestRemote : public TEventPB<TEvQueryRequestRemote, NKikimrKqp::TEvQueryRequest,
         TKqpEvents::EvQueryRequest> {};
+
+    struct TEvQueryRequest : public NActors::TEventLocal<TEvQueryRequest, TKqpEvents::EvQueryRequest> {
+    public:
+        using TSerializerCb = void (*)(std::shared_ptr<NGRpcService::IRequestCtxMtSafe>&, NKikimrKqp::TEvQueryRequest*) noexcept;
+        TEvQueryRequest(std::shared_ptr<NGRpcService::IRequestCtxMtSafe> ctx, TSerializerCb cb)
+            : RequestCtx(ctx)
+            , SerializerCb(cb)
+        { }
+
+        TEvQueryRequest() = default;
+
+        bool IsSerializable() const override {
+            return true;
+        }
+
+        // Same as TEventPBBase but without Rope
+        bool IsExtendedFormat() const override {
+            return false;
+        }
+
+        ui32 CalculateSerializedSize() const override {
+            PrepareRemote();
+            return Record.ByteSize();
+        }
+
+        bool SerializeToArcadiaStream(NActors::TChunkSerializer* chunker) const override {
+            PrepareRemote();
+            return Record.SerializeToZeroCopyStream(chunker);
+        }
+
+        static NActors::IEventBase* Load(TEventSerializedData* data) {
+            auto pbEv = THolder<TEvQueryRequestRemote>(static_cast<TEvQueryRequestRemote*>(TEvQueryRequestRemote::Load(data)));
+            auto req = new TEvQueryRequest();
+            req->Record.Swap(&pbEv->Record);
+            return req;
+        }
+
+        void PrepareRemote() const {
+            if (RequestCtx) {
+                Y_VERIFY(SerializerCb);
+                SerializerCb(RequestCtx, &Record);
+                RequestCtx.reset();
+            }
+        }
+        mutable NKikimrKqp::TEvQueryRequest Record;
+    private:
+        mutable std::shared_ptr<NGRpcService::IRequestCtxMtSafe> RequestCtx;
+        TSerializerCb SerializerCb;
+    };
 
     struct TEvCloseSessionRequest : public TEventPB<TEvCloseSessionRequest,
         NKikimrKqp::TEvCloseSessionRequest, TKqpEvents::EvCloseSessionRequest> {};
@@ -431,9 +508,6 @@ struct TEvKqp {
         TKqpCompileResult::TConstPtr CompileResult;
         NKqpProto::TKqpStatsCompile Stats;
         std::optional<TString> ReplayMessage;
-
-        ui32 ForceNewEnginePercent = 0;
-        ui32 ForceNewEngineLevel = 0;
 
         NLWTrace::TOrbit Orbit;
     };

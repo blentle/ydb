@@ -2250,9 +2250,10 @@ namespace NTypeAnnImpl {
             }
             return IGraphTransformer::TStatus::Ok;
         }
-    };
+    }
 
     IGraphTransformer::TStatus AddWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+        const bool checked = input->Content().StartsWith("Checked");
         if (!EnsureArgsCount(*input, 2, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
@@ -2274,9 +2275,11 @@ namespace NTypeAnnImpl {
             haveOptional |= isOptional[i];
         }
 
-        auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
-        if (check_result != IGraphTransformer::TStatus::Ok) {
-            return check_result;
+        if (!checked) {
+            auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
+            if (check_result != IGraphTransformer::TStatus::Ok) {
+                return check_result;
+            }
         }
 
         const bool isLeftNumeric = IsDataTypeNumeric(dataType[0]->GetSlot());
@@ -2320,6 +2323,15 @@ namespace NTypeAnnImpl {
         }
 
         const TTypeAnnotationNode* resultType = commonType;
+        if (checked) {
+            if (IsDataTypeIntegral(dataType[0]->GetSlot()) && IsDataTypeIntegral(dataType[1]->GetSlot())) {
+                haveOptional = true;
+            } else {
+                output = ctx.Expr.RenameNode(*input, "+");
+                return IGraphTransformer::TStatus::Repeat;
+            }
+        }
+
         if (haveOptional) {
             resultType = ctx.Expr.MakeType<TOptionalExprType>(resultType);
         }
@@ -2329,6 +2341,8 @@ namespace NTypeAnnImpl {
     }
 
     IGraphTransformer::TStatus SubWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+        const bool checked = input->Content().StartsWith("Checked");
+
         if (!EnsureArgsCount(*input, 2, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
@@ -2350,9 +2364,11 @@ namespace NTypeAnnImpl {
             haveOptional |= isOptional[i];
         }
 
-        auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
-        if (check_result != IGraphTransformer::TStatus::Ok) {
-            return check_result;
+        if (!checked) {
+            auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
+            if (check_result != IGraphTransformer::TStatus::Ok) {
+                return check_result;
+            }
         }
 
         const bool isLeftNumeric = IsDataTypeNumeric(dataType[0]->GetSlot());
@@ -2394,6 +2410,15 @@ namespace NTypeAnnImpl {
         }
 
         const TTypeAnnotationNode* resultType = commonType;
+        if (checked) {
+            if (IsDataTypeIntegral(dataType[0]->GetSlot()) && IsDataTypeIntegral(dataType[1]->GetSlot())) {
+                haveOptional = true;
+            } else {
+                output = ctx.Expr.RenameNode(*input, "-");
+                return IGraphTransformer::TStatus::Repeat;
+            }
+        }
+
         if (haveOptional) {
             resultType = ctx.Expr.MakeType<TOptionalExprType>(resultType);
         }
@@ -2403,6 +2428,8 @@ namespace NTypeAnnImpl {
     }
 
     IGraphTransformer::TStatus MulWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+        const bool checked = input->Content().StartsWith("Checked");
+
         if (!EnsureArgsCount(*input, 2, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
@@ -2424,9 +2451,11 @@ namespace NTypeAnnImpl {
             haveOptional |= isOptional[i];
         }
 
-        auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
-        if (check_result != IGraphTransformer::TStatus::Ok) {
-            return check_result;
+        if (!checked) {
+            auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
+            if (check_result != IGraphTransformer::TStatus::Ok) {
+                return check_result;
+            }
         }
 
         if (IsDataTypeNumeric(dataType[0]->GetSlot()) && IsDataTypeNumeric(dataType[1]->GetSlot())) {
@@ -2455,6 +2484,15 @@ namespace NTypeAnnImpl {
         }
 
         const TTypeAnnotationNode* resultType = commonType;
+        if (checked) {
+            if (IsDataTypeIntegral(dataType[0]->GetSlot()) && IsDataTypeIntegral(dataType[1]->GetSlot())) {
+                haveOptional = true;
+            } else {
+                output = ctx.Expr.RenameNode(*input, "*");
+                return IGraphTransformer::TStatus::Repeat;
+            }
+        }
+
         if (haveOptional) {
             resultType = ctx.Expr.MakeType<TOptionalExprType>(resultType);
         }
@@ -2464,6 +2502,8 @@ namespace NTypeAnnImpl {
     }
 
     IGraphTransformer::TStatus DivWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+        const bool checked = input->Content().StartsWith("Checked");
+
         if (!EnsureArgsCount(*input, 2, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
@@ -2485,9 +2525,11 @@ namespace NTypeAnnImpl {
             haveOptional |= isOptional[i];
         }
 
-        auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
-        if (check_result != IGraphTransformer::TStatus::Ok) {
-            return check_result;
+        if (!checked) {
+            auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
+            if (check_result != IGraphTransformer::TStatus::Ok) {
+                return check_result;
+            }
         }
 
         if (IsDataTypeNumeric(dataType[0]->GetSlot()) && IsDataTypeNumeric(dataType[1]->GetSlot())) {
@@ -2517,11 +2559,20 @@ namespace NTypeAnnImpl {
             resultType = ctx.Expr.MakeType<TOptionalExprType>(resultType);
         }
 
+        if (checked) {
+            if (!(IsDataTypeIntegral(dataType[0]->GetSlot()) && IsDataTypeIntegral(dataType[1]->GetSlot()))) {
+                output = ctx.Expr.RenameNode(*input, "/");
+                return IGraphTransformer::TStatus::Repeat;
+            }
+        }
+
         input->SetTypeAnn(resultType);
         return IGraphTransformer::TStatus::Ok;
     }
 
     IGraphTransformer::TStatus ModWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+        const bool checked = input->Content().StartsWith("Checked");
+
         if (!EnsureArgsCount(*input, 2, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
@@ -2543,9 +2594,11 @@ namespace NTypeAnnImpl {
             haveOptional |= isOptional[i];
         }
 
-        auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
-        if (check_result != IGraphTransformer::TStatus::Ok) {
-            return check_result;
+        if (!checked) {
+            auto check_result = CheckIntegralsWidth(input, ctx, dataType[0]->GetSlot(), dataType[1]->GetSlot());
+            if (check_result != IGraphTransformer::TStatus::Ok) {
+                return check_result;
+            }
         }
 
         if (IsDataTypeNumeric(dataType[0]->GetSlot()) && IsDataTypeNumeric(dataType[1]->GetSlot())) {
@@ -2570,6 +2623,13 @@ namespace NTypeAnnImpl {
         const TTypeAnnotationNode* resultType = commonType;
         if (haveOptional) {
             resultType = ctx.Expr.MakeType<TOptionalExprType>(resultType);
+        }
+
+        if (checked) {
+            if (!(IsDataTypeIntegral(dataType[0]->GetSlot()) && IsDataTypeIntegral(dataType[1]->GetSlot()))) {
+                output = ctx.Expr.RenameNode(*input, "%");
+                return IGraphTransformer::TStatus::Repeat;
+            }
         }
 
         input->SetTypeAnn(resultType);
@@ -2744,7 +2804,22 @@ namespace NTypeAnnImpl {
             return IGraphTransformer::TStatus::Error;
         }
 
-        input->SetTypeAnn(input->Head().GetTypeAnn());
+        bool haveOptional = false;
+        if (input->Content().StartsWith("Checked")) {
+            if (!IsDataTypeIntegral(dataSlot)) {
+                output = ctx.Expr.RenameNode(*input, "Minus");
+                return IGraphTransformer::TStatus::Repeat;
+            }
+
+            haveOptional = true;
+        }
+
+        if (!isOptional && haveOptional) {
+            input->SetTypeAnn(ctx.Expr.MakeType<TOptionalExprType>(input->Head().GetTypeAnn()));
+        } else {
+            input->SetTypeAnn(input->Head().GetTypeAnn());
+        }
+
         return IGraphTransformer::TStatus::Ok;
     }
 
@@ -6983,14 +7058,12 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                 description.Name = TString(name);
                 description.UserType = userType;
                 description.TypeConfig = typeConfig;
-                for (const auto& cred : ctx.Types.Credentials) {
-                    for (const auto& x : *cred) {
-                        description.SecureParams[TString("token:") + x.first] = x.second.Content;
-                        if (x.first.StartsWith("default_")) {
-                            description.SecureParams[TString("cluster:") + x.first] = x.second.Content;
-                        }
+                ctx.Types.Credentials->ForEach([&description](const TString& name, const TCredential& cred) {
+                    description.SecureParams[TString("token:") + name] = cred.Content;
+                    if (name.StartsWith("default_")) {
+                        description.SecureParams[TString("cluster:") + name] = cred.Content;
                     }
-                }
+                });
 
                 for (const auto& x : ctx.Types.DataSources) {
                     auto tokens = x->GetClusterTokens();
@@ -7001,12 +7074,12 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                     }
                 }
 
-                if (ctx.Types.UserCredentials.OauthToken) {
-                    description.SecureParams["api:oauth"] = ctx.Types.UserCredentials.OauthToken;
+                if (ctx.Types.Credentials->GetUserCredentials().OauthToken) {
+                    description.SecureParams["api:oauth"] = ctx.Types.Credentials->GetUserCredentials().OauthToken;
                 }
 
-                if (ctx.Types.UserCredentials.BlackboxSessionIdCookie) {
-                    description.SecureParams["api:cookie"] = ctx.Types.UserCredentials.BlackboxSessionIdCookie;
+                if (ctx.Types.Credentials->GetUserCredentials().BlackboxSessionIdCookie) {
+                    description.SecureParams["api:cookie"] = ctx.Types.Credentials->GetUserCredentials().BlackboxSessionIdCookie;
                 }
 
                 TVector<IUdfResolver::TFunction*> functions;
@@ -9194,17 +9267,17 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         return IGraphTransformer::TStatus::Repeat;
     }
 
-    IGraphTransformer::TStatus AutoDemuxListWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+    IGraphTransformer::TStatus AutoDemuxWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
         if (!EnsureArgsCount(*input, 1, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
 
-        if (!EnsureListType(input->Head(), ctx.Expr)) {
+        const TTypeAnnotationNode* itemType = nullptr;
+        if (!EnsureNewSeqType<false>(input->Head(), ctx.Expr, &itemType)) {
             return IGraphTransformer::TStatus::Error;
         }
 
-        auto listType = input->Head().GetTypeAnn()->Cast<TListExprType>();
-        if (listType->GetItemType()->GetKind() == ETypeAnnotationKind::Variant) {
+        if (itemType->GetKind() == ETypeAnnotationKind::Variant) {
             output = ctx.Expr.RenameNode(*input, "Demux");
         } else {
             output = input->HeadPtr();
@@ -9953,7 +10026,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
             }
         } else if (p0 == "token" || p0 == "cluster") {
             const auto p1 = tokenName.substr(separator + 1);
-            auto cred = ctx.Types.FindCredential(p1);
+            auto cred = ctx.Types.Credentials->FindCredential(p1);
             TMaybe<TCredential> clusterCred;
             if (cred == nullptr && p0 == "cluster") {
                 if (p1.StartsWith("default_")) {
@@ -10137,16 +10210,16 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
             return IGraphTransformer::TStatus::Error;
         }
 
-        if (!EnsureListType(input->Head(), ctx.Expr)) {
+        const TTypeAnnotationNode* itemType = nullptr;
+        if (!EnsureNewSeqType<false>(input->Head(), ctx.Expr, &itemType)) {
             return IGraphTransformer::TStatus::Error;
         }
 
-        auto listItemType = input->Head().GetTypeAnn()->Cast<TListExprType>()->GetItemType();
-        if (!EnsureVariantType(input->Head().Pos(), *listItemType, ctx.Expr)) {
+        if (!EnsureVariantType(input->Head().Pos(), *itemType, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
 
-        auto variantType = listItemType->Cast<TVariantExprType>();
+        auto variantType = itemType->Cast<TVariantExprType>();
         const TTypeAnnotationNode* resultType = nullptr;
         if (variantType->GetUnderlyingType()->GetKind() == ETypeAnnotationKind::Tuple) {
             const TTupleExprType* tupleType = variantType->GetUnderlyingType()->Cast<TTupleExprType>();
@@ -11215,17 +11288,23 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["CountBits"] = &CountBitsWrapper;
         Functions["Plus"] = &PlusMinusWrapper;
         Functions["Minus"] = &PlusMinusWrapper;
+        Functions["CheckedMinus"] = &PlusMinusWrapper;
         Functions["+"] = &AddWrapper;
         Functions["Add"] = &AddWrapper;
+        Functions["CheckedAdd"] = &AddWrapper;
         Functions["AggrAdd"] = &AggrAddWrapper;
         Functions["-"] = &SubWrapper;
         Functions["Sub"] = &SubWrapper;
+        Functions["CheckedSub"] = &SubWrapper;
         Functions["*"] = &MulWrapper;
         Functions["Mul"] = &MulWrapper;
+        Functions["CheckedMul"] = &MulWrapper;
         Functions["/"] = &DivWrapper;
         Functions["Div"] = &DivWrapper;
+        Functions["CheckedDiv"] = &DivWrapper;
         Functions["%"] = &ModWrapper;
         Functions["Mod"] = &ModWrapper;
+        Functions["CheckedMod"] = &ModWrapper;
         Functions["BitAnd"] = &BitOpsWrapper<2>;
         Functions["BitOr"] = &BitOpsWrapper<2>;
         Functions["BitXor"] = &BitOpsWrapper<2>;
@@ -11497,6 +11576,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["CountedAggregateAll"] = &CountedAggregateAllWrapper;
         Functions["AggApply"] = &AggApplyWrapper;
         Functions["AggApplyState"] = &AggApplyWrapper;
+        Functions["AggBlockApply"] = &AggBlockApplyWrapper;
         Functions["WinOnRows"] = &WinOnWrapper;
         Functions["WinOnGroups"] = &WinOnWrapper;
         Functions["WinOnRange"] = &WinOnWrapper;
@@ -11572,7 +11652,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["PgGrouping"] = &PgGroupingWrapper;
         Functions["PgGroupingSet"] = &PgGroupingSetWrapper;
 
-        Functions["AutoDemuxList"] = &AutoDemuxListWrapper;
+        Functions["AutoDemux"] = &AutoDemuxWrapper;
         Functions["AggrCountInit"] = &AggrCountInitWrapper;
         Functions["AggrCountUpdate"] = &AggrCountUpdateWrapper;
         Functions["QueueCreate"] = &QueueCreateWrapper;
@@ -11692,9 +11772,12 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
 
         Functions["WideToBlocks"] = &WideToBlocksWrapper;
         Functions["WideFromBlocks"] = &WideFromBlocksWrapper;
+        Functions["WideSkipBlocks"] = &WideSkipTakeBlocksWrapper;
+        Functions["WideTakeBlocks"] = &WideSkipTakeBlocksWrapper;
         Functions["AsScalar"] = &AsScalarWrapper;
         ExtFunctions["BlockFunc"] = &BlockFuncWrapper;
         ExtFunctions["BlockBitCast"] = &BlockBitCastWrapper;
+        ExtFunctions["BlockCombineAll"] = &BlockCombineAllWrapper;
 
         Functions["AsRange"] = &AsRangeWrapper;
         Functions["RangeCreate"] = &RangeCreateWrapper;

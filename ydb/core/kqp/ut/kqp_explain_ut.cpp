@@ -42,12 +42,26 @@ void CreateSampleTables(TKikimrRunner& kikimr) {
     session.Close();
 }
 
+bool ValidatePlanNodeIds(const NJson::TJsonValue& plan) {
+    ui32 planNodeId = 0;
+    ui32 count = 0;
+
+    do {
+        count = CountPlanNodesByKv(plan, "PlanNodeId", std::to_string(++planNodeId));
+        if (count > 1) {
+            return false;
+        }
+    } while (count > 0);
+
+    return true;
+}
+
 }
 
 Y_UNIT_TEST_SUITE(KqpExplain) {
 
-    Y_UNIT_TEST_TWIN(Explain, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(Explain) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
@@ -64,6 +78,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto join = FindPlanNodeByKv(plan, "Node Type", "Aggregate-InnerJoin (MapJoin)-Filter");
         UNIT_ASSERT(join.IsDefined());
@@ -75,8 +90,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT(right.IsDefined());
     }
 
-    Y_UNIT_TEST_TWIN(ExplainStream, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(ExplainStream) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
@@ -92,6 +107,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto join = FindPlanNodeByKv(plan, "Node Type", "Aggregate-InnerJoin (MapJoin)-Filter");
         UNIT_ASSERT(join.IsDefined());
@@ -103,15 +119,14 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT(right.IsDefined());
     }
 
-    Y_UNIT_TEST_TWIN(ExplainScanQueryWithParams, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(ExplainScanQueryWithParams) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
 
         auto it = db.StreamExecuteScanQuery(R"(
             --SELECT count(*) FROM `/Root/EightShard` AS t JOIN `/Root/KeyValue` AS kv ON t.Data = kv.Key;
-            PRAGMA Kikimr.UseNewEngine = "false";
             DECLARE $value as Utf8;
             SELECT $value as value;
         )", settings).GetValueSync();
@@ -120,8 +135,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
     }
 
-    Y_UNIT_TEST_TWIN(AggGroupLimit, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(AggGroupLimit) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
@@ -137,6 +152,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto read = FindPlanNodeByKv(plan, "Node Type", "Aggregate-Filter-TableFullScan");
         UNIT_ASSERT(read.IsDefined());
@@ -153,8 +169,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
             "{_yql_agg_0: MIN(item.Message),_yql_agg_1: MAX(item.Message)}");
     }
 
-    Y_UNIT_TEST_TWIN(ComplexJoin, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(ComplexJoin) {
+        auto kikimr = DefaultKikimrRunner();
         CreateSampleTables(kikimr);
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
@@ -179,6 +195,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto join = FindPlanNodeByKv(
             plan,
@@ -194,8 +211,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT(right.IsDefined());
     }
 
-    Y_UNIT_TEST_TWIN(PrecomputeRange, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(PrecomputeRange) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
@@ -211,6 +228,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto node = FindPlanNodeByKv(plan, "Node Type", "TopSort-TableRangesScan");
         UNIT_ASSERT(node.IsDefined());
@@ -222,8 +240,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT(readRanges[0] == "Key [150, 266]");
     }
 
-    Y_UNIT_TEST_TWIN(CompoundKeyRange, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(CompoundKeyRange) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
@@ -240,6 +258,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto read = FindPlanNodeByKv(plan, "Node Type", "Limit-TablePointLookup");
         auto& operators = read.GetMapSafe().at("Operators").GetArraySafe();
@@ -250,8 +269,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT(lookup.at("ReadRange").GetArraySafe()[0] == "App (new_app_1)");
     }
 
-    Y_UNIT_TEST_TWIN(SortStage, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(SortStage) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
@@ -267,13 +286,14 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto scanSort = FindPlanNodeByKv(plan, "Node Type", "Sort-TableRangeScan");
         UNIT_ASSERT(scanSort.IsDefined());
     }
 
-    Y_UNIT_TEST_TWIN(LimitOffset, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(LimitOffset) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
@@ -289,6 +309,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto limit = FindPlanNodeByKv(plan, "Limit", "10");
         UNIT_ASSERT(limit.IsDefined());
@@ -296,8 +317,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT(offset.IsDefined());
     }
 
-    Y_UNIT_TEST_TWIN(SelfJoin3xSameLabels, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(SelfJoin3xSameLabels) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
@@ -324,6 +345,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto join1 = FindPlanNodeByKv(plan, "Node Type", "Sort-InnerJoin (MapJoin)-Filter");
         UNIT_ASSERT(join1.IsDefined());
@@ -331,8 +353,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT(join2.IsDefined());
     }
 
-    Y_UNIT_TEST_TWIN(PureExpr, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(PureExpr) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
@@ -348,17 +370,18 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto constExpr = FindPlanNodeByKv(plan, "Node Type", "ConstantExpr");
         UNIT_ASSERT(constExpr.IsDefined());
     }
 
-    Y_UNIT_TEST_TWIN(MultiUsedStage, UseSessionActor) {
+    Y_UNIT_TEST(MultiUsedStage) {
         NKikimrConfig::TAppConfig appCfg;
         auto* spilling = appCfg.MutableTableServiceConfig()->MutableSpillingServiceConfig()->MutableLocalFileConfig();
         spilling->SetEnable(true);
         spilling->SetRoot("./spilling/");
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, appCfg);
+        auto kikimr = DefaultKikimrRunner({}, appCfg);
 
         auto db = kikimr.GetTableClient();
         TStreamExecScanQuerySettings settings;
@@ -375,6 +398,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         bool containCte = false;
         auto& plans = plan.GetMapSafe().at("Plan").GetMapSafe().at("Plans");
@@ -389,8 +413,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT(containCte);
     }
 
-    Y_UNIT_TEST_TWIN(SqlIn, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(SqlIn) {
+        auto kikimr = DefaultKikimrRunner();
         CreateSampleTables(kikimr);
 
         TStreamExecScanQuerySettings settings;
@@ -411,33 +435,18 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto unionNode = FindPlanNodeByKv(plan, "Node Type", "Sort-Union");
         UNIT_ASSERT_EQUAL(unionNode.GetMap().at("Plans").GetArraySafe().size(), 4);
     }
 
-    Y_UNIT_TEST_TWIN(ExplainDataQueryOldEngine, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(ExplainDataQuery) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
         auto result = session.ExplainDataQuery(R"(
-            SELECT Key, Value FROM `/Root/KeyValue` WHERE Key IN (1, 2, 3, 42) ORDER BY Key;
-        )").ExtractValueSync();
-        result.GetIssues().PrintTo(Cerr);
-
-        NJson::TJsonValue plan;
-        NJson::ReadJsonTree(result.GetPlan(), &plan, true);
-        UNIT_ASSERT_EQUAL(plan.GetMapSafe().at("tables").GetArraySafe()[0].GetMapSafe().at("name").GetStringSafe(), "/Root/KeyValue");
-    }
-
-    Y_UNIT_TEST_TWIN(ExplainDataQueryNewEngine, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
-        auto db = kikimr.GetTableClient();
-        auto session = db.CreateSession().GetValueSync().GetSession();
-
-        auto result = session.ExplainDataQuery(R"(
-            PRAGMA kikimr.UseNewEngine = "true";
             SELECT Key, Value FROM `/Root/KeyValue` WHERE Key IN (1, 2, 3, 42) ORDER BY Key;
             SELECT Key, Value FROM `/Root/KeyValue` WHERE Key IN (1, 2, 3, 4*2) ORDER BY Key;
             SELECT count(distinct Value) FROM `/Root/KeyValue` WHERE Key > 20 and Key <= 120;
@@ -448,6 +457,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(result.GetPlan(), &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
+
         auto node = FindPlanNodeByKv(plan, "Name", "TableRangeScan");
         UNIT_ASSERT_EQUAL(node.GetMapSafe().at("Table").GetStringSafe(), "KeyValue");
         node = FindPlanNodeByKv(plan, "Name", "TableFullScan");
@@ -456,13 +467,12 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT_EQUAL(node.GetMapSafe().at("Table").GetStringSafe(), "KeyValue");
     }
 
-    Y_UNIT_TEST_TWIN(FewEffects, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(FewEffects) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
         auto result = session.ExplainDataQuery(R"(
-            PRAGMA kikimr.UseNewEngine = "true";
             UPDATE `/Root/EightShard` SET Data=Data+1;
             UPDATE `/Root/EightShard` SET Data=Data-1 WHERE Key In (100,200,300);
             DELETE FROM `/Root/EightShard` WHERE Key > 350;
@@ -471,6 +481,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(result.GetPlan(), &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         // Cerr << plan << Endl;
 
@@ -510,28 +521,26 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT_VALUES_EQUAL(counter["Lookup"], lookupsCount);
     }
 
-    Y_UNIT_TEST_TWIN(ExplainDataQueryWithParams, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(ExplainDataQueryWithParams) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
         auto result = session.ExplainDataQuery(R"(
-            PRAGMA Kikimr.UseNewEngine = "false";
             DECLARE $value as Utf8;
             SELECT $value as value;
         )").ExtractValueSync();
         UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
 
         auto result2 = session.ExplainDataQuery(R"(
-            PRAGMA Kikimr.UseNewEngine = "true";
             DECLARE $value as Utf8;
             SELECT $value as value;
         )").ExtractValueSync();
         UNIT_ASSERT_VALUES_EQUAL_C(result2.GetStatus(), EStatus::SUCCESS, result2.GetIssues().ToString());
     }
 
-    Y_UNIT_TEST_TWIN(FullOuterJoin, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(FullOuterJoin) {
+        auto kikimr = DefaultKikimrRunner();
         CreateSampleTables(kikimr);
 
         TStreamExecScanQuerySettings settings;
@@ -550,6 +559,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto join = FindPlanNodeByKv(plan, "Node Type", "FullJoin (JoinDict)");
         UNIT_ASSERT(join.IsDefined());
@@ -559,8 +569,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT(right.IsDefined());
     }
 
-    Y_UNIT_TEST_TWIN(ReadTableRangesFullScan, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(ReadTableRangesFullScan) {
+        auto kikimr = DefaultKikimrRunner();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
         auto db = kikimr.GetTableClient();
@@ -610,6 +620,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
             NJson::TJsonValue plan;
             NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+            UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
             auto read = FindPlanNodeByKv(plan, "Node Type", data.second);
             UNIT_ASSERT(read.IsDefined());
@@ -622,8 +633,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         }
     }
 
-    Y_UNIT_TEST_TWIN(ReadTableRanges, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(ReadTableRanges) {
+        auto kikimr = DefaultKikimrRunner();
         CreateSampleTables(kikimr);
 
         TStreamExecScanQuerySettings settings;
@@ -641,6 +652,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto read = FindPlanNodeByKv(plan, "Node Type", "TableRangesScan");
         UNIT_ASSERT(read.IsDefined());
@@ -650,8 +662,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         UNIT_ASSERT(count.IsDefined());
     }
 
-    Y_UNIT_TEST_TWIN(Predicates, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(Predicates) {
+        auto kikimr = DefaultKikimrRunner();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
 
@@ -709,6 +721,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
             NJson::TJsonValue plan;
             NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+            UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
             auto filter = FindPlanNodeByKv(plan, "Name", "Filter");
             UNIT_ASSERT(filter.IsDefined());
@@ -719,8 +732,8 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         }
     }
 
-    Y_UNIT_TEST_TWIN(MergeConnection, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(MergeConnection) {
+        auto kikimr = DefaultKikimrRunner();
         TStreamExecScanQuerySettings settings;
         settings.Explain(true);
 
@@ -738,6 +751,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
 
         NJson::TJsonValue plan;
         NJson::ReadJsonTree(*res.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
 
         auto merge = FindPlanNodeByKv(
             plan,

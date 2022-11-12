@@ -269,19 +269,6 @@ public:
         , SessionCtx(sessionCtx) {}
 
 private:
-    virtual TStatus HandleClusterConfig(TKiClusterConfig node, TExprContext& ctx) override {
-        if (!EnsureTuple(node.GrpcData().Ref(), ctx)) {
-            return TStatus::Error;
-        }
-
-        if (!EnsureAtom(node.TvmId().Ref(), ctx)) {
-            return TStatus::Error;
-        }
-
-        node.Ptr()->SetTypeAnn(ctx.MakeType<TUnitExprType>());
-        return TStatus::Ok;
-    }
-
     virtual TStatus HandleWriteTable(TKiWriteTable node, TExprContext& ctx) override {
         if (!EnsureWorldType(node.World().Ref(), ctx)) {
             return TStatus::Error;
@@ -557,12 +544,21 @@ private:
     virtual TStatus HandleCreateTable(TKiCreateTable create, TExprContext& ctx) override {
         TString cluster = TString(create.DataSink().Cluster());
         TString table = TString(create.Table());
+        TString tableType = TString(create.TableType());
 
         auto columnTypeError = GetColumnTypeErrorFn(ctx);
 
         TKikimrTableMetadataPtr meta = new TKikimrTableMetadata(cluster, table);
         meta->DoesExist = true;
         meta->ColumnOrder.reserve(create.Columns().Size());
+
+        auto tableTypeEnum = GetTableTypeFromString(tableType);
+        if (tableTypeEnum == ETableType::Unknown) {
+            ctx.AddError(TIssue(ctx.GetPosition(create.Pos()), TStringBuilder()
+                << "Unknown table type: " << tableType << "."));
+            return TStatus::Error;
+        }
+        meta->TableType = tableTypeEnum;
 
         for (auto atom : create.PrimaryKey()) {
             meta->KeyColumnNames.emplace_back(atom.Value());
@@ -821,7 +817,10 @@ private:
                     "Can't reset TTL settings"));
                 return TStatus::Error;
             } else if (name == "storeType") {
-                meta->TableSettings.StoreType = TString(setting.Value().Cast<TCoAtom>().Value());
+                TMaybe<TString> storeType = TString(setting.Value().Cast<TCoAtom>().Value());
+                if (storeType && to_lower(storeType.GetRef()) == "column") {
+                    meta->StoreType = EStoreType::Column;
+                }
             } else if (name == "partitionByHashFunction") {
                 meta->TableSettings.PartitionByHashFunction = TString(
                     setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Value()
@@ -833,12 +832,17 @@ private:
             }
         }
 
-        if (!EnsureModifyPermissions(cluster, table, create.Pos(), ctx)) {
+        if (meta->TableType == ETableType::TableStore && meta->StoreType != EStoreType::Column) {
+            ctx.AddError(TIssue(ctx.GetPosition(create.Pos()),
+                    TStringBuilder() << "TABLESTORE recuires STORE = COLUMN setting now"));
             return TStatus::Error;
         }
 
+        if (!EnsureModifyPermissions(cluster, table, create.Pos(), ctx)) {
+            return TStatus::Error;
+        }
         auto& tableDesc = SessionCtx->Tables().GetTable(cluster, table);
-        if (tableDesc.DoesExist() && !tableDesc.Metadata->IsSameTable(*meta)) {
+        if (meta->TableType == ETableType::Table && tableDesc.DoesExist() && !tableDesc.Metadata->IsSameTable(*meta)) {
             ctx.AddError(TIssue(ctx.GetPosition(create.Pos()), TStringBuilder()
                 << "Table name conflict: " << NCommon::FullTableName(cluster, table)
                 << " is used to reference multiple tables."));
@@ -859,12 +863,14 @@ private:
             return TStatus::Error;
         }
 
-        if (!EnsureModifyPermissions(table->Metadata->Cluster, table->Metadata->Name, node.Pos(), ctx)) {
-            return TStatus::Error;
-        }
+        if (table->GetTableType() == ETableType::Table) {
+            if (!EnsureModifyPermissions(table->Metadata->Cluster, table->Metadata->Name, node.Pos(), ctx)) {
+                return TStatus::Error;
+            }
 
-        if (!CheckDocApiModifiation(*table->Metadata, node.Pos(), ctx)) {
-            return TStatus::Error;
+            if (!CheckDocApiModifiation(*table->Metadata, node.Pos(), ctx)) {
+                return TStatus::Error;
+            }
         }
 
         node.Ptr()->SetTypeAnn(node.World().Ref().GetTypeAnn());
@@ -1265,151 +1271,6 @@ private:
     }
 
     virtual TStatus HandleKql(TCallable node, TExprContext& ctx) override {
-        bool sysColumnsEnabled = SessionCtx->Config().SystemColumnsEnabled();
-        if (auto call = node.Maybe<TKiSelectRow>()) {
-            auto selectRow = call.Cast();
-
-            auto selectType = GetReadTableRowType(ctx, SessionCtx->Tables(), TString(selectRow.Cluster()),
-                TString(selectRow.Table().Path()), selectRow.Select(), sysColumnsEnabled);
-            if (!selectType) {
-                return TStatus::Error;
-            }
-
-            auto optSelectType = ctx.MakeType<TOptionalExprType>(selectType);
-
-            node.Ptr()->SetTypeAnn(optSelectType);
-
-            return TStatus::Ok;
-        }
-
-        if (auto call = node.Maybe<TKiSelectRangeBase>()) {
-            auto selectRange = call.Cast();
-
-            auto selectType = GetReadTableRowType(ctx, SessionCtx->Tables(), TString(selectRange.Cluster()),
-                TString(selectRange.Table().Path()), selectRange.Select(), sysColumnsEnabled);
-            if (!selectType) {
-                return TStatus::Error;
-            }
-
-            auto listSelectType = ctx.MakeType<TListExprType>(selectType);
-
-            node.Ptr()->SetTypeAnn(listSelectType);
-
-            return TStatus::Ok;
-        }
-
-        if (node.Maybe<TKiUpdateRow>()) {
-            node.Ptr()->SetTypeAnn(ctx.MakeType<TVoidExprType>());
-
-            return TStatus::Ok;
-        }
-
-        if (node.Maybe<TKiEraseRow>()) {
-            node.Ptr()->SetTypeAnn(ctx.MakeType<TVoidExprType>());
-
-            return TStatus::Ok;
-        }
-
-        if (node.Maybe<TKiSetResult>()) {
-            node.Ptr()->SetTypeAnn(ctx.MakeType<TVoidExprType>());
-
-            return TStatus::Ok;
-        }
-
-        if (auto maybeMap = node.Maybe<TKiMapParameter>()) {
-            auto map = maybeMap.Cast();
-
-            if (!EnsureArgsCount(map.Ref(), 2, ctx)) {
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            if (!EnsureListType(map.Input().Ref(), ctx)) {
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            auto& lambda = map.Ptr()->ChildRef(TKiMapParameter::idx_Lambda);
-            auto itemType = map.Input().Ref().GetTypeAnn()->Cast<TListExprType>()->GetItemType();
-            if (!UpdateLambdaAllArgumentsTypes(lambda, {itemType}, ctx)) {
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            if (!lambda->GetTypeAnn()) {
-                return IGraphTransformer::TStatus::Repeat;
-            }
-
-            map.Ptr()->SetTypeAnn(ctx.MakeType<TListExprType>(lambda->GetTypeAnn()));
-
-            return TStatus::Ok;
-        }
-
-        if (auto maybeMap = node.Maybe<TKiFlatMapParameter>()) {
-            auto map = maybeMap.Cast();
-
-            if (!EnsureArgsCount(map.Ref(), 2, ctx)) {
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            if (!EnsureListType(map.Input().Ref(), ctx)) {
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            auto& lambda = map.Ptr()->ChildRef(TKiFlatMapParameter::idx_Lambda);
-            auto itemType = map.Input().Ref().GetTypeAnn()->Cast<TListExprType>()->GetItemType();
-            if (!UpdateLambdaAllArgumentsTypes(lambda, {itemType}, ctx)) {
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            if (!lambda->GetTypeAnn()) {
-                return IGraphTransformer::TStatus::Repeat;
-            }
-
-            auto retKind = lambda->GetTypeAnn()->GetKind();
-            if (retKind != ETypeAnnotationKind::List) {
-                ctx.AddError(TIssue(ctx.GetPosition(lambda->Pos()), TStringBuilder() << "Expected list as labmda return type, but got: " << *lambda->GetTypeAnn()));
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            map.Ptr()->SetTypeAnn(lambda->GetTypeAnn());
-
-            return TStatus::Ok;
-        }
-
-        if (node.Maybe<TKiPartialSort>()) {
-            NTypeAnnImpl::TContext typeAnnCtx(ctx);
-            TExprNode::TPtr output;
-            return NTypeAnnImpl::SortWrapper(node.Ptr(), output, typeAnnCtx);
-        }
-
-        if (node.Maybe<TKiPartialTake>()) {
-            NTypeAnnImpl::TContext typeAnnCtx(ctx);
-            TExprNode::TPtr output;
-            return NTypeAnnImpl::TakeWrapper(node.Ptr(), output, typeAnnCtx);
-        }
-
-        if (auto maybeCondEffect = node.Maybe<TKiConditionalEffect>()) {
-            auto condEffect = maybeCondEffect.Cast();
-
-            if (!EnsureDataType(condEffect.Predicate().Ref(), ctx)) {
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            auto predicateType = condEffect.Predicate().Ref().GetTypeAnn()->Cast<TDataExprType>();
-            YQL_ENSURE(predicateType);
-
-            if (predicateType->GetSlot() != EDataSlot::Bool) {
-                ctx.AddError(TIssue(ctx.GetPosition(condEffect.Pos()), "Expected bool as predicate type"));
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            if (!EnsureListOfVoidType(condEffect.Effect().Ref(), ctx)) {
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            condEffect.Ptr()->SetTypeAnn(condEffect.Effect().Ref().GetTypeAnn());
-
-            return TStatus::Ok;
-        }
-
         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
             << "Unknown Kql callable in type annotation: " << node.CallableName()));
 

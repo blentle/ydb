@@ -311,11 +311,10 @@ private:
                 }
 
                 TVector<NDqProto::TData> chunks;
-                NDqProto::TPopResponse lastPop;
                 NDqProto::TPopResponse response;
                 for (;maxChunks && remain > 0 && !isFinished && hasData; maxChunks--, remain -= dataSize) {
                     NDqProto::TData data;
-                    lastPop = std::move(channel->Pop(data, remain));
+                    const auto lastPop = std::move(channel->Pop(data, remain));
 
                     for (auto& metric : lastPop.GetMetric()) {
                         *response.AddMetric() = metric;
@@ -332,11 +331,6 @@ private:
                     }
                 }
 
-                TDqTaskRunnerStatsInplace stats;
-                NDqProto::TGetStatsResponse pbStats;
-                lastPop.GetStats().UnpackTo(&pbStats);
-                stats.FromProto(pbStats.GetStats());
-
                 actorSystem->Send(
                     new IEventHandle(
                         replyTo,
@@ -348,8 +342,7 @@ private:
                             Nothing(),
                             isFinished,
                             changed,
-                            GetSensors(response),
-                            TDqTaskRunnerStatsView(std::move(stats))),
+                            GetSensors(response)),
                         /*flags=*/0,
                         cookie));
             } catch (...) {

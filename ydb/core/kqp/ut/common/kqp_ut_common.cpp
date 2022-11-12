@@ -75,18 +75,6 @@ TKikimrRunner::TKikimrRunner(const TKikimrSettings& settings) {
     Cerr << "Trying to start YDB, gRPC: " << grpcPort << ", MsgBus: " << mbusPort << Endl;
 
     TVector<NKikimrKqp::TKqpSetting> effectiveKqpSettings;
-    {
-        // Allow NewEngine in tests
-        NKikimrKqp::TKqpSetting setting;
-        setting.SetName("_KqpAllowNewEngine");
-        setting.SetValue("true");
-        effectiveKqpSettings.push_back(setting);
-
-        // Force NewEngine in tests
-        // setting.SetName("_KqpForceNewEngine");
-        // setting.SetValue("true");
-        // effectiveKqpSettings.push_back(setting);
-    }
 
     bool enableSpilling = false;
     if (settings.AppConfig.GetTableServiceConfig().GetSpillingServiceConfig().GetLocalFileConfig().GetEnable()) {
@@ -291,7 +279,6 @@ void TKikimrRunner::CreateSampleTables() {
     )").GetValueSync());
 
     AssertSuccessResult(session.ExecuteDataQuery(R"(
-        PRAGMA kikimr.UseNewEngine = "true";
 
         REPLACE INTO `TwoShard` (Key, Value1, Value2) VALUES
             (1u, "One", -1),
@@ -535,22 +522,6 @@ void FillProfile(NYdb::NTable::TScanQueryPart& streamPart, NYson::TYsonWriter& w
     Y_UNUSED(profileIndex);
 }
 
-void FillProfile(NYdb::NExperimental::TStreamPart& streamPart, NYson::TYsonWriter& writer, TVector<TString>* profiles,
-    ui32 profileIndex)
-{
-    if (streamPart.HasProfile()) {
-        if (profiles) {
-            profiles->emplace_back(streamPart.ExtractProfile());
-        } else {
-            writer.OnListItem();
-            writer.OnBeginMap();
-            writer.OnKeyedItem(TStringBuilder() << "_profile_" << profileIndex);
-            writer.OnStringScalar(streamPart.ExtractProfile());
-            writer.OnEndMap();
-        }
-    }
-}
-
 void PrintResultSet(const NYdb::TResultSet& resultSet, NYson::TYsonWriter& writer) {
     auto columns = resultSet.GetColumnsMeta();
 
@@ -593,10 +564,6 @@ TString StreamResultToYsonImpl(TIterator& it, TVector<TString>* profiles) {
     writer.OnEndList();
 
     return out.Str();
-}
-
-TString StreamResultToYson(NYdb::NExperimental::TStreamPartIterator& it, TVector<TString>* profiles) {
-    return StreamResultToYsonImpl(it, profiles);
 }
 
 TString StreamResultToYson(NYdb::NTable::TScanQueryPartIterator& it) {
@@ -711,10 +678,6 @@ TCollectedStreamResult CollectStreamResultImpl(TIterator& it) {
 
     res.ResultSetYson = out.Str();
     return res;
-}
-
-TCollectedStreamResult CollectStreamResult(NYdb::NExperimental::TStreamPartIterator& it) {
-    return CollectStreamResultImpl(it);
 }
 
 TCollectedStreamResult CollectStreamResult(NYdb::NTable::TScanQueryPartIterator& it) {
@@ -883,7 +846,6 @@ void CreateSampleTablesWithIndex(TSession& session) {
     UNIT_ASSERT_C(res.IsSuccess(), res.GetIssues().ToString());
 
     auto result = session.ExecuteDataQuery(R"(
-        PRAGMA kikimr.UseNewEngine = "true";
 
         REPLACE INTO `KeyValue` (Key, Value) VALUES
             (3u,   "Three"),
@@ -928,7 +890,6 @@ void WaitForKqpProxyInit(const NYdb::TDriver& driver) {
     while (true) {
         auto it = client.RetryOperationSync([=](TSession session) {
             return session.ExecuteDataQuery(R"(
-                        PRAGMA kikimr.UseNewEngine = "true";
                         SELECT 1;
                     )",
                     TTxControl::BeginTx().CommitTx()
@@ -943,46 +904,7 @@ void WaitForKqpProxyInit(const NYdb::TDriver& driver) {
 }
 
 void InitRoot(Tests::TServer::TPtr server, TActorId sender) {
-    if (server->GetSettings().StoragePoolTypes.empty()) {
-        return;
-    }
-
-    auto &runtime = *server->GetRuntime();
-    auto &settings = server->GetSettings();
-
-    auto tid = Tests::ChangeStateStorage(Tests::SchemeRoot, settings.Domain);
-    const TDomainsInfo::TDomain& domain = runtime.GetAppData().DomainsInfo->GetDomain(settings.Domain);
-
-    auto evTx = MakeHolder<NSchemeShard::TEvSchemeShard::TEvModifySchemeTransaction>(1, tid);
-    auto transaction = evTx->Record.AddTransaction();
-    transaction->SetOperationType(NKikimrSchemeOp::EOperationType::ESchemeOpAlterSubDomain);
-    transaction->SetWorkingDir("/");
-    auto op = transaction->MutableSubDomain();
-    op->SetName(domain.Name);
-
-    for (const auto& [kind, pool] : settings.StoragePoolTypes) {
-        auto* p = op->AddStoragePools();
-        p->SetKind(kind);
-        p->SetName(pool.GetName());
-    }
-
-    runtime.SendToPipe(tid, sender, evTx.Release(), 0, GetPipeConfigWithRetries());
-
-    {
-        TAutoPtr<IEventHandle> handle;
-        auto event = runtime.GrabEdgeEvent<NSchemeShard::TEvSchemeShard::TEvModifySchemeTransactionResult>(handle);
-        UNIT_ASSERT_VALUES_EQUAL(event->Record.GetSchemeshardId(), tid);
-        UNIT_ASSERT_VALUES_EQUAL(event->Record.GetStatus(), NKikimrScheme::EStatus::StatusAccepted);
-    }
-
-    auto evSubscribe = MakeHolder<NSchemeShard::TEvSchemeShard::TEvNotifyTxCompletion>(1);
-    runtime.SendToPipe(tid, sender, evSubscribe.Release(), 0, GetPipeConfigWithRetries());
-
-    {
-        TAutoPtr<IEventHandle> handle;
-        auto event = runtime.GrabEdgeEvent<NSchemeShard::TEvSchemeShard::TEvNotifyTxCompletionResult>(handle);
-        UNIT_ASSERT_VALUES_EQUAL(event->Record.GetTxId(), 1);
-    }
+    server->SetupRootStoragePools(sender);
 }
 
 } // namspace NKqp

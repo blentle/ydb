@@ -98,6 +98,21 @@ public:
 };
 
 template <>
+class TContextBase<TEvDeleteObjectsRequest, TEvDeleteObjectsResponse>
+    : public TCommonContextBase<TEvDeleteObjectsRequest, TEvDeleteObjectsResponse> {
+private:
+    using TBase = TCommonContextBase<TEvDeleteObjectsRequest, TEvDeleteObjectsResponse>;
+public:
+    using TBase::Send;
+    using TBase::TBase;
+    void Reply(const typename TBase::TRequest& /*request*/, const typename TBase::TOutcome& outcome) const {
+        Y_VERIFY(!std::exchange(TBase::Replied, true), "Double-reply");
+
+        Send(MakeHolder<TEvDeleteObjectsResponse>(outcome).Release());
+    }
+};
+
+template <>
 class TContextBase<TEvCheckObjectExistsRequest, TEvCheckObjectExistsResponse>
     : public TCommonContextBase<TEvCheckObjectExistsRequest, TEvCheckObjectExistsResponse> {
 private:
@@ -105,9 +120,9 @@ private:
 public:
     using TBase::Send;
     using TBase::TBase;
-    void Reply(const typename TBase::TRequest& request, const typename TBase::TOutcome& outcome) const {
+    void Reply(const typename TBase::TRequest& /*request*/, const typename TBase::TOutcome& outcome) const {
         Y_VERIFY(!std::exchange(TBase::Replied, true), "Double-reply");
-        Send(MakeHolder<TEvCheckObjectExistsResponse>(request, outcome, RequestContext).Release());
+        Send(MakeHolder<TEvCheckObjectExistsResponse>(outcome, RequestContext).Release());
     }
 };
 
@@ -209,7 +224,7 @@ public:
     using TContextBase<TEvRequest, TEvResponse>::TContextBase;
 
     const TRequest& PrepareRequest(typename TEvRequest::TPtr& ev) override {
-        auto& request = ev->Get()->Request;
+        auto& request = ev->Get()->MutableRequest();
 
         Buffer = std::move(ev->Get()->Body);
         request.SetBody(MakeShared<DefaultUnderlyingStream>("StreamContext",
@@ -238,7 +253,7 @@ void TS3ExternalStorage::Execute(TEvGetObjectRequest::TPtr& ev) const {
 
 void TS3ExternalStorage::Execute(TEvCheckObjectExistsRequest::TPtr& ev) const {
     Call<TEvCheckObjectExistsRequest, TEvCheckObjectExistsResponse, TContextBase>(
-        ev, &S3Client::HeadObjectAsync);
+        ev, &S3Client::ListObjectsAsync);
 }
 
 void TS3ExternalStorage::Execute(TEvListObjectsRequest::TPtr& ev) const {
@@ -259,6 +274,11 @@ void TS3ExternalStorage::Execute(TEvPutObjectRequest::TPtr& ev) const {
 void TS3ExternalStorage::Execute(TEvDeleteObjectRequest::TPtr& ev) const {
     Call<TEvDeleteObjectRequest, TEvDeleteObjectResponse, TContextBase>(
         ev, &S3Client::DeleteObjectAsync);
+}
+
+void TS3ExternalStorage::Execute(TEvDeleteObjectsRequest::TPtr& ev) const {
+    Call<TEvDeleteObjectsRequest, TEvDeleteObjectsResponse, TContextBase>(
+        ev, &S3Client::DeleteObjectsAsync);
 }
 
 void TS3ExternalStorage::Execute(TEvCreateMultipartUploadRequest::TPtr& ev) const {

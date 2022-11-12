@@ -51,7 +51,10 @@ TDqConfiguration::TDqConfiguration() {
     REGISTER_SETTING(*this, EnableDqReplicate);
     REGISTER_SETTING(*this, WatermarksMode);
     REGISTER_SETTING(*this, WatermarksGranularityMs);
+    REGISTER_SETTING(*this, WatermarksLateArrivalDelayMs);
+    REGISTER_SETTING(*this, WatermarksEnableIdlePartitions);
     REGISTER_SETTING(*this, UseAggPhases);
+    REGISTER_SETTING(*this, ParallelOperationsLimit).Lower(1).Upper(128);
 }
 
 } // namespace NYql

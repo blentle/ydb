@@ -1,4 +1,4 @@
-#include "kqp_prepare_impl.h"
+#include "kqp_prepare.h"
 
 #include <ydb/core/kqp/common/kqp_yql.h>
 #include <ydb/core/kqp/provider/yql_kikimr_provider_impl.h>
@@ -6,6 +6,7 @@
 #include <ydb/library/yql/core/type_ann/type_ann_core.h>
 #include "ydb/library/yql/core/type_ann/type_ann_impl.h"
 #include <ydb/library/yql/core/yql_opt_utils.h>
+#include <ydb/library/yql/core/yql_expr_type_annotation.h>
 #include <ydb/library/yql/dq/type_ann/dq_type_ann.h>
 #include <ydb/library/yql/utils/log/log.h>
 
@@ -697,6 +698,110 @@ TStatus AnnotateDeleteRows(const TExprNode::TPtr& node, TExprContext& ctx, const
     return TStatus::Ok;
 }
 
+TStatus AnnotateOlapUnaryLogicOperator(const TExprNode::TPtr& node, TExprContext& ctx) {
+    if (!EnsureArgsCount(*node, 1, ctx)) {
+        return TStatus::Error;
+    }
+
+    node->SetTypeAnn(ctx.MakeType<TUnitExprType>());
+    return TStatus::Ok;
+}
+
+TStatus AnnotateOlapBinaryLogicOperator(const TExprNode::TPtr& node, TExprContext& ctx) {
+    if (!EnsureMinArgsCount(*node, 1, ctx)) {
+        return TStatus::Error;
+    }
+
+    node->SetTypeAnn(ctx.MakeType<TUnitExprType>());
+    return TStatus::Ok;
+}
+
+bool ValidateOlapFilterConditions(const TExprNode* node, const TStructExprType* itemType, TExprContext& ctx) {
+    YQL_ENSURE(itemType);
+
+    if (TKqpOlapAnd::Match(node) || TKqpOlapOr::Match(node) || TKqpOlapXor::Match(node) || TKqpOlapNot::Match(node)) {
+        bool res = true;
+        for (auto arg : node->ChildrenList()) {
+            res &= ValidateOlapFilterConditions(arg.Get(), itemType, ctx);
+            if (!res) {
+                break;
+            }
+        }
+        return res;
+    } else if (TKqpOlapFilterCompare::Match(node)) {
+        if (!EnsureArgsCount(*node, 3, ctx)) {
+            return false;
+        }
+        auto op = node->Child(TKqpOlapFilterCompare::idx_Operator);
+        if (!EnsureAtom(*op, ctx)) {
+            ctx.AddError(TIssue(ctx.GetPosition(node->Pos()),
+                TStringBuilder() << "Expected string as operator in OLAP comparison filter, got: " << op->Content()
+            ));
+            return false;
+        }
+        auto opStr = op->Content();
+        if (opStr != "eq"sv && opStr != "neq"sv && opStr != "lt"sv && opStr != "lte"sv && opStr != "gt"sv && opStr != "gte"sv) {
+            ctx.AddError(TIssue(ctx.GetPosition(node->Pos()),
+                TStringBuilder() << "Expected one of eq/neq/lt/lte/gt/gte operators in OLAP comparison filter, got: " << op->Content()
+            ));
+            return false;
+        }
+        return ValidateOlapFilterConditions(node->Child(TKqpOlapFilterCompare::idx_Left), itemType, ctx)
+            && ValidateOlapFilterConditions(node->Child(TKqpOlapFilterCompare::idx_Right), itemType, ctx);
+    } else if (TKqpOlapFilterExists::Match(node)) {
+        if (!EnsureArgsCount(*node, 1, ctx)) {
+            return false;
+        }
+        auto column = node->Child(TKqpOlapFilterExists::idx_Column);
+        if (!EnsureAtom(*column, ctx)) {
+            ctx.AddError(TIssue(ctx.GetPosition(node->Pos()),
+                TStringBuilder() << "Expected column in OLAP Exists filter, got: " << column->Content()
+            ));
+            return false;
+        }
+        return ValidateOlapFilterConditions(column, itemType, ctx);
+    }
+
+    // Column name, validate that it is present in Input node
+    if (TCoAtom::Match(node)) {
+        if (itemType->FindItem(node->Content())) {
+            return true;
+        }
+
+        ctx.AddError(TIssue(ctx.GetPosition(node->Pos()),
+            TStringBuilder() << "Missing column in input type: " << node->Content()
+        ));
+
+        return false;
+    }
+
+    // Null argument for IS NULL/NOT NULL
+    if (TCoNull::Match(node)) {
+        return true;
+    }
+
+    // Incoming parameter
+    if (TCoParameter::Match(node)) {
+        return true;
+    }
+
+    // Any supported literal
+    if (TCoDataCtor::Match(node)) {
+        return true;
+    }
+
+    // SafeCast, the checks about validity should be placed in kqp_opt_phy_olap_filter.cpp
+    if (TCoSafeCast::Match(node)) {
+        return true;
+    }
+
+    ctx.AddError(TIssue(ctx.GetPosition(node->Pos()),
+        TStringBuilder() << "Expected literal or column as OLAP filter value, got: " << node->Content()
+    ));
+
+    return false;
+}
+
 TStatus AnnotateOlapFilter(const TExprNode::TPtr& node, TExprContext& ctx) {
     if (!EnsureArgsCount(*node, 2, ctx)) {
         return TStatus::Error;
@@ -713,132 +818,11 @@ TStatus AnnotateOlapFilter(const TExprNode::TPtr& node, TExprContext& ctx) {
         return TStatus::Error;
     }
 
-    if (!EnsureSpecificDataType(*node->Child(TKqpOlapFilter::idx_Condition), EDataSlot::Bool, ctx)) {
+    if (!ValidateOlapFilterConditions(node->Child(TKqpOlapFilter::idx_Condition), itemType->Cast<TStructExprType>(), ctx)) {
         return TStatus::Error;
     }
 
     node->SetTypeAnn(input->GetTypeAnn());
-    return TStatus::Ok;
-}
-
-TStatus AnnotateOlapFilterCompare(const TExprNode::TPtr& node, TExprContext& ctx) {
-    if (!EnsureArgsCount(*node, 3, ctx)) {
-        return TStatus::Error;
-    }
-
-    auto* input = node->Child(TKqpOlapFilterCompare::idx_Input);
-
-    const TTypeAnnotationNode* itemType;
-
-    if (!EnsureNewSeqType<false, false, true>(*input, ctx, &itemType)) {
-        return TStatus::Error;
-    }
-
-    if (!EnsureStructType(input->Pos(), *itemType, ctx)) {
-        return TStatus::Error;
-    }
-
-    auto validateNode = [itemType, &ctx](TExprNode* node) {
-        // Column name, validate that it is present in Input node
-        if (TCoAtom::Match(node)) {
-            auto rowType = itemType->Cast<TStructExprType>();
-
-            if (rowType->FindItem(node->Content())) {
-                return true;
-            }
-
-            ctx.AddError(TIssue(
-                ctx.GetPosition(node->Pos()),
-                TStringBuilder() << "Missing column in input type: " << node->Content()
-            ));
-
-            return false;
-        }
-
-        // Null argument for IS NULL/NOT NULL
-        if (TCoNull::Match(node)) {
-            return true;
-        }
-
-        // Incoming parameter
-        if (TCoParameter::Match(node)) {
-            return true;
-        }
-
-        // Any supported literal
-        if (TCoDataCtor::Match(node)) {
-            return true;
-        }
-
-        // SafeCast, the checks about validity should be placed in kqp_opt_phy_olap_filter.cpp
-        if (TCoSafeCast::Match(node)) {
-            return true;
-        }
-
-        ctx.AddError(TIssue(
-            ctx.GetPosition(node->Pos()),
-            TStringBuilder()
-                << "Expected literal or column as OLAP filter value, got: " << node->Content()
-        ));
-
-        return false;
-    };
-
-    auto leftNode = node->Child(TKqpOlapFilterCompare::idx_Left);
-    auto rightNode = node->Child(TKqpOlapFilterCompare::idx_Right);
-
-    if (!validateNode(leftNode)) {
-        return TStatus::Error;
-    }
-
-    if (!validateNode(rightNode)) {
-        return TStatus::Error;
-    }
-
-    node->SetTypeAnn(ctx.MakeType<TDataExprType>(EDataSlot::Bool));
-
-    return TStatus::Ok;
-}
-
-TStatus AnnotateOlapFilterExists(const TExprNode::TPtr& node, TExprContext& ctx) {
-    if (!EnsureArgsCount(*node, 2, ctx)) {
-        return TStatus::Error;
-    }
-
-    auto* input = node->Child(TKqpOlapFilterExists::idx_Input);
-
-    const TTypeAnnotationNode* itemType;
-
-    if (!EnsureNewSeqType<false, false, true>(*input, ctx, &itemType)) {
-        return TStatus::Error;
-    }
-
-    if (!EnsureStructType(input->Pos(), *itemType, ctx)) {
-        return TStatus::Error;
-    }
-
-    auto column = node->Child(TKqpOlapFilterExists::idx_Column);
-
-    if (!EnsureAtom(*column, ctx)) {
-        ctx.AddError(TIssue(
-            ctx.GetPosition(node->Pos()),
-            TStringBuilder()
-                << "Expected column in OLAP Exists filter, got: " << column->Content()
-        ));
-
-        return TStatus::Error;
-    }
-
-    auto rowType = itemType->Cast<TStructExprType>();
-
-    if (!rowType->FindItem(column->Content())) {
-        ctx.AddError(TIssue(
-            ctx.GetPosition(node->Pos()),
-            TStringBuilder() << "Missing column in OLAP Exists filter in input type: " << column->Content()
-        ));
-    }
-
-    node->SetTypeAnn(ctx.MakeType<TDataExprType>(EDataSlot::Bool));
     return TStatus::Ok;
 }
 
@@ -892,8 +876,15 @@ TStatus AnnotateOlapAgg(const TExprNode::TPtr& node, TExprContext& ctx) {
         }
         if (opType->Content() == "count") {
             aggTypes.push_back(ctx.MakeType<TItemExprType>(aggName->Content(), ctx.MakeType<TDataExprType>(EDataSlot::Uint64)));
-        } else if (opType->Content() == "some") {
-            aggTypes.push_back(ctx.MakeType<TItemExprType>(aggName->Content(), structType->FindItemType(colName->Content())));
+        } else if (opType->Content() == "sum") {
+            auto colType = structType->FindItemType(colName->Content());
+            const TTypeAnnotationNode* resultType = nullptr;
+            if(!GetSumResultType(node->Pos(), *colType, resultType, ctx)) {
+                ctx.AddError(TIssue(ctx.GetPosition(node->Pos()),
+                    TStringBuilder() << "Unsupported type: " << FormatType(colType) << ". Expected Data or Optional of Data or Null."));
+                return TStatus::Error;
+            }
+            aggTypes.push_back(ctx.MakeType<TItemExprType>(aggName->Content(), resultType));
         } else {
             ctx.AddError(TIssue(
                 ctx.GetPosition(node->Pos()),
@@ -1258,16 +1249,20 @@ TAutoPtr<IGraphTransformer> CreateKqpTypeAnnotationTransformer(const TString& cl
                 return AnnotateDeleteRows(input, ctx, cluster, *tablesData);
             }
 
+            if (TKqpOlapAnd::Match(input.Get())
+                || TKqpOlapOr::Match(input.Get())
+                || TKqpOlapXor::Match(input.Get())
+            )
+            {
+                return AnnotateOlapBinaryLogicOperator(input, ctx);
+            }
+
+            if (TKqpOlapNot::Match(input.Get())) {
+                return AnnotateOlapUnaryLogicOperator(input, ctx);
+            }
+
             if (TKqpOlapFilter::Match(input.Get())) {
                 return AnnotateOlapFilter(input, ctx);
-            }
-
-            if (TKqpOlapFilterCompare::Match(input.Get())) {
-                return AnnotateOlapFilterCompare(input, ctx);
-            }
-
-            if (TKqpOlapFilterExists::Match(input.Get())) {
-                return AnnotateOlapFilterExists(input, ctx);
             }
 
             if (TKqpOlapAgg::Match(input.Get())) {
@@ -1333,30 +1328,6 @@ TAutoPtr<IGraphTransformer> CreateKqpCheckQueryTransformer() {
                 if (!EnsureListType(result.Value().Ref(), ctx)) {
                     return TStatus::Error;
                 }
-            }
-
-            return TStatus::Ok;
-        });
-}
-
-TAutoPtr<IGraphTransformer> CreateKqpCheckKiProgramTransformer() {
-    return CreateFunctorTransformer(
-        [](const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) -> TStatus {
-            output = input;
-
-            YQL_ENSURE(TMaybeNode<TKiProgram>(input));
-
-            auto program = TKiProgram(input);
-            auto effectsType = program.Effects().Ptr()->GetTypeAnn();
-            bool typeOk = EnsureListType(input->Pos(), *effectsType, ctx);
-            if (typeOk) {
-                auto listType = effectsType->Cast<TListExprType>();
-                typeOk = listType->GetItemType()->GetKind() == ETypeAnnotationKind::Void;
-            }
-            if (!typeOk) {
-                ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TStringBuilder()
-                    << "Invalid program effects type: " << FormatType(effectsType)));
-                return TStatus::Error;
             }
 
             return TStatus::Ok;

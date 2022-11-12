@@ -49,11 +49,6 @@ TColumnTableInfo::TPtr ParseParams(
             tableSchema = &presetProto.GetSchema();
         }
 
-        THashSet<TString> knownTiers;
-        for (const auto& tier : tableSchema->GetStorageTiers()) {
-            knownTiers.insert(tier.GetName());
-        }
-
         THashMap<ui32, TOlapSchema::TColumn> columns;
         THashMap<TString, ui32> columnsByName;
         for (const auto& col : tableSchema->GetColumns()) {
@@ -65,7 +60,7 @@ TColumnTableInfo::TPtr ParseParams(
             columnsByName[name] = id;
         }
 
-        if (!ValidateTtlSettings(alter.GetAlterTtlSettings(), columns, columnsByName, knownTiers, errStr)) {
+        if (!ValidateTtlSettings(alter.GetAlterTtlSettings(), columns, columnsByName, errStr)) {
             status = NKikimrScheme::StatusInvalidParameter;
             return nullptr;
         }
@@ -447,10 +442,7 @@ public:
                 .NotUnderOperation();
 
             if (!checks) {
-                TString explain = TStringBuilder() << "path fail checks"
-                                                   << ", path: " << path.PathString();
-                auto status = checks.GetStatus(&explain);
-                result->SetError(status, explain);
+                result->SetError(checks.GetStatus(), checks.GetError());
                 return result;
             }
         }
@@ -458,7 +450,15 @@ public:
         Y_VERIFY(context.SS->ColumnTables.contains(path.Base()->PathId));
         TColumnTableInfo::TPtr tableInfo = context.SS->ColumnTables.at(path.Base()->PathId);
 
-        TPath storePath = TPath::Init(tableInfo->OlapStorePathId, context.SS);
+        if (!tableInfo->OlapStorePathId) {
+            result->SetError(NKikimrScheme::StatusSchemeError,
+                             "Alter for standalone column table is not supported yet");
+            return result;
+        }
+
+        auto& storePathId = *tableInfo->OlapStorePathId;
+
+        TPath storePath = TPath::Init(storePathId, context.SS);
         {
             TPath::TChecker checks = storePath.Check();
             checks
@@ -468,16 +468,13 @@ public:
                 .NotUnderOperation();
 
             if (!checks) {
-                TString explain = TStringBuilder() << "store path fail checks"
-                                                   << ", path: " << storePath.PathString();
-                auto status = checks.GetStatus(&explain);
-                result->SetError(status, explain);
+                result->SetError(checks.GetStatus(), checks.GetError());
                 return result;
             }
         }
 
-        Y_VERIFY(context.SS->OlapStores.contains(tableInfo->OlapStorePathId));
-        TOlapStoreInfo::TPtr storeInfo = context.SS->OlapStores.at(tableInfo->OlapStorePathId);
+        Y_VERIFY(context.SS->OlapStores.contains(storePathId));
+        TOlapStoreInfo::TPtr storeInfo = context.SS->OlapStores.at(storePathId);
 
         TString errStr;
         if (!context.SS->CheckApplyIf(Transaction, errStr)) {

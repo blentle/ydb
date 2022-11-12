@@ -73,13 +73,18 @@ public:
     TActorId KqpShardsResolverId;
 
     STATEFN(WaitResolveState) {
-        switch (ev->GetTypeRewrite()) {
-            hFunc(TEvKqpExecuter::TEvTableResolveStatus, HandleResolve);
-            hFunc(TEvKqpExecuter::TEvShardsResolveStatus, HandleResolve);
-            hFunc(TEvKqp::TEvAbortExecution, HandleAbortExecution);
-            hFunc(TEvents::TEvWakeup, HandleTimeout);
-            default:
-                UnexpectedEvent("WaitResolveState", ev->GetTypeRewrite());
+        try {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvKqpExecuter::TEvTableResolveStatus, HandleResolve);
+                hFunc(TEvKqpExecuter::TEvShardsResolveStatus, HandleResolve);
+                hFunc(TEvKqp::TEvAbortExecution, HandleAbortExecution);
+                hFunc(TEvents::TEvWakeup, HandleTimeout);
+                default:
+                    UnexpectedEvent("WaitResolveState", ev->GetTypeRewrite());
+            }
+
+        } catch (const yexception& e) {
+            InternalError(e.what());
         }
         ReportEventElapsedTime();
     }
@@ -660,13 +665,13 @@ private:
     void Execute() {
         LWTRACK(KqpScanExecuterStartExecute, ResponseEv->Orbit, TxId);
         auto& funcRegistry = *AppData()->FunctionRegistry;
-        NMiniKQL::TScopedAlloc alloc(TAlignedPagePoolCounters(), funcRegistry.SupportsSizedAllocators());
+        NMiniKQL::TScopedAlloc alloc(__LOCATION__, TAlignedPagePoolCounters(), funcRegistry.SupportsSizedAllocators());
         NMiniKQL::TTypeEnvironment typeEnv(alloc);
+        NMiniKQL::TMemoryUsageInfo memInfo("KqpScanExecuter");
+        NMiniKQL::THolderFactory holderFactory(alloc.Ref(), memInfo, &funcRegistry);
+        auto unguard = Unguard(alloc);
 
         NWilson::TSpan prepareTasksSpan(TWilsonKqp::ScanExecuterPrepareTasks, ExecuterStateSpan.GetTraceId(), "PrepareTasks", NWilson::EFlags::AUTO_END);
-
-        NMiniKQL::TMemoryUsageInfo memInfo("PrepareTasks");
-        NMiniKQL::THolderFactory holderFactory(alloc.Ref(), memInfo, &funcRegistry);
 
         auto& tx = Request.Transactions[0];
         for (ui32 stageIdx = 0; stageIdx < tx.Body->StagesSize(); ++stageIdx) {
@@ -877,7 +882,6 @@ private:
             ExecuterStateSpan.End();
             ExecuterStateSpan = NWilson::TSpan(TWilsonKqp::ScanExecuterExecuteState, ExecuterSpan.GetTraceId(), "ExecuteState", NWilson::EFlags::AUTO_END);
         }
-
     }
 
     void ExecuteScanTx(TVector<NYql::NDqProto::TDqTask>&& computeTasks, THashMap<ui64, TVector<NYql::NDqProto::TDqTask>>&& scanTasks) {

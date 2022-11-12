@@ -9,6 +9,12 @@ items:
     href: connect.md
   - name: Глобальные параметры
     href: commands/global-options.md
+  - name: Команды YDB CLI
+    items:
+    - name: table attribute add
+      href: table-attribute-add.md
+    - name: table attribute drop
+      href: table-attribute-drop.md
   - name: Работа со схемой БД
     items:
     - name: Список объектов
@@ -19,12 +25,18 @@ items:
       href: commands/dir.md
     - name: Вторичные индексы
       href: commands/secondary_index.md
+    - name: Копирование таблиц
+      href: tools-copy.md
     - name: Переименование таблиц
       href: commands/tools/rename.md
+    - name: Установка параметров TTL
+      href: table-ttl-set.md
+    - name: Удаление параметров TTL
+      href: table-ttl-drop.md
+    - name: Удаление таблицы
+      href: table-drop.md
   - name: Работа с данными
     items:
-    - name: Выполнение запроса к данным
-      href: commands/query.md
     - name: Получение плана исполнения запроса и AST
       href: commands/explain-plan.md
     - name: Потоковое чтение таблицы
@@ -52,15 +64,33 @@ items:
     - name: Запись в топик
       href: topic-write.md
     - name: Конвейерная обработка сообщений
-      href: topic-pipeline.md
+      href: topic-pipeline.md    
+  - name: Выполнение YQL
+    items:
+    - name: Обзор
+      href: yql-query-overview.md
+    - name: Выполнение скрипта (с поддержкой стриминга)
+      href: yql.md
+    - name: Выполнение скрипта
+      href: scripting-yql.md
+    - name: Выполнение запроса
+      href: table-query-execute.md
 #  - name: Утилиты
 #    items:
-    # - name: Копирование таблиц
-    #   href: commands/tools/copy.md
     # - name: Снятие бэкапа
     #   href: commands/tools/dump.md
     # - name: Восстановление бэкапа
     #   href: commands/tools/restore.md
+  - name: Управление фоновыми операциями
+    items:
+    - name: Получение списка фоновых операций
+      href: operation-list.md
+    - name: Получение статуса фоновой операции
+      href: operation-get.md
+    - name: Отмена фоновой операции
+      href: operation-cancel.md
+    - name: Удаление фоновой операции из списка
+      href: operation-forget.md
   - name: Управление профилями
     include: { mode: link, path: profile/toc_p.yaml }
   - name: Информационные сервисы
@@ -77,6 +107,8 @@ items:
       href: commands/workload/index.md
     - name: Stock нагрузка
       href: commands/workload/stock.md
+    - name: ClickBench нагрузка
+      href: workload-click-bench.md
     - name: Key-Value нагрузка
       href: workload-kv.md
 

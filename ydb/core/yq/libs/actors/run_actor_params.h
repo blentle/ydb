@@ -48,6 +48,7 @@ struct TRunActorParams { // TODO2 : Change name
         NYql::ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory,
         THashMap<TString, TString> accountIdSignatures,
         YandexQuery::QueryContent::QueryType queryType,
+        YandexQuery::QueryContent::QuerySyntax querySyntax,
         YandexQuery::ExecuteMode executeMode,
         const TString& resultId,
         const YandexQuery::StateLoadMode stateLoadMode,
@@ -68,7 +69,8 @@ struct TRunActorParams { // TODO2 : Change name
         TDuration executionTtl,
         TInstant requestStartedAt,
         ui32 restartCount,
-        const TString& jobId
+        const TString& jobId,
+        const Fq::Private::TaskResources& resources
     );
 
     TRunActorParams(const TRunActorParams& params) = default;
@@ -103,6 +105,7 @@ struct TRunActorParams { // TODO2 : Change name
     const NYql::ISecuredServiceAccountCredentialsFactory::TPtr CredentialsFactory;
     const THashMap<TString, TString> AccountIdSignatures;
     const YandexQuery::QueryContent::QueryType QueryType;
+    const YandexQuery::QueryContent::QuerySyntax QuerySyntax;
     const YandexQuery::ExecuteMode ExecuteMode;
     const TString ResultId;
     const YandexQuery::StateLoadMode StateLoadMode;
@@ -114,18 +117,19 @@ struct TRunActorParams { // TODO2 : Change name
     const int32_t DqGraphIndex;
     TVector<Fq::Private::TopicConsumer> CreatedTopicConsumers;
 
-    bool Automatic = false;
-    TString QueryName;
-    TInstant Deadline;
+    const bool Automatic = false;
+    const TString QueryName;
+    const TInstant Deadline;
 
     const ::NMonitoring::TDynamicCounterPtr ClientCounters;
     const TInstant CreatedAt;
     const TString TenantName;
-    uint64_t ResultBytesLimit;
-    TDuration ExecutionTtl;
+    const uint64_t ResultBytesLimit;
+    const TDuration ExecutionTtl;
     TInstant RequestStartedAt;
-    ui32 RestartCount;
+    const ui32 RestartCount;
     const TString JobId;
+    Fq::Private::TaskResources Resources;
 };
 
 } /* NYq */

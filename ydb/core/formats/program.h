@@ -4,87 +4,12 @@
 #include <contrib/libs/apache/arrow/cpp/src/arrow/api.h>
 #include <util/system/types.h>
 
+#include <ydb/library/arrow_kernels/operations.h>
 #include <ydb/core/scheme_types/scheme_types_defs.h>
 
 namespace NKikimr::NArrow {
 
-enum class EOperation {
-    Unspecified = 0,
-    Constant,
-    //
-    CastBoolean,
-    CastInt8,
-    CastInt16,
-    CastInt32,
-    CastInt64,
-    CastUInt8,
-    CastUInt16,
-    CastUInt32,
-    CastUInt64,
-    CastFloat,
-    CastDouble,
-    CastBinary,
-    CastFixedSizeBinary,
-    CastString,
-    CastTimestamp,
-    //
-    IsValid,
-    IsNull,
-    //
-    Equal,
-    NotEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-    //
-    Invert,
-    And,
-    Or,
-    Xor,
-    //
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Abs,
-    Negate,
-    Gcd,
-    Lcm,
-    Modulo,
-    ModuloOrZero,
-    AddNotNull,
-    SubtractNotNull,
-    MultiplyNotNull,
-    DivideNotNull,
-    //
-    BinaryLength,
-    MatchSubstring,
-    // math
-    Acosh,
-    Atanh,
-    Cbrt,
-    Cosh,
-    E,
-    Erf,
-    Erfc,
-    Exp,
-    Exp2,
-    Exp10,
-    Hypot,
-    Lgamma,
-    Pi,
-    Sinh,
-    Sqrt,
-    Tgamma,
-    // round
-    Floor,
-    Ceil,
-    Trunc,
-    Round,
-    RoundBankers,
-    RoundToExp2
-};
+using EOperation = NKikimr::NKernels::EOperation;
 
 enum class EAggregate {
     Unspecified = 0,
@@ -95,6 +20,13 @@ enum class EAggregate {
     Sum = 5,
     //Avg = 6,
 };
+
+}
+
+namespace NKikimr::NSsa {
+
+using EOperation = NArrow::EOperation;
+using EAggregate = NArrow::EAggregate;
 
 const char * GetFunctionName(EOperation op);
 const char * GetFunctionName(EAggregate op);
@@ -199,13 +131,21 @@ private:
 
 class TAggregateAssign {
 public:
+    TAggregateAssign(const std::string& name, EAggregate op = EAggregate::Unspecified)
+        : Name(name)
+        , Operation(op)
+    {
+        if (op != EAggregate::Count) {
+            op = EAggregate::Unspecified;
+        }
+    }
+
     TAggregateAssign(const std::string& name, EAggregate op, std::string&& arg)
         : Name(name)
         , Operation(op)
         , Arguments({std::move(arg)})
     {
-        if (Arguments[0].empty() && op != EAggregate::Count) {
-            // COUNT(*) doesn't have arguments
+        if (Arguments.empty()) {
             op = EAggregate::Unspecified;
         }
     }
@@ -213,6 +153,7 @@ public:
     bool IsOk() const { return Operation != EAggregate::Unspecified; }
     EAggregate GetOperation() const { return Operation; }
     const std::vector<std::string>& GetArguments() const { return Arguments; }
+    std::vector<std::string>& MutableArguments() { return Arguments; }
     const std::string& GetName() const { return Name; }
     const arrow::compute::ScalarAggregateOptions& GetAggregateOptions() const { return ScalarOpts; }
 
@@ -238,6 +179,7 @@ struct TProgramStep {
     std::vector<TAggregateAssign> GroupBy;
     std::vector<std::string> GroupByKeys; // TODO: it's possible to use them without GROUP BY for DISTINCT
     std::vector<std::string> Projection; // Step's result columns (remove others)
+    bool NullableGroupByKeys = true;
 
     struct TDatumBatch {
         std::shared_ptr<arrow::Schema> schema;
@@ -272,9 +214,9 @@ inline arrow::Status ApplyProgram(
     return arrow::Status::OK();
 }
 
-struct TSsaProgramSteps {
-    std::vector<std::shared_ptr<TProgramStep>> Program;
-    THashMap<ui32, TString> ProgramSourceColumns;
+struct TProgram {
+    std::vector<std::shared_ptr<TProgramStep>> Steps;
+    THashMap<ui32, TString> SourceColumns;
 };
 
 }

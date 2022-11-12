@@ -2,8 +2,11 @@
 
 #include "event.h"
 #include "monotonic.h"
-#include <util/system/tls.h>
+
 #include <library/cpp/actors/util/local_process_key.h>
+
+#include <util/system/tls.h>
+#include <util/generic/noncopyable.h>
 
 namespace NActors {
     class TActorSystem;
@@ -323,6 +326,47 @@ namespace NActors {
         }
 
     public:
+        template <class TEventBase>
+        class TEventSenderFromActor: ::TNonCopyable {
+        private:
+            ui32 Flags = 0;
+            ui64 Cookie = 0;
+            const TActorIdentity SenderId;
+            NWilson::TTraceId TraceId = {};
+            std::unique_ptr<TEventBase> Event;
+        public:
+            template <class... Types>
+            TEventSenderFromActor(const IActor* owner, Types&&... args)
+                : SenderId(owner->SelfId())
+                , Event(new TEventBase(std::forward<Types>(args)...)) {
+
+            }
+
+            TEventSenderFromActor& SetFlags(const ui32 flags) {
+                Flags = flags;
+                return *this;
+            }
+
+            TEventSenderFromActor& SetCookie(const ui64 value) {
+                Cookie = value;
+                return *this;
+            }
+
+            TEventSenderFromActor& SetTraceId(NWilson::TTraceId&& value) {
+                TraceId = std::move(value);
+                return *this;
+            }
+
+            bool SendTo(const TActorId& recipient) {
+                return SenderId.Send(recipient, Event.release(), Flags, Cookie, std::move(TraceId));
+            }
+        };
+
+        template <class TEvent, class... Types>
+        TEventSenderFromActor<TEvent> Sender(Types&&... args) const {
+            return TEventSenderFromActor<TEvent>(this, std::forward<Types>(args)...);
+        }
+
         virtual ~IActor() {
         } // must not be called for registered actors, see Die method instead
 
@@ -336,6 +380,32 @@ namespace NActors {
         }
 
     public:
+        class TPassAwayGuard: TMoveOnly {
+        private:
+            IActor* Owner = nullptr;
+        public:
+            TPassAwayGuard(TPassAwayGuard&& item) {
+                Owner = item.Owner;
+                item.Owner = nullptr;
+            }
+
+            TPassAwayGuard(IActor* owner)
+                : Owner(owner)
+            {
+
+            }
+
+            ~TPassAwayGuard() {
+                if (Owner) {
+                    Owner->PassAway();
+                }
+            }
+        };
+
+        TPassAwayGuard PassAwayGuard() {
+            return TPassAwayGuard(this);
+        }
+
         // must be called to wrap any call trasitions from one actor to another
         template<typename TActor, typename TMethod, typename... TArgs>
         static decltype((std::declval<TActor>().*std::declval<TMethod>())(std::declval<TArgs>()...))

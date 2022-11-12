@@ -116,6 +116,11 @@ struct TSwitchInput {
     std::optional<ui32> ResultVariantOffset;
 };
 
+struct TAggInfo {
+    TString Name;
+    std::vector<ui32> ArgsColumns;
+};
+
 class TProgramBuilder : private TNonCopyable {
 public:
     TProgramBuilder(const TTypeEnvironment& env, const IFunctionRegistry& functionRegistry, bool voidWithEffects = false);
@@ -238,10 +243,14 @@ public:
     TRuntimeNode WideToBlocks(TRuntimeNode flow);
     TRuntimeNode FromBlocks(TRuntimeNode flow);
     TRuntimeNode WideFromBlocks(TRuntimeNode flow);
+    TRuntimeNode WideSkipBlocks(TRuntimeNode flow, TRuntimeNode count);
+    TRuntimeNode WideTakeBlocks(TRuntimeNode flow, TRuntimeNode count);
     TRuntimeNode AsScalar(TRuntimeNode value);
 
     TRuntimeNode BlockFunc(const std::string_view& funcName, TType* returnType, const TArrayRef<const TRuntimeNode>& args);
     TRuntimeNode BlockBitCast(TRuntimeNode value, TType* targetType);
+    TRuntimeNode BlockCombineAll(TRuntimeNode flow, ui32 countColumn, std::optional<ui32> filterColumn,
+        const TArrayRef<const TAggInfo>& aggs, TType* returnType);
 
     // udfs
     TRuntimeNode Udf(
@@ -666,6 +675,7 @@ protected:
     TRuntimeNode BuildLogical(const std::string_view& callableName, const TArrayRef<const TRuntimeNode>& args);
     TRuntimeNode BuildBinaryLogical(const std::string_view& callableName, TRuntimeNode data1, TRuntimeNode data2);
     TRuntimeNode BuildMinMax(const std::string_view& callableName, const TRuntimeNode* data, size_t size);
+    TRuntimeNode BuildWideSkipTakeBlocks(const std::string_view& callableName, TRuntimeNode flow, TRuntimeNode count);
 
 private:
     TRuntimeNode BuildWideFilter(const std::string_view& callableName, TRuntimeNode flow, const TNarrowLambda& handler);

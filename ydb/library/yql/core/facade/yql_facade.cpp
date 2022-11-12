@@ -87,10 +87,10 @@ TProgram::TStatus SyncExecution(
     return status;
 }
 
-std::function<TString(const TString&, const TString&)> BuildDefaultTokenResolver(const TTypeAnnotationContext* typeCtx) {
-    return [typeCtx](const TString& /*url*/, const TString& alias) -> TString {
+std::function<TString(const TString&, const TString&)> BuildDefaultTokenResolver(TCredentials::TPtr credentials) {
+    return [credentials](const TString& /*url*/, const TString& alias) -> TString {
         if (alias) {
-            if (auto cred = typeCtx->FindCredential(TString("default_").append(alias))) {
+            if (auto cred = credentials->FindCredential(TString("default_").append(alias))) {
                 return cred->Content;
             }
         }
@@ -133,11 +133,11 @@ TProgramFactory::TProgramFactory(
     , FunctionRegistry_(functionRegistry)
     , NextUniqueId_(nextUniqueId)
     , DataProvidersInit_(dataProvidersInit)
+    , Credentials_(MakeIntrusive<TCredentials>())
     , GatewaysConfig_(nullptr)
     , Runner_(runner)
     , ArrowResolver_(MakeSimpleArrowResolver(*functionRegistry))
 {
-    AddCredentialsTable(std::make_shared<TCredentialTable>());
 }
 
 void TProgramFactory::UnrepeatableRandom() {
@@ -156,12 +156,8 @@ void TProgramFactory::AddUserDataTable(const TUserDataTable& userDataTable) {
     }
 }
 
-void TProgramFactory::AddCredentialsTable(TCredentialTablePtr credentialTable) {
-    CredentialTables_.push_back(credentialTable);
-}
-
-void TProgramFactory::SetUserCredentials(const TUserCredentials& userCredentials) {
-    UserCredentials_ = userCredentials;
+void TProgramFactory::SetCredentials(TCredentials::TPtr credentials) {
+    Credentials_ = std::move(credentials);
 }
 
 void TProgramFactory::SetGatewaysConfig(const TGatewaysConfig* gatewaysConfig) {
@@ -215,7 +211,7 @@ TProgramPtr TProgramFactory::Create(
 
     // make UserDataTable_ copy here
     return new TProgram(FunctionRegistry_, randomProvider, timeProvider, NextUniqueId_, DataProvidersInit_,
-        UserDataTable_, CredentialTables_, UserCredentials_, moduleResolver, udfResolver, udfIndex, udfIndexPackageSet, FileStorage_,
+        UserDataTable_, Credentials_, moduleResolver, udfResolver, udfIndex, udfIndexPackageSet, FileStorage_,
         GatewaysConfig_, filename, sourceCode, sessionId, Runner_, EnableRangeComputeFor_, ArrowResolver_, hiddenMode);
 }
 
@@ -229,8 +225,7 @@ TProgram::TProgram(
         ui64 nextUniqueId,
         const TVector<TDataProviderInitializer>& dataProvidersInit,
         const TUserDataTable& userDataTable,
-        const TVector<TCredentialTablePtr>& credentialTables,
-        const TUserCredentials& userCredentials,
+        const TCredentials::TPtr& credentials,
         const IModuleResolver::TPtr& modules,
         const IUdfResolver::TPtr& udfResolver,
         const TUdfIndex::TPtr& udfIndex,
@@ -250,8 +245,7 @@ TProgram::TProgram(
     , TimeProvider_(timeProvider)
     , NextUniqueId_(nextUniqueId)
     , DataProvidersInit_(dataProvidersInit)
-    , CredentialTables_(credentialTables)
-    , UserCredentials_(userCredentials)
+    , Credentials_(credentials)
     , UdfResolver_(udfResolver)
     , UdfIndex_(udfIndex)
     , UdfIndexPackageSet_(udfIndexPackageSet)
@@ -279,6 +273,7 @@ TProgram::TProgram(
     if (auto modules = dynamic_cast<TModuleResolver*>(Modules_.get())) {
         modules->AttachUserData(UserDataStorage_);
         modules->SetUrlLoader(new TUrlLoader(FileStorage_));
+        modules->SetCredentials(Credentials_);
     }
     OperationOptions_.Runner = runner;
 }
@@ -286,6 +281,10 @@ TProgram::TProgram(
 TProgram::~TProgram() {
     try {
         CloseLastSession();
+        // Token resolver may keep some references to provider internal's. So reset it to release provider's data
+        if (FileStorage_) {
+            FileStorage_->SetTokenResolver({});
+        }
         // stop all non complete execution before deleting TExprCtx
         DataProviders_.clear();
     } catch (...) {
@@ -379,7 +378,7 @@ bool TProgram::FillParseResult(NYql::TAstParseResult&& astRes, NYql::TWarningRul
         }
         iManager.AddScope([this]() {
             TIssuePtr issueHolder = new TIssue();
-            issueHolder->Message = TStringBuilder() << "Parse " << SourceSyntax_;
+            issueHolder->SetMessage(TStringBuilder() << "Parse " << SourceSyntax_);
             issueHolder->Severity = TSeverityIds::S_INFO;
             return issueHolder;
         });
@@ -1274,11 +1273,6 @@ void TProgram::CloseLastSession() {
             dp.CloseSession(sessionId);
         }
     }
-
-    // Token resolver may keep some references to provider internal's. So reset it to release provider's data
-    if (FileStorage_) {
-        FileStorage_->SetTokenResolver({});
-    }
 }
 
 TString TProgram::ResultsAsString() const {
@@ -1300,8 +1294,7 @@ TTypeAnnotationContextPtr TProgram::BuildTypeAnnotationContext(const TString& us
     auto typeAnnotationContext = MakeIntrusive<TTypeAnnotationContext>();
 
     typeAnnotationContext->UserDataStorage = UserDataStorage_;
-    typeAnnotationContext->Credentials = CredentialTables_;
-    typeAnnotationContext->UserCredentials = UserCredentials_;
+    typeAnnotationContext->Credentials = Credentials_;
     typeAnnotationContext->Modules = Modules_;
     typeAnnotationContext->UdfResolver = UdfResolver_;
     typeAnnotationContext->UdfIndex = UdfIndex_;
@@ -1401,7 +1394,7 @@ TTypeAnnotationContextPtr TProgram::BuildTypeAnnotationContext(const TString& us
         typeAnnotationContext->AddDataSource(ConfigProviderName, configProvider);
     }
 
-    tokenResolvers.push_back(BuildDefaultTokenResolver(typeAnnotationContext.Get()));
+    tokenResolvers.push_back(BuildDefaultTokenResolver(typeAnnotationContext->Credentials));
     if (FileStorage_) {
         FileStorage_->SetTokenResolver(BuildCompositeTokenResolver(std::move(tokenResolvers)));
     }

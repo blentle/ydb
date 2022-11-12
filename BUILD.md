@@ -29,13 +29,13 @@
 
 1. Add repositories for dependencies
 
-    Note: the following repositories are required for **Ubuntu 20.04**. You may skip this step if your GNU/Linux distribution has all required packages in their default repository.
+    Note: the following repositories are required for **Ubuntu 18.04 and Ubuntu 20.04**. You may skip this step if your GNU/Linux distribution has all required packages in their default repository.
     For more information please read your distribution documentation and https://apt.llvm.org as well as https://apt.kitware.com/
      ```
     wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
     wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc | sudo apt-key add -
-    echo 'deb http://apt.kitware.com/ubuntu/ focal main' | sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
-    echo 'deb http://apt.llvm.org/focal/ llvm-toolchain-focal main' | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+    echo "deb http://apt.kitware.com/ubuntu/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
+    echo "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
 
     sudo apt-get update
      ```
@@ -59,11 +59,24 @@
     ```
 
  1. Build ydb
-     ```
+
+    Run cmake to generate build configuration:
+
+    ```
     cd build
     cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=../ydb/clang.toolchain ../ydb
+    ```
+
+    To build both YDB server (ydbd) and YDB CLI (ydb) run:
+    ```
     ninja
     ```
+
+    To build only YDB CLI (ydb) run:
+    ```
+    ninja ydb/apps/ydb/all
+    ```
+
     A YDB server binary can be found at:
     ```
     ydb/apps/ydbd/ydbd

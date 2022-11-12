@@ -127,6 +127,64 @@ namespace {
         }
         return dropGroupSettings;
     }
+
+    TCreateTableStoreSettings ParseCreateTableStoreSettings(TKiCreateTable create, const TTableSettings& settings) {
+        TCreateTableStoreSettings out;
+        out.TableStore = TString(create.Table());
+        out.ShardsCount = settings.MinPartitions ? *settings.MinPartitions : 0;
+
+        for (auto atom : create.PrimaryKey()) {
+            out.KeyColumnNames.emplace_back(atom.Value());
+        }
+
+        for (auto item : create.Columns()) {
+            auto columnTuple = item.Cast<TExprList>();
+            auto nameNode = columnTuple.Item(0).Cast<TCoAtom>();
+            auto typeNode = columnTuple.Item(1);
+
+            auto columnName = TString(nameNode.Value());
+            auto columnType = typeNode.Ref().GetTypeAnn();
+            YQL_ENSURE(columnType && columnType->GetKind() == ETypeAnnotationKind::Type);
+
+            auto type = columnType->Cast<TTypeExprType>()->GetType();
+            auto notNull = type->GetKind() != ETypeAnnotationKind::Optional;
+            auto actualType = notNull ? type : type->Cast<TOptionalExprType>()->GetItemType();
+            auto dataType = actualType->Cast<TDataExprType>();
+
+            TKikimrColumnMetadata columnMeta;
+            columnMeta.Name = columnName;
+            columnMeta.Type = dataType->GetName();
+            columnMeta.NotNull = notNull;
+
+            out.ColumnOrder.push_back(columnName);
+            out.Columns.insert(std::make_pair(columnName, columnMeta));
+        }
+#if 0 // TODO
+        for (const auto& index : create.Indexes()) {
+            TIndexDescription indexDesc;
+            out.Indexes.push_back(indexDesc);
+        }
+#endif
+        return out;
+    }
+
+    TAlterTableStoreSettings ParseAlterTableStoreSettings(TKiAlterTable alter) {
+        return TAlterTableStoreSettings{
+            .TableStore = TString(alter.Table())
+        };
+    }
+
+    TDropTableStoreSettings ParseDropTableStoreSettings(TKiDropTable drop) {
+        return TDropTableStoreSettings{
+            .TableStore = TString(drop.Table())
+        };
+    }
+
+    TAlterColumnTableSettings ParseAlterColumnTableSettings(TKiAlterTable alter) {
+        return TAlterColumnTableSettings{
+            .Table = TString(alter.Table())
+        };
+    }
 }
 
 class TKiSinkPlanInfoTransformer : public TGraphTransformerBase {
@@ -469,24 +527,39 @@ public:
             auto cluster = TString(maybeCreate.Cast().DataSink().Cluster());
             auto& table = SessionCtx->Tables().GetTable(cluster, TString(maybeCreate.Cast().Table()));
 
-            if (!ApplyDdlOperation(cluster, input->Pos(), table.Metadata->Name, TYdbOperation::CreateTable, ctx)) {
+            bool isTableStore = (table.Metadata->TableType == ETableType::TableStore);
+
+            if (!isTableStore && !ApplyDdlOperation(cluster, input->Pos(), table.Metadata->Name, TYdbOperation::CreateTable, ctx)) {
                 return SyncError();
             }
 
-            bool prepareOnly = SessionCtx->Query().PrepareOnly;
-            auto future = prepareOnly ? CreateDummySuccess() : (
-                table.Metadata->TableSettings.StoreType
-                    && to_lower(table.Metadata->TableSettings.StoreType.GetRef()) == "column"
-                    ? Gateway->CreateColumnTable(table.Metadata, true)
-                    : Gateway->CreateTable(table.Metadata, true)
-            );
+            NThreading::TFuture<IKikimrGateway::TGenericResult> future;
+            if (SessionCtx->Query().PrepareOnly) {
+                future = CreateDummySuccess();
+            } else {
+                bool isColumn = (table.Metadata->StoreType == EStoreType::Column);
+
+                if (isTableStore) {
+                    if (!isColumn) {
+                        ctx.AddError(TIssue(ctx.GetPosition(input->Pos()),
+                            TStringBuilder() << "TABLESTORE with not COLUMN store"));
+                        return SyncError();
+                    }
+                    future = Gateway->CreateTableStore(cluster,
+                        ParseCreateTableStoreSettings(maybeCreate.Cast(), table.Metadata->TableSettings));
+                } else if (isColumn) {
+                    future = Gateway->CreateColumnTable(table.Metadata, true);
+                } else {
+                    future = Gateway->CreateTable(table.Metadata, true);
+                }
+            }
 
             return WrapFuture(future,
                 [](const IKikimrGateway::TGenericResult& res, const TExprNode::TPtr& input, TExprContext& ctx) {
                     Y_UNUSED(res);
                     auto resultNode = ctx.NewWorld(input->Pos());
                     return resultNode;
-                }, "Executing CREATE TABLE");
+                }, isTableStore ? "Executing CREATE TABLESTORE" : "Executing CREATE TABLE");
         }
 
         if (auto maybeDrop = TMaybeNode<TKiDropTable>(input)) {
@@ -498,23 +571,42 @@ public:
             if (requireStatus.Level != TStatus::Ok) {
                 return SyncStatus(requireStatus);
             }
-
             auto cluster = TString(maybeDrop.Cast().DataSink().Cluster());
-            auto& table = SessionCtx->Tables().GetTable(cluster, TString(maybeDrop.Cast().Table()));
+            TString tableName = TString(maybeDrop.Cast().Table());
+            auto& table = SessionCtx->Tables().GetTable(cluster, tableName);
+            auto tableType = TString(maybeDrop.Cast().TableType());
+            bool isTableStore;
 
-            if (!ApplyDdlOperation(cluster, input->Pos(), table.Metadata->Name, TYdbOperation::DropTable, ctx)) {
-                return SyncError();
+            switch (GetTableTypeFromString(tableType)) {
+                case ETableType::Table:
+                    if (!ApplyDdlOperation(cluster, input->Pos(), tableName, TYdbOperation::DropTable, ctx)) {
+                        return SyncError();
+                    }
+                    isTableStore = false;
+                    break;
+                case ETableType::TableStore:
+                    isTableStore = true;
+                    break;
+                case ETableType::Unknown:
+                default:
+                    ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TStringBuilder() << "Unsupported table type " << tableType));
+                    return SyncError();
             }
 
             bool prepareOnly = SessionCtx->Query().PrepareOnly;
-            auto future = prepareOnly ? CreateDummySuccess() : Gateway->DropTable(table.Metadata->Cluster, table.Metadata->Name);
+            auto future = prepareOnly ? CreateDummySuccess() : (
+                isTableStore
+                ? Gateway->DropTableStore(cluster, ParseDropTableStoreSettings(maybeDrop.Cast()))
+                : Gateway->DropTable(table.Metadata->Cluster, table.Metadata->Name)
+            );
+
 
             return WrapFuture(future,
                 [](const IKikimrGateway::TGenericResult& res, const TExprNode::TPtr& input, TExprContext& ctx) {
                     Y_UNUSED(res);
                     auto resultNode = ctx.NewWorld(input->Pos());
                     return resultNode;
-                });
+                }, isTableStore ? "Executing DROP TABLESTORE" : "Executing DROP TABLE");
 
             input->SetState(TExprNode::EState::ExecutionComplete);
             input->SetResult(ctx.NewWorld(input->Pos()));
@@ -869,6 +961,11 @@ public:
                                             TStringBuilder() << "Unknown changefeed format: " << format));
                                         return SyncError();
                                     }
+                                } else if (name == "initial_scan") {
+                                    // TODO: handle initial_scan setting
+                                    ctx.AddError(TIssue(ctx.GetPosition(setting.Name().Pos()),
+                                        TStringBuilder() << name << " setting is not supported yet"));
+                                    return SyncError();
                                 } else if (name == "local") {
                                     // nop
                                 } else {
@@ -913,8 +1010,26 @@ public:
                 }
             }
 
-            bool prepareOnly = SessionCtx->Query().PrepareOnly;
-            auto future = prepareOnly ? CreateDummySuccess() : Gateway->AlterTable(std::move(alterTableRequest), cluster);
+            NThreading::TFuture<IKikimrGateway::TGenericResult> future;
+            if (SessionCtx->Query().PrepareOnly) {
+                future = CreateDummySuccess();
+            } else {
+                bool isTableStore = (table.Metadata->TableType == ETableType::TableStore);
+                bool isColumn = (table.Metadata->StoreType == EStoreType::Column);
+
+                if (isTableStore) {
+                    if (!isColumn) {
+                        ctx.AddError(TIssue(ctx.GetPosition(input->Pos()),
+                            TStringBuilder() << "TABLESTORE with not COLUMN store"));
+                        return SyncError();
+                    }
+                    future = Gateway->AlterTableStore(cluster, ParseAlterTableStoreSettings(maybeAlter.Cast()));
+                } else if (isColumn) {
+                    future = Gateway->AlterColumnTable(cluster, ParseAlterColumnTableSettings(maybeAlter.Cast()));
+                } else {
+                    future = Gateway->AlterTable(std::move(alterTableRequest), cluster);
+                }
+            }
 
             return WrapFuture(future,
                 [](const IKikimrGateway::TGenericResult& res, const TExprNode::TPtr& input, TExprContext& ctx) {
@@ -1081,7 +1196,7 @@ private:
         TExprContext& ctx)>;
 
     std::pair<IGraphTransformer::TStatus, TAsyncTransformCallbackFuture> PerformExecution(TExprBase node,
-        TExprContext& ctx, const TString& cluster, TMaybe<TString> mode, TMaybe<bool> useNewEngine,
+        TExprContext& ctx, const TString& cluster, TMaybe<TString> mode,
         const TExecuteRunFunc& runFunc, const TExecuteFinalizeFunc& finalizeFunc)
     {
         if (node.Ref().GetState() == TExprNode::EState::ExecutionComplete) {
@@ -1112,7 +1227,6 @@ private:
             }
 
             settings.IsolationLevel = isolationLevel;
-            settings.UseNewEngine = useNewEngine;
             settings.StrictDml = config->StrictDml.Get(cluster).GetRef();
 
             const auto& scanQuery = config->ScanQuery.Get(cluster);
@@ -1191,7 +1305,7 @@ private:
             FillExecDataQueryAst(node.Cast<TKiExecDataQuery>(), result.QueryAst, ctx);
         };
 
-        return PerformExecution(execQuery, ctx, cluster, settings.Mode, settings.UseNewEngine, runFunc, finalizeFunc);
+        return PerformExecution(execQuery, ctx, cluster, settings.Mode, runFunc, finalizeFunc);
     }
 
     bool ApplyTableOperations(const TString& cluster, const TVector<NKqpProto::TKqpTableOp>& tableOps,

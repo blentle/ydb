@@ -163,13 +163,26 @@ public:
                 );
             }
 
-            if (const auto useCoro = State_->Configuration->SourceCoroActor.Get(); (!useCoro || *useCoro) && !s3ReadObject.Object().Format().Ref().IsAtom({"raw", "json_list"}))
+            auto format = s3ReadObject.Object().Format().Ref().Content();
+            if (const auto useCoro = State_->Configuration->SourceCoroActor.Get(); (!useCoro || *useCoro) && format != "raw" && format != "json_list") {
+                bool supportedArrowTypes = false;
+                if (State_->Types->UseBlocks && State_->Types->ArrowResolver) {
+                    TVector<const TTypeAnnotationNode*> allTypes;
+                    for (const auto& x : rowType->Cast<TStructExprType>()->GetItems()) {
+                        allTypes.push_back(x->GetItemType());
+                    }
+
+                    YQL_ENSURE(State_->Types->ArrowResolver->AreTypesSupported(ctx.GetPosition(read->Pos()), allTypes, supportedArrowTypes, ctx));
+                }
+
                 return Build<TDqSourceWrap>(ctx, read->Pos())
-                    .Input<TS3ParseSettings>()
+                    .Input<TS3ParseSettingsBase>()
+                        .CallableName((supportedArrowTypes && format == "parquet") ? TS3ArrowSettings::CallableName() :
+                                                                                     TS3ParseSettings::CallableName())
                         .Paths(s3ReadObject.Object().Paths())
                         .Token<TCoSecureParam>()
                             .Name().Build(token)
-                            .Build()
+                        .Build()
                         .Format(s3ReadObject.Object().Format())
                         .RowType(ExpandType(s3ReadObject.Pos(), *rowType, ctx))
                         .Settings(s3ReadObject.Object().Settings())
@@ -178,7 +191,7 @@ public:
                     .DataSource(s3ReadObject.DataSource().Cast<TCoDataSource>())
                     .Settings(ctx.NewList(s3ReadObject.Object().Pos(), std::move(settings)))
                     .Done().Ptr();
-            else {
+            } else {
                 if (const auto& objectSettings = s3ReadObject.Object().Settings()) {
                     settings.emplace_back(
                         ctx.Builder(objectSettings.Cast().Pos())
@@ -243,9 +256,10 @@ public:
             YQL_ENSURE(paths.Size() > 0);
             const TStructExprType* extraColumnsType = paths.Item(0).ExtraColumns().Ref().GetTypeAnn()->Cast<TStructExprType>();
 
-            if (const auto mayParseSettings = settings.Maybe<TS3ParseSettings>()) {
+            if (const auto mayParseSettings = settings.Maybe<TS3ParseSettingsBase>()) {
                 const auto parseSettings = mayParseSettings.Cast();
                 srcDesc.SetFormat(parseSettings.Format().StringValue().c_str());
+                srcDesc.SetArrow(bool(parseSettings.Maybe<TS3ArrowSettings>()));
 
                 const TStructExprType* fullRowType = parseSettings.RowType().Ref().GetTypeAnn()->Cast<TTypeExprType>()->GetType()->Cast<TStructExprType>();
                 // exclude extra columns to get actual row type we need to read from input
@@ -260,7 +274,7 @@ public:
                 if (const auto maySettings = parseSettings.Settings()) {
                     const auto& settings = maySettings.Cast();
                     for (auto i = 0U; i < settings.Ref().ChildrenSize(); ++i) {
-                        srcDesc.MutableSettings()->insert({TString(settings.Ref().Child(i)->Head().Content()), TString(settings.Ref().Child(i)->Tail().IsAtom() ? settings.Ref().Child(i)->Tail().Content() : settings.Ref().Child(i)->Tail().Head().Content())});
+                        srcDesc.MutableSettings()->insert({ TString(settings.Ref().Child(i)->Head().Content()), TString(settings.Ref().Child(i)->Tail().IsAtom() ? settings.Ref().Child(i)->Tail().Content() : settings.Ref().Child(i)->Tail().Head().Content()) });
                     }
                 }
             } else if (const auto maySourceSettings = source.Settings().Maybe<TS3SourceSettings>()){

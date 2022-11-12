@@ -1699,7 +1699,7 @@ TOwner TPDisk::FindNextOwnerId() {
         if (LastOwnerId == start) {
             return 0;
         }
-    } while (OwnerData[LastOwnerId].VDiskId != TVDiskID::InvalidId);
+    } while (OwnerData[LastOwnerId].VDiskId != TVDiskID::InvalidId || OwnerData[LastOwnerId].OnQuarantine);
 
     *Mon.LastOwnerId = LastOwnerId;
     return LastOwnerId;
@@ -1830,7 +1830,7 @@ void TPDisk::YardInitFinish(TYardInit &evYardInit) {
         // TODO(cthulhu): don't allocate more owners than expected
         Keeper.AddOwner(owner, vDiskId);
 
-        OwnerData[owner] = TOwnerData{};
+        OwnerData[owner].Reset(false);
 
         // A new owner is created.
 
@@ -1911,6 +1911,7 @@ void TPDisk::CheckSpace(TCheckSpace &evCheckSpace) {
                 GetFreeChunks(evCheckSpace.Owner, evCheckSpace.OwnerGroupType),
                 GetTotalChunks(evCheckSpace.Owner, evCheckSpace.OwnerGroupType),
                 GetUsedChunks(evCheckSpace.Owner, evCheckSpace.OwnerGroupType),
+                AtomicGet(TotalOwners),
                 TString()));
     ActorSystem->Send(evCheckSpace.Sender, result.Release());
     Mon.CheckSpace.CountResponse();
@@ -2058,7 +2059,7 @@ void TPDisk::KillOwner(TOwner owner, TOwnerRound killOwnerRound, TCompletionEven
         AtomicDecrement(TotalOwners);
 
         TOwnerRound ownerRound = OwnerData[owner].OwnerRound;
-        OwnerData[owner] = TOwnerData{};
+        OwnerData[owner].Reset(pushedOwnerIntoQuarantine);
         OwnerData[owner].OwnerRound = ownerRound;
         VDiskOwners.erase(vDiskId);
 
@@ -2883,7 +2884,7 @@ bool TPDisk::PreprocessRequest(TRequestBase *request) {
             if (errStatus != NKikimrProto::OK) {
                 LOG_ERROR_S(*ActorSystem, NKikimrServices::BS_PDISK, err.Str());
                 THolder<NPDisk::TEvCheckSpaceResult> result(new NPDisk::TEvCheckSpaceResult(errStatus,
-                            GetStatusFlags(ev.Owner, ev.OwnerGroupType), 0, 0, 0, err.Str()));
+                            GetStatusFlags(ev.Owner, ev.OwnerGroupType), 0, 0, 0, 0, err.Str()));
                 ActorSystem->Send(ev.Sender, result.Release());
                 Mon.CheckSpace.CountResponse();
                 delete request;

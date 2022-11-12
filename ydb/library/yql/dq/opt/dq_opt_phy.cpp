@@ -1621,7 +1621,10 @@ TExprBase DqRewriteLengthOfStageOutput(TExprBase node, TExprContext& ctx, IOptim
                     .Args({"item", "state"})
                     .Body<TCoAggrAdd>()
                         .Left("state")
-                        .Right("item")
+                        .Right<TCoMember>()
+                            .Struct("item")
+                            .Name(field)
+                            .Build()
                         .Build()
                     .Build()
                 .Build()
@@ -1655,88 +1658,76 @@ TExprBase DqRewriteLengthOfStageOutputLegacy(TExprBase node, TExprContext& ctx, 
 
     auto field = BuildAtom("_dq_agg_cnt", node.Pos(), ctx);
 
-    auto combine = Build<TCoCombineByKey>(ctx, node.Pos())
-            .Input(dqUnion)
-            .PreMapLambda()
-                .Args({"item"})
-                .Body<TCoJust>()
-                    .Input("item")
+    auto aggregateCombine = Build<TCoAggregateCombine>(ctx, node.Pos())
+        .Input(dqUnion)
+        .Keys()
+        .Build()
+        .Handlers()
+            .Add<TCoAggregateTuple>()
+                .ColumnName(field)
+                .Trait<TCoAggApply>()
+                    .Name<TCoAtom>()
+                        .Value("count_all")
+                    .Build()
+                    .InputType(ExpandType(node.Pos(), *GetSeqItemType(dqUnion.Raw()->GetTypeAnn()), ctx))
+                    .Extractor<TCoLambda>()
+                        .Args({ "row" })
+                        .Body<TCoVoid>()
+                        .Build()
                     .Build()
                 .Build()
-            .KeySelectorLambda()
-                .Args({"item"})
-                .Body(zero)
-                .Build()
-            .InitHandlerLambda()
-                .Args({"key", "item"})
-                .Body<TCoUint64>()
-                    .Literal().Build("1")
+            .Build()
+        .Build()
+        .Settings()
+        .Build()
+        .Done();
+
+    TVector<const TItemExprType*> stateItems = {
+        ctx.MakeType<TItemExprType>("_dq_agg_cnt", ctx.MakeType<TDataExprType>(EDataSlot::Uint64))
+    };
+
+    auto stateRowType = ctx.MakeType<TStructExprType>(stateItems);
+    auto stateTypeNode = ExpandType(node.Pos(), *stateRowType, ctx);
+
+    auto originalTypeNode = ctx.Builder(node.Pos())
+        .Callable("StructType")
+            .List(0)
+                .Add(0, field.Ptr())
+                .Callable(1, "VoidType")
+                .Seal()
+            .Seal()
+        .Seal()
+        .Build();
+
+    auto aggregateFinal = Build<TCoAggregateMergeFinalize>(ctx, node.Pos())
+        .Input(aggregateCombine)
+        .Keys()
+        .Build()
+        .Handlers()
+            .Add<TCoAggregateTuple>()
+                .ColumnName(field)
+                .Trait<TCoAggApplyState>()
+                    .Name<TCoAtom>()
+                        .Value("count_all")
                     .Build()
-                .Build()
-            .UpdateHandlerLambda()
-                .Args({"key", "item", "state"})
-                .Body<TCoInc>()
-                    .Value("state")
-                    .Build()
-                .Build()
-            .FinishHandlerLambda()
-                .Args({"key", "state"})
-                .Body<TCoJust>()
-                    .Input<TCoAsStruct>()
-                        .Add<TCoNameValueTuple>()
+                    .InputType(stateTypeNode)
+                    .Extractor<TCoLambda>()
+                        .Args({ "row" })
+                        .Body<TCoMember>()
+                            .Struct("row")
                             .Name(field)
-                            .Value("state")
-                            .Build()
                         .Build()
                     .Build()
+                    .OriginalType(originalTypeNode)
                 .Build()
-            .Done();
-
-    const auto stub = MakeBool<false>(node.Pos(), ctx);
-
-    auto partition = Build<TCoPartitionsByKeys>(ctx, node.Pos())
-            .Input(combine)
-            .KeySelectorLambda()
-                .Args({"item"})
-                .Body(stub)
-                .Build()
-            .SortDirections<TCoVoid>()
-                .Build()
-            .SortKeySelectorLambda<TCoVoid>()
-                .Build()
-            .ListHandlerLambda()
-                .Args({"list"})
-                .Body<TCoCondense1>()
-                    .Input("list")
-                    .InitHandler(BuildIdentityLambda(node.Pos(), ctx)) // take struct from CombineByKey result
-                    .SwitchHandler()
-                        .Args({"item", "state"})
-                        .Body(stub)
-                        .Build()
-                    .UpdateHandler()
-                        .Args({"item", "state"})
-                        .Body<TCoAsStruct>()
-                            .Add<TCoNameValueTuple>()
-                                .Name(field)
-                                .Value<TCoAggrAdd>()
-                                    .Left<TCoMember>()
-                                        .Struct("state")
-                                        .Name(field)
-                                        .Build()
-                                    .Right<TCoMember>()
-                                        .Struct("item")
-                                        .Name(field)
-                                        .Build()
-                                    .Build()
-                                .Build()
-                            .Build()
-                        .Build()
-                    .Build()
-                .Build()
-            .Done();
+            .Build()
+        .Build()
+        .Settings()
+        .Build()
+        .Done();
 
     auto toOptional = Build<TCoToOptional>(ctx, node.Pos())
-            .List(partition)
+            .List(aggregateFinal)
             .Done();
 
     auto coalesce = Build<TCoCoalesce>(ctx, node.Pos())
@@ -2298,8 +2289,12 @@ TExprBase DqBuildJoin(const TExprBase& node, TExprContext& ctx, IOptimizationCon
     }
 
     auto joinType = join.JoinType().Value();
+    bool leftIsUnionAll = join.LeftInput().Maybe<TDqCnUnionAll>().IsValid();
+    bool rightIsUnionAll = join.RightInput().Maybe<TDqCnUnionAll>().IsValid();
 
-    if (useGraceJoin) {
+
+
+    if (useGraceJoin && joinType != "Cross"sv && leftIsUnionAll && rightIsUnionAll) {
         return DqBuildGraceJoin(join, ctx);
     }
 

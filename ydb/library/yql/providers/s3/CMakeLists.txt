@@ -7,6 +7,7 @@
 
 
 add_subdirectory(actors)
+add_subdirectory(common)
 add_subdirectory(compressors)
 add_subdirectory(expr_nodes)
 add_subdirectory(path_generator)

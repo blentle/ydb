@@ -1,4 +1,5 @@
 #include <ydb/core/base/tablet.h>
+#include <ydb/core/base/kikimr_issue.h>
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
 #include <ydb/core/kqp/proxy/kqp_proxy_service.h>
 #include <ydb/core/kqp/kqp.h>
@@ -17,6 +18,8 @@ namespace NKikimr::NKqp {
 
 using namespace Tests;
 using namespace NSchemeShard;
+
+namespace  {
 
 struct TSimpleResource {
     ui32 Cnt;
@@ -43,6 +46,17 @@ TVector<NKikimrKqp::TKqpProxyNodeResources> Transform(TVector<TSimpleResource> d
     }
 
     return result;
+}
+
+TString CreateSession(TTestActorRuntime* runtime, const TActorId& kqpProxy, const TActorId& sender) {
+    runtime->Send(new IEventHandle(kqpProxy, sender, new TEvKqp::TEvCreateSessionRequest()));
+    auto reply = runtime->GrabEdgeEventRethrow<TEvKqp::TEvCreateSessionResponse>(sender);
+    auto record = reply->Get()->Record;
+    UNIT_ASSERT_VALUES_EQUAL(record.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+    TString sessionId = record.GetResponse().GetSessionId();
+    return sessionId;
+}
+
 }
 
 Y_UNIT_TEST_SUITE(KqpProxy) {
@@ -95,6 +109,44 @@ Y_UNIT_TEST_SUITE(KqpProxy) {
         SendBadRequestToSession("ydb://session/1?id=ZjY5NWRlM2EtYWMyYjA5YWEtNzQ0MTVlYTMtM2Q4ZDgzOWQ=&node_id=1234&node_id=12345");
         SendBadRequestToSession("unknown://session/1?id=ZjY5NWRlM2EtYWMyYjA5YWEtNzQ0MTVlYTMtM2Q4ZDgzOWQ=&node_id=1234&node_id=12345");
         SendBadRequestToSession("ydb://session/1?id=ZjY5NWRlM2EtYWMyYjA5YWEtNzQ0MTVlYTMtM2Q4ZDgzOWQ=&node_id=eqweq");
+    }
+
+    Y_UNIT_TEST(PassErrroViaSessionActor) {
+        TPortManager tp;
+
+        ui16 mbusport = tp.GetPort(2134);
+        auto settings = Tests::TServerSettings(mbusport);
+
+        Tests::TServer server(settings);
+        Tests::TClient client(settings);
+
+        server.GetRuntime()->SetLogPriority(NKikimrServices::KQP_PROXY, NActors::NLog::PRI_DEBUG);
+        client.InitRootScheme();
+        auto runtime = server.GetRuntime();
+
+        TActorId kqpProxy = MakeKqpProxyID(runtime->GetNodeId(0));
+        TActorId sender = runtime->AllocateEdgeActor();
+
+        auto ev = MakeHolder<NKqp::TEvKqp::TEvQueryRequest>();
+        //ev->Record.MutableRequest()->SetSessionId(sessionId);
+        ev->Record.SetYdbStatus(Ydb::StatusIds::BAD_REQUEST);
+        auto issue = MakeIssue(NKikimrIssues::TIssuesIds::DEFAULT_ERROR, "SomeUniqTextForUt");
+
+        NYql::TIssues issues;
+        issues.AddIssue(issue);
+        NYql::IssuesToMessage(issues, ev->Record.MutableQueryIssues());
+
+        ev->Record.MutableRequest()->SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
+        ev->Record.MutableRequest()->SetType(NKikimrKqp::QUERY_TYPE_SQL_SCRIPT);
+        ev->Record.MutableRequest()->SetQuery("SELECT 1; COMMIT;");
+        ev->Record.MutableRequest()->SetKeepSession(true);
+        ev->Record.MutableRequest()->SetTimeoutMs(10);
+
+        runtime->Send(new IEventHandle(kqpProxy, sender, ev.Release()));
+        TAutoPtr<IEventHandle> handle;
+        auto reply = runtime->GrabEdgeEventRethrow<TEvKqp::TEvProcessResponse>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.GetYdbStatus(), Ydb::StatusIds::BAD_REQUEST);
+        UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.GetError(), "<main>: Error: SomeUniqTextForUt\n");
     }
 
     Y_UNIT_TEST(LoadedMetadataAfterCompilationTimeout) {
@@ -173,17 +225,7 @@ Y_UNIT_TEST_SUITE(KqpProxy) {
             UNIT_ASSERT_VALUES_EQUAL(reply->Get()->Record.GetRef().GetYdbStatus(), Ydb::StatusIds::TIMEOUT);
         };
 
-        std::function<TString()> CreateSession = [&]() {
-            runtime->Send(new IEventHandle(kqpProxy, sender, new TEvKqp::TEvCreateSessionRequest()));
-            auto reply = runtime->GrabEdgeEventRethrow<TEvKqp::TEvCreateSessionResponse>(sender);
-            auto record = reply->Get()->Record;
-            UNIT_ASSERT_VALUES_EQUAL(record.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-            TString sessionId = record.GetResponse().GetSessionId();
-            Cerr << "Created session " << sessionId << Endl;
-            return sessionId;
-        };
-
-        TString sessionId = CreateSession();
+        TString sessionId = CreateSession(runtime, kqpProxy, sender);
         CreateTable(sessionId, "--!syntax_v1\nCREATE TABLE `/Root/Table` (A int32, PRIMARY KEY(A));");
         CreateTable(sessionId, "--!syntax_v1\nCREATE TABLE `/Root/TableWithIndex` (A int32, B int32, PRIMARY KEY(A), INDEX TestIndex GLOBAL ON(B));");
 
@@ -192,7 +234,7 @@ Y_UNIT_TEST_SUITE(KqpProxy) {
         std::vector<TString> queries{"SELECT * FROM `/Root/Table`;", "SELECT * FROM `/Root/TableWithIndex`;", "SELECT * FROM `/Root/Table`;", "SELECT * FROM `/Root/Table`;"};
         for (auto query: queries) {
             for(size_t iter = 0; iter < 2; ++iter) {
-                SendQuery(CreateSession(), query);
+                SendQuery(CreateSession(runtime, kqpProxy, sender), query);
                 for(auto ev: scheduled) {
                     Cerr << "Send scheduled evet back" << Endl;
                     runtime->Send(ev.Release());
@@ -206,6 +248,44 @@ Y_UNIT_TEST_SUITE(KqpProxy) {
                 scheduled.clear();
                 captured.clear();
             }
+        }
+    }
+
+    Y_UNIT_TEST(NoLocalSessionExecution) {
+        TPortManager tp;
+
+        ui16 mbusport = tp.GetPort(2134);
+        auto settings = Tests::TServerSettings(mbusport);
+        // Setup two to nodes with 2 KQP_RPOXY_ACTOR instances.
+        settings.SetNodeCount(2);
+
+        Tests::TServer server(settings);
+        Tests::TClient client(settings);
+
+        server.GetRuntime()->SetLogPriority(NKikimrServices::KQP_PROXY, NActors::NLog::PRI_DEBUG);
+        auto runtime = server.GetRuntime();
+
+        TActorId kqpProxy1 = MakeKqpProxyID(runtime->GetNodeId(0));
+        TActorId kqpProxy2 = MakeKqpProxyID(runtime->GetNodeId(1));
+        TActorId sender = runtime->AllocateEdgeActor();
+
+        {
+            TString sessionId = CreateSession(runtime, kqpProxy2, sender);
+            auto ev = MakeHolder<NKqp::TEvKqp::TEvQueryRequest>();
+            ev->Record.MutableRequest()->SetSessionId(sessionId);
+            ev->Record.MutableRequest()->SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
+            ev->Record.MutableRequest()->SetType(NKikimrKqp::QUERY_TYPE_SQL_SCRIPT);
+            ev->Record.MutableRequest()->SetQuery("SELECT 1; COMMIT;");
+            ev->Record.MutableRequest()->SetKeepSession(true);
+
+            runtime->Send(new IEventHandle(kqpProxy1, sender, ev.Release()));
+
+            TAutoPtr<IEventHandle> handle;
+            auto reply = runtime->GrabEdgeEventsRethrow<TEvKqp::TEvQueryResponse, TEvKqp::TEvProcessResponse>(handle);
+
+            TEvKqp::TEvQueryResponse* queryResponse = std::get<TEvKqp::TEvQueryResponse*>(reply);
+            Y_VERIFY(queryResponse);
+            UNIT_ASSERT_VALUES_EQUAL(queryResponse->Record.GetRef().GetYdbStatus(), Ydb::StatusIds::SUCCESS);
         }
     }
 
@@ -236,16 +316,6 @@ Y_UNIT_TEST_SUITE(KqpProxy) {
         size_t NegativeStories = 0;
         size_t SuccessStories = 0;
 
-        std::function<TString()> CreateSession = [&]() {
-            runtime->Send(new IEventHandle(kqpProxy2, sender, new TEvKqp::TEvCreateSessionRequest()));
-            auto reply = runtime->GrabEdgeEventRethrow<TEvKqp::TEvCreateSessionResponse>(sender);
-            auto record = reply->Get()->Record;
-            UNIT_ASSERT_VALUES_EQUAL(record.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-            TString sessionId = record.GetResponse().GetSessionId();
-            Cerr << "Created session " << sessionId << Endl;
-            return sessionId;
-        };
-
         size_t capturedQueries = 0;
         size_t capturedPings = 0;
         auto captureEvents = [&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle> &ev) {
@@ -275,7 +345,7 @@ Y_UNIT_TEST_SUITE(KqpProxy) {
         for (ui32 rep = 0; rep < 30; rep++) {
 
             {
-                TString sessionId = CreateSession();
+                TString sessionId = CreateSession(runtime, kqpProxy2, sender);
                 Cerr << "Created  session " << sessionId << Endl;
                 auto ev = MakeHolder<NKqp::TEvKqp::TEvQueryRequest>();
                 ev->Record.MutableRequest()->SetSessionId(sessionId);
@@ -304,7 +374,7 @@ Y_UNIT_TEST_SUITE(KqpProxy) {
             }
 
             {
-                TString sessionId = CreateSession();
+                TString sessionId = CreateSession(runtime, kqpProxy2, sender);
                 auto ev = MakeHolder<NKqp::TEvKqp::TEvPingSessionRequest>();
                 ev->Record.MutableRequest()->SetSessionId(sessionId);
                 ev->Record.MutableRequest()->SetTimeoutMs(1);

@@ -307,6 +307,10 @@ namespace NActors {
             Node->MailboxTable->ReclaimMailbox(mailboxType, hint, revolvingCounter);
         }
 
+        TMailboxHeader *ResolveMailbox(ui32 hint) override {
+            return Node->MailboxTable->Get(hint);
+        }
+
         void Schedule(TInstant deadline, TAutoPtr<IEventHandle> ev, ISchedulerCookie *cookie, TWorkerId workerId) override {
             DoSchedule(deadline, ev, cookie, workerId);
         }
@@ -1417,6 +1421,10 @@ namespace NActors {
         Y_VERIFY(senderNodeIndex < NodeCount, "senderNodeIndex# %" PRIu32 " < NodeCount# %" PRIu32,
             senderNodeIndex, NodeCount);
         SendInternal(ev, senderNodeIndex, viaActorSystem);
+    }
+
+    void TTestActorRuntimeBase::SendAsync(IEventHandle* ev, ui32 senderNodeIndex) {
+        Send(ev, senderNodeIndex, true);
     }
 
     void TTestActorRuntimeBase::Schedule(IEventHandle* ev, const TDuration& duration, ui32 nodeIndex) {

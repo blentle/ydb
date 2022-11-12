@@ -21,10 +21,12 @@ items:
       href: commands/secondary_index.md
     - name: Renaming tables
       href: commands/tools/rename.md
+    - name: Setting TTL parameters
+      href: table-ttl-set.md
+    - name: Deleting TTL parameters
+      href: table-ttl-drop.md
   - name: Operations with data
     items:
-    - name: Making a DB query
-      href: commands/query.md
     - name: Getting a query execution plan and AST
       href: commands/explain-plan.md
     - name: Streaming table reads
@@ -53,6 +55,16 @@ items:
       href: topic-write.md
     - name: Message pipeline processing
       href: topic-pipeline.md
+  - name: YQL execution
+    items:
+    - name: Overview
+      href: yql-query-overview.md
+    - name: Running a script (with streaming support)
+      href: yql.md
+    - name: Running a script
+      href: scripting-yql.md
+    - name: Running a query
+      href: table-query-execute.md
 #  - name: Utilities
 #    items:
     # - name: Copy tables
@@ -61,6 +73,16 @@ items:
     #   href: commands/tools/dump.md
     # - name: Restore backup
     #   href: commands/tools/restore.md
+  - name: Managing long running operations
+    items:
+    - name: Getting a list of long running operations
+      href: operation-list.md
+    - name: Obtaining the status of long running operations
+      href: operation-get.md
+    - name: Canceling long running operations
+      href: operation-cancel.md
+    - name: Deleting long running operations from the list
+      href: operation-forget.md
   - name: Managing profiles
     include: { mode: link, path: profile/toc_p.yaml }
   - name: Information services
@@ -79,5 +101,3 @@ items:
       href: commands/workload/stock.md
     - name: Key-Value load
       href: workload-kv.md
-
-

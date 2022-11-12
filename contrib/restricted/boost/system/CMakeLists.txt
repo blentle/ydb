@@ -13,9 +13,9 @@ target_include_directories(restricted-boost-system INTERFACE
 )
 target_link_libraries(restricted-boost-system INTERFACE
   contrib-libs-cxxsupp
-  yutil
   restricted-boost-assert
   restricted-boost-config
   restricted-boost-throw_exception
+  restricted-boost-variant2
   restricted-boost-winapi
 )

@@ -129,23 +129,23 @@ public:
         const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
         ui64 nextUniqueId,
         TVector<TDataProviderInitializer> dataProvidersInit,
-        NYql::IModuleResolver::TPtr& moduleResolver,
-        NYql::TGatewaysConfig gatewaysConfig,
+        NYql::IModuleResolver::TPtr moduleResolver,
+        const NYql::TGatewaysConfig& gatewaysConfig,
         const TString& sql,
         const TString& sessionId,
-        NSQLTranslation::TTranslationSettings sqlSettings,
+        const NSQLTranslation::TTranslationSettings& sqlSettings,
         YandexQuery::ExecuteMode executeMode
     )
-        : RunActorId(runActorId),
-        FunctionRegistry(functionRegistry),
-        NextUniqueId(nextUniqueId),
-        DataProvidersInit(dataProvidersInit),
-        ModuleResolver(moduleResolver),
-        GatewaysConfig(gatewaysConfig),
-        Sql(sql),
-        SessionId(sessionId),
-        SqlSettings(sqlSettings),
-        ExecuteMode(executeMode)
+        : RunActorId(runActorId)
+        , FunctionRegistry(functionRegistry)
+        , NextUniqueId(nextUniqueId)
+        , DataProvidersInit(std::move(dataProvidersInit))
+        , ModuleResolver(moduleResolver)
+        , GatewaysConfig(gatewaysConfig)
+        , Sql(sql)
+        , SessionId(sessionId)
+        , SqlSettings(sqlSettings)
+        , ExecuteMode(executeMode)
     {
     }
 
@@ -251,16 +251,16 @@ public:
 private:
     TProgramPtr Program;
     TIssues Issues;
-    TActorId RunActorId;
+    const TActorId RunActorId;
     const NKikimr::NMiniKQL::IFunctionRegistry* FunctionRegistry;
     ui64 NextUniqueId;
-    TVector<TDataProviderInitializer> DataProvidersInit;
-    NYql::IModuleResolver::TPtr ModuleResolver;
-    NYql::TGatewaysConfig GatewaysConfig;
+    const TVector<TDataProviderInitializer> DataProvidersInit;
+    const NYql::IModuleResolver::TPtr ModuleResolver;
+    const NYql::TGatewaysConfig GatewaysConfig;
     const TString Sql;
     const TString SessionId;
-    NSQLTranslation::TTranslationSettings SqlSettings;
-    YandexQuery::ExecuteMode ExecuteMode;
+    const NSQLTranslation::TTranslationSettings SqlSettings;
+    const YandexQuery::ExecuteMode ExecuteMode;
     bool Compiled = false;
 };
 
@@ -284,7 +284,6 @@ public:
         , EnableCheckpointCoordinator(Params.QueryType == YandexQuery::QueryContent::STREAMING && Params.CheckpointCoordinatorConfig.GetEnabled())
         , MaxTasksPerOperation(Params.CommonConfig.GetMaxTasksPerOperation() ? Params.CommonConfig.GetMaxTasksPerOperation() : 40)
         , Compressor(Params.CommonConfig.GetQueryArtifactsCompressionMethod(), Params.CommonConfig.GetQueryArtifactsCompressionMinSize())
-        , RateLimiterResourceWasCreated(CalcRateLimiterResourceWasCreated())
     {
         QueryCounters.SetUptimePublicAndServiceCounter(0);
     }
@@ -321,7 +320,9 @@ public:
         Become(&TRunActor::StateFuncWrapper<&TRunActor::StateFunc>);
 
         try {
-            Run();
+            if (!TimeLimitExceeded()) {
+                Run();
+            }
         } catch (const std::exception&) {
             FailOnException();
         }
@@ -435,6 +436,10 @@ private:
         NActors::TActorBootstrapped<TRunActor>::PassAway();
     }
 
+    void AbortByExecutionTimeout() {
+        Abort("Execution time limit exceeded", YandexQuery::QueryMeta::ABORTED_BY_SYSTEM);
+    }
+
     bool TimeLimitExceeded() {
         if (Params.ExecutionTtl != TDuration::Zero()) {
             auto currentTime = TInstant::Now();
@@ -442,7 +447,7 @@ private:
             auto deadline = startedAt  + Params.ExecutionTtl;
 
             if (currentTime >= deadline) {
-                Abort("Execution time limit exceeded", YandexQuery::QueryMeta::ABORTED_BY_SYSTEM);
+                AbortByExecutionTimeout();
                 return true;
             } else {
                 Schedule(deadline, new NActors::TEvents::TEvWakeup(RunActorWakeupTag::ExecutionTimeout));
@@ -451,13 +456,68 @@ private:
         return false;
     }
 
-    void Run() {
-        if (!Params.DqGraphs.empty() && Params.Status != YandexQuery::QueryMeta::STARTING) {
-            FillDqGraphParams();
+    void ProcessQuery() {
+        // should be called in case of some event, so sync state first
+        Send(Pinger, new TEvents::TEvForwardPingRequest(QueryStateUpdateRequest));
+
+        // must be in-sync, TODO: dedup
+        Params.Resources = QueryStateUpdateRequest.resources();
+
+        if (QueryStateUpdateRequest.resources().rate_limiter() == Fq::Private::TaskResources::PREPARE) {
+            if (!RateLimiterResourceCreatorId) {
+                LOG_D("Start rate limiter resource creator");
+                RateLimiterResourceCreatorId = Register(CreateRateLimiterResourceCreator(SelfId(), Params.Owner, Params.QueryId, Params.Scope, Params.TenantName));
+            }
+            return;
         }
 
-        if (TimeLimitExceeded()) {
+        if (QueryStateUpdateRequest.resources().compilation() == Fq::Private::TaskResources::PREPARE) {
+            if (!ProgramRunnerId) {
+                RunProgram();
+            }
             return;
+        }
+
+        if (QueryStateUpdateRequest.resources().read_rules() == Fq::Private::TaskResources::PREPARE) {
+            if (!ReadRulesCreatorId) {
+                ReadRulesCreatorId = Register(
+                    ::NYq::MakeReadRuleCreatorActor(
+                        SelfId(),
+                        Params.QueryId,
+                        Params.YqSharedResources->UserSpaceYdbDriver,
+                        std::move(TopicsForConsumersCreation),
+                        std::move(CredentialsForConsumersCreation)
+                    )
+                );
+            }
+            return;
+        }
+
+        if (DqGraphParams.empty()) {
+            QueryStateUpdateRequest.set_resign_query(false);
+            const bool isOk = Issues.Size() == 0;
+            Finish(GetFinishStatus(isOk));
+            return;
+        }
+
+        if (AbortOnExceedingDqGraphsLimits()) {
+            return;
+        }
+
+        for (const auto& m : Params.ResultSetMetas) {
+            *QueryStateUpdateRequest.add_result_set_meta() = m;
+        }
+
+        DqGraphIndex = Params.DqGraphIndex;
+        UpdateResultIndices();
+        RunNextDqGraph();
+    }
+
+    void Run() {
+        *QueryStateUpdateRequest.mutable_resources() = Params.Resources;
+
+        if (!Params.DqGraphs.empty() && QueryStateUpdateRequest.resources().compilation() == Fq::Private::TaskResources::READY) {
+            FillDqGraphParams();
         }
 
         switch (Params.Status) {
@@ -470,16 +530,16 @@ private:
             break;
         case YandexQuery::QueryMeta::STARTING:
             HandleConnections();
-            if (Params.RateLimiterConfig.GetEnabled()) {
-                if (StartRateLimiterResourceCreatorIfNeeded() || !RateLimiterResourceWasCreated) {
-                    return;
-                }
-            }
-            RunProgram();
-            break;
+            QueryStateUpdateRequest.mutable_resources()->set_rate_limiter(
+                Params.RateLimiterConfig.GetEnabled() ? Fq::Private::TaskResources::PREPARE : Fq::Private::TaskResources::NOT_NEEDED);
+            QueryStateUpdateRequest.mutable_resources()->set_compilation(Fq::Private::TaskResources::PREPARE);
+            // know nothing about read rules yet
+            Params.Status = YandexQuery::QueryMeta::RUNNING; // ???
+            QueryStateUpdateRequest.set_status(YandexQuery::QueryMeta::RUNNING);
+            // DO NOT break here
         case YandexQuery::QueryMeta::RESUMING:
         case YandexQuery::QueryMeta::RUNNING:
-            ReRunQuery();
+            ProcessQuery();
             break;
         default:
             Abort("Fail to start query from unexpected status " + YandexQuery::QueryMeta::ComputeStatus_Name(Params.Status), YandexQuery::QueryMeta::FAILED);
@@ -647,7 +707,7 @@ private:
         auto tag = (RunActorWakeupTag) ev->Get()->Tag;
         switch (tag) {
             case RunActorWakeupTag::ExecutionTimeout: {
-                Abort("Execution timeout", YandexQuery::QueryMeta::ABORTED_BY_SYSTEM);
+                AbortByExecutionTimeout();
                 break;
             }
             default: {
@@ -664,19 +724,10 @@ private:
         }
 
         if (ev->Cookie == SaveQueryInfoCookie) {
-            if (TopicsForConsumersCreation.size()) {
-                ReadRulesCreatorId = Register(
-                    ::NYq::MakeReadRuleCreatorActor(
-                        SelfId(),
-                        Params.QueryId,
-                        Params.YqSharedResources->UserSpaceYdbDriver,
-                        std::move(TopicsForConsumersCreation),
-                        std::move(CredentialsForConsumersCreation)
-                    )
-                );
-            } else {
-                RunDqGraphs();
-            }
+            QueryStateUpdateRequest.mutable_resources()->set_compilation(Fq::Private::TaskResources::READY);
+            QueryStateUpdateRequest.mutable_resources()->set_read_rules(
+                TopicsForConsumersCreation.size() ? Fq::Private::TaskResources::PREPARE : Fq::Private::TaskResources::NOT_NEEDED);
+            ProcessQuery();
         } else if (ev->Cookie == SetLoadFromCheckpointModeCookie) {
             Send(CheckpointCoordinatorId, new TEvCheckpointCoordinator::TEvRunGraph());
         }
@@ -719,10 +770,10 @@ private:
     void Handle(TEvents::TEvGraphParams::TPtr& ev) {
         LOG_D("Graph (" << (ev->Get()->IsEvaluation ? "evaluation" : "execution") << ") with tasks: " << ev->Get()->GraphParams.TasksSize());
 
-        if (RateLimiterPath) {
+        if (Params.Resources.rate_limiter_path()) {
             const TString rateLimiterResource = GetRateLimiterResourcePath(Params.CloudId, Params.Scope.ParseFolder(), Params.QueryId);
             for (auto& task : *ev->Get()->GraphParams.MutableTasks()) {
-                task.SetRateLimiter(RateLimiterPath);
+                task.SetRateLimiter(Params.Resources.rate_limiter_path());
                 task.SetRateLimiterResource(rateLimiterResource);
             }
         }
@@ -745,8 +796,7 @@ private:
                 gatewayResult.Truncated = true;
                 gatewayResult.RowsCount = 0;
             } else {
-                // for resultless results expect infinite INSERT FROM SELECT and fail YQL facade (with well known secret code?)
-                gatewayResult.AddIssues({NYql::TIssue("MAGIC BREAK").SetCode(555, NYql::TSeverityIds::S_ERROR)});
+                // for resultless results expect infinite INSERT FROM SELECT and just return "nothing"
             }
             ev->Get()->Result.SetValue(gatewayResult);
         }
@@ -759,11 +809,7 @@ private:
     }
 
     void Handle(TEvents::TEvRaiseTransientIssues::TPtr& ev) {
-        Fq::Private::PingTaskRequest request;
-
-        NYql::IssuesToMessage(ev->Get()->TransientIssues, request.mutable_transient_issues());
-
-        Send(Pinger, new TEvents::TEvForwardPingRequest(request), 0, RaiseTransientIssuesCookie);
+        SendTransientIssues(ev->Get()->TransientIssues);
     }
 
     void Handle(TEvDqStats::TPtr& ev) {
@@ -774,8 +820,15 @@ private:
         }
     }
 
+    void SendTransientIssues(const NYql::TIssues& issues) {
+        Fq::Private::PingTaskRequest request;
+        NYql::IssuesToMessage(issues, request.mutable_transient_issues());
+        Send(Pinger, new TEvents::TEvForwardPingRequest(request), 0, RaiseTransientIssuesCookie);
+    }
+
     i32 UpdateResultIndices() {
         i32 count = 0;
+        DqGrapResultIndices.clear();
         for (const auto& graphParams : DqGraphParams) {
             DqGrapResultIndices.push_back(graphParams.GetResultType() ? count++ : -1);
         }
@@ -983,10 +1036,10 @@ private:
         KillExecuter();
     }
 
-    void Handle(NYql::NDqs::TEvQueryResponse::TPtr& ev) {
+    bool HandleEvalQueryResponse(NYql::NDqs::TEvQueryResponse::TPtr& ev) {
         auto it = EvalInfos.find(ev->Sender);
-        if (it != EvalInfos.end()) {
-
+        auto eval = it != EvalInfos.end();
+        if (eval) {
             IDqGateway::TResult QueryResult;
 
             auto& result = ev->Get()->Record;
@@ -1016,8 +1069,18 @@ private:
             QueryResult.RowsCount = result.GetRowsCount();
             it->second.Result.SetValue(QueryResult);
             EvalInfos.erase(it);
+        }
+        return eval;
+    }
 
+    void Handle(NYql::NDqs::TEvQueryResponse::TPtr& ev) {
+        if (HandleEvalQueryResponse(ev)) {
             return;
+        }
+
+        if (ev->Sender != ExecuterId) {
+           LOG_E("TEvQueryResponse received from UNKNOWN Actor (TDqExecuter?) " << ev->Sender);
+           return;
         }
 
         SaveQueryResponse(ev);
@@ -1058,6 +1121,15 @@ private:
             ev->Get()->Record.SetStatusCode(NYql::NDqProto::StatusIds::CANCELLED);
         }
 
+        if (HandleEvalQueryResponse(ev)) {
+            return;
+        }
+
+        if (ev->Sender != ExecuterId) {
+           LOG_E("TEvQueryResponse received from UNKNOWN Actor (TDqExecuter?) when FINISHED " << ev->Sender);
+           return;
+        }
+
         QueryResponseArrived = true;
         SaveQueryResponse(ev);
 
@@ -1072,7 +1144,8 @@ private:
             LOG_D(Issues.ToOneLineString());
             Finish(YandexQuery::QueryMeta::FAILED);
         } else {
-            RunDqGraphs();
+            QueryStateUpdateRequest.mutable_resources()->set_read_rules(Fq::Private::TaskResources::READY);
+            ProcessQuery();
         }
     }
 
@@ -1138,9 +1211,10 @@ private:
             LOG_D(Issues.ToOneLineString());
             Finish(YandexQuery::QueryMeta::FAILED);
         } else {
-            RateLimiterResourceWasCreated = true;
-            RateLimiterPath = ev->Get()->Result.rate_limiter();
-            RunProgram();
+            Params.Resources.set_rate_limiter_path(ev->Get()->Result.rate_limiter());
+            QueryStateUpdateRequest.mutable_resources()->set_rate_limiter_path(ev->Get()->Result.rate_limiter());
+            QueryStateUpdateRequest.mutable_resources()->set_rate_limiter(Fq::Private::TaskResources::READY);
+            ProcessQuery();
         }
     }
 
@@ -1159,15 +1233,6 @@ private:
         ContinueFinish();
     }
 
-    bool StartRateLimiterResourceCreatorIfNeeded() {
-        if (!RateLimiterResourceWasCreated && !RateLimiterResourceCreatorId && Params.RateLimiterConfig.GetEnabled()) {
-            LOG_D("Start rate limiter resource creator");
-            RateLimiterResourceCreatorId = Register(CreateRateLimiterResourceCreator(SelfId(), Params.Owner, Params.QueryId, Params.Scope, Params.TenantName));
-            return true;
-        }
-        return false;
-    }
-
     bool StartRateLimiterResourceDeleterIfCan() {
         if (!RateLimiterResourceDeleterId && !RateLimiterResourceCreatorId && FinalizingStatusIsWritten && QueryResponseArrived && Params.RateLimiterConfig.GetEnabled()) {
             LOG_D("Start rate limiter resource deleter");
@@ -1175,24 +1240,6 @@ private:
             return true;
         }
         return false;
-    }
-
-    void RunDqGraphs() {
-        if (DqGraphParams.empty()) {
-            QueryStateUpdateRequest.set_resign_query(false);
-            const bool isOk = Issues.Size() == 0;
-            Finish(GetFinishStatus(isOk));
-            return;
-        }
-
-        {
-            Params.Status = YandexQuery::QueryMeta::RUNNING;
-            Fq::Private::PingTaskRequest request;
-            request.set_status(YandexQuery::QueryMeta::RUNNING);
-            Send(Pinger, new TEvents::TEvForwardPingRequest(request), 0, UpdateQueryInfoCookie);
-        }
-
-        RunNextDqGraph();
     }
 
     TEvaluationGraphInfo RunEvalDqGraph(NYq::NProto::TGraphParams& dqGraphParams) {
@@ -1328,6 +1375,8 @@ private:
         apply("_EnablePrecompute", "1");
         apply("WatermarksMode", "disable");
         apply("WatermarksGranularityMs", "1000");
+        apply("WatermarksLateArrivalDelayMs", "5000");
+        apply("WatermarksIdlePartitions", "true");
 
         switch (Params.QueryType) {
         case YandexQuery::QueryContent::STREAMING: {
@@ -1512,86 +1561,6 @@ private:
         }
     }
 
-    void ReRunQuery() {
-        if (AbortOnExceedingDqGraphsLimits()) {
-            return;
-        }
-        for (const auto& m : Params.ResultSetMetas) {
-            *QueryStateUpdateRequest.add_result_set_meta() = m;
-        }
-        DqGraphIndex = Params.DqGraphIndex;
-        UpdateResultIndices();
-        RunNextDqGraph();
-    }
-
-    bool RunProgram(
-        const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
-        ui64 nextUniqueId,
-        TVector<TDataProviderInitializer> dataProvidersInit,
-        NYql::IModuleResolver::TPtr& moduleResolver,
-        NYql::TGatewaysConfig gatewaysConfig,
-        const TString& sql,
-        const TString& sessionId,
-        NSQLTranslation::TTranslationSettings sqlSettings,
-        YandexQuery::ExecuteMode executeMode
-    ) {
-        TProgramFactory progFactory(false, functionRegistry, nextUniqueId, dataProvidersInit, "yq");
-        progFactory.SetModules(moduleResolver);
-        progFactory.SetUdfResolver(NYql::NCommon::CreateSimpleUdfResolver(functionRegistry, nullptr));
-        progFactory.SetGatewaysConfig(&gatewaysConfig);
-
-        Program = progFactory.Create("-stdin-", sql, sessionId);
-        Program->EnableResultPosition();
-
-        // parse phase
-        {
-            if (!Program->ParseSql(sqlSettings)) {
-                Issues.AddIssues(Program->Issues());
-                return false;
-
-            }
-
-            if (executeMode == YandexQuery::ExecuteMode::PARSE) {
-                return true;
-            }
-        }
-
-        // compile phase
-        {
-            if (!Program->Compile("")) {
-                Issues.AddIssues(Program->Issues());
-                return false;
-            }
-
-            if (executeMode == YandexQuery::ExecuteMode::COMPILE) {
-                return true;
-            }
-        }
-
-        // next phases can be async: optimize, validate, run
-        TProgram::TFutureStatus futureStatus;
-        switch (executeMode) {
-        case YandexQuery::ExecuteMode::EXPLAIN:
-            futureStatus = Program->OptimizeAsync("");
-            break;
-        case YandexQuery::ExecuteMode::VALIDATE:
-            futureStatus = Program->ValidateAsync("");
-            break;
-        case YandexQuery::ExecuteMode::RUN:
-            futureStatus = Program->RunAsync("");
-            break;
-        default:
-            Issues.AddIssue(TStringBuilder() << "Unexpected execute mode " << static_cast<int>(Params.ExecuteMode));
-            return false;
-        }
-
-        futureStatus.Subscribe([actorSystem = NActors::TActivationContext::ActorSystem(), selfId = SelfId()](const TProgram::TFutureStatus& f) {
-            actorSystem->Send(selfId, new TEvents::TEvAsyncContinue(f));
-        });
-
-        return true;
-    }
-
     void RunProgram() {
         LOG_D("Compiling query ...");
         NYql::TGatewaysConfig gatewaysConfig;
@@ -1666,6 +1635,7 @@ private:
         NSQLTranslation::TTranslationSettings sqlSettings;
         sqlSettings.ClusterMapping = clusters;
         sqlSettings.SyntaxVersion = 1;
+        sqlSettings.PgParser = (Params.QuerySyntax == YandexQuery::QueryContent::PG);
         sqlSettings.V0Behavior = NSQLTranslation::EV0Behavior::Disable;
         sqlSettings.Flags.insert({ "DqEngineEnable", "DqEngineForce", "DisableAnsiOptionalAs" });
         try {
@@ -1676,19 +1646,6 @@ private:
             return;
         }
 
-/*
-        return RunProgram(
-            Params.FunctionRegistry,
-            Params.NextUniqueId,
-            dataProvidersInit,
-            Params.ModuleResolver,
-            gatewaysConfig,
-            Params.Sql,
-            SessionId,
-            sqlSettings,
-            Params.ExecuteMode
-        );
-*/
         ProgramRunnerId = Register(new TProgramRunnerActor(
             SelfId(),
             Params.FunctionRegistry,
@@ -1738,6 +1695,9 @@ private:
 
     void FinishProgram(NYql::TProgram::TStatus status, const TString& message = "", const NYql::TIssues& issues = {}) {
         if (status == TProgram::TStatus::Ok || (DqGraphParams.size() > 0 && !DqGraphParams[0].GetResultType())) {
+            if (issues) {
+                SendTransientIssues(issues);
+            }
             PrepareGraphs();
         } else {
             TString abortMessage = message;
@@ -1917,13 +1877,6 @@ private:
             << " }");
     }
 
-    bool CalcRateLimiterResourceWasCreated() const {
-        if (Params.Status == YandexQuery::QueryMeta::STARTING) {
-            return false;
-        }
-        return true;
-    }
-
 private:
     TActorId FetcherId;
     TActorId ProgramRunnerId;
@@ -1961,11 +1914,9 @@ private:
     NActors::TActorId ReadRulesCreatorId;
 
     // Rate limiter resource creation
-    bool RateLimiterResourceWasCreated = false;
     bool RateLimiterResourceWasDeleted = false;
     NActors::TActorId RateLimiterResourceCreatorId;
     NActors::TActorId RateLimiterResourceDeleterId;
-    TString RateLimiterPath;
 
     // Finish
     bool Finishing = false;

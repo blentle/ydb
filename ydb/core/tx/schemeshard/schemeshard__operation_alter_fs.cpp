@@ -160,10 +160,8 @@ public:
 
         TPathElement::TPtr path = context.SS->PathsById.at(pathId);
         path->PathState = TPathElement::EPathState::EPathStateNoChanges;
-        path->StepCreated = step;
 
         NIceDb::TNiceDb db(context.GetDB());
-        context.SS->PersistCreateStep(db, pathId, step);
 
         fs->FinishAlter();
 
@@ -352,12 +350,7 @@ THolder<TProposeResponse> TAlterFileStore::Propose(
             .IsCommonSensePath();
 
         if (!checks) {
-            TString explain = TStringBuilder()
-                << "path fail checks"
-                << ", path: " << path.PathString();
-
-            auto status = checks.GetStatus(&explain);
-            result->SetError(status, explain);
+            result->SetError(checks.GetStatus(), checks.GetError());
             return result;
         }
     }

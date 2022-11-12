@@ -41,8 +41,6 @@ public:
 
         TPathId pathId = txState->TargetPathId;
         TPathElement::TPtr path = context.SS->PathsById.at(pathId);
-        path->StepCreated = step;
-        context.SS->PersistCreateStep(db, path->PathId, step);
 
         Y_VERIFY(context.SS->Indexes.contains(path->PathId));
         TTableIndexInfo::TPtr indexData = context.SS->Indexes.at(path->PathId);
@@ -170,10 +168,7 @@ public:
                 .IsTable();
 
             if (!checks) {
-                TString explain = TStringBuilder() << "parent path fail checks"
-                                                   << ", path: " << parentPath.PathString();
-                auto status = checks.GetStatus(&explain);
-                result->SetError(status, explain);
+                result->SetError(checks.GetStatus(), checks.GetError());
                 return result;
             }
         }
@@ -191,10 +186,7 @@ public:
             }
 
             if (!checks) {
-                TString explain = TStringBuilder() << "dst path fail checks"
-                                                   << ", path: " << parentPath.PathString();
-                auto status = checks.GetStatus(&explain);
-                result->SetError(status, explain);
+                result->SetError(checks.GetStatus(), checks.GetError());
                 if (dstPath.IsResolved()) {
                     result->SetPathCreateTxId(ui64(dstPath.Base()->CreateTxId));
                     result->SetPathId(dstPath.Base()->PathId.LocalPathId);

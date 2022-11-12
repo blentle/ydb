@@ -24,15 +24,19 @@ public:
 
     void AddState(EPDiskState state);
     EPDiskStatus Compute(EPDiskStatus current, TString& reason) const;
+
     EPDiskState GetState() const {
         return State;
     }
+
     EPDiskState GetPrevState() const {
         return PrevState;
     }
+
     ui64 GetStateCounter() const {
         return StateCounter;
     }
+
     void Reset();
 
 private:
@@ -67,8 +71,24 @@ private:
 
 }; // TPDiskStatus
 
-struct TPDiskInfo: public TPDiskStatus {
+struct TStatusChangerState: public TSimpleRefCount<TStatusChangerState> {
+    using TPtr = TIntrusivePtr<TStatusChangerState>;
+
+    explicit TStatusChangerState(NKikimrBlobStorage::EDriveStatus status)
+        : Status(status)
+    {}
+
+    const NKikimrBlobStorage::EDriveStatus Status;
+    ui32 Attempt = 0;
+}; // TStatusChangerState
+
+struct TPDiskInfo
+    : public TSimpleRefCount<TPDiskInfo>
+    , public TPDiskStatus
+{
+    using TPtr = TIntrusivePtr<TPDiskInfo>;
     TActorId StatusChanger;
+    TStatusChangerState::TPtr StatusChangerState;
 
     explicit TPDiskInfo(EPDiskStatus initialStatus, const ui32& defaultStateLimit, const TLimitsMap& stateLimits);
 
@@ -80,18 +100,19 @@ struct TPDiskInfo: public TPDiskStatus {
 
 private:
     bool Touched;
-
 }; // TPDiskInfo
 
 class TClusterMap {
 public:
     using TPDiskIDSet = THashSet<TPDiskID, TPDiskIDHash>;
     using TDistribution = THashMap<TString, TPDiskIDSet>;
+    using TNodeIDSet = THashSet<ui32>;
 
     TCmsStatePtr State;
     TDistribution ByDataCenter;
     TDistribution ByRoom;
     TDistribution ByRack;
+    THashMap<TString, TNodeIDSet> NodeByRack;
 
     TClusterMap(TCmsStatePtr state);
 

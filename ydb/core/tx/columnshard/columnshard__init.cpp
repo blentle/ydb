@@ -34,7 +34,8 @@ void TTxInit::SetDefaults() {
     Self->LastWriteId = TWriteId{0};
     Self->LastPlannedStep = 0;
     Self->LastPlannedTxId = 0;
-    Self->StorePathId = 0;
+    Self->OwnerPathId = 0;
+    Self->OwnerPath.clear();
     Self->BasicTxInfo.clear();
     Self->DeadlineQueue.clear();
     Self->PlanQueue.clear();
@@ -78,7 +79,8 @@ bool TTxInit::ReadEverything(TTransactionContext& txc, const TActorContext& ctx)
     ready = ready && Schema::GetSpecialValue(db, Schema::EValueIds::LastPlannedStep, Self->LastPlannedStep);
     ready = ready && Schema::GetSpecialValue(db, Schema::EValueIds::LastPlannedTxId, Self->LastPlannedTxId);
     ready = ready && Schema::GetSpecialValue(db, Schema::EValueIds::LastExportNumber, Self->LastExportNo);
-    ready = ready && Schema::GetSpecialValue(db, Schema::EValueIds::StorePathId, Self->StorePathId);
+    ready = ready && Schema::GetSpecialValue(db, Schema::EValueIds::OwnerPathId, Self->OwnerPathId);
+    ready = ready && Schema::GetSpecialValue(db, Schema::EValueIds::OwnerPath, Self->OwnerPath);
 
     if (!ready)
         return false;
@@ -137,6 +139,7 @@ bool TTxInit::ReadEverything(TTransactionContext& txc, const TActorContext& ctx)
 
     // Primary index defaut schema and TTL (both are versioned)
     TMap<NOlap::TSnapshot, NOlap::TIndexInfo> schemaPreset;
+    TMap<NOlap::TSnapshot, NOlap::TIndexInfo> commonSchema;
     THashMap<ui64, TMap<TRowVersion, TTtl::TDescription>> ttls;
 
     { // Load schema presets
@@ -148,8 +151,10 @@ bool TTxInit::ReadEverything(TTransactionContext& txc, const TActorContext& ctx)
             const ui32 id = rowset.GetValue<Schema::SchemaPresetInfo::Id>();
             auto& preset = Self->SchemaPresets[id];
             preset.Id = id;
-            preset.Name = rowset.GetValue<Schema::SchemaPresetInfo::Name>();
-            Y_VERIFY(preset.Name == "default", "Unsupported preset at load time");
+            if (id) {
+                preset.Name = rowset.GetValue<Schema::SchemaPresetInfo::Name>();
+            }
+            Y_VERIFY(!id || preset.Name == "default", "Unsupported preset at load time");
 
             if (rowset.HaveValue<Schema::SchemaPresetInfo::DropStep>() &&
                 rowset.HaveValue<Schema::SchemaPresetInfo::DropTxId>())
@@ -178,9 +183,11 @@ bool TTxInit::ReadEverything(TTransactionContext& txc, const TActorContext& ctx)
             auto& info = preset.Versions[version];
             Y_VERIFY(info.ParseFromString(rowset.GetValue<Schema::SchemaPresetVersionInfo::InfoProto>()));
 
-            if (preset.Name == "default") {
-                schemaPreset.emplace(NOlap::TSnapshot{version.Step, version.TxId},
-                                     Self->ConvertSchema(info.GetSchema()));
+            NOlap::TSnapshot snap{version.Step, version.TxId};
+            if (!id) {
+                commonSchema.emplace(snap, Self->ConvertSchema(info.GetSchema()));
+            } else if (preset.Name == "default") {
+                schemaPreset.emplace(snap, Self->ConvertSchema(info.GetSchema()));
             }
 
             if (!rowset.Next())
@@ -244,7 +251,13 @@ bool TTxInit::ReadEverything(TTransactionContext& txc, const TActorContext& ctx)
     Self->SetCounter(COUNTER_TABLE_TTLS, ttls.size());
 
     if (!schemaPreset.empty()) {
+        Y_VERIFY(commonSchema.empty(), "Mix of schema preset and common schema");
         Self->SetPrimaryIndex(std::move(schemaPreset));
+    } else if (!commonSchema.empty()) {
+        Self->SetPrimaryIndex(std::move(commonSchema));
+    } else {
+        Y_VERIFY(Self->Tables.empty());
+        Y_VERIFY(Self->SchemaPresets.empty());
     }
 
     { // Load long tx writes

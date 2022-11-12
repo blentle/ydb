@@ -315,7 +315,7 @@ private:
             YQL_CLOG(WARN, ProviderDq) << "Empty md5 for " << pathWithMd5.Path;
         }
         return GetPathAndObjectId(pathWithMd5.Path,
-            pathWithMd5.Md5.empty()
+            (pathWithMd5.Md5.empty() && !pathWithMd5.Path.StartsWith(NKikimr::NMiniKQL::StaticModulePrefix))
             ? MD5::File(pathWithMd5.Path) /* used for local run only */
             : pathWithMd5.Md5,
             pathWithMd5.Md5);
@@ -545,7 +545,7 @@ private:
         FlushCounter("FreezeUsedFiles");
         // copy-paste }
 
-        TScopedAlloc alloc(NKikimr::TAlignedPagePoolCounters(), State->FunctionRegistry->SupportsSizedAllocators());
+        TScopedAlloc alloc(__LOCATION__, NKikimr::TAlignedPagePoolCounters(), State->FunctionRegistry->SupportsSizedAllocators());
         TTypeEnvironment typeEnv(alloc);
         NCommon::TMkqlCommonCallableCompiler compiler;
 
@@ -789,8 +789,13 @@ private:
                         future = NThreading::MakeFuture<IDqGateway::TResult>(std::move(result));
                     }
                 } else {
+                    if (State->Metrics) {
+                        State->Metrics->IncCounter("dq", "HandleResult");
+                    }
+                    State->Statistics[State->MetricId++].Entries.push_back(TOperationStatistics::TEntry("HandleResult", 0, 0, 0, 0, 1));
+
                     graphParams["Evaluation"] = ToString(!ctx.Step.IsDone(TExprStep::ExprEval));
-                    future = State->DqGateway->ExecutePlan(
+                    future = State->ExecutePlan(
                         State->SessionId, executionPlanner->GetPlan(), columns, secureParams, graphParams,
                         settings, progressWriter, ModulesMapping, fillSettings.Discard);
                 }
@@ -806,10 +811,11 @@ private:
 
             FlushStatisticsToState();
 
-            return WrapFutureCallback(future, [localRun, startTime, type, fillSettings, level, settings, enableFullResultWrite, columns, graphParams, state = State](const IDqGateway::TResult& res, const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) {
+            return WrapFutureCallback<false>(future, [localRun, startTime, type, fillSettings, level, settings, enableFullResultWrite, columns, graphParams, state = State](const IDqGateway::TResult& res, const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) {
                 YQL_CLOG(DEBUG, ProviderDq) << state->SessionId <<  " WrapFutureCallback";
 
                 auto duration = TInstant::Now() - startTime;
+                YQL_CLOG(INFO, ProviderDq) << "Execution Result complete, duration: " << duration;
                 if (state->Metrics) {
                     state->Metrics->SetCounter("dq", "TotalExecutionTime", duration.MilliSeconds());
                     state->Metrics->SetCounter(
@@ -1090,7 +1096,7 @@ private:
         YQL_ENSURE(tasks.size() <= maxTasksPerOperation);
 
         {
-            TScopedAlloc alloc(NKikimr::TAlignedPagePoolCounters(), State->FunctionRegistry->SupportsSizedAllocators());
+            TScopedAlloc alloc(__LOCATION__, NKikimr::TAlignedPagePoolCounters(), State->FunctionRegistry->SupportsSizedAllocators());
             TTypeEnvironment typeEnv(alloc);
             for (auto& t : tasks) {
                 TUploadList uploadList;
@@ -1148,9 +1154,14 @@ private:
             settings->_RowsLimitPerWrite = 0;
         }
 
+        if (State->Metrics) {
+            State->Metrics->IncCounter("dq", "HandlePull");
+        }
+        State->Statistics[State->MetricId++].Entries.push_back(TOperationStatistics::TEntry("HandlePull", 0, 0, 0, 0, 1));
+
         IDqGateway::TDqProgressWriter progressWriter = MakeDqProgressWriter(publicIds);
 
-        auto future = State->DqGateway->ExecutePlan(State->SessionId, executionPlanner->GetPlan(), columns, secureParams, graphParams,
+        auto future = State->ExecutePlan(State->SessionId, executionPlanner->GetPlan(), columns, secureParams, graphParams,
             settings, progressWriter, ModulesMapping, fillSettings.Discard);
 
         future.Subscribe([publicIds, progressWriter = State->ProgressWriter](const NThreading::TFuture<IDqGateway::TResult>& completedFuture) {
@@ -1161,8 +1172,9 @@ private:
 
         int level = 0;
         // TODO: remove copy-paste
-        return WrapFutureCallback(future, [settings, startTime, localRun, type, fillSettings, level, graphParams, columns, enableFullResultWrite, state = State](const IDqGateway::TResult& res, const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) {
+        return WrapFutureCallback<false>(future, [settings, startTime, localRun, type, fillSettings, level, graphParams, columns, enableFullResultWrite, state = State](const IDqGateway::TResult& res, const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) {
             auto duration = TInstant::Now() - startTime;
+            YQL_CLOG(INFO, ProviderDq) << "Execution Pull complete, duration: " << duration;
             if (state->Metrics) {
                 state->Metrics->SetCounter("dq", "TotalExecutionTime", duration.MilliSeconds());
                 state->Metrics->SetCounter(
@@ -1182,6 +1194,7 @@ private:
                 state->Statistics[state->MetricId++].Entries.push_back(TOperationStatistics::TEntry("Fallback", 0, 0, 0, 0, 1));
                 // never fallback will be captured in yql_facade
                 auto issues = TIssues{TIssue(ctx.GetPosition(input->Pos()), "Gateway Error").SetCode(TIssuesIds::DQ_GATEWAY_NEED_FALLBACK_ERROR, TSeverityIds::S_WARNING)};
+                issues.AddIssues(res.Issues());
                 ctx.AssociativeIssues.emplace(input.Get(), std::move(issues));
                 return IGraphTransformer::TStatus(IGraphTransformer::TStatus::Error);
             }
@@ -1220,7 +1233,7 @@ private:
                 }
 
                 if (error) {
-                    issue.Message = "Too big result " + trStr;
+                    issue.SetMessage("Too big result " + trStr);
                     issue.Severity = TSeverityIds::S_ERROR;
                 }
                 ctx.IssueManager.RaiseIssue(issue);
@@ -1567,7 +1580,7 @@ private:
             YQL_ENSURE(tasks.size() <= maxTasksPerOperation);
 
             {
-                TScopedAlloc alloc(NKikimr::TAlignedPagePoolCounters(), State->FunctionRegistry->SupportsSizedAllocators());
+                TScopedAlloc alloc(__LOCATION__, NKikimr::TAlignedPagePoolCounters(), State->FunctionRegistry->SupportsSizedAllocators());
                 TTypeEnvironment typeEnv(alloc);
                 for (auto& t : tasks) {
                     TUploadList uploadList;
@@ -1590,13 +1603,18 @@ private:
                 return FallbackWithMessage(*input, "Too big attachment", ctx, false);
             }
 
+            if (State->Metrics) {
+                State->Metrics->IncCounter("dq", "Precompute");
+            }
+            State->Statistics[State->MetricId++].Entries.push_back(TOperationStatistics::TEntry("Precompute", 0, 0, 0, 0, 1));
+
             auto graphParams = GatherGraphParams(optimizedInput);
             graphParams["Precompute"] = ToString(true);
             MarkProgressStarted(publicIds->AllPublicIds, State->ProgressWriter);
 
             IDqGateway::TDqProgressWriter progressWriter = MakeDqProgressWriter(publicIds);
 
-            auto future = State->DqGateway->ExecutePlan(State->SessionId, executionPlanner->GetPlan(), {}, secureParams, graphParams,
+            auto future = State->ExecutePlan(State->SessionId, executionPlanner->GetPlan(), {}, secureParams, graphParams,
                 settings, progressWriter, ModulesMapping, false);
 
             executionPlanner.Destroy();
@@ -1610,6 +1628,7 @@ private:
                 MarkProgressFinished(publicIds->AllPublicIds, res.Success(), state->ProgressWriter);
 
                 auto duration = TInstant::Now() - startTime;
+                YQL_CLOG(INFO, ProviderDq) << "Execution precomputes complete, duration: " << duration;
                 if (state->Metrics) {
                     state->Metrics->SetCounter("dq", "PrecomputeExecutionTime", duration.MilliSeconds());
                 }
@@ -1652,7 +1671,7 @@ private:
                         }
 
                         if (neverFallback) {
-                            issue.Message = "Too big precompute result";
+                            issue.SetMessage("Too big precompute result");
                             issue.Severity = TSeverityIds::S_ERROR;
                         }
                         ctx.IssueManager.RaiseIssue(issue);

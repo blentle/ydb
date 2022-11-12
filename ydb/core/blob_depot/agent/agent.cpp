@@ -30,6 +30,9 @@ namespace NKikimr::NBlobDepot {
         if (TabletId && TabletId != Max<ui64>()) {
             ConnectToBlobDepot();
         }
+
+        HandleQueryWatchdog();
+        HandlePendingEventQueueWatchdog();
     }
 
     IActor *CreateBlobDepotAgent(ui32 virtualGroupId, TIntrusivePtr<TBlobStorageGroupInfo> info, TActorId proxyId) {

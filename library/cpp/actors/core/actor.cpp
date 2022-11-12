@@ -175,7 +175,7 @@ namespace NActors {
 
     void IActor::PassAway() {
         auto& cx = *TlsActivationContext;
-        cx.ExecutorThread.UnregisterActor(&cx.Mailbox, SelfActorId.LocalId());
+        cx.ExecutorThread.UnregisterActor(&cx.Mailbox, SelfActorId);
     }
 
     double IActor::GetElapsedTicksAsSeconds() const {
@@ -187,10 +187,8 @@ namespace NActors {
     }
 
     void TActorVirtualBehaviour::Receive(IActor* actor, std::unique_ptr<IEventHandle> ev) {
-        Y_VERIFY(!!ev);
-        Y_ASSERT(dynamic_cast<IEventBehavioral*>(ev->GetBase()));
-        IEventBehavioral* eActor = static_cast<IEventBehavioral*>(ev->GetBase());
-        eActor->Execute(actor, std::move(ev));
+        Y_VERIFY(!!ev && ev->GetBase());
+        ev->GetBase()->Execute(actor, std::move(ev));
     }
 
 }

@@ -375,6 +375,7 @@ private:
             CredentialsFactory,
             serviceAccounts,
             task.query_type(),
+            task.query_syntax(),
             task.execute_mode(),
             GetEntityIdAsString(CommonConfig.GetIdsPrefix(), EEntityType::RESULT),
             task.state_load_mode(),
@@ -395,7 +396,8 @@ private:
             NProtoInterop::CastFromProto(task.execution_limit()),
             NProtoInterop::CastFromProto(task.request_started_at()),
             task.restart_count(),
-            task.job_id().value()
+            task.job_id().value(),
+            task.resources()
             );
 
         auto runActorId = Register(CreateRunActor(SelfId(), queryCounters, std::move(params)));

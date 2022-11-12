@@ -7,7 +7,7 @@
 #include "yql_arrow_resolver.h"
 
 #include <ydb/library/yql/public/udf/udf_validate.h>
-
+#include <ydb/library/yql/core/credentials/yql_credentials.h>
 #include <ydb/library/yql/ast/yql_expr.h>
 
 #include <library/cpp/yson/node/node.h>
@@ -76,11 +76,15 @@ public:
         Parameters = node;
     }
 
+    void SetCredentials(TCredentials::TPtr credentials) {
+        Credentials = std::move(credentials);
+    }
+
     void RegisterPackage(const TString& package) override;
     bool SetPackageDefaultVersion(const TString& package, ui32 version) override;
     const TExportTable* GetModule(const TString& module) const override;
     bool AddFromFile(const TStringBuf& file, TExprContext& ctx, ui16 syntaxVersion, ui32 packageVersion) override;
-    bool AddFromUrl(const TStringBuf& file, const TStringBuf& url, TExprContext& ctx, ui16 syntaxVersion, ui32 packageVersion) override;
+    bool AddFromUrl(const TStringBuf& file, const TStringBuf& url, const TStringBuf& tokenName, TExprContext& ctx, ui16 syntaxVersion, ui32 packageVersion) override;
     bool AddFromMemory(const TStringBuf& file, const TString& body, TExprContext& ctx, ui16 syntaxVersion, ui32 packageVersion) override;
     bool AddFromMemory(const TStringBuf& file, const TString& body, TExprContext& ctx, ui16 syntaxVersion, ui32 packageVersion, TString& moduleName, std::vector<TString>* exports = nullptr, std::vector<TString>* imports = nullptr) override;
     bool Link(TExprContext& ctx) override;
@@ -100,6 +104,7 @@ private:
     TUserDataStorage::TPtr UserData;
     IUrlLoader::TPtr UrlLoader;
     TMaybe<NYT::TNode> Parameters;
+    TCredentials::TPtr Credentials;
     TExprContext LibsContext;
     TSet<TString> KnownPackages;
     THashMap<TString, ui32> PackageVersions;
@@ -109,28 +114,6 @@ private:
     const THashSet<TString> SqlFlags;
     const bool OptimizeLibraries;
     THolder<TExprContext::TFreezeGuard> FreezeGuard;
-};
-
-// -- credentials --
-struct TCredential {
-    const TString Category;
-    const TString Subcategory;
-    const TString Content;
-
-    TCredential(const TString& category, const TString& subcategory, const TString& content)
-        : Category(category)
-        , Subcategory(subcategory)
-        , Content(content)
-    {
-    }
-};
-
-using TCredentialTable = THashMap<TString, TCredential>;
-using TCredentialTablePtr = std::shared_ptr<TCredentialTable>;
-
-struct TUserCredentials {
-    TString OauthToken;
-    TString BlackboxSessionIdCookie;
 };
 
 bool SplitUdfName(TStringBuf name, TStringBuf& moduleName, TStringBuf& funcName);
@@ -198,7 +181,7 @@ struct TTypeAnnotationContext: public TThrRefBase {
     TUserDataStorage::TPtr UserDataStorage;
     TUserDataTable UserDataStorageCrutches;
     TYqlOperationOptions OperationOptions;
-    TVector<TCredentialTablePtr> Credentials;
+    TCredentials::TPtr Credentials = MakeIntrusive<TCredentials>();
     TUserCredentials UserCredentials;
     IModuleResolver::TPtr Modules;
     NUdf::EValidateMode ValidateMode = NUdf::EValidateMode::None;
@@ -293,8 +276,6 @@ struct TTypeAnnotationContext: public TThrRefBase {
     bool Initialize(TExprContext& ctx);
     bool DoInitialize(TExprContext& ctx);
 
-    const TCredential* FindCredential(const TStringBuf& name) const;
-    TString FindCredentialContent(const TStringBuf& name1, const TStringBuf& name2, const TString& defaultContent) const;
     TString GetDefaultDataSource() const;
 
     TMaybe<ui32> TranslateOperationId(ui64 id) const {

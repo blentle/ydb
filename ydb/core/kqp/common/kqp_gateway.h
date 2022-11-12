@@ -29,41 +29,6 @@ struct TKqpParamsMap {
 
 class IKqpGateway : public NYql::IKikimrGateway {
 public:
-    struct TMkqlResult : public TGenericResult {
-        TString CompiledProgram;
-        NKikimrMiniKQL::TResult Result;
-        NKikimrQueryStats::TTxStats TxStats;
-    };
-
-    struct TMkqlSettings {
-        bool LlvmRuntime = false;
-        bool CollectStats = false;
-        TMaybe<ui64> PerShardKeysSizeLimitBytes;
-        ui64 CancelAfterMs = 0;
-        ui64 TimeoutMs = 0;
-        NYql::TKikimrQueryPhaseLimits Limits;
-    };
-
-    struct TRunResponse {
-        bool HasProxyError;
-        ui32 ProxyStatus;
-        TString ProxyStatusName;
-        TString ProxyStatusDesc;
-
-        bool HasExecutionEngineError;
-        TString ExecutionEngineStatusName;
-        TString ExecutionEngineStatusDesc;
-
-        NYql::TIssues Issues;
-
-        TString MiniKQLErrors;
-        TString DataShardErrors;
-        NKikimrTxUserProxy::TMiniKQLCompileResults MiniKQLCompileResults;
-
-        NKikimrMiniKQL::TResult ExecutionEngineEvaluatedResponse;
-        NKikimrQueryStats::TTxStats TxStats;
-    };
-
     struct TPhysicalTxData : private TMoveOnly {
         std::shared_ptr<const NKqpProto::TKqpPhyTx> Body;
         TKqpParamsMap Params;
@@ -146,32 +111,8 @@ public:
     };
 
 public:
-    /* Mkql */
-    virtual NThreading::TFuture<TMkqlResult> ExecuteMkql(const TString& cluster, const TString& program,
-        TKqpParamsMap&& params, const TMkqlSettings& settings, const TKqpSnapshot& snapshot) = 0;
-
-    virtual NThreading::TFuture<TMkqlResult> ExecuteMkqlPrepared(const TString& cluster, const TString& program,
-        TKqpParamsMap&& params, const TMkqlSettings& settings, const TKqpSnapshot& snapshot) = 0;
-
-    virtual NThreading::TFuture<TMkqlResult> PrepareMkql(const TString& cluster, const TString& program) = 0;
-
-    /* Snapshots */
-    virtual NThreading::TFuture<TKqpSnapshotHandle> CreatePersistentSnapshot(const TVector<TString>& tablePaths,
-        TDuration queryTimeout) = 0;
-
-    virtual void DiscardPersistentSnapshot(const TKqpSnapshotHandle& handle) = 0;
-
-    virtual NThreading::TFuture<TKqpSnapshotHandle> AcquireMvccSnapshot(TDuration queryTimeout) = 0;
-
-    /* Physical */
-    virtual NThreading::TFuture<TExecPhysicalResult> ExecutePhysical(TExecPhysicalRequest&& request,
-        const NActors::TActorId& target) = 0;
-
-    virtual NThreading::TFuture<TExecPhysicalResult> ExecuteScanQuery(TExecPhysicalRequest&& request,
-        const NActors::TActorId& target) = 0;
-
-    virtual NThreading::TFuture<TExecPhysicalResult> ExecutePure(TExecPhysicalRequest&& request,
-        const NActors::TActorId& target) = 0;
+    /* Compute */
+    virtual NThreading::TFuture<TExecPhysicalResult> ExecutePure(TExecPhysicalRequest&& request) = 0;
 
     /* Scripting */
     virtual NThreading::TFuture<TQueryResult> ExplainDataQueryAst(const TString& cluster, const TString& query) = 0;
@@ -191,9 +132,6 @@ public:
 
     virtual NThreading::TFuture<TQueryResult> StreamExecScanQueryAst(const TString& cluster, const TString& query,
         TKqpParamsMap&& params, const TAstQuerySettings& settings, const NActors::TActorId& target) = 0;
-
-public:
-    virtual TInstant GetCurrentTime() const = 0;
 };
 
 } // namespace NKqp

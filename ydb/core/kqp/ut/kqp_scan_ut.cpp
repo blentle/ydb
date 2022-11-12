@@ -2,8 +2,6 @@
 #include <ydb/core/kqp/counters/kqp_counters.h>
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
 
-#include <ydb/public/lib/experimental/ydb_experimental.h>
-
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor.h>
 
 #include <util/generic/size_literals.h>
@@ -95,8 +93,8 @@ void CreateNullSampleTables(TKikimrRunner& kikimr) {
 } // namespace
 
 Y_UNIT_TEST_SUITE(KqpScan) {
-    Y_UNIT_TEST_TWIN(IsNull, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(IsNull) {
+        auto kikimr = DefaultKikimrRunner();
         CreateNullSampleTables(kikimr);
 
         auto it = kikimr.GetTableClient().StreamExecuteScanQuery(R"(
@@ -108,8 +106,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[["One"]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(IsNullPartial, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(IsNullPartial) {
+        auto kikimr = DefaultKikimrRunner();
         CreateNullSampleTables(kikimr);
 
         auto it = kikimr.GetTableClient().StreamExecuteScanQuery(R"(
@@ -121,8 +119,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(NullInKey, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(NullInKey) {
+        auto kikimr = DefaultKikimrRunner();
         CreateNullSampleTables(kikimr);
 
         auto it = kikimr.GetTableClient().StreamExecuteScanQuery(R"(
@@ -135,8 +133,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[["Five"]];[["Four"]];[["Six"]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(NullInKeySuffix, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(NullInKeySuffix) {
+        auto kikimr = DefaultKikimrRunner();
         CreateNullSampleTables(kikimr);
 
         auto it = kikimr.GetTableClient().StreamExecuteScanQuery(R"(
@@ -151,9 +149,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
             ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(DecimalColumn, UseSessionActor) {
-        //auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(DecimalColumn) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
 
         TTableClient client{kikimr.GetDriver()};
         auto session = client.CreateSession().GetValueSync().GetSession();
@@ -199,8 +196,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(Offset, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Offset) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -215,8 +212,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(Limit, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Limit) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -227,8 +224,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[1u];["One"]];[[2u];["Two"]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(TopSort, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(TopSort) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -239,8 +236,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[1u];["One"]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(Grep, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Grep) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -260,8 +257,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
             [[1];[802u];["Value2"]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(GrepByString, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(GrepByString) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -275,8 +272,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
             [["ydb"];["ydb-1000"];["some very very very very long string"];[0]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(Order, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Order) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto params = db.GetParamsBuilder()
@@ -302,8 +299,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(GrepRange, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(GrepRange) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto params = db.GetParamsBuilder()
@@ -332,8 +329,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(GrepLimit, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(GrepLimit) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto params = db.GetParamsBuilder()
@@ -370,8 +367,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(GrepNonKeyColumns, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(GrepNonKeyColumns) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         TParamsBuilder params;
@@ -404,8 +401,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(SingleKey, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(SingleKey) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto params = db.GetParamsBuilder()
@@ -427,8 +424,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(AggregateByColumn, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(AggregateByColumn) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -446,8 +443,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(AggregateNoColumn, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(AggregateNoColumn) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -461,8 +458,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[36];[2.];18u;[3];[1];[19980u]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(AggregateNoColumnNoRemaps, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(AggregateNoColumnNoRemaps) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -476,8 +473,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[36];[2.];18u]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(AggregateWithFunction, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(AggregateWithFunction) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -490,8 +487,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[436]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(AggregateCountStar, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(AggregateCountStar) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery("SELECT COUNT(*) FROM `/Root/EightShard`").GetValueSync();
@@ -499,8 +496,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[24u]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(AggregateEmptyCountStar, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(AggregateEmptyCountStar) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery("SELECT COUNT(*) FROM `/Root/EightShard` WHERE Key < 10").GetValueSync();
@@ -508,8 +505,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[0u]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(AggregateEmptySum, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(AggregateEmptySum) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery("SELECT SUM(Data) FROM `/Root/EightShard` WHERE Key < 10").GetValueSync();
@@ -517,8 +514,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[#]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(JoinSimple, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(JoinSimple) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -540,8 +537,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(Join, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Join) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -568,8 +565,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         test(false);
     }
 
-    Y_UNIT_TEST_TWIN(Join2, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Join2) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -591,8 +588,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(Join3, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Join3) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -625,8 +622,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         test(false);
     }
 
-    Y_UNIT_TEST_TWIN(Join4, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Join4) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
         CreateSampleTables(kikimr);
@@ -667,8 +664,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(LeftSemiJoinSimple, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(LeftSemiJoinSimple) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -689,8 +686,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
             [[302u];["Value-302"];["302"]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(RightJoinSimple, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(RightJoinSimple) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -711,8 +708,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         )", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(RightOnlyJoinSimple, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(RightOnlyJoinSimple) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -731,8 +728,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(RightSemiJoinSimple, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(RightSemiJoinSimple) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -751,8 +748,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         )", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(JoinWithParams, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(JoinWithParams) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         auto params = TParamsBuilder().AddParam("$in")
             .BeginList()
@@ -778,8 +775,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         }
     }
 
-    Y_UNIT_TEST_TWIN(NoTruncate, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(NoTruncate) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
@@ -851,8 +848,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT_VALUES_EQUAL(totalRows, RowsCount);
     }
 
-    Y_UNIT_TEST_TWIN(Join3TablesNoRemap, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Join3TablesNoRemap) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -880,8 +877,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
             ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(Join3Tables, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Join3Tables) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -912,8 +909,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         test(false /* DisableSimpleColumns */);
     }
 
-    Y_UNIT_TEST_TWIN(JoinLeftOnly, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(JoinLeftOnly) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -945,8 +942,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         test(false /* DisableSimpleColumns */);
     }
 
-    Y_UNIT_TEST_TWIN(CrossJoin, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(CrossJoin) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -988,8 +985,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(SelfJoin3xSameLabels, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(SelfJoin3xSameLabels) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -1014,8 +1011,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson("[[[1u]];[[2u]]]", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(SelfJoin3x, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(SelfJoin3x) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -1041,8 +1038,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
     }
 
 #if 0
-    Y_UNIT_TEST_TWIN(JoinParams, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(JoinParams) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto params = TParamsBuilder().AddParam("$in").BeginList()
@@ -1063,8 +1060,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         Cerr << StreamResultToYson(it) << Endl;
     }
 
-    Y_UNIT_TEST_TWIN(JoinParams2, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(JoinParams2) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto params = TParamsBuilder()
@@ -1093,8 +1090,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         Cerr << StreamResultToYson(it) << Endl;
     }
 
-    Y_UNIT_TEST_TWIN(JoinParams3, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(JoinParams3) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto params = TParamsBuilder()
@@ -1127,10 +1124,10 @@ Y_UNIT_TEST_SUITE(KqpScan) {
     }
 #endif
 
-    Y_UNIT_TEST_QUAD(PrunePartitionsByLiteral, WithPredicatesExtract, UseSessionActor) {
+    Y_UNIT_TEST_TWIN(PrunePartitionsByLiteral, WithPredicatesExtract) {
         auto cfg = AppCfg();
         cfg.MutableFeatureFlags()->SetEnablePredicateExtractForScanQueries(WithPredicatesExtract);
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, cfg);
+        auto kikimr = DefaultKikimrRunner({}, cfg);
         auto db = kikimr.GetTableClient();
 
         TStreamExecScanQuerySettings settings;
@@ -1176,8 +1173,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         }
     }
 
-    Y_UNIT_TEST_TWIN(PrunePartitionsByExpr, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(PrunePartitionsByExpr) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         TStreamExecScanQuerySettings settings;
@@ -1205,14 +1202,14 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT_VALUES_EQUAL(res.QueryStats->query_phases(1).affected_shards(), 1);
     }
 
-    Y_UNIT_TEST_TWIN(TooManyComputeActors, UseSessionActor) {
+    Y_UNIT_TEST(TooManyComputeActors) {
         TVector<NKikimrKqp::TKqpSetting> settings;
         auto setting = NKikimrKqp::TKqpSetting();
         setting.SetName("_KqpMaxComputeActors");
         setting.SetValue("5");
         settings.push_back(setting);
 
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, settings);
+        auto kikimr = DefaultKikimrRunner(settings);
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -1236,7 +1233,7 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         part.GetIssues().PrintTo(Cerr);
         UNIT_ASSERT(HasIssue(part.GetIssues(), NYql::TIssuesIds::KIKIMR_PRECONDITION_FAILED,
             [](const NYql::TIssue& issue) {
-                return issue.Message.Contains("Requested too many execution units");
+                return issue.GetMessage().Contains("Requested too many execution units");
             }));
 
         part = it.ReadNext().GetValueSync();
@@ -1244,7 +1241,7 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT_EQUAL(part.GetStatus(), EStatus::CLIENT_OUT_OF_RANGE);
     }
 
-    Y_UNIT_TEST_TWIN(EarlyFinish, UseSessionActor) {
+    Y_UNIT_TEST(EarlyFinish) {
         auto appCfg = AppCfg();
         appCfg.MutableTableServiceConfig()->MutableResourceManager()->SetChannelBufferSize(5);
         appCfg.MutableTableServiceConfig()->MutableResourceManager()->SetMinChannelBufferSize(5);
@@ -1254,7 +1251,7 @@ Y_UNIT_TEST_SUITE(KqpScan) {
             NYql::NDq::GetDqExecutionSettingsForTests().Reset();
         };
 
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, appCfg);
+        auto kikimr = DefaultKikimrRunner({}, appCfg);
 
         NYdb::NTable::TTableClient client(kikimr.GetDriver());
         auto session = client.CreateSession().GetValueSync().GetSession();
@@ -1282,8 +1279,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
     }
 
-    Y_UNIT_TEST_TWIN(MultipleResults, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(MultipleResults) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1297,8 +1294,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT_EQUAL_C(part.GetStatus(), EStatus::PRECONDITION_FAILED, part.GetIssues().ToString());
     }
 
-    Y_UNIT_TEST_TWIN(Effects, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Effects) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1314,8 +1311,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT_EQUAL_C(part.GetStatus(), EStatus::PRECONDITION_FAILED, part.GetIssues().ToString());
     }
 
-    Y_UNIT_TEST_TWIN(PureExpr, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(PureExpr) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1326,8 +1323,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([["42";42;25]])", res);
     }
 
-    Y_UNIT_TEST_TWIN(UnionWithPureExpr, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(UnionWithPureExpr) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1340,8 +1337,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([["42";[42];[25]];["forty-two";#;#]])", res);
     }
 
-    Y_UNIT_TEST_TWIN(MiltiExprWithPure, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(MiltiExprWithPure) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1354,8 +1351,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT_EQUAL_C(part.GetStatus(), EStatus::PRECONDITION_FAILED, part.GetIssues().ToString());
     }
 
-    Y_UNIT_TEST_TWIN(UnionBasic, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(UnionBasic) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1368,8 +1365,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[1u]];[[101u]]])", res);
     }
 
-    Y_UNIT_TEST_TWIN(UnionMixed, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(UnionMixed) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1382,8 +1379,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[42];#];[#;[101u]]])", res);
     }
 
-    Y_UNIT_TEST_TWIN(UnionThree, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(UnionThree) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1398,8 +1395,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[1u]];[[101u]];[[4000000003u]]])", res);
     }
 
-    Y_UNIT_TEST_TWIN(UnionSameTable, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(UnionSameTable) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1412,8 +1409,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[1u]];[[1u]]])", res);
     }
 
-    Y_UNIT_TEST_TWIN(UnionAggregate, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(UnionAggregate) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1428,8 +1425,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[2u]];[[24u]];[[11000u]]])", res);
     }
 
-    Y_UNIT_TEST_TWIN(CountDistinct, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(CountDistinct) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1441,8 +1438,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[1u;1u];[1u;1u]])", res);
     }
 
-    Y_UNIT_TEST_TWIN(FullFrameWindow, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(FullFrameWindow) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1456,8 +1453,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[15];8u];[[16];8u];[[17];8u]])", res);
     }
 
-    Y_UNIT_TEST_TWIN(SimpleWindow, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(SimpleWindow) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1483,8 +1480,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", res);
     }
 
-    Y_UNIT_TEST_TWIN(TwoAggregatesOneFullFrameWindow, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(TwoAggregatesOneFullFrameWindow) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1500,8 +1497,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[17];[2.125];8u]])", res);
     }
 
-    Y_UNIT_TEST_TWIN(TwoAggregatesTwoWindows, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(TwoAggregatesTwoWindows) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1526,8 +1523,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", res);
     }
 
-    Y_UNIT_TEST_TWIN(CustomWindow, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(CustomWindow) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1552,8 +1549,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", res);
     }
 
-    Y_UNIT_TEST_TWIN(EmptySet, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(EmptySet) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1564,8 +1561,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson("[]",res);
     }
 
-     Y_UNIT_TEST_TWIN(RestrictSqlV0, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+     Y_UNIT_TEST(RestrictSqlV0) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1579,8 +1576,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT_EQUAL_C(part.GetStatus(), EStatus::GENERIC_ERROR, part.GetStatus());
     }
 
-    Y_UNIT_TEST_TWIN(LongStringCombiner, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(LongStringCombiner) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1591,8 +1588,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[[" GET /index.html HTTP/1.1"];["some very very very very long string"]]])",res);
     }
 
-    Y_UNIT_TEST_TWIN(SqlInParameter, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(SqlInParameter) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto result = db.CreateSession().GetValueSync().GetSession().ExecuteDataQuery(R"(
@@ -1625,8 +1622,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
                         [[3u];["Three"]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(SqlInLiteral, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(SqlInLiteral) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto result = db.CreateSession().GetValueSync().GetSession().ExecuteDataQuery(R"(
@@ -1650,7 +1647,7 @@ Y_UNIT_TEST_SUITE(KqpScan) {
                         [[3u];["Three"]]])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(UdfFailure, UseSessionActor) {
+    Y_UNIT_TEST(UdfFailure) {
         auto testFn = [](bool disableLlvmForUdfStages) {
             TVector<NKikimrKqp::TKqpSetting> settings;
             auto setting = NKikimrKqp::TKqpSetting();
@@ -1658,7 +1655,7 @@ Y_UNIT_TEST_SUITE(KqpScan) {
             setting.SetValue(disableLlvmForUdfStages ? "true" : "false");
             settings.push_back(setting);
 
-            auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, settings);
+            auto kikimr = DefaultKikimrRunner(settings);
             auto db = kikimr.GetTableClient();
 
             auto it = db.StreamExecuteScanQuery(R"(
@@ -1673,8 +1670,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
             UNIT_ASSERT_C(!streamPart.EOS(), streamPart.GetIssues().ToString());
             UNIT_ASSERT(
                 HasIssue(streamPart.GetIssues(), NYql::TIssuesIds::DEFAULT_ERROR, [](const NYql::TIssue& issue) {
-                    return issue.Message.Contains("Terminate was called")   // general termination prefix
-                           && issue.Message.Contains("Bad filter value.");  // test specific UDF exception
+                    return issue.GetMessage().Contains("Terminate was called")   // general termination prefix
+                           && issue.GetMessage().Contains("Bad filter value.");  // test specific UDF exception
                 }));
         };
 
@@ -1682,8 +1679,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         testFn(true);
     }
 
-    Y_UNIT_TEST_TWIN(SecondaryIndex, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(SecondaryIndex) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
@@ -1741,8 +1738,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         }
     }
 
-    Y_UNIT_TEST_TWIN(BoolFlag, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(BoolFlag) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
 
         TTableClient client{kikimr.GetDriver()};
         auto session = client.CreateSession().GetValueSync().GetSession();
@@ -1776,8 +1773,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         ])", StreamResultToYson(it));
     }
 
-    Y_UNIT_TEST_TWIN(Counters, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(Counters) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto it = db.StreamExecuteScanQuery(R"(
@@ -1790,8 +1787,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT_VALUES_EQUAL(1, counters.GetQueryTypeCounter(NKikimrKqp::EQueryType::QUERY_TYPE_SQL_SCAN)->Val());
     }
 
-    Y_UNIT_TEST_TWIN(DropRedundantSortByPk, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {}, AppCfg());
+    Y_UNIT_TEST(DropRedundantSortByPk) {
+        auto kikimr = DefaultKikimrRunner({}, AppCfg());
         auto db = kikimr.GetTableClient();
 
         auto settings = TStreamExecScanQuerySettings()
@@ -1833,10 +1830,9 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         }
     }
 
-    Y_UNIT_TEST_TWIN(LMapFunction, UseSessionActor) {
+    Y_UNIT_TEST(LMapFunction) {
         auto settings = TKikimrSettings()
-            .SetWithSampleTables(false)
-            .SetEnableKqpSessionActor(UseSessionActor);
+            .SetWithSampleTables(false);
 
         TKikimrRunner kikimr(settings);
         auto tableClient = kikimr.GetTableClient();
@@ -1879,12 +1875,12 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(result, R"([[[2];[1000];["Dogecoin"]];[[4];[1];["XTC"]];[[5];[2];["Cardano"]];[[6];[3];["Tether"]]])");
     }
 
-    Y_UNIT_TEST_TWIN(YqlTableSample, UseSessionActor) {
+    Y_UNIT_TEST(YqlTableSample) {
         auto setting = NKikimrKqp::TKqpSetting();
         setting.SetName("_KqpYqlSyntaxVersion");
         setting.SetValue("1");
 
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor, {setting});
+        auto kikimr = DefaultKikimrRunner({setting});
         auto db = kikimr.GetTableClient();
 
         const TString query(R"(SELECT * FROM `/Root/Test` TABLESAMPLE SYSTEM(1.0);)");
@@ -1894,12 +1890,12 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         auto result = it.ReadNext().GetValueSync();
         UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), EStatus::UNSUPPORTED);
         UNIT_ASSERT(HasIssue(result.GetIssues(), NYql::TIssuesIds::KIKIMR_UNSUPPORTED, [](const NYql::TIssue& issue) {
-            return issue.Message.Contains("ATOM evaluation is not supported in YDB queries.");
+            return issue.GetMessage().Contains("ATOM evaluation is not supported in YDB queries.");
         }));
     }
 
-    Y_UNIT_TEST_TWIN(CrossJoinOneColumn, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(CrossJoinOneColumn) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -1924,8 +1920,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[24u]])", StreamResultToYson(result));
     }
 
-    Y_UNIT_TEST_TWIN(CrossJoinCount, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(CrossJoinCount) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -1939,8 +1935,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson(R"([[192u]])", StreamResultToYson(result));
     }
 
-    Y_UNIT_TEST_TWIN(SelectExistsUnexpected, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(SelectExistsUnexpected) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
         CreateSampleTables(kikimr);
@@ -1964,8 +1960,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         CompareYson("[[%false]]", StreamResultToYson(result));
     }
 
-    Y_UNIT_TEST_TWIN(StreamLookup, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(StreamLookup) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -1983,7 +1979,6 @@ Y_UNIT_TEST_SUITE(KqpScan) {
 
         {
             auto result = db.StreamExecuteScanQuery(R"(
-                PRAGMA kikimr.UseNewEngine = "true";
                 PRAGMA kikimr.OptEnablePredicateExtract = "false";
                 $keys = SELECT Key FROM `/Root/EightShard`;
                 SELECT * FROM `/Root/KeyValue` WHERE Key IN $keys ORDER BY Key;
@@ -1993,8 +1988,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         }
     }
 
-    Y_UNIT_TEST_TWIN(StreamLookupByPkPrefix, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(StreamLookupByPkPrefix) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         CreateSampleTables(kikimr);
 
@@ -2027,7 +2022,6 @@ Y_UNIT_TEST_SUITE(KqpScan) {
 
         {
             auto result = db.StreamExecuteScanQuery(R"(
-                PRAGMA kikimr.UseNewEngine = "true";
                 PRAGMA kikimr.OptEnablePredicateExtract = "false";
                 $keys = SELECT Key FROM `/Root/KeyValue`;
                 SELECT * FROM `/Root/TestTable` WHERE Key1 IN $keys ORDER BY Key1, Key2;
@@ -2037,7 +2031,7 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         }
     }
 
-    Y_UNIT_TEST_TWIN(StreamLookupTryGetDataBeforeSchemeInitialization, UseSessionActor) {
+    Y_UNIT_TEST(StreamLookupTryGetDataBeforeSchemeInitialization) {
         TPortManager tp;
 
         ui16 mbusport = tp.GetPort(2134);
@@ -2128,14 +2122,13 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         server->GetRuntime()->SetEventFilter(captureEvents);
 
         sendQuery(R"(
-            PRAGMA kikimr.UseNewEngine = "true";
             PRAGMA kikimr.OptEnablePredicateExtract = "false";
             SELECT Value FROM `/Root/Table` WHERE Key IN AsList(1, 2, 3);
         )");
     }
 
-    Y_UNIT_TEST_TWIN(LimitOverSecondaryIndexRead, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(LimitOverSecondaryIndexRead) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
@@ -2169,8 +2162,8 @@ Y_UNIT_TEST_SUITE(KqpScan) {
         UNIT_ASSERT(limit.IsDefined());
     }
 
-    Y_UNIT_TEST_TWIN(TopSortOverSecondaryIndexRead, UseSessionActor) {
-        auto kikimr = KikimrRunnerEnableSessionActor(UseSessionActor);
+    Y_UNIT_TEST(TopSortOverSecondaryIndexRead) {
+        auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 

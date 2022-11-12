@@ -1,5 +1,6 @@
 #include "blob_depot_tablet.h"
 #include "data.h"
+#include "space_monitor.h"
 
 namespace NKikimr::NBlobDepot {
 
@@ -59,6 +60,8 @@ namespace NKikimr::NBlobDepot {
         agent.AgentId = ev->Sender;
         agent.ConnectedNodeId = nodeId;
         agent.ExpirationTimestamp = TInstant::Max();
+        agent.LastPushedSpaceColor = SpaceMonitor->GetSpaceColor();
+        agent.LastPushedApproximateFreeSpaceShare = SpaceMonitor->GetApproximateFreeSpaceShare();
 
         if (agent.AgentInstanceId && *agent.AgentInstanceId != req.GetAgentInstanceId()) {
             ResetAgent(agent);
@@ -68,6 +71,8 @@ namespace NKikimr::NBlobDepot {
         OnAgentConnect(agent);
 
         auto [response, record] = TEvBlobDepot::MakeResponseFor(*ev, SelfId(), Executor()->Generation());
+        record->SetSpaceColor(agent.LastPushedSpaceColor);
+        record->SetApproximateFreeSpaceShare(agent.LastPushedApproximateFreeSpaceShare);
 
         for (const auto& [k, v] : ChannelKinds) {
             auto *proto = record->AddChannelKinds();
@@ -114,32 +119,36 @@ namespace NKikimr::NBlobDepot {
 
             ui64 accum = 0;
             for (const auto& [groupId, group] : groups) {
-                //const ui64 allocatedBytes = Groups[groupId].AllocatedBytes;
-                const ui64 groupWeight = 1;
-                accum += groupWeight;
-                options.emplace_back(accum, &group);
+                if (const ui64 w = SpaceMonitor->GetGroupAllocationWeight(groupId)) {
+                    accum += w;
+                    options.emplace_back(accum, &group);
+                }
             }
 
-            THashMap<ui8, NKikimrBlobDepot::TGivenIdRange::TChannelRange*> issuedRanges;
-            for (ui32 i = 0, count = ev->Get()->Record.GetCount(); i < count; ++i) {
-                const ui64 selection = RandomNumber(accum);
-                const auto it = std::upper_bound(options.begin(), options.end(), selection,
-                    [](ui64 x, const auto& y) { return x < std::get<0>(y); });
-                const auto& [_, group] = *it;
+            if (accum) {
+                THashMap<ui8, NKikimrBlobDepot::TGivenIdRange::TChannelRange*> issuedRanges;
+                for (ui32 i = 0, count = ev->Get()->Record.GetCount(); i < count; ++i) {
+                    const ui64 selection = RandomNumber(accum);
+                    const auto it = std::upper_bound(options.begin(), options.end(), selection,
+                        [](ui64 x, const auto& y) { return x < std::get<0>(y); });
+                    const auto& [_, group] = *it;
 
-                const size_t channelIndex = RandomNumber(group->Channels.size());
-                TChannelInfo* const channel = group->Channels[channelIndex];
+                    const size_t channelIndex = RandomNumber(group->Channels.size());
+                    TChannelInfo* const channel = group->Channels[channelIndex];
 
-                const ui64 value = channel->NextBlobSeqId++;
+                    const ui64 value = channel->NextBlobSeqId++;
 
-                // fill in range item
-                auto& range = issuedRanges[channel->Index];
-                if (!range || range->GetEnd() != value) {
-                    range = givenIdRange->AddChannelRanges();
-                    range->SetChannel(channel->Index);
-                    range->SetBegin(value);
+                    // fill in range item
+                    auto& range = issuedRanges[channel->Index];
+                    if (!range || range->GetEnd() != value) {
+                        range = givenIdRange->AddChannelRanges();
+                        range->SetChannel(channel->Index);
+                        range->SetBegin(value);
+                    }
+                    range->SetEnd(value + 1);
                 }
-                range->SetEnd(value + 1);
+            } else {
+                Y_VERIFY_DEBUG(false); // TODO(alexvru): handle this situation somehow -- agent needs to retry this query?
             }
 
             // register issued ranges in agent and global records
@@ -188,8 +197,8 @@ namespace NKikimr::NBlobDepot {
                 (Channel, channel_), (GivenIdRanges, Channels[channel_].GivenIdRanges),
                 (Agent.GivenIdRanges, agentGivenIdRange_));
             agentGivenIdRange = {};
+            Data->OnLeastExpectedBlobIdChange(channel);
         }
-        Data->HandleTrash();
     }
 
     void TBlobDepot::InitChannelKinds() {
@@ -230,16 +239,18 @@ namespace NKikimr::NBlobDepot {
 
     void TBlobDepot::Handle(TEvBlobDepot::TEvPushNotifyResult::TPtr ev) {
         class TTxInvokeCallback : public NTabletFlatExecutor::TTransactionBase<TBlobDepot> {
+            const ui32 NodeId;
             TEvBlobDepot::TEvPushNotifyResult::TPtr Ev;
 
         public:
-            TTxInvokeCallback(TBlobDepot *self, TEvBlobDepot::TEvPushNotifyResult::TPtr ev)
+            TTxInvokeCallback(TBlobDepot *self, ui32 nodeId, TEvBlobDepot::TEvPushNotifyResult::TPtr ev)
                 : TTransactionBase(self)
+                , NodeId(nodeId)
                 , Ev(ev)
             {}
 
             bool Execute(TTransactionContext& /*txc*/, const TActorContext&) override {
-                TAgent& agent = Self->GetAgent(Ev->Recipient);
+                TAgent& agent = Self->GetAgent(NodeId);
                 if (const auto it = agent.PushCallbacks.find(Ev->Cookie); it != agent.PushCallbacks.end()) {
                     auto callback = std::move(it->second);
                     agent.PushCallbacks.erase(it);
@@ -251,7 +262,8 @@ namespace NKikimr::NBlobDepot {
             void Complete(const TActorContext&) override {}
         };
 
-        Execute(std::make_unique<TTxInvokeCallback>(this, ev));
+        TAgent& agent = GetAgent(ev->Recipient);
+        Execute(std::make_unique<TTxInvokeCallback>(this, agent.ConnectedNodeId, ev));
     }
 
     void TBlobDepot::ProcessRegisterAgentQ() {
@@ -263,6 +275,23 @@ namespace NKikimr::NBlobDepot {
             for (auto& ev : events) {
                 TAutoPtr<IEventHandle> tmp(ev.release());
                 Receive(tmp, TActivationContext::AsActorContext());
+            }
+        }
+    }
+
+    void TBlobDepot::OnSpaceColorChange(NKikimrBlobStorage::TPDiskSpaceColor::E spaceColor, float approximateFreeSpaceShare) {
+        for (auto& [nodeId, agent] : Agents) {
+            if (agent.AgentId && (agent.LastPushedSpaceColor != spaceColor ||
+                    agent.LastPushedApproximateFreeSpaceShare != approximateFreeSpaceShare)) {
+                Y_VERIFY(agent.ConnectedNodeId == nodeId);
+                const ui64 id = ++agent.LastRequestId;
+                agent.PushCallbacks.emplace(id, [](TEvBlobDepot::TEvPushNotifyResult::TPtr) {});
+                auto ev = std::make_unique<TEvBlobDepot::TEvPushNotify>();
+                ev->Record.SetSpaceColor(spaceColor);
+                ev->Record.SetApproximateFreeSpaceShare(approximateFreeSpaceShare);
+                Send(*agent.AgentId, ev.release(), 0, id);
+                agent.LastPushedSpaceColor = spaceColor;
+                agent.LastPushedApproximateFreeSpaceShare = approximateFreeSpaceShare;
             }
         }
     }

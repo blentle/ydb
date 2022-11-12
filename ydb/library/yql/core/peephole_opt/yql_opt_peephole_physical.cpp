@@ -67,6 +67,17 @@ TExprNode::TPtr Now0Arg(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnn
     return node;
 }
 
+TExprNode::TPtr OptimizeWideToBlocks(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& types) {
+    Y_UNUSED(ctx);
+    Y_UNUSED(types);
+    if (node->Head().IsCallable("WideFromBlocks")) {
+        YQL_CLOG(DEBUG, Core) << "Drop " << node->Head().Content() << " under " << node->Content();
+        return node->Head().HeadPtr();
+    }
+
+    return node;
+}
+
 TExprNode::TPtr SplitEquiJoinToPairsRecursive(const TExprNode& node, const TExprNode& joinTree, TExprContext& ctx,
     std::vector<std::string_view>& outLabels, const TExprNode::TPtr& settings) {
     const auto leftSubtree = joinTree.Child(1);
@@ -4335,10 +4346,19 @@ TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext&
     }
 
     auto multiInputType = node->Head().GetTypeAnn()->Cast<TFlowExprType>()->GetItemType()->Cast<TMultiExprType>();
+    TVector<const TTypeAnnotationNode*> allInputTypes;
     for (const auto& i : multiInputType->GetItems()) {
-        if (i->GetKind() == ETypeAnnotationKind::Block) {
+        if (i->GetKind() == ETypeAnnotationKind::Block || i->GetKind() == ETypeAnnotationKind::Scalar) {
             return node;
         }
+
+        allInputTypes.push_back(i);
+    }
+
+    bool supportedInputTypes = false;
+    YQL_ENSURE(types.ArrowResolver->AreTypesSupported(ctx.GetPosition(node->Pos()), allInputTypes, supportedInputTypes, ctx));
+    if (!supportedInputTypes) {
+        return node;
     }
 
     TExprNode::TListType blockArgs;
@@ -4483,15 +4503,22 @@ TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext&
         return true;
     });
 
-    if (!newNodes) {
-        return node;
-    }
-
     // calculate extra columns
     TNodeOnNodeOwnedMap replaces;
     TExprNode::TListType lambdaArgs, roots;
 
     for (ui32 i = 1; i < lambda->ChildrenSize(); ++i) {
+        if (lambda->ChildPtr(i)->IsComplete()) {
+            TVector<const TTypeAnnotationNode*> allTypes;
+            allTypes.push_back(lambda->ChildPtr(i)->GetTypeAnn());
+            bool supported = false;
+            YQL_ENSURE(types.ArrowResolver->AreTypesSupported(ctx.GetPosition(node->Pos()), allTypes, supported, ctx));
+            if (supported) {
+                rewrites[lambda->Child(i)] = ctx.NewCallable(node->Pos(), "AsScalar", { lambda->ChildPtr(i) });
+                ++newNodes;
+            }
+        }
+
         VisitExpr(lambda->ChildPtr(i), [&](const TExprNode::TPtr& node) {
             auto it = rewrites.find(node.Get());
             if (it != rewrites.end()) {
@@ -4507,6 +4534,10 @@ TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext&
 
             return true;
         });
+    }
+
+    if (!newNodes) {
+        return node;
     }
 
     YQL_CLOG(DEBUG, CorePeepHole) << "Convert " << node->Content() << " to blocks, extra nodes: " << newNodes << ", extra columns: " << lambdaArgs.size();
@@ -4537,6 +4568,47 @@ TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext&
         .Callable(node->Content())
             .Add(0, ret)
             .Add(1, restLambda)
+        .Seal()
+        .Build();
+}
+
+TExprNode::TPtr OptimizeSkipTakeToBlocks(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& types) {
+    if (!types.ArrowResolver) {
+        return node;
+    }
+
+    if (node->Head().GetTypeAnn()->GetKind() != ETypeAnnotationKind::Flow) {
+        return node;
+    }
+
+    auto flowItemType = node->Head().GetTypeAnn()->Cast<TFlowExprType>()->GetItemType();
+    if (flowItemType->GetKind() != ETypeAnnotationKind::Multi) {
+        return node;
+    }
+
+    const auto& allTypes = flowItemType->Cast<TMultiExprType>()->GetItems();
+    if (AnyOf(allTypes, [](const TTypeAnnotationNode* type) { return type->GetKind() == ETypeAnnotationKind::Block; })) {
+        return node;
+    }
+
+    bool supported = false;
+    YQL_ENSURE(types.ArrowResolver->AreTypesSupported(ctx.GetPosition(node->Head().Pos()),
+                                                      TVector<const TTypeAnnotationNode*>(allTypes.begin(), allTypes.end()),
+                                                      supported, ctx));
+    if (!supported) {
+        return node;
+    }
+
+    TStringBuf newName = node->Content() == "Skip" ? "WideSkipBlocks" : "WideTakeBlocks";
+    YQL_CLOG(DEBUG, CorePeepHole) << "Convert " << node->Content() << " to " << newName;
+    return ctx.Builder(node->Pos())
+        .Callable("WideFromBlocks")
+            .Callable(0, newName)
+                .Callable(0, "WideToBlocks")
+                    .Add(0, node->HeadPtr())
+                .Seal()
+                .Add(1, node->ChildPtr(1))
+            .Seal()
         .Seal()
         .Build();
 }
@@ -6048,6 +6120,95 @@ TExprNode::TPtr DropToFlowDeps(const TExprNode::TPtr& node, TExprContext& ctx) {
     return ctx.ChangeChildren(*node, std::move(children));
 }
 
+TExprNode::TPtr BuildCheckedBinaryOpOverDecimal(TPositionHandle pos, TStringBuf op, const TExprNode::TPtr& lhs, const TExprNode::TPtr& rhs, const TTypeAnnotationNode& resultType, TExprContext& ctx) {
+    auto typeNode = ExpandType(pos, resultType, ctx);
+    return ctx.Builder(pos)
+        .Callable("SafeCast")
+            .Callable(0, op)
+                .Callable(0, "SafeCast")
+                    .Callable(0, "SafeCast")
+                        .Add(0, lhs)
+                        .Add(1, typeNode)
+                    .Seal()
+                    .Callable(1, "DataType")
+                        .Atom(0, "Decimal")
+                        .Atom(1, "20")
+                        .Atom(2, "0")
+                    .Seal()
+                .Seal()
+                .Callable(1, "SafeCast")
+                    .Callable(0, "SafeCast")
+                        .Add(0, rhs)
+                        .Add(1, typeNode)
+                    .Seal()
+                    .Callable(1, "DataType")
+                        .Atom(0, "Decimal")
+                        .Atom(1, "20")
+                        .Atom(2, "0")
+                    .Seal()
+                .Seal()
+            .Seal()
+            .Add(1, typeNode)
+        .Seal()
+        .Build();
+}
+
+TExprNode::TPtr BuildCheckedBinaryOpOverSafeCast(TPositionHandle pos, TStringBuf op, const TExprNode::TPtr& lhs, const TExprNode::TPtr& rhs, const TTypeAnnotationNode& resultType, TExprContext& ctx) {
+    auto typeNode = ExpandType(pos, resultType, ctx);
+    return ctx.Builder(pos)
+        .Callable(op)
+            .Callable(0, "SafeCast")
+                .Add(0, lhs)
+                .Add(1, typeNode)
+            .Seal()
+            .Callable(1, "SafeCast")
+                .Add(0, rhs)
+                .Add(1, typeNode)
+            .Seal()
+        .Seal()
+        .Build();
+}
+
+TExprNode::TPtr ExpandCheckedAdd(const TExprNode::TPtr& node, TExprContext& ctx) {
+    return BuildCheckedBinaryOpOverDecimal(node->Pos(), "+", node->ChildPtr(0), node->ChildPtr(1), *node->GetTypeAnn(), ctx);
+}
+
+TExprNode::TPtr ExpandCheckedSub(const TExprNode::TPtr& node, TExprContext& ctx) {
+    return BuildCheckedBinaryOpOverDecimal(node->Pos(), "-", node->ChildPtr(0), node->ChildPtr(1), *node->GetTypeAnn(), ctx);
+}
+
+TExprNode::TPtr ExpandCheckedMul(const TExprNode::TPtr& node, TExprContext& ctx) {
+    return BuildCheckedBinaryOpOverDecimal(node->Pos(), "*", node->ChildPtr(0), node->ChildPtr(1), *node->GetTypeAnn(), ctx);
+}
+
+TExprNode::TPtr ExpandCheckedDiv(const TExprNode::TPtr& node, TExprContext& ctx) {
+    return BuildCheckedBinaryOpOverSafeCast(node->Pos(), "/", node->ChildPtr(0), node->ChildPtr(1), *node->GetTypeAnn(), ctx);
+}
+
+TExprNode::TPtr ExpandCheckedMod(const TExprNode::TPtr& node, TExprContext& ctx) {
+    return BuildCheckedBinaryOpOverSafeCast(node->Pos(), "%", node->ChildPtr(0), node->ChildPtr(1), *node->GetTypeAnn(), ctx);
+}
+
+TExprNode::TPtr ExpandCheckedMinus(const TExprNode::TPtr& node, TExprContext& ctx) {
+    return ctx.Builder(node->Pos())
+        .Callable("SafeCast")
+            .Callable(0, "Minus")
+                .Callable(0, "SafeCast")
+                    .Add(0, node->HeadPtr())
+                    .Callable(1, "DataType")
+                        .Atom(0, "Decimal")
+                        .Atom(1, "20")
+                        .Atom(2, "0")
+                    .Seal()
+                .Seal()
+            .Seal()
+            .Callable(1, "TypeOf")
+                .Add(0, node->HeadPtr())
+            .Seal()
+        .Seal()
+        .Build();
+}
+
 ui64 ToDate(ui64 now)      { return std::min<ui64>(NUdf::MAX_DATE - 1U, now / 86400000000ull); }
 ui64 ToDatetime(ui64 now)  { return std::min<ui64>(NUdf::MAX_DATETIME - 1U, now / 1000000ull); }
 ui64 ToTimestamp(ui64 now) { return std::min<ui64>(NUdf::MAX_TIMESTAMP - 1ULL, now); }
@@ -6118,6 +6279,12 @@ struct TPeepHoleRules {
         {"AsRange", &ExpandAsRange},
         {"RangeFor", &ExpandRangeFor},
         {"ToFlow", &DropToFlowDeps},
+        {"CheckedAdd", &ExpandCheckedAdd},
+        {"CheckedSub", &ExpandCheckedSub},
+        {"CheckedMul", &ExpandCheckedMul},
+        {"CheckedDiv", &ExpandCheckedDiv},
+        {"CheckedMod", &ExpandCheckedMod},
+        {"CheckedMinus", &ExpandCheckedMinus},
     };
 
     static constexpr std::initializer_list<TExtPeepHoleOptimizerMap::value_type> CommonStageExtRulesInit = {
@@ -6210,6 +6377,9 @@ struct TPeepHoleRules {
         {"NarrowMultiMap", &OptimizeWideMapBlocks},
         {"WideMap", &OptimizeWideMapBlocks},
         {"NarrowMap", &OptimizeWideMapBlocks},
+        {"WideToBlocks", &OptimizeWideToBlocks},
+        {"Skip", &OptimizeSkipTakeToBlocks},
+        {"Take", &OptimizeSkipTakeToBlocks},
     };
 
     TPeepHoleRules()

@@ -148,6 +148,12 @@
 #include <ydb/library/yql/minikql/comp_nodes/mkql_factories.h>
 #include <ydb/library/yql/parser/pg_wrapper/interface/comp_factory.h>
 
+#include <ydb/services/metadata/ds_table/service.h>
+#include <ydb/services/metadata/service.h>
+
+#include <ydb/services/bg_tasks/ds_table/executor.h>
+#include <ydb/services/bg_tasks/service.h>
+
 #include <library/cpp/actors/protos/services_common.pb.h>
 
 #include <library/cpp/actors/core/actor_bootstrapped.h>
@@ -998,17 +1004,8 @@ void TLocalServiceInitializer::InitializeServices(
         new TTabletSetupInfo(&NBlobDepot::CreateBlobDepot, TMailboxType::ReadAsFilled, appData->UserPoolId, TMailboxType::ReadAsFilled, appData->SystemPoolId));
 
     TTenantPoolConfig::TPtr tenantPoolConfig = new TTenantPoolConfig(Config.GetTenantPoolConfig(), localConfig);
-    if (!tenantPoolConfig->IsEnabled
-        && (!tenantPoolConfig->StaticSlots.empty() || !tenantPoolConfig->DynamicSlots.empty()))
+    if (!tenantPoolConfig->IsEnabled && !tenantPoolConfig->StaticSlots.empty())
         Y_FAIL("Tenant slots are not allowed in disabled pool");
-    // If there are no slots configured then bind to all domains and serve '/' and '/{domain}' together as usual
-    if (tenantPoolConfig->IsEnabled
-        && tenantPoolConfig->StaticSlots.empty()
-        && tenantPoolConfig->DynamicSlots.empty()) {
-        for (const auto &domain : Config.GetDomainsConfig().GetDomain()) {
-            tenantPoolConfig->AddStaticSlot(domain.GetName());
-        }
-    }
 
     setup->LocalServices.push_back(std::make_pair(MakeTenantPoolRootID(),
         TActorSetupCmd(CreateTenantPool(tenantPoolConfig), TMailboxType::ReadAsFilled, 0)));
@@ -1593,13 +1590,6 @@ void TGRpcServicesInitializer::InitializeServices(NActors::TActorSystemSetup* se
                 );
         }
 
-        TVector<TString> rootDomains;
-        for (auto &domain : appData->DomainsInfo->Domains)
-            rootDomains.emplace_back("/" + domain.second->Name);
-
-        const bool ignoreServeRootDomain = ScopeId.IsTenantScope();
-        const bool serveRootDomain = !ignoreServeRootDomain && config.GetServeRootDomains();
-
         auto stringsFromProto = [](TVector<TString>& vec, const auto& proto) {
             if (!proto.empty()) {
                 vec.reserve(proto.size());
@@ -1620,8 +1610,6 @@ void TGRpcServicesInitializer::InitializeServices(NActors::TActorSystemSetup* se
             stringsFromProto(desc->AddressesV4, config.GetPublicAddressesV4());
             stringsFromProto(desc->AddressesV6, config.GetPublicAddressesV6());
 
-            if (serveRootDomain)
-                desc->ServedDatabases.insert(desc->ServedDatabases.end(), rootDomains.begin(), rootDomains.end());
             desc->ServedServices.insert(desc->ServedServices.end(), config.GetServices().begin(), config.GetServices().end());
             endpoints.push_back(std::move(desc));
         }
@@ -1635,9 +1623,6 @@ void TGRpcServicesInitializer::InitializeServices(NActors::TActorSystemSetup* se
             stringsFromProto(desc->AddressesV4, config.GetPublicAddressesV4());
             stringsFromProto(desc->AddressesV6, config.GetPublicAddressesV6());
             desc->TargetNameOverride = config.GetPublicTargetNameOverride();
-
-            if (serveRootDomain)
-                desc->ServedDatabases.insert(desc->ServedDatabases.end(), rootDomains.begin(), rootDomains.end());
 
             desc->ServedServices.insert(desc->ServedServices.end(), config.GetServices().begin(), config.GetServices().end());
             endpoints.push_back(std::move(desc));
@@ -1654,8 +1639,6 @@ void TGRpcServicesInitializer::InitializeServices(NActors::TActorSystemSetup* se
                 stringsFromProto(desc->AddressesV4, sx.GetPublicAddressesV4());
                 stringsFromProto(desc->AddressesV6, sx.GetPublicAddressesV6());
 
-                if (serveRootDomain)
-                    desc->ServedDatabases.insert(desc->ServedDatabases.end(), rootDomains.begin(), rootDomains.end());
                 desc->ServedServices.insert(desc->ServedServices.end(), sx.GetServices().begin(), sx.GetServices().end());
                 endpoints.push_back(std::move(desc));
             }
@@ -1670,8 +1653,6 @@ void TGRpcServicesInitializer::InitializeServices(NActors::TActorSystemSetup* se
                 stringsFromProto(desc->AddressesV6, sx.GetPublicAddressesV6());
                 desc->TargetNameOverride = sx.GetPublicTargetNameOverride();
 
-                if (serveRootDomain)
-                    desc->ServedDatabases.insert(desc->ServedDatabases.end(), rootDomains.begin(), rootDomains.end());
                 desc->ServedServices.insert(desc->ServedServices.end(), sx.GetServices().begin(), sx.GetServices().end());
                 endpoints.push_back(std::move(desc));
             }
@@ -2017,6 +1998,43 @@ void TKqpServiceInitializer::InitializeServices(NActors::TActorSystemSetup* setu
         setup->LocalServices.push_back(std::make_pair(
             NKqp::MakeKqpProxyID(NodeId),
             TActorSetupCmd(proxy, TMailboxType::HTSwap, appData->UserPoolId)));
+    }
+}
+
+TMetadataProviderInitializer::TMetadataProviderInitializer(const TKikimrRunConfig& runConfig)
+    : IKikimrServicesInitializer(runConfig)
+{
+}
+
+void TMetadataProviderInitializer::InitializeServices(NActors::TActorSystemSetup* setup, const NKikimr::TAppData* appData) {
+    NMetadataProvider::TConfig serviceConfig;
+    if (Config.HasMetadataProviderConfig()) {
+        Y_VERIFY(serviceConfig.DeserializeFromProto(Config.GetMetadataProviderConfig()));
+    }
+
+    if (serviceConfig.IsEnabled()) {
+        auto service = NMetadataProvider::CreateService(serviceConfig);
+        setup->LocalServices.push_back(std::make_pair(
+            NMetadataProvider::MakeServiceId(NodeId),
+            TActorSetupCmd(service, TMailboxType::HTSwap, appData->UserPoolId)));
+    }
+}
+
+TBackgroundTasksInitializer::TBackgroundTasksInitializer(const TKikimrRunConfig& runConfig)
+    : IKikimrServicesInitializer(runConfig) {
+}
+
+void TBackgroundTasksInitializer::InitializeServices(NActors::TActorSystemSetup* setup, const NKikimr::TAppData* appData) {
+    NBackgroundTasks::TConfig serviceConfig;
+    if (Config.HasBackgroundTasksConfig()) {
+        Y_VERIFY(serviceConfig.DeserializeFromProto(Config.GetBackgroundTasksConfig()));
+    }
+
+    if (serviceConfig.IsEnabled()) {
+        auto service = NBackgroundTasks::CreateService(serviceConfig);
+        setup->LocalServices.push_back(std::make_pair(
+            NBackgroundTasks::MakeServiceId(NodeId),
+            TActorSetupCmd(service, TMailboxType::HTSwap, appData->UserPoolId)));
     }
 }
 

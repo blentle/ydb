@@ -1,5 +1,6 @@
 #include "change_collector.h"
 #include "datashard_impl.h"
+#include "datashard_user_db.h"
 #include "datashard__engine_host.h"
 #include "sys_tables.h"
 
@@ -191,7 +192,7 @@ TIntrusivePtr<TThrRefBase> InitDataShardSysTables(TDataShard* self) {
 }
 
 ///
-class TDataShardEngineHost : public TEngineHost {
+class TDataShardEngineHost : public TEngineHost, public IDataShardUserDb {
 public:
     TDataShardEngineHost(TDataShard* self, TEngineBay& engineBay, NTable::TDatabase& db, TEngineHostCounters& counters, ui64& lockTxId, ui32& lockNodeId, TInstant now)
         : TEngineHost(db, counters,
@@ -205,7 +206,24 @@ public:
         , LockTxId(lockTxId)
         , LockNodeId(lockNodeId)
         , Now(now)
-    {}
+    {
+    }
+
+    NTable::EReady SelectRow(
+            const TTableId& tableId,
+            TArrayRef<const TRawTypeValue> key,
+            TArrayRef<const NTable::TTag> tags,
+            NTable::TRowState& row) override
+    {
+        auto tid = LocalTableId(tableId);
+
+        return DB.Select(
+            tid, key, tags, row,
+            /* readFlags */ 0,
+            ReadVersion,
+            GetReadTxMap(tableId),
+            GetReadTxObserver(tableId));
+    }
 
     void SetWriteVersion(TRowVersion writeVersion) {
         WriteVersion = writeVersion;
@@ -235,7 +253,7 @@ public:
         IsRepeatableSnapshot = true;
     }
 
-    IChangeCollector* GetChangeCollector(const TTableId& tableId) const override {
+    IDataShardChangeCollector* GetChangeCollector(const TTableId& tableId) const override {
         auto it = ChangeCollectors.find(tableId);
         if (it != ChangeCollectors.end()) {
             return it->second.Get();
@@ -246,8 +264,31 @@ public:
             return it->second.Get();
         }
 
-        it->second.Reset(CreateChangeCollector(*Self, DB, tableId.PathId.LocalPathId, IsImmediateTx));
+        it->second.Reset(CreateChangeCollector(*Self, *const_cast<TDataShardEngineHost*>(this), DB, tableId.PathId.LocalPathId, IsImmediateTx));
         return it->second.Get();
+    }
+
+    void CommitChanges(const TTableId& tableId, ui64 lockId, const TRowVersion& writeVersion, TTransactionContext& txc) {
+        auto localTid = Self->GetLocalTableId(tableId);
+        Y_VERIFY_S(localTid, "Unexpected failure to find table " << tableId << " in datashard " << Self->TabletID());
+
+        if (!DB.HasOpenTx(localTid, lockId)) {
+            return;
+        }
+
+        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+            "Committing changes lockId# " << lockId << " in localTid# " << localTid << " shard# " << Self->TabletID());
+        DB.CommitTx(localTid, lockId, writeVersion);
+
+        if (!CommittedLockChanges.contains(lockId)) {
+            if (const auto& lockChanges = Self->GetLockChangeRecords(lockId)) {
+                if (auto* collector = GetChangeCollector(tableId)) {
+                    collector->SetWriteVersion(WriteVersion);
+                    collector->CommitLockChanges(lockId, lockChanges, txc);
+                    CommittedLockChanges.insert(lockId);
+                }
+            }
+        }
     }
 
     TVector<IChangeCollector::TChange> GetCollectedChanges() const {
@@ -565,30 +606,54 @@ public:
         TSmallVec<TRawTypeValue> key;
         ConvertTableKeys(Scheme, tableInfo, row, key, nullptr);
 
+        ui64 skipCount = 0;
+
+        NTable::ITransactionObserverPtr txObserver;
+        if (LockTxId) {
+            txObserver = new TLockedWriteTxObserver(this, LockTxId, skipCount, localTid);
+        } else {
+            txObserver = new TWriteTxObserver(this);
+        }
+
         // We are not actually interested in the row version, we only need to
         // detect uncommitted transaction skips on the path to that version.
         auto res = Db.SelectRowVersion(
             localTid, key, /* readFlags */ 0,
-            GetReadTxMap(tableId),
-            new TWriteTxObserver(this, tableId));
+            nullptr, txObserver);
 
         if (res.Ready == NTable::EReady::Page) {
             throw TNotReadyTabletException();
         }
+
+        if (LockTxId) {
+            ui64 skipLimit = Self->GetMaxLockedWritesPerKey();
+            if (skipLimit > 0 && skipCount >= skipLimit) {
+                throw TLockedWriteLimitException();
+            }
+        }
     }
 
-    class TWriteTxObserver : public NTable::ITransactionObserver {
+    class TLockedWriteTxObserver : public NTable::ITransactionObserver {
     public:
-        TWriteTxObserver(const TDataShardEngineHost* host, const TTableId& tableId)
+        TLockedWriteTxObserver(const TDataShardEngineHost* host, ui64 txId, ui64& skipCount, ui32 localTid)
             : Host(host)
-            , TableId(tableId)
+            , SelfTxId(txId)
+            , SkipCount(skipCount)
+            , LocalTid(localTid)
         {
-            Y_UNUSED(Host);
-            Y_UNUSED(TableId);
         }
 
         void OnSkipUncommitted(ui64 txId) override {
-            Host->AddWriteConflict(TableId, txId);
+            if (!Host->Db.HasRemovedTx(LocalTid, txId)) {
+                ++SkipCount;
+                if (!SelfFound) {
+                    if (txId != SelfTxId) {
+                        Host->AddWriteConflict(txId);
+                    } else {
+                        SelfFound = true;
+                    }
+                }
+            }
         }
 
         void OnSkipCommitted(const TRowVersion&) override {
@@ -609,16 +674,49 @@ public:
 
     private:
         const TDataShardEngineHost* const Host;
-        const TTableId TableId;
+        const ui64 SelfTxId;
+        ui64& SkipCount;
+        const ui32 LocalTid;
+        bool SelfFound = false;
     };
 
-    void AddWriteConflict(const TTableId& tableId, ui64 txId) const {
-        Y_UNUSED(tableId);
-        if (LockTxId) {
-            Self->SysLocksTable().AddWriteConflict(txId);
-        } else {
-            Self->SysLocksTable().BreakLock(txId);
+    class TWriteTxObserver : public NTable::ITransactionObserver {
+    public:
+        TWriteTxObserver(const TDataShardEngineHost* host)
+            : Host(host)
+        {
         }
+
+        void OnSkipUncommitted(ui64 txId) override {
+            Host->BreakWriteConflict(txId);
+        }
+
+        void OnSkipCommitted(const TRowVersion&) override {
+            // nothing
+        }
+
+        void OnSkipCommitted(const TRowVersion&, ui64) override {
+            // nothing
+        }
+
+        void OnApplyCommitted(const TRowVersion&) override {
+            // nothing
+        }
+
+        void OnApplyCommitted(const TRowVersion&, ui64) override {
+            // nothing
+        }
+
+    private:
+        const TDataShardEngineHost* const Host;
+    };
+
+    void AddWriteConflict(ui64 txId) const {
+        Self->SysLocksTable().AddWriteConflict(txId);
+    }
+
+    void BreakWriteConflict(ui64 txId) const {
+        Self->SysLocksTable().BreakLock(txId);
     }
 
 private:
@@ -636,7 +734,8 @@ private:
     TInstant Now;
     TRowVersion WriteVersion = TRowVersion::Max();
     TRowVersion ReadVersion = TRowVersion::Min();
-    mutable THashMap<TTableId, THolder<IChangeCollector>> ChangeCollectors;
+    THashSet<ui64> CommittedLockChanges;
+    mutable THashMap<TTableId, THolder<IDataShardChangeCollector>> ChangeCollectors;
     mutable THashMap<TTableId, NTable::ITransactionMapPtr> TxMaps;
     mutable THashMap<TTableId, NTable::ITransactionObserverPtr> TxObservers;
 };
@@ -687,7 +786,7 @@ TEngineBay::TEngineBay(TDataShard * self, TTransactionContext& txc, const TActor
 
     KqpApplyCtx.Reset(kqpApplyCtx.Release());
 
-    KqpAlloc = MakeHolder<TScopedAlloc>(TAlignedPagePoolCounters(), AppData(ctx)->FunctionRegistry->SupportsSizedAllocators());
+    KqpAlloc = MakeHolder<TScopedAlloc>(__LOCATION__, TAlignedPagePoolCounters(), AppData(ctx)->FunctionRegistry->SupportsSizedAllocators());
     KqpTypeEnv = MakeHolder<TTypeEnvironment>(*KqpAlloc);
     KqpAlloc->Release();
 
@@ -821,6 +920,13 @@ void TEngineBay::SetIsRepeatableSnapshot() {
 
     auto* host = static_cast<TDataShardEngineHost*>(EngineHost.Get());
     host->SetIsRepeatableSnapshot();
+}
+
+void TEngineBay::CommitChanges(const TTableId& tableId, ui64 lockId, const TRowVersion& writeVersion, TTransactionContext& txc) {
+    Y_VERIFY(EngineHost);
+
+    auto* host = static_cast<TDataShardEngineHost*>(EngineHost.Get());
+    host->CommitChanges(tableId, lockId, writeVersion, txc);
 }
 
 TVector<IChangeCollector::TChange> TEngineBay::GetCollectedChanges() const {

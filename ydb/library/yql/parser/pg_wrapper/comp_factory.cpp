@@ -23,6 +23,7 @@
 #undef SIZEOF_SIZE_T
 extern "C" {
 #include "postgres.h"
+#include "access/xact.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_collation_d.h"
 #include "utils/builtins.h"
@@ -35,7 +36,7 @@ extern "C" {
 #include "executor/executor.h"
 #include "lib/stringinfo.h"
 #include "thread_inits.h"
-    
+
 #undef Abs
 #undef Min
 #undef Max
@@ -67,6 +68,7 @@ struct TMainContext {
     MemoryContextData Data;
     MemoryContext PrevCurrentMemoryContext = nullptr;
     MemoryContext PrevErrorContext = nullptr;
+    TimestampTz StartTimestamp;
 };
 
 ui32 GetFullVarSize(const text* s) {
@@ -1285,7 +1287,7 @@ public:
             const auto& value = args[i];
             if (value) {
                 dnulls[i] = false;
-                
+
                 dvalues[i] = ArgDescs[i].PassByValue ?
                     ScalarDatumFromPod(value) :
                     PointerDatumFromPod(value);
@@ -2787,6 +2789,7 @@ void* PgInitializeMainContext() {
         &MkqlMethods,
         nullptr,
         "mkql");
+    ctx->StartTimestamp = GetCurrentTimestamp();
     return ctx;
 }
 
@@ -2801,6 +2804,7 @@ void PgAcquireThreadContext(void* ctx) {
         main->PrevCurrentMemoryContext = CurrentMemoryContext;
         main->PrevErrorContext = ErrorContext;
         CurrentMemoryContext = ErrorContext = (MemoryContext)&main->Data;
+        SetParallelStartTimestamps(main->StartTimestamp, main->StartTimestamp);
     }
 }
 
@@ -2932,7 +2936,7 @@ public:
     }
 
     int Compare(const char* dataL, size_t sizeL, const char* dataR, size_t sizeR) const {
-        NMiniKQL::TScopedAlloc alloc;
+        NMiniKQL::TScopedAlloc alloc(__LOCATION__);
         NMiniKQL::TPAllocScope scope;
         PG_TRY();
         {
@@ -2971,7 +2975,7 @@ public:
     }
 
     ui64 Hash(const char* data, size_t size) const {
-        NMiniKQL::TScopedAlloc alloc;
+        NMiniKQL::TScopedAlloc alloc(__LOCATION__);
         NMiniKQL::TPAllocScope scope;
         PG_TRY();
         {

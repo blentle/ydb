@@ -44,52 +44,52 @@ static bool TryParseRange(const TString& str, std::pair<ui64, ui64>& range) {
 }
 }
 
-void TFakeExternalStorage::Execute(TEvListObjectsRequest::TPtr& ev) const {
-    auto& awsPrefix = ev->Get()->GetRequest().GetPrefix();
+TEvListObjectsResponse::TResult TFakeExternalStorage::BuildListObjectsResult(const TEvListObjectsRequest::TRequest& request) const {
+    auto& bucket = GetBucket(AwsToString(request.GetBucket()));
+    auto& awsPrefix = request.GetPrefix();
     const TString prefix(awsPrefix.data(), awsPrefix.size());
     THolder<TEvListObjectsResponse> result;
-    if (!prefix) {
-        TEvListObjectsResponse::TOutcome awsOutcome;
-        result = MakeHolder<TEvListObjectsResponse>(awsOutcome);
-        TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
-    } else {
-        TGuard<TMutex> g(Mutex);
-        TEvListObjectsResponse::TResult awsResult;
-        for (auto&& i : Data) {
-            if (!i.first.StartsWith(prefix)) {
-                continue;
-            } else {
-                Aws::S3::Model::Object objectMeta;
-                objectMeta.SetKey(i.first);
-                objectMeta.SetSize(i.second.size());
-                awsResult.AddContents(std::move(objectMeta));
-            }
+    TGuard<TMutex> g(Mutex);
+    TEvListObjectsResponse::TAwsResult awsResult;
+    for (auto&& i : bucket) {
+        if (!!prefix && !i.first.StartsWith(prefix)) {
+            continue;
         }
-        TEvListObjectsResponse::TOutcome awsOutcome(awsResult);
-        result = MakeHolder<TEvListObjectsResponse>(awsOutcome);
-        TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
+        Aws::S3::Model::Object objectMeta;
+        objectMeta.SetKey(i.first);
+        objectMeta.SetSize(i.second.size());
+        awsResult.AddContents(std::move(objectMeta));
+        break;
     }
+    awsResult.SetIsTruncated(bucket.GetSize() > 1);
+    return awsResult;
+}
+
+void TFakeExternalStorage::Execute(TEvListObjectsRequest::TPtr& ev) const {
+    auto awsResult = BuildListObjectsResult(ev->Get()->GetRequest());
+    auto result = MakeHolder<TEvListObjectsResponse>(awsResult);
+    TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
 }
 
 void TFakeExternalStorage::Execute(TEvGetObjectRequest::TPtr& ev) const {
     TGuard<TMutex> g(Mutex);
-    auto& awsKey = ev->Get()->Request.GetKey();
-    const TString key(awsKey.data(), awsKey.size());
-    auto it = Data.find(key);
+    auto& bucket = GetBucket(AwsToString(ev->Get()->GetRequest().GetBucket()));
+    const TString key = AwsToString(ev->Get()->GetRequest().GetKey());
+    auto object = bucket.GetObject(key);
     TString data;
 
-    if (it != Data.end()) {
+    if (!!object) {
         Aws::S3::Model::GetObjectResult awsResult;
-        awsResult.SetETag(MD5::Calc(it->second));
-        data = it->second;
+        awsResult.SetETag(MD5::Calc(*object));
+        data = *object;
 
-        auto awsRange = ev->Get()->Request.GetRange();
+        auto awsRange = ev->Get()->GetRequest().GetRange();
         if (awsRange.size()) {
             const TString strRange(awsRange.data(), awsRange.size());
             std::pair<ui64, ui64> range;
             if (!TryParseRange(strRange, range)) {
                 Aws::Utils::Outcome<Aws::S3::Model::GetObjectResult, Aws::S3::S3Error> awsOutcome;
-                THolder<TEvGetObjectResponse> result(new TEvGetObjectResponse(key, awsOutcome, std::move(data)));
+                THolder<TEvGetObjectResponse> result(new TEvGetObjectResponse(key, std::move(awsOutcome), std::move(data)));
                 TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
                 return;
             } else {
@@ -98,41 +98,40 @@ void TFakeExternalStorage::Execute(TEvGetObjectRequest::TPtr& ev) const {
         }
 
         Aws::Utils::Outcome<Aws::S3::Model::GetObjectResult, Aws::S3::S3Error> awsOutcome(std::move(awsResult));
-        THolder<TEvGetObjectResponse> result(new TEvGetObjectResponse(key, awsOutcome, std::move(data)));
+        THolder<TEvGetObjectResponse> result(new TEvGetObjectResponse(key, std::move(awsOutcome), std::move(data)));
         TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
     } else {
         Aws::Utils::Outcome<Aws::S3::Model::GetObjectResult, Aws::S3::S3Error> awsOutcome;
-        THolder<TEvGetObjectResponse> result(new TEvGetObjectResponse(key, awsOutcome, std::move(data)));
+        THolder<TEvGetObjectResponse> result(new TEvGetObjectResponse(key, std::move(awsOutcome), std::move(data)));
         TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
     }
 }
 
 void TFakeExternalStorage::Execute(TEvHeadObjectRequest::TPtr& ev) const {
     TGuard<TMutex> g(Mutex);
-    auto& awsKey = ev->Get()->Request.GetKey();
-    const TString key(awsKey.data(), awsKey.size());
-
-    auto it = Data.find(key);
-    if (it != Data.end()) {
+    auto& bucket = GetBucket(AwsToString(ev->Get()->GetRequest().GetBucket()));
+    const TString key = AwsToString(ev->Get()->GetRequest().GetKey());
+    auto object = bucket.GetObject(key);
+    if (object) {
         Aws::S3::Model::HeadObjectResult awsResult;
-        awsResult.SetETag(MD5::Calc(it->second));
-        awsResult.SetContentLength(it->second.size());
+        awsResult.SetETag(MD5::Calc(*object));
+        awsResult.SetContentLength(object->size());
         Aws::Utils::Outcome<Aws::S3::Model::HeadObjectResult, Aws::S3::S3Error> awsOutcome(awsResult);
-        THolder<TEvHeadObjectResponse> result(new TEvHeadObjectResponse(key, awsOutcome));
+        THolder<TEvHeadObjectResponse> result(new TEvHeadObjectResponse(key, std::move(awsOutcome)));
         TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
     } else {
         Aws::Utils::Outcome<Aws::S3::Model::HeadObjectResult, Aws::S3::S3Error> awsOutcome;
-        THolder<TEvHeadObjectResponse> result(new TEvHeadObjectResponse(key, awsOutcome));
+        THolder<TEvHeadObjectResponse> result(new TEvHeadObjectResponse(key, std::move(awsOutcome)));
         TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
     }
 }
 
 void TFakeExternalStorage::Execute(TEvPutObjectRequest::TPtr& ev) const {
     TGuard<TMutex> g(Mutex);
+    const TString key = AwsToString(ev->Get()->GetRequest().GetKey());
+    auto& bucket = MutableBucket(AwsToString(ev->Get()->GetRequest().GetBucket()));
+    bucket.PutObject(key, ev->Get()->Body);
     Aws::S3::Model::PutObjectResult awsResult;
-    auto& awsKey = ev->Get()->Request.GetKey();
-    const TString key(awsKey.data(), awsKey.size());
-    Data[key] = ev->Get()->Body;
 
     THolder<TEvPutObjectResponse> result(new TEvPutObjectResponse(key, awsResult));
     TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
@@ -141,11 +140,27 @@ void TFakeExternalStorage::Execute(TEvPutObjectRequest::TPtr& ev) const {
 void TFakeExternalStorage::Execute(TEvDeleteObjectRequest::TPtr& ev) const {
     TGuard<TMutex> g(Mutex);
     Aws::S3::Model::DeleteObjectResult awsResult;
-    auto& awsKey = ev->Get()->Request.GetKey();
-    const TString key(awsKey.data(), awsKey.size());
-    Data.erase(key);
+    auto& bucket = MutableBucket(AwsToString(ev->Get()->GetRequest().GetBucket()));
+    const TString key = AwsToString(ev->Get()->GetRequest().GetKey());
+    bucket.Remove(key);
 
     THolder<TEvDeleteObjectResponse> result(new TEvDeleteObjectResponse(key, awsResult));
+    TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
+}
+
+void TFakeExternalStorage::Execute(TEvDeleteObjectsRequest::TPtr& ev) const {
+    TGuard<TMutex> g(Mutex);
+    auto& bucket = MutableBucket(AwsToString(ev->Get()->GetRequest().GetBucket()));
+    Aws::S3::Model::DeleteObjectsResult awsResult;
+    for (auto&& awsKey : ev->Get()->GetRequest().GetDelete().GetObjects()) {
+        const TString key = AwsToString(awsKey.GetKey());
+        bucket.Remove(key);
+        Aws::S3::Model::DeletedObject dObject;
+        dObject.WithKey(key);
+        awsResult.AddDeleted(std::move(dObject));
+    }
+
+    THolder<TEvDeleteObjectsResponse> result(new TEvDeleteObjectsResponse(awsResult));
     TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
 }
 
@@ -163,21 +178,9 @@ void TFakeExternalStorage::Execute(TEvAbortMultipartUploadRequest::TPtr& /*ev*/)
 
 void TFakeExternalStorage::Execute(TEvCheckObjectExistsRequest::TPtr& ev) const {
     TGuard<TMutex> g(Mutex);
-    auto& awsKey = ev->Get()->GetRequest().GetKey();
-    const TString key(awsKey.data(), awsKey.size());
-
-    auto it = Data.find(key);
-    if (it != Data.end()) {
-        Aws::S3::Model::HeadObjectResult awsResult;
-        awsResult.SetETag(MD5::Calc(it->second));
-        awsResult.SetContentLength(it->second.size());
-        THolder<TEvCheckObjectExistsResponse> result(new TEvCheckObjectExistsResponse(ev->Get()->GetRequest(), awsResult, ev->Get()->GetRequestContext()));
-        TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
-    } else {
-        Aws::Utils::Outcome<Aws::S3::Model::HeadObjectResult, Aws::S3::S3Error> awsOutcome;
-        THolder<TEvCheckObjectExistsResponse> result(new TEvCheckObjectExistsResponse(ev->Get()->GetRequest(), awsOutcome, ev->Get()->GetRequestContext()));
-        TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
-    }
+    auto awsResult = BuildListObjectsResult(ev->Get()->GetRequest());
+    THolder<TEvCheckObjectExistsResponse> result(new TEvCheckObjectExistsResponse(awsResult, ev->Get()->GetRequestContext()));
+    TlsActivationContext->ActorSystem()->Send(ev->Sender, result.Release());
 
 }
 }

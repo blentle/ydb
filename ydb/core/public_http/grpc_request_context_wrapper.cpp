@@ -11,11 +11,15 @@ namespace NKikimr::NPublicHttp {
       , DeadlineAt(TInstant::Max())
     {
         JsonSettings.EnumAsNumbers = false;
-        JsonSettings.UI64AsString = true;
+        JsonSettings.UI64AsString = false;
         JsonSettings.EmptyRepeated = true;
     }
 
     const NProtoBuf::Message* TGrpcRequestContextWrapper::GetRequest() const {
+        return Request.get();
+    }
+
+    NProtoBuf::Message* TGrpcRequestContextWrapper::GetRequestMut() {
         return Request.get();
     }
 

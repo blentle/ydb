@@ -12,10 +12,12 @@
 #include <ydb/core/testlib/basics/runtime.h>
 
 #include <util/system/mutex.h>
+#include <util/datetime/base.h>
 
 namespace NKikimr {
 namespace NCmsTest {
 
+using NNodeWhiteboard::TTabletId;
 using TNodeTenantsMap = THashMap<ui32, TVector<TString>>;
 
 struct TFakeNodeInfo {
@@ -81,7 +83,7 @@ struct TTestEnvOpts {
     ui32 DataCenterCount;
     TNodeTenantsMap Tenants;
     bool UseMirror3dcErasure;
-
+    bool AdvanceCurrentTime;
 
     TTestEnvOpts() = default;
 
@@ -96,6 +98,7 @@ struct TTestEnvOpts {
             , DataCenterCount(1)
             , Tenants(tenants)
             , UseMirror3dcErasure(false)
+            , AdvanceCurrentTime(false)
     {
     }
 };
@@ -128,6 +131,10 @@ public:
 
     void EnableSysNodeChecking(); 
     TIntrusiveConstPtr<NKikimr::TStateStorageInfo> GetStateStorageInfo();
+    
+    void UpdateNodeStartTime(ui32 nodeIndex, TInstant startTime) {
+        TFakeNodeWhiteboardService::Info[GetNodeId(nodeIndex)].SystemStateInfo.SetStartTime(startTime.GetValue());
+    }
 
     NKikimrCms::TClusterState
     RequestState(const NKikimrCms::TClusterStateRequest &request = {},

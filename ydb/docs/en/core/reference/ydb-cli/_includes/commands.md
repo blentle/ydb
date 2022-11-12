@@ -35,10 +35,10 @@ Any command can be run from the command line with the `--help` option to get hel
 | [import file tsv](../export_import/import-file.md) | Importing data from a TSV file |
 | [import s3](../export_import/s3_import.md) | Importing data from S3 storage |
 | [init](../profile/create.md) | Initializing the CLI, creating a [profile](../profile/index.md) |
-| operation cancel | Aborting background operations |
-| operation forget | Deleting background operations from history |
-| operation get | Status of background operations |
-| operation list | List of background operations |
+| [operation cancel](../operation-cancel.md) | Aborting long running operations |
+| [operation forget](../operation-forget.md) | Deleting long running operations from the list |
+| [operation get](../operation-get.md) | Status of long running operations |
+| [operation list](../operation-list.md) | List of long running operations |
 | [scheme describe](../commands/scheme-describe.md) | Description of a data schema object |
 | [scheme ls](../commands/scheme-ls.md) | List of data schema objects |
 | [scheme mkdir](../commands/dir.md#mkdir) | Creating a directory |
@@ -50,18 +50,18 @@ Any command can be run from the command line with the `--help` option to get hel
 | scheme permissions revoke | Revoking a permission |
 | scheme permissions set | Setting permissions |
 | [scheme rmdir](../commands/dir.md#rmdir) | Deleting a directory |
-| scripting yql | Executing a YQL script |
+| [scripting yql](../scripting-yql.md) | Executing a YQL script |
 | table attribute add | Adding a table attribute |
 | table attribute drop | Deleting a table attribute |
 | table drop | Deleting a table |
 | [table index add global-async](../commands/secondary_index.md#add) | Adding an asynchronous index |
 | [table index add global-sync](../commands/secondary_index.md#add) | Adding a synchronous index |
 | [table index drop](../commands/secondary_index.md#drop) | Deleting an index |
-| [table query execute](../commands/query.md) | Executing a YQL query |
+| [table query execute](../table-query-execute.md) | Executing a YQL query |
 | [table query explain](../commands/explain-plan.md) | YQL query execution plan |
 | [table readtable](../commands/readtable.md) | Streaming table reads |
-| table ttl drop | Deleting TTL parameters |
-| table ttl set | Setting TTL parameters |
+| [table ttl set](../table-ttl-set.md) | Setting TTL parameters |
+| [table ttl drop](../table-ttl-drop.md) | Deleting TTL parameters |
 | tools copy | Copying tables |
 | [tools dump](../export_import/tools_dump.md) | Dumping a directory or table to the file system |
 | [tools rename](../commands/tools/rename.md) | Renaming tables |
@@ -78,4 +78,3 @@ Any command can be run from the command line with the `--help` option to get hel
 [version](../commands/service.md) | Output details about the {{ ydb-short-name }} CLI version
 {% endif %}
 [workload](../commands/workload/index.md) | Generate the yql workload | Execute a YQL script (with streaming support)
-

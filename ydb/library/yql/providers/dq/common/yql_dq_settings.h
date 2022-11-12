@@ -28,6 +28,9 @@ struct TDqSettings {
         static constexpr ui64 OutputChunkMaxSize = 4_MB;
         static constexpr ui64 ChunkSizeLimit = 128_MB;
         static constexpr bool EnableDqReplicate = false;
+        static constexpr ui64 WatermarksGranularityMs = 1000;
+        static constexpr ui64 WatermarksLateArrivalDelayMs = 5000;
+        static constexpr ui64 ParallelOperationsLimit = 16;
     };
 
     using TPtr = std::shared_ptr<TDqSettings>;
@@ -73,8 +76,11 @@ struct TDqSettings {
     NCommon::TConfSetting<bool, false> EnableDqReplicate;
     NCommon::TConfSetting<bool, false> EnableGraceJoin;
     NCommon::TConfSetting<TString, false> WatermarksMode;
+    NCommon::TConfSetting<bool, false> WatermarksEnableIdlePartitions;
     NCommon::TConfSetting<ui64, false> WatermarksGranularityMs;
+    NCommon::TConfSetting<ui64, false> WatermarksLateArrivalDelayMs;
     NCommon::TConfSetting<bool, false> UseAggPhases;
+    NCommon::TConfSetting<ui64, false> ParallelOperationsLimit;
 
     NCommon::TConfSetting<TString, false> WorkerFilter;
 
@@ -115,8 +121,10 @@ struct TDqSettings {
         SAVE_SETTING(WorkerFilter);
         SAVE_SETTING(ComputeActorType);
         SAVE_SETTING(WatermarksMode);
+        SAVE_SETTING(WatermarksEnableIdlePartitions);
         SAVE_SETTING(EnableGraceJoin);
         SAVE_SETTING(WatermarksGranularityMs);
+        SAVE_SETTING(WatermarksLateArrivalDelayMs);
         SAVE_SETTING(UseAggPhases);
 
 #undef SAVE_SETTING

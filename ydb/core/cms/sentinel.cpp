@@ -19,8 +19,7 @@
 #include <util/string/builder.h>
 #include <util/string/join.h>
 
-namespace NKikimr {
-namespace NCms {
+namespace NKikimr::NCms {
 
 #if defined LOG_T || \
     defined LOG_D || \
@@ -190,7 +189,8 @@ void TPDiskInfo::AddState(EPDiskState state) {
 
 TClusterMap::TClusterMap(TCmsStatePtr state)
     : State(state)
-{}
+{
+}
 
 void TClusterMap::AddPDisk(const TPDiskID& id) {
     Y_VERIFY(State->ClusterInfo->HasNode(id.NodeId));
@@ -200,6 +200,7 @@ void TClusterMap::AddPDisk(const TPDiskID& id) {
     ByDataCenter[location.HasKey(TNodeLocation::TKeys::DataCenter) ? location.GetDataCenterId() : ""].insert(id);
     ByRoom[location.HasKey(TNodeLocation::TKeys::Module) ? location.GetModuleId() : ""].insert(id);
     ByRack[location.HasKey(TNodeLocation::TKeys::Rack) ? location.GetRackId() : ""].insert(id);
+    NodeByRack[location.HasKey(TNodeLocation::TKeys::Rack) ? location.GetRackId() : ""].insert(id.NodeId);
 }
 
 /// TGuardian
@@ -251,7 +252,8 @@ TClusterMap::TPDiskIDSet TGuardian::GetAllowedPDisks(const TClusterMap& all, TSt
     for (const auto& kv : ByRack) {
         Y_VERIFY(all.ByRack.contains(kv.first));
         // ignore check if there is only one node in a rack
-        if (kv.second.size() == 1) {
+        auto it = NodeByRack.find(kv.first);
+        if (it != NodeByRack.end() && it->second.size() == 1) {
             continue;
         }
         if (kv.first && !CheckRatio(kv, all.ByRack, RackRatio)) {
@@ -273,7 +275,9 @@ TClusterMap::TPDiskIDSet TGuardian::GetAllowedPDisks(const TClusterMap& all, TSt
 struct TSentinelState: public TSimpleRefCount<TSentinelState> {
     using TPtr = TIntrusivePtr<TSentinelState>;
 
-    TMap<TPDiskID, TPDiskInfo> PDisks;
+    TMap<TPDiskID, TPDiskInfo::TPtr> PDisks;
+    THashSet<ui32> StateUpdaterWaitNodes;
+    ui32 ConfigUpdaterAttempt = 0;
 };
 
 /// Actors
@@ -324,8 +328,8 @@ public:
         : TSentinelChildBase<TDerived>(parent, cmsState)
         , SentinelState(sentinelState)
     {
-        for (auto& pdisk : SentinelState->PDisks) {
-            pdisk.second.ClearTouched();
+        for (auto& [_, info] : SentinelState->PDisks) {
+            info->ClearTouched();
         }
     }
 
@@ -336,13 +340,13 @@ protected:
 
 class TConfigUpdater: public TUpdaterBase<TEvSentinel::TEvConfigUpdated, TConfigUpdater> {
     void Retry() {
-        ++Attempt;
+        ++SentinelState->ConfigUpdaterAttempt;
         Schedule(Config.RetryUpdateConfig, new TEvSentinel::TEvRetry());
     }
 
     void RequestBSConfig() {
         LOG_D("Request blobstorage config"
-            << ": attempt# " << Attempt);
+            << ": attempt# " << SentinelState->ConfigUpdaterAttempt);
 
         if (!CmsState->BSControllerPipe) {
             ConnectBSC();
@@ -376,11 +380,11 @@ class TConfigUpdater: public TUpdaterBase<TEvSentinel::TEvConfigUpdated, TConfig
                 TPDiskID id(pdisk.GetNodeId(), pdisk.GetPDiskId());
 
                 if (pdisks.contains(id)) {
-                    pdisks.at(id).Touch();
+                    pdisks.at(id)->Touch();
                     continue;
                 }
 
-                pdisks.emplace(id, TPDiskInfo(pdisk.GetDriveStatus(), Config.DefaultStateLimit, Config.StateLimits));
+                pdisks.emplace(id, new TPDiskInfo(pdisk.GetDriveStatus(), Config.DefaultStateLimit, Config.StateLimits));
             }
 
             Reply();
@@ -408,21 +412,21 @@ public:
         Become(&TThis::StateWork);
     }
 
-    STFUNC(StateWork) {
-        Y_UNUSED(ctx);
+    void PassAway() override {
+        SentinelState->ConfigUpdaterAttempt = 0;
+        TActor::PassAway();
+    }
+
+    STATEFN(StateWork) {
         switch (ev->GetTypeRewrite()) {
-            cFunc(TEvSentinel::TEvRetry::EventType, RequestBSConfig);
-            cFunc(TEvSentinel::TEvBSCPipeDisconnected::EventType, OnPipeDisconnected);
+            sFunc(TEvSentinel::TEvRetry, RequestBSConfig);
+            sFunc(TEvSentinel::TEvBSCPipeDisconnected, OnPipeDisconnected);
 
             hFunc(TEvBlobStorage::TEvControllerConfigResponse, Handle);
 
-            cFunc(TEvents::TEvPoisonPill::EventType, PassAway);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
         }
     }
-
-private:
-    ui32 Attempt = 0;
-
 }; // TConfigUpdater
 
 class TStateUpdater: public TUpdaterBase<TEvSentinel::TEvStateUpdated, TStateUpdater> {
@@ -452,17 +456,17 @@ class TStateUpdater: public TUpdaterBase<TEvSentinel::TEvStateUpdated, TStateUpd
     }
 
     bool AcceptNodeReply(ui32 nodeId) {
-        auto it = WaitNodes.find(nodeId);
-        if (it == WaitNodes.end()) {
+        auto it = SentinelState->StateUpdaterWaitNodes.find(nodeId);
+        if (it == SentinelState->StateUpdaterWaitNodes.end()) {
             return false;
         }
 
-        WaitNodes.erase(it);
+        SentinelState->StateUpdaterWaitNodes.erase(it);
         return true;
     }
 
     void MaybeReply() {
-        if (WaitNodes) {
+        if (SentinelState->StateUpdaterWaitNodes) {
             return;
         }
 
@@ -472,13 +476,13 @@ class TStateUpdater: public TUpdaterBase<TEvSentinel::TEvStateUpdated, TStateUpd
     void MarkNodePDisks(ui32 nodeId, EPDiskState state, bool skipTouched = false) {
         auto it = SentinelState->PDisks.lower_bound(TPDiskID(nodeId, 0));
         while (it != SentinelState->PDisks.end() && it->first.NodeId == nodeId) {
-            if (skipTouched && it->second.IsTouched()) {
+            if (skipTouched && it->second->IsTouched()) {
                 ++it;
                 continue;
             }
 
-            Y_VERIFY(!it->second.IsTouched());
-            it->second.AddState(state);
+            Y_VERIFY(!it->second->IsTouched());
+            it->second->AddState(state);
             ++it;
         }
     }
@@ -524,7 +528,7 @@ class TStateUpdater: public TUpdaterBase<TEvSentinel::TEvStateUpdated, TStateUpd
                     << ", original# " << (ui32)info.GetState()
                     << ", safeState# " << safeState);
 
-                it->second.AddState(safeState);
+                it->second->AddState(safeState);
             }
 
             MarkNodePDisks(nodeId, NKikimrBlobStorage::TPDiskState::Missing, true);
@@ -571,8 +575,8 @@ class TStateUpdater: public TUpdaterBase<TEvSentinel::TEvStateUpdated, TStateUpd
         LOG_E("Timed out"
             << ": timeout# " << Config.UpdateStateTimeout);
 
-        while (WaitNodes) {
-            const ui32 nodeId = *WaitNodes.begin();
+        while (SentinelState->StateUpdaterWaitNodes) {
+            const ui32 nodeId = *SentinelState->StateUpdaterWaitNodes.begin();
 
             MarkNodePDisks(nodeId, NKikimrBlobStorage::TPDiskState::Timeout);
             AcceptNodeReply(nodeId);
@@ -593,29 +597,30 @@ public:
     using TBase::TBase;
 
     void Bootstrap() {
-        for (const auto& pdisk : SentinelState->PDisks) {
-            if (WaitNodes.insert(pdisk.first.NodeId).second) {
-                RequestPDiskState(pdisk.first.NodeId);
+        for (const auto& [id, _] : SentinelState->PDisks) {
+            if (SentinelState->StateUpdaterWaitNodes.insert(id.NodeId).second) {
+                RequestPDiskState(id.NodeId);
             }
         }
 
         Become(&TThis::StateWork, Config.UpdateStateTimeout, new TEvSentinel::TEvTimeout());
     }
 
-    STFUNC(StateWork) {
-        Y_UNUSED(ctx);
+    void PassAway() override {
+        SentinelState->StateUpdaterWaitNodes.clear();
+        TActor::PassAway();
+    }
+
+    STATEFN(StateWork) {
         switch (ev->GetTypeRewrite()) {
-            cFunc(TEvSentinel::TEvTimeout::EventType, TimedOut);
+            sFunc(TEvSentinel::TEvTimeout, TimedOut);
 
             hFunc(TEvWhiteboard::TEvPDiskStateResponse, Handle);
 
             hFunc(TEvents::TEvUndelivered, Handle);
-            cFunc(TEvents::TEvPoisonPill::EventType, PassAway);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
         }
     }
-
-private:
-    THashSet<ui32> WaitNodes;
 
 }; // TStateUpdater
 
@@ -626,7 +631,7 @@ class TStatusChanger: public TSentinelChildBase<TStatusChanger> {
     }
 
     void MaybeRetry() {
-        if (Attempt++ < Config.ChangeStatusRetries) {
+        if (Info->StatusChangerState->Attempt++ < Config.ChangeStatusRetries) {
             Schedule(Config.RetryChangeStatus, new TEvSentinel::TEvRetry());
         } else {
             Reply(false);
@@ -636,8 +641,8 @@ class TStatusChanger: public TSentinelChildBase<TStatusChanger> {
     void RequestStatusChange() {
         LOG_D("Change pdisk status"
             << ": pdiskId# " << Id
-            << ", status# " << Status
-            << ", attempt# " << Attempt);
+            << ", status# " << Info->StatusChangerState->Status
+            << ", attempt# " << Info->StatusChangerState->Attempt);
 
         if (!CmsState->BSControllerPipe) {
             ConnectBSC();
@@ -647,7 +652,7 @@ class TStatusChanger: public TSentinelChildBase<TStatusChanger> {
         auto& command = *request->Record.MutableRequest()->AddCommand()->MutableUpdateDriveStatus();
         command.MutableHostKey()->SetNodeId(Id.NodeId);
         command.SetPDiskId(Id.DiskId);
-        command.SetStatus(Status);
+        command.SetStatus(Info->StatusChangerState->Status);
         NTabletPipe::SendData(SelfId(), CmsState->BSControllerPipe, request.Release());
     }
 
@@ -682,6 +687,11 @@ public:
         return NKikimrServices::TActivity::CMS_SENTINEL_STATUS_CHANGER_ACTOR;
     }
 
+    void PassAway() override {
+        Info->StatusChangerState.Reset();
+        TActor::PassAway();
+    }
+
     static TStringBuf Name() {
         return "StatusChanger"sv;
     }
@@ -690,11 +700,13 @@ public:
             const TActorId& parent,
             TCmsStatePtr state,
             const TPDiskID& id,
+            TPDiskInfo::TPtr info,
             NKikimrBlobStorage::EDriveStatus status)
         : TBase(parent, state)
         , Id(id)
-        , Status(status)
+        , Info(info)
     {
+        info->StatusChangerState = new TStatusChangerState(status);
     }
 
     void Bootstrap() {
@@ -702,24 +714,20 @@ public:
         Become(&TThis::StateWork);
     }
 
-    STFUNC(StateWork) {
-        Y_UNUSED(ctx);
+    STATEFN(StateWork) {
         switch (ev->GetTypeRewrite()) {
-            cFunc(TEvSentinel::TEvRetry::EventType, RequestStatusChange);
-            cFunc(TEvSentinel::TEvBSCPipeDisconnected::EventType, OnPipeDisconnected);
+            sFunc(TEvSentinel::TEvRetry, RequestStatusChange);
+            sFunc(TEvSentinel::TEvBSCPipeDisconnected, OnPipeDisconnected);
 
             hFunc(TEvBlobStorage::TEvControllerConfigResponse, Handle);
 
-            cFunc(TEvents::TEvPoisonPill::EventType, PassAway);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
         }
     }
 
 private:
     const TPDiskID Id;
-    const NKikimrBlobStorage::EDriveStatus Status;
-
-    ui32 Attempt = 0;
-
+    TPDiskInfo::TPtr Info;
 }; // TStatusChanger
 
 class TSentinel: public TActorBootstrapped<TSentinel> {
@@ -806,13 +814,13 @@ class TSentinel: public TActorBootstrapped<TSentinel> {
 
     void RemoveUntouched() {
         EraseNodesIf(SentinelState->PDisks, [](const auto& kv) {
-            return !kv.second.IsTouched();
+            return !kv.second->IsTouched();
         });
     }
 
     void EnsureAllTouched() const {
         Y_VERIFY(AllOf(SentinelState->PDisks, [](const auto& kv) {
-            return kv.second.IsTouched();
+            return kv.second->IsTouched();
         }));
     }
 
@@ -876,7 +884,7 @@ class TSentinel: public TActorBootstrapped<TSentinel> {
 
         for (auto& pdisk : SentinelState->PDisks) {
             const TPDiskID& id = pdisk.first;
-            TPDiskInfo& info = pdisk.second;
+            TPDiskInfo& info = *(pdisk.second);
 
             if (!CmsState->ClusterInfo->HasNode(id.NodeId)) {
                 LOG_E("Missing node info"
@@ -904,26 +912,26 @@ class TSentinel: public TActorBootstrapped<TSentinel> {
 
         TString issues;
         THashSet<TPDiskID, TPDiskIDHash> disallowed;
-
         TClusterMap::TPDiskIDSet allowed = changed.GetAllowedPDisks(all, issues, disallowed);
-        Copy(alwaysAllowed.begin(), alwaysAllowed.end(), std::inserter(allowed, allowed.begin()));
-        for (const TPDiskID& id : allowed) {
+        std::move(alwaysAllowed.begin(), alwaysAllowed.end(), std::inserter(allowed, allowed.begin()));
+
+        for (const auto& id : allowed) {
             Y_VERIFY(SentinelState->PDisks.contains(id));
-            TPDiskInfo& info = SentinelState->PDisks.at(id);
+            TPDiskInfo::TPtr info = SentinelState->PDisks.at(id);
 
-            if (!info.IsChangingAllowed()) {
-                info.AllowChanging();
+            if (!info->IsChangingAllowed()) {
+                info->AllowChanging();
                 continue;
             }
 
-            if (info.StatusChanger) {
+            if (info->StatusChanger) {
                 continue;
             }
 
-            const EPDiskStatus status = info.GetStatus();
+            const EPDiskStatus status = info->GetStatus();
             TString reason;
-            info.ApplyChanges(reason);
-            const EPDiskStatus requiredStatus = info.GetStatus();
+            info->ApplyChanges(reason);
+            const EPDiskStatus requiredStatus = info->GetStatus();
 
             LOG_N("PDisk status changed"
                 << ": pdiskId# " << id
@@ -934,14 +942,14 @@ class TSentinel: public TActorBootstrapped<TSentinel> {
             LogStatusChange(id, status, requiredStatus, reason);
 
             if (!Config.DryRun) {
-                info.StatusChanger = Register(new TStatusChanger(SelfId(), CmsState, id, requiredStatus));
+                info->StatusChanger = RegisterWithSameMailbox(new TStatusChanger(SelfId(), CmsState, id, info, requiredStatus));
                 (*Counters->PDisksPendingChange)++;
             }
         }
 
-        for (const TPDiskID& id : disallowed) {
+        for (const auto& id : disallowed) {
             Y_VERIFY(SentinelState->PDisks.contains(id));
-            SentinelState->PDisks.at(id).DisallowChanging();
+            SentinelState->PDisks.at(id)->DisallowChanging();
         }
 
         if (issues) {
@@ -953,29 +961,46 @@ class TSentinel: public TActorBootstrapped<TSentinel> {
         );
     }
 
-    void Handle(TEvSentinel::TEvGetSentinelStateRequest::TPtr& ev, const TActorContext &ctx) {
-        THolder<TEvCms::TEvGetSentinelStateResponse> Response;
-        Response = MakeHolder<TEvCms::TEvGetSentinelStateResponse>();
-        auto &rec = Response->Record;
-        rec.MutableStatus()->SetCode(NKikimrCms::TStatus::OK);
+    void Handle(TEvCms::TEvGetSentinelStateRequest::TPtr& ev) {
+        auto response = MakeHolder<TEvCms::TEvGetSentinelStateResponse>();
 
-        auto& sentinelConfig = *rec.MutableSentinelConfig();
-        Config.Serialize(sentinelConfig);
+        auto& record = response->Record;
+        record.MutableStatus()->SetCode(NKikimrCms::TStatus::OK);
+        Config.Serialize(*record.MutableSentinelConfig());
 
         if (SentinelState) {
-            for (auto it = SentinelState->PDisks.begin(); it != SentinelState->PDisks.end(); ++it) {
-                auto &entry = *rec.AddPDisks();
-                entry.MutableId()->SetNodeId(it->first.NodeId);
-                entry.MutableId()->SetDiskId(it->first.DiskId);
-                entry.MutableInfo()->SetState(it->second.GetState());
-                entry.MutableInfo()->SetPrevState(it->second.GetPrevState());
-                entry.MutableInfo()->SetStateCounter(it->second.GetStateCounter());
-                entry.MutableInfo()->SetStatus(it->second.GetStatus());
-                entry.MutableInfo()->SetChangingAllowed(it->second.IsChangingAllowed());
-                entry.MutableInfo()->SetTouched(it->second.IsTouched());
+            auto& stateUpdater = *record.MutableStateUpdater();
+            stateUpdater.MutableUpdaterInfo()->SetActorId(StateUpdater.Id.ToString());
+            stateUpdater.MutableUpdaterInfo()->SetStartedAt(StateUpdater.StartedAt.ToString());
+            stateUpdater.MutableUpdaterInfo()->SetDelayed(StateUpdater.Delayed);
+            for (const auto& waitNode : SentinelState->StateUpdaterWaitNodes) {
+                stateUpdater.AddWaitNodes(waitNode);
+            }
+
+            auto& configUpdater = *record.MutableConfigUpdater();
+            configUpdater.MutableUpdaterInfo()->SetActorId(ConfigUpdater.Id.ToString());
+            configUpdater.MutableUpdaterInfo()->SetStartedAt(ConfigUpdater.StartedAt.ToString());
+            configUpdater.MutableUpdaterInfo()->SetDelayed(ConfigUpdater.Delayed);
+            configUpdater.SetAttempt(SentinelState->ConfigUpdaterAttempt);
+
+            for (const auto& [id, info] : SentinelState->PDisks) {
+                auto& entry = *record.AddPDisks();
+                entry.MutableId()->SetNodeId(id.NodeId);
+                entry.MutableId()->SetDiskId(id.DiskId);
+                entry.MutableInfo()->SetState(info->GetState());
+                entry.MutableInfo()->SetPrevState(info->GetPrevState());
+                entry.MutableInfo()->SetStateCounter(info->GetStateCounter());
+                entry.MutableInfo()->SetStatus(info->GetStatus());
+                entry.MutableInfo()->SetChangingAllowed(info->IsChangingAllowed());
+                entry.MutableInfo()->SetTouched(info->IsTouched());
+                if(info->StatusChangerState) {
+                    entry.MutableInfo()->SetDesiredStatus(info->StatusChangerState->Status);
+                    entry.MutableInfo()->SetStatusChangeAttempts(info->StatusChangerState->Attempt);
+                }
             }
         }
-        ctx.Send(ev->Sender, Response.Release());
+
+        Send(ev->Sender, std::move(response));
     }
 
     void Handle(TEvSentinel::TEvStatusChanged::TPtr& ev) {
@@ -1003,7 +1028,7 @@ class TSentinel: public TActorBootstrapped<TSentinel> {
             (*Counters->PDisksChanged)++;
         }
 
-        it->second.StatusChanger = TActorId();
+        it->second->StatusChanger = TActorId();
     }
 
     void OnPipeDisconnected() {
@@ -1011,8 +1036,8 @@ class TSentinel: public TActorBootstrapped<TSentinel> {
             Send(actor, new TEvSentinel::TEvBSCPipeDisconnected());
         }
 
-        for (const auto& pdisk : SentinelState->PDisks) {
-            if (const TActorId& actor = pdisk.second.StatusChanger) {
+        for (const auto& [_, info] : SentinelState->PDisks) {
+            if (const TActorId& actor = info->StatusChanger) {
                 Send(actor, new TEvSentinel::TEvBSCPipeDisconnected());
             }
         }
@@ -1027,8 +1052,8 @@ class TSentinel: public TActorBootstrapped<TSentinel> {
             Send(actor, new TEvents::TEvPoisonPill());
         }
 
-        for (const auto& pdisk : SentinelState->PDisks) {
-            if (const TActorId& actor = pdisk.second.StatusChanger) {
+        for (const auto& [_, info] : SentinelState->PDisks) {
+            if (const TActorId& actor = info->StatusChanger) {
                 Send(actor, new TEvents::TEvPoisonPill());
             }
         }
@@ -1062,18 +1087,17 @@ public:
         Become(&TThis::StateWork);
     }
 
-    STFUNC(StateWork) {
-        Y_UNUSED(ctx);
+    STATEFN(StateWork) {
         switch (ev->GetTypeRewrite()) {
-            cFunc(TEvSentinel::TEvUpdateConfig::EventType, UpdateConfig);
-            cFunc(TEvSentinel::TEvConfigUpdated::EventType, OnConfigUpdated);
-            cFunc(TEvSentinel::TEvUpdateState::EventType, UpdateState);
-            cFunc(TEvSentinel::TEvStateUpdated::EventType, OnStateUpdated);
+            sFunc(TEvSentinel::TEvUpdateConfig, UpdateConfig);
+            sFunc(TEvSentinel::TEvConfigUpdated, OnConfigUpdated);
+            sFunc(TEvSentinel::TEvUpdateState, UpdateState);
+            sFunc(TEvSentinel::TEvStateUpdated, OnStateUpdated);
             hFunc(TEvSentinel::TEvStatusChanged, Handle);
-            HFunc(TEvSentinel::TEvGetSentinelStateRequest, Handle);
-            cFunc(TEvSentinel::TEvBSCPipeDisconnected::EventType, OnPipeDisconnected);
+            hFunc(TEvCms::TEvGetSentinelStateRequest, Handle);
+            sFunc(TEvSentinel::TEvBSCPipeDisconnected, OnPipeDisconnected);
 
-            cFunc(TEvents::TEvPoisonPill::EventType, PassAway);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
         }
     }
 
@@ -1094,5 +1118,4 @@ IActor* CreateSentinel(TCmsStatePtr state) {
     return new NSentinel::TSentinel(state);
 }
 
-} // NCms
-} // NKikimr
+} // NKikimr::NCms

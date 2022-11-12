@@ -47,6 +47,10 @@ public:
         return TRequest::GetProtoRequest(Request_);
     }
 
+    typename TRequest::TRequest* GetProtoRequestMut() {
+        return TRequest::GetProtoRequestMut(Request_);
+    }
+
     Ydb::Operations::OperationParams::OperationMode GetOperationMode() const {
         return GetProtoRequest()->operation_params().operation_mode();
     }
@@ -112,7 +116,7 @@ protected:
     }
 
 protected:
-    std::unique_ptr<TRequestBase> Request_;
+    std::shared_ptr<TRequestBase> Request_;
 
     TActorId OperationTimeoutTimer;
     TActorId CancelAfterTimer;

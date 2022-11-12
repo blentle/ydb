@@ -54,7 +54,7 @@ bool HasIssue(const NYql::TIssues& issues, ui32 code, std::string_view message,
 
     for (auto& issue : issues) {
         NYql::WalkThroughIssues(issue, false, [&] (const NYql::TIssue& issue, int) {
-            if (!hasIssue && issue.GetCode() == code && (message.empty() || message == issue.Message)) {
+            if (!hasIssue && issue.GetCode() == code && (message.empty() || message == issue.GetMessage())) {
                 hasIssue = !predicate || predicate(issue);
             }
         });
@@ -2165,6 +2165,17 @@ R"___(<main>: Error: Transaction not found: , code: 2015
         UNIT_ASSERT_VALUES_EQUAL(bool(streamPart.GetSnapshot()), true);
         UNIT_ASSERT_GT(streamPart.GetSnapshot()->GetStep(), 0u);
         UNIT_ASSERT_GT(streamPart.GetSnapshot()->GetTxId(), 0u);
+
+        TResultSetParser parser(streamPart.GetPart());
+        UNIT_ASSERT_VALUES_EQUAL(parser.ColumnsCount(), 2u);
+        UNIT_ASSERT_VALUES_EQUAL(parser.RowsCount(), 0u);
+        UNIT_ASSERT_VALUES_EQUAL(parser.ColumnIndex("Key"), 0);
+        UNIT_ASSERT_VALUES_EQUAL(parser.ColumnIndex("Value"), 1);
+        UNIT_ASSERT(!parser.TryNextRow());
+
+        TReadTableResultPart lastPart = it.ReadNext().ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL(lastPart.IsSuccess(), false);
+        UNIT_ASSERT_VALUES_EQUAL(lastPart.EOS(), true);
     }
 
     Y_UNIT_TEST(RetryOperation) {

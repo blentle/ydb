@@ -42,6 +42,12 @@ void TTester::Setup(TTestActorRuntime& runtime) {
     runtime.UpdateCurrentTime(TInstant::Now());
 }
 
+void ProvideTieringSnapshot(TTestBasicRuntime& runtime, TActorId& sender, NMetadataProvider::ISnapshot::TPtr snapshot) {
+    auto event = std::make_unique<NMetadataProvider::TEvRefreshSubscriberData>(snapshot);
+
+    ForwardToTablet(runtime, TTestTxConfig::TxTablet0, sender, event.release());
+}
+
 bool ProposeSchemaTx(TTestBasicRuntime& runtime, TActorId& sender, const TString& txBody, NOlap::TSnapshot snap) {
     auto event = std::make_unique<TEvColumnShard::TEvProposeTransaction>(
         NKikimrTxColumnShard::TX_KIND_SCHEMA, 0, sender, snap.TxId, txBody);
@@ -85,6 +91,28 @@ bool WriteData(TTestBasicRuntime& runtime, TActorId& sender, ui64 metaShard, ui6
     UNIT_ASSERT_EQUAL(resWrite.GetOrigin(), TTestTxConfig::TxTablet0);
     UNIT_ASSERT_EQUAL(resWrite.GetTxInitiator(), metaShard);
     return (resWrite.GetStatus() == NKikimrTxColumnShard::EResultStatus::SUCCESS);
+}
+
+std::optional<ui64> WriteData(TTestBasicRuntime& runtime, TActorId& sender, const NLongTxService::TLongTxId& longTxId,
+                              ui64 tableId, const TString& dedupId, const TString& data,
+                              std::shared_ptr<arrow::Schema> schema)
+{
+    auto write = std::make_unique<TEvColumnShard::TEvWrite>(sender, longTxId, tableId, dedupId, data);
+    if (schema) {
+        write->SetArrowSchema(NArrow::SerializeSchema(*schema));
+    }
+    ForwardToTablet(runtime, TTestTxConfig::TxTablet0, sender, write.release());
+    TAutoPtr<IEventHandle> handle;
+    auto event = runtime.GrabEdgeEvent<TEvColumnShard::TEvWriteResult>(handle);
+    UNIT_ASSERT(event);
+
+    auto& resWrite = Proto(event);
+    UNIT_ASSERT_EQUAL(resWrite.GetOrigin(), TTestTxConfig::TxTablet0);
+    UNIT_ASSERT_EQUAL(resWrite.GetTxInitiator(), 0);
+    if (resWrite.GetStatus() == NKikimrTxColumnShard::EResultStatus::SUCCESS) {
+        return resWrite.GetWriteId();
+    }
+    return {};
 }
 
 void ScanIndexStats(TTestBasicRuntime& runtime, TActorId& sender, const TVector<ui64>& pathIds,
@@ -139,6 +167,10 @@ void ProposeCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 metaShard,
     UNIT_ASSERT_EQUAL(res.GetTxKind(), txKind);
     UNIT_ASSERT_EQUAL(res.GetTxId(), txId);
     UNIT_ASSERT_EQUAL(res.GetStatus(), NKikimrTxColumnShard::EResultStatus::PREPARED);
+}
+
+void ProposeCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 txId, const TVector<ui64>& writeIds) {
+    ProposeCommit(runtime, sender, 0, txId, writeIds);
 }
 
 void PlanCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 planStep, const TSet<ui64>& txIds) {
@@ -257,6 +289,39 @@ TSerializedTableRange MakeTestRange(std::pair<ui64, ui64> range, bool inclusiveF
 
     return TSerializedTableRange(TConstArrayRef<TCell>(cellsFrom), inclusiveFrom,
                                  TConstArrayRef<TCell>(cellsTo), inclusiveTo);
+}
+
+NMetadataProvider::ISnapshot::TPtr TTestSchema::BuildSnapshot(const TTableSpecials& specials, const TString& tablePath, const ui32 tablePathId) {
+    std::unique_ptr<NColumnShard::NTiers::TConfigsSnapshot> cs(new NColumnShard::NTiers::TConfigsSnapshot(Now()));
+    for (auto&& tier : specials.Tiers) {
+        {
+            NColumnShard::NTiers::TTierConfig tConfig;
+            tConfig.SetOwnerPath("/Root/olapStore");
+            tConfig.SetTierName(tier.Name);
+            tConfig.MutableProtoConfig().SetName(tier.Name);
+            auto& cProto = tConfig.MutableProtoConfig();
+            if (tier.S3) {
+                *cProto.MutableObjectStorage() = *tier.S3;
+            }
+            if (tier.Codec) {
+                cProto.MutableCompression()->SetCompressionCodec(tier.GetCodecId());
+            }
+            if (tier.CompressionLevel) {
+                cProto.MutableCompression()->SetCompressionLevel(*tier.CompressionLevel);
+            }
+            cs->MutableTierConfigs().emplace(tConfig.GetGlobalTierId(), tConfig);
+        }
+        {
+            NColumnShard::NTiers::TTieringRule tRule;
+            tRule.SetOwnerPath("/Root/olapStore");
+            tRule.SetDurationForEvict(TDuration::Seconds(tier.GetEvictAfterSecondsUnsafe()));
+            tRule.SetTablePath(tablePath).SetTablePathId(tablePathId);
+            tRule.SetTierName(tier.Name);
+            tRule.SetColumn(tier.GetTtlColumn());
+            cs->MutableTableTierings()[tablePath].AddRule(std::move(tRule));
+        }
+    }
+    return cs;
 }
 
 }

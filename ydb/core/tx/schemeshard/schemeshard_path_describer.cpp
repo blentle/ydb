@@ -369,8 +369,6 @@ void TPathDescriber::DescribeOlapStore(TPathId pathId, TPathElement::TPtr pathEl
 void TPathDescriber::DescribeColumnTable(TPathId pathId, TPathElement::TPtr pathEl) {
     const TColumnTableInfo::TPtr tableInfo = *Self->ColumnTables.FindPtr(pathId);
     Y_VERIFY(tableInfo, "ColumnTable not found");
-    const TOlapStoreInfo::TPtr storeInfo = *Self->OlapStores.FindPtr(tableInfo->OlapStorePathId);
-    Y_VERIFY(storeInfo, "OlapStore not found");
     Y_UNUSED(pathEl);
 
     auto description = Result->Record.MutablePathDescription()->MutableColumnTableDescription();
@@ -378,6 +376,9 @@ void TPathDescriber::DescribeColumnTable(TPathId pathId, TPathElement::TPtr path
     description->MutableSharding()->CopyFrom(tableInfo->Sharding);
 
     if (!description->HasSchema() && description->HasSchemaPresetId()) {
+        const TOlapStoreInfo::TPtr storeInfo = *Self->OlapStores.FindPtr(*tableInfo->OlapStorePathId);
+        Y_VERIFY(storeInfo, "OlapStore not found");
+
         auto& preset = storeInfo->SchemaPresets.at(description->GetSchemaPresetId());
         auto& presetProto = storeInfo->Description.GetSchemaPresets(preset.ProtoIndex);
         *description->MutableSchema() = presetProto.GetSchema();
@@ -486,6 +487,7 @@ void TPathDescriber::DescribePersQueueGroup(TPathId pathId, TPathElement::TPtr p
                 }
             }
         }
+        allocate->SetAlterVersion(pqGroupInfo->AlterVersion);
     }
 
     Y_VERIFY_DEBUG(!Result->PreSerializedData.empty());
@@ -790,9 +792,6 @@ THolder<TEvSchemeShard::TEvDescribeSchemeResultBuilder> TPathDescriber::Describe
         }
 
         if (!checks) {
-            TString explain;
-            auto status = checks.GetStatus(&explain);
-
             if (Params.HasPathId()) {
                 pathStr = path.PathString();
             }
@@ -802,13 +801,13 @@ THolder<TEvSchemeShard::TEvDescribeSchemeResultBuilder> TPathDescriber::Describe
                 Self->TabletID(),
                 pathId
                 ));
-            Result->Record.SetStatus(status);
-            Result->Record.SetReason(explain);
+            Result->Record.SetStatus(checks.GetStatus());
+            Result->Record.SetReason(checks.GetError());
 
             TPath firstExisted = path.FirstExistedParent();
             FillLastExistedPrefixDescr(firstExisted);
 
-            if (status ==  NKikimrScheme::StatusRedirectDomain) {
+            if (checks.GetStatus() == NKikimrScheme::StatusRedirectDomain) {
                 DescribeDomain(firstExisted.Base());
             }
 

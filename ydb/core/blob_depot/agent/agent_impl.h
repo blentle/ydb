@@ -32,7 +32,11 @@ namespace NKikimr::NBlobDepot {
     };
 
     struct TTabletDisconnected {};
-    struct TKeyResolved { const TResolvedValueChain* ValueChain; };
+
+    struct TKeyResolved {
+        const TResolvedValueChain* ValueChain;
+        std::optional<TString> ErrorReason;
+    };
 
     class TRequestSender {
         THashMap<ui64, TRequestContext::TPtr> RequestsInFlight;
@@ -86,6 +90,8 @@ namespace NKikimr::NBlobDepot {
         struct TEvPrivate {
             enum {
                 EvQueryWatchdog = EventSpaceBegin(TEvents::ES_PRIVATE),
+                EvProcessPendingEvent,
+                EvPendingEventQueueWatchdog,
             };
         };
 
@@ -122,8 +128,10 @@ namespace NKikimr::NBlobDepot {
 
             ENUMERATE_INCOMING_EVENTS(FORWARD_STORAGE_PROXY)
             hFunc(TEvBlobStorage::TEvBunchOfEvents, Handle);
+            cFunc(TEvPrivate::EvProcessPendingEvent, HandlePendingEvent);
+            cFunc(TEvPrivate::EvPendingEventQueueWatchdog, HandlePendingEventQueueWatchdog);
 
-            fFunc(TEvPrivate::EvQueryWatchdog, HandleQueryWatchdog);
+            cFunc(TEvPrivate::EvQueryWatchdog, HandleQueryWatchdog);
         );
 #undef FORWARD_STORAGE_PROXY
 
@@ -140,10 +148,7 @@ namespace NKikimr::NBlobDepot {
                     if (TabletId && TabletId != Max<ui64>()) {
                         ConnectToBlobDepot();
                     }
-                
-                    for (auto& ev : std::exchange(PendingEventQ, {})) {
-                        TActivationContext::Send(ev.release());
-                    }
+                    HandlePendingEvent();
                 }
                 if (!info->GetTotalVDisksNum()) {
                     TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, ProxyId, {}, nullptr, 0));
@@ -193,6 +198,8 @@ namespace NKikimr::NBlobDepot {
 
         ui32 BlobDepotGeneration = 0;
         std::optional<ui32> DecommitGroupId;
+        NKikimrBlobStorage::TPDiskSpaceColor::E SpaceColor = {};
+        float ApproximateFreeSpaceShare = 0.0f;
 
         void Handle(TEvTabletPipe::TEvClientConnected::TPtr ev);
         void Handle(TEvTabletPipe::TEvClientDestroyed::TPtr ev);
@@ -225,7 +232,10 @@ namespace NKikimr::NBlobDepot {
         protected:
             std::unique_ptr<IEventHandle> Event; // original query event
             const ui64 QueryId;
+            mutable TString QueryIdString;
             const TMonotonic StartTime;
+            std::multimap<TMonotonic, TQuery*>::iterator QueryWatchdogMapIter;
+            NLog::EPriority WatchdogPriority = NLog::PRI_WARN;
 
             static constexpr TDuration WatchdogDuration = TDuration::Seconds(10);
 
@@ -233,12 +243,13 @@ namespace NKikimr::NBlobDepot {
             TQuery(TBlobDepotAgent& agent, std::unique_ptr<IEventHandle> event);
             virtual ~TQuery();
 
-            void CheckQueryExecutionTime();
+            void CheckQueryExecutionTime(TMonotonic now);
 
             void EndWithError(NKikimrProto::EReplyStatus status, const TString& errorReason);
             void EndWithSuccess(std::unique_ptr<IEventBase> response);
             TString GetName() const;
-            ui64 GetQueryId() const { return QueryId; }
+            TString GetQueryId() const;
+            virtual ui64 GetTabletId() const { return 0; }
             virtual void Initiate() = 0;
 
             virtual void OnUpdateBlock(bool /*success*/) {}
@@ -252,15 +263,38 @@ namespace NKikimr::NBlobDepot {
             };
         };
 
-        std::deque<std::unique_ptr<IEventHandle>> PendingEventQ;
-        TIntrusiveListWithAutoDelete<TQuery, TQuery::TDeleter, TExecutingQueries> ExecutingQueries;
-        THashMultiMap<ui64, TQuery*> QueryIdToQuery;
+        template<typename TEvent>
+        class TBlobStorageQuery : public TQuery {
+        public:
+            TBlobStorageQuery(TBlobDepotAgent& agent, std::unique_ptr<IEventHandle> event)
+                : TQuery(agent, std::move(event))
+                , Request(*Event->Get<TEvent>())
+            {}
 
-        void HandleQueryWatchdog(TAutoPtr<IEventHandle> ev);
-        void HandleStorageProxy(TAutoPtr<IEventHandle> ev);
-        void Handle(TEvBlobStorage::TEvBunchOfEvents::TPtr ev);
-        TQuery *CreateQuery(TAutoPtr<IEventHandle> ev);
+        protected:
+            TEvent& Request;
+        };
+
+        struct TPendingEvent {
+            std::unique_ptr<IEventHandle> Event;
+            size_t Size;
+            TMonotonic ExpirationTimestamp;
+        };
+
+        std::deque<TPendingEvent> PendingEventQ;
+        size_t PendingEventBytes = 0;
+        static constexpr size_t MaxPendingEventBytes = 32'000'000; // ~32 MB
+        static constexpr TDuration EventExpirationTime = TDuration::Seconds(5);
+        TIntrusiveListWithAutoDelete<TQuery, TQuery::TDeleter, TExecutingQueries> ExecutingQueries;
+        std::multimap<TMonotonic, TQuery*> QueryWatchdogMap;
+
         template<ui32 EventType> TQuery *CreateQuery(std::unique_ptr<IEventHandle> ev);
+        void HandleStorageProxy(TAutoPtr<IEventHandle> ev);
+        void HandlePendingEvent();
+        void ProcessStorageEvent(std::unique_ptr<IEventHandle> ev);
+        void HandlePendingEventQueueWatchdog();
+        void Handle(TEvBlobStorage::TEvBunchOfEvents::TPtr ev);
+        void HandleQueryWatchdog();
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 

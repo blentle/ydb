@@ -307,23 +307,13 @@ TExprNode::TPtr AddMembersUsedInside(const TExprNode::TPtr& start, const TExprNo
 template<class TFieldsSet>
 TExprNode::TPtr FilterByFields(TPositionHandle position, const TExprNode::TPtr& input, const TFieldsSet& subsetFields,
     TExprContext& ctx, bool singleValue) {
-    if (singleValue) {
-        TExprNode::TListType structItems;
-        for (auto field : subsetFields) {
-            auto name = ctx.NewAtom(position, field);
-            auto member = ctx.NewCallable(position, "Member", { input , name });
-            structItems.push_back(ctx.NewList(position, { name, member }));
-        }
-
-        return ctx.NewCallable(position, "AsStruct", std::move(structItems));
-    }
-
     TExprNode::TListType fields;
-    for (auto& x : subsetFields) {
+    fields.reserve(subsetFields.size());
+    for (const auto& x : subsetFields) {
         fields.emplace_back(ctx.NewAtom(position, x));
     }
 
-    return ctx.NewCallable(position, "ExtractMembers", { input, ctx.NewList(position, std::move(fields)) });
+    return ctx.NewCallable(position, singleValue ? "FilterMembers" : "ExtractMembers", { input, ctx.NewList(position, std::move(fields)) });
 }
 
 template TExprNode::TPtr FilterByFields(TPositionHandle position, const TExprNode::TPtr& input, const TSet<TStringBuf>& subsetFields, TExprContext& ctx, bool singleValue);
@@ -1596,6 +1586,51 @@ TVector<TStringBuf> GetCommonKeysFromVariantSelector(const NNodes::TCoLambda& la
 
 bool IsIdentityLambda(const TExprNode& lambda) {
     return lambda.IsLambda() && &lambda.Head().Head() == &lambda.Tail();
+}
+
+TExprNode::TPtr MakeExpandMap(TPositionHandle pos, const TVector<TString>& columns, const TExprNode::TPtr& input, TExprContext& ctx) {
+    return ctx.Builder(pos)
+        .Callable("ExpandMap")
+            .Add(0, input)
+            .Lambda(1)
+                .Param("item")
+                .Do([&](TExprNodeBuilder& lambda) -> TExprNodeBuilder& {
+                    ui32 i = 0U;
+                    for (const auto& col : columns) {
+                        lambda.Callable(i++, "Member")
+                            .Arg(0, "item")
+                            .Atom(1, col)
+                        .Seal();
+                    }
+                    return lambda;
+                })
+            .Seal()
+        .Seal()
+        .Build();
+}
+
+TExprNode::TPtr MakeNarrowMap(TPositionHandle pos, const TVector<TString>& columns, const TExprNode::TPtr& input, TExprContext& ctx) {
+    return ctx.Builder(pos)
+        .Callable("NarrowMap")
+            .Add(0, input)
+            .Lambda(1)
+                .Params("fields", columns.size())
+                .Callable("AsStruct")
+                    .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
+                        ui32 i = 0U;
+                        for (const auto& col : columns) {
+                            parent.List(i)
+                                .Atom(0, col)
+                                .Arg(1, "fields", i)
+                            .Seal();
+                            ++i;
+                        }
+                        return parent;
+                    })
+                .Seal()
+            .Seal()
+        .Seal()
+        .Build();
 }
 
 }

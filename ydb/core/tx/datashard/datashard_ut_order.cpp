@@ -1236,12 +1236,11 @@ Y_UNIT_TEST_WITH_MVCC(ScanFollowedByUpdate) {
     proxy.ExecQueue();
 }
 
-Y_UNIT_TEST_QUAD(TestDelayedTxWaitsForWriteActiveTxOnly, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestDelayedTxWaitsForWriteActiveTxOnly, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1250,11 +1249,7 @@ Y_UNIT_TEST_QUAD(TestDelayedTxWaitsForWriteActiveTxOnly, UseMvcc, UseNewEngine) 
     TAutoPtr<IEventHandle> handle;
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_DEBUG);
-    if (UseNewEngine) {
-        runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
-    } else {
-        runtime.SetLogPriority(NKikimrServices::KQP_PROXY, NLog::PRI_DEBUG);
-    }
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
     runtime.SetLogPriority(NKikimrServices::MINIKQL_ENGINE, NActors::NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
@@ -1333,12 +1328,11 @@ Y_UNIT_TEST_QUAD(TestDelayedTxWaitsForWriteActiveTxOnly, UseMvcc, UseNewEngine) 
     }
 }
 
-Y_UNIT_TEST_QUAD(TestOnlyDataTxLagCausesRejects, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestOnlyDataTxLagCausesRejects, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1347,8 +1341,8 @@ Y_UNIT_TEST_QUAD(TestOnlyDataTxLagCausesRejects, UseMvcc, UseNewEngine) {
     TAutoPtr<IEventHandle> handle;
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::KQP_PROXY, NLog::PRI_DEBUG);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_SESSION : NKikimrServices::KQP_WORKER, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_SESSION, NLog::PRI_DEBUG);
     runtime.SetLogPriority(NKikimrServices::MINIKQL_ENGINE, NActors::NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
@@ -1419,12 +1413,11 @@ Y_UNIT_TEST_QUAD(TestOnlyDataTxLagCausesRejects, UseMvcc, UseNewEngine) {
 
 Y_UNIT_TEST_SUITE(DataShardOutOfOrder) {
 
-Y_UNIT_TEST_QUAD(TestOutOfOrderLockLost, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestOutOfOrderLockLost, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1432,7 +1425,7 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderLockLost, UseMvcc, UseNewEngine) {
     auto sender = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -1442,18 +1435,18 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderLockLost, UseMvcc, UseNewEngine) {
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1`
             UNION ALL
-            SELECT * FROM `/Root/table-2`)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2`)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     // Capture and block all readset messages
@@ -1469,10 +1462,9 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderLockLost, UseMvcc, UseNewEngine) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto sender2 = runtime.AllocateEdgeActor();
-    SendRequest(runtime, sender2, MakeCommitRequest(sessionId, txId, Q_(R"(
+    auto f2 = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     {
@@ -1516,16 +1508,12 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderLockLost, UseMvcc, UseNewEngine) {
     // Read the commit reply next
     bool committed;
     {
-        auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(sender2);
-        auto& response = ev->Get()->Record.GetRef();
-        if (response.GetYdbStatus() == Ydb::StatusIds::ABORTED) {
+        auto response = AwaitResponse(runtime, f2);
+        if (response.operation().status() == Ydb::StatusIds::ABORTED) {
             // Let's suppose somehow locks still managed to become invalidated
-            NYql::TIssues issues;
-            IssuesFromMessage(response.GetResponse().GetQueryIssues(), issues);
-            UNIT_ASSERT(NKqp::HasIssue(issues, NYql::TIssuesIds::KIKIMR_LOCKS_INVALIDATED));
             committed = false;
         } else {
-            UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+            UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
             committed = true;
         }
     }
@@ -1553,23 +1541,21 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderLockLost, UseMvcc, UseNewEngine) {
     }
 }
 
-Y_UNIT_TEST_NEW_ENGINE(TestMvccReadDoesntBlockWrites) {
+Y_UNIT_TEST(TestMvccReadDoesntBlockWrites) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(true)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
     auto &runtime = *server->GetRuntime();
 
     auto sender = runtime.AllocateEdgeActor();
-    auto sender2 = runtime.AllocateEdgeActor();
     auto sender3 = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -1579,18 +1565,18 @@ Y_UNIT_TEST_NEW_ENGINE(TestMvccReadDoesntBlockWrites) {
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 2);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1`
             UNION ALL
-            SELECT * FROM `/Root/table-2`)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2`)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
     }
 
     // Capture and block all readset messages
@@ -1606,9 +1592,9 @@ Y_UNIT_TEST_NEW_ENGINE(TestMvccReadDoesntBlockWrites) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    SendRequest(runtime, sender2, MakeCommitRequest(sessionId, txId, Q_(R"(
+    auto f2 = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2);)")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2);)"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     {
@@ -1653,9 +1639,8 @@ Y_UNIT_TEST_NEW_ENGINE(TestMvccReadDoesntBlockWrites) {
 
     // Read the commit reply next, it must succeed
     {
-        auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(sender2);
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+        auto response = AwaitResponse(runtime, f2);
+        UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
     }
 
     {
@@ -1692,12 +1677,11 @@ Y_UNIT_TEST_NEW_ENGINE(TestMvccReadDoesntBlockWrites) {
     }
 }
 
-Y_UNIT_TEST_QUAD(TestOutOfOrderReadOnlyAllowed, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestOutOfOrderReadOnlyAllowed, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1705,7 +1689,7 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderReadOnlyAllowed, UseMvcc, UseNewEngine) {
     auto sender = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -1715,18 +1699,18 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderReadOnlyAllowed, UseMvcc, UseNewEngine) {
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1`
             UNION ALL
-            SELECT * FROM `/Root/table-2`)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2`)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     // Capture and block all readset messages
@@ -1742,10 +1726,9 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderReadOnlyAllowed, UseMvcc, UseNewEngine) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto sender2 = runtime.AllocateEdgeActor();
-    SendRequest(runtime, sender2, MakeCommitRequest(sessionId, txId, Q_(R"(
+    auto f2 = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     {
@@ -1780,9 +1763,8 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderReadOnlyAllowed, UseMvcc, UseNewEngine) {
 
     // Read the commit reply next, it must succeed
     {
-        auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(sender2);
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+        auto response = AwaitResponse(runtime, f2);
+        UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
     }
 
     // Select keys 3 and 4 from both tables, both should have been be inserted
@@ -1803,12 +1785,11 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderReadOnlyAllowed, UseMvcc, UseNewEngine) {
     }
 }
 
-Y_UNIT_TEST_QUAD(TestOutOfOrderNonConflictingWrites, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestOutOfOrderNonConflictingWrites, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1816,7 +1797,7 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderNonConflictingWrites, UseMvcc, UseNewEngine) {
     auto sender = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -1826,18 +1807,18 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderNonConflictingWrites, UseMvcc, UseNewEngine) {
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 1
             UNION ALL
-            SELECT * FROM `/Root/table-2` WHERE key = 2)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2` WHERE key = 2)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     // Capture and block all readset messages
@@ -1853,10 +1834,9 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderNonConflictingWrites, UseMvcc, UseNewEngine) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto sender2 = runtime.AllocateEdgeActor();
-    SendRequest(runtime, sender2, MakeCommitRequest(sessionId, txId, Q_(R"(
+    auto f2 = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     if (readSets.size() < 2) {
@@ -1897,9 +1877,8 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderNonConflictingWrites, UseMvcc, UseNewEngine) {
 
     // Read the commit reply next, it must succeed
     {
-        auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(sender2);
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+        auto response = AwaitResponse(runtime, f2);
+        UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
     }
 
     // Select keys 3 and 4 from both tables, both should have been inserted
@@ -1920,12 +1899,11 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderNonConflictingWrites, UseMvcc, UseNewEngine) {
     }
 }
 
-Y_UNIT_TEST_NEW_ENGINE(TestOutOfOrderRestartLocksSingleWithoutBarrier) {
+Y_UNIT_TEST(TestOutOfOrderRestartLocksSingleWithoutBarrier) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(false) // intentionally, because we test non-mvcc locks logic
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -1936,7 +1914,7 @@ Y_UNIT_TEST_NEW_ENGINE(TestOutOfOrderRestartLocksSingleWithoutBarrier) {
     runtime.GetAppData().FeatureFlags.SetDisableDataShardBarrier(true);
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -1948,19 +1926,18 @@ Y_UNIT_TEST_NEW_ENGINE(TestOutOfOrderRestartLocksSingleWithoutBarrier) {
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto sender1 = runtime.AllocateEdgeActor();
-        auto ev = ExecRequest(runtime, sender1, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 1
             UNION ALL
-            SELECT * FROM `/Root/table-2` WHERE key = 2)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2` WHERE key = 2)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     // Capture and block all readset messages
@@ -1976,10 +1953,9 @@ Y_UNIT_TEST_NEW_ENGINE(TestOutOfOrderRestartLocksSingleWithoutBarrier) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto sender2 = runtime.AllocateEdgeActor();
-    SendRequest(runtime, sender2, MakeCommitRequest(sessionId, txId, Q_(R"(
+    SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     if (readSets.size() < 2) {
@@ -2066,12 +2042,11 @@ Y_UNIT_TEST_NEW_ENGINE(TestOutOfOrderRestartLocksSingleWithoutBarrier) {
     }
 }
 
-Y_UNIT_TEST_NEW_ENGINE(MvccTestOutOfOrderRestartLocksSingleWithoutBarrier) {
+Y_UNIT_TEST(MvccTestOutOfOrderRestartLocksSingleWithoutBarrier) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(true)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2082,7 +2057,7 @@ Y_UNIT_TEST_NEW_ENGINE(MvccTestOutOfOrderRestartLocksSingleWithoutBarrier) {
     runtime.GetAppData().FeatureFlags.SetDisableDataShardBarrier(true);
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -2094,19 +2069,18 @@ Y_UNIT_TEST_NEW_ENGINE(MvccTestOutOfOrderRestartLocksSingleWithoutBarrier) {
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto sender1 = runtime.AllocateEdgeActor();
-        auto ev = ExecRequest(runtime, sender1, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
              SELECT * FROM `/Root/table-1` WHERE key = 1
              UNION ALL
-             SELECT * FROM `/Root/table-2` WHERE key = 2)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+             SELECT * FROM `/Root/table-2` WHERE key = 2)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     // Capture and block all readset messages
@@ -2122,10 +2096,9 @@ Y_UNIT_TEST_NEW_ENGINE(MvccTestOutOfOrderRestartLocksSingleWithoutBarrier) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto sender2 = runtime.AllocateEdgeActor();
-    SendRequest(runtime, sender2, MakeCommitRequest(sessionId, txId, Q_(R"(
+    SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     if (readSets.size() < 2) {
@@ -2208,12 +2181,11 @@ Y_UNIT_TEST_NEW_ENGINE(MvccTestOutOfOrderRestartLocksSingleWithoutBarrier) {
     }
 }
 
-Y_UNIT_TEST_QUAD(TestOutOfOrderRestartLocksReorderedWithoutBarrier, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestOutOfOrderRestartLocksReorderedWithoutBarrier, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2224,7 +2196,7 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderRestartLocksReorderedWithoutBarrier, UseMvcc, Use
     runtime.GetAppData().FeatureFlags.SetDisableDataShardBarrier(true);
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -2236,19 +2208,18 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderRestartLocksReorderedWithoutBarrier, UseMvcc, Use
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto sender1 = runtime.AllocateEdgeActor();
-        auto ev = ExecRequest(runtime, sender1, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 1
             UNION ALL
-            SELECT * FROM `/Root/table-2` WHERE key = 2)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2` WHERE key = 2)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     // Capture and block all readset messages
@@ -2264,10 +2235,9 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderRestartLocksReorderedWithoutBarrier, UseMvcc, Use
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto sender2 = runtime.AllocateEdgeActor();
-    SendRequest(runtime, sender2, MakeCommitRequest(sessionId, txId, Q_(R"(
+    SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     if (readSets.size() < 2) {
@@ -2355,12 +2325,11 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderRestartLocksReorderedWithoutBarrier, UseMvcc, Use
     }
 }
 
-Y_UNIT_TEST_QUAD(TestOutOfOrderNoBarrierRestartImmediateLongTail, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestOutOfOrderNoBarrierRestartImmediateLongTail, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2371,7 +2340,7 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderNoBarrierRestartImmediateLongTail, UseMvcc, UseNe
     runtime.GetAppData().FeatureFlags.SetDisableDataShardBarrier(true);
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -2383,19 +2352,18 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderNoBarrierRestartImmediateLongTail, UseMvcc, UseNe
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto sender1 = runtime.AllocateEdgeActor();
-        auto ev = ExecRequest(runtime, sender1, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 1
             UNION ALL
-            SELECT * FROM `/Root/table-2` WHERE key = 2)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2` WHERE key = 2)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     // Capture and block all readset messages
@@ -2438,10 +2406,9 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderNoBarrierRestartImmediateLongTail, UseMvcc, UseNe
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto sender2 = runtime.AllocateEdgeActor();
-    SendRequest(runtime, sender2, MakeCommitRequest(sessionId, txId, Q_(R"(
+    auto fCommit = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     if (readSets.size() < 2) {
@@ -2545,12 +2512,11 @@ Y_UNIT_TEST_QUAD(TestOutOfOrderNoBarrierRestartImmediateLongTail, UseMvcc, UseNe
     }
 }
 
-Y_UNIT_TEST_QUAD(TestCopyTableNoDeadlock, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestCopyTableNoDeadlock, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2558,7 +2524,7 @@ Y_UNIT_TEST_QUAD(TestCopyTableNoDeadlock, UseMvcc, UseNewEngine) {
     auto sender = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -2568,18 +2534,18 @@ Y_UNIT_TEST_QUAD(TestCopyTableNoDeadlock, UseMvcc, UseNewEngine) {
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId,Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1`
             UNION ALL
-            SELECT * FROM `/Root/table-2`)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2`)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     // Capture and block all readset messages
@@ -2616,10 +2582,9 @@ Y_UNIT_TEST_QUAD(TestCopyTableNoDeadlock, UseMvcc, UseNewEngine) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto senderCommit = runtime.AllocateEdgeActor();
-    SendRequest(runtime, senderCommit, MakeCommitRequest(sessionId, txId, Q_(R"(
+    auto fCommit = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     if (readSets.size() < 2) {
@@ -2714,9 +2679,8 @@ Y_UNIT_TEST_QUAD(TestCopyTableNoDeadlock, UseMvcc, UseNewEngine) {
 
     // Wait for commit to complete, it must succeed
     {
-        auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(senderCommit);
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+        auto response = AwaitResponse(runtime, fCommit);
+        UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
     }
 
     // Wait for copy table tx to complete
@@ -2730,11 +2694,10 @@ Y_UNIT_TEST_QUAD(TestCopyTableNoDeadlock, UseMvcc, UseNewEngine) {
     }
 }
 
-Y_UNIT_TEST_NEW_ENGINE(TestPlannedCancelSplit) {
+Y_UNIT_TEST(TestPlannedCancelSplit) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2742,7 +2705,7 @@ Y_UNIT_TEST_NEW_ENGINE(TestPlannedCancelSplit) {
     auto sender = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -2918,12 +2881,11 @@ Y_UNIT_TEST_NEW_ENGINE(TestPlannedCancelSplit) {
         "Split needed " << elapsed.ToString() << " to complete, which is too long");
 }
 
-Y_UNIT_TEST_QUAD(TestPlannedTimeoutSplit, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestPlannedTimeoutSplit, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -2931,7 +2893,7 @@ Y_UNIT_TEST_QUAD(TestPlannedTimeoutSplit, UseMvcc, UseNewEngine) {
     auto sender = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -3038,12 +3000,11 @@ Y_UNIT_TEST_QUAD(TestPlannedTimeoutSplit, UseMvcc, UseNewEngine) {
     }
 }
 
-Y_UNIT_TEST_QUAD(TestPlannedHalfOverloadedSplit, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestPlannedHalfOverloadedSplit, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3051,7 +3012,7 @@ Y_UNIT_TEST_QUAD(TestPlannedHalfOverloadedSplit, UseMvcc, UseNewEngine) {
     auto sender = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -3206,11 +3167,10 @@ namespace {
 /**
  * Regression test for KIKIMR-7751, designed to crash under asan
  */
-Y_UNIT_TEST_NEW_ENGINE(TestReadTableWriteConflict) {
+Y_UNIT_TEST(TestReadTableWriteConflict) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3229,18 +3189,18 @@ Y_UNIT_TEST_NEW_ENGINE(TestReadTableWriteConflict) {
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId, Q_(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(
             "SELECT * FROM `/Root/table-1` "
             "UNION ALL "
-            "SELECT * FROM `/Root/table-2`")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            "SELECT * FROM `/Root/table-2`"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+             "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+             "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     // Capture and block all readset messages
@@ -3269,10 +3229,9 @@ Y_UNIT_TEST_NEW_ENGINE(TestReadTableWriteConflict) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto senderCommit = runtime.AllocateEdgeActor();
-    SendRequest(runtime, senderCommit, MakeCommitRequest(sessionId, txId, Q_(
+    auto qCommit = SendRequest(runtime, MakeSimpleRequestRPC(Q_(
         "UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2); "
-        "UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2)")));
+        "UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2); "), sessionId, txId, true));
 
     // Wait until we captured all readsets
     if (readSets.size() < 4) {
@@ -3334,9 +3293,8 @@ Y_UNIT_TEST_NEW_ENGINE(TestReadTableWriteConflict) {
 
     // Wait for commit to succeed
     {
-        auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(senderCommit);
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+        auto response = AwaitResponse(runtime, qCommit);
+        UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
     }
 
     // Wait for immediate write to succeed
@@ -3357,11 +3315,10 @@ Y_UNIT_TEST_NEW_ENGINE(TestReadTableWriteConflict) {
 /**
  * Regression test for KIKIMR-7903
  */
-Y_UNIT_TEST_NEW_ENGINE(TestReadTableImmediateWriteBlock) {
+Y_UNIT_TEST(TestReadTableImmediateWriteBlock) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3428,12 +3385,11 @@ Y_UNIT_TEST_NEW_ENGINE(TestReadTableImmediateWriteBlock) {
     }
 }
 
-Y_UNIT_TEST_QUAD(TestReadTableSingleShardImmediate, WithMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestReadTableSingleShardImmediate, WithMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3477,11 +3433,10 @@ Y_UNIT_TEST_QUAD(TestReadTableSingleShardImmediate, WithMvcc, UseNewEngine) {
     UNIT_ASSERT_VALUES_EQUAL(seenPlanSteps, 0u);
 }
 
-Y_UNIT_TEST_NEW_ENGINE(TestImmediateQueueThenSplit) {
+Y_UNIT_TEST(TestImmediateQueueThenSplit) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3489,7 +3444,7 @@ Y_UNIT_TEST_NEW_ENGINE(TestImmediateQueueThenSplit) {
     auto sender = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -3653,13 +3608,6 @@ void TestLateKqpQueryAfterColumnDrop(bool dataQuery, const TString& query, bool 
         .SetEnableMvcc(enableMvcc)
         .SetUseRealThreads(false);
 
-    if (dataQuery) {
-        NKikimrKqp::TKqpSetting setting;
-        setting.SetName("_KqpAllowNewEngine");
-        setting.SetValue("true");
-        serverSettings.KqpSettings.push_back(setting);
-    }
-
     Tests::TServer::TPtr server = new TServer(serverSettings);
     auto &runtime = *server->GetRuntime();
     auto sender = runtime.AllocateEdgeActor();
@@ -3764,17 +3712,15 @@ Y_UNIT_TEST_WITH_MVCC(TestLateKqpScanAfterColumnDrop) {
 
 Y_UNIT_TEST_WITH_MVCC(TestLateKqpDataReadAfterColumnDrop) {
     TestLateKqpQueryAfterColumnDrop(true, R"(
-            PRAGMA kikimr.UseNewEngine = "true";
             SELECT SUM(value2) FROM `/Root/table-1`
         )", WithMvcc);
 }
 
-Y_UNIT_TEST_NEW_ENGINE(MvccTestSnapshotRead) {
+Y_UNIT_TEST(MvccTestSnapshotRead) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(true)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3782,7 +3728,7 @@ Y_UNIT_TEST_NEW_ENGINE(MvccTestSnapshotRead) {
     auto sender = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_DEBUG);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_DEBUG);
 
     InitRoot(server, sender);
 
@@ -3897,11 +3843,10 @@ Y_UNIT_TEST_NEW_ENGINE(MvccTestSnapshotRead) {
     UNIT_ASSERT(!rescheduled);
 }
 
-Y_UNIT_TEST_NEW_ENGINE(TestSecondaryClearanceAfterShardRestartRace) {
+Y_UNIT_TEST(TestSecondaryClearanceAfterShardRestartRace) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -3909,7 +3854,7 @@ Y_UNIT_TEST_NEW_ENGINE(TestSecondaryClearanceAfterShardRestartRace) {
     auto sender = runtime.AllocateEdgeActor();
 
     runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-    runtime.SetLogPriority(UseNewEngine ? NKikimrServices::KQP_EXECUTER : NKikimrServices::TX_PROXY, NLog::PRI_TRACE);
+    runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_TRACE);
 
     InitRoot(server, sender);
 
@@ -3983,25 +3928,16 @@ Y_UNIT_TEST_NEW_ENGINE(TestSecondaryClearanceAfterShardRestartRace) {
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (4, 4);"));
 }
 
-Y_UNIT_TEST_QUAD(TestShardRestartNoUndeterminedImmediate, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestShardRestartNoUndeterminedImmediate, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
     auto &runtime = *server->GetRuntime();
     auto sender = runtime.AllocateEdgeActor();
-
-//    runtime.SetLogPriority(NKikimrServices::TABLET_MAIN, NLog::PRI_TRACE);
-//    runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-//    if (UseNewEngine) {
-//        runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_TRACE);
-//    } else {
-//        runtime.SetLogPriority(NKikimrServices::TX_PROXY, NLog::PRI_TRACE);
-//    }
 
     InitRoot(server, sender);
 
@@ -4012,18 +3948,18 @@ Y_UNIT_TEST_QUAD(TestShardRestartNoUndeterminedImmediate, UseMvcc, UseNewEngine)
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1);"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1`
             UNION ALL
-            SELECT * FROM `/Root/table-2`)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2`)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     auto waitFor = [&](const auto& condition, const TString& description) {
@@ -4057,10 +3993,9 @@ Y_UNIT_TEST_QUAD(TestShardRestartNoUndeterminedImmediate, UseMvcc, UseNewEngine)
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto sender2 = runtime.AllocateEdgeActor();
-    SendRequest(runtime, sender2, MakeCommitRequest(sessionId, txId, Q_(R"(
+    auto myCommit2 = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     waitFor([&]{ return readSets.size() >= 2; }, "commit read sets");
@@ -4103,25 +4038,16 @@ Y_UNIT_TEST_QUAD(TestShardRestartNoUndeterminedImmediate, UseMvcc, UseNewEngine)
     }
 }
 
-Y_UNIT_TEST_QUAD(TestShardRestartPlannedCommitShouldSucceed, UseMvcc, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestShardRestartPlannedCommitShouldSucceed, UseMvcc) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(WithMvcc)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
     auto &runtime = *server->GetRuntime();
     auto sender = runtime.AllocateEdgeActor();
-
-//    runtime.SetLogPriority(NKikimrServices::TABLET_MAIN, NLog::PRI_TRACE);
-//    runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
-//    if (UseNewEngine) {
-//        runtime.SetLogPriority(NKikimrServices::KQP_EXECUTER, NLog::PRI_TRACE);
-//    } else {
-//        runtime.SetLogPriority(NKikimrServices::TX_PROXY, NLog::PRI_TRACE);
-//    }
 
     InitRoot(server, sender);
 
@@ -4132,18 +4058,18 @@ Y_UNIT_TEST_QUAD(TestShardRestartPlannedCommitShouldSucceed, UseMvcc, UseNewEngi
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1)"));
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-2` (key, value) VALUES (2, 1)"));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     TString txId;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1`
             UNION ALL
-            SELECT * FROM `/Root/table-2`)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2`)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 1 } }");
     }
 
     auto waitFor = [&](const auto& condition, const TString& description) {
@@ -4173,10 +4099,9 @@ Y_UNIT_TEST_QUAD(TestShardRestartPlannedCommitShouldSucceed, UseMvcc, UseNewEngi
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    auto sender2 = runtime.AllocateEdgeActor();
-    SendRequest(runtime, sender2, MakeCommitRequest(sessionId, txId, Q_(R"(
+    auto myCommit2 = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (3, 2);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (4, 2))"), sessionId, txId, true));
 
     // Wait until we captured both readsets
     waitFor([&]{ return readSets.size() >= 2; }, "commit read sets");
@@ -4189,9 +4114,8 @@ Y_UNIT_TEST_QUAD(TestShardRestartPlannedCommitShouldSucceed, UseMvcc, UseNewEngi
 
     // The result of commit should be SUCCESS
     {
-        auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(sender2);
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+        auto response = AwaitResponse(runtime, myCommit2);
+        UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
     }
 
     // Select key 3 and verify its value was updated
@@ -4207,13 +4131,12 @@ Y_UNIT_TEST_QUAD(TestShardRestartPlannedCommitShouldSucceed, UseMvcc, UseNewEngi
     }
 }
 
-Y_UNIT_TEST_NEW_ENGINE(TestShardSnapshotReadNoEarlyReply) {
+Y_UNIT_TEST(TestShardSnapshotReadNoEarlyReply) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(true)
         .SetEnableMvccSnapshotReads(true)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -4281,21 +4204,19 @@ Y_UNIT_TEST_NEW_ENGINE(TestShardSnapshotReadNoEarlyReply) {
     };
     auto prevObserver = runtime.SetObserverFunc(blockCommits);
 
-    auto sender1 = runtime.AllocateEdgeActor();
-    TString sessionId1 = CreateSession(runtime, sender1, "/Root");
-    auto sender2 = runtime.AllocateEdgeActor();
-    TString sessionId2 = CreateSession(runtime, sender2, "/Root");
+    TString sessionId1 = CreateSessionRPC(runtime, "/Root");
+    TString sessionId2 = CreateSessionRPC(runtime, "/Root");
 
-    SendRequest(runtime, sender1, MakeBeginRequest(sessionId1, Q_(R"(
+    auto f1 = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         SELECT * FROM `/Root/table-1`
         UNION ALL
         SELECT * FROM `/Root/table-2`
-    )"), "/Root"));
-    SendRequest(runtime, sender2, MakeBeginRequest(sessionId2, Q_(R"(
+    )"), sessionId1, "", false), "/Root");
+    auto f2 = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         SELECT * FROM `/Root/table-1`
         UNION ALL
         SELECT * FROM `/Root/table-2`
-    )"), "/Root"));
+    )"), sessionId2, "", false), "/Root");
 
     waitFor([&]{ return blockedCommits.size() >= 2; }, "at least 2 blocked commits");
 
@@ -4312,18 +4233,20 @@ Y_UNIT_TEST_NEW_ENGINE(TestShardSnapshotReadNoEarlyReply) {
 
     TString txId1;
     {
-        auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(sender1);
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId1 = response.GetResponse().GetTxMeta().id();
+        auto response = AwaitResponse(runtime, f1);
+        UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
+        Ydb::Table::ExecuteQueryResult result;
+        response.operation().result().UnpackTo(&result);
+        txId1 = result.tx_meta().id();
     }
 
     TString txId2;
     {
-        auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(sender2);
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId2 = response.GetResponse().GetTxMeta().id();
+        auto response = AwaitResponse(runtime, f2);
+        UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
+        Ydb::Table::ExecuteQueryResult result;
+        response.operation().result().UnpackTo(&result);
+        txId2 = result.tx_meta().id();
     }
 
     // Perform a couple of immediate reads to make sure shards are ready to respond to read-only requests
@@ -4339,26 +4262,24 @@ Y_UNIT_TEST_NEW_ENGINE(TestShardSnapshotReadNoEarlyReply) {
     waitFor([&]{ return blockedCommits.size() >= 2; }, "at least 2 blocked commits");
 
     // Send an additional read request, it must not be blocked
-    SendRequest(runtime, sender1, MakeContinueRequest(sessionId1, txId1, Q_(R"(
+    auto f = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         SELECT * FROM `/Root/table-1`
         UNION ALL
         SELECT * FROM `/Root/table-2`
-    )"), "/Root"));
+    )"), sessionId1, txId1, false), "/Root");
 
     {
-        auto ev = runtime.GrabEdgeEventRethrow<NKqp::TEvKqp::TEvQueryResponse>(sender1);
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
+        auto response = AwaitResponse(runtime, f);
+        UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
     }
 }
 
-Y_UNIT_TEST_TWIN(TestSnapshotReadAfterBrokenLock, UseNewEngine) {
+Y_UNIT_TEST(TestSnapshotReadAfterBrokenLock) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(true)
         .SetEnableMvccSnapshotReads(true)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -4375,20 +4296,20 @@ Y_UNIT_TEST_TWIN(TestSnapshotReadAfterBrokenLock, UseNewEngine) {
 
     SimulateSleep(server, TDuration::Seconds(1));
 
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
 
     // Start transaction by reading from both tables, we will only set locks
     // to currently existing variables
     TString txId;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 1
             UNION ALL
-            SELECT * FROM `/Root/table-2` WHERE key = 2)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2` WHERE key = 2)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
     }
 
     SimulateSleep(server, TDuration::Seconds(1));
@@ -4398,40 +4319,34 @@ Y_UNIT_TEST_TWIN(TestSnapshotReadAfterBrokenLock, UseNewEngine) {
 
     // Perform an additional read, it would mark transaction as write-broken
     {
-        auto ev = ExecRequest(runtime, sender, MakeContinueRequest(sessionId, txId, Q_(R"(
+        auto result = KqpSimpleContinue(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 3
-        )")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+        )"));
+        UNIT_ASSERT_VALUES_EQUAL(result, "");
     }
 
     // Perform one more read, it would be in an already write-broken transaction
     {
-        auto ev = ExecRequest(runtime, sender, MakeContinueRequest(sessionId, txId, Q_(R"(
+        auto result = KqpSimpleContinue(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 5
-        )")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+        )"));
+        UNIT_ASSERT_VALUES_EQUAL(result, "");
     }
 
     {
-        auto ev = ExecRequest(runtime, sender, MakeCommitRequest(sessionId, txId, Q_(R"(
+        auto result = KqpSimpleCommit(runtime, sessionId, txId, Q_(R"(
             UPSERT INTO `/Root/table-1` (key, value) VALUES (5, 5)
-        )")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::ABORTED);
+        )"));
+        UNIT_ASSERT_VALUES_EQUAL(result, "ERROR: ABORTED");
     }
 }
 
-Y_UNIT_TEST_TWIN(TestSnapshotReadAfterBrokenLockOutOfOrder, UseNewEngine) {
+Y_UNIT_TEST(TestSnapshotReadAfterBrokenLockOutOfOrder) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(true)
         .SetEnableMvccSnapshotReads(true)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -4449,33 +4364,32 @@ Y_UNIT_TEST_TWIN(TestSnapshotReadAfterBrokenLockOutOfOrder, UseNewEngine) {
     SimulateSleep(server, TDuration::Seconds(1));
 
     // Start transaction by reading from both tables
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
     TString txId;
     {
         Cerr << "... performing the first select" << Endl;
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 1
             UNION ALL
-            SELECT * FROM `/Root/table-2` WHERE key = 2)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2` WHERE key = 2)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
     }
 
     // Arrange for another distributed tx stuck at readset exchange
-    auto senderBlocker = runtime.AllocateEdgeActor();
-    TString sessionIdBlocker = CreateSession(runtime, senderBlocker);
+    TString sessionIdBlocker = CreateSessionRPC(runtime);
     TString txIdBlocker;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionIdBlocker, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionIdBlocker, txIdBlocker, Q_(R"(
             SELECT * FROM `/Root/table-1`
             UNION ALL
-            SELECT * FROM `/Root/table-2`)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txIdBlocker = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2`)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
     }
 
     auto waitFor = [&](const auto& condition, const TString& description) {
@@ -4505,9 +4419,9 @@ Y_UNIT_TEST_TWIN(TestSnapshotReadAfterBrokenLockOutOfOrder, UseNewEngine) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    SendRequest(runtime, senderBlocker, MakeCommitRequest(sessionIdBlocker, txIdBlocker, Q_(R"(
+    auto thisCommit2 = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (99, 99);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (99, 99))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (99, 99))"), sessionIdBlocker, txIdBlocker, true));
 
     // Wait until we captured both readsets
     waitFor([&]{ return readSets.size() >= 2; }, "commit read sets");
@@ -4525,42 +4439,36 @@ Y_UNIT_TEST_TWIN(TestSnapshotReadAfterBrokenLockOutOfOrder, UseNewEngine) {
     // Perform an additional read, it would mark transaction as write-broken for the first time
     {
         Cerr << "... performing the second select" << Endl;
-        auto ev = ExecRequest(runtime, sender, MakeContinueRequest(sessionId, txId, Q_(R"(
+        auto result = KqpSimpleContinue(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 3
-        )")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+        )"));
+        UNIT_ASSERT_VALUES_EQUAL(result, "");
     }
 
     // Perform one more read, it would be in an already write-broken transaction
     {
         Cerr << "... performing the third select" << Endl;
-        auto ev = ExecRequest(runtime, sender, MakeContinueRequest(sessionId, txId, Q_(R"(
+        auto result = KqpSimpleContinue(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 5
-        )")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+        )"));
+        UNIT_ASSERT_VALUES_EQUAL(result, "");
     }
 
     {
         Cerr << "... performing the last upsert and commit" << Endl;
-        auto ev = ExecRequest(runtime, sender, MakeCommitRequest(sessionId, txId, Q_(R"(
+        auto result = KqpSimpleCommit(runtime, sessionId, txId, Q_(R"(
             UPSERT INTO `/Root/table-1` (key, value) VALUES (5, 5)
-        )")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::ABORTED);
+        )"));
+        UNIT_ASSERT_VALUES_EQUAL(result, "ERROR: ABORTED");
     }
 }
 
-Y_UNIT_TEST_TWIN(TestSnapshotReadAfterStuckRW, UseNewEngine) {
+Y_UNIT_TEST(TestSnapshotReadAfterStuckRW) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(true)
         .SetEnableMvccSnapshotReads(true)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
     Tests::TServer::TPtr server = new TServer(serverSettings);
@@ -4580,18 +4488,17 @@ Y_UNIT_TEST_TWIN(TestSnapshotReadAfterStuckRW, UseNewEngine) {
     SimulateSleep(server, TDuration::Seconds(1));
 
     // Arrange for a distributed tx stuck at readset exchange
-    auto senderBlocker = runtime.AllocateEdgeActor();
-    TString sessionIdBlocker = CreateSession(runtime, senderBlocker);
+    TString sessionIdBlocker = CreateSessionRPC(runtime);
     TString txIdBlocker;
     {
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionIdBlocker, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionIdBlocker, txIdBlocker, Q_(R"(
             SELECT * FROM `/Root/table-1`
             UNION ALL
-            SELECT * FROM `/Root/table-2`)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txIdBlocker = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2`)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
     }
 
     auto waitFor = [&](const auto& condition, const TString& description) {
@@ -4621,9 +4528,9 @@ Y_UNIT_TEST_TWIN(TestSnapshotReadAfterStuckRW, UseNewEngine) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureRS);
 
     // Send a commit request, it would block on readset exchange
-    SendRequest(runtime, senderBlocker, MakeCommitRequest(sessionIdBlocker, txIdBlocker, Q_(R"(
+    auto sCommit = SendRequest(runtime, MakeSimpleRequestRPC(Q_(R"(
         UPSERT INTO `/Root/table-1` (key, value) VALUES (99, 99);
-        UPSERT INTO `/Root/table-2` (key, value) VALUES (99, 99))")));
+        UPSERT INTO `/Root/table-2` (key, value) VALUES (99, 99))"), sessionIdBlocker, txIdBlocker, true));
 
     // Wait until we captured both readsets
     waitFor([&]{ return readSets.size() >= 2; }, "commit read sets");
@@ -4635,22 +4542,22 @@ Y_UNIT_TEST_TWIN(TestSnapshotReadAfterStuckRW, UseNewEngine) {
     SimulateSleep(server, TDuration::Seconds(1));
 
     // Start a transaction by reading from both tables
-    TString sessionId = CreateSession(runtime, sender);
+    TString sessionId = CreateSessionRPC(runtime);
     TString txId;
     {
         Cerr << "... performing the first select" << Endl;
-        auto ev = ExecRequest(runtime, sender, MakeBeginRequest(sessionId, Q_(R"(
+        auto result = KqpSimpleBegin(runtime, sessionId, txId, Q_(R"(
             SELECT * FROM `/Root/table-1` WHERE key = 1
             UNION ALL
-            SELECT * FROM `/Root/table-2` WHERE key = 2)")));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
+            SELECT * FROM `/Root/table-2` WHERE key = 2)"));
+        UNIT_ASSERT_VALUES_EQUAL(
+            result,
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
     }
 }
 
-Y_UNIT_TEST_QUAD(TestSnapshotReadPriority, UnprotectedReads, UseNewEngine) {
+Y_UNIT_TEST_TWIN(TestSnapshotReadPriority, UnprotectedReads) {
     TPortManager pm;
     TServerSettings::TControls controls;
     controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -4659,7 +4566,6 @@ Y_UNIT_TEST_QUAD(TestSnapshotReadPriority, UnprotectedReads, UseNewEngine) {
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(true)
         .SetEnableMvccSnapshotReads(true)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetControls(controls)
         .SetUseRealThreads(false);
 
@@ -4697,30 +4603,17 @@ Y_UNIT_TEST_QUAD(TestSnapshotReadPriority, UnprotectedReads, UseNewEngine) {
     };
 
     auto beginSnapshotRequest = [&](TString& sessionId, TString& txId, const TString& query) -> TString {
-        auto reqSender = runtime.AllocateEdgeActor();
-        sessionId = CreateSession(runtime, reqSender);
-        auto ev = ExecRequest(runtime, reqSender, MakeBeginRequest(sessionId, query));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-        return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        return KqpSimpleBegin(runtime, sessionId, txId, query);
     };
 
     auto continueSnapshotRequest = [&](const TString& sessionId, const TString& txId, const TString& query) -> TString {
-        auto reqSender = runtime.AllocateEdgeActor();
-        auto ev = ExecRequest(runtime, reqSender, MakeContinueRequest(sessionId, txId, query));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-        return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        return KqpSimpleContinue(runtime, sessionId, txId, query);
     };
 
     auto execSnapshotRequest = [&](const TString& query) -> TString {
-        auto reqSender = runtime.AllocateEdgeActor();
         TString sessionId, txId;
         TString result = beginSnapshotRequest(sessionId, txId, query);
-        CloseSession(runtime, reqSender, sessionId);
+        CloseSession(runtime, sessionId);
         return result;
     };
 
@@ -4741,10 +4634,8 @@ Y_UNIT_TEST_QUAD(TestSnapshotReadPriority, UnprotectedReads, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 3 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+        "{ items { uint32_value: 3 } items { uint32_value: 3 } }");
 
     // Spam schedules in the runtime to prevent mediator time jumping prematurely
     {
@@ -4781,10 +4672,8 @@ Y_UNIT_TEST_QUAD(TestSnapshotReadPriority, UnprotectedReads, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 3 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+        "{ items { uint32_value: 3 } items { uint32_value: 3 } }");
 
     // Wait for the write to finish
     {
@@ -4811,11 +4700,9 @@ Y_UNIT_TEST_QUAD(TestSnapshotReadPriority, UnprotectedReads, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 3 } } } "
-        "List { Struct { Optional { Uint32: 5 } } Struct { Optional { Uint32: 5 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+        "{ items { uint32_value: 3 } items { uint32_value: 3 } }, "
+        "{ items { uint32_value: 5 } items { uint32_value: 5 } }");
 
     // Start a new write and sleep again
     SendRequest(runtime, senderImmediateWrite, MakeSimpleRequest(Q_(R"(
@@ -4882,11 +4769,9 @@ Y_UNIT_TEST_QUAD(TestSnapshotReadPriority, UnprotectedReads, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 3 } } } "
-        "List { Struct { Optional { Uint32: 5 } } Struct { Optional { Uint32: 5 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+        "{ items { uint32_value: 3 } items { uint32_value: 3 } }, "
+        "{ items { uint32_value: 5 } items { uint32_value: 5 } }");
 
     // Wait for result of the second write
     {
@@ -4915,13 +4800,11 @@ Y_UNIT_TEST_QUAD(TestSnapshotReadPriority, UnprotectedReads, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 3 } } } "
-        "List { Struct { Optional { Uint32: 5 } } Struct { Optional { Uint32: 5 } } } "
-        "List { Struct { Optional { Uint32: 7 } } Struct { Optional { Uint32: 7 } } } "
-        "List { Struct { Optional { Uint32: 9 } } Struct { Optional { Uint32: 9 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+        "{ items { uint32_value: 3 } items { uint32_value: 3 } }, "
+        "{ items { uint32_value: 5 } items { uint32_value: 5 } }, "
+        "{ items { uint32_value: 7 } items { uint32_value: 7 } }, "
+        "{ items { uint32_value: 9 } items { uint32_value: 9 } }");
 
     // Spam schedules in the runtime to prevent mediator time jumping prematurely
     {
@@ -4944,13 +4827,11 @@ Y_UNIT_TEST_QUAD(TestSnapshotReadPriority, UnprotectedReads, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 3 } } } "
-        "List { Struct { Optional { Uint32: 5 } } Struct { Optional { Uint32: 5 } } } "
-        "List { Struct { Optional { Uint32: 7 } } Struct { Optional { Uint32: 7 } } } "
-        "List { Struct { Optional { Uint32: 9 } } Struct { Optional { Uint32: 9 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+        "{ items { uint32_value: 3 } items { uint32_value: 3 } }, "
+        "{ items { uint32_value: 5 } items { uint32_value: 5 } }, "
+        "{ items { uint32_value: 7 } items { uint32_value: 7 } }, "
+        "{ items { uint32_value: 9 } items { uint32_value: 9 } }");
 
     // Make sure new snapshot will actually observe new data
     UNIT_ASSERT_VALUES_EQUAL(
@@ -4958,17 +4839,15 @@ Y_UNIT_TEST_QUAD(TestSnapshotReadPriority, UnprotectedReads, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "List { Struct { Optional { Uint32: 3 } } Struct { Optional { Uint32: 3 } } } "
-        "List { Struct { Optional { Uint32: 5 } } Struct { Optional { Uint32: 5 } } } "
-        "List { Struct { Optional { Uint32: 7 } } Struct { Optional { Uint32: 7 } } } "
-        "List { Struct { Optional { Uint32: 9 } } Struct { Optional { Uint32: 9 } } } "
-        "List { Struct { Optional { Uint32: 11 } } Struct { Optional { Uint32: 11 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+        "{ items { uint32_value: 3 } items { uint32_value: 3 } }, "
+        "{ items { uint32_value: 5 } items { uint32_value: 5 } }, "
+        "{ items { uint32_value: 7 } items { uint32_value: 7 } }, "
+        "{ items { uint32_value: 9 } items { uint32_value: 9 } }, "
+        "{ items { uint32_value: 11 } items { uint32_value: 11 } }");
 }
 
-Y_UNIT_TEST_TWIN(TestUnprotectedReadsThenWriteVisibility, UseNewEngine) {
+Y_UNIT_TEST(TestUnprotectedReadsThenWriteVisibility) {
     TPortManager pm;
     TServerSettings::TControls controls;
     controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -4978,7 +4857,6 @@ Y_UNIT_TEST_TWIN(TestUnprotectedReadsThenWriteVisibility, UseNewEngine) {
         .SetNodeCount(2)
         .SetEnableMvcc(true)
         .SetEnableMvccSnapshotReads(true)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetControls(controls)
         .SetUseRealThreads(false);
 
@@ -5093,30 +4971,17 @@ Y_UNIT_TEST_TWIN(TestUnprotectedReadsThenWriteVisibility, UseNewEngine) {
     };
 
     auto beginSnapshotRequest = [&](TString& sessionId, TString& txId, const TString& query) -> TString {
-        auto reqSender = runtime.AllocateEdgeActor();
-        sessionId = CreateSession(runtime, reqSender);
-        auto ev = ExecRequest(runtime, reqSender, MakeBeginRequest(sessionId, query));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-        return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        return KqpSimpleBegin(runtime, sessionId, txId, query);
     };
 
     auto continueSnapshotRequest = [&](const TString& sessionId, const TString& txId, const TString& query) -> TString {
-        auto reqSender = runtime.AllocateEdgeActor();
-        auto ev = ExecRequest(runtime, reqSender, MakeContinueRequest(sessionId, txId, query));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-        return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        return KqpSimpleContinue(runtime, sessionId, txId, query);
     };
 
     auto execSnapshotRequest = [&](const TString& query) -> TString {
-        auto reqSender = runtime.AllocateEdgeActor();
         TString sessionId, txId;
         TString result = beginSnapshotRequest(sessionId, txId, query);
-        CloseSession(runtime, reqSender, sessionId);
+        CloseSession(runtime, sessionId);
         return result;
     };
 
@@ -5137,9 +5002,7 @@ Y_UNIT_TEST_TWIN(TestUnprotectedReadsThenWriteVisibility, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
     // Stop updating mediator timecast on the second node
     mustWaitForSteps[1] = true;
@@ -5171,9 +5034,7 @@ Y_UNIT_TEST_TWIN(TestUnprotectedReadsThenWriteVisibility, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
     // However new snapshots must see updated data
     UNIT_ASSERT_VALUES_EQUAL(
@@ -5181,18 +5042,15 @@ Y_UNIT_TEST_TWIN(TestUnprotectedReadsThenWriteVisibility, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+        "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
 }
 
-Y_UNIT_TEST_TWIN(UncommittedReadSetAck, UseNewEngine) {
+Y_UNIT_TEST(UncommittedReadSetAck) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
     serverSettings.SetDomainName("Root")
         .SetNodeCount(2)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetUseRealThreads(false);
 
 
@@ -5232,14 +5090,7 @@ Y_UNIT_TEST_TWIN(UncommittedReadSetAck, UseNewEngine) {
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-3` (key, value) VALUES (3, 3)"));
 
     auto beginTx = [&](TString& sessionId, TString& txId, const TString& query) -> TString {
-        auto reqSender = runtime.AllocateEdgeActor();
-        sessionId = CreateSession(runtime, reqSender);
-        auto ev = ExecRequest(runtime, reqSender, MakeBeginRequest(sessionId, query));
-        auto& response = ev->Get()->Record.GetRef();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetYdbStatus(), Ydb::StatusIds::SUCCESS);
-        txId = response.GetResponse().GetTxMeta().id();
-        UNIT_ASSERT_VALUES_EQUAL(response.GetResponse().GetResults().size(), 1u);
-        return response.GetResponse().GetResults()[0].GetValue().ShortDebugString();
+        return KqpSimpleBegin(runtime, sessionId, txId, query);
     };
 
     TString sessionId1, txId1;
@@ -5248,9 +5099,7 @@ Y_UNIT_TEST_TWIN(UncommittedReadSetAck, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
     TString sessionId2, txId2;
     UNIT_ASSERT_VALUES_EQUAL(
@@ -5258,9 +5107,7 @@ Y_UNIT_TEST_TWIN(UncommittedReadSetAck, UseNewEngine) {
             SELECT key, value FROM `/Root/table-2`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 2 } } Struct { Optional { Uint32: 2 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 2 } items { uint32_value: 2 } }");
 
     bool capturePlanSteps = true;
     TVector<THolder<IEventHandle>> capturedPlanSteps;
@@ -5318,16 +5165,14 @@ Y_UNIT_TEST_TWIN(UncommittedReadSetAck, UseNewEngine) {
     auto prevObserverFunc = runtime.SetObserverFunc(captureCommitAfterReadSet);
 
     // Make two commits in parallel, one of them will receive a readset and become complete
-    auto reqCommit1Sender = runtime.AllocateEdgeActor();
-    SendRequest(runtime, reqCommit1Sender, MakeCommitRequest(sessionId1, txId1,
+    SendRequest(runtime, MakeSimpleRequestRPC(
         Q_(R"(
             UPSERT INTO `/Root/table-3` (key, value) VALUES (4, 4)
-        )")));
-    auto reqCommit2Sender = runtime.AllocateEdgeActor();
-    SendRequest(runtime, reqCommit2Sender, MakeCommitRequest(sessionId2, txId2,
+        )"), sessionId1, txId1, true));
+    SendRequest(runtime, MakeSimpleRequestRPC(
         Q_(R"(
             UPSERT INTO `/Root/table-3` (key, value) VALUES (5, 5)
-        )")));
+        )"), sessionId2, txId2, true));
 
     auto waitFor = [&](const auto& condition, const TString& description) {
         while (!condition()) {
@@ -5425,7 +5270,7 @@ Y_UNIT_TEST_TWIN(UncommittedReadSetAck, UseNewEngine) {
     )"));
 }
 
-Y_UNIT_TEST_TWIN(UncommittedReads, UseNewEngine) {
+Y_UNIT_TEST(UncommittedReads) {
     TPortManager pm;
     TServerSettings::TControls controls;
     controls.MutableDataShardControls()->SetPrioritizedMvccSnapshotReads(1);
@@ -5435,7 +5280,6 @@ Y_UNIT_TEST_TWIN(UncommittedReads, UseNewEngine) {
     serverSettings.SetDomainName("Root")
         .SetEnableMvcc(true)
         .SetEnableMvccSnapshotReads(true)
-        .SetEnableKqpSessionActor(UseNewEngine)
         .SetControls(controls)
         .SetUseRealThreads(false);
 
@@ -5468,9 +5312,7 @@ Y_UNIT_TEST_TWIN(UncommittedReads, UseNewEngine) {
             SELECT key, value FROM `/Root/table-1`
             ORDER BY key
             )")),
-        "Struct { "
-        "List { Struct { Optional { Uint32: 1 } } Struct { Optional { Uint32: 1 } } } "
-        "} Struct { Bool: false }");
+        "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
 
     // Make sure we are at the max immediate write edge for current step and it's confirmed
     ExecSQL(server, sender, Q_("UPSERT INTO `/Root/table-1` (key, value) VALUES (2, 2)"));

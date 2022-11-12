@@ -71,7 +71,7 @@ message TKqlSettings {
     optional bool RollbackTx = 2;
     optional bool RawResults = 3;
     optional EIsolationLevel IsolationLevel = 5;
-    optional bool NewEngine = 6;
+    reserved 6; // (deprecated) NewEngine
 };
 
 message TTopicOperations {
@@ -102,6 +102,8 @@ message TQueryRequest {
     optional NYql.NDqProto.EDqStatsMode StatsMode = 20; // deprecated
     optional Ydb.Table.QueryStatsCollection.Mode CollectStats = 21;
     optional TTopicOperations TopicOperations = 22;
+    optional bool UsePublicResponseDataFormat = 23;
+    map<string, Ydb.TypedValue> YdbParameters = 24;
 }
 
 message TKqpPathIdProto {
@@ -162,6 +164,9 @@ message TEvQueryRequest {
     optional NActorsProto.TActorId RequestActorId = 4;
     optional string RequestType = 5;
     optional TRlPath RlPath = 6;
+
+    repeated Ydb.Issue.IssueMessage QueryIssues = 7;
+    optional Ydb.StatusIds.StatusCode YdbStatus = 8;
 }
 
 message TMkqlProfile {
@@ -181,7 +186,6 @@ message TTransformProfile {
     repeated TTransformProfile Stages = 100;
 }
 
-
 message TKqlProfile {
     optional string Query = 1;
     repeated TMkqlProfile MkqlProfiles = 2;
@@ -200,28 +204,6 @@ message TParameterBinding {
     optional uint32 ResultIndex = 3;
 }
 
-message TPreparedMkql {
-    optional string Program = 1;
-    repeated TParameterBinding Bindings = 2;
-    optional string ProgramText = 3;
-    optional bool IsPure = 4;
-};
-
-message TPreparedEffect {
-    optional string NodeAst = 1;
-    repeated TParameterBinding Bindings = 2;
-}
-
-message TPreparedKql {
-    optional TKqlSettings Settings = 1;
-    repeated TPreparedMkql Mkqls = 2;
-    repeated TPreparedEffect Effects = 3;
-    repeated NKqpProto.TKqpTableOp Operations = 4;
-    repeated NKqpProto.TKqpTableInfo TableInfo = 5;
-    optional string Ast = 6;
-    optional string Plan = 7;
-};
-
 message TPreparedResult {
     optional uint32 KqlIndex = 1;
     optional uint32 ResultIndex = 2;
@@ -237,12 +219,12 @@ message TParameterDescription {
 message TPreparedQuery {
     enum EVersion {
         VERSION_UNSPECIFIED = 0;
-        VERSION_V1 = 1;
+        VERSION_V1_DEPRECATED = 1;
         VERSION_PHYSICAL_V1 = 11;
     };
 
     optional uint32 Version = 1;
-    repeated TPreparedKql Kqls = 2;
+    reserved 2; // (deprecated) Kqls
     repeated TPreparedResult Results = 3;
     repeated TParameterDescription Parameters = 4;
     optional string Text = 5;
@@ -262,6 +244,7 @@ message TQueryResponse {
     repeated TParameterDescription QueryParameters = 10;
     optional Ydb.Table.TransactionMeta TxMeta = 11;
     optional NKqpProto.TKqpStatsQuery QueryStats = 12;
+    repeated Ydb.ResultSet YdbResults = 13;
 }
 
 message TEvQueryResponse {
@@ -383,6 +366,7 @@ message TExecuterTxResult {
     optional NKikimrMiniKQL.TResult Locks = 4;
     reserved 5; // (deprecated) Stats
     optional NYql.NDqProto.TDqExecutionStats Stats = 6;
+    repeated Ydb.ResultSet YdbResults = 7;
 };
 
 message TExecuterTxResponse {

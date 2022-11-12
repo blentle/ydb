@@ -183,24 +183,13 @@ class TDqTaskRunnerStatsView {
 public:
     TDqTaskRunnerStatsView() : IsDefined(false) {}
 
-    TDqTaskRunnerStatsView(TDqTaskRunnerStatsInplace&& stats)  // used in TTaskRunnerActor, cause it constructs stats on-the-fly, and cannot own it due to threaded implementation
-        : StatsInplace(std::move(stats))
-        , StatsPtr(nullptr)
-        , IsInplace(true)
-        , IsDefined(true) {
-    }
-
     TDqTaskRunnerStatsView(const TDqTaskRunnerStats* stats)   // used in TLocalTaskRunnerActor, cause it holds this stats, and does not modify it asyncronously from TDqAsyncComputeActor
-        : StatsInplace()
-        , StatsPtr(stats)
-        , IsInplace(false)
+        : StatsPtr(stats)
         , IsDefined(true) {
     }
 
     TDqTaskRunnerStatsView(const TDqTaskRunnerStats* stats, THashMap<ui32, const TDqAsyncOutputBufferStats*>&& sinkStats)
-        : StatsInplace()
-        , StatsPtr(stats)
-        , IsInplace(false)
+        : StatsPtr(stats)
         , IsDefined(true)
         , SinkStats(std::move(sinkStats)) {
     }
@@ -209,7 +198,7 @@ public:
         if (!IsDefined) {
             return nullptr;
         }
-        return IsInplace ? static_cast<const TTaskRunnerStatsBase*>(&StatsInplace) : StatsPtr;
+        return StatsPtr;
     }
 
     operator bool() const {
@@ -221,9 +210,7 @@ public:
     }
 
 private:
-    TDqTaskRunnerStatsInplace StatsInplace;
     const TDqTaskRunnerStats* StatsPtr;
-    bool IsInplace;
     bool IsDefined;
     THashMap<ui32, const TDqAsyncOutputBufferStats*> SinkStats;
 };

@@ -189,19 +189,13 @@ public:
         txState->ClearShardsInProgress();
 
         for (auto& shard : txState->Shards) {
-            TTabletId tabletId = context.SS->ShardInfos[shard.Idx].TabletID;
-            switch (shard.TabletType) {
-                case ETabletType::ColumnShard: {
-                    auto event = std::make_unique<TEvColumnShard::TEvNotifyTxCompletion>(ui64(OperationId.GetTxId()));
+            Y_VERIFY(shard.TabletType == ETabletType::ColumnShard);
 
-                    context.OnComplete.BindMsgToPipe(OperationId, tabletId, shard.Idx, event.release());
-                    txState->ShardsInProgress.insert(shard.Idx);
-                    break;
-                }
-                default: {
-                    Y_FAIL("unexpected tablet type");
-                }
-            }
+            TTabletId tabletId = context.SS->ShardInfos[shard.Idx].TabletID;
+            auto event = std::make_unique<TEvColumnShard::TEvNotifyTxCompletion>(ui64(OperationId.GetTxId()));
+
+            context.OnComplete.BindMsgToPipe(OperationId, tabletId, shard.Idx, event.release());
+            txState->ShardsInProgress.insert(shard.Idx);
 
             LOG_DEBUG_S(context.Ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
                         DebugHint() << " ProgressState"
@@ -308,10 +302,7 @@ public:
                 .NotChildren(NKikimrScheme::StatusNameConflict);
 
             if (!checks) {
-                TString explain = TStringBuilder() << "path fail checks"
-                                                   << ", path: " << path.PathString();
-                auto status = checks.GetStatus(&explain);
-                result->SetError(status, explain);
+                result->SetError(checks.GetStatus(), checks.GetError());
                 if (path.IsResolved() && path.Base()->IsOlapStore() && (path.Base()->PlannedToDrop() || path.Base()->Dropped())) {
                     result->SetPathDropTxId(ui64(path.Base()->DropTxId));
                     result->SetPathId(path.Base()->PathId.LocalPathId);
@@ -332,10 +323,7 @@ public:
                 .NotUnderDeleting();
 
             if (!checks) {
-                TString explain = TStringBuilder() << "parent path fail checks"
-                                                   << ", path: " << parent.PathString();
-                auto status = checks.GetStatus(&explain);
-                result->SetError(status, explain);
+                result->SetError(checks.GetStatus(), checks.GetError());
                 return result;
             }
         }

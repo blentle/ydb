@@ -204,6 +204,7 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
     TMaybeNode<TExprList> columnFamilies;
     TVector<TCoNameValueTuple> tableSettings;
     TVector<TCoNameValueTuple> alterActions;
+    TMaybeNode<TCoAtom> tableType;
     for (auto child : node) {
         if (auto maybeTuple = child.Maybe<TCoNameValueTuple>()) {
             auto tuple = maybeTuple.Cast();
@@ -278,6 +279,9 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
                 for (const auto& item : tuple.Value().Cast<TCoNameValueTupleList>()) {
                     alterActions.push_back(item);
                 }
+            } else if (name == "tableType") {
+                YQL_ENSURE(tuple.Value().Maybe<TCoAtom>());
+                tableType = tuple.Value().Cast<TCoAtom>();
             } else {
                 other.push_back(tuple);
             }
@@ -321,6 +325,7 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
     ret.ColumnFamilies = columnFamilies;
     ret.TableSettings = tableProfileSettings;
     ret.AlterActions = alterTableActions;
+    ret.TableType = tableType;
 
     return ret;
 }
@@ -609,7 +614,7 @@ static void GetToken(const TString& string, TString& out, const TTypeAnnotationC
         }
     } else if (p0 == "token" || p0 == "cluster") {
         const auto p1 = string.substr(separator + 1);
-        auto cred = type.FindCredential(p1);
+        auto cred = type.Credentials->FindCredential(p1);
         if (cred == nullptr) {
             if (p0 == "cluster") {
                 TStringBuf clusterName = p1;

@@ -426,10 +426,9 @@ message TColumnTableSchema {
     //optional int32 DefaultCompressionLevel = 7; // deprecated, not used before replace
     optional TCompressionOptions DefaultCompression = 8;
 
-    // Storage tiers specification (not ordered list).
-    // You could use any combination of the tiers in TColumnDataLifeCycle.Tiering in any order.
-    // If storage tier's Compression is not set it would be derived from table's DefaultCompression.
-    repeated TStorageTierConfig StorageTiers = 9;
+    // Storage tiers usage flag.
+    // Tiers detail information contains in storage_path/parent/.external_info/tiers
+    optional bool EnableTiering = 10 [default = false];
 }
 
 message TAlterColumnTableSchema {
@@ -647,6 +646,9 @@ message TColumnTableDescription {
     // Internal fields that make sure versions always increase when presets are switched
     optional uint64 SchemaPresetVersionAdj = 11;
     optional uint64 TtlSettingsPresetVersionAdj = 12;
+
+    // Channels for standalone column table
+    optional TColumnStorageConfig StorageConfig = 13;
 }
 
 message TAlterColumnTable {
@@ -886,6 +888,12 @@ message TS3Settings {
     optional uint32 HttpRequestTimeoutMs = 102;
     optional uint32 ConnectionTimeoutMs = 103;
 };
+
+message TTaskCleaner {
+    optional uint64 PathId = 1;
+    optional TS3Settings StorageSettings = 2;
+    optional string OwnerPath = 3;
+}
 
 message TBackupTask {
     optional string TableName = 1;

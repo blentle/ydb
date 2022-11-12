@@ -309,6 +309,7 @@ enum EServiceKikimr {
     YQ_RATE_LIMITER = 1155;
     FQ_QUOTA_PROXY = 1156;
     PUBLIC_HTTP = 1157;
+    FQ_CONTROL_PLANE_CONFIG = 1158;
 
     // 1024 - 1099 is reserved for nbs
 
@@ -326,6 +327,17 @@ enum EServiceKikimr {
 
     // DATASHARD section again
     DS_LOAD_TEST = 1400;
+
+    // MetadataProvider
+    METADATA_PROVIDER = 1500;
+
+    // Tiering
+    TX_TIERING = 1600;
+
+    // Background tasks
+    BG_TASKS = 1700;
+
+    METADATA_INITIALIZER = 1800;
 };
 
 message TActivity {
@@ -915,5 +927,17 @@ message TActivity {
         BLOB_DEPOT_BLOCKS_PROCESSOR_ACTOR = 581;
         TEST_SHARD_LOAD_ACTOR = 582;
         TEST_SHARD_VALIDATION_ACTOR = 583;
+        TX_TIERING_TIER_CLEANER = 584;
+        TX_TIERING_PATH_CLEANER = 585;
+        METADATA_INITIALIZER = 586;
+        TIERING_OWNER_ENRICH = 587;
+        TIERING_SNAPSHOT_ENRICH = 588;
+        HTTP_MON_LEGACY_ACTOR_REQUEST = 589;
+        HTTP_MON_LEGACY_INDEX_REQUEST = 590;
+        HTTP_MON_LEGACY_ACTOR_SERVICE = 591;
+        HTTP_MON_LEGACY_INDEX_SERVICE = 592;
+        HTTP_MON_SERVICE_NODE_REQUEST = 593;
+        HTTP_MON_SERVICE_MON_REQUEST = 594;
+        HTTP_MON_SERVICE_NODE_PROXY = 595;
     };
 };

@@ -3005,11 +3005,23 @@ void TSchemeShard::PersistColumnTable(NIceDb::TNiceDb& db, TPathId pathId, const
             db.Table<Schema::ColumnTablesAlters>().Key(pathId.LocalPathId).Update(
                 NIceDb::TUpdate<Schema::ColumnTablesAlters::AlterBody>(serializedAlterBody));
         }
+        if (tableInfo.StandaloneSharding) {
+            TString serializedOwnedShards;
+            Y_VERIFY(tableInfo.StandaloneSharding->SerializeToString(&serializedOwnedShards));
+            db.Table<Schema::ColumnTablesAlters>().Key(pathId.LocalPathId).Update(
+                NIceDb::TUpdate<Schema::ColumnTablesAlters::StandaloneSharding>(serializedOwnedShards));
+        }
     } else {
         db.Table<Schema::ColumnTables>().Key(pathId.LocalPathId).Update(
             NIceDb::TUpdate<Schema::ColumnTables::AlterVersion>(tableInfo.AlterVersion),
             NIceDb::TUpdate<Schema::ColumnTables::Description>(serialized),
             NIceDb::TUpdate<Schema::ColumnTables::Sharding>(serializedSharding));
+        if (tableInfo.StandaloneSharding) {
+            TString serializedOwnedShards;
+            Y_VERIFY(tableInfo.StandaloneSharding->SerializeToString(&serializedOwnedShards));
+            db.Table<Schema::ColumnTables>().Key(pathId.LocalPathId).Update(
+                NIceDb::TUpdate<Schema::ColumnTables::StandaloneSharding>(serializedOwnedShards));
+        }
     }
 }
 
@@ -3032,8 +3044,9 @@ void TSchemeShard::PersistColumnTableRemove(NIceDb::TNiceDb& db, TPathId pathId,
     }
 
     // Unlink table from olap store
-    if (OlapStores.contains(tableInfo->OlapStorePathId)) {
-        auto storeInfo = OlapStores.at(tableInfo->OlapStorePathId);
+    if (tableInfo->OlapStorePathId && *tableInfo->OlapStorePathId) {
+        Y_VERIFY(OlapStores.contains(*tableInfo->OlapStorePathId));
+        auto storeInfo = OlapStores.at(*tableInfo->OlapStorePathId);
         storeInfo->ColumnTablesUnderOperation.erase(pathId);
         storeInfo->ColumnTables.erase(pathId);
     }
@@ -3657,7 +3670,8 @@ NKikimrSchemeOp::TPathVersion TSchemeShard::GetPathVersion(const TPath& path) co
                 if (tableInfo->Description.HasSchema()) {
                     result.SetColumnTableSchemaVersion(tableInfo->Description.GetSchema().GetVersion());
                 } else if (tableInfo->Description.HasSchemaPresetId() && tableInfo->OlapStorePathId) {
-                    auto storeInfo = OlapStores.at(tableInfo->OlapStorePathId);
+                    Y_VERIFY(OlapStores.contains(*tableInfo->OlapStorePathId));
+                    auto& storeInfo = OlapStores.at(*tableInfo->OlapStorePathId);
                     auto& preset = storeInfo->SchemaPresets.at(tableInfo->Description.GetSchemaPresetId());
                     result.SetColumnTableSchemaVersion(tableInfo->Description.GetSchemaPresetVersionAdj() + preset.Version);
                 } else {
@@ -3768,7 +3782,7 @@ TSchemeShard::TSchemeShard(const TActorId &tablet, TTabletStorageInfo *info)
     , AllowConditionalEraseOperations(1, 0, 1)
     , AllowServerlessStorageBilling(0, 0, 1)
     , DisablePublicationsOfDropping(0, 0, 1)
-    , FillAllocatePQ(1, 0, 1)
+    , FillAllocatePQ(0, 0, 1)
     , SplitSettings()
     , IsReadOnlyMode(false)
     , ParentDomainLink(this)
@@ -3891,6 +3905,7 @@ void TSchemeShard::OnActivateExecutor(const TActorContext &ctx) {
 
     EnableBackgroundCompaction = appData->FeatureFlags.GetEnableBackgroundCompaction();
     EnableBackgroundCompactionServerless = appData->FeatureFlags.GetEnableBackgroundCompactionServerless();
+    EnableBorrowedSplitCompaction = appData->FeatureFlags.GetEnableBorrowedSplitCompaction();
     EnableMoveIndex = appData->FeatureFlags.GetEnableMoveIndex();
 
     ConfigureCompactionQueues(appData->CompactionConfig, ctx);
@@ -4042,6 +4057,7 @@ void TSchemeShard::StateWork(STFUNC_SIG) {
 
         //
         HFuncTraced(TEvColumnShard::TEvProposeTransactionResult, Handle);
+        HFuncTraced(NBackgroundTasks::TEvAddTaskResult, Handle);
         HFuncTraced(TEvColumnShard::TEvNotifyTxCompletionResult, Handle);
 
         // sequence shard
@@ -5006,6 +5022,38 @@ void TSchemeShard::Handle(TEvBlobDepot::TEvApplyConfigResult::TPtr& ev, const TA
     }
 }
 
+void TSchemeShard::Handle(NBackgroundTasks::TEvAddTaskResult::TPtr& ev, const TActorContext& ctx) {
+    LOG_DEBUG_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+        "Handle NBackgroundTasks::TEvAddTaskResult"
+        << ", at schemeshard: " << TabletID()
+        << ", message: " << ev->Get()->GetDebugString());
+    TOperationId id;
+    if (!id.DeserializeFromString(ev->Get()->GetTaskId())) {
+        LOG_ERROR_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+            "Got NBackgroundTasks::TEvAddTaskResult cannot parse operation id in result"
+            << ", message: " << ev->Get()->GetDebugString()
+            << ", at schemeshard: " << TabletID());
+        return;
+    }
+    if (!Operations.contains(id.GetTxId())) {
+        LOG_ERROR_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+            "Got NBackgroundTasks::TEvAddTaskResult for unknown txId, ignore it"
+            << ", txId: " << id.SerializeToString()
+            << ", message: " << ev->Get()->GetDebugString()
+            << ", at schemeshard: " << TabletID());
+        return;
+    }
+    if (!ev->Get()->IsSuccess()) {
+        LOG_ERROR_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+            "Got NBackgroundTasks::TEvAddTaskResult cannot execute"
+            << ", txId: " << id.SerializeToString()
+            << ", message: " << ev->Get()->GetDebugString()
+            << ", at schemeshard: " << TabletID());
+        return;
+    }
+    Execute(CreateTxOperationReply(id, ev), ctx);
+}
+
 void TSchemeShard::Handle(TEvColumnShard::TEvProposeTransactionResult::TPtr &ev, const TActorContext &ctx) {
     LOG_DEBUG_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
                 "Handle TEvProposeTransactionResult"
@@ -5402,39 +5450,31 @@ void TSchemeShard::RestartPipeTx(TTabletId tabletId, const TActorContext& ctx) {
         }
 
         TOperation::TPtr operation = Operations.at(txId);
-        TSubTxId subTxId = operation->FindRelatedPartByTabletId(tabletId, ctx);
 
-        for (auto related: PipeTracker.FindTablets(item)) {
-            ui64 pipeTrackerCookie = related.first;
-            auto relatedTabletId = TTabletId(related.second);
-
-            if (tabletId != relatedTabletId) {
-                continue;
-            }
-
-            if (!operation->PipeBindedMessages.contains(tabletId)) {
+        if (!operation->PipeBindedMessages.contains(tabletId)) {
+            for (ui64 pipeTrackerCookie : PipeTracker.FindCookies(ui64(txId), ui64(tabletId))) {
                 LOG_DEBUG_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
                             "Pipe attached message is not found, ignore event"
                                 << ", opId:" << TOperationId(txId, pipeTrackerCookie)
                                 << ", tableId: " << tabletId
                                 << ", at schemeshardId: " << TabletID());
-                continue;
             }
+            continue;
+        }
 
-            for (auto& items: operation->PipeBindedMessages.at(tabletId)) {
-                TPipeMessageId msgCookie = items.first;
-                TOperation::TPreSerialisedMessage& preSerialisedMessages = items.second;
+        for (auto& item: operation->PipeBindedMessages.at(tabletId)) {
+            TPipeMessageId msgCookie = item.first;
+            TOperation::TPreSerializedMessage& msg = item.second;
 
-                LOG_INFO_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
-                            "Pipe attached message is found and resent into the new pipe"
-                                << ", opId:" << TOperationId(txId, subTxId)
-                                << ", dst tableId: " << tabletId
-                                << ", msg type: " << preSerialisedMessages.first
-                                << ", msg cookie: " << msgCookie
-                                << ", at schemeshardId: " << TabletID());
+            LOG_INFO_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+                        "Pipe attached message is found and resent into the new pipe"
+                            << ", opId:" << msg.OpId
+                            << ", dst tableId: " << tabletId
+                            << ", msg type: " << msg.Type
+                            << ", msg cookie: " << msgCookie
+                            << ", at schemeshardId: " << TabletID());
 
-                PipeClientCache->Send(ctx, ui64(tabletId),  preSerialisedMessages.first, preSerialisedMessages.second, msgCookie.second);
-            }
+            PipeClientCache->Send(ctx, ui64(tabletId),  msg.Type, msg.Data, msgCookie.second);
         }
     }
 }
@@ -5954,9 +5994,7 @@ bool TSchemeShard::FillUniformPartitioning(TVector<TString>& rangeEnds, ui32 key
     return true;
 }
 
-void TSchemeShard::SetPartitioning(TPathId pathId, TOlapStoreInfo::TPtr storeInfo) {
-    const TVector<TShardIdx>& partitioning = storeInfo->ColumnShards;
-
+void TSchemeShard::SetPartitioning(TPathId pathId, const TVector<TShardIdx>& partitioning) {
     if (AppData()->FeatureFlags.GetEnableSystemViews()) {
         TVector<std::pair<ui64, ui64>> shardIndices;
         shardIndices.reserve(partitioning.size());
@@ -5969,6 +6007,14 @@ void TSchemeShard::SetPartitioning(TPathId pathId, TOlapStoreInfo::TPtr storeInf
         ev->ShardIndices.swap(shardIndices);
         Send(SysPartitionStatsCollector, ev.Release());
     }
+}
+
+void TSchemeShard::SetPartitioning(TPathId pathId, TOlapStoreInfo::TPtr storeInfo) {
+    SetPartitioning(pathId, storeInfo->ColumnShards);
+}
+
+void TSchemeShard::SetPartitioning(TPathId pathId, TColumnTableInfo::TPtr tableInfo) {
+    SetPartitioning(pathId, tableInfo->OwnedColumnShards);
 }
 
 void TSchemeShard::SetPartitioning(TPathId pathId, TTableInfo::TPtr tableInfo, TVector<TTableShardInfo>&& newPartitioning) {
@@ -6213,6 +6259,7 @@ void TSchemeShard::ApplyConsoleConfigs(const NKikimrConfig::TFeatureFlags& featu
 
     EnableBackgroundCompaction = featureFlags.GetEnableBackgroundCompaction();
     EnableBackgroundCompactionServerless = featureFlags.GetEnableBackgroundCompactionServerless();
+    EnableBorrowedSplitCompaction = featureFlags.GetEnableBorrowedSplitCompaction();
     EnableMoveIndex = featureFlags.GetEnableMoveIndex();
 }
 
@@ -6232,7 +6279,7 @@ void TSchemeShard::ConfigureStatsOperations(const NKikimrConfig::TSchemeShardCon
         auto txState = TTxState::ConvertToTxType(operationConfig.GetType());
         InFlightLimits[txState] = limit;
     }
-    
+
     if (InFlightLimits.empty()) {
         NKikimrConfig::TSchemeShardConfig_TInFlightCounterConfig inFlightCounterConfig;
         auto defaultInFlightLimit = inFlightCounterConfig.GetInFlightLimit();
@@ -6252,7 +6299,7 @@ void TSchemeShard::ConfigureStatsOperations(const NKikimrConfig::TSchemeShardCon
 bool TSchemeShard::CheckInFlightLimit(const TTxState::ETxType txType, TString& errStr) const {
     auto it = InFlightLimits.find(txType);
     if (it == InFlightLimits.end()) {
-        return true; 
+        return true;
     }
     if (it->second != 0 && TabletCounters->Simple()[TTxState::TxTypeInFlightCounter(txType)].Get() >= it->second)
     {
@@ -6261,7 +6308,7 @@ bool TSchemeShard::CheckInFlightLimit(const TTxState::ETxType txType, TString& e
                                             << ", limit: " << it->second;
         return false;
     }
-    
+
     return true;
 }
 

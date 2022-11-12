@@ -1,9 +1,16 @@
 #include "yql_issue.h"
+#include "yql_issue_message.h"
 
 #include <library/cpp/testing/unittest/registar.h>
 #include <ydb/library/yql/public/issue/protos/issue_message.pb.h>
 #include <ydb/library/yql/public/issue/yql_issue_message.h>
 #include <ydb/public/api/protos/ydb_issue_message.pb.h>
+
+#include <library/cpp/unicode/normalization/normalization.h>
+
+#include <util/charset/utf8.h>
+#include <util/charset/wide.h>
+#include <util/string/builder.h>
 
 #include <google/protobuf/message.h>
 #include <google/protobuf/descriptor.h>
@@ -46,13 +53,13 @@ void ensureMessageTypesSame(const Descriptor* a, const Descriptor* b, THashSet<T
 Y_UNIT_TEST_SUITE(IssueTest) {
     Y_UNIT_TEST(Ascii) {
         TIssue issue1("тест abc");
-        UNIT_ASSERT_VALUES_EQUAL(issue1.Message, "тест abc");
+        UNIT_ASSERT_VALUES_EQUAL(issue1.GetMessage(), "тест abc");
         TIssue issue2("\xFF abc");
-        UNIT_ASSERT_VALUES_EQUAL(issue2.Message, "? abc");
+        UNIT_ASSERT_VALUES_EQUAL(issue2.GetMessage(), "? abc");
         TIssue issue3("");
-        UNIT_ASSERT_VALUES_EQUAL(issue3.Message, "");
+        UNIT_ASSERT_VALUES_EQUAL(issue3.GetMessage(), "");
         TIssue issue4("abc");
-        UNIT_ASSERT_VALUES_EQUAL(issue4.Message, "abc");
+        UNIT_ASSERT_VALUES_EQUAL(issue4.GetMessage(), "abc");
     }
 }
 
@@ -135,5 +142,47 @@ Y_UNIT_TEST_SUITE(ToOneLineStringTest) {
         issues.AddIssue(issue);
         issues.AddIssue(TPosition(100, 2, "abc.file"), "my\nmessage");
         UNIT_ASSERT_STRINGS_EQUAL(issues.ToOneLineString(), "[ { file.abc:34:12: Error: error subissue: { <main>: Error: suberror } } { abc.file:2:100: Error: my message } ]");
+    }
+}
+
+Y_UNIT_TEST_SUITE(ToMessage) {
+    Y_UNIT_TEST(NonUtf8) {
+        const TString nonUtf8String = "\x7f\xf8\xf7\xff\xf8\x1f\xff\xf2\xaf\xbf\xfe\xfa\xf5\x7f\xfe\xfa\x27\x20\x7d\x20\x5d\x2e";
+        UNIT_ASSERT(!IsUtf(nonUtf8String));
+        TIssue issue;
+        issue.SetMessage(nonUtf8String);
+
+        Ydb::Issue::IssueMessage msg;
+        IssueToMessage(issue, &msg);
+        TString serialized;
+        UNIT_ASSERT(msg.SerializeToString(&serialized));
+        Ydb::Issue::IssueMessage msg2;
+        UNIT_ASSERT(msg2.ParseFromString(serialized));
+    }
+}
+
+Y_UNIT_TEST_SUITE(EscapeNonUtf8) {
+    Y_UNIT_TEST(Escape) {
+        const TString nonUtf8String = "\xfe\xfa\xf5\xc2";
+        UNIT_ASSERT(!IsUtf(nonUtf8String));
+
+        // Check that our escaping correctly processes unicode pairs
+        const TString toNormalize = "Ёлка";
+        const TString nfd = WideToUTF8(Normalize<NUnicode::ENormalization::NFD>(UTF8ToWide(toNormalize))); // dots over 'ё' will be separate unicode symbol
+        const TString nfc = WideToUTF8(Normalize<NUnicode::ENormalization::NFC>(UTF8ToWide(toNormalize))); // dots over 'ё' will be with with their letter
+        UNIT_ASSERT_STRINGS_UNEQUAL(nfc, nfd);
+        std::pair<TString, TString> nonUtf8Messages[] = {
+            { nonUtf8String, "????" },
+            { TStringBuilder() << nonUtf8String << "Failed to parse file " << nonUtf8String << "עברית" << nonUtf8String, "????Failed to parse file ????עברית????" },
+            { nfd, nfd },
+            { nfc, nfc },
+            { TStringBuilder() << nfc << nonUtf8String << nfd, TStringBuilder() << nfc << "????" << nfd },
+            { TStringBuilder() << nfd << nonUtf8String << nfc, TStringBuilder() << nfd << "????" << nfc },
+        };
+
+        for (const auto& [src, dst] : nonUtf8Messages) {
+            TIssue issue(src);
+            UNIT_ASSERT_STRINGS_EQUAL(issue.GetMessage(), dst);
+        }
     }
 }

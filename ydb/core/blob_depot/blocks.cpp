@@ -64,6 +64,7 @@ namespace NKikimr::NBlobDepot {
         ui32 BlocksPending = 0;
         ui32 RetryCount = 0;
         THashSet<ui32> NodesWaitingForPushResult;
+        std::weak_ptr<TToken> Token;
 
     public:
         static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
@@ -78,9 +79,28 @@ namespace NKikimr::NBlobDepot {
             , NodeId(nodeId)
             , IssuerGuid(issuerGuid)
             , Response(std::move(response))
+            , Token(Self->Token)
         {}
 
+        bool CheckIfObsolete() {
+            if (Token.expired()) {
+                return true; // tablet is dead
+            }
+            auto& block = Self->BlocksManager->Blocks[TabletId];
+            if (block.BlockedGeneration == BlockedGeneration && block.IssuerGuid == IssuerGuid) {
+                return false;
+            } else {
+                auto& r = Response->Get<TEvBlobDepot::TEvBlockResult>()->Record;
+                r.SetStatus(NKikimrProto::ALREADY);
+                Finish();
+                return true;
+            }
+        }
+
         void Bootstrap() {
+            if (CheckIfObsolete()) {
+                return;
+            }
             IssueNotificationsToAgents();
             Become(&TThis::StateFunc, AgentsWaitTime, new TEvents::TEvWakeup);
         }
@@ -162,10 +182,12 @@ namespace NKikimr::NBlobDepot {
                     }
                     break;
 
-                case NKikimrProto::ALREADY:
-                    // race, but this is not possible in current implementation
-                    // ORLY? :)
-                    Y_FAIL(); // FIXME: fails
+                case NKikimrProto::ALREADY: {
+                    auto& r = Response->Get<TEvBlobDepot::TEvBlockResult>()->Record;
+                    r.SetStatus(NKikimrProto::ALREADY);
+                    Finish();
+                    break;
+                }
 
                 case NKikimrProto::ERROR:
                 default:
@@ -186,12 +208,17 @@ namespace NKikimr::NBlobDepot {
             PassAway();
         }
 
-        STRICT_STFUNC(StateFunc,
-            hFunc(TEvBlobStorage::TEvBlockResult, Handle);
-            hFunc(TEvBlobDepot::TEvPushNotifyResult, Handle);
-            cFunc(TEvents::TSystem::Wakeup, IssueBlocksToStorage);
-            cFunc(TEvents::TSystem::Poison, PassAway);
-        )
+        STATEFN(StateFunc) {
+            if (CheckIfObsolete()) {
+                return;
+            }
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvBlobStorage::TEvBlockResult, Handle);
+                hFunc(TEvBlobDepot::TEvPushNotifyResult, Handle);
+                cFunc(TEvents::TSystem::Wakeup, IssueBlocksToStorage);
+                cFunc(TEvents::TSystem::Poison, PassAway);
+            }
+        }
     };
 
     void TBlobDepot::TBlocksManager::AddBlockOnLoad(ui64 tabletId, ui32 blockedGeneration, ui64 issuerGuid) {

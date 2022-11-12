@@ -7,6 +7,7 @@
 
 
 add_subdirectory(auth)
+add_subdirectory(bg_tasks)
 add_subdirectory(cms)
 add_subdirectory(datastreams)
 add_subdirectory(discovery)
@@ -14,6 +15,7 @@ add_subdirectory(fq)
 add_subdirectory(kesus)
 add_subdirectory(lib)
 add_subdirectory(local_discovery)
+add_subdirectory(metadata)
 add_subdirectory(monitoring)
 add_subdirectory(persqueue_cluster_discovery)
 add_subdirectory(persqueue_v1)

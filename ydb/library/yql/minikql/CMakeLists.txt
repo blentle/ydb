@@ -11,6 +11,7 @@ add_subdirectory(benchmark)
 add_subdirectory(codegen)
 add_subdirectory(comp_nodes)
 add_subdirectory(computation)
+add_subdirectory(datetime)
 add_subdirectory(dom)
 add_subdirectory(invoke_builtins)
 add_subdirectory(jsonpath)
@@ -41,6 +42,7 @@ target_link_libraries(library-yql-minikql PUBLIC
   yql-public-udf
   public-udf-tz
   library-yql-utils
+  ydb-library-uuid
 )
 target_sources(library-yql-minikql PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/minikql/aligned_page_pool.cpp

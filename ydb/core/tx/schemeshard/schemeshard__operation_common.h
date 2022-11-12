@@ -407,8 +407,10 @@ public:
 
         NIceDb::TNiceDb db(context.GetDB());
 
-        path->StepCreated = step;
-        context.SS->PersistCreateStep(db, pathId, step);
+        if (path->StepCreated == InvalidStepId) {
+            path->StepCreated = step;
+            context.SS->PersistCreateStep(db, pathId, step);
+        }
 
         Y_VERIFY(context.SS->SubDomains.contains(pathId));
         auto subDomain = context.SS->SubDomains.at(pathId);
@@ -885,9 +887,12 @@ public:
         // OlapStore tracks all tables that are under operation, make sure to unlink
         if (context.SS->ColumnTables.contains(pathId)) {
             auto tableInfo = context.SS->ColumnTables.at(pathId);
-            if (context.SS->OlapStores.contains(tableInfo->OlapStorePathId)) {
-                auto storeInfo = context.SS->OlapStores.at(tableInfo->OlapStorePathId);
-                storeInfo->ColumnTablesUnderOperation.erase(pathId);
+            if (tableInfo->OlapStorePathId) {
+                auto& storePathId = *tableInfo->OlapStorePathId;
+                if (context.SS->OlapStores.contains(storePathId)) {
+                    auto storeInfo = context.SS->OlapStores.at(storePathId);
+                    storeInfo->ColumnTablesUnderOperation.erase(pathId);
+                }
             }
         }
 
@@ -1183,8 +1188,10 @@ public:
 
         NIceDb::TNiceDb db(context.GetDB());
 
-        path->StepCreated = step;
-        context.SS->PersistCreateStep(db, pathId, step);
+        if (path->StepCreated == InvalidStepId) {
+            path->StepCreated = step;
+            context.SS->PersistCreateStep(db, pathId, step);
+        }
 
         if (txState->TxType == TTxState::TxCreatePQGroup  || txState->TxType == TTxState::TxAllocatePQ) {
             auto parentDir = context.SS->PathsById.at(path->ParentPathId);
@@ -1390,8 +1397,10 @@ public:
 
         NIceDb::TNiceDb db(context.GetDB());
 
-        path->StepCreated = step;
-        context.SS->PersistCreateStep(db, pathId, step);
+        if (path->StepCreated == InvalidStepId) {
+            path->StepCreated = step;
+            context.SS->PersistCreateStep(db, pathId, step);
+        }
 
         TBlockStoreVolumeInfo::TPtr volume = context.SS->BlockStoreVolumes.at(pathId);
 

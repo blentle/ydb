@@ -28,6 +28,7 @@ struct GroupByOptions : public arrow::compute::ScalarAggregateOptions {
 
     std::shared_ptr<arrow::Schema> schema;
     std::vector<Assign> assigns;
+    bool has_nullable_key = true;
 };
 }
 #endif
@@ -41,7 +42,7 @@ struct GroupByOptions : public arrow::compute::ScalarAggregateOptions {
 #include <contrib/libs/apache/arrow/cpp/src/arrow/result.h>
 #include <ydb/core/util/yverify_stream.h>
 
-namespace NKikimr::NArrow {
+namespace NKikimr::NSsa {
 
 const char * GetFunctionName(EOperation op) {
     switch (op) {
@@ -549,6 +550,7 @@ arrow::Status TProgramStep::ApplyAggregates(
         CH::GroupByOptions funcOpts;
         funcOpts.schema = batch.schema;
         funcOpts.assigns.reserve(numResultColumns);
+        funcOpts.has_nullable_key = NullableGroupByKeys;
 
         for (auto& assign : GroupBy) {
             funcOpts.assigns.emplace_back(GetGroupByAssign(assign));
@@ -608,7 +610,7 @@ arrow::Status TProgramStep::ApplyFilters(TDatumBatch& batch) const {
 
     std::vector<bool> bits;
     for (auto& f : filters) {
-        bits = CombineFilters(std::move(bits), std::move(f));
+        bits = NArrow::CombineFilters(std::move(bits), std::move(f));
     }
 
     if (bits.size()) {

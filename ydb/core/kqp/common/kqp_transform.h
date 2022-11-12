@@ -87,12 +87,8 @@ struct TKqpTxLocks {
 using TParamValueMap = THashMap<TString, NKikimrMiniKQL::TParams>;
 
 struct TDeferredEffect {
-    NYql::NNodes::TMaybeNode<NYql::NNodes::TExprBase> Node;
     std::shared_ptr<const NKqpProto::TKqpPhyTx> PhysicalTx;
     TParamValueMap Params;
-
-    explicit TDeferredEffect(const NYql::NNodes::TExprBase& node)
-        : Node(node) {}
 
     explicit TDeferredEffect(std::shared_ptr<const NKqpProto::TKqpPhyTx>&& physicalTx)
         : PhysicalTx(std::move(physicalTx)) {}
@@ -104,10 +100,6 @@ struct TDeferredEffects {
 public:
     bool Empty() const {
         return DeferredEffects.empty();
-    }
-
-    std::optional<TKqpTransactionInfo::EEngine> GetEngine() const {
-        return Engine;
     }
 
     ui64 Size() const {
@@ -124,21 +116,7 @@ public:
 
 private:
     [[nodiscard]]
-    bool Add(const NYql::NNodes::TExprBase& node) {
-        if (Engine.has_value() && *Engine != TKqpTransactionInfo::EEngine::OldEngine) {
-            return false;
-        }
-        Engine.emplace(TKqpTransactionInfo::EEngine::OldEngine);
-        DeferredEffects.emplace_back(node);
-        return true;
-    }
-
-    [[nodiscard]]
     bool Add(std::shared_ptr<const NKqpProto::TKqpPhyTx>&& physicalTx, TParamValueMap&& params) {
-        if (Engine.has_value() && *Engine != TKqpTransactionInfo::EEngine::NewEngine) {
-            return false;
-        }
-        Engine.emplace(TKqpTransactionInfo::EEngine::NewEngine);
         DeferredEffects.emplace_back(std::move(physicalTx));
         DeferredEffects.back().Params = std::move(params);
         return true;
@@ -146,12 +124,10 @@ private:
 
     void Clear() {
         DeferredEffects.clear();
-        Engine.reset();
     }
 
 private:
     TVector<TDeferredEffect> DeferredEffects;
-    std::optional<TKqpTransactionInfo::EEngine> Engine;
 
     friend class TKqpTransactionContext;
 };
@@ -172,11 +148,6 @@ public:
 
     void ClearDeferredEffects() {
         DeferredEffects.Clear();
-    }
-
-    [[nodiscard]]
-    bool AddDeferredEffect(const NYql::NNodes::TExprBase& node) {
-        return DeferredEffects.Add(node);
     }
 
     [[nodiscard]]
@@ -221,26 +192,9 @@ public:
         DeferredEffects.Clear();
         ParamsState = MakeIntrusive<TParamsState>();
         SnapshotHandle.Snapshot = IKqpGateway::TKqpSnapshot::InvalidSnapshot;
-        ForceNewEngineSettings = {};
     }
 
     TKqpTransactionInfo GetInfo() const;
-
-    void ForceOldEngine() {
-        auto engine = DeferredEffects.GetEngine();
-        YQL_ENSURE(!engine || engine == TKqpTransactionInfo::EEngine::OldEngine);
-        YQL_ENSURE(!ForceNewEngineSettings.ForcedNewEngine || *ForceNewEngineSettings.ForcedNewEngine == false);
-        ForceNewEngineSettings.ForcedNewEngine = false;
-    }
-
-    void ForceNewEngine(ui32 percent, ui32 level) {
-        auto engine = DeferredEffects.GetEngine();
-        YQL_ENSURE(!engine || engine == TKqpTransactionInfo::EEngine::NewEngine);
-        YQL_ENSURE(!ForceNewEngineSettings.ForcedNewEngine.has_value());
-        ForceNewEngineSettings.ForcedNewEngine = true;
-        ForceNewEngineSettings.ForceNewEnginePercent = percent;
-        ForceNewEngineSettings.ForceNewEngineLevel = level;
-    }
 
     void SetIsolationLevel(const Ydb::Table::TransactionSettings& settings) {
         switch (settings.tx_mode_case()) {
@@ -296,8 +250,6 @@ public:
     TIntrusivePtr<TParamsState> ParamsState;
 
     IKqpGateway::TKqpSnapshotHandle SnapshotHandle;
-
-    TKqpForceNewEngineState ForceNewEngineSettings;
 };
 
 class TLogExprTransformer {

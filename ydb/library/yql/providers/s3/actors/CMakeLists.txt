@@ -10,6 +10,7 @@
 add_library(providers-s3-actors)
 target_compile_options(providers-s3-actors PRIVATE
   -DARCADIA_BUILD
+  -DUSE_PARQUET
   -DUSE_CURRENT_UDF_ABI_VERSION
 )
 target_include_directories(providers-s3-actors PRIVATE
@@ -31,6 +32,7 @@ target_link_libraries(providers-s3-actors PUBLIC
   providers-common-http_gateway
   common-schema-mkql
   common-token_accessor-client
+  providers-s3-common
   providers-s3-compressors
   providers-s3-proto
   providers-s3-range_helpers

@@ -149,6 +149,8 @@ struct TAppData {
     TVector<TString> AdministrationAllowedSIDs; // users/groups which allowed to perform administrative tasks
     TVector<TString> DefaultUserSIDs;
     TString AllAuthenticatedUsers;
+    TString TenantName;
+
     TResourceProfilesPtr ResourceProfiles;
 
     TProgramShouldContinue * const KikimrShouldContinue;
@@ -163,7 +165,9 @@ struct TAppData {
 
     // Used to disable object deletion in schemeshard for cleanup tests
     bool DisableSchemeShardCleanupOnDropForTest = false;
-    
+
+    TMaybe<ui32> ZstdBlockSizeForTest;
+
     // Used to disable checking nodes with sys tablets only in cms
     bool  DisableCheckingSysNodesCms = false;
 

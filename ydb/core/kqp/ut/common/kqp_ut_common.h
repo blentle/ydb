@@ -2,7 +2,6 @@
 
 #include <ydb/core/testlib/test_client.h>
 
-#include <ydb/public/lib/experimental/ydb_experimental.h>
 #include <ydb/public/lib/yson_value/ydb_yson_value.h>
 #include <ydb/public/sdk/cpp/client/ydb_scheme/scheme.h>
 #include <ydb/public/sdk/cpp/client/ydb_table/table.h>
@@ -37,8 +36,6 @@
     template <bool OPT>                                                                                            \
     void TTestCase##N<OPT>::Execute_(NUnitTest::TTestContext& ut_context Y_DECLARE_UNUSED)
 
-#define Y_UNIT_TEST_NEW_ENGINE(N) Y_UNIT_TEST_TWIN(N, UseNewEngine)
-
 #define Y_UNIT_TEST_QUAD(N, OPT1, OPT2)                                                                                              \
     template<bool OPT1, bool OPT2> void N(NUnitTest::TTestContext&);                                                                 \
     struct TTestRegistration##N {                                                                                                    \
@@ -53,17 +50,15 @@
     template<bool OPT1, bool OPT2>                                                                                                   \
     void N(NUnitTest::TTestContext&)
 
-template <bool UseNewEngine, bool ForceVersionV1 = false>
+template <bool ForceVersionV1>
 TString Query(const TString& tmpl) {
     return TStringBuilder()
         << (ForceVersionV1 ? "--!syntax_v1\n" : "")
-        << "PRAGMA Kikimr.UseNewEngine = '" << (UseNewEngine ? "true" : "false") << "';" << Endl
-        //<< (UseNewEngine ? "PRAGMA Kikimr.UseNewEngine = 'true';" : "")
         << tmpl;
 }
 
-#define Q_(expr) Query<UseNewEngine, false>(expr)
-#define Q1_(expr) Query<UseNewEngine, true>(expr)
+#define Q_(expr) Query<false>(expr)
+#define Q1_(expr) Query<true>(expr)
 
 namespace NKikimr {
 namespace NKqp {
@@ -85,14 +80,7 @@ struct TKikimrSettings: public TTestFeatureFlagsHolder<TKikimrSettings> {
 
     TKikimrSettings()
     {
-        // default value for tests, can be overwritten by SetFeatureFlags()
-        SetEnableKqpSessionActor(false);
         this->SetEnableKqpScanQueryStreamLookup(true);
-    }
-
-    TKikimrSettings& SetEnableKqpSessionActor(bool enable) {
-        AppConfig.MutableTableServiceConfig()->SetEnableKqpSessionActor(enable);
-        return *this;
     }
 
     TKikimrSettings& SetAppConfig(const NKikimrConfig::TAppConfig& value) { AppConfig = value; return *this; }
@@ -164,12 +152,11 @@ private:
     THolder<NYdb::TDriver> Driver;
 };
 
-inline TKikimrRunner KikimrRunnerEnableSessionActor(bool enable, TVector<NKikimrKqp::TKqpSetting> kqpSettings = {},
+inline TKikimrRunner DefaultKikimrRunner(TVector<NKikimrKqp::TKqpSetting> kqpSettings = {},
     const NKikimrConfig::TAppConfig& appConfig = {})
 {
     auto settings = TKikimrSettings()
         .SetAppConfig(appConfig)
-        .SetEnableKqpSessionActor(enable)
         .SetKqpSettings(kqpSettings);
 
     return TKikimrRunner{settings};
@@ -182,7 +169,6 @@ struct TCollectedStreamResult {
     ui64 RowsCount = 0;
 };
 
-TCollectedStreamResult CollectStreamResult(NYdb::NExperimental::TStreamPartIterator& it);
 TCollectedStreamResult CollectStreamResult(NYdb::NTable::TScanQueryPartIterator& it);
 
 enum class EIndexTypeSql {
@@ -243,7 +229,6 @@ inline NYdb::NTable::TDataQueryResult ExecQueryAndTestResult(NYdb::NTable::TSess
     return ExecQueryAndTestResult(session, query, NYdb::TParamsBuilder().Build(), expectedYson);
 }
 
-TString StreamResultToYson(NYdb::NExperimental::TStreamPartIterator& it, TVector<TString>* profiles = nullptr);
 TString StreamResultToYson(NYdb::NTable::TScanQueryPartIterator& it);
 TString StreamResultToYson(NYdb::NScripting::TYqlResultPartIterator& it);
 TString StreamResultToYson(NYdb::NTable::TTablePartIterator& it);

@@ -17,13 +17,6 @@ public:
         : SessionCtx(sessionCtx) {}
 
 private:
-    TStatus HandleClusterConfig(TKiClusterConfig node, TExprContext& ctx) override {
-        Y_UNUSED(node);
-        Y_UNUSED(ctx);
-
-        return TStatus::Ok;
-    }
-
     TStatus HandleWriteTable(TKiWriteTable node, TExprContext& ctx) override {
         Y_UNUSED(ctx);
 
@@ -139,7 +132,10 @@ private:
                 auto mode = settings.Mode.Cast();
 
                 if (mode == "drop") {
-                    SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath());
+                    auto tableType = settings.TableType.IsValid()
+                        ? GetTableTypeFromString(settings.TableType.Cast())
+                        : ETableType::Table; // v0 support
+                    SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath(), tableType);
                     return TStatus::Ok;
                 } else if (
                     mode == "upsert" ||
@@ -190,6 +186,11 @@ private:
                 }
 
                 auto mode = settings.Mode.Cast();
+
+                auto tableType = settings.TableType.IsValid()
+                    ? GetTableTypeFromString(settings.TableType.Cast())
+                    : ETableType::Table; // v0 support
+
                 if (mode == "create") {
                     if (!settings.Columns) {
                         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
@@ -197,7 +198,7 @@ private:
                         return TStatus::Error;
                     }
 
-                    SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath());
+                    SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath(), tableType);
                     return TStatus::Ok;
                 } else if (mode == "alter") {
                     if (!settings.AlterActions) {
@@ -206,7 +207,7 @@ private:
                         return TStatus::Error;
                     }
 
-                    SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath());
+                    SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath(), tableType);
                     return TStatus::Ok;
                 }
 
@@ -256,40 +257,8 @@ private:
     }
 
     TStatus HandleKql(TCallable node, TExprContext& ctx) override {
+        Y_UNUSED(node);
         Y_UNUSED(ctx);
-
-        if (auto call = node.Maybe<TKiSelectRow>()) {
-            auto cluster = call.Cast().Cluster().Value();
-            auto table = call.Cast().Table();
-
-            SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), TString(table.Path()));
-            return TStatus::Ok;
-        }
-
-        if (auto call = node.Maybe<TKiSelectRangeBase>()) {
-            auto cluster = call.Cast().Cluster().Value();
-            auto table = call.Cast().Table();
-
-            SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), TString(table.Path()));
-            return TStatus::Ok;
-        }
-
-        if (auto call = node.Maybe<TKiUpdateRow>()) {
-
-            auto cluster = call.Cast().Cluster().Value();
-            auto table = call.Cast().Table();
-
-            SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), TString(table.Path()));
-            return TStatus::Ok;
-        }
-
-        if (auto call = node.Maybe<TKiEraseRow>()) {
-            auto cluster = call.Cast().Cluster().Value();
-            auto table = call.Cast().Table();
-
-            SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), TString(table.Path()));
-            return TStatus::Ok;
-        }
 
         return TStatus::Ok;
     }
@@ -333,32 +302,9 @@ public:
     }
 
     TExprNode::TPtr GetClusterInfo(const TString& cluster, TExprContext& ctx) override {
-        auto config = Gateway->GetClusterConfig(cluster);
-        if (!config) {
-            return {};
-        }
-
-        TPositionHandle pos;
-
-        TVector<TExprBase> locators;
-        auto& grpcData = config->GetGrpc();
-        for (size_t index = 0; index < grpcData.LocatorsSize(); ++index) {
-            locators.push_back(Build<TCoAtom>(ctx, pos)
-                .Value(grpcData.GetLocators(index))
-                .Done());
-        }
-
-        return Build<TKiClusterConfig>(ctx, pos)
-            .GrpcData<TKiGrpcData>()
-                .Locators<TCoAtomList>()
-                    .Add(locators)
-                    .Build()
-                .TimeoutMs<TCoAtom>().Build(ToString(grpcData.GetTimeoutMs()))
-                .MaxMessageSizeBytes<TCoAtom>().Build(ToString(grpcData.GetMaxMessageSizeBytes()))
-                .MaxInFlight<TCoAtom>().Build(ToString(grpcData.GetMaxInFlight()))
-                .Build()
-            .TvmId<TCoAtom>().Build(ToString(config->GetTvmId()))
-            .Done().Ptr();
+        Y_UNUSED(cluster);
+        Y_UNUSED(ctx);
+        return {};
     }
 
     IGraphTransformer& GetIntentDeterminationTransformer() override {
@@ -494,11 +440,15 @@ public:
 
                 if (mode == "drop") {
                     YQL_ENSURE(!settings.Columns);
+                    auto tableType = settings.TableType.IsValid()
+                        ? settings.TableType.Cast()
+                        : Build<TCoAtom>(ctx, node->Pos()).Value("table").Done(); // v0 support
                     return Build<TKiDropTable>(ctx, node->Pos())
                         .World(node->Child(0))
                         .DataSink(node->Child(1))
                         .Table().Build(key.GetTablePath())
                         .Settings(settings.Other)
+                        .TableType(tableType)
                         .Done()
                         .Ptr();
                 } else if (mode == "update") {
@@ -537,6 +487,9 @@ public:
             case TKikimrKey::Type::TableScheme: {
                 NCommon::TWriteTableSettings settings = NCommon::ParseWriteTableSettings(TExprList(node->Child(4)), ctx);
                 YQL_ENSURE(settings.Mode);
+                auto tableType = settings.TableType.IsValid()
+                    ? settings.TableType.Cast()
+                    : Build<TCoAtom>(ctx, node->Pos()).Value("table").Done(); // v0 support
                 auto mode = settings.Mode.Cast();
                 if (mode == "create") {
                     YQL_ENSURE(settings.Columns);
@@ -563,6 +516,7 @@ public:
                         .PartitionBy(settings.PartitionBy.Cast())
                         .ColumnFamilies(settings.ColumnFamilies.Cast())
                         .TableSettings(settings.TableSettings.Cast())
+                        .TableType(tableType)
                         .Done()
                         .Ptr();
                 } else if (mode == "alter") {
@@ -581,6 +535,7 @@ public:
                         .DataSink(node->Child(1))
                         .Table().Build(key.GetTablePath())
                         .Actions(settings.AlterActions.Cast())
+                        .TableType(tableType)
                         .Done()
                         .Ptr();
                 } else {
@@ -701,10 +656,6 @@ IGraphTransformer::TStatus TKiSinkVisitorTransformer::DoTransform(TExprNode::TPt
     output = input;
 
     auto callable = TCallable(input);
-
-    if (auto node = callable.Maybe<TKiClusterConfig>()) {
-        return HandleClusterConfig(node.Cast(), ctx);
-    }
 
     if (auto node = callable.Maybe<TKiWriteTable>()) {
         return HandleWriteTable(node.Cast(), ctx);

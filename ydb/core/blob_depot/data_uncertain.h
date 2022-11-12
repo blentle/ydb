@@ -15,7 +15,6 @@ namespace NKikimr::NBlobDepot {
         struct TResolveOnHold : TSimpleRefCount<TResolveOnHold> {
             TResolveResultAccumulator Result;
             ui32 NumUncertainKeys = 0;
-            std::unordered_set<TKey> KeysToBeFilteredOut;
 
             TResolveOnHold(TResolveResultAccumulator&& result)
                 : Result(std::move(result))
@@ -35,7 +34,7 @@ namespace NKikimr::NBlobDepot {
             std::vector<TIntrusivePtr<TResolveOnHold>> DependentRequests;
 
             // blob queries issued and replied
-            std::unordered_map<TLogoBlobID, EKeyBlobState> BlobState;
+            std::unordered_map<TLogoBlobID, std::tuple<EKeyBlobState, TString>> BlobState;
         };
 
         using TKeys = std::map<TKey, TKeyContext>;
@@ -48,6 +47,22 @@ namespace NKikimr::NBlobDepot {
         TKeys Keys;
         std::unordered_map<TLogoBlobID, TBlobContext> Blobs;
 
+        ui64 NumKeysQueried = 0;
+        ui64 NumGetsIssued = 0;
+        ui64 NumKeysResolved = 0;
+        ui64 NumKeysUnresolved = 0;
+        ui64 NumKeysDropped = 0;
+
+        friend void Out<EKeyBlobState>(IOutputStream& s, EKeyBlobState value) {
+            switch (value) {
+                case EKeyBlobState::INITIAL:            s << "INITIAL";             break;
+                case EKeyBlobState::QUERY_IN_FLIGHT:    s << "QUERY_IN_FLIGHT";     break;
+                case EKeyBlobState::CONFIRMED:          s << "CONFIRMED";           break;
+                case EKeyBlobState::WASNT_WRITTEN:      s << "WASNT_WRITTEN";       break;
+                case EKeyBlobState::ERROR:              s << "ERROR";               break;
+            }
+        }
+
     public:
         TUncertaintyResolver(TBlobDepot *self);
         void PushResultWithUncertainties(TResolveResultAccumulator&& result, std::deque<TKey>&& uncertainties);
@@ -56,10 +71,12 @@ namespace NKikimr::NBlobDepot {
         void DropKey(const TKey& key);
         void Handle(TEvBlobStorage::TEvGetResult::TPtr ev);
 
+        void RenderMainPage(IOutputStream& s);
+
     private:
-        void FinishBlob(TLogoBlobID id, EKeyBlobState state);
+        void FinishBlob(TLogoBlobID id, EKeyBlobState state, const TString& errorReason);
         void CheckAndFinishKeyIfPossible(TKeys::value_type *keyRecord);
-        void FinishKey(const TKey& key, bool success);
+        void FinishKey(const TKey& key, NKikimrProto::EReplyStatus status, const TString& errorReason);
     };
 
 } // NKikimr::NBlobDepot

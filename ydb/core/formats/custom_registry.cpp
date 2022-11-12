@@ -1,7 +1,7 @@
 #include "custom_registry.h"
 
-#include "functions.h"
-#include "func_common.h"
+#include <ydb/library/arrow_kernels/functions.h>
+#include <ydb/library/arrow_kernels/func_common.h>
 #include "program.h"
 
 #include <util/system/yassert.h>
@@ -16,6 +16,9 @@
 #endif
 
 namespace cp = ::arrow::compute;
+
+using namespace NKikimr::NKernels;
+using namespace NKikimr::NSsa;
 
 namespace NKikimr::NArrow {
 

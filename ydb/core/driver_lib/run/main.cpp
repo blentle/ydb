@@ -21,6 +21,8 @@
 #include <sys/mman.h>
 #endif
 
+#include <filesystem>
+
 namespace NKikimr {
 
 int MainRun(const TKikimrRunConfig& runConfig, std::shared_ptr<TModuleFactories> factories) {
@@ -70,6 +72,7 @@ int MainRun(const TKikimrRunConfig& runConfig, std::shared_ptr<TModuleFactories>
         configParser.SetupGlobalOpts(opts);
         NMsgBusProxy::TMsgBusClientConfig mbusConfig;
         mbusConfig.ConfigureLastGetopt(opts, "mb-");
+        opts.AddLongOption("ca-file", "Path to a file containing the PEM encoding of the server root certificates for tls connections.\n").RequiredArgument("PATH");
         NDriverClient::HideOptions(opts);
         opts.AddLongOption('s', "server", "Server address to connect (default $KIKIMR_SERVER)").RequiredArgument("ADDR[:NUM]");
         opts.AddLongOption('k', "token", "Security token").RequiredArgument("TOKEN");
@@ -81,7 +84,7 @@ int MainRun(const TKikimrRunConfig& runConfig, std::shared_ptr<TModuleFactories>
                 .NoArgument().Handler(&PrintAllocatorInfoAndExit);
         opts.SetFreeArgsMin(1);
         opts.SetFreeArgTitle(0, "<command>", TDriverModeParser::CommandsCsv());
-        opts.SetCmdLineDescr(NDriverClient::NewClientCommandsDescription(factories));
+        opts.SetCmdLineDescr(NDriverClient::NewClientCommandsDescription(std::filesystem::path(argv[0]).stem().string(), factories));
 
         opts.AddHelpOption('h');
         opts.ArgPermutation_ = NLastGetopt::REQUIRE_ORDER;

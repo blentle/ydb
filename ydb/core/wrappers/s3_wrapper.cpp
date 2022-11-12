@@ -23,40 +23,10 @@ namespace NKikimr::NWrappers {
 namespace NExternalStorage {
 
 class TS3Wrapper: public TActor<TS3Wrapper> {
-    void Handle(TEvGetObjectRequest::TPtr& ev) {
-        CSOperator->Execute(ev);
-    }
 
-    void Handle(TEvCheckObjectExistsRequest::TPtr& ev) {
-        CSOperator->Execute(ev);
-    }
-
-    void Handle(TEvHeadObjectRequest::TPtr& ev) {
-        CSOperator->Execute(ev);
-    }
-
-    void Handle(TEvPutObjectRequest::TPtr& ev) {
-        CSOperator->Execute(ev);
-    }
-
-    void Handle(TEvDeleteObjectRequest::TPtr& ev) {
-        CSOperator->Execute(ev);
-    }
-
-    void Handle(TEvCreateMultipartUploadRequest::TPtr& ev) {
-        CSOperator->Execute(ev);
-    }
-
-    void Handle(TEvUploadPartRequest::TPtr& ev) {
-        CSOperator->Execute(ev);
-    }
-
-    void Handle(TEvCompleteMultipartUploadRequest::TPtr& ev) {
-        CSOperator->Execute(ev);
-    }
-
-    void Handle(TEvAbortMultipartUploadRequest::TPtr& ev) {
-        CSOperator->Execute(ev);
+    template <class T>
+    void Handle(T& ev) {
+        StorageOperator->Execute(ev);
     }
 
 public:
@@ -64,32 +34,35 @@ public:
         return NKikimrServices::TActivity::S3_WRAPPER_ACTOR;
     }
 
-    explicit TS3Wrapper(IExternalStorageOperator::TPtr csOperator)
+    explicit TS3Wrapper(IExternalStorageOperator::TPtr storageOperator)
         : TActor(&TThis::StateWork)
-        , CSOperator(csOperator) {
+        , StorageOperator(storageOperator)
+    {
+        Y_VERIFY(!!StorageOperator, "not initialized operator. incorrect config.");
     }
 
     virtual ~TS3Wrapper() = default;
 
     STATEFN(StateWork) {
         switch (ev->GetTypeRewrite()) {
+            hFunc(TEvListObjectsRequest, Handle);
             hFunc(TEvGetObjectRequest, Handle);
             hFunc(TEvHeadObjectRequest, Handle);
             hFunc(TEvPutObjectRequest, Handle);
             hFunc(TEvDeleteObjectRequest, Handle);
+            hFunc(TEvDeleteObjectsRequest, Handle);
             hFunc(TEvCreateMultipartUploadRequest, Handle);
             hFunc(TEvUploadPartRequest, Handle);
             hFunc(TEvCompleteMultipartUploadRequest, Handle);
             hFunc(TEvAbortMultipartUploadRequest, Handle);
             hFunc(TEvCheckObjectExistsRequest, Handle);
 
-
             cFunc(TEvents::TEvPoison::EventType, PassAway);
         }
     }
 
 private:
-    IExternalStorageOperator::TPtr CSOperator;
+    IExternalStorageOperator::TPtr StorageOperator;
 
 }; // TS3Wrapper
 

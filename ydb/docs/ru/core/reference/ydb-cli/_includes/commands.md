@@ -35,10 +35,10 @@
 [import file tsv](../export_import/import-file.md) | Импорт данных из TSV-файла
 [import s3](../export_import/s3_import.md) | Импорт данных из хранилища S3
 [init](../profile/create.md) | Инициализация CLI, создание [профиля](../profile/index.md)
-operation cancel | Прерывание исполнения фоновой операции
-operation forget | Удаление фоновой операции из истории
-operation get | Статус фоновой операции
-operation list | Список фоновых операций
+[operation cancel](../operation-cancel.md) | Прерывание исполнения фоновой операции
+[operation forget](../operation-forget.md) | Удаление фоновой операции из списка
+[operation get](../operation-get.md) | Статус фоновой операции
+[operation list](../operation-list.md) | Список фоновых операций
 [scheme describe](../commands/scheme-describe.md) | Описание объекта схемы данных
 [scheme ls](../commands/scheme-ls.md) | Список объектов схемы данных
 [scheme mkdir](../commands/dir.md#mkdir) | Создание директории
@@ -50,19 +50,19 @@ scheme permissions remove | Удаление разрешения
 scheme permissions revoke | Удаление разрешения
 scheme permissions set | Установка разрешений
 [scheme rmdir](../commands/dir.md#rmdir) | Удаление директории
-scripting yql | Выполнение YQL-скрипта
+[scripting yql](../scripting-yql.md) | Выполнение YQL-скрипта
 table attribute add | Добавление атрибута таблицы
 table attribute drop | Удаление атрибута таблицы
-table drop | Удаление таблицы
+[table drop](../table-drop.md) | Удаление таблицы
 [table index add global-async](../commands/secondary_index.md#add) | Добавление асинхронного индекса 
 [table index add global-sync](../commands/secondary_index.md#add) | Добавление синхронного индекса 
 [table index drop](../commands/secondary_index.md#drop) | Удаление индекса
-[table query execute](../commands/query.md) | Исполнение YQL-запроса
+[table query execute](../table-query-execute.md) | Исполнение YQL-запроса
 [table query explain](../commands/explain-plan.md) | План исполнения YQL-запроса
 [table readtable](../commands/readtable.md) | Потоковое чтение таблицы
-table ttl drop | Удаление параметров TTL
-table ttl set | Установка параметров TTL
-tools copy | Копирование таблиц
+[table ttl set](../table-ttl-set.md) | Установка параметров TTL
+[table ttl drop](../table-ttl-drop.md) | Удаление параметров TTL
+[tools copy](../tools-copy.md) | Копирование таблиц
 [tools dump](../export_import/tools_dump.md) | Выгрузка директории или таблицы в файловую систему
 [tools rename](../commands/tools/rename.md) | Переименование таблиц
 [tools restore](../export_import/tools_restore.md) | Восстановление из файловой системы
@@ -78,5 +78,4 @@ tools copy | Копирование таблиц
 [version](../commands/service.md) | Вывод информации о версии {{ ydb-short-name }} CLI
 {% endif %}
 [workload](../commands/workload/index.md) | Генерация нагрузки
-yql | Выполнение YQL-скрипта (с поддержкой стриминга)
-
+[yql](../yql.md) | Выполнение YQL-скрипта (с поддержкой стриминга)

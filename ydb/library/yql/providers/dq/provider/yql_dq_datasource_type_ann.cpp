@@ -18,8 +18,9 @@ public:
     TDqsDataSourceTypeAnnotationTransformer()
         : TVisitorTransformerBase(true)
     {
-        AddHandler({TDqSourceWrap::CallableName()}, Hndl(&TDqsDataSourceTypeAnnotationTransformer::HandleSourceWrap<false>));
-        AddHandler({TDqSourceWideWrap::CallableName()}, Hndl(&TDqsDataSourceTypeAnnotationTransformer::HandleSourceWrap<true>));
+        AddHandler({TDqSourceWrap::CallableName()}, Hndl(&TDqsDataSourceTypeAnnotationTransformer::HandleSourceWrap<false, false>));
+        AddHandler({TDqSourceWideWrap::CallableName()}, Hndl(&TDqsDataSourceTypeAnnotationTransformer::HandleSourceWrap<true, false>));
+        AddHandler({TDqSourceWideBlockWrap::CallableName()}, Hndl(&TDqsDataSourceTypeAnnotationTransformer::HandleSourceWrap<true, true>));
         AddHandler({TDqReadWrap::CallableName()}, Hndl(&TDqsDataSourceTypeAnnotationTransformer::HandleReadWrap));
         AddHandler({TDqReadWideWrap::CallableName()}, Hndl(&TDqsDataSourceTypeAnnotationTransformer::HandleWideReadWrap));
         AddHandler({TCoConfigure::CallableName()}, Hndl(&TDqsDataSourceTypeAnnotationTransformer::HandleConfig));
@@ -29,6 +30,10 @@ public:
 private:
     TStatus HandleReadWrap(const TExprNode::TPtr& input, TExprContext& ctx) {
         if (!EnsureMinMaxArgsCount(*input, 1, 3, ctx)) {
+            return TStatus::Error;
+        }
+
+        if (!EnsureTupleOfAtoms(*input->Child(TDqReadWrapBase::idx_Flags), ctx)) {
             return TStatus::Error;
         }
 
@@ -43,10 +48,6 @@ private:
             }
         }
 
-        if (input->ChildrenSize() > TDqReadWrapBase::idx_Flags && !EnsureTupleOfAtoms(*input->Child(TDqReadWrapBase::idx_Flags), ctx)) {
-            return TStatus::Error;
-        }
-
         if (!EnsureTupleTypeSize(input->Head(), 2, ctx)) {
             return TStatus::Error;
         }
@@ -58,7 +59,7 @@ private:
         return TStatus::Ok;
     }
 
-    template<bool Wide>
+    template<bool Wide, bool Blocks>
     TStatus HandleSourceWrap(const TExprNode::TPtr& input, TExprContext& ctx) {
         if (!EnsureMinMaxArgsCount(*input, 3U, 4U, ctx)) {
             return TStatus::Error;
@@ -91,6 +92,14 @@ private:
             TTypeAnnotationNode::TListType types;
             types.reserve(items.size());
             std::transform(items.cbegin(), items.cend(), std::back_inserter(types), std::bind(&TItemExprType::GetItemType, std::placeholders::_1));
+            if constexpr (Blocks) {
+                for (auto& type : types) {
+                    type = ctx.MakeType<TBlockExprType>(type);
+                }
+
+                types.push_back(ctx.MakeType<TScalarExprType>(ctx.MakeType<TDataExprType>(EDataSlot::Uint64)));
+            }
+
             input->SetTypeAnn(ctx.MakeType<TFlowExprType>(ctx.MakeType<TMultiExprType>(types)));
         } else {
             input->SetTypeAnn(ctx.MakeType<TListExprType>(input->Child(TDqSourceWrapBase::idx_RowType)->GetTypeAnn()->Cast<TTypeExprType>()->GetType()));
@@ -101,6 +110,10 @@ private:
 
     TStatus HandleWideReadWrap(const TExprNode::TPtr& input, TExprContext& ctx) {
         if (!EnsureMinMaxArgsCount(*input, 1, 3, ctx)) {
+            return TStatus::Error;
+        }
+
+        if (!EnsureTupleOfAtoms(*input->Child(TDqReadWrapBase::idx_Flags), ctx)) {
             return TStatus::Error;
         }
 
@@ -115,13 +128,10 @@ private:
             }
         }
 
-        if (input->ChildrenSize() > TDqReadWrapBase::idx_Flags && !EnsureTupleOfAtoms(*input->Child(TDqReadWrapBase::idx_Flags), ctx)) {
-            return TStatus::Error;
-        }
-
         if (!EnsureTupleTypeSize(input->Head(), 2, ctx)) {
             return TStatus::Error;
         }
+
         const auto readerType = input->Head().GetTypeAnn()->Cast<TTupleExprType>()->GetItems().back();
         if (!EnsureListType(input->Head().Pos(), *readerType, ctx)) {
             return TStatus::Error;

@@ -1,6 +1,7 @@
 #include "cms_impl.h"
 #include "info_collector.h"
 #include "library/cpp/actors/core/actor.h"
+#include "library/cpp/actors/core/hfunc.h"
 #include "scheme.h"
 #include "sentinel.h"
 #include "erasure_checkers.h"
@@ -119,16 +120,6 @@ void TCms::ProcessInitQueue(const TActorContext &ctx)
         ctx.Send(ev.Release());
         InitQueue.pop();
     }
-}
-
-void TCms::RequestStateStorageConfig(const TActorContext &ctx) {
-    const auto& domains = *AppData(ctx)->DomainsInfo;
-    ui32 domainUid = domains.Domains.begin()->second->DomainUid;
-    const ui32 stateStorageGroup = domains.GetDefaultStateStorageGroup(domainUid);
-
-    const TActorId proxy = MakeStateStorageProxyID(stateStorageGroup);
-
-    ctx.Send(proxy, new TEvStateStorage::TEvListStateStorage(), IEventHandle::FlagTrackDelivery);
 }
 
 void TCms::SubscribeForConfig(const TActorContext &ctx)
@@ -420,7 +411,7 @@ bool TCms::CheckActionShutdownNode(const NKikimrCms::TAction &action,
     }
 
     // node is not locked
-    if (!CheckActionShutdownStateStorage(action, opts, node, error)) {
+    if (!TryToLockStateStorageReplica(action, opts, node, error, ctx)) {
         return false;
     }
 
@@ -483,70 +474,103 @@ bool TCms::CheckActionShutdownHost(const TAction &action,
     return true;
 }
 
-bool TCms::CheckActionShutdownStateStorage(
-                         const TAction& action,
-                         const TActionOptions& opts,
-                         const TNodeInfo& node,
-                         TErrorInfo& error) const 
+bool TCms::TryToLockStateStorageReplica(const TAction& action,
+                                        const TActionOptions& opts,
+                                        const TNodeInfo& node,
+                                        TErrorInfo& error,
+                                        const TActorContext &ctx) const 
 {
-    // TODO (t1mursadykov): отслеживание времени отключенных стейт стораджей
-    if (opts.AvailabilityMode == MODE_FORCE_RESTART) {
-        return true;
-    }
-    
     TInstant defaultDeadline = TActivationContext::Now() + State->Config.DefaultRetryTime;
 
-    if (!StateStorageInfo) {
+    if (!ClusterInfo->IsStateStorageinfoReceived()) {
         error.Code = TStatus::DISALLOW_TEMP;
         error.Reason = "Did not received state storage configuration";
         error.Deadline = defaultDeadline;
         return false;
     }
 
-    if (!StateStorageNodes.contains(node.NodeId)) {
+    if (!ClusterInfo->IsStateStorageReplicaNode(node.NodeId)) {
         return true;
     }
 
-    THashSet<ui32> injuredRings;
+    const ui32 nToSelect = ClusterInfo->StateStorageInfo->NToSelect;
+    const ui32 currentRing = ClusterInfo->GetRingId(node.NodeId);
+    ui8 currentRingState = TStateStorageRingInfo::Unknown;
+    ui32 restartRings = 0;
+    ui32 lockedRings = 0;
+    ui32 disabledRings = 0;
+    auto now = AppData(ctx)->TimeProvider->Now();
     TDuration duration = TDuration::MicroSeconds(action.GetDuration()) + opts.PermissionDuration;
-    TErrorInfo err;
-    TStringStream brokenNodesMsg;
-    for (auto& i : StateStorageNodes) {
-        if (node.NodeId == i) {
+    for (auto ringInfo : ClusterInfo->StateStorageRings) {
+        auto state = ringInfo->CountState(now, State->Config.DefaultRetryTime, duration);
+        LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::CMS, "Ring: " << ringInfo->RingId 
+                                                                 << "; State: " << TStateStorageRingInfo::RingStateToString(state));
+
+        if (ringInfo->RingId == currentRing) {
+            if (state == TStateStorageRingInfo::Disabled) {
+                return true;
+            }
+            currentRingState = state;
             continue;
         }
-        if (ClusterInfo->Node(i).IsLocked(err, State->Config.DefaultRetryTime, 
-                                               TActivationContext::Now(), duration) || 
-            ClusterInfo->Node(i).IsDown(err, defaultDeadline)) {  
-
-            injuredRings.insert(NodeToRing.at(i));
-            brokenNodesMsg << " " << i;
+        switch (state) {
+            case TStateStorageRingInfo::Ok:
+                break;
+            case TStateStorageRingInfo::Locked:
+                ++lockedRings;
+                break;
+            case TStateStorageRingInfo::Restart:
+                ++restartRings;
+                break;
+            case TStateStorageRingInfo::Disabled:
+                ++disabledRings;
+                break;
+            default:
+                break;
         }
     }
+    Y_VERIFY(currentRingState != TStateStorageRingInfo::Unknown);
 
-    if (injuredRings.size() == 0) {
-        return true;
-    }
+    // Add current ring to restart rings
+    ++restartRings;
 
-    if ((opts.AvailabilityMode == MODE_MAX_AVAILABILITY && injuredRings.size() > 1) ||
-        (opts.AvailabilityMode == MODE_KEEP_AVAILABLE && injuredRings.size() > 2)) {
-        error.Code = TStatus::DISALLOW_TEMP;
-        error.Reason = TStringBuilder() << "Too many broken state storage rings: " << injuredRings.size() <<
-                                        " Down state storage nodes:" << brokenNodesMsg.Str();
-        error.Deadline = defaultDeadline;
-        return false;
-    }
-
-    if (injuredRings.contains(NodeToRing.at(node.NodeId))) {
-        return true;
-    }
-
-    if (opts.AvailabilityMode == MODE_MAX_AVAILABILITY || injuredRings.size() > 2) {
-        error.Code = TStatus::DISALLOW_TEMP;
-        error.Reason = TStringBuilder() << "There are down state storage nodes in other rings. "
-                                         "Down state storage nodes: " << brokenNodesMsg.Str();
-        error.Deadline = defaultDeadline;
-        return false;
+    switch (opts.AvailabilityMode) {
+        case MODE_MAX_AVAILABILITY:
+            if (restartRings + lockedRings > 1) {
+                error.Code = TStatus::DISALLOW_TEMP;
+                error.Reason = TStringBuilder() << "Too many unavailable state storage rings"
+                                                << ". Restarting rings: " 
+                                                    << (currentRingState == TStateStorageRingInfo::Restart ? restartRings : restartRings - 1)
+                                                << ". Temporary (for a 2 minutes) locked rings: " 
+                                                    << (currentRingState == TStateStorageRingInfo::Locked ? lockedRings + 1 : lockedRings)
+                                                << ". Maximum allowed number of unavailable rings for this mode: " << 1;
+                error.Deadline = defaultDeadline;
+                return false;
+            }
+            break;
+        case MODE_KEEP_AVAILABLE:
+            if (restartRings + lockedRings + disabledRings > (nToSelect - 1) / 2) {
+                error.Code = TStatus::DISALLOW_TEMP;
+                error.Reason = TStringBuilder() << "Too many unavailable state storage rings"
+                                                << ". Restarting rings: " 
+                                                    << (currentRingState == TStateStorageRingInfo::Restart ? restartRings : restartRings - 1)
+                                                << ". Temporary (for a 2 minutes) locked rings: " 
+                                                    << (currentRingState == TStateStorageRingInfo::Locked ? lockedRings + 1 : lockedRings)
+                                                << ". Disabled rings: " << disabledRings
+                                                << ". Maximum allowed number of unavailable rings for this mode: " << (nToSelect - 1) / 2;
+                error.Deadline = defaultDeadline;
+                return false;
+            }
+            break;
+        case MODE_FORCE_RESTART:
+            break;
+        default:
+            error.Code = TStatus::WRONG_REQUEST;
+            error.Reason = Sprintf("Unknown availability mode: %s (%" PRIu32 ")",
+                                   EAvailabilityMode_Name(opts.AvailabilityMode).data(),
+                                   static_cast<ui32>(opts.AvailabilityMode));
+            error.Deadline = defaultDeadline;
+            return false;
     }
 
     return true;
@@ -1313,12 +1337,20 @@ bool TCms::RemoveNotification(const TString &id, const TString &user, bool remov
 
 void TCms::EnqueueRequest(TAutoPtr<IEventHandle> ev, const TActorContext &ctx)
 {
-    if (Queue.empty()) {
-        auto collector = CreateInfoCollector(SelfId(), State->Config.InfoCollectionTimeout);
-        ctx.ExecutorThread.RegisterActor(collector);
+    if (Queue.empty() && NextQueue.empty()) {
+        ctx.Schedule(TDuration::MilliSeconds(100), new TEvPrivate::TEvStartCollecting);
     }
 
-    Queue.push(ev);
+    NextQueue.push(ev);
+}
+
+void TCms::StartCollecting(const TActorContext &ctx) 
+{
+    Y_VERIFY(Queue.empty());
+    std::swap(NextQueue, Queue);
+
+    auto collector = CreateInfoCollector(SelfId(), State->Config.InfoCollectionTimeout);
+    ctx.ExecutorThread.RegisterActor(collector);
 }
 
 void TCms::CheckAndEnqueueRequest(TEvCms::TEvPermissionRequest::TPtr &ev, const TActorContext &ctx)
@@ -1396,6 +1428,11 @@ void TCms::ProcessQueue(const TActorContext &ctx)
         ProcessRequest(Queue.front(), ctx);
         Queue.pop();
     }
+
+    // Process events received while collecting
+    if (!NextQueue.empty()) {
+        StartCollecting(ctx);
+    }
 }
 
 void TCms::ProcessRequest(TAutoPtr<IEventHandle> &ev, const TActorContext &ctx)
@@ -1409,6 +1446,7 @@ void TCms::ProcessRequest(TAutoPtr<IEventHandle> &ev, const TActorContext &ctx)
         HFuncTraced(TEvCms::TEvNotification, Handle);
         HFuncTraced(TEvCms::TEvResetMarkerRequest, Handle);
         HFuncTraced(TEvCms::TEvSetMarkerRequest, Handle);
+        HFuncTraced(TEvCms::TEvGetClusterInfoRequest, Handle);
 
     default:
         Y_FAIL("Unexpected request type");
@@ -1428,25 +1466,11 @@ void TCms::OnBSCPipeDestroyed(const TActorContext &ctx)
         ctx.Send(State->Sentinel, new TEvSentinel::TEvBSCPipeDisconnected);
 }
 
-void TCms::Handle(TEvStateStorage::TEvListStateStorageResult::TPtr& ev, const TActorContext &ctx) {
-    auto& info = ev->Get()->Info;
-    if (!info) {
-        LOG_NOTICE_S(ctx, NKikimrServices::CMS,
-                     "Couldn't collect group info");
-        return;
-    }
+void TCms::Handle(TEvCms::TEvGetClusterInfoRequest::TPtr &ev, const TActorContext &ctx) {
+    TAutoPtr<TEvCms::TEvGetClusterInfoResponse> resp = new TEvCms::TEvGetClusterInfoResponse;
+    resp->Info = ClusterInfo;
 
-    StateStorageInfo = info;
-    
-    // index in array will be used as ring id for simplicity
-    for (ui32 ring = 0; ring < info->Rings.size(); ++ring) {
-        for (auto& replica : info->Rings[ring].Replicas) {
-            ui32 nodeId = replica.NodeId();
-
-            NodeToRing[nodeId] = ring;
-            StateStorageNodes.insert(nodeId);
-        }
-    }
+    ctx.Send(ev->Sender, resp.Release());
 }
 
 void TCms::Handle(TEvPrivate::TEvClusterInfo::TPtr &ev, const TActorContext &ctx)

@@ -19,24 +19,39 @@ public:
     TCommandProfile();
 };
 
-class TCommandInit : public TClientCommand {
-public:
-    TCommandInit();
-    virtual void Config(TConfig& config) override;
-    virtual int Run(TConfig& config) override;
-};
-
 class TCommandProfileCommon : public TClientCommand {
 public:
     TCommandProfileCommon(const TString& name, const std::initializer_list<TString>& aliases =
             std::initializer_list<TString>(), const TString& description = TString());
     virtual void Config(TConfig& config) override;
+    virtual void Parse(TConfig& config) override;
 
 protected:
-    void ValidateAuth(TConfig& config);
-    bool AnyProfileOptionInCommandLine(TConfig& config);
-    TString ProfileName;
+    void ValidateAuth();
+    bool AnyProfileOptionInCommandLine();
+    void ConfigureProfile(const TString& profileName, std::shared_ptr<IProfileManager> profileManager,
+                     TConfig& config, bool interactive, bool cmdLine);
+
+    TString ProfileName, Endpoint, Database, TokenFile, YcTokenFile, SaKeyFile,
+            IamTokenFile, IamEndpoint, User, PasswordFile;
+
     bool UseMetadataCredentials = false;
+
+private:
+    void SetupProfileSetting(const TString& name, const TString& value, bool existingProfile, const TString &profileName,
+                             std::shared_ptr<IProfile> profile, bool interactive, bool cmdLine);
+    void SetupProfileAuthentication(bool existingProfile, const TString& profileName, std::shared_ptr<IProfile> profile,
+                                    TConfig& config, bool interactive, bool cmdLine);
+    bool SetAuthFromCommandLine(std::shared_ptr<IProfile> profile);
+    void GetOptionsFromStdin();
+    void ParseUrl(const TString& url);
+};
+
+class TCommandInit : public TCommandProfileCommon {
+public:
+    TCommandInit();
+    virtual void Config(TConfig& config) override;
+    virtual int Run(TConfig& config) override;
 };
 
 class TCommandCreateProfile : public TCommandProfileCommon {
@@ -108,7 +123,7 @@ public:
     virtual void Parse(TConfig& config) override;
     virtual int Run(TConfig& config) override;
 private:
-    void ValidateNoOptions(TConfig& config);
+    void ValidateNoOptions();
     void DropNoOptions(std::shared_ptr<IProfile> profile);
     bool NoEndpoint = false;
     bool NoDatabase = false;

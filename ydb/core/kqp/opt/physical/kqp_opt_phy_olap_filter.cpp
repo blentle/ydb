@@ -12,6 +12,10 @@ namespace {
 
 static TMaybeNode<TExprBase> NullNode = TMaybeNode<TExprBase>();
 
+bool IsFalseLiteral(TExprBase node) {
+    return node.Maybe<TCoBool>() && !FromString<bool>(node.Cast<TCoBool>().Literal().Value());
+}
+
 bool IsSupportedPredicate(const TCoCompare& predicate) {
     if (predicate.Maybe<TCoCmpEqual>()) {
         return true;
@@ -56,8 +60,11 @@ bool ValidateIfArgument(const TCoOptionalIf& optionalIf, const TExprNode* rawLam
     auto asStruct = maybeAsStruct.Cast();
 
     // SELECT `field` has only one item
-    if (asStruct.ArgCount() != 1) {
+    if (asStruct.ArgCount() > 1) {
         return false;
+    } else if (asStruct.ArgCount() == 0) {
+        // In case of COUNT(*) we use empty AsStruct
+        return true;
     }
 
     // Check that second tuple element is Member(lambda arg)
@@ -368,7 +375,7 @@ TVector<std::pair<TExprBase, TExprBase>> ExtractComparisonParameters(const TCoCo
 }
 
 TExprBase BuildOneElementComparison(const std::pair<TExprBase, TExprBase>& parameter, const TCoCompare& predicate,
-    TExprContext& ctx, TPositionHandle pos, const TExprBase& input, bool forceStrictComparison)
+    TExprContext& ctx, TPositionHandle pos, bool forceStrictComparison)
 {
     auto isNull = [](const TExprBase& node) {
         if (node.Maybe<TCoNull>()) {
@@ -391,41 +398,23 @@ TExprBase BuildOneElementComparison(const std::pair<TExprBase, TExprBase>& param
             .Done();
     }
 
+    std::string compareOperator = "";
+
     if (predicate.Maybe<TCoCmpEqual>()) {
-        return Build<TKqpOlapFilterEqual>(ctx, pos)
-            .Input(input)
-            .Left(parameter.first)
-            .Right(parameter.second)
-            .Done();
+        compareOperator = "eq";
+    } else if (predicate.Maybe<TCoCmpLess>() || (predicate.Maybe<TCoCmpLessOrEqual>() && forceStrictComparison)) {
+        compareOperator = "lt";
+    } else if (predicate.Maybe<TCoCmpLessOrEqual>() && !forceStrictComparison) {
+        compareOperator = "lte";
+    } else if (predicate.Maybe<TCoCmpGreater>() || (predicate.Maybe<TCoCmpGreaterOrEqual>() && forceStrictComparison)) {
+        compareOperator = "gt";
+    } if (predicate.Maybe<TCoCmpGreaterOrEqual>() && !forceStrictComparison) {
+        compareOperator = "gte";
     }
 
-    if (predicate.Maybe<TCoCmpLess>() || (predicate.Maybe<TCoCmpLessOrEqual>() && forceStrictComparison)) {
-        return Build<TKqpOlapFilterLess>(ctx, pos)
-            .Input(input)
-            .Left(parameter.first)
-            .Right(parameter.second)
-            .Done();
-    }
-
-    if (predicate.Maybe<TCoCmpLessOrEqual>() && !forceStrictComparison) {
-        return Build<TKqpOlapFilterLessOrEqual>(ctx, pos)
-            .Input(input)
-            .Left(parameter.first)
-            .Right(parameter.second)
-            .Done();
-    }
-
-    if (predicate.Maybe<TCoCmpGreater>() || (predicate.Maybe<TCoCmpGreaterOrEqual>() && forceStrictComparison)) {
-        return Build<TKqpOlapFilterGreater>(ctx, pos)
-            .Input(input)
-            .Left(parameter.first)
-            .Right(parameter.second)
-            .Done();
-    }
-
-    if (predicate.Maybe<TCoCmpGreaterOrEqual>() && !forceStrictComparison) {
-        return Build<TKqpOlapFilterGreaterOrEqual>(ctx, pos)
-            .Input(input)
+    if (!compareOperator.empty()) {
+        return Build<TKqpOlapFilterCompare>(ctx, pos)
+            .Operator(ctx.NewAtom(pos, compareOperator))
             .Left(parameter.first)
             .Right(parameter.second)
             .Done();
@@ -433,39 +422,49 @@ TExprBase BuildOneElementComparison(const std::pair<TExprBase, TExprBase>& param
 
     YQL_ENSURE(predicate.Maybe<TCoCmpNotEqual>(), "Unsupported comparison node: " << predicate.Ptr()->Content());
 
-    return Build<TCoNot>(ctx, pos)
-        .Value<TKqpOlapFilterEqual>()
-            .Input(input)
+    return Build<TKqpOlapNot>(ctx, pos)
+        .Value<TKqpOlapFilterCompare>()
+            .Operator(ctx.NewAtom(pos, "eq"))
             .Left(parameter.first)
             .Right(parameter.second)
             .Build()
         .Done();
 }
 
-TExprBase ComparisonPushdown(const TVector<std::pair<TExprBase, TExprBase>>& parameters, const TCoCompare& predicate,
-    TExprContext& ctx, TPositionHandle pos, const TExprBase& input)
+TMaybeNode<TExprBase> ComparisonPushdown(const TVector<std::pair<TExprBase, TExprBase>>& parameters, const TCoCompare& predicate,
+    TExprContext& ctx, TPositionHandle pos)
 {
     ui32 conditionsCount = parameters.size();
 
     if (conditionsCount == 1) {
-        return BuildOneElementComparison(parameters[0], predicate, ctx, pos, input, false);
+        auto condition = BuildOneElementComparison(parameters[0], predicate, ctx, pos, false);
+        return IsFalseLiteral(condition) ? NullNode : condition;
     }
 
     if (predicate.Maybe<TCoCmpEqual>() || predicate.Maybe<TCoCmpNotEqual>()) {
         TVector<TExprBase> conditions;
         conditions.reserve(conditionsCount);
+        bool hasFalseCondition = false;
 
         for (ui32 i = 0; i < conditionsCount; ++i) {
-            conditions.emplace_back(BuildOneElementComparison(parameters[i], predicate, ctx, pos, input, false));
+            auto condition = BuildOneElementComparison(parameters[i], predicate, ctx, pos, false);
+            if (IsFalseLiteral(condition)) {
+                hasFalseCondition = true;
+            } else {
+                conditions.emplace_back(condition);
+            }
         }
 
         if (predicate.Maybe<TCoCmpEqual>()) {
-            return Build<TCoAnd>(ctx, pos)
+            if (hasFalseCondition) {
+                return NullNode;
+            }
+            return Build<TKqpOlapAnd>(ctx, pos)
                 .Add(conditions)
                 .Done();
         }
 
-        return Build<TCoOr>(ctx, pos)
+        return Build<TKqpOlapOr>(ctx, pos)
             .Add(conditions)
             .Done();
     }
@@ -473,29 +472,35 @@ TExprBase ComparisonPushdown(const TVector<std::pair<TExprBase, TExprBase>>& par
     TVector<TExprBase> orConditions;
     orConditions.reserve(conditionsCount);
 
-    // Here we can be only whe comparing tuples lexicographically
+    // Here we can be only when comparing tuples lexicographically
     for (ui32 i = 0; i < conditionsCount; ++i) {
         TVector<TExprBase> andConditions;
         andConditions.reserve(conditionsCount);
 
         // We need strict < and > in beginning columns except the last one
         // For example: (c1, c2, c3) >= (1, 2, 3) ==> (c1 > 1) OR (c2 > 2 AND c1 = 1) OR (c3 >= 3 AND c2 = 2 AND c1 = 1)
-        andConditions.emplace_back(BuildOneElementComparison(parameters[i], predicate, ctx, pos, input, i < conditionsCount - 1));
+        auto condition = BuildOneElementComparison(parameters[i], predicate, ctx, pos, i < conditionsCount - 1);
+        if (IsFalseLiteral(condition)) {
+            continue;
+        }
+        andConditions.emplace_back(condition);
 
         for (ui32 j = 0; j < i; ++j) {
-            andConditions.emplace_back(Build<TKqpOlapFilterEqual>(ctx, pos)
-                .Input(input)
+            andConditions.emplace_back(Build<TKqpOlapFilterCompare>(ctx, pos)
+                .Operator(ctx.NewAtom(pos, "eq"))
                 .Left(parameters[j].first)
                 .Right(parameters[j].second)
                 .Done());
         }
 
-        orConditions.emplace_back(Build<TCoAnd>(ctx, pos)
-            .Add(std::move(andConditions))
-            .Done());
+        orConditions.emplace_back(
+            Build<TKqpOlapAnd>(ctx, pos)
+                .Add(std::move(andConditions))
+                .Done()
+        );
     }
 
-    return Build<TCoOr>(ctx, pos)
+    return Build<TKqpOlapOr>(ctx, pos)
         .Add(std::move(orConditions))
         .Done();
 }
@@ -528,8 +533,7 @@ TMaybeNode<TCoAtomList> BuildColumnsFromLambda(const TCoLambda& lambda, TExprCon
 }
 #endif
 
-TMaybeNode<TExprBase> ExistsPushdown(const TCoExists& exists, TExprContext& ctx, TPositionHandle pos,
-    const TExprNode* lambdaArg, const TExprBase& input)
+TMaybeNode<TExprBase> ExistsPushdown(const TCoExists& exists, TExprContext& ctx, TPositionHandle pos, const TExprNode* lambdaArg)
 {
     auto maybeMember = exists.Optional().Maybe<TCoMember>();
 
@@ -544,13 +548,12 @@ TMaybeNode<TExprBase> ExistsPushdown(const TCoExists& exists, TExprContext& ctx,
     auto columnName = maybeMember.Cast().Name();
 
     return Build<TKqpOlapFilterExists>(ctx, pos)
-        .Input(input)
         .Column(columnName)
         .Done();
 }
 
 TMaybeNode<TExprBase> SafeCastPredicatePushdown(const TCoFlatMap& flatmap,
-    TExprContext& ctx, TPositionHandle pos, const TExprNode* lambdaArg, const TExprBase& input)
+    TExprContext& ctx, TPositionHandle pos, const TExprNode* lambdaArg)
 {
     /*
      * There are three ways of comparison in following format:
@@ -610,7 +613,7 @@ TMaybeNode<TExprBase> SafeCastPredicatePushdown(const TCoFlatMap& flatmap,
         out.emplace_back(std::move(std::make_pair(left[i], right[i])));
     }
 
-    return ComparisonPushdown(parameters, predicate, ctx, pos, input);
+    return ComparisonPushdown(parameters, predicate, ctx, pos);
 }
 
 TMaybeNode<TExprBase> SimplePredicatePushdown(const TCoCompare& predicate, TExprContext& ctx, TPositionHandle pos,
@@ -626,7 +629,7 @@ TMaybeNode<TExprBase> SimplePredicatePushdown(const TCoCompare& predicate, TExpr
         return NullNode;
     }
 
-    return ComparisonPushdown(parameters, predicate, ctx, pos, input);
+    return ComparisonPushdown(parameters, predicate, ctx, pos);
 }
 
 
@@ -644,7 +647,7 @@ TMaybeNode<TExprBase> CoalescePushdown(const TCoCoalesce& coalesce, TExprContext
     auto maybeFlatmap = coalesce.Predicate().Maybe<TCoFlatMap>();
 
     if (maybeFlatmap.IsValid()) {
-        return SafeCastPredicatePushdown(maybeFlatmap.Cast(), ctx, pos, lambdaArg, input);
+        return SafeCastPredicatePushdown(maybeFlatmap.Cast(), ctx, pos, lambdaArg);
     }
 
     auto maybePredicate = coalesce.Predicate().Maybe<TCoCompare>();
@@ -668,7 +671,7 @@ TMaybeNode<TExprBase> PredicatePushdown(const TExprBase& predicate, TExprContext
     auto maybeExists = predicate.Maybe<TCoExists>();
 
     if (maybeExists.IsValid()) {
-        return ExistsPushdown(maybeExists.Cast(), ctx, pos, lambdaArg, input);
+        return ExistsPushdown(maybeExists.Cast(), ctx, pos, lambdaArg);
     }
 
     if (predicate.Maybe<TCoNot>()) {
@@ -679,7 +682,7 @@ TMaybeNode<TExprBase> PredicatePushdown(const TExprBase& predicate, TExprContext
             return NullNode;
         }
 
-        return Build<TCoNot>(ctx, pos)
+        return Build<TKqpOlapNot>(ctx, pos)
             .Value(pushedNot.Cast())
             .Done();
     }
@@ -702,20 +705,20 @@ TMaybeNode<TExprBase> PredicatePushdown(const TExprBase& predicate, TExprContext
     }
 
     if (predicate.Maybe<TCoAnd>()) {
-        return Build<TCoAnd>(ctx, pos)
+        return Build<TKqpOlapAnd>(ctx, pos)
             .Add(pushedOps)
             .Done();
     }
 
     if (predicate.Maybe<TCoOr>()) {
-        return Build<TCoOr>(ctx, pos)
+        return Build<TKqpOlapOr>(ctx, pos)
             .Add(pushedOps)
             .Done();
     }
 
     Y_VERIFY_DEBUG(predicate.Maybe<TCoXor>());
 
-    return Build<TCoXor>(ctx, pos)
+    return Build<TKqpOlapXor>(ctx, pos)
         .Add(pushedOps)
         .Done();
 }
@@ -773,10 +776,10 @@ TExprBase KqpPushOlapFilter(TExprBase node, TExprContext& ctx, const TKqpOptimiz
         .Done();
 
     auto newProcessLambda = Build<TCoLambda>(ctx, node.Pos())
-        .Args({"row"})
+        .Args({"olap_filter_row"})
         .Body<TExprApplier>()
             .Apply(olapFilter)
-            .With(read.Process().Args().Arg(0), "row")
+            .With(read.Process().Args().Arg(0), "olap_filter_row")
             .Build()
         .Done();
 

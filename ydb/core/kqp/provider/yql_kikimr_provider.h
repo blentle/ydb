@@ -2,7 +2,6 @@
 
 #include "yql_kikimr_gateway.h"
 #include "yql_kikimr_settings.h"
-#include "yql_kikimr_query_traits.h"
 
 #include <ydb/library/yql/ast/yql_gc_nodes.h>
 #include <ydb/library/yql/core/yql_type_annotation.h>
@@ -45,13 +44,10 @@ public:
         bool RawResults = false; // TODO: deprecate
         TMaybe<TString> IsolationLevel; // TODO: deprecate
         TMaybe<bool> StrictDml; // TODO: deprecate
-        TMaybe<bool> UseNewEngine;
         TMaybe<bool> UseScanQuery;
         EKikimrStatsMode StatsMode = EKikimrStatsMode::None;
         TMaybe<bool> DocumentApiRestricted;
         TMaybe<NKikimrKqp::TRlPath> RlPath;
-
-        bool ForceNewEngine() const { return UseNewEngine && *UseNewEngine; }
     };
 
     virtual ~IKikimrQueryExecutor() {}
@@ -155,10 +151,6 @@ struct TKikimrQueryContext : TThrRefBase, TTimeAndRandomProvider {
     // full mode can be enabled explicitly.
     bool DocumentApiRestricted = true;
 
-    // Force NewEngine stuff
-    // remove it after enabling NewEngine
-    std::optional<NKikimr::NKqp::TQueryTraits> QueryTraits;
-
     std::unique_ptr<NKikimrKqp::TPreparedQuery> PreparingQuery;
     std::shared_ptr<const NKikimrKqp::TPreparedQuery> PreparedQuery;
     TKikimrParamsMap Parameters;
@@ -178,7 +170,6 @@ struct TKikimrQueryContext : TThrRefBase, TTimeAndRandomProvider {
         Deadlines = {};
         Limits = {};
 
-        QueryTraits.reset();
         PreparingQuery.reset();
         PreparedQuery.reset();
         Parameters.clear();
@@ -216,10 +207,13 @@ public:
 
     void RequireStats() { NeedsStats = true; }
     bool GetNeedsStats() const { return NeedsStats; }
+    ETableType GetTableType() const { return TableType; }
+    void SetTableType(ETableType tableType) { TableType = tableType; }
 
 private:
     THashMap<TString, const TTypeAnnotationNode*> ColumnTypes;
     bool NeedsStats = false;
+    ETableType TableType;
 };
 
 class TKikimrTablesData : public TThrRefBase {
@@ -228,7 +222,8 @@ public:
     TKikimrTablesData(const TKikimrTablesData&) = delete;
     TKikimrTablesData& operator=(const TKikimrTablesData&) = delete;
 
-    TKikimrTableDescription& GetOrAddTable(const TString& cluster, const TString& database, const TString& table);
+    TKikimrTableDescription& GetOrAddTable(const TString& cluster, const TString& database, const TString& table,
+        ETableType tableType = ETableType::Table);
     TKikimrTableDescription& GetTable(const TString& cluster, const TString& table);
 
     const TKikimrTableDescription* EnsureTableExists(const TString& cluster, const TString& table,

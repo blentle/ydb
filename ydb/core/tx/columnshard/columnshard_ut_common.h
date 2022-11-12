@@ -25,19 +25,20 @@ using TTypeId = NScheme::TTypeId;
 using TTypeInfo = NScheme::TTypeInfo;
 
 struct TTestSchema {
-    static const constexpr char * DefaultTtlColumn = "saved_at";
+    static inline const TString DefaultTtlColumn = "saved_at";
 
     struct TStorageTier {
+        YDB_ACCESSOR(TString, TtlColumn, DefaultTtlColumn);
+        YDB_OPT(ui32, EvictAfterSeconds);
+    public:
         TString Name;
         TString Codec;
         std::optional<int> CompressionLevel;
-        std::optional<ui32> EvictAfterSeconds;
-        TString TtlColumn;
         std::optional<NKikimrSchemeOp::TS3Settings> S3;
 
         TStorageTier(const TString& name = {})
             : Name(name)
-            , TtlColumn(DefaultTtlColumn)
+
         {}
 
         NKikimrSchemeOp::EColumnCodec GetCodecId() const {
@@ -62,12 +63,6 @@ struct TTestSchema {
             }
             return *this;
         }
-
-        TStorageTier& SetTtl(ui32 seconds, const TString& column = DefaultTtlColumn) {
-            EvictAfterSeconds = seconds;
-            TtlColumn = column;
-            return *this;
-        }
     };
 
     struct TTableSpecials : public TStorageTier {
@@ -78,7 +73,7 @@ struct TTestSchema {
         }
 
         bool HasTtl() const {
-            return !HasTiers() && EvictAfterSeconds;
+            return !HasTiers() && HasEvictAfterSeconds();
         }
 
         TTableSpecials WithCodec(const TString& codec) {
@@ -178,9 +173,42 @@ struct TTestSchema {
         return col;
     }
 
+    static void InitSchema(const TVector<std::pair<TString, TTypeInfo>>& columns,
+                           const TVector<std::pair<TString, TTypeInfo>>& pk,
+                           const TTableSpecials& specials,
+                           NKikimrSchemeOp::TColumnTableSchema* schema)
+    {
+        schema->SetEngine(NKikimrSchemeOp::COLUMN_ENGINE_REPLACING_TIMESERIES);
+
+        for (ui32 i = 0; i < columns.size(); ++i) {
+            *schema->MutableColumns()->Add() = CreateColumn(i + 1, columns[i].first, columns[i].second);
+        }
+
+        Y_VERIFY(pk.size() > 0);
+        for (auto& column : ExtractNames(pk)) {
+            schema->AddKeyColumnNames(column);
+        }
+
+        if (specials.HasCodec()) {
+            schema->MutableDefaultCompression()->SetCompressionCodec(specials.GetCodecId());
+        }
+        if (specials.CompressionLevel) {
+            schema->MutableDefaultCompression()->SetCompressionLevel(*specials.CompressionLevel);
+        }
+
+        schema->SetEnableTiering(specials.HasTiers());
+    }
+
+    static void InitTtl(const TTableSpecials& specials, NKikimrSchemeOp::TColumnDataLifeCycle* ttlSettings) {
+        ttlSettings->SetVersion(1);
+        auto* enable = ttlSettings->MutableEnabled();
+        enable->SetColumnName(specials.GetTtlColumn());
+        enable->SetExpireAfterSeconds(specials.GetEvictAfterSecondsUnsafe());
+    }
+
     static TString CreateTableTxBody(ui64 pathId, const TVector<std::pair<TString, TTypeInfo>>& columns,
-                                     const TVector<std::pair<TString, TTypeInfo>>& pk,
-                                     const TTableSpecials& specials = {}) {
+        const TVector<std::pair<TString, TTypeInfo>>& pk,
+        const TTableSpecials& specials = {}) {
         NKikimrTxColumnShard::TSchemaTxBody tx;
         auto* table = tx.MutableEnsureTables()->AddTables();
         table->SetPathId(pathId);
@@ -191,57 +219,47 @@ struct TTestSchema {
             preset->SetName("default");
 
             // schema
-
-            auto* schema = preset->MutableSchema();
-            schema->SetEngine(NKikimrSchemeOp::COLUMN_ENGINE_REPLACING_TIMESERIES);
-
-            for (ui32 i = 0; i < columns.size(); ++i) {
-                *schema->MutableColumns()->Add() = CreateColumn(i + 1, columns[i].first, columns[i].second);
-            }
-
-            Y_VERIFY(pk.size() == 4);
-            for (auto& column : ExtractNames(pk)) {
-                schema->AddKeyColumnNames(column);
-            }
-
-            if (specials.HasCodec()) {
-                schema->MutableDefaultCompression()->SetCompressionCodec(specials.GetCodecId());
-            }
-            if (specials.CompressionLevel) {
-                schema->MutableDefaultCompression()->SetCompressionLevel(*specials.CompressionLevel);
-            }
-
-            for (auto& tier : specials.Tiers) {
-                auto* t = schema->AddStorageTiers();
-                t->SetName(tier.Name);
-                if (tier.HasCodec()) {
-                    t->MutableCompression()->SetCompressionCodec(tier.GetCodecId());
-                }
-                if (tier.CompressionLevel) {
-                    t->MutableCompression()->SetCompressionLevel(*tier.CompressionLevel);
-                }
-                if (tier.S3) {
-                    t->MutableObjectStorage()->CopyFrom(*tier.S3);
-                }
-            }
+            InitSchema(columns, pk, specials, preset->MutableSchema());
         }
 
-        if (specials.HasTiers()) {
-            auto* ttlSettings = table->MutableTtlSettings();
-            ttlSettings->SetVersion(1);
-            auto* tiering = ttlSettings->MutableTiering();
-            for (auto& tier : specials.Tiers) {
-                auto* t = tiering->AddTiers();
-                t->SetName(tier.Name);
-                t->MutableEviction()->SetColumnName(tier.TtlColumn);
-                t->MutableEviction()->SetExpireAfterSeconds(*tier.EvictAfterSeconds);
-            }
-        } else  if (specials.HasTtl()) {
-            auto* ttlSettings = table->MutableTtlSettings();
-            ttlSettings->SetVersion(1);
-            auto* enable = ttlSettings->MutableEnabled();
-            enable->SetColumnName(specials.TtlColumn);
-            enable->SetExpireAfterSeconds(*specials.EvictAfterSeconds);
+        if (specials.HasTtl()) {
+            InitTtl(specials, table->MutableTtlSettings());
+        }
+
+        TString out;
+        Y_PROTOBUF_SUPPRESS_NODISCARD tx.SerializeToString(&out);
+        return out;
+    }
+
+    static TString CreateInitShardTxBody(ui64 pathId, const TVector<std::pair<TString, TTypeInfo>>& columns,
+        const TVector<std::pair<TString, TTypeInfo>>& pk,
+        const TTableSpecials& specials = {}, const TString& ownerPath = "/Root/olap") {
+        NKikimrTxColumnShard::TSchemaTxBody tx;
+        auto* table = tx.MutableInitShard()->AddTables();
+        tx.MutableInitShard()->SetOwnerPath(ownerPath);
+        table->SetPathId(pathId);
+
+        InitSchema(columns, pk, specials, table->MutableSchema());
+        if (specials.HasTtl()) {
+            InitTtl(specials, table->MutableTtlSettings());
+        }
+
+        TString out;
+        Y_PROTOBUF_SUPPRESS_NODISCARD tx.SerializeToString(&out);
+        return out;
+    }
+
+    static TString CreateStandaloneTableTxBody(ui64 pathId, const TVector<std::pair<TString, TTypeInfo>>& columns,
+                                               const TVector<std::pair<TString, TTypeInfo>>& pk,
+                                               const TTableSpecials& specials = {}) {
+        NKikimrTxColumnShard::TSchemaTxBody tx;
+        auto* table = tx.MutableEnsureTables()->AddTables();
+        table->SetPathId(pathId);
+
+        InitSchema(columns, pk, specials, table->MutableSchema());
+
+        if (specials.HasTtl()) {
+            InitTtl(specials, table->MutableTtlSettings());
         }
 
         TString out;
@@ -258,18 +276,10 @@ struct TTestSchema {
         auto* ttlSettings = table->MutableTtlSettings();
         ttlSettings->SetVersion(version);
 
-        if (specials.HasTiers()) {
-            auto* tiering = ttlSettings->MutableTiering();
-            for (auto& tier : specials.Tiers) {
-                auto* t = tiering->AddTiers();
-                t->SetName(tier.Name);
-                t->MutableEviction()->SetColumnName(tier.TtlColumn);
-                t->MutableEviction()->SetExpireAfterSeconds(*tier.EvictAfterSeconds);
-            }
-        } else if (specials.HasTtl()) {
+        if (specials.HasTtl()) {
             auto* enable = ttlSettings->MutableEnabled();
-            enable->SetColumnName(specials.TtlColumn);
-            enable->SetExpireAfterSeconds(*specials.EvictAfterSeconds);
+            enable->SetColumnName(specials.GetTtlColumn());
+            enable->SetExpireAfterSeconds(specials.GetEvictAfterSecondsUnsafe());
         } else {
             ttlSettings->MutableDisabled();
         }
@@ -289,9 +299,13 @@ struct TTestSchema {
         return out;
     }
 
+    static NMetadataProvider::ISnapshot::TPtr BuildSnapshot(const TTableSpecials& specials, const TString& tablePath, const ui32 tablePathId);
+
     static TString CommitTxBody(ui64 metaShard, const TVector<ui64>& writeIds) {
         NKikimrTxColumnShard::TCommitTxBody proto;
-        proto.SetTxInitiator(metaShard);
+        if (metaShard) {
+            proto.SetTxInitiator(metaShard);
+        }
         for (ui64 id : writeIds) {
             proto.AddWriteIds(id);
         }
@@ -334,12 +348,17 @@ struct TTestSchema {
 };
 
 bool ProposeSchemaTx(TTestBasicRuntime& runtime, TActorId& sender, const TString& txBody, NOlap::TSnapshot snap);
+void ProvideTieringSnapshot(TTestBasicRuntime& runtime, TActorId& sender, NMetadataProvider::ISnapshot::TPtr snapshot);
 void PlanSchemaTx(TTestBasicRuntime& runtime, TActorId& sender, NOlap::TSnapshot snap);
 bool WriteData(TTestBasicRuntime& runtime, TActorId& sender, ui64 metaShard, ui64 writeId, ui64 tableId,
                const TString& data, std::shared_ptr<arrow::Schema> schema = {});
+std::optional<ui64> WriteData(TTestBasicRuntime& runtime, TActorId& sender, const NLongTxService::TLongTxId& longTxId,
+                              ui64 tableId, const TString& dedupId, const TString& data,
+                              std::shared_ptr<arrow::Schema> schema = {});
 void ScanIndexStats(TTestBasicRuntime& runtime, TActorId& sender, const TVector<ui64>& pathIds,
                     NOlap::TSnapshot snap, ui64 scanId = 0);
 void ProposeCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 metaShard, ui64 txId, const TVector<ui64>& writeIds);
+void ProposeCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 txId, const TVector<ui64>& writeIds);
 void PlanCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 planStep, const TSet<ui64>& txIds);
 
 inline void PlanCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 planStep, ui64 txId) {

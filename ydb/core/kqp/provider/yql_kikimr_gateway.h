@@ -1,38 +1,22 @@
 #pragma once
 
-#include "yql_kikimr_query_traits.h"
-
-#include <ydb/library/yql/public/udf/udf_data_type.h>
-#include <ydb/library/yql/utils/resetable_setting.h>
-#include <ydb/library/yql/utils/yql_panic.h>
+#include <ydb/library/aclib/aclib.h>
 #include <ydb/library/yql/providers/common/gateway/yql_provider_gateway.h>
 #include <ydb/library/yql/providers/result/expr_nodes/yql_res_expr_nodes.h>
+#include <ydb/library/yql/public/udf/udf_data_type.h>
+#include <ydb/library/yql/utils/resetable_setting.h>
 
-// TODO: Switch to public protobufs
-#include <ydb/core/scheme/scheme_types_proto.h>
-#include <ydb/core/protos/kqp.pb.h>
-#include <ydb/library/yql/dq/actors/protos/dq_events.pb.h>
 #include <ydb/core/protos/flat_scheme_op.pb.h>
-#include <ydb/library/aclib/aclib.h>
+#include <ydb/core/protos/kqp.pb.h>
+#include <ydb/core/scheme/scheme_types_proto.h>
 
 #include <library/cpp/threading/future/future.h>
 
-#include <util/datetime/base.h>
-#include <util/generic/flags.h>
-#include <util/generic/map.h>
-#include <util/generic/maybe.h>
-#include <util/generic/hash.h>
-#include <util/generic/ptr.h>
 #include <util/string/join.h>
-
-#include <memory>
 
 namespace NYql {
 
 using NUdf::EDataSlot;
-
-class TKikimrGatewayConfig;
-class TKikimrClusterConfig;
 
 using TKikimrParamsMap = TMap<TString, NKikimrMiniKQL::TParams>;
 
@@ -174,7 +158,6 @@ struct TTableSettings {
     TMaybe<TString> KeyBloomFilter;
     TMaybe<TString> ReadReplicasSettings;
     TResetableSetting<TTtlSettings, void> TtlSettings;
-    TMaybe<TString> StoreType;
     TMaybe<TString> PartitionByHashFunction;
 
     bool IsSet() const;
@@ -279,6 +262,19 @@ enum class EKikimrTableKind : ui32 {
     Olap = 3
 };
 
+enum class ETableType : ui32 {
+    Unknown = 0,
+    Table = 1,
+    TableStore = 2
+};
+
+ETableType GetTableTypeFromString(const TStringBuf& tableType);
+
+enum class EStoreType : ui32 {
+    Row = 0,
+    Column = 1
+};
+
 struct TKikimrTableMetadata : public TThrRefBase {
     bool DoesExist = false;
     TString Cluster;
@@ -288,6 +284,8 @@ struct TKikimrTableMetadata : public TThrRefBase {
     ui64 SchemaVersion = 0;
     THashMap<TString, TString> Attributes;
     EKikimrTableKind Kind = EKikimrTableKind::Unspecified;
+    ETableType TableType = ETableType::Table;
+    EStoreType StoreType = EStoreType::Row;
 
     ui64 RecordsCount = 0;
     ui64 DataSize = 0;
@@ -467,6 +465,27 @@ struct TDropGroupSettings {
     bool Force = false;
 };
 
+struct TAlterColumnTableSettings {
+    TString Table;
+};
+
+struct TCreateTableStoreSettings {
+    TString TableStore;
+    ui32 ShardsCount = 0;
+    TMap<TString, TKikimrColumnMetadata> Columns;
+    TVector<TString> KeyColumnNames;
+    TVector<TString> ColumnOrder;
+    TVector<TIndexDescription> Indexes;
+};
+
+struct TAlterTableStoreSettings {
+    TString TableStore;
+};
+
+struct TDropTableStoreSettings {
+    TString TableStore;
+};
+
 struct TKikimrListPathItem {
     TKikimrListPathItem(TString name, bool isDirectory) {
         Name = name;
@@ -478,22 +497,6 @@ struct TKikimrListPathItem {
 };
 
 typedef TIntrusivePtr<TKikimrTableMetadata> TKikimrTableMetadataPtr;
-
-class TKikimrClusterMapping {
-public:
-    TKikimrClusterMapping(const TKikimrGatewayConfig& config);
-
-    void GetAllClusterNames(TVector<TString>& names) const;
-    const TKikimrClusterConfig& GetClusterConfig(const TString& name) const;
-    TMaybe<TString> GetClusterSetting(const TString& cluster, const TString& name) const;
-    TString GetDefaultClusterName() const;
-    bool HasCluster(const TString& cluster) const;
-
-private:
-    THashMap<TString, TKikimrClusterConfig> Clusters;
-    THashMap<TString, THashMap<TString, TString>> ClusterSettings;
-    TString DefaultClusterName;
-};
 
 template<typename TResult>
 class IKikimrAsyncResult : public TThrRefBase {
@@ -557,7 +560,6 @@ public:
         NKqpProto::TKqpStatsQuery QueryStats;
         std::unique_ptr<NKikimrKqp::TPreparedQuery> PreparingQuery;
         std::shared_ptr<const NKikimrKqp::TPreparedQuery> PreparedQuery;
-        std::optional<NKikimr::NKqp::TQueryTraits> QueryTraits;
         TString QueryAst;
         TString QueryPlan;
         std::shared_ptr<google::protobuf::Arena> ProtobufArenaPtr;
@@ -594,7 +596,6 @@ public:
     virtual bool HasCluster(const TString& cluster) = 0;
     virtual TVector<TString> GetClusters() = 0;
     virtual TString GetDefaultCluster() = 0;
-    virtual TMaybe<TKikimrClusterConfig> GetClusterConfig(const TString& cluster) = 0;
     virtual TMaybe<TString> GetSetting(const TString& cluster, const TString& name) = 0;
 
     virtual void SetToken(const TString& cluster, const TString& token) = 0;
@@ -625,6 +626,14 @@ public:
     virtual NThreading::TFuture<TGenericResult> DropGroup(const TString& cluster, const TDropGroupSettings& settings) = 0;
 
     virtual NThreading::TFuture<TGenericResult> CreateColumnTable(TKikimrTableMetadataPtr metadata, bool createDir) = 0;
+
+    virtual NThreading::TFuture<TGenericResult> AlterColumnTable(const TString& cluster, const TAlterColumnTableSettings& settings) = 0;
+
+    virtual NThreading::TFuture<TGenericResult> CreateTableStore(const TString& cluster, const TCreateTableStoreSettings& settings) = 0;
+
+    virtual NThreading::TFuture<TGenericResult> AlterTableStore(const TString& cluster, const TAlterTableStoreSettings& settings) = 0;
+
+    virtual NThreading::TFuture<TGenericResult> DropTableStore(const TString& cluster, const TDropTableStoreSettings& settings) = 0;
 
     virtual TVector<TString> GetCollectedSchemeData() = 0;
 

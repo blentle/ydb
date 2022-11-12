@@ -644,29 +644,51 @@ static bool CreateTableIndex(const TRule_table_index& node, TTranslation& ctx, T
 
 static bool ChangefeedSettingsEntry(const TRule_changefeed_settings_entry& node, TTranslation& ctx, TChangefeedSettings& settings, bool alter) {
     const auto id = IdEx(node.GetRule_an_id1(), ctx);
-    const TString value(ctx.Token(node.GetRule_changefeed_setting_value3().GetToken1()));
-
     if (alter) {
         // currently we don't support alter settings
         ctx.Error() << to_upper(id.Name) << " alter is not supported";
         return false;
     }
 
+    const TToken* token = nullptr;
+    const auto& setting = node.GetRule_changefeed_setting_value3();
+    switch (setting.Alt_case()) {
+    case TRule_changefeed_setting_value::kAltChangefeedSettingValue1:
+        token = &setting.GetAlt_changefeed_setting_value1().GetToken1();
+        break;
+    case TRule_changefeed_setting_value::kAltChangefeedSettingValue2:
+        token = &setting.GetAlt_changefeed_setting_value2().GetRule_bool_value1().GetToken1();
+        break;
+    default:
+        return false;
+    }
+
+    YQL_ENSURE(token);
+    const TString value(ctx.Token(*token));
+    const auto pos = GetPos(*token);
+
     if (to_lower(id.Name) == "sink_type") {
-        auto parsed = StringContent(ctx.Context(), ctx.Context().Pos(), value);
+        auto parsed = StringContent(ctx.Context(), pos, value);
         YQL_ENSURE(parsed.Defined());
         if (to_lower(parsed->Content) == "local") {
             settings.SinkSettings = TChangefeedSettings::TLocalSinkSettings();
         } else {
-            ctx.Error() << "Unknown changefeed sink type: " << to_upper(parsed->Content);
+            ctx.Context().Error() << "Unknown changefeed sink type: " << to_upper(parsed->Content);
             return false;
         }
     } else if (to_lower(id.Name) == "mode") {
         settings.Mode = BuildLiteralSmartString(ctx.Context(), value);
     } else if (to_lower(id.Name) == "format") {
         settings.Format = BuildLiteralSmartString(ctx.Context(), value);
+    } else if (to_lower(id.Name) == "initial_scan") {
+        bool v;
+        if (!TryFromString<bool>(to_lower(value), v)) {
+            ctx.Context().Error(id.Pos) << "Invalid changefeed setting: " << id.Name;
+            return false;
+        }
+        settings.InitialScan = BuildLiteralBool(pos, v);
     } else {
-        ctx.Error() << "Unknown changefeed setting: " << id.Name;
+        ctx.Context().Error(id.Pos) << "Unknown changefeed setting: " << id.Name;
         return false;
     }
 
@@ -4973,7 +4995,7 @@ TNodePtr TSqlExpression::SubExpr(const TRule_con_subexpr& node, const TTrailingQ
             switch (token.GetId()) {
                 case SQLv1LexerTokens::TOKEN_NOT: opName = "Not"; break;
                 case SQLv1LexerTokens::TOKEN_PLUS: opName = "Plus"; break;
-                case SQLv1LexerTokens::TOKEN_MINUS: opName = "Minus"; break;
+                case SQLv1LexerTokens::TOKEN_MINUS: opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedMinus" : "Minus"; break;
                 case SQLv1LexerTokens::TOKEN_TILDA: opName = "BitNot"; break;
                 default:
                     Ctx.IncrementMonCounter("sql_errors", "UnsupportedUnaryOperation");
@@ -5326,15 +5348,15 @@ TNodePtr TSqlExpression::BinOpList(const TNode& node, TGetNode getNode, TIter be
                 Ctx.IncrementMonCounter("sql_binary_operations", "GreaterOrEq");
                 break;
             case SQLv1LexerTokens::TOKEN_PLUS:
-                opName = "+";
+                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedAdd" : "+";
                 Ctx.IncrementMonCounter("sql_binary_operations", "Plus");
                 break;
             case SQLv1LexerTokens::TOKEN_MINUS:
-                opName = "-";
+                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedSub" : "-";
                 Ctx.IncrementMonCounter("sql_binary_operations", "Minus");
                 break;
             case SQLv1LexerTokens::TOKEN_ASTERISK:
-                opName = "*";
+                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedMul" : "*";
                 Ctx.IncrementMonCounter("sql_binary_operations", "Multiply");
                 break;
             case SQLv1LexerTokens::TOKEN_SLASH:
@@ -5342,10 +5364,12 @@ TNodePtr TSqlExpression::BinOpList(const TNode& node, TGetNode getNode, TIter be
                 Ctx.IncrementMonCounter("sql_binary_operations", "Divide");
                 if (!Ctx.Scoped->PragmaClassicDivision && partialResult) {
                     partialResult = new TCallNodeImpl(pos, "SafeCast", {std::move(partialResult), BuildDataType(pos, "Double")});
+                } else if (Ctx.Scoped->PragmaCheckedOps) {
+                    opName = "CheckedDiv";
                 }
                 break;
             case SQLv1LexerTokens::TOKEN_PERCENT:
-                opName = "%";
+                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedMod" : "%";
                 Ctx.IncrementMonCounter("sql_binary_operations", "Mod");
                 break;
             default:
@@ -7234,7 +7258,7 @@ bool TGroupByClause::Build(const TRule_group_by_clause& node) {
         TString mode = Id(node.GetBlock6().GetRule_an_id2(), *this);
         TMaybe<TIssue> normalizeError = NormalizeName(Ctx.Pos(), mode);
         if (!normalizeError.Empty()) {
-            Error() << normalizeError->Message;
+            Error() << normalizeError->GetMessage();
             Ctx.IncrementMonCounter("sql_errors", "NormalizeGroupByModeError");
             return false;
         }
@@ -8603,16 +8627,16 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             Ctx.BodyPart();
             const auto& rule = core.GetAlt_sql_stmt_core4().GetRule_create_table_stmt1();
             const bool isTablestore = rule.GetToken2().GetId() == SQLv1LexerTokens::TOKEN_TABLESTORE;
-            if (isTablestore) {
-                Context().Error(GetPos(rule.GetToken2())) << "CREATE TABLESTORE is not supported yet";
-                return false;
-            }
+
             TTableRef tr;
             if (!SimpleTableRefImpl(rule.GetRule_simple_table_ref3(), tr)) {
                 return false;
             }
 
             TCreateTableParameters params;
+            if (isTablestore) {
+                params.TableType = ETableType::TableStore;
+            }
 
             if (!CreateTableEntry(rule.GetRule_create_table_entry5(), params)) {
                 return false;
@@ -8624,12 +8648,14 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             }
 
             if (rule.HasBlock8()) {
-                Context().Error(GetPos(rule.GetBlock8().GetRule_table_inherits1().GetToken1())) << "INHERITS clause is not supported yet";
+                Context().Error(GetPos(rule.GetBlock8().GetRule_table_inherits1().GetToken1()))
+                    << "INHERITS clause is not supported yet";
                 return false;
             }
 
-            if (rule.HasBlock9()) {
-                Context().Error(GetPos(rule.GetBlock9().GetRule_table_partition_by1().GetToken1())) << "PARTITION BY clause is not supported yet";
+            if (rule.HasBlock9() && isTablestore) {
+                Context().Error(GetPos(rule.GetBlock9().GetRule_table_partition_by1().GetToken1()))
+                    << "PARTITION BY is not supported for TABLESTORE";
                 return false;
             }
 
@@ -8640,7 +8666,8 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             }
 
             if (rule.HasBlock11()) {
-                Context().Error(GetPos(rule.GetBlock11().GetRule_table_tablestore1().GetToken1())) << "TABLESTORE clause is not supported yet";
+                Context().Error(GetPos(rule.GetBlock11().GetRule_table_tablestore1().GetToken1()))
+                    << "TABLESTORE clause is not supported yet";
                 return false;
             }
 
@@ -8651,10 +8678,6 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             Ctx.BodyPart();
             const auto& rule = core.GetAlt_sql_stmt_core5().GetRule_drop_table_stmt1();
             const bool isTablestore = rule.GetToken2().GetId() == SQLv1LexerTokens::TOKEN_TABLESTORE;
-            if (isTablestore) {
-                Context().Error(GetPos(rule.GetToken2())) << "DROP TABLESTORE is not supported yet";
-                return false;
-            }
             if (rule.HasBlock3()) {
                 Context().Error(GetPos(rule.GetToken1())) << "IF EXISTS in " << humanStatementName
                     << " is not supported.";
@@ -8665,7 +8688,7 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                 return false;
             }
 
-            AddStatementToBlocks(blocks, BuildDropTable(Ctx.Pos(), tr, Ctx.Scoped));
+            AddStatementToBlocks(blocks, BuildDropTable(Ctx.Pos(), tr, isTablestore, Ctx.Scoped));
             break;
         }
         case TRule_sql_stmt_core::kAltSqlStmtCore6: {
@@ -8737,12 +8760,16 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
         case TRule_sql_stmt_core::kAltSqlStmtCore15: {
             Ctx.BodyPart();
             const auto& rule = core.GetAlt_sql_stmt_core15().GetRule_alter_table_stmt1();
+            const bool isTablestore = rule.GetToken2().GetId() == SQLv1LexerTokens::TOKEN_TABLESTORE;
             TTableRef tr;
             if (!SimpleTableRefImpl(rule.GetRule_simple_table_ref3(), tr)) {
                 return false;
             }
 
             TAlterTableParameters params;
+            if (isTablestore) {
+                params.TableType = ETableType::TableStore;
+            }
             if (!AlterTableAction(rule.GetRule_alter_table_action4(), params)) {
                 return false;
             }
@@ -9412,7 +9439,7 @@ TNodePtr TSqlQuery::PragmaStatement(const TRule_pragma_stmt& stmt, bool& success
     TString normalizedPragma(pragma);
     TMaybe<TIssue> normalizeError = NormalizeName(Ctx.Pos(), normalizedPragma);
     if (!normalizeError.Empty()) {
-        Error() << normalizeError->Message;
+        Error() << normalizeError->GetMessage();
         Ctx.IncrementMonCounter("sql_errors", "NormalizePragmaError");
         return {};
     }
@@ -9431,7 +9458,7 @@ TNodePtr TSqlQuery::PragmaStatement(const TRule_pragma_stmt& stmt, bool& success
     }
 
     const bool withConfigure = prefix || normalizedPragma == "file" || normalizedPragma == "folder" || normalizedPragma == "udf";
-    static const THashSet<TStringBuf> lexicalScopePragmas = {"classicdivision", "strictjoinkeytypes", "disablestrictjoinkeytypes"};
+    static const THashSet<TStringBuf> lexicalScopePragmas = {"classicdivision", "strictjoinkeytypes", "disablestrictjoinkeytypes", "checkedops"};
     const bool hasLexicalScope = withConfigure || lexicalScopePragmas.contains(normalizedPragma);
     for (auto pragmaValue : pragmaValues) {
         if (pragmaValue->HasAlt_pragma_value3()) {
@@ -9540,8 +9567,13 @@ TNodePtr TSqlQuery::PragmaStatement(const TRule_pragma_stmt& stmt, bool& success
             success = true;
             return BuildPragma(Ctx.Pos(), TString(ConfigProviderName), "AddFolderByUrl", values, false);
         } else if (normalizedPragma == "library") {
-            if (values.size() != 1 && values.size() != 2) {
+            if (values.size() < 1) {
                 Error() << "Expected non-empty file alias";
+                Ctx.IncrementMonCounter("sql_errors", "BadPragmaValue");
+                return{};
+            }
+            if (values.size() > 3) {
+                Error() << "Expected file alias and optional url and token name as pragma values";
                 Ctx.IncrementMonCounter("sql_errors", "BadPragmaValue");
                 return{};
             }
@@ -9552,25 +9584,31 @@ TNodePtr TSqlQuery::PragmaStatement(const TRule_pragma_stmt& stmt, bool& success
                 return{};
             }
 
-            TMaybe<TString> file;
-            if (values.size() == 2) {
-                file.ConstructInPlace();
-                if (!values[1].GetLiteral(*file, Ctx)) {
+            TMaybe<std::pair<TString, TString>> fileWithToken;
+            if (values.size() > 1) {
+                fileWithToken.ConstructInPlace();
+                if (!values[1].GetLiteral(fileWithToken->first, Ctx)) {
                     Ctx.IncrementMonCounter("sql_errors", "BadPragmaValue");
                     return{};
                 }
 
                 TSet<TString> names;
-                SubstParameters(*file, Nothing(), &names);
+                SubstParameters(fileWithToken->first, Nothing(), &names);
                 for (const auto& name : names) {
                     auto namedNode = GetNamedNode(name);
                     if (!namedNode) {
                         return{};
                     }
                 }
+                if (values.size() > 2) {
+                    if (!values[2].GetLiteral(fileWithToken->second, Ctx)) {
+                        Ctx.IncrementMonCounter("sql_errors", "BadPragmaValue");
+                        return{};
+                    }
+                }
             }
 
-            Ctx.Libraries[alias]=file;
+            Ctx.Libraries[alias] = fileWithToken;
             Ctx.IncrementMonCounter("sql_pragma", "library");
         } else if (normalizedPragma == "directread") {
             Ctx.PragmaDirectRead = true;
@@ -9727,6 +9765,13 @@ TNodePtr TSqlQuery::PragmaStatement(const TRule_pragma_stmt& stmt, bool& success
                 return {};
             }
             Ctx.IncrementMonCounter("sql_pragma", "ClassicDivision");
+        } else if (normalizedPragma == "checkedops") {
+            if (values.size() != 1 || !values[0].GetLiteral() || !TryFromString(*values[0].GetLiteral(), Ctx.Scoped->PragmaCheckedOps)) {
+                Error() << "Expected boolean literal as a single argument for: " << pragma;
+                Ctx.IncrementMonCounter("sql_errors", "BadPragmaValue");
+                return {};
+            }
+            Ctx.IncrementMonCounter("sql_pragma", "CheckedOps");
         } else if (normalizedPragma == "disableunordered") {
             Ctx.Warning(Ctx.Pos(), TIssuesIds::YQL_DEPRECATED_PRAGMA)
                 << "Use of deprecated DisableUnordered pragma. It will be dropped soon";

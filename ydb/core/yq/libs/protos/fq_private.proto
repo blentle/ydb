@@ -22,6 +22,23 @@ message CompressedData {
     bytes data = 2;
 }
 
+message TaskResources {
+
+    enum ResourceState {
+        UNSPECIFIED = 0; // on start
+        NOT_NEEDED = 1;  // is not configured to use - skip it
+        PREPARE = 2;    // resource creating in progress (retriable)
+        READY = 3;     // created and ready to go
+        CLEANUP = 4;   // is being destroyin (cleanup)
+    }
+
+    ResourceState rate_limiter = 1;
+    ResourceState compilation = 2;
+    ResourceState read_rules = 3;
+
+    string rate_limiter_path = 10;
+}
+
 message GetTaskRequest {
     string tenant = 1;
     string owner_id = 2; // guid, should be refreshed on node restart
@@ -85,23 +102,19 @@ message GetTaskResult {
         uint64 result_limit = 26;
 
         YandexQuery.Limits limits = 27;
-        string rate_limiter = 28; // Kesus path. If empty, rate limiting is off.
         google.protobuf.Duration execution_limit = 29;
         google.protobuf.Timestamp request_started_at = 30;
         repeated CompressedData dq_graph_compressed = 31;
         uint32 restart_count = 32;
+
+        TaskResources resources = 33;
+        YandexQuery.QueryContent.QuerySyntax query_syntax = 34;
     }
     repeated Task tasks = 1;
 }
 
 message GetTaskResponse {
     Ydb.Operations.Operation operation = 1; // GetTaskResult
-}
-
-message RateLimiterResources {
-    string rate_limiter = 1; // Kesus path
-    string resource_path = 2;
-    bool delete_resource = 3; // Delete resource when query is finished. Otherwise create
 }
 
 message PingTaskRequest {
@@ -126,7 +139,6 @@ message PingTaskRequest {
     YandexQuery.StreamingDisposition disposition = 19;
     int32 dq_graph_index = 20;
     NYql.NDqProto.StatusIds.StatusCode status_code = 21;
-    RateLimiterResources rate_limiter_resources = 22;
     repeated CompressedData dq_graph_compressed = 23;
     CompressedData ast_compressed = 24;
     CompressedData plan_compressed = 25;
@@ -135,6 +147,7 @@ message PingTaskRequest {
     google.protobuf.Timestamp finished_at = 102;
     google.protobuf.Timestamp deadline = 103;
     string tenant = 104;
+    TaskResources resources = 33;
 }
 
 message PingTaskResult {

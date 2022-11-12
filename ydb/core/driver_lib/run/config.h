@@ -65,6 +65,7 @@ union TBasicKikimrServicesMask {
         bool EnableYandexQuery:1;
         bool EnableSequenceProxyService:1;
         bool EnableHttpProxy:1;
+        bool EnableMetadataProvider : 1;
     };
 
     ui64 Raw;
@@ -105,6 +106,7 @@ struct TKikimrRunConfig {
 
     TString                    PathToConfigCacheFile;
 
+    TString                    TenantName;
     TBasicKikimrServicesMask   ServicesMask;
 
     TKikimrRunConfig(NKikimrConfig::TAppConfig& appConfig,

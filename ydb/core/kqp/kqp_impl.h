@@ -52,7 +52,7 @@ IActor* CreateKqpCompileService(const NKikimrConfig::TTableServiceConfig& servic
 IActor* CreateKqpCompileActor(const TActorId& owner, const TKqpSettings::TConstPtr& kqpSettings,
     const NKikimrConfig::TTableServiceConfig& serviceConfig, TIntrusivePtr<TModuleResolverState> moduleResolverState,
     TIntrusivePtr<TKqpCounters> counters, const TString& uid, const TKqpQueryId& query, const TString& userToken,
-    TKqpDbCountersPtr dbCounters, bool recompileWithNewEngine, NWilson::TTraceId traceId = {});
+    TKqpDbCountersPtr dbCounters, NWilson::TTraceId traceId = {});
 
 IActor* CreateKqpCompileRequestActor(const TActorId& owner, const TString& userToken, const TMaybe<TString>& uid,
     TMaybe<TKqpQueryId>&& query, bool keepInCache, const TInstant& deadline, TKqpDbCountersPtr dbCounters,
@@ -84,18 +84,14 @@ IActor* CreateKqpSessionActor(const TActorId& owner, const TString& sessionId,
     TIntrusivePtr<TModuleResolverState> moduleResolverState, TIntrusivePtr<TKqpCounters> counters);
 
 TIntrusivePtr<IKqpGateway> CreateKikimrIcGateway(const TString& cluster, const TString& database,
-    std::shared_ptr<IKqpGateway::IKqpTableMetadataLoader>&& metadataLoader, NActors::TActorSystem* actorSystem, ui32 nodeId, TKqpRequestCounters::TPtr counters,
-    const TActorId& MkqlCompileService);
+    std::shared_ptr<IKqpGateway::IKqpTableMetadataLoader>&& metadataLoader, NActors::TActorSystem* actorSystem,
+    ui32 nodeId, TKqpRequestCounters::TPtr counters);
 
 TMaybe<Ydb::StatusIds::StatusCode> GetYdbStatus(const NYql::TIssue& issue);
 Ydb::StatusIds::StatusCode GetYdbStatus(const NYql::NCommon::TOperationResult& queryResult);
 Ydb::StatusIds::StatusCode GetYdbStatus(const NYql::TIssues& issues);
 void AddQueryIssues(NKikimrKqp::TQueryResponse& response, const NYql::TIssues& issues);
 bool HasSchemeOrFatalIssues(const NYql::TIssues& issues);
-
-// for tests only
-void FailForcedNewEngineCompilationForTests(bool fail = true);
-void FailForcedNewEngineExecutionForTests(bool fail = true);
 
 } // namespace NKqp
 } // namespace NKikimr

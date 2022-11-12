@@ -12,7 +12,21 @@
 namespace NKikimr {
 namespace NKqp {
 
-void WriteKqlPlan(NJsonWriter::TBuf& writer, const NYql::TExprNode::TPtr& query);
+enum class EPlanTableReadType {
+    Unspecified,
+    FullScan,
+    Scan,
+    Lookup,
+    MultiLookup,
+};
+
+enum class EPlanTableWriteType {
+    Unspecified,
+    Upsert,
+    MultiUpsert,
+    Erase,
+    MultiErase,
+};
 
 /*
  * Set dqPlan in each physical transaction (TKqpPhyQuery.Transactions[].Plan). Common query plan with all
