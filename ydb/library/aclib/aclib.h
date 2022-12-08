@@ -9,6 +9,14 @@ namespace NACLib {
 #define BUILTIN_ACL_DOMAIN "builtin"
 #define BUILTIN_ACL_ROOT "root@" BUILTIN_ACL_DOMAIN
 #define BUILTIN_ERROR_DOMAIN "error"
+#define BUILTIN_SYSTEM_DOMAIN "system"
+
+#define BUILTIN_ACL_METADATA "metadata@" BUILTIN_SYSTEM_DOMAIN
+class TUserToken;
+class TSystemUsers {
+public:
+    static const TUserToken& Metadata();
+};
 
 enum EAccessRights : ui32 { // bitmask
     NoAccess = 0x00000000,
@@ -31,12 +39,14 @@ enum EAccessRights : ui32 { // bitmask
     ReadStream = 0x00010000, // reading streams
     WriteStream = 0x00020000, // writing streams
     ReadTopic = 0x00040000, // reading topics
-    WritTopic = 0x00080000, // writing topics
+    WriteTopic = 0x00080000, // writing topics
 
     GenericRead = SelectRow | ReadAttributes | DescribeSchema,
     GenericWrite = UpdateRow | EraseRow | WriteAttributes | CreateDirectory | CreateTable | CreateQueue | RemoveSchema | AlterSchema | WriteUserAttributes,
-    GenericUse = GenericRead | GenericWrite | GrantAccessRights,
+    GenericUseLegacy = GenericRead | GenericWrite | GrantAccessRights,
+    GenericUse = GenericUseLegacy | ConnectDatabase,
     GenericManage = CreateDatabase | DropDatabase,
+    GenericFullLegacy = GenericUseLegacy | GenericManage,
     GenericFull = GenericUse | GenericManage,
 };
 
@@ -83,6 +93,7 @@ public:
     TString GetOriginalUserToken() const;
     TString SerializeAsString() const;
     void AddGroupSID(const TSID& groupSID);
+    bool IsSystemUser() const;
 
     using NACLibProto::TUserToken::ShortDebugString;
 

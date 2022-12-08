@@ -1,9 +1,9 @@
 #include "schemeshard__operation_part.h"
+#include "schemeshard__operation_common_subdomain.h"
 #include "schemeshard__operation_common.h"
 #include "schemeshard_impl.h"
 
 #include <ydb/core/base/subdomain.h>
-#include <ydb/core/persqueue/config/config.h>
 
 namespace {
 
@@ -11,16 +11,12 @@ using namespace NKikimr;
 using namespace NSchemeShard;
 
 class TCreateExtSubDomain: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::Propose;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Waiting:
             return TTxState::Propose;
         case TTxState::Propose:
@@ -28,11 +24,10 @@ class TCreateExtSubDomain: public TSubOperation {
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::Propose:
             return THolder(new NSubDomainState::TPropose(OperationId));
@@ -43,28 +38,8 @@ class TCreateExtSubDomain: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TCreateExtSubDomain(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TCreateExtSubDomain(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-          , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString& owner, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -75,8 +50,6 @@ public:
         const TString& parentPathStr = Transaction.GetWorkingDir();
         const TString& name = settings.GetName();
 
-        ui64 shardsToCreate = settings.GetCoordinators() + settings.GetMediators();
-
         LOG_NOTICE_S(context.Ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
                      "TCreateExtSubDomain Propose"
                          << ", path" << parentPathStr << "/" << name
@@ -86,17 +59,19 @@ public:
         TEvSchemeShard::EStatus status = NKikimrScheme::StatusAccepted;
         auto result = MakeHolder<TProposeResponse>(status, ui64(OperationId.GetTxId()), ui64(ssId));
 
-        if (!parentPathStr) {
+        auto paramErrorResult = [&result](const char* const msg) {
             result->SetError(NKikimrScheme::StatusInvalidParameter,
-                             "Malformed subdomain request: no working dir");
-            return result;
+                TStringBuilder() << "Invalid ExtSubDomain request: " << msg
+            );
+            return std::move(result);
+        };
+
+        if (!parentPathStr) {
+            return paramErrorResult("no working dir");
         }
 
         if (!name) {
-            result->SetError(
-                NKikimrScheme::StatusInvalidParameter,
-                "Malformed subdomain request: no name");
-            return result;
+            return paramErrorResult("no name");
         }
 
         NSchemeShard::TPath parentPath = NSchemeShard::TPath::Resolve(parentPathStr, context.SS);
@@ -140,8 +115,6 @@ public:
                     .DepthLimit()
                     .PathsLimit() //check capacity on root Domain
                     .DirChildrenLimit()
-                    .PathShardsLimit(shardsToCreate)
-                    .ShardsLimit(shardsToCreate) //check capacity on root Domain
                     .IsValidACL(acl);
             }
 
@@ -161,10 +134,7 @@ public:
             settings.GetMediators() == 0;
 
         if (!onlyDeclaration) {
-            result->SetError(
-                NKikimrScheme::StatusInvalidParameter,
-                "Malformed subdomain request: only declaration at creation is allowed, do not set up tables");
-            return result;
+            return paramErrorResult("only declaration at creation is allowed, do not set up tables");
         }
 
         TPathId resourcesDomainId;
@@ -189,10 +159,7 @@ public:
 
         bool requestedStoragePools = !settings.GetStoragePools().empty();
         if (requestedStoragePools) {
-            result->SetError(
-                NKikimrScheme::StatusInvalidParameter,
-                "Malformed subdomain request: only declaration at creation is allowed, do not set up storage");
-            return result;
+            return paramErrorResult("only declaration at creation is allowed, do not set up storage");
         }
 
         const auto& userAttrsDetails = Transaction.GetAlterUserAttributes();
@@ -209,10 +176,6 @@ public:
 
         if (!context.SS->CheckApplyIf(Transaction, errStr)) {
             result->SetError(NKikimrScheme::StatusPreconditionFailed, errStr);
-            return result;
-        }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxCreateExtSubDomain, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
             return result;
         }
 
@@ -296,8 +259,7 @@ public:
         parentPath.DomainInfo()->IncPathsInside();
         parentPath.Base()->IncAliveChildren();
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -318,17 +280,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateExtSubDomain(TOperationId id, const TTxTransaction& tx) {
-    return new TCreateExtSubDomain(id, tx);
+    return MakeSubOperation<TCreateExtSubDomain>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateExtSubDomain(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TCreateExtSubDomain(id, state);
+    return MakeSubOperation<TCreateExtSubDomain>(id, state);
 }
 
-}
 }

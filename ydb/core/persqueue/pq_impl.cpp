@@ -658,7 +658,8 @@ void TPersQueue::ApplyNewConfigAndReply(const TActorContext& ctx)
         if (Partitions.find(partitionId) == Partitions.end()) {
             Partitions.emplace(partitionId, TPartitionInfo(
                 ctx.Register(new TPartition(TabletID(), partitionId, ctx.SelfID, CacheActor, TopicConverter,
-                                            IsLocalDC, DCId, Config, *Counters, ctx, true)),
+                                            IsLocalDC, DCId, Config, *Counters,
+                                            true)),
                 GetPartitionKeyRange(partition),
                 true,
                 *Counters
@@ -788,7 +789,8 @@ void TPersQueue::ReadConfig(const NKikimrClient::TKeyValueResponse::TReadResult&
         const auto partitionId = partition.GetPartitionId();
         Partitions.emplace(partitionId, TPartitionInfo(
             ctx.Register(new TPartition(TabletID(), partitionId, ctx.SelfID, CacheActor, TopicConverter,
-                                        IsLocalDC, DCId, Config, *Counters, ctx, false)),
+                                        IsLocalDC, DCId, Config, *Counters,
+                                        false)),
             GetPartitionKeyRange(partition),
             false,
             *Counters
@@ -1420,7 +1422,8 @@ void TPersQueue::Handle(TEvPersQueue::TEvStatus::TPtr& ev, const TActorContext& 
     for (auto& p : Partitions) {
         if (!p.second.InitDone)
             continue;
-        THolder<TEvPQ::TEvPartitionStatus> event = MakeHolder<TEvPQ::TEvPartitionStatus>(ans, ev->Get()->Record.HasClientId() ? ev->Get()->Record.GetClientId() : "");
+        THolder<TEvPQ::TEvPartitionStatus> event = MakeHolder<TEvPQ::TEvPartitionStatus>(ans, ev->Get()->Record.HasClientId() ? ev->Get()->Record.GetClientId() : "",
+                                                    ev->Get()->Record.HasGetStatForAllConsumers() ? ev->Get()->Record.GetGetStatForAllConsumers() : false);
         ctx.Send(p.second.Actor, event.Release());
     }
 }
@@ -2198,16 +2201,38 @@ void TPersQueue::Handle(TEvPersQueue::TEvProposeTransaction::TPtr& ev, const TAc
                     ", is_write=" << isWriteOperation);
     }
 
-    auto result = std::make_unique<TEvPersQueue::TEvProposeTransactionResult>();
+    //
+    // TODO(abcdef): сохранить пока инициализиремся. TEvPersQueue::TEvHasDataInfo::TPtr как образец. не только конфиг. Inited==true
+    //
 
-    result->Record.SetOrigin(TabletID());
-    result->Record.SetStatus(NKikimrPQ::TEvProposeTransactionResult::ERROR);
-    result->Record.SetTxId(event.GetTxId());
-    //result->Record.SetMinStep();
-    //result->Record.SetMaxStep();
-    //result->Record.SetStep();
+    //
+    // TODO(abcdef): если установлен флаг ImmediateTx, то отправлять в партицию
+    //
+    if (txBody.GetImmediate()) {
+        //
+        // FIXME(abcdef): вместо Y_VERIFY отправлять TEvProposeTransactionResult с кодом ошибки
+        //
+        Y_VERIFY(txBody.OperationsSize() > 0);
 
-    ctx.Send(ActorIdFromProto(event.GetSource()), result.release());
+        auto i = Partitions.find(txBody.GetOperations(0).GetPartitionId());
+        Y_VERIFY(i != Partitions.end());
+
+        //
+        // FIXME(abcdef): последовательность вызовов Release
+        //
+        ctx.Send(i->second.Actor, ev.Release()->Release().Release());
+    } else {
+        auto result = std::make_unique<TEvPersQueue::TEvProposeTransactionResult>();
+
+        result->Record.SetOrigin(TabletID());
+        result->Record.SetStatus(NKikimrPQ::TEvProposeTransactionResult::ERROR);
+        result->Record.SetTxId(event.GetTxId());
+        //result->Record.SetMinStep();
+        //result->Record.SetMaxStep();
+        //result->Record.SetStep();
+
+        ctx.Send(ActorIdFromProto(event.GetSource()), result.release());
+    }
 }
 
 bool TPersQueue::HandleHook(STFUNC_SIG)

@@ -155,6 +155,19 @@ struct TEquals : public TCompareArithmeticBinary<TLeft, TRight, TEquals<TLeft, T
 #endif
 };
 
+template<typename TLeft, typename TRight, typename TOutput>
+struct TEqualsOp;
+
+template<typename TLeft, typename TRight>
+struct TEqualsOp<TLeft, TRight, ui8> : public TEquals<TLeft, TRight, false> {
+    using TBase = TEquals<TLeft, TRight, false>;
+    static constexpr bool DefaultNulls = true;
+    static ui8 Do(TLeft left, TRight right)
+    {
+        return TBase::Do(left, right);
+    }
+};
+
 template<typename TLeft, typename TRight, bool Aggr>
 struct TDiffDateEquals : public TCompareArithmeticBinary<TLeft, TRight, TDiffDateEquals<TLeft, TRight, Aggr>>, public TAggrEquals {
     static bool Do(TLeft left, TRight right)
@@ -274,6 +287,10 @@ void RegisterEquals(IBuiltinFunctionRegistry& registry) {
 
     RegisterAggrCompareStrings<TCustomEquals, TCompareArgsOpt>(registry, aggrName);
     RegisterAggrCompareCustomOpt<NUdf::TDataType<NUdf::TDecimal>, TDecimalAggrEquals, TCompareArgsOpt>(registry, aggrName);
+}
+
+void RegisterEquals(TKernelFamilyMap& kernelFamilyMap) {
+    kernelFamilyMap["Equals"] = std::make_unique<TBinaryNumericPredicateKernelFamily<TEqualsOp>>();
 }
 
 } // namespace NMiniKQL

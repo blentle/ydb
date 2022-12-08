@@ -16,7 +16,7 @@ items:
 
 - { name: Управление базами данных,                include: { mode: link, path: db/toc_p.yaml } }
 - { name: Управление кластером,                    include: { mode: link, path: cluster/toc_p.yaml } }
-# References  
+# References
 - { name: YQL,                                     include: { mode: link, path: yql/toc_p.yaml } }
 - { name: Работа с YDB CLI,                        include: { mode: link, path: reference/ydb-cli/toc_p.yaml } }
 - { name: Работа с YDB SDK,                        include: { mode: link, path: reference/ydb-sdk/toc_p.yaml } }
@@ -26,13 +26,36 @@ items:
   - name: Ядро
     items:
     - name: Тестирование с помощью нагружающих акторов
-      href: development/testing-load-actor.md
+      items:
+      - name: Обзор
+        href: development/load-actors-overview.md
+      - name: KqpLoadStart
+        href: development/load-actors-kqp.md
+      - name: KeyValueLoadStart
+        href: development/load-actors-key-value.md
+      - name: LoadStart
+        href: development/load-actors-load-start.md
+      - name: VDiskLoadStart
+        href: development/load-actors-vdisk.md
+      - name: PDiskLoadStart
+        href: development/load-actors-pdisk.md
+      - name: PDiskReadLoadStart
+        href: development/load-actors-pdisk-read.md
+      - name: PDiskLogLoadStart
+        href: development/load-actors-pdisk-log.md
+      - name: MemoryLoadStart
+        href: development/load-actors-memory.md
+      - name: LoadStop
+        href: development/load-actors-load-stop.md
 
 # Footer
 - { name: Вопросы и ответы,                        include: { mode: link, path: faq/toc_p.yaml } }
 - include: { mode: link, path: downloads/toc_p.yaml }
 - name: Публичные материалы
   href: public-talks.md
-- name: История изменений
-  href: changelog.md
-  
+- name: Что нового
+  items:
+  - name: Список изменений
+    href: changelog.md
+  - name: Список изменений безопасности
+    href: security-changelog.md

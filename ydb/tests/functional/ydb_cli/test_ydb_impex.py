@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-
 from ydb.tests.library.common import yatest_common
 from ydb.tests.library.harness.kikimr_cluster import kikimr_cluster_factory
+from ydb.tests.oss_canonical import set_canondata_root
+
 import ydb
 import logging
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,10 @@ DATA_JSON = """{"key":1,"id":1111,"value":"one"}
 {"key":7,"id":7777,"value":"seven"}
 """
 
+ARRAYS = [pa.array([1, 2, 3, 5, 7], type=pa.uint32()), pa.array([1111, 2222, 3333, 5555, 7777], type=pa.uint64()), pa.array(["one", "two", "three", "five", "seven"], type=pa.string())]
+ARRAY_NAMES = ['key', 'id', 'value']
+DATA_PARQUET = pa.Table.from_arrays(ARRAYS, names=ARRAY_NAMES)
+
 
 def ydb_bin():
     return yatest_common.binary_path("ydb/apps/ydb/ydb")
@@ -46,6 +53,8 @@ def create_table(session, path):
 class BaseTestTableService(object):
     @classmethod
     def setup_class(cls):
+        set_canondata_root('ydb/tests/functional/ydb_cli/canondata')
+
         cls.cluster = kikimr_cluster_factory()
         cls.cluster.start()
         cls.root_dir = "/Root"
@@ -99,16 +108,21 @@ class TestImpex(BaseTestTableService):
 
     def run_import_csv(self, ftype, data):
         self.clear_table()
-        with open("tempinput.dat", "w") as f:
+        with open("tempinput.csv", "w") as f:
             f.writelines(data)
-        output = self.execute_ydb_cli_command(["import", "file", ftype, "-p", self.table_path, "-i", "tempinput.dat", "--header"])
-        return self.canonical_result(output)
+        self.execute_ydb_cli_command(["import", "file", ftype, "-p", self.table_path, "-i", "tempinput.csv", "--header"])
 
     def run_import_json(self, data):
         self.clear_table()
-        with open("tempinput.dat", "w") as f:
+        with open("tempinput.json", "w") as f:
             f.writelines(data)
-        output = self.execute_ydb_cli_command(["import", "file", "json", "-p", self.table_path, "-i", "tempinput.dat"])
+        self.execute_ydb_cli_command(["import", "file", "json", "-p", self.table_path, "-i", "tempinput.json"])
+
+    def run_import_parquet(self, data):
+        self.clear_table()
+        with open("tempinput.parquet", "w"):
+            pq.write_table(data, "tempinput.parquet", version="2.4")
+        output = self.execute_ydb_cli_command(["import", "file", "parquet", "-p", self.table_path, "-i", "tempinput.parquet"])
         return self.canonical_result(output)
 
     def run_export(self, format):
@@ -127,3 +141,7 @@ class TestImpex(BaseTestTableService):
     def test_format_json(self):
         self.run_import_json(DATA_JSON)
         return self.run_export("json-unicode")
+
+    def test_format_parquet(self):
+        self.run_import_parquet(DATA_PARQUET)
+        return self.run_export("csv")

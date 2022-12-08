@@ -20,10 +20,6 @@
 namespace CH
 {
 
-using NDB::StringRef;
-using NDB::StringRefHash;
-using NDB::StringRefs;
-
 /// What to do if the limit is exceeded.
 enum class OverflowMode
 {
@@ -184,6 +180,38 @@ inline To assert_cast(From && from)
         }
     }
     return dynamic_cast<To>(from);
+#else
+    return static_cast<To>(from);
+#endif
+}
+
+template <typename To>
+inline To assert_same_size_cast(const IColumn * from)
+{
+#ifndef NDEBUG
+    using ArrayType = typename std::remove_pointer<To>::type;
+    using CTo = typename ArrayType::value_type;
+
+    auto type_id = from->type_id();
+    if (arrow::is_primitive(type_id) && sizeof(CTo) == (bit_width(type_id) / 8))
+        return static_cast<To>(from);
+    return assert_cast<To>(from);
+#else
+    return static_cast<To>(from);
+#endif
+}
+
+template <typename To>
+inline To assert_same_size_cast(MutableColumn & from)
+{
+#ifndef NDEBUG
+    using ArrayType = typename std::remove_reference<To>::type;
+    using CTo = typename ArrayType::value_type;
+
+    auto type_id = from.type()->id();
+    if (arrow::is_primitive(type_id) && sizeof(CTo) == (bit_width(type_id) / 8))
+        return static_cast<To>(from);
+    return assert_cast<To>(from);
 #else
     return static_cast<To>(from);
 #endif

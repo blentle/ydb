@@ -92,8 +92,7 @@ public:
         return RunSimple<Ydb::Topic::V1::TopicService, Ydb::Topic::CreateTopicRequest, Ydb::Topic::CreateTopicResponse>(
             std::move(request),
             &Ydb::Topic::V1::TopicService::Stub::AsyncCreateTopic,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
 
@@ -154,8 +153,7 @@ public:
         return RunSimple<Ydb::Topic::V1::TopicService, Ydb::Topic::AlterTopicRequest, Ydb::Topic::AlterTopicResponse>(
             std::move(request),
             &Ydb::Topic::V1::TopicService::Stub::AsyncAlterTopic,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
 
@@ -166,13 +164,16 @@ public:
         return RunSimple<Ydb::Topic::V1::TopicService, Ydb::Topic::DropTopicRequest, Ydb::Topic::DropTopicResponse>(
             std::move(request),
             &Ydb::Topic::V1::TopicService::Stub::AsyncDropTopic,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TAsyncDescribeTopicResult DescribeTopic(const TString& path, const TDescribeTopicSettings& settings) {
         auto request = MakeOperationRequest<Ydb::Topic::DescribeTopicRequest>(settings);
         request.set_path(path);
+
+        if (settings.IncludeStats_) {
+            request.set_include_stats(true);
+        }
 
         auto promise = NThreading::NewPromise<TDescribeTopicResult>();
 
@@ -193,8 +194,40 @@ public:
             &Ydb::Topic::V1::TopicService::Stub::AsyncDescribeTopic,
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
+
+        return promise.GetFuture();
+    }
+
+    TAsyncDescribeConsumerResult DescribeConsumer(const TString& path, const TString& consumer, const TDescribeConsumerSettings& settings) {
+        auto request = MakeOperationRequest<Ydb::Topic::DescribeConsumerRequest>(settings);
+        request.set_path(path);
+        request.set_consumer(consumer);
+
+        if (settings.IncludeStats_) {
+            request.set_include_stats(true);
+        }
+
+        auto promise = NThreading::NewPromise<TDescribeConsumerResult>();
+
+        auto extractor = [promise]
+            (google::protobuf::Any* any, TPlainStatus status) mutable {
+                Ydb::Topic::DescribeConsumerResult result;
+                if (any) {
+                    any->UnpackTo(&result);
+                }
+
+                TDescribeConsumerResult val(TStatus(std::move(status)), std::move(result));
+                promise.SetValue(std::move(val));
+            };
+
+        Connections_->RunDeferred<Ydb::Topic::V1::TopicService, Ydb::Topic::DescribeConsumerRequest, Ydb::Topic::DescribeConsumerResponse>(
+            std::move(request),
+            extractor,
+            &Ydb::Topic::V1::TopicService::Stub::AsyncDescribeConsumer,
+            DbDriverState_,
+            INITIAL_DEFERRED_CALL_DELAY,
+            TRpcRequestSettings::Make(settings));
 
         return promise.GetFuture();
     }

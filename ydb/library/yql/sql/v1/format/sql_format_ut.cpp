@@ -248,6 +248,34 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
         setup.Run(cases);
     }
 
+    Y_UNIT_TEST(ObjectOperations) {
+        TCases cases = {
+            {"alter oBject usEr (TYpe abcde) Set (a = b)",
+             "ALTER OBJECT usEr (TYPE abcde) SET (a = b);\n"},
+            {"creAte oBject usEr (tYpe abcde) With (a = b)",
+             "CREATE OBJECT usEr (TYPE abcde) WITH (a = b);\n"},
+            {"creAte oBject usEr (tYpe abcde) With a = b",
+             "CREATE OBJECT usEr (TYPE abcde) WITH a = b;\n"},
+            {"dRop oBject usEr (tYpe abcde) With (aeEE)",
+             "DROP OBJECT usEr (TYPE abcde) WITH (aeEE);\n"},
+            {"dRop oBject usEr (tYpe abcde) With aeEE",
+             "DROP OBJECT usEr (TYPE abcde) WITH aeEE;\n"}
+        };
+
+        TSetup setup;
+        setup.Run(cases);
+    }
+
+    Y_UNIT_TEST(TypeSelection) {
+        TCases cases = {
+            {"Select tYpe.* frOm Table tYpe",
+             "SELECT\n\ttYpe.*\nFROM Table\n\ttYpe;\n"}
+        };
+
+        TSetup setup;
+        setup.Run(cases);
+    }
+
     Y_UNIT_TEST(AlterTable) {
         TCases cases = {
             {"alter table user add user int32",
@@ -294,6 +322,12 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
              "ALTER TABLE user\n\tADD CHANGEFEED user WITH (initial_scan = TRUE);\n"},
             {"alter table user add changefeed user with (initial_scan = FaLsE)",
              "ALTER TABLE user\n\tADD CHANGEFEED user WITH (initial_scan = FALSE);\n"},
+            {"alter table user add changefeed user with (retention_period = Interval(\"P1D\"))",
+             "ALTER TABLE user\n\tADD CHANGEFEED user WITH (retention_period = Interval(\"P1D\"));\n"},
+            {"alter table user add changefeed user with (virtual_timestamps = TruE)",
+             "ALTER TABLE user\n\tADD CHANGEFEED user WITH (virtual_timestamps = TRUE);\n"},
+            {"alter table user add changefeed user with (virtual_timestamps = fAlSe)",
+             "ALTER TABLE user\n\tADD CHANGEFEED user WITH (virtual_timestamps = FALSE);\n"},
         };
 
         TSetup setup;

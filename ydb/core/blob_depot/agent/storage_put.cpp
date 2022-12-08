@@ -7,7 +7,7 @@ namespace NKikimr::NBlobDepot {
     TBlobDepotAgent::TQuery *TBlobDepotAgent::CreateQuery<TEvBlobStorage::EvPut>(std::unique_ptr<IEventHandle> ev) {
         class TPutQuery : public TBlobStorageQuery<TEvBlobStorage::TEvPut> {
             const bool SuppressFooter = true;
-            const bool IssueUncertainWrites = true;
+            const bool IssueUncertainWrites = false;
 
             std::vector<ui32> BlockChecksRemain;
             ui32 PutsInFlight = 0;
@@ -28,9 +28,14 @@ namespace NKikimr::NBlobDepot {
                     BlobSeqId.ToProto(msg.AddItems());
                     Agent.Issue(std::move(msg), this, nullptr);
                 }
+
+                TBlobStorageQuery::OnDestroy(success);
             }
 
             void Initiate() override {
+                BDEV_QUERY(BDEV09, "TEvPut_new", (U.BlobId, Request.Id), (U.BufferSize, Request.Buffer.size()),
+                    (U.HandleClass, Request.HandleClass));
+
                 if (Request.Buffer.size() > MaxBlobSize) {
                     return EndWithError(NKikimrProto::ERROR, "blob is way too big");
                 } else if (Request.Buffer.size() != Request.Id.BlobSize()) {
@@ -120,6 +125,7 @@ namespace NKikimr::NBlobDepot {
                     if (!Request.Decommission) { // do not check original blob against blocks when writing decommission copy
                         ev->ExtraBlockChecks.emplace_back(Request.Id.TabletID(), Request.Id.Generation());
                     }
+                    BDEV_QUERY(BDEV10, "TEvPut_sendToProxy", (BlobSeqId, BlobSeqId), (GroupId, groupId), (BlobId, id));
                     Agent.SendToProxy(groupId, std::move(ev), this, nullptr);
                     ++PutsInFlight;
                 };
@@ -178,7 +184,7 @@ namespace NKikimr::NBlobDepot {
                 }
                 auto& kind = it->second;
                 const size_t numErased = kind.WritesInFlight.erase(BlobSeqId);
-                Y_VERIFY(numErased);
+                Y_VERIFY(numErased || BlobSeqId.Generation < Agent.BlobDepotGeneration);
             }
 
             void OnUpdateBlock(bool success) override {
@@ -208,6 +214,9 @@ namespace NKikimr::NBlobDepot {
             void HandlePutResult(TRequestContext::TPtr /*context*/, TEvBlobStorage::TEvPutResult& msg) {
                 STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA22, "TEvPutResult", (VirtualGroupId, Agent.VirtualGroupId),
                     (QueryId, GetQueryId()), (Msg, msg));
+
+                BDEV_QUERY(BDEV11, "TEvPut_resultFromProxy", (BlobId, msg.Id), (Status, msg.Status),
+                    (ErrorReason, msg.ErrorReason));
 
                 --PutsInFlight;
                 if (msg.Status != NKikimrProto::OK) {
@@ -251,14 +260,21 @@ namespace NKikimr::NBlobDepot {
                 }
             }
 
+            void EndWithError(NKikimrProto::EReplyStatus status, const TString& errorReason) {
+                BDEV_QUERY(BDEV12, "TEvPut_end", (Status, status), (ErrorReason, errorReason));
+                TBlobStorageQuery::EndWithError(status, errorReason);
+            }
+
             void EndWithSuccess() {
+                BDEV_QUERY(BDEV13, "TEvPut_end", (Status, NKikimrProto::OK));
+
                 if (IssueUncertainWrites) { // send a notification
                     auto *item = CommitBlobSeq.MutableItems(0);
                     item->SetCommitNotify(true);
                     IssueCommitBlobSeq(false);
                 }
 
-                TQuery::EndWithSuccess(std::make_unique<TEvBlobStorage::TEvPutResult>(NKikimrProto::OK, Request.Id,
+                TBlobStorageQuery::EndWithSuccess(std::make_unique<TEvBlobStorage::TEvPutResult>(NKikimrProto::OK, Request.Id,
                     Agent.GetStorageStatusFlags(), Agent.VirtualGroupId, Agent.GetApproximateFreeSpaceShare()));
             }
 

@@ -1489,6 +1489,74 @@ TRuntimeNode TProgramBuilder::AsScalar(TRuntimeNode value) {
     return TRuntimeNode(callableBuilder.Build(), false);
 }
 
+TRuntimeNode TProgramBuilder::BlockCompress(TRuntimeNode flow, ui32 bitmapIndex) {
+    auto blockItemTypes = ValidateBlockFlowType(flow.GetStaticType());
+
+    MKQL_ENSURE(blockItemTypes.size() >= 2, "Expected at least two input columns");
+    MKQL_ENSURE(bitmapIndex < blockItemTypes.size() - 1, "Invalid bitmap index");
+    MKQL_ENSURE(AS_TYPE(TDataType, blockItemTypes[bitmapIndex])->GetSchemeType() == NUdf::TDataType<bool>::Id, "Expected Bool as bitmap column type");
+
+
+    const auto* inputTupleType = AS_TYPE(TTupleType, AS_TYPE(TFlowType, flow.GetStaticType())->GetItemType());
+    MKQL_ENSURE(inputTupleType->GetElementsCount() == blockItemTypes.size(), "Unexpected tuple size");
+    std::vector<TType*> flowItems;
+    for (size_t i = 0; i < inputTupleType->GetElementsCount(); ++i) {
+        if (i == bitmapIndex) {
+            continue;
+        }
+        flowItems.push_back(inputTupleType->GetElementType(i));
+    }
+
+    TCallableBuilder callableBuilder(Env, __func__, NewFlowType(NewTupleType(flowItems)));
+    callableBuilder.Add(flow);
+    callableBuilder.Add(NewDataLiteral<ui32>(bitmapIndex));
+    return TRuntimeNode(callableBuilder.Build(), false);
+}
+
+TRuntimeNode TProgramBuilder::BlockCoalesce(TRuntimeNode first, TRuntimeNode second) {
+    auto firstType = AS_TYPE(TBlockType, first.GetStaticType());
+    auto secondType = AS_TYPE(TBlockType, second.GetStaticType());
+
+    bool firstOptional;
+    auto firstItemType = UnpackOptionalData(firstType->GetItemType(), firstOptional);
+
+    bool secondOptional;
+    auto secondItemType = UnpackOptionalData(secondType->GetItemType(), secondOptional);
+
+    MKQL_ENSURE(firstOptional, "BlockCoalesce with non-optional first argument");
+    MKQL_ENSURE(firstItemType->IsSameType(*secondItemType), "Argument should have same base types");
+
+    auto outputType = NewBlockType(secondType->GetItemType(), GetResultShape({firstType, secondType}));
+
+    TCallableBuilder callableBuilder(Env, __func__, outputType);
+    callableBuilder.Add(first);
+    callableBuilder.Add(second);
+    return TRuntimeNode(callableBuilder.Build(), false);
+}
+
+TRuntimeNode TProgramBuilder::BlockNot(TRuntimeNode data) {
+    auto dataType = AS_TYPE(TBlockType, data.GetStaticType());
+
+    bool isOpt;
+    MKQL_ENSURE(UnpackOptionalData(dataType->GetItemType(), isOpt)->GetSchemeType() == NUdf::TDataType<bool>::Id, "Requires boolean args.");
+
+    TCallableBuilder callableBuilder(Env, __func__, data.GetStaticType());
+    callableBuilder.Add(data);
+    return TRuntimeNode(callableBuilder.Build(), false);
+}
+
+TRuntimeNode TProgramBuilder::BlockAnd(TRuntimeNode first, TRuntimeNode second) {
+    return BuildBlockLogical(__func__, first, second);
+}
+
+TRuntimeNode TProgramBuilder::BlockOr(TRuntimeNode first, TRuntimeNode second) {
+    return BuildBlockLogical(__func__, first, second);
+}
+
+TRuntimeNode TProgramBuilder::BlockXor(TRuntimeNode first, TRuntimeNode second) {
+    return BuildBlockLogical(__func__, first, second);
+}
+
 TRuntimeNode TProgramBuilder::ListFromRange(TRuntimeNode start, TRuntimeNode end, TRuntimeNode step) {
     MKQL_ENSURE(start.GetStaticType()->IsData(), "Expected data");
     MKQL_ENSURE(end.GetStaticType()->IsSameType(*start.GetStaticType()), "Mismatch type");
@@ -2469,6 +2537,23 @@ TRuntimeNode TProgramBuilder::BuildWideSkipTakeBlocks(const std::string_view& ca
     TCallableBuilder callableBuilder(Env, callableName, flow.GetStaticType());
     callableBuilder.Add(flow);
     callableBuilder.Add(count);
+    return TRuntimeNode(callableBuilder.Build(), false);
+}
+
+TRuntimeNode TProgramBuilder::BuildBlockLogical(const std::string_view& callableName, TRuntimeNode first, TRuntimeNode second) {
+    auto firstType = AS_TYPE(TBlockType, first.GetStaticType());
+    auto secondType = AS_TYPE(TBlockType, second.GetStaticType());
+
+    bool isOpt1, isOpt2;
+    MKQL_ENSURE(UnpackOptionalData(firstType->GetItemType(), isOpt1)->GetSchemeType() == NUdf::TDataType<bool>::Id, "Requires boolean args.");
+    MKQL_ENSURE(UnpackOptionalData(secondType->GetItemType(), isOpt2)->GetSchemeType() == NUdf::TDataType<bool>::Id, "Requires boolean args.");
+
+    const auto itemType = NewDataType(NUdf::TDataType<bool>::Id, isOpt1 || isOpt2);
+    auto outputType = NewBlockType(itemType, GetResultShape({firstType, secondType}));
+
+    TCallableBuilder callableBuilder(Env, callableName, outputType);
+    callableBuilder.Add(first);
+    callableBuilder.Add(second);
     return TRuntimeNode(callableBuilder.Build(), false);
 }
 

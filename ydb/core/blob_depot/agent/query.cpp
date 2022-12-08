@@ -136,7 +136,7 @@ namespace NKikimr::NBlobDepot {
         Y_VERIFY(response);
         Agent.SelfId().Send(Event->Sender, response.release(), 0, Event->Cookie);
         OnDestroy(false);
-        delete this;
+        DoDestroy();
     }
 
     void TBlobDepotAgent::TQuery::EndWithSuccess(std::unique_ptr<IEventBase> response) {
@@ -144,7 +144,14 @@ namespace NKikimr::NBlobDepot {
             (QueryId, GetQueryId()), (Response, response->ToString()), (Duration, TActivationContext::Monotonic() - StartTime));
         Agent.SelfId().Send(Event->Sender, response.release(), 0, Event->Cookie);
         OnDestroy(true);
-        delete this;
+        DoDestroy();
+    }
+
+    void TBlobDepotAgent::TQuery::DoDestroy() {
+        Y_VERIFY(!Destroyed);
+        Destroyed = true;
+        Agent.ExecutingQueries.Remove(this);
+        Agent.DeletePendingQueries.PushBack(this);
     }
 
     TString TBlobDepotAgent::TQuery::GetQueryId() const {

@@ -82,6 +82,12 @@ void ConvertMiniKQLTypeToYdbType(const NKikimrMiniKQL::TType& input, Ydb::Type& 
             ConvertMiniKQLTypeToYdbType(protoOptionalType.GetItem(), *output.mutable_optional_type()->mutable_item());
             break;
         }
+        case NKikimrMiniKQL::ETypeKind::Tagged: {
+            const NKikimrMiniKQL::TTaggedType& protoTaggedType = input.GetTagged();
+            output.mutable_tagged_type()->set_tag(protoTaggedType.GetTag());
+            ConvertMiniKQLTypeToYdbType(protoTaggedType.GetItem(), *output.mutable_tagged_type()->mutable_type());
+            break;
+        }
         case NKikimrMiniKQL::ETypeKind::List: {
             const NKikimrMiniKQL::TListType& protoListType = input.GetList();
             ConvertMiniKQLTypeToYdbType(protoListType.GetItem(), *output.mutable_list_type()->mutable_item());
@@ -121,6 +127,12 @@ void ConvertMiniKQLTypeToYdbType(const NKikimrMiniKQL::TType& input, Ydb::Type& 
                     ythrow yexception() << "Unknown variant type representation: "
                                         << protoVariantType.DebugString();
             }
+            break;
+        }
+        case NKikimrMiniKQL::ETypeKind::Pg: {
+            const NKikimrMiniKQL::TPgType& pgType = input.GetPg();
+            auto pgOut = output.mutable_pg_type();
+            pgOut->Setoid(pgType.Getoid());
             break;
         }
         default: {
@@ -491,6 +503,12 @@ void ConvertMiniKQLValueToYdbValue(const NKikimrMiniKQL::TType& inputType,
             }
             break;
         }
+        case NKikimrMiniKQL::ETypeKind::Tagged: {
+            const NKikimrMiniKQL::TTaggedType& protoTaggedType = inputType.GetTagged();
+            const NKikimrMiniKQL::TType& protoItemType = protoTaggedType.GetItem();
+            ConvertMiniKQLValueToYdbValue(protoItemType, inputValue, output);
+            break;
+        }
         case NKikimrMiniKQL::ETypeKind::List: {
             const NKikimrMiniKQL::TListType& protoListType = inputType.GetList();
             const NKikimrMiniKQL::TType& protoItemType = protoListType.GetItem();
@@ -557,6 +575,11 @@ void ConvertMiniKQLValueToYdbValue(const NKikimrMiniKQL::TType& inputType,
                     ythrow yexception() << "Unknown variant type representation: "
                                         << protoVariantType.DebugString();
             }
+            break;
+        }
+        case NKikimrMiniKQL::ETypeKind::Pg: {
+            const auto& stringRef = inputValue.GetText();
+            output.set_text_value(stringRef.data(), stringRef.size());
             break;
         }
         default: {
@@ -710,8 +733,10 @@ const THashMap<TString, TACLAttrs> AccessMap_  = {
     { "ydb.tables.read", TACLAttrs(EAccessRights::SelectRow | EAccessRights::ReadAttributes) },
     { "ydb.generic.read", EAccessRights::GenericRead },
     { "ydb.generic.write", EAccessRights::GenericWrite },
-    { "ydb.generic.use", EAccessRights::GenericUse },
+    { "ydb.generic.use_legacy", EAccessRights::GenericUseLegacy },
+    { "ydb.generic.use", EAccessRights::GenericUse},
     { "ydb.generic.manage", EAccessRights::GenericManage },
+    { "ydb.generic.full_legacy", EAccessRights::GenericFullLegacy},
     { "ydb.generic.full", EAccessRights::GenericFull },
     { "ydb.database.create", EAccessRights::CreateDatabase },
     { "ydb.database.drop", EAccessRights::DropDatabase },
@@ -794,6 +819,10 @@ void ConvertDirectoryEntry(const NKikimrSchemeOp::TDirEntry& from, Ydb::Scheme::
     default:
         to->set_type(static_cast<Ydb::Scheme::Entry::Type>(from.GetPathType()));
     }
+
+    auto& timestamp = *to->mutable_created_at();
+    timestamp.set_plan_step(from.GetCreateStep());
+    timestamp.set_tx_id(from.GetCreateTxId());
 
     if (processAcl) {
         const bool isDir = from.GetPathType() == NKikimrSchemeOp::EPathTypeDir;

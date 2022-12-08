@@ -228,7 +228,7 @@ public:
         Y_VERIFY(!context.SS->Tables.contains(dstPath.Base()->PathId));
         Y_VERIFY(context.SS->Tables.contains(srcPath.Base()->PathId));
 
-        TTableInfo::TPtr tableInfo = new TTableInfo(*context.SS->Tables.at(srcPath.Base()->PathId));
+        TTableInfo::TPtr tableInfo = TTableInfo::DeepCopy(*context.SS->Tables.at(srcPath.Base()->PathId));
         tableInfo->ResetDescriptionCache();
         tableInfo->AlterVersion += 1;
 
@@ -358,7 +358,6 @@ public:
     }
 };
 
-
 class TDeleteTableBarrier: public TSubOperationState {
 private:
     TOperationId OperationId;
@@ -401,15 +400,33 @@ public:
         TTxState* txState = context.SS->FindTx(OperationId);
         Y_VERIFY(txState);
 
-        TPath srcPath = TPath::Init(txState->SourcePathId, context.SS);
+        auto srcPath = TPath::Init(txState->SourcePathId, context.SS);
+        auto dstPath = TPath::Init(txState->TargetPathId, context.SS);
 
         Y_VERIFY(txState->PlanStep);
 
         MarkSrcDropped(db, context, OperationId, *txState, srcPath);
 
+        Y_VERIFY(context.SS->Tables.contains(dstPath.Base()->PathId));
+        auto tableInfo = context.SS->Tables.at(dstPath.Base()->PathId);
+
+        if (tableInfo->IsTTLEnabled() && !context.SS->TTLEnabledTables.contains(dstPath.Base()->PathId)) {
+            context.SS->TTLEnabledTables[dstPath.Base()->PathId] = tableInfo;
+            // MarkSrcDropped() removes srcPath from TTLEnabledTables & decrements the counters
+            context.SS->TabletCounters->Simple()[COUNTER_TTL_ENABLED_TABLE_COUNT].Add(1);
+
+            const auto now = context.Ctx.Now();
+            for (auto& shard : tableInfo->GetPartitions()) {
+                auto& lag = shard.LastCondEraseLag;
+                lag = now - shard.LastCondErase;
+                context.SS->TabletCounters->Percentile()[COUNTER_NUM_SHARDS_BY_TTL_LAG].IncrementFor(lag->Seconds());
+            }
+        }
+
         context.SS->ChangeTxState(db, OperationId, TTxState::ProposedWaitParts);
         return true;
     }
+
     bool ProgressState(TOperationContext& context) override {
         TTabletId ssId = context.SS->SelfTabletId();
         context.OnComplete.RouteByTabletsFromOperation(OperationId);
@@ -426,7 +443,6 @@ public:
         return false;
     }
 };
-
 
 class TDone: public TSubOperationState {
 private:
@@ -490,40 +506,33 @@ public:
     }
 };
 
-
 class TMoveTable: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
     TTxState::ETxState AfterPropose = TTxState::Invalid;
 
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::ConfigureParts;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::ConfigureParts:
             return TTxState::Propose;
         case TTxState::Propose:
             return AfterPropose;
-
         case TTxState::WaitShadowPathPublication:
             return TTxState::DeletePathBarrier;
         case TTxState::DeletePathBarrier:
             return TTxState::ProposedWaitParts;
-
         case TTxState::ProposedWaitParts:
             return TTxState::Done;
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::ConfigureParts:
             return MakeHolder<TConfigureParts>(OperationId);
@@ -542,28 +551,8 @@ class TMoveTable: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TMoveTable(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TMoveTable(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -693,10 +682,6 @@ public:
             result->SetError(NKikimrScheme::StatusMultipleModifications, errStr);
             return result;
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxMoveTable, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         auto guard = context.DbGuard();
         TPathId allocatedPathId = context.SS->AllocatePathId();
@@ -743,9 +728,8 @@ public:
         }
 
         context.OnComplete.ActivateTx(OperationId);
-        State = NextState();
-        SetState(SelectStateFunc(State));
 
+        SetState(NextState());
         return result;
     }
 
@@ -769,17 +753,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateMoveTable(TOperationId id, const TTxTransaction& tx) {
-    return new TMoveTable(id, tx);
+    return MakeSubOperation<TMoveTable>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateMoveTable(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TMoveTable(id, state);
+    return MakeSubOperation<TMoveTable>(id, state);
 }
 
-}
 }

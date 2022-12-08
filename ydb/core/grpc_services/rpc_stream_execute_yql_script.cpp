@@ -6,8 +6,7 @@
 #include <ydb/core/actorlib_impl/long_timer.h>
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/kikimr_issue.h>
-#include <ydb/core/kqp/executer/kqp_executer.h>
-#include <ydb/core/kqp/prepare/kqp_query_plan.h>
+#include <ydb/core/kqp/executer_actor/kqp_executer.h>
 
 #include <ydb/core/protos/services.pb.h>
 #include <ydb/core/ydb_convert/ydb_convert.h>
@@ -55,31 +54,10 @@ namespace {
         ClientTimeoutTag = 2
     };
 
-    bool FillKqpParameters(const ::google::protobuf::Map<TString, Ydb::TypedValue>& input,
-        NKikimrMiniKQL::TParams& output, TParseRequestError& error)
-    {
-        if (input.size() != 0) {
-            try {
-                ConvertYdbParamsToMiniKQLParams(input, output);
-            }
-            catch (const std::exception& ex) {
-                auto issue = MakeIssue(NKikimrIssues::TIssuesIds::DEFAULT_ERROR, "Failed to parse query parameters.");
-                issue.AddSubIssue(MakeIntrusive<NYql::TIssue>(NYql::ExceptionToIssue(ex)));
-
-                error = TParseRequestError(Ydb::StatusIds::BAD_REQUEST, { issue });
-                return false;
-            }
-        }
-
-        return true;
-    }
-
     bool FillKqpRequest(const Ydb::Scripting::ExecuteYqlRequest& req, NKikimrKqp::TEvQueryRequest& kqpRequest,
         TParseRequestError& error)
     {
-        if (!FillKqpParameters(req.parameters(), *kqpRequest.MutableRequest()->MutableParameters(), error)) {
-            return false;
-        }
+        kqpRequest.MutableRequest()->MutableYdbParameters()->insert(req.parameters().begin(), req.parameters().end());
 
         auto& script = req.script();
         NYql::TIssues issues;

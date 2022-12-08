@@ -3,6 +3,7 @@
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/kqp/runtime/kqp_compute.h>
 #include <ydb/core/kqp/runtime/kqp_read_table.h>
+#include <ydb/core/kqp/runtime/kqp_read_actor.h>
 #include <ydb/core/kqp/runtime/kqp_stream_lookup_factory.h>
 
 namespace NKikimr {
@@ -48,6 +49,7 @@ namespace NKqp {
 NYql::NDq::IDqAsyncIoFactory::TPtr CreateKqpAsyncIoFactory() {
     auto factory = MakeIntrusive<NYql::NDq::TDqAsyncIoFactory>();
     RegisterStreamLookupActorFactory(*factory);
+    RegisterKqpReadActor(*factory);
     return factory;
 }
 
@@ -59,14 +61,12 @@ void TShardsScanningPolicy::FillRequestScanFeatures(const NKikimrTxDataShard::TK
     maxInFlight = 1;
 
     NKikimrSSA::TProgram program;
-    bool hasNoGroupBy = false;
     bool hasGroupByWithFields = false;
     bool hasGroupByWithNoFields = false;
     if (meta.HasOlapProgram()) {
         Y_VERIFY(program.ParseFromString(meta.GetOlapProgram().GetProgram()));
         for (auto&& command : program.GetCommand()) {
             if (!command.HasGroupBy()) {
-                hasNoGroupBy = true;
                 continue;
             }
             if (command.GetGroupBy().GetKeyColumns().size()) {
@@ -75,8 +75,6 @@ void TShardsScanningPolicy::FillRequestScanFeatures(const NKikimrTxDataShard::TK
                 hasGroupByWithNoFields = true;
             }
         }
-    } else {
-        hasNoGroupBy = true;
     }
     isAggregationRequest = hasGroupByWithFields || hasGroupByWithNoFields;
     if (isSorted) {

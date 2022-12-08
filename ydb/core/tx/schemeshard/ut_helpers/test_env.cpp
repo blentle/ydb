@@ -496,6 +496,7 @@ NSchemeShardUT_Private::TTestEnv::TTestEnv(TTestActorRuntime& runtime, const TTe
 
     app.SetEnableDataColumnForIndexTable(true);
     app.SetEnableSystemViews(opts.EnableSystemViews_);
+    app.SetEnablePersistentQueryStats(opts.EnablePersistentQueryStats_);
     app.SetEnablePersistentPartitionStats(opts.EnablePersistentPartitionStats_);
     app.SetAllowUpdateChannelsBindingOfSolomonPartitions(opts.AllowUpdateChannelsBindingOfSolomonPartitions_);
     app.SetEnableNotNullColumns(opts.EnableNotNullColumns_);
@@ -506,6 +507,9 @@ NSchemeShardUT_Private::TTestEnv::TTestEnv(TTestActorRuntime& runtime, const TTe
     app.SetEnableBorrowedSplitCompaction(opts.EnableBorrowedSplitCompaction_);
     app.FeatureFlags.SetEnablePublicApiExternalBlobs(true);
     app.SetEnableMoveIndex(opts.EnableMoveIndex_);
+    app.SetEnableChangefeedInitialScan(opts.EnableChangefeedInitialScan_);
+    app.SetEnableNotNullDataColumns(opts.EnableNotNullDataColumns_);
+    app.SetEnableAlterDatabaseCreateHiveFirst(opts.EnableAlterDatabaseCreateHiveFirst_);
 
     if (opts.DisableStatsBatching_.value_or(false)) {
         app.SchemeShardConfig.SetStatsMaxBatchSize(0);
@@ -881,7 +885,9 @@ void NSchemeShardUT_Private::TTestWithReboots::Run(std::function<void (TTestActo
 void NSchemeShardUT_Private::TTestWithReboots::Run(std::function<void (TTestActorRuntime &, bool &)> testScenario, bool allowLogBatching) {
     TDatashardLogBatchingSwitch logBatchingSwitch(allowLogBatching);
 
+    Cerr << "==== RunWithTabletReboots" << Endl;
     RunWithTabletReboots(testScenario);
+    Cerr << "==== RunWithPipeResets" << Endl;
     RunWithPipeResets(testScenario);
     //RunWithDelays(testScenario);
 }
@@ -1014,5 +1020,6 @@ NSchemeShardUT_Private::TTestEnvOptions NSchemeShardUT_Private::TTestWithReboots
             .EnableNotNullColumns(true)
             .EnableProtoSourceIdInfo(true)
             .DisableStatsBatching(true)
-            .EnableMoveIndex(true);
+            .EnableMoveIndex(true)
+            ;
 }

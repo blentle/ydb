@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ydb/public/sdk/cpp/client/impl/ydb_internal/internal_header.h>
+#include <ydb/public/sdk/cpp/client/impl/ydb_internal/common/ssl_credentials.h>
 
 #include "actions.h"
 #include "params.h"
@@ -60,8 +61,7 @@ public:
         const TMaybe<TStringType>& database,
         const TMaybe<TStringType>& discoveryEndpoint,
         const TMaybe<EDiscoveryMode>& discoveryMode,
-        const TMaybe<bool>& enableSsl,
-        const TMaybe<TStringType>& caCert,
+        const TMaybe<TSslCredentials>& sslCredentials,
         const TMaybe<std::shared_ptr<ICredentialsProviderFactory>>& credentialsProviderFactory
     );
     IQueueClientContextPtr CreateContext() override;
@@ -80,8 +80,10 @@ public:
         TRpcRequestSettings::TEndpointPolicy endpointPolicy)
     {
         auto clientConfig = NGrpc::TGRpcClientConfig(dbState->DiscoveryEndpoint);
-        clientConfig.EnableSsl = dbState->EnableSsl;
-        clientConfig.SslCaCert = dbState->CaCert;
+        const auto& sslCredentials = dbState->SslCredentials;
+        clientConfig.SslCredentials = {.pem_root_certs = sslCredentials.CaCert, .pem_private_key = sslCredentials.PrivateKey, .pem_cert_chain = sslCredentials.Cert};
+        clientConfig.EnableSsl = sslCredentials.IsEnabled;
+
         clientConfig.MemQuota = MemoryQuota_;
 
         if (MaxMessageSize_ > 0) {
@@ -137,7 +139,6 @@ public:
         TSimpleRpc<TService, TRequest, TResponse> rpc,
         TDbDriverStatePtr dbState,
         const TRpcRequestSettings& requestSettings,
-        TDuration clientTimeout,
         const TEndpointKey& preferredEndpoint,
         std::shared_ptr<IQueueClientContext> context = nullptr)
     {
@@ -168,7 +169,7 @@ public:
         auto endpointPolicy = requestSettings.EndpointPolicy;
 
         WithServiceConnection<TService>(
-            [this, request = std::move(request), userResponseCb = std::move(userResponseCb), rpc, requestSettings, context = std::move(context), clientTimeout, dbState]
+            [this, request = std::move(request), userResponseCb = std::move(userResponseCb), rpc, requestSettings, context = std::move(context), dbState]
             (TPlainStatus status, TConnection serviceConnection, TEndpointKey endpoint) mutable -> void {
                 if (!status.Ok()) {
                     userResponseCb(
@@ -178,7 +179,7 @@ public:
                 }
 
                 TCallMeta meta;
-                meta.Timeout = clientTimeout;
+                meta.Timeout = requestSettings.ClientTimeout;
         #ifndef YDB_GRPC_UNSECURE_AUTH
                 meta.CallCredentials = dbState->CallCredentials;
         #else
@@ -278,7 +279,6 @@ public:
         TDbDriverStatePtr dbState,
         TDuration deferredTimeout,
         const TRpcRequestSettings& requestSettings,
-        TDuration clientTimeout,
         bool poll = false,
         const TEndpointKey& preferredEndpoint = TEndpointKey(),
         std::shared_ptr<IQueueClientContext> context = nullptr)
@@ -322,7 +322,6 @@ public:
             rpc,
             dbState,
             requestSettings,
-            clientTimeout,
             preferredEndpoint,
             std::move(context));
     }
@@ -335,8 +334,7 @@ public:
         TRequest&& request,
         TResponseCb<TResponse>&& responseCb,
         TSimpleRpc<TService, TRequest, TResponse> rpc,
-        TRpcRequestSettings requestSettings,
-        TDuration clientTimeout)
+        TRpcRequestSettings requestSettings)
     {
         requestSettings.EndpointPolicy = TRpcRequestSettings::TEndpointPolicy::UseDiscoveryEndpoint;
         requestSettings.UseAuth = false;
@@ -351,7 +349,6 @@ public:
             rpc,
             dbState,
             requestSettings,
-            clientTimeout,
             TEndpointKey(),
             nullptr);
     }
@@ -364,7 +361,6 @@ public:
         TDbDriverStatePtr dbState,
         TDuration deferredTimeout,
         const TRpcRequestSettings& requestSettings,
-        TDuration clientTimeout,
         const TEndpointKey& preferredEndpoint = TEndpointKey(),
         std::shared_ptr<IQueueClientContext> context = nullptr)
     {
@@ -384,7 +380,6 @@ public:
             dbState,
             deferredTimeout,
             requestSettings,
-            clientTimeout,
             true, // poll
             preferredEndpoint,
             context);
@@ -426,6 +421,7 @@ public:
                 }
 
                 TCallMeta meta;
+                meta.Timeout = requestSettings.ClientTimeout;
 #ifndef YDB_GRPC_UNSECURE_AUTH
                 meta.CallCredentials = dbState->CallCredentials;
 #else
@@ -703,8 +699,7 @@ private:
     std::unique_ptr<IThreadPool> ResponseQueue_;
 
     const TStringType DefaultDiscoveryEndpoint_;
-    const bool EnableSsl_;
-    const TStringType CaCert_;
+    const TSslCredentials SslCredentials_;
     const TStringType DefaultDatabase_;
     std::shared_ptr<ICredentialsProviderFactory> DefaultCredentialsProviderFactory_;
     TDbDriverStateTracker StateTracker_;

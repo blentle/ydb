@@ -126,6 +126,7 @@ public:
             ui32 MaxRestartsPerPeriod = 30; // per hour
             ui32 MaxTabletIdsStored = 10;
             bool ReportGoodTabletsIds = false;
+            bool IsHiveSynchronizationPeriod = false;
         };
 
         enum class ETabletState {
@@ -147,7 +148,8 @@ public:
                 Leader = info.followerid() == 0;
                 if (info.volatilestate() == NKikimrHive::TABLET_VOLATILE_STATE_STOPPED) {
                     State = ETabletState::Stopped;
-                } else if (info.volatilestate() != NKikimrHive::TABLET_VOLATILE_STATE_RUNNING
+                } else if (!settings.IsHiveSynchronizationPeriod
+                            && info.volatilestate() != NKikimrHive::TABLET_VOLATILE_STATE_RUNNING
                             && TInstant::MilliSeconds(info.lastalivetimestamp()) < settings.AliveBarrier
                             && info.tabletbootmode() == NKikimrHive::TABLET_BOOT_MODE_DEFAULT) {
                     State = ETabletState::Dead;
@@ -200,6 +202,8 @@ public:
         TVector<TString> StoragePoolNames;
         THashMap<std::pair<TTabletId, NNodeWhiteboard::TFollowerId>, const NKikimrHive::TTabletInfo*> MergedTabletState;
         THashMap<TNodeId, TNodeTabletState> MergedNodeTabletState;
+        ui64 StorageLimit;
+        ui64 StorageUsage;
     };
 
     struct TSelfCheckResult {
@@ -333,7 +337,7 @@ public:
         void SetOverallStatus(Ydb::Monitoring::StatusFlag::Status status) {
             OverallStatus = status;
         }
-        
+
         void InheritFrom(TSelfCheckResult& lower) {
             if (lower.GetOverallStatus() >= OverallStatus) {
                 OverallStatus = lower.GetOverallStatus();
@@ -559,7 +563,7 @@ public:
                 storagePoolName = STATIC_STORAGE_POOL_NAME;
             }
             StoragePoolState[storagePoolName].Groups.emplace(group.groupid());
-            
+
             if (!IsSpecificDatabaseFilter()) {
                 DatabaseState[DomainPath].StoragePoolNames.emplace_back(storagePoolName);
             }
@@ -908,6 +912,9 @@ public:
             if (path == DomainPath) {
                 state.StoragePoolNames.emplace_back(STATIC_STORAGE_POOL_NAME);
             }
+            state.StorageUsage = ev->Get()->GetRecord().GetPathDescription().GetDomainDescription().GetDiskSpaceUsage().GetTables().GetTotalSize();
+            state.StorageLimit = ev->Get()->GetRecord().GetPathDescription().GetDomainDescription().GetDatabaseQuotas().Getdata_stream_reserved_storage_quota();
+
             DescribeByPath[path] = ev->Release();
         }
         RequestDone("TEvDescribeSchemeResult");
@@ -1017,11 +1024,19 @@ public:
         }
     }
 
+    static const int HIVE_SYNCHRONIZATION_PERIOD_MS = 10000;
+
+    bool IsHiveSynchronizationPeriod(NKikimrHive::TEvResponseHiveInfo& hiveInfo) {
+        auto hiveUptime = hiveInfo.GetStartTimeTimestamp() - hiveInfo.GetResponseTimestamp();
+        return hiveUptime > HIVE_SYNCHRONIZATION_PERIOD_MS;
+    }
+
     void AggregateHiveInfo() {
         TNodeTabletState::TTabletStateSettings settings;
         settings.AliveBarrier = TInstant::Now() - TDuration::Minutes(5);
         for (const auto& [hiveId, hiveResponse] : HiveInfo) {
             if (hiveResponse) {
+                settings.IsHiveSynchronizationPeriod = IsHiveSynchronizationPeriod(hiveResponse->Record);
                 for (const NKikimrHive::TTabletInfo& hiveTablet : hiveResponse->Record.GetTablets()) {
                     TSubDomainKey tenantId = TSubDomainKey(hiveTablet.GetObjectDomain());
                     auto itDomain = FilterDomainKey.find(tenantId);
@@ -1604,10 +1619,12 @@ public:
                 break;
             case NKikimrWhiteboard::EVDiskState::Initial:
             case NKikimrWhiteboard::EVDiskState::SyncGuidRecovery:
+                context.IssueRecords.clear();
                 context.ReportStatus(Ydb::Monitoring::StatusFlag::YELLOW,
                                      TStringBuilder() << "VDisk state is " << NKikimrWhiteboard::EVDiskState_Name(vDiskInfo.GetVDiskState()),
                                      ETags::VDiskState);
-                break;
+                storageVDiskStatus.set_overall(context.GetOverallStatus());
+                return;
             case NKikimrWhiteboard::EVDiskState::LocalRecoveryError:
             case NKikimrWhiteboard::EVDiskState::SyncGuidRecoveryError:
             case NKikimrWhiteboard::EVDiskState::PDiskError:
@@ -1615,20 +1632,34 @@ public:
                                      TStringBuilder() << "VDisk state is " << NKikimrWhiteboard::EVDiskState_Name(vDiskInfo.GetVDiskState()),
                                      ETags::VDiskState,
                                      {ETags::PDiskState});
-                break;
+                storageVDiskStatus.set_overall(context.GetOverallStatus());
+                return;
+        }
+
+        if (!vDiskInfo.GetReplicated()) {
+            context.IssueRecords.clear();
+            context.ReportStatus(Ydb::Monitoring::StatusFlag::BLUE, "Replication in progress", ETags::VDiskState);
+            return;
         }
 
         if (vDiskInfo.HasDiskSpace()) {
             switch(vDiskInfo.GetDiskSpace()) {
                 case NKikimrWhiteboard::EFlag::Green:
-                    context.ReportStatus(Ydb::Monitoring::StatusFlag::GREEN);
+                    if (context.IssueRecords.size() == 0) {
+                        context.ReportStatus(Ydb::Monitoring::StatusFlag::GREEN);
+                    } else {
+                        context.ReportStatus(context.IssueRecords.begin()->IssueLog.status(),
+                                            TStringBuilder() << "VDisk is degraded",
+                                            ETags::VDiskState,
+                                            {ETags::PDiskSpace});
+                    }
                     break;
                 case NKikimrWhiteboard::EFlag::Red:
-                    break;
                     context.ReportStatus(GetFlagFromWhiteboardFlag(vDiskInfo.GetDiskSpace()),
                                          TStringBuilder() << "DiskSpace is " << NKikimrWhiteboard::EFlag_Name(vDiskInfo.GetDiskSpace()),
                                          ETags::VDiskState,
                                          {ETags::PDiskSpace});
+                    break;
                 default:
                     context.ReportStatus(GetFlagFromWhiteboardFlag(vDiskInfo.GetDiskSpace()),
                                          TStringBuilder() << "DiskSpace is " << NKikimrWhiteboard::EFlag_Name(vDiskInfo.GetDiskSpace()),
@@ -1636,10 +1667,6 @@ public:
                                          {ETags::PDiskSpace});
                     break;
             }
-        }
-
-        if (context.GetOverallStatus() == Ydb::Monitoring::StatusFlag::GREEN && !vDiskInfo.GetReplicated()) {
-            context.ReportStatus(Ydb::Monitoring::StatusFlag::BLUE, "Replication in progress", ETags::VDiskState);
         }
 
         storageVDiskStatus.set_overall(context.GetOverallStatus());
@@ -1665,14 +1692,14 @@ public:
     struct TMergeIssuesContext {
         std::unordered_map<ETags, TList<TSelfCheckContext::TIssueRecord>> recordsMap;
         std::unordered_set<TString> removeIssuesIds;
-        
+
         TMergeIssuesContext(TList<TSelfCheckContext::TIssueRecord>& records) {
             for (auto it = records.begin(); it != records.end(); ) {
                 auto move = it++;
                 recordsMap[move->Tag].splice(recordsMap[move->Tag].end(), records, move);
             }
         }
-        
+
         void RemoveUnlinkIssues(TList<TSelfCheckContext::TIssueRecord>& records) {
             bool isRemovingIssuesIteration = true;
             while (isRemovingIssuesIteration) {
@@ -1780,7 +1807,7 @@ public:
                     ++it;
                 }
             }
-            
+
             if (similar.size() <= MERGING_IGNORE_SIZE) {
                 Mergeed.splice(Mergeed.end(), similar);
             }
@@ -1846,7 +1873,7 @@ public:
                 default:
                     break;
             }
-            
+
             auto donorReasons = it->IssueLog.mutable_reason();
             for (auto donorReasonIt = donorReasons->begin(); donorReasonIt != donorReasons->end(); donorReasonIt++) {
                 if (!mainReasonIds.contains(*donorReasonIt)) {
@@ -1859,7 +1886,7 @@ public:
             it = similar.erase(it);
         }
 
-        similar.begin()->IssueLog.set_count(ids.size());        
+        similar.begin()->IssueLog.set_count(ids.size());
         similar.begin()->IssueLog.set_listed(ids.size());
     }
 
@@ -2022,14 +2049,14 @@ public:
             FillVDiskStatus(vDiskId, itVDisk != MergedVDiskState.end() ? *itVDisk->second : NKikimrWhiteboard::TVDiskStateInfo(), vDiskStatus, {&context, "VDISK"});
             ++disksColors[vDiskStatus.overall()];
             switch (vDiskStatus.overall()) {
-            case Ydb::Monitoring::StatusFlag::BLUE: // disk is good, but not available
-            case Ydb::Monitoring::StatusFlag::RED: // disk is bad, probably not available
-            case Ydb::Monitoring::StatusFlag::GREY: // the status is absent, the disk is not available
-                IncrementFor(failedRealms, protoVDiskId.ring());
-                ++failedDisks;
-                break;
-            default:
-                break;
+                case Ydb::Monitoring::StatusFlag::BLUE: // disk is good, but not available
+                case Ydb::Monitoring::StatusFlag::RED: // disk is bad, probably not available
+                case Ydb::Monitoring::StatusFlag::GREY: // the status is absent, the disk is not available
+                    IncrementFor(failedRealms, protoVDiskId.ring());
+                    ++failedDisks;
+                    break;
+                default:
+                    break;
             }
         }
 
@@ -2039,6 +2066,8 @@ public:
         if (groupInfo.erasurespecies() == NONE) {
             if (failedDisks > 0) {
                 context.ReportStatus(Ydb::Monitoring::StatusFlag::RED, "Group failed", ETags::GroupState, {ETags::VDiskState});
+            } else if (disksColors[Ydb::Monitoring::StatusFlag::YELLOW] > 0) {
+                context.ReportStatus(Ydb::Monitoring::StatusFlag::YELLOW, "Group degraded", ETags::GroupState, {ETags::VDiskState});
             }
         } else if (groupInfo.erasurespecies() == BLOCK_4_2) {
             if (failedDisks > 2) {
@@ -2051,6 +2080,8 @@ public:
                 } else {
                     context.ReportStatus(Ydb::Monitoring::StatusFlag::YELLOW, "Group degraded", ETags::GroupState, {ETags::VDiskState});
                 }
+            } else if (disksColors[Ydb::Monitoring::StatusFlag::YELLOW] > 0) {
+                context.ReportStatus(Ydb::Monitoring::StatusFlag::YELLOW, "Group degraded", ETags::GroupState, {ETags::VDiskState});
             }
         } else if (groupInfo.erasurespecies() == MIRROR_3_DC) {
             if (failedRealms.size() > 2 || (failedRealms.size() == 2 && failedRealms[0].second > 1 && failedRealms[1].second > 1)) {
@@ -2063,6 +2094,8 @@ public:
                 } else {
                     context.ReportStatus(Ydb::Monitoring::StatusFlag::YELLOW, "Group degraded", ETags::GroupState, {ETags::VDiskState});
                 }
+            } else if (disksColors[Ydb::Monitoring::StatusFlag::YELLOW] > 0) {
+                context.ReportStatus(Ydb::Monitoring::StatusFlag::YELLOW, "Group degraded", ETags::GroupState, {ETags::VDiskState});
             }
         }
 
@@ -2139,6 +2172,14 @@ public:
                     break;
             }
         }
+        auto usage = (float)databaseState.StorageUsage / databaseState.StorageLimit;
+        if (usage > 0.9) {
+            context.ReportStatus(Ydb::Monitoring::StatusFlag::RED, "Storage usage over 90%", ETags::StorageState);
+        } else if (usage > 0.85) {
+            context.ReportStatus(Ydb::Monitoring::StatusFlag::ORANGE, "Storage usage over 85%", ETags::StorageState);
+        } else if (usage > 0.75) {
+            context.ReportStatus(Ydb::Monitoring::StatusFlag::YELLOW, "Storage usage over 75%", ETags::StorageState);
+        }
         storageStatus.set_overall(context.GetOverallStatus());
     }
 
@@ -2147,7 +2188,7 @@ public:
         Ydb::Monitoring::StatusFlag::Status Status = Ydb::Monitoring::StatusFlag::GREY;
         bool HasDegraded = false;
         std::unordered_set<std::pair<TString, TString>> IssueIds;
-        
+
         TOverallStateContext(Ydb::Monitoring::SelfCheckResult* result) {
             Result = result;
         }

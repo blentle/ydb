@@ -15,6 +15,7 @@ public:
     virtual NBus::TBusMessage* GetMessage() = 0;
     virtual NBus::TBusMessage* ReleaseMessage() = 0;
     virtual void SendReplyMove(NBus::TBusMessageAutoPtr response) = 0;
+    virtual TVector<TStringBuf> FindClientCert() const = 0;
     virtual THolder<TMessageBusSessionIdentHolder::TImpl> CreateSessionIdentHolder() = 0;
 };
 
@@ -56,6 +57,11 @@ public:
     NBus::TBusKey GetMessageId() override {
         return GetMessage()->GetHeader()->Id;
     }
+
+    TVector<TStringBuf> FindClientCert() const override {
+        return {};
+    }
+
 
     THolder<TMessageBusSessionIdentHolder::TImpl> CreateSessionIdentHolder() override;
 };
@@ -127,14 +133,13 @@ public:
             MTYPE(TBusSqsRequest)
             MTYPE(TBusWhoAmI)
             MTYPE(TBusStreamRequest)
-            MTYPE(TBusS3ListingRequest)
-            MTYPE(TBusS3ListingResponse)
             MTYPE(TBusInterconnectDebug)
             MTYPE(TBusConsoleRequest)
             MTYPE(TBusResolveNode)
             MTYPE(TBusFillNode)
             MTYPE(TBusDrainNode)
             MTYPE(TBusTestShardControlRequest)
+            MTYPE(TBusLoginRequest)
 #undef MTYPE
         }
 
@@ -178,7 +183,6 @@ public:
             REPLY_OPTION(TBusNodeRegistrationResponse)
             REPLY_OPTION(TBusCmsResponse)
             REPLY_OPTION(TBusSqsResponse)
-            REPLY_OPTION(TBusS3ListingResponse)
             REPLY_OPTION(TBusConsoleResponse)
 
             default:
@@ -190,6 +194,10 @@ public:
     void SendReplyMove(NBus::TBusMessageAutoPtr response) override {
         SendReply(response.Get());
     }
+
+    TVector<TStringBuf> FindClientCert() const override {
+        return RequestContext->FindClientCert();
+    };
 
     THolder<TMessageBusSessionIdentHolder::TImpl> CreateSessionIdentHolder() override;
 };
@@ -236,6 +244,8 @@ void TBusMessageContext::Swap(TBusMessageContext &msg) {
     std::swap(Impl, msg.Impl);
 }
 
+TVector<TStringBuf> TBusMessageContext::FindClientCert() const { return Impl->FindClientCert(); }
+
 THolder<TMessageBusSessionIdentHolder::TImpl> TBusMessageContext::CreateSessionIdentHolder() {
     Y_VERIFY(Impl);
     return Impl->CreateSessionIdentHolder();
@@ -248,6 +258,8 @@ public:
     virtual void SendReply(NBus::TBusMessage *resp) = 0;
     virtual void SendReplyMove(NBus::TBusMessageAutoPtr resp) = 0;
     virtual ui64 GetTotalTimeout() const = 0;
+    virtual TVector<TStringBuf> FindClientCert() const = 0;
+
 };
 
 class TMessageBusSessionIdentHolder::TImplMessageBus
@@ -287,6 +299,10 @@ public:
     ui64 GetTotalTimeout() const override {
         return Session->GetConfig()->TotalTimeout;
     }
+
+    TVector<TStringBuf> FindClientCert() const override {
+        return {};
+    }
 };
 
 THolder<TMessageBusSessionIdentHolder::TImpl> TBusMessageContext::TImplMessageBus::CreateSessionIdentHolder() {
@@ -322,6 +338,10 @@ public:
         Context->SendReplyMove(resp);
 
         auto context = std::move(Context);
+    }
+
+    TVector<TStringBuf> FindClientCert() const override {
+        return Context->FindClientCert();
     }
 
     ui64 GetTotalTimeout() const override {
@@ -361,6 +381,10 @@ void TMessageBusSessionIdentHolder::SendReply(NBus::TBusMessage *resp) {
 void TMessageBusSessionIdentHolder::SendReplyMove(NBus::TBusMessageAutoPtr resp) {
     Y_VERIFY(Impl);
     Impl->SendReplyMove(resp);
+}
+
+TVector<TStringBuf> TMessageBusSessionIdentHolder::FindClientCert() const {
+    return Impl->FindClientCert();
 }
 
 
@@ -547,14 +571,14 @@ void TMessageBusServer::OnMessage(TBusMessageContext &msg) {
         return ClientActorRequest(CreateMessageBusSqsRequest, msg);
     case MTYPE_CLIENT_WHOAMI:
         return ClientActorRequest(CreateMessageBusWhoAmI, msg);
-    case MTYPE_CLIENT_S3_LISTING_REQUEST:
-        return ClientActorRequest(CreateMessageBusS3ListingRequest, msg);
     case MTYPE_CLIENT_INTERCONNECT_DEBUG:
         return ClientActorRequest(CreateMessageBusInterconnectDebug, msg);
     case MTYPE_CLIENT_CONSOLE_REQUEST:
         return ClientActorRequest(CreateMessageBusConsoleRequest, msg);
     case MTYPE_CLIENT_TEST_SHARD_CONTROL:
         return ClientActorRequest(CreateMessageBusTestShardControl, msg);
+    case MTYPE_CLIENT_LOGIN_REQUEST:
+        return ClientActorRequest(CreateMessageBusLoginRequest, msg);
     default:
         return UnknownMessage(msg);
     }

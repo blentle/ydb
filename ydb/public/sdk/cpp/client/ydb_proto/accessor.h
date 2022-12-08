@@ -20,6 +20,7 @@ namespace NYdb {
 class TResultSet;
 class TValue;
 class TType;
+class TParams;
 
 namespace NTable {
 class TQueryStats;
@@ -35,9 +36,11 @@ public:
     static const Ydb::Type& GetProto(const TType& type);
     static const Ydb::Value& GetProto(const TValue& value);
     static const Ydb::ResultSet& GetProto(const TResultSet& resultSet);
+    static const ::google::protobuf::Map<TString, Ydb::TypedValue>& GetProtoMap(const TParams& params);
     static const Ydb::TableStats::QueryStats& GetProto(const NTable::TQueryStats& queryStats);
     static const Ydb::Table::DescribeTableResult& GetProto(const NTable::TTableDescription& tableDescription);
     static const Ydb::Topic::DescribeTopicResult& GetProto(const NYdb::NTopic::TTopicDescription& topicDescription);
+    static const Ydb::Topic::DescribeConsumerResult& GetProto(const NYdb::NTopic::TConsumerDescription& consumerDescription);
     static const Ydb::Monitoring::SelfCheckResult& GetProto(const NYdb::NMonitoring::TSelfCheckResult& selfCheckResult);
 
     static NTable::TQueryStats FromProto(const Ydb::TableStats::QueryStats& queryStats);

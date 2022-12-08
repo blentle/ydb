@@ -13,7 +13,7 @@ add_subdirectory(ut)
 
 add_library(ydb-library-arrow_clickhouse)
 target_include_directories(ydb-library-arrow_clickhouse PUBLIC
-  ${CMAKE_SOURCE_DIR}/ydb/library/yql/udfs/common/clickhouse/client/base
+  ${CMAKE_SOURCE_DIR}/ydb/library/arrow_clickhouse/base
 )
 target_include_directories(ydb-library-arrow_clickhouse PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/library/arrow_clickhouse
@@ -22,6 +22,7 @@ target_link_libraries(ydb-library-arrow_clickhouse PUBLIC
   contrib-libs-cxxsupp
   yutil
   libs-apache-arrow
+  contrib-restricted-cityhash-1.0.2
   library-arrow_clickhouse-Common
   library-arrow_clickhouse-Columns
   library-arrow_clickhouse-DataStreams
@@ -29,6 +30,5 @@ target_link_libraries(ydb-library-arrow_clickhouse PUBLIC
 target_sources(ydb-library-arrow_clickhouse PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/library/arrow_clickhouse/AggregateFunctions/IAggregateFunction.cpp
   ${CMAKE_SOURCE_DIR}/ydb/library/arrow_clickhouse/Aggregator.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/library/yql/udfs/common/clickhouse/client/base/common/mremap.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/library/yql/udfs/common/clickhouse/client/base/common/getPageSize.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/library/arrow_clickhouse/base/common/mremap.cpp
 )

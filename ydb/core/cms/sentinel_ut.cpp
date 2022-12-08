@@ -1,6 +1,7 @@
 #include "cms_ut_common.h"
 #include "sentinel.h"
 #include "sentinel_impl.h"
+#include "cms_impl.h"
 
 #include <library/cpp/testing/unittest/registar.h>
 
@@ -136,7 +137,8 @@ Y_UNIT_TEST_SUITE(TSentinelBaseTests) {
         }
     }
 
-    TCmsStatePtr MockCmsState(ui16 numDataCenter, ui16 racksPerDataCenter, ui16 nodesPerRack, ui16 pdisksPerNode, bool anyDC, bool anyRack) {
+    std::pair<TCmsStatePtr, TSentinelState::TPtr> MockCmsState(ui16 numDataCenter, ui16 racksPerDataCenter, ui16 nodesPerRack, ui16 pdisksPerNode, bool anyDC, bool anyRack) {
+        TSentinelState::TPtr sentinelState = new TSentinelState;
         TCmsStatePtr state = new TCmsState;
         state->ClusterInfo = new TClusterInfo;
 
@@ -156,6 +158,7 @@ Y_UNIT_TEST_SUITE(TSentinelBaseTests) {
                     location.SetUnit(ToString(id));
 
                     state->ClusterInfo->AddNode(TEvInterconnect::TNodeInfo(id, name, name, name, 10000, TNodeLocation(location)), nullptr);
+                    sentinelState->Nodes[id] = NSentinel::TNodeInfo{name, NActors::TNodeLocation(location)};
 
                     for (ui64 npdisk : xrange(pdisksPerNode)) {
                         NKikimrBlobStorage::TBaseConfig::TPDisk pdisk;
@@ -168,16 +171,26 @@ Y_UNIT_TEST_SUITE(TSentinelBaseTests) {
             }
         }
 
-        return state;
+        return {state, sentinelState};
     }
+
+    THashSet<TPDiskID, TPDiskIDHash> MapKeys(TClusterMap::TPDiskIgnoredMap& map) {
+        THashSet<TPDiskID, TPDiskIDHash> result;
+
+        for (auto& [k, _] : map) {
+            result.insert(k);
+        }
+
+        return result;
+    };
 
     void GuardianDataCenterRatio(ui16 numDataCenter, const TVector<ui16>& nodesPerDataCenterVariants, bool anyDC = false) {
         UNIT_ASSERT(!anyDC || numDataCenter == 1);
 
         for (ui16 nodesPerDataCenter : nodesPerDataCenterVariants) {
-            TCmsStatePtr state = MockCmsState(numDataCenter, nodesPerDataCenter, 1, 1, anyDC, false);
-            TGuardian all(state);
-            TGuardian changed(state, 50);
+            auto [state, sentinelState] = MockCmsState(numDataCenter, nodesPerDataCenter, 1, 1, anyDC, false);
+            TGuardian all(sentinelState);
+            TGuardian changed(sentinelState, 50);
             THashSet<TPDiskID, TPDiskIDHash> changedSet;
 
             const auto& nodes = state->ClusterInfo->AllNodes();
@@ -195,7 +208,7 @@ Y_UNIT_TEST_SUITE(TSentinelBaseTests) {
             }
 
             TString issues;
-            THashSet<TPDiskID, TPDiskIDHash> disallowed;
+            TClusterMap::TPDiskIgnoredMap disallowed;
 
             UNIT_ASSERT_VALUES_EQUAL(changed.GetAllowedPDisks(all, issues, disallowed), changedSet);
             UNIT_ASSERT(disallowed.empty());
@@ -215,7 +228,7 @@ Y_UNIT_TEST_SUITE(TSentinelBaseTests) {
             disallowed.clear();
             if (!anyDC) {
                 UNIT_ASSERT(changed.GetAllowedPDisks(all, issues, disallowed).empty());
-                UNIT_ASSERT_VALUES_EQUAL(disallowed, changedSet);
+                UNIT_ASSERT_VALUES_EQUAL(MapKeys(disallowed), changedSet);
                 UNIT_ASSERT_STRING_CONTAINS(issues, "due to DataCenterRatio");
             } else {
                 UNIT_ASSERT_VALUES_EQUAL(changed.GetAllowedPDisks(all, issues, disallowed), changedSet);
@@ -233,10 +246,10 @@ Y_UNIT_TEST_SUITE(TSentinelBaseTests) {
 
     void GuardianRackRatio(ui16 numRacks, const TVector<ui16>& nodesPerRackVariants, ui16 numPDisks, bool anyRack) {
         for (ui16 nodesPerRack : nodesPerRackVariants) {
-            TCmsStatePtr state = MockCmsState(1, numRacks, nodesPerRack, numPDisks, false, anyRack);
+            auto [state, sentinelState] = MockCmsState(1, numRacks, nodesPerRack, numPDisks, false, anyRack);
 
-            TGuardian all(state);
-            TGuardian changed(state, 100, 100, 50);
+            TGuardian all(sentinelState);
+            TGuardian changed(sentinelState, 100, 100, 50);
             THashSet<TPDiskID, TPDiskIDHash> changedSet;
 
             const auto& nodes = state->ClusterInfo->AllNodes();
@@ -256,7 +269,7 @@ Y_UNIT_TEST_SUITE(TSentinelBaseTests) {
             }
 
             TString issues;
-            THashSet<TPDiskID, TPDiskIDHash> disallowed;
+            TClusterMap::TPDiskIgnoredMap disallowed;
 
             UNIT_ASSERT_VALUES_EQUAL(changed.GetAllowedPDisks(all, issues, disallowed), changedSet);
             UNIT_ASSERT(disallowed.empty());
@@ -284,7 +297,7 @@ Y_UNIT_TEST_SUITE(TSentinelBaseTests) {
                 UNIT_ASSERT(issues.empty());
             } else {
                 UNIT_ASSERT_VALUES_EQUAL(allowed, decltype(allowed){});
-                UNIT_ASSERT_VALUES_EQUAL(disallowed, changedSet);
+                UNIT_ASSERT_VALUES_EQUAL(MapKeys(disallowed), changedSet);
                 UNIT_ASSERT_STRING_CONTAINS(issues, "due to RackRatio");
             }
         }
@@ -365,15 +378,37 @@ Y_UNIT_TEST_SUITE(TSentinelTests) {
                 switch (ev->GetTypeRewrite()) {
                 case TEvSentinel::TEvUpdateConfig::EventType:
                 case TEvSentinel::TEvUpdateState::EventType:
+                case TEvents::TEvWakeup::EventType:
                     return false;
 
                 default:
                     return true;
                 }
             });
+            auto prevObserver = SetObserverFunc(&TTestActorRuntimeBase::DefaultObserverFunc);
+            SetObserverFunc([this, prevObserver](TTestActorRuntimeBase& runtime,
+                                    TAutoPtr<IEventHandle> &event){
+                switch (event->GetTypeRewrite()) {
+                case TEvCms::TEvClusterStateRequest::EventType:
+                {
+                    TAutoPtr<TEvCms::TEvClusterStateResponse> resp = new TEvCms::TEvClusterStateResponse;
+                    if (State) {
+                        resp->Record.MutableStatus()->SetCode(NKikimrCms::TStatus::OK);
+                        for (const auto &entry : State->ClusterInfo->AllNodes()) {
+                            NCms::TCms::AddHostState(State->ClusterInfo, *entry.second, resp->Record, State->ClusterInfo->GetTimestamp());
+                        }
+                    }
+                    Send(new IEventHandle(event->Sender, TActorId(), resp.Release()));
+                    return TTestActorRuntime::EEventAction::PROCESS;
+                }
+                default:
+                    return prevObserver(runtime, event);
+                }
+            });
 
             State = new TCmsState;
             MockClusterInfo(State->ClusterInfo);
+            State->CmsActorId = GetSender();
 
             Sentinel = Register(CreateSentinel(State));
             EnableScheduleForActor(Sentinel, true);
@@ -433,11 +468,11 @@ Y_UNIT_TEST_SUITE(TSentinelTests) {
 
             struct TPDiskUpdates {
                 bool UpdateStatusRequested = false;
-                bool StatusChanged = false;
+                ui32 IgnoredUpdateRequests = 0;
             };
             THashMap<TPDiskID, TPDiskUpdates, TPDiskIDHash> pdiskUpdates;
             for (const auto& id : pdisks) {
-                pdiskUpdates[id] = {};// TPDiskUpdates {false, false});
+                pdiskUpdates[id] = {};// TPDiskUpdates {false, 0});
             }
 
             auto check = [&](IEventHandle& ev) {
@@ -448,43 +483,39 @@ Y_UNIT_TEST_SUITE(TSentinelTests) {
 
                 case TEvBlobStorage::TEvControllerConfigRequest::EventType:
                     {
+                        TGuard<TMutex> guard(TFakeNodeWhiteboardService::Mutex);
                         const auto& request = ev.Get<TEvBlobStorage::TEvControllerConfigRequest>()->Record;
 
                         UNIT_ASSERT(request.HasRequest());
-                        if (request.GetRequest().CommandSize() && request.GetRequest().GetCommand(0).HasUpdateDriveStatus()) {
-                            const auto& update = request.GetRequest().GetCommand(0).GetUpdateDriveStatus();
-                            TPDiskID id(update.GetHostKey().GetNodeId(), update.GetPDiskId());
-                            auto it = pdiskUpdates.find(id);
-                            if (it != pdiskUpdates.end()) {
-                                it->second.UpdateStatusRequested = (expectedStatus == update.GetStatus());
+                        for (ui32 i = 0; i < request.GetRequest().CommandSize(); ++i) {
+                            if (request.GetRequest().GetCommand(i).HasUpdateDriveStatus()) {
+                                const auto& update = request.GetRequest().GetCommand(i).GetUpdateDriveStatus();
+                                TPDiskID id(update.GetHostKey().GetNodeId(), update.GetPDiskId());
+
+                                auto it = pdiskUpdates.find(id);
+                                if (it != pdiskUpdates.end()) {
+                                    if (expectedStatus == update.GetStatus()) {
+                                        auto& vec = TFakeNodeWhiteboardService::BSControllerResponsePatterns[id];
+                                        if (!(TFakeNodeWhiteboardService::NoisyBSCPipeCounter % 3) && (vec.empty() || *vec.begin())) {
+                                            it->second.UpdateStatusRequested = true;
+                                        } else {
+                                            it->second.IgnoredUpdateRequests++;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                     break;
-
-                case TEvSentinel::TEvStatusChanged::EventType:
-                    {
-                        const auto* event = ev.Get<TEvSentinel::TEvStatusChanged>();
-
-                        auto it = pdiskUpdates.find(event->Id);
-                        if (it != pdiskUpdates.end()) {
-                            UNIT_ASSERT(event->Success);
-                            it->second.StatusChanged = true;
-                        }
-                    }
-                    break;
-
                 default:
                     break;
                 }
 
-                bool allUpdateStatusRequested = true;
-                bool allStatusChanged = true;
+                bool allUpdateStatusRequestedOrIgnored = true;
                 for (const auto& [id, info] : pdiskUpdates) {
-                    allUpdateStatusRequested &= info.UpdateStatusRequested;
-                    allStatusChanged &= info.StatusChanged;
+                    allUpdateStatusRequestedOrIgnored &= (info.UpdateStatusRequested || info.IgnoredUpdateRequests == 6);
                 }
-                return stateUpdated && pdiskUpdates.size() && allUpdateStatusRequested && allStatusChanged;
+                return stateUpdated && pdiskUpdates.size() && allUpdateStatusRequestedOrIgnored;
             };
 
             TDispatchOptions options;
@@ -494,6 +525,7 @@ Y_UNIT_TEST_SUITE(TSentinelTests) {
 
     private:
         TCmsStatePtr State;
+        std::atomic<bool> NosiyBlobstoragePipe = false;
         TActorId Sentinel;
 
     }; // TTestEnv
@@ -580,6 +612,44 @@ Y_UNIT_TEST_SUITE(TSentinelTests) {
             // for full rack pdisks is not expected to become FAULTY, so they become ACTIVE immediatetly
             // after pdisk becomes Normal
             env.SetPDiskState(pdisks, NKikimrBlobStorage::TPDiskState::Normal, EPDiskStatus::ACTIVE);
+        }
+    }
+
+    Y_UNIT_TEST(BSControllerUnresponsive) {
+        TTestEnv env(8, 4);
+
+        env.EnableNoisyBSCPipe();
+
+        const TPDiskID id1 = env.RandomPDiskID();
+        const TPDiskID id2 = env.RandomPDiskID();
+        const TPDiskID id3 = env.RandomPDiskID();
+        for (size_t i = 0; i < sizeof(ErrorStates) / sizeof(ErrorStates[0]); ++i) {
+            env.AddBSCFailures(id1, {false, true});
+            env.AddBSCFailures(id2, {false, false, false, false, false, false});
+        }
+
+        for (const EPDiskState state : ErrorStates) {
+            env.SetPDiskState({id1, id2, id3}, state, EPDiskStatus::FAULTY);
+            env.SetPDiskState({id1, id2, id3}, NKikimrBlobStorage::TPDiskState::Normal, EPDiskStatus::ACTIVE);
+        }
+    }
+
+    Y_UNIT_TEST(BSControllerCantChangeStatus) {
+        TTestEnv env(8, 4);
+
+        const TPDiskID id1 = env.RandomPDiskID();
+        const TPDiskID id2 = env.RandomPDiskID();
+        const TPDiskID id3 = env.RandomPDiskID();
+        for (size_t i = 0; i < sizeof(ErrorStates) / sizeof(ErrorStates[0]); ++i) {
+            env.AddBSCFailures(id1, {true, false, false, true, false, false});
+            // will fail for all requests assuming there is only 5 retries
+            env.AddBSCFailures(id2, {false, false, false, false, false, false});
+            env.AddBSCFailures(id3, {false, true, false, false, true, false});
+        }
+
+        for (const EPDiskState state : ErrorStates) {
+            env.SetPDiskState({id1, id2, id3}, state, EPDiskStatus::FAULTY);
+            env.SetPDiskState({id1, id2, id3}, NKikimrBlobStorage::TPDiskState::Normal, EPDiskStatus::ACTIVE);
         }
     }
 } // TSentinelTests

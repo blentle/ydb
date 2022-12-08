@@ -38,6 +38,7 @@ Y_UNIT_TEST_SUITE(TCdcStreamTests) {
             NLs::StreamMode(NKikimrSchemeOp::ECdcStreamModeKeysOnly),
             NLs::StreamFormat(NKikimrSchemeOp::ECdcStreamFormatProto),
             NLs::StreamState(NKikimrSchemeOp::ECdcStreamStateReady),
+            NLs::StreamVirtualTimestamps(false),
         });
         TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Table/Stream/streamImpl"), {NLs::PathExist});
 
@@ -63,6 +64,39 @@ Y_UNIT_TEST_SUITE(TCdcStreamTests) {
 
         TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Table/Stream"), {NLs::PathNotExist});
         TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Table/Stream/streamImpl"), {NLs::PathNotExist});
+    }
+
+    Y_UNIT_TEST(VirtualTimestamps) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime, TTestEnvOptions().EnableProtoSourceIdInfo(true));
+        ui64 txId = 100;
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Uint64" }
+            Columns { Name: "value" Type: "Uint64" }
+            KeyColumnNames: ["key"]
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TestCreateCdcStream(runtime, ++txId, "/MyRoot", R"(
+            TableName: "Table"
+            StreamDescription {
+              Name: "Stream"
+              Mode: ECdcStreamModeKeysOnly
+              Format: ECdcStreamFormatProto
+              VirtualTimestamps: true
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Table/Stream"), {
+            NLs::PathExist,
+            NLs::StreamMode(NKikimrSchemeOp::ECdcStreamModeKeysOnly),
+            NLs::StreamFormat(NKikimrSchemeOp::ECdcStreamFormatProto),
+            NLs::StreamState(NKikimrSchemeOp::ECdcStreamStateReady),
+            NLs::StreamVirtualTimestamps(true),
+        });
     }
 
     Y_UNIT_TEST(RetentionPeriod) {
@@ -103,6 +137,57 @@ Y_UNIT_TEST_SUITE(TCdcStreamTests) {
                 NLs::RetentionPeriod(rp),
             });
         }
+    }
+
+    void InitialScan(bool enable) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime, TTestEnvOptions()
+            .EnableProtoSourceIdInfo(true)
+            .EnableChangefeedInitialScan(enable));
+        ui64 txId = 100;
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Uint64" }
+            Columns { Name: "value" Type: "Uint64" }
+            KeyColumnNames: ["key"]
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        const auto expectedStatus = enable
+            ? NKikimrScheme::StatusAccepted
+            : NKikimrScheme::StatusPreconditionFailed;
+
+        TestCreateCdcStream(runtime, ++txId, "/MyRoot", R"(
+            TableName: "Table"
+            StreamDescription {
+              Name: "Stream"
+              Mode: ECdcStreamModeKeysOnly
+              Format: ECdcStreamFormatProto
+              State: ECdcStreamStateScan
+            }
+        )", {expectedStatus});
+
+        if (!enable) {
+            return;
+        }
+
+        env.TestWaitNotification(runtime, txId);
+
+        TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Table/Stream"), {
+            NLs::PathExist,
+            NLs::StreamMode(NKikimrSchemeOp::ECdcStreamModeKeysOnly),
+            NLs::StreamFormat(NKikimrSchemeOp::ECdcStreamFormatProto),
+            NLs::StreamState(NKikimrSchemeOp::ECdcStreamStateScan),
+        });
+    }
+
+    Y_UNIT_TEST(InitialScanShouldSucceed) {
+        InitialScan(true);
+    }
+
+    Y_UNIT_TEST(InitialScanShouldFail) {
+        InitialScan(false);
     }
 
     Y_UNIT_TEST(Negative) {

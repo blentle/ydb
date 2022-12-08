@@ -1,4 +1,5 @@
 #include "dq_opt_phy.h"
+#include "dq_opt_join.h"
 
 #include <ydb/library/yql/core/yql_expr_type_annotation.h>
 #include <ydb/library/yql/core/yql_opt_utils.h>
@@ -302,9 +303,32 @@ TExprBase DqPushMembersFilterToStage(TExprBase node, TExprContext& ctx, IOptimiz
     return result.Cast();
 }
 
+TExprNode::TListType FindLambdaPrecomputes(const TCoLambda& lambda) {
+    auto predicate = [](const TExprNode::TPtr& node) {
+        return TMaybeNode<TDqPrecompute>(node).IsValid();
+    };
+
+    TExprNode::TListType result;
+    VisitExpr(lambda.Body().Ptr(), [&result, &predicate] (const TExprNode::TPtr& node) {
+        if (predicate(node)) {
+            result.emplace_back(node);
+            return false;
+        }
+
+        return true;
+    });
+
+    return result;
+}
+
 TMaybeNode<TDqStage> DqPushFlatMapInnerConnectionsToStageInput(TCoFlatMapBase& flatmap,
-    TExprNode::TListType&& innerConnections, const TParentsMap& parentsMap, TExprContext& ctx)
+    TVector<NNodes::TDqConnection>&& innerConnections, const TParentsMap& parentsMap, TExprContext& ctx)
 {
+    auto innerPrecomputes = FindLambdaPrecomputes(flatmap.Lambda());
+    if (!innerPrecomputes.empty()) {
+        return {};
+    }
+
     TVector<TDqConnection> inputs;
     TNodeOnNodeOwnedMap replaceMap;
 
@@ -312,15 +336,15 @@ TMaybeNode<TDqStage> DqPushFlatMapInnerConnectionsToStageInput(TCoFlatMapBase& f
     inputs.reserve(innerConnections.size() + 1);
     inputs.push_back(flatmap.Input().Cast<TDqConnection>());
     for (auto& cn : innerConnections) {
-        if (!TMaybeNode<TDqCnUnionAll>(cn).IsValid() && !TMaybeNode<TDqCnMerge>(cn).IsValid()) {
+        if (!cn.Maybe<TDqCnUnionAll>() && !cn.Maybe<TDqCnMerge>()) {
             return {};
         }
 
-        if (!IsSingleConsumerConnection(TDqConnection(cn), parentsMap, true)) {
+        if (!IsSingleConsumerConnection(cn, parentsMap, true)) {
             return {};
         }
 
-        inputs.push_back(TDqConnection(cn));
+        inputs.push_back(cn);
     }
 
     auto args = PrepareArgumentsReplacement(flatmap.Input(), inputs, ctx, replaceMap);
@@ -401,22 +425,9 @@ TMaybeNode<TDqStage> DqPushFlatMapInnerConnectionsToStageInput(TCoFlatMapBase& f
         .Done();
 }
 
-TExprNode::TListType FindLambdaConnections(const TCoLambda& lambda) {
-    auto filter = [](const TExprNode::TPtr& node) {
-        return !TMaybeNode<TDqPhyPrecompute>(node).IsValid();
-    };
-
-    auto predicate = [](const TExprNode::TPtr& node) {
-        return TMaybeNode<TDqSource>(node).IsValid() ||
-               TMaybeNode<TDqConnection>(node).IsValid();
-    };
-
-    return FindNodes(lambda.Body().Ptr(), filter, predicate);
-}
-
 } // namespace
 
-TMaybeNode<TDqStage> DqPushLambdaToStage(const TDqStage& stage, const TCoAtom& outputIndex, TCoLambda& lambda,
+TMaybeNode<TDqStage> DqPushLambdaToStage(const TDqStage& stage, const TCoAtom& outputIndex, const TCoLambda& lambda,
     const TVector<TDqConnection>& lambdaInputs, TExprContext& ctx, IOptimizationContext& optCtx)
 {
     YQL_CLOG(TRACE, CoreDq) << "stage #" << stage.Ref().UniqueId() << ": " << PrintDqStageOnly(stage, ctx)
@@ -526,7 +537,7 @@ TExprNode::TPtr DqBuildPushableStage(const NNodes::TDqConnection& connection, TE
     return ctx.ChangeChild(connection.Ref(), TDqConnection::idx_Output, output.Ptr());
 }
 
-TMaybeNode<TDqConnection> DqPushLambdaToStageUnionAll(const TDqConnection& connection, TCoLambda& lambda,
+TMaybeNode<TDqConnection> DqPushLambdaToStageUnionAll(const TDqConnection& connection, const TCoLambda& lambda,
     const TVector<TDqConnection>& lambdaInputs, TExprContext& ctx, IOptimizationContext& optCtx)
 {
     auto stage = connection.Output().Stage().Cast<TDqStage>();
@@ -566,7 +577,7 @@ TExprBase DqBuildPureFlatmapStage(TExprBase node, TExprContext& ctx) {
         return node;
     }
 
-    auto innerConnections = FindLambdaConnections(flatmap.Lambda());
+    auto innerConnections = FindDqConnections(flatmap.Lambda());
     if (innerConnections.empty()) {
         return node;
     }
@@ -606,7 +617,7 @@ TExprBase DqBuildFlatmapStage(TExprBase node, TExprContext& ctx, IOptimizationCo
         return node;
     }
 
-    auto innerConnections = FindLambdaConnections(flatmap.Lambda());
+    auto innerConnections = FindDqConnections(flatmap.Lambda());
 
     TMaybeNode<TDqStage> flatmapStage;
     if (!innerConnections.empty()) {
@@ -2268,7 +2279,7 @@ TMaybeNode<TDqJoin> DqFlipJoin(const TDqJoin& join, TExprContext& ctx) {
 
 
 TExprBase DqBuildJoin(const TExprBase& node, TExprContext& ctx, IOptimizationContext& optCtx,
-                      const TParentsMap& parentsMap, bool allowStageMultiUsage, bool pushLeftStage, bool useGraceJoin)
+                      const TParentsMap& parentsMap, bool allowStageMultiUsage, bool pushLeftStage, EHashJoinMode hashJoin)
 {
     if (!node.Maybe<TDqJoin>()) {
         return node;
@@ -2279,23 +2290,22 @@ TExprBase DqBuildJoin(const TExprBase& node, TExprContext& ctx, IOptimizationCon
     if (DqValidateJoinInputs(join.LeftInput(), join.RightInput(), parentsMap, allowStageMultiUsage)) {
         // pass
     } else if (DqValidateJoinInputs(join.RightInput(), join.LeftInput(), parentsMap, allowStageMultiUsage)) {
-        auto maybeFlipJoin = DqFlipJoin(join, ctx);
-        if (!maybeFlipJoin) {
-            return node;
+        if (EHashJoinMode::Off == hashJoin) {
+            if (const auto maybeFlipJoin = DqFlipJoin(join, ctx)) {
+                join = maybeFlipJoin.Cast();
+            } else {
+                return node;
+            }
         }
-        join = maybeFlipJoin.Cast();
     } else {
         return node;
     }
 
-    auto joinType = join.JoinType().Value();
-    bool leftIsUnionAll = join.LeftInput().Maybe<TDqCnUnionAll>().IsValid();
-    bool rightIsUnionAll = join.RightInput().Maybe<TDqCnUnionAll>().IsValid();
-
-
-
-    if (useGraceJoin && joinType != "Cross"sv && leftIsUnionAll && rightIsUnionAll) {
-        return DqBuildGraceJoin(join, ctx);
+    const auto joinType = join.JoinType().Value();
+    const bool leftIsUnionAll = join.LeftInput().Maybe<TDqCnUnionAll>().IsValid();
+    const bool rightIsUnionAll = join.RightInput().Maybe<TDqCnUnionAll>().IsValid();
+    if (EHashJoinMode::Off != hashJoin && join.JoinType().Value() != "Cross"sv && leftIsUnionAll && rightIsUnionAll) {
+        return DqBuildHashJoin(join, hashJoin, ctx, optCtx);
     }
 
     if (joinType == "Full"sv || joinType == "Exclusion"sv) {

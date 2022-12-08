@@ -1,5 +1,6 @@
 #include "run.h"
 #include "dummy.h"
+#include "cert_auth_props.h"
 #include "service_initializer.h"
 #include "kikimr_services_initializers.h"
 
@@ -99,7 +100,6 @@
 #include <ydb/services/ydb/ydb_logstore.h>
 #include <ydb/services/ydb/ydb_long_tx.h>
 #include <ydb/services/ydb/ydb_operation.h>
-#include <ydb/services/ydb/ydb_s3_internal.h>
 #include <ydb/services/ydb/ydb_scheme.h>
 #include <ydb/services/ydb/ydb_scripting.h>
 #include <ydb/services/ydb/ydb_table.h>
@@ -349,7 +349,7 @@ void TKikimrRunner::InitializeMonitoring(const TKikimrRunConfig& runConfig, bool
     NActors::TMon::TConfig monConfig;
     monConfig.Port = appConfig.HasMonitoringConfig() ? appConfig.GetMonitoringConfig().GetMonitoringPort() : 0;
     if (monConfig.Port) {
-        monConfig.Title = appConfig.HasMonitoringConfig() ? appConfig.GetMonitoringConfig().GetMonitoringCaption() : "YDB Monitoring";
+        monConfig.Title = appConfig.GetMonitoringConfig().GetMonitoringCaption();
         monConfig.Threads = appConfig.GetMonitoringConfig().GetMonitoringThreads();
         monConfig.Address = appConfig.GetMonitoringConfig().GetMonitoringAddress();
         monConfig.Certificate = appConfig.GetMonitoringConfig().GetMonitoringCertificate();
@@ -549,8 +549,6 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
         names["topic"] = &hasTopic;
         TServiceCfg hasPQCD = services.empty();
         names["pqcd"] = &hasPQCD;
-        TServiceCfg hasS3Internal = false;
-        names["s3_internal"] = &hasS3Internal;
         TServiceCfg hasClickhouseInternal = services.empty();
         names["clickhouse_internal"] = &hasClickhouseInternal;
         TServiceCfg hasRateLimiter = false;
@@ -668,6 +666,9 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
         if (hasLegacy) {
             // start legacy service
             auto grpcService = new NGRpcProxy::TGRpcService();
+            if (!opts.SslData.Empty()) {
+                grpcService->SetDynamicNodeAuthParams(GetDynamicNodeAuthorizationParams(appConfig.GetClientCertificateAuthorization()));
+            }
             auto future = grpcService->Prepare(ActorSystem.Get(), NMsgBusProxy::CreatePersQueueMetaCacheV2Id(), NMsgBusProxy::CreateMsgBusProxyId(), Counters);
             auto startCb = [grpcService](NThreading::TFuture<void> result) {
                 if (result.HasException()) {
@@ -695,11 +696,6 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
         if (hasClickhouseInternal) {
             server.AddService(new NGRpcService::TGRpcYdbClickhouseInternalService(ActorSystem.Get(), Counters,
                 AppData->InFlightLimiterRegistry, grpcRequestProxyId, hasClickhouseInternal.IsRlAllowed()));
-        }
-
-        if (hasS3Internal) {
-            server.AddService(new NGRpcService::TGRpcYdbS3InternalService(ActorSystem.Get(), Counters,
-                grpcRequestProxyId, hasS3Internal.IsRlAllowed()));
         }
 
         if (hasScripting) {
@@ -866,6 +862,7 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
             sslData.Root = ReadFile(pathToCaFile);
             sslData.Cert = ReadFile(pathToCertificateFile);
             sslData.Key = ReadFile(pathToPrivateKeyFile);
+            sslData.DoRequestClientCertificate = appConfig.GetFeatureFlags().GetEnableDynamicNodeAuthorization() && appConfig.GetClientCertificateAuthorization().HasDynamicNodeAuthorization();
             sslOpts.SetSslData(sslData);
 
             GRpcServers.push_back({ "grpcs", new NGrpc::TGRpcServer(sslOpts) });
@@ -1030,6 +1027,10 @@ void TKikimrRunner::InitializeAppData(const TKikimrRunConfig& runConfig)
 
     if (runConfig.AppConfig.HasMeteringConfig()) {
         AppData->MeteringConfig = runConfig.AppConfig.GetMeteringConfig();
+    }
+
+    if (runConfig.AppConfig.HasAuditConfig()) {
+        AppData->AuditConfig = runConfig.AppConfig.GetAuditConfig();
     }
 
     AppData->TenantName = runConfig.TenantName;
@@ -1462,6 +1463,10 @@ TIntrusivePtr<TServiceInitializersList> TKikimrRunner::CreateServiceInitializers
 
     if (serviceMask.EnableMeteringWriter) {
         sil->AddServiceInitializer(new TMeteringWriterInitializer(runConfig));
+    }
+
+    if (serviceMask.EnableAuditWriter) {
+        sil->AddServiceInitializer(new TAuditWriterInitializer(runConfig));
     }
 
     if (serviceMask.EnableLongTxService) {

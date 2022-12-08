@@ -1,4 +1,5 @@
 #include "msgbus_servicereq.h"
+#include "grpc_server.h"
 
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 #include <library/cpp/actors/core/hfunc.h>
@@ -6,7 +7,7 @@
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/tablet_pipe.h>
 #include <ydb/core/mind/node_broker.h>
-#include <ydb/core/kqp/kqp.h>
+#include <ydb/core/kqp/common/kqp.h>
 
 namespace NKikimr {
 namespace NMsgBusProxy {
@@ -20,19 +21,34 @@ class TNodeRegistrationActor : public TActorBootstrapped<TNodeRegistrationActor>
 {
     using TActorBase = TActorBootstrapped<TNodeRegistrationActor>;
 
+    struct TNodeAuthorizationResult {
+        bool IsAuthorized = false;
+        bool IsCertififateUsed = false;
+
+        operator bool() const {
+            return IsAuthorized;
+        }
+    };
+
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
         return NKikimrServices::TActivity::MSGBUS_COMMON;
     }
 
-    TNodeRegistrationActor(NKikimrClient::TNodeRegistrationRequest &request, NMsgBusProxy::TBusMessageContext &msg)
+    TNodeRegistrationActor(NKikimrClient::TNodeRegistrationRequest &request, NMsgBusProxy::TBusMessageContext &msg, const NKikimr::TDynamicNodeAuthorizationParams& dynamicNodeAuthorizationParams)
         : TMessageBusSessionIdentHolder(msg)
         , Request(request)
+        , DynamicNodeAuthorizationParams(dynamicNodeAuthorizationParams)
     {
     }
 
     void Bootstrap(const TActorContext &ctx)
     {
+        const TNodeAuthorizationResult nodeAuthorizationResult = IsNodeAuthorized();
+        if (!nodeAuthorizationResult.IsAuthorized) {
+            SendReplyAndDie(ctx);
+        }
+
         auto dinfo = AppData(ctx)->DomainsInfo;
         ui32 group;
 
@@ -62,6 +78,7 @@ public:
 
         TAutoPtr<TEvNodeBroker::TEvRegistrationRequest> request
             = new TEvNodeBroker::TEvRegistrationRequest;
+
         request->Record.SetHost(Request.GetHost());
         request->Record.SetPort(Request.GetPort());
         request->Record.SetResolveHost(Request.GetResolveHost());
@@ -71,6 +88,8 @@ public:
         if (Request.HasPath()) {
             request->Record.SetPath(Request.GetPath());
         }
+        request->Record.SetAuthorizedByCertificate(nodeAuthorizationResult.IsCertififateUsed);
+
         NTabletPipe::SendData(ctx, NodeBrokerPipe, request.Release());
 
         Become(&TNodeRegistrationActor::MainState);
@@ -165,17 +184,52 @@ public:
     }
 
 private:
+    TNodeAuthorizationResult IsNodeAuthorized() {
+        TNodeAuthorizationResult result {.IsAuthorized = false, .IsCertififateUsed = false};
+        auto* appdata = AppData();
+        if (appdata && appdata->FeatureFlags.GetEnableDynamicNodeAuthorization() && DynamicNodeAuthorizationParams) {
+            const auto& nodeAuthValues = FindClientCert();
+            if (nodeAuthValues.empty()) {
+                Response.MutableStatus()->SetCode(TStatus::UNAUTHORIZED);
+                Response.MutableStatus()->SetReason("Cannot authorize node. Node has not provided certificate");
+                return result;
+            }
+            const auto& pemCert = nodeAuthValues.front();
+            TMap<TString, TString> subjectDescription;
+            X509CertificateReader::X509Ptr x509cert = X509CertificateReader::ReadCertAsPEM(pemCert);
+            for(const auto& term: X509CertificateReader::ReadSubjectTerms(x509cert)) {
+                subjectDescription.insert(term);
+            }
+
+            if (!DynamicNodeAuthorizationParams.IsSubjectDescriptionMatched(subjectDescription)) {
+                Response.MutableStatus()->SetCode(TStatus::UNAUTHORIZED);
+                Response.MutableStatus()->SetReason("Cannot authorize node by certificate");
+                return result;
+            }
+            const auto& host = Request.GetHost();
+            if (!DynamicNodeAuthorizationParams.IsHostMatchAttributeCN(host)) {
+                Response.MutableStatus()->SetCode(TStatus::UNAUTHORIZED);
+                Response.MutableStatus()->SetReason("Cannot authorize node with host: " + host);
+                return result;
+            }
+            result.IsCertififateUsed = true;
+        }
+        result.IsAuthorized = true;
+        return result;;
+    }
+
     NKikimrClient::TNodeRegistrationRequest Request;
     NKikimrClient::TNodeRegistrationResponse Response;
     TActorId NodeBrokerPipe;
+    const TDynamicNodeAuthorizationParams DynamicNodeAuthorizationParams;
 };
 
 } // namespace
 
-IActor *CreateMessageBusRegisterNode(NMsgBusProxy::TBusMessageContext &msg) {
+IActor *CreateMessageBusRegisterNode(NMsgBusProxy::TBusMessageContext &msg, const NKikimr::TDynamicNodeAuthorizationParams& dynamicNodeAuthorizationParams) {
     NKikimrClient::TNodeRegistrationRequest &record
         = static_cast<TBusNodeRegistrationRequest*>(msg.GetMessage())->Record;
-    return new TNodeRegistrationActor(record, msg);
+    return new TNodeRegistrationActor(record, msg, dynamicNodeAuthorizationParams);
 }
 
 } // namespace NMsgBusProxy

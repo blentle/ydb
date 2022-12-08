@@ -283,6 +283,8 @@ enum EServiceKikimr {
 
     BUILD_INDEX = 1000;
 
+    AUDIT_LOG_WRITER = 1005;
+
     METERING_WRITER = 1010;
 
     // Streaming
@@ -311,6 +313,17 @@ enum EServiceKikimr {
     PUBLIC_HTTP = 1157;
     FQ_CONTROL_PLANE_CONFIG = 1158;
 
+    FQ_RUN_ACTOR         = 1159;
+    FQ_DATABASE_RESOLVER = 1160;
+    FQ_PENDING_FETCHER   = 1161;
+    FQ_PINGER            = 1162;
+    FQ_RESULT_WRITER     = 1163;
+    FQ_LOG_UPDATER       = 1164;
+
+    DQ_TASK_RUNNER       = 1165;
+
+    VIEWER = 1166;
+
     // 1024 - 1099 is reserved for nbs
 
     // Change exchange (async indexes & CDC)
@@ -324,20 +337,22 @@ enum EServiceKikimr {
     // Blob depot
     BLOB_DEPOT = 1300;
     BLOB_DEPOT_AGENT = 1301;
+    BLOB_DEPOT_EVENTS = 1302; // event flow for debugging purposes
 
     // DATASHARD section again
     DS_LOAD_TEST = 1400;
 
     // MetadataProvider
     METADATA_PROVIDER = 1500;
+    METADATA_INITIALIZER = 1501;
+    METADATA_MANAGER = 1502;
+    METADATA_SECRET = 1503;
 
     // Tiering
     TX_TIERING = 1600;
 
     // Background tasks
     BG_TASKS = 1700;
-
-    METADATA_INITIALIZER = 1800;
 };
 
 message TActivity {
@@ -939,5 +954,8 @@ message TActivity {
         HTTP_MON_SERVICE_NODE_REQUEST = 593;
         HTTP_MON_SERVICE_MON_REQUEST = 594;
         HTTP_MON_SERVICE_NODE_PROXY = 595;
+        AUDIT_WRITER_ACTOR = 596;
+        SCHEMESHARD_SVP_MIGRATOR = 597;
+        SS_FETCHING_ACTOR = 598;
     };
 };

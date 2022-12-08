@@ -115,6 +115,7 @@ namespace Tests {
         TStoragePoolKinds StoragePoolTypes;
         TVector<NKikimrKqp::TKqpSetting> KqpSettings;
         bool EnableConsole = true;
+        bool EnableNodeBroker = false;
         bool EnableConfigsDispatcher = true;
         bool UseRealThreads = true;
         bool EnableKqpSpilling = false;
@@ -153,6 +154,7 @@ namespace Tests {
         TServerSettings& AddStoragePool(const TString& poolKind, const TString& poolName = {}, ui32 numGroups = 1, ui32 encryptionMode = 0);
         TServerSettings& SetKqpSettings(const TVector<NKikimrKqp::TKqpSetting>& settings) { KqpSettings = settings; return *this; }
         TServerSettings& SetEnableConsole(bool value) { EnableConsole = value; return *this; }
+        TServerSettings& SetEnableNodeBroker(bool value) { EnableNodeBroker = value; return *this; }
         TServerSettings& SetEnableConfigsDispatcher(bool value) { EnableConfigsDispatcher = value; return *this; }
         TServerSettings& SetUseRealThreads(bool value) { UseRealThreads = value; return *this; }
         TServerSettings& SetAppConfig(const NKikimrConfig::TAppConfig value) { AppConfig = value; return *this; }
@@ -162,6 +164,7 @@ namespace Tests {
         TServerSettings& SetFeatureFlags(const NKikimrConfig::TFeatureFlags& value) { FeatureFlags = value; return *this; }
         TServerSettings& SetCompactionConfig(const NKikimrConfig::TCompactionConfig& value) { CompactionConfig = value; return *this; }
         TServerSettings& SetEnableDbCounters(bool value) { FeatureFlags.SetEnableDbCounters(value); return *this; }
+        TServerSettings& SetEnablePersistentQueryStats(bool value) { FeatureFlags.SetEnablePersistentQueryStats(value); return *this; }
         TServerSettings& SetEnableYq(bool value) { EnableYq = value; return *this; }
         TServerSettings& SetKeepSnapshotTimeout(TDuration value) { KeepSnapshotTimeout = value; return *this; }
         TServerSettings& SetChangesQueueItemsLimit(ui64 value) { ChangesQueueItemsLimit = value; return *this; }
@@ -255,6 +258,7 @@ namespace Tests {
             }
         }
         void StartDummyTablets();
+        TVector<ui64> StartPQTablets(ui32 pqTabletsN);
         TTestActorRuntime* GetRuntime() const;
         const TServerSettings& GetSettings() const;
         const NScheme::TTypeRegistry* GetTypeRegistry();
@@ -458,10 +462,6 @@ namespace Tests {
         ui32 GetLeaderNode(TTestActorRuntime* runtime, ui64 tabletId);
         bool TabletExistsInHive(TTestActorRuntime* runtime, ui64 tabletId, bool evenInDeleting = false);
         TVector<ui32> GetFollowerNodes(TTestActorRuntime *runtime, ui64 tabletId);
-        void S3Listing(const TString& table, const TString& prefixColumnsPb, const TString &pathPrefix,
-                       const TString &pathDelimiter, const TString& startAfterSuffixColumnsPb,
-                       const TVector<TString>& columnsToReturn, ui32 maxKeys, ui32 timeoutMillisec,
-                       NKikimrClient::TS3ListingResponse &res);
 
         void GetTabletInfoFromHive(TTestActorRuntime* runtime, ui64 tabletId, bool returnFollowers, NKikimrHive::TEvResponseHiveInfo& res);
         void GetTabletStorageInfoFromHive(TTestActorRuntime* runtime, ui64 tabletId, NKikimrHive::TEvGetTabletStorageInfoResult& res);

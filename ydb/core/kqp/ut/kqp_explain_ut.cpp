@@ -708,7 +708,7 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
             },
             {
                 "SELECT * FROM `/Root/TwoKeys` WHERE Key2 < 10 Or Cast(Key2 As Int64) < Value",
-                "item.Key2 < 10 Or ..."
+                "item.Key2 < 10 Or item.Key2 < item.Value"
             }
         };
 
@@ -762,6 +762,47 @@ Y_UNIT_TEST_SUITE(KqpExplain) {
         const auto& sortColumns = merge.GetMapSafe().at("SortColumns").GetArraySafe();
         UNIT_ASSERT(sortColumns.size() == 1);
         UNIT_ASSERT(sortColumns.at(0) == "Key (Asc)");
+    }
+
+    Y_UNIT_TEST(SsaProgramInJsonPlan) {
+        auto kikimr = DefaultKikimrRunner();
+        TStreamExecScanQuerySettings settings;
+        settings.Explain(true);
+
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        auto res = session.ExecuteSchemeQuery(R"(
+            CREATE TABLE `/Root/OlapTable` (
+                Key Int32,
+                Value Int64,
+                PRIMARY KEY (Key)
+            )
+            WITH (STORE = COLUMN);
+        )").GetValueSync();
+        UNIT_ASSERT_C(res.IsSuccess(), res.GetIssues().ToString());
+
+        TString query = "SELECT * FROM `/Root/OlapTable` WHERE Value > 0;";
+        auto it = db.StreamExecuteScanQuery(query, settings).GetValueSync();
+        auto streamRes = CollectStreamResult(it);
+
+        UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
+        UNIT_ASSERT(streamRes.PlanJson);
+
+        Cerr << streamRes.PlanJson.GetOrElse("NO_PLAN") << Endl;
+        NJson::TJsonValue plan;
+        NJson::ReadJsonTree(*streamRes.PlanJson, &plan, true);
+        UNIT_ASSERT(ValidatePlanNodeIds(plan));
+
+        auto readNode = FindPlanNodeByKv(plan, "Node Type", "Filter-TableFullScan");
+        UNIT_ASSERT(readNode.IsDefined());
+
+        auto& operators = readNode.GetMapSafe().at("Operators").GetArraySafe();
+        for (auto& op : operators) {
+            if (op.GetMapSafe().at("Name") == "TableFullScan") {
+                UNIT_ASSERT(op.GetMapSafe().at("SsaProgram").IsDefined());
+            }
+        }
     }
 }
 

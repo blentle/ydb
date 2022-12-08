@@ -12,6 +12,7 @@
 #include <ydb/core/tablet_flat/flat_cxx_database.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
 #include <ydb/core/tablet_flat/tablet_flat_executor.h>
+#include <ydb/core/tx/tiering/common.h>
 #include <ydb/core/tx/tiering/manager.h>
 #include <ydb/core/tx/time_cast/time_cast.h>
 #include <ydb/core/tx/tx_processing.h>
@@ -125,6 +126,8 @@ class TColumnShard
     void Handle(TEvPrivate::TEvForget::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr& ev, const TActorContext& ctx);
     void Handle(NMetadataProvider::TEvRefreshSubscriberData::TPtr& ev);
+    void Handle(NTiers::TEvTiersManagerReadyForUsage::TPtr& ev);
+    
 
     ITransaction* CreateTxInitSchema();
     ITransaction* CreateTxRunGc();
@@ -139,7 +142,7 @@ class TColumnShard
         Y_UNUSED(ctx);
     }
 
-    const NTiers::TManager& GetTierManagerVerified(const NTiers::TGlobalTierId& tierId) const {
+    const NTiers::TManager& GetTierManagerVerified(const TString& tierId) const {
         Y_VERIFY(!!Tiers);
         return Tiers->GetManagerVerified(tierId);
     }
@@ -177,6 +180,7 @@ class TColumnShard
 
     NOlap::TIndexInfo GetActualIndexInfo(const bool tiersUsage = true) const;
 
+    void ActivateTiering(const ui64 pathId, const TString& useTiering);
 protected:
     STFUNC(StateInit) {
         TRACE_EVENT(NKikimrServices::TX_COLUMNSHARD);
@@ -226,6 +230,7 @@ protected:
             HFunc(TEvPrivate::TEvScanStats, Handle);
             HFunc(TEvPrivate::TEvReadFinished, Handle);
             HFunc(TEvPrivate::TEvPeriodicWakeup, Handle);
+            hFunc(NTiers::TEvTiersManagerReadyForUsage, Handle);
         default:
             if (!HandleDefaultEvents(ev, ctx)) {
                 LOG_S_WARN("TColumnShard.StateWork at " << TabletID()
@@ -311,6 +316,7 @@ private:
         ui64 PathId;
         std::map<TRowVersion, TTableVersionInfo> Versions;
         TRowVersion DropVersion = TRowVersion::Max();
+        TString TieringUsage;
 
         bool IsDropped() const {
             return DropVersion != TRowVersion::Max();
@@ -346,6 +352,7 @@ private:
     TDuration ActivationPeriod = TDuration::Seconds(60);
     TDuration FailActivationDelay = TDuration::Seconds(1);
     TDuration StatsReportInterval = TDuration::Seconds(10);
+    TInstant LastAccessTime;
     TInstant LastBackActivation;
     TInstant LastStatsReport;
 
@@ -354,7 +361,7 @@ private:
     TActorId EvictionActor;
     TActorId StatsReportPipe;
 
-    bool EnableTiering = false;
+    bool TieringWaiting = false;
     std::shared_ptr<TTiersManager> Tiers;
     std::unique_ptr<TTabletCountersBase> TabletCountersPtr;
     TTabletCountersBase* TabletCounters;
@@ -447,7 +454,7 @@ private:
 
     NOlap::TIndexInfo ConvertSchema(const NKikimrSchemeOp::TColumnTableSchema& schema);
     void MapExternBlobs(const TActorContext& ctx, NOlap::TReadMetadata& metadata);
-    TActorId GetS3ActorForTier(const NTiers::TGlobalTierId& tierId) const;
+    TActorId GetS3ActorForTier(const TString& tierId) const;
     void ExportBlobs(const TActorContext& ctx, ui64 exportNo, const TString& tierName,
         TEvPrivate::TEvExport::TBlobDataMap&& blobsInfo) const;
     void ForgetBlobs(const TActorContext& ctx, const TString& tierName, std::vector<NOlap::TEvictedBlob>&& blobs) const;

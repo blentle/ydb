@@ -183,10 +183,8 @@ public:
                 blockRowTypeItems.push_back(ctx.MakeType<TItemExprType>(x->GetName(), ctx.MakeType<TBlockExprType>(x->GetItemType())));
             }
 
-            auto blockRowType = ctx.MakeType<TStructExprType>(blockRowTypeItems);
-
-            itemType = ctx.MakeType<TTupleExprType>(
-                TTypeAnnotationNode::TListType{ blockRowType, ctx.MakeType<TScalarExprType>(ctx.MakeType<TDataExprType>(EDataSlot::Uint64)) }); // struct + block length
+            blockRowTypeItems.push_back(ctx.MakeType<TItemExprType>("_yql_block_length", ctx.MakeType<TScalarExprType>(ctx.MakeType<TDataExprType>(EDataSlot::Uint64))));
+            itemType = ctx.MakeType<TStructExprType>(blockRowTypeItems);
         } else {
             itemType = ctx.MakeType<TResourceExprType>("ClickHouseClient.Block");
         }
@@ -371,6 +369,14 @@ public:
                     return true;
                 }
 
+                if (name == "filepattern"sv) {
+                    TStringBuf unused;
+                    if (!ExtractSettingValue(setting.Tail(), "file_pattern"sv, format, {}, ctx, unused)) {
+                        return false;
+                    }
+                    return true;
+                }
+
                 YQL_ENSURE(name == "projection"sv);
                 haveProjection = true;
                 if (!EnsureAtom(setting.Tail(), ctx)) {
@@ -386,7 +392,7 @@ public:
             };
             if (!EnsureValidSettings(*input->Child(TS3Object::idx_Settings),
                                      { "compression"sv, "partitionedby"sv, "projection"sv, "data.interval.unit"sv,
-                                       "readmaxbytes"sv, "csvdelimiter"sv, "directories"sv }, validator, ctx))
+                                       "readmaxbytes"sv, "csvdelimiter"sv, "directories"sv, "filepattern"sv }, validator, ctx))
             {
                 return TStatus::Error;
             }

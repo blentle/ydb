@@ -393,6 +393,7 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
         {"Inc", &TProgramBuilder::Increment},
         {"Dec", &TProgramBuilder::Decrement},
         {"Not", &TProgramBuilder::Not},
+        {"BlockNot", &TProgramBuilder::BlockNot},
 
         {"BitNot", &TProgramBuilder::BitNot},
 
@@ -520,6 +521,11 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
 
         {"WideTakeBlocks", &TProgramBuilder::WideTakeBlocks},
         {"WideSkipBlocks", &TProgramBuilder::WideSkipBlocks},
+        {"BlockCoalesce", &TProgramBuilder::BlockCoalesce},
+
+        {"BlockAnd", &TProgramBuilder::BlockAnd},
+        {"BlockOr", &TProgramBuilder::BlockOr},
+        {"BlockXor", &TProgramBuilder::BlockXor},
 
         {"Append", &TProgramBuilder::Append},
         {"Insert", &TProgramBuilder::Append},
@@ -2419,6 +2425,12 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
 
         auto returnType = BuildType(node, *node.GetTypeAnn(), ctx.ProgramBuilder);
         return ctx.ProgramBuilder.BlockCombineAll(arg, countColumn, filterColumn, aggs, returnType);
+    });
+
+    AddCallable("BlockCompress", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        const auto flow = MkqlBuildExpr(node.Head(), ctx);
+        const auto index = FromString<ui32>(node.Child(1)->Content());
+        return ctx.ProgramBuilder.BlockCompress(flow, index);
     });
 
     AddCallable("PgArray", [](const TExprNode& node, TMkqlBuildContext& ctx) {

@@ -51,6 +51,7 @@
 #include <ydb/core/yq/libs/common/entity_id.h>
 #include <ydb/core/yq/libs/control_plane_storage/control_plane_storage.h>
 #include <ydb/core/yq/libs/control_plane_storage/events/events.h>
+#include <ydb/core/yq/libs/control_plane_storage/util.h>
 #include <ydb/core/yq/libs/db_id_async_resolver_impl/db_async_resolver_impl.h>
 #include <ydb/core/yq/libs/gateway/empty_gateway.h>
 #include <ydb/core/yq/libs/checkpointing/checkpoint_coordinator.h>
@@ -75,14 +76,9 @@
 #include <util/string/split.h>
 #include <util/system/hostname.h>
 
-#define LOG_E(stream) \
-    LOG_ERROR_S(*TlsActivationContext, NKikimrServices::YQL_PROXY, Params.QueryId << " RunActor : " << stream)
-
-#define LOG_D(stream) \
-    LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::YQL_PROXY, Params.QueryId << " RunActor : " << stream)
-
-#define LOG_T(stream) \
-    LOG_TRACE_S(*TlsActivationContext, NKikimrServices::YQL_PROXY, Params.QueryId << " RunActor : " << stream)
+#define LOG_E(stream) LOG_ERROR_S(*TlsActivationContext, NKikimrServices::FQ_RUN_ACTOR, "QueryId: " << Params.QueryId << " " << stream)
+#define LOG_D(stream) LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::FQ_RUN_ACTOR, "QueryId: " << Params.QueryId << " " << stream)
+#define LOG_T(stream) LOG_TRACE_S(*TlsActivationContext, NKikimrServices::FQ_RUN_ACTOR, "QueryId: " << Params.QueryId << " " << stream)
 
 namespace NYq {
 
@@ -1542,6 +1538,16 @@ private:
 
         NYql::IssuesToMessage(TransientIssues, QueryStateUpdateRequest.mutable_transient_issues());
         NYql::IssuesToMessage(Issues, QueryStateUpdateRequest.mutable_issues());
+        /*
+            1. If the execution has already started then the issue will be put through TEvAbortExecution
+            2. If execution hasn't started then the issue will be put in this place
+            3. This is necessary for symmetrical behavior in case of abortion
+        */
+        if (!QueryStateUpdateRequest.issues_size() && IsAbortedStatus(QueryStateUpdateRequest.status())) {
+            auto& issue = *QueryStateUpdateRequest.add_issues();
+            issue.set_message(YandexQuery::QueryMeta::ComputeStatus_Name(QueryStateUpdateRequest.status()));
+            issue.set_severity(NYql::TSeverityIds::S_ERROR);
+        }
 
         Send(Pinger, new TEvents::TEvForwardPingRequest(QueryStateUpdateRequest, true));
 
@@ -1572,12 +1578,23 @@ private:
 
         THashMap<TString, TString> clusters;
 
+        TString monitoringEndpoint = Params.CommonConfig.GetMonitoringEndpoint();
+        // TODO: get monitoring endpoint from config only after YQ-148
+        if (monitoringEndpoint.Empty()) {
+            if (Params.CommonConfig.GetObjectStorageEndpoint().Contains("preprod")) {
+                monitoringEndpoint = "monitoring.api.cloud-preprod.yandex.net";
+            } else {
+                monitoringEndpoint = "monitoring.api.cloud.yandex.net";
+            }
+        }
+
         //todo: consider cluster name clashes
         AddClustersFromConfig(gatewaysConfig, clusters);
         AddSystemClusters(gatewaysConfig, clusters, Params.AuthToken);
         AddClustersFromConnections(YqConnections,
             Params.CommonConfig.GetUseBearerForYdb(),
             Params.CommonConfig.GetObjectStorageEndpoint(),
+            monitoringEndpoint,
             Params.AuthToken,
             Params.AccountIdSignatures,
             // out params:

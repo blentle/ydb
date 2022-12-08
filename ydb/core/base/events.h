@@ -152,7 +152,10 @@ struct TKikimrEvents : TEvents {
         ES_INTERNAL_REQUEST,
         ES_BACKGROUND_TASKS,
         ES_TIERING,
-        ES_METADATA_INITIALIZER
+        ES_METADATA_INITIALIZER,
+        ES_YDB_AUDIT_LOG,
+        ES_METADATA_MANAGER,
+        ES_METADATA_SECRET,
     };
 };
 

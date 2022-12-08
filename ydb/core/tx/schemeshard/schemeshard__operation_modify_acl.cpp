@@ -6,22 +6,9 @@ namespace {
 using namespace NKikimr;
 using namespace NSchemeShard;
 
-class TModifyACL: public ISubOperationBase {
-private:
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-
+class TModifyACL: public TSubOperationBase {
 public:
-    TModifyACL(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TModifyACL(TOperationId id)
-        : OperationId(id)
-    {
-    }
+    using TSubOperationBase::TSubOperationBase;
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -74,7 +61,7 @@ public:
             path.Base()->ApplyACL(acl);
             context.SS->PersistACL(db, path.Base());
 
-            auto subtree = context.SS->ListSubThee(path.Base()->PathId, context.Ctx);
+            auto subtree = context.SS->ListSubTree(path.Base()->PathId, context.Ctx);
             for (const TPathId pathId : subtree) {
                 if (context.SS->PathsById.at(pathId)->IsMigrated()) {
                     continue;
@@ -133,17 +120,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateModifyACL(TOperationId id, const TTxTransaction& tx) {
-    return new TModifyACL(id, tx);
+    return MakeSubOperation<TModifyACL>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateModifyACL(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state == TTxState::Invalid);
-    return new TModifyACL(id);
+    return MakeSubOperation<TModifyACL>(id);
 }
 
-}
 }

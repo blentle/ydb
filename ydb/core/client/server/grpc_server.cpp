@@ -202,14 +202,6 @@ public:
         }
     }
 
-    void Reply(const NKikimrClient::TS3ListingResponse& resp) override {
-        try {
-            Finish(dynamic_cast<const TOut&>(resp), 0);
-        } catch (const std::bad_cast&) {
-            Y_FAIL("unexpected response type generated");
-        }
-    }
-
     void Reply(const NKikimrClient::TConsoleResponse& resp) override {
         try {
             Finish(dynamic_cast<const TOut&>(resp), 0);
@@ -251,11 +243,6 @@ public:
     static void GenerateErrorResponse(NKikimrClient::TSqsResponse&, const TString&)
     { }
 
-    static void GenerateErrorResponse(NKikimrClient::TS3ListingResponse& resp, const TString& reason) {
-        resp.SetStatus(NMsgBusProxy::MSTATUS_ERROR);
-        resp.SetDescription(reason);
-    }
-
     static void GenerateErrorResponse(NKikimrClient::TConsoleResponse& resp, const TString& reason) {
         resp.MutableStatus()->SetCode(Ydb::StatusIds::GENERIC_ERROR);
         resp.MutableStatus()->SetReason(reason);
@@ -267,6 +254,10 @@ public:
 
     TString GetPeer() const override {
         return GetPeerName();
+    }
+
+    TVector<TStringBuf> FindClientCert() const override {
+        return TGrpcBaseAsyncContext::FindClientCert();
     }
 
 private:
@@ -503,11 +494,12 @@ void TGRpcService::SetupIncomingRequests() {
     ADD_ACTOR_REQUEST(DrainNode,                 TDrainNodeRequest,                 MTYPE_CLIENT_DRAIN_NODE)
     ADD_ACTOR_REQUEST(InterconnectDebug,         TInterconnectDebug,                MTYPE_CLIENT_INTERCONNECT_DEBUG)
     ADD_ACTOR_REQUEST(TestShardControl,          TTestShardControlRequest,          MTYPE_CLIENT_TEST_SHARD_CONTROL)
+    ADD_ACTOR_REQUEST(LoginRequest,              TLoginRequest,                     MTYPE_CLIENT_LOGIN_REQUEST)
 
     // dynamic node registration
     ADD_REQUEST(RegisterNode, TNodeRegistrationRequest, TNodeRegistrationResponse, {
         NMsgBusProxy::TBusMessageContext msg(ctx->BindBusContext(NMsgBusProxy::MTYPE_CLIENT_NODE_REGISTRATION_REQUEST));
-        RegisterRequestActor(CreateMessageBusRegisterNode(msg));
+        RegisterRequestActor(CreateMessageBusRegisterNode(msg, DynamicNodeAuthorizationParams));
     })
 
     // CMS request
@@ -520,12 +512,6 @@ void TGRpcService::SetupIncomingRequests() {
     ADD_REQUEST(SqsRequest, TSqsRequest, TSqsResponse, {
         NMsgBusProxy::TBusMessageContext msg(ctx->BindBusContext(NMsgBusProxy::MTYPE_CLIENT_SQS_REQUEST));
         RegisterRequestActor(CreateMessageBusSqsRequest(msg));
-    })
-
-    // S3 listing request
-    ADD_REQUEST(S3Listing, TS3ListingRequest, TS3ListingResponse, {
-        NMsgBusProxy::TBusMessageContext msg(ctx->BindBusContext(NMsgBusProxy::MTYPE_CLIENT_S3_LISTING_REQUEST));
-        RegisterRequestActor(CreateMessageBusS3ListingRequest(msg));
     })
 
     // Console request

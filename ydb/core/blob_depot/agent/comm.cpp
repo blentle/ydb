@@ -4,14 +4,21 @@
 namespace NKikimr::NBlobDepot {
 
     void TBlobDepotAgent::Handle(TEvTabletPipe::TEvClientConnected::TPtr ev) {
+        auto& msg = *ev->Get();
         STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA03, "TEvClientConnected", (VirtualGroupId, VirtualGroupId),
-            (Msg, ev->Get()->ToString()));
+            (TabletId, msg.TabletId), (Status, msg.Status), (ClientId, msg.ClientId), (ServerId, msg.ServerId));
+        Y_VERIFY_DEBUG_S(msg.Status == NKikimrProto::OK, "Status# " << NKikimrProto::EReplyStatus_Name(msg.Status));
+        if (msg.Status != NKikimrProto::OK) {
+            ConnectToBlobDepot();
+        } else {
+            PipeServerId = msg.ServerId;
+        }
     }
 
     void TBlobDepotAgent::Handle(TEvTabletPipe::TEvClientDestroyed::TPtr ev) {
         STLOG(PRI_INFO, BLOB_DEPOT_AGENT, BDA04, "TEvClientDestroyed", (VirtualGroupId, VirtualGroupId),
             (Msg, ev->Get()->ToString()));
-        PipeId = {};
+        PipeId = PipeServerId = {};
         OnDisconnect();
         ConnectToBlobDepot();
     }
@@ -19,7 +26,8 @@ namespace NKikimr::NBlobDepot {
     void TBlobDepotAgent::ConnectToBlobDepot() {
         Y_VERIFY(!PipeId);
         PipeId = Register(NTabletPipe::CreateClient(SelfId(), TabletId, NTabletPipe::TClientRetryPolicy::WithRetries()));
-        const ui64 id = NextRequestId++;
+        NextTabletRequestId = 1;
+        const ui64 id = NextTabletRequestId++;
         STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA05, "ConnectToBlobDepot", (VirtualGroupId, VirtualGroupId),
             (PipeId, PipeId), (RequestId, id));
         NTabletPipe::SendData(SelfId(), PipeId, new TEvBlobDepot::TEvRegisterAgent(VirtualGroupId, AgentInstanceId), id);
@@ -84,7 +92,7 @@ namespace NKikimr::NBlobDepot {
 
     void TBlobDepotAgent::IssueAllocateIdsIfNeeded(TChannelKind& kind) {
         if (!kind.IdAllocInFlight && kind.GetNumAvailableItems() < 100 && PipeId) {
-            const ui64 id = NextRequestId++;
+            const ui64 id = NextTabletRequestId++;
             STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA08, "IssueAllocateIdsIfNeeded", (VirtualGroupId, VirtualGroupId),
                 (ChannelKind, NKikimrBlobDepot::TChannelKind::E_Name(kind.Kind)),
                 (IdAllocInFlight, kind.IdAllocInFlight), (NumAvailableItems, kind.GetNumAvailableItems()),
@@ -162,19 +170,22 @@ namespace NKikimr::NBlobDepot {
     template void TBlobDepotAgent::Issue(NKikimrBlobDepot::TEvDiscardSpoiledBlobSeq msg, TRequestSender *sender, TRequestContext::TPtr context);
 
     void TBlobDepotAgent::Issue(std::unique_ptr<IEventBase> ev, TRequestSender *sender, TRequestContext::TPtr context) {
-        const ui64 id = NextRequestId++;
-        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA10, "Issue", (VirtualGroupId, VirtualGroupId), (Id, id), (Msg, ev->ToString()));
+        const ui64 id = NextTabletRequestId++;
+        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA10, "Issue", (VirtualGroupId, VirtualGroupId), (RequestId, id), (Msg, ev->ToString()));
         NTabletPipe::SendData(SelfId(), PipeId, ev.release(), id);
         RegisterRequest(id, sender, std::move(context), {}, true);
     }
 
     void TBlobDepotAgent::Handle(TEvBlobDepot::TEvPushNotify::TPtr ev) {
-        auto response = std::make_unique<TEvBlobDepot::TEvPushNotifyResult>();
-
         auto& msg = ev->Get()->Record;
-
         STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA11, "TEvPushNotify", (VirtualGroupId, VirtualGroupId), (Msg, msg),
-            (Id, ev->Cookie));
+            (Id, ev->Cookie), (Sender, ev->Sender), (PipeServerId, PipeServerId));
+        if (ev->Sender != PipeServerId) {
+            return; // race with previous connection
+        }
+
+        auto response = std::make_unique<TEvBlobDepot::TEvPushNotifyResult>();
+        response->Record.SetId(ev->Cookie);
 
         BlocksManager.OnBlockedTablets(msg.GetBlockedTablets());
 
@@ -208,7 +219,9 @@ namespace NKikimr::NBlobDepot {
 
         // it is essential to send response through the pipe -- otherwise we can break order with, for example, commits:
         // this message can outrun previously sent commit and lead to data loss
-        NTabletPipe::SendData(SelfId(), PipeId, response.release(), ev->Cookie);
+        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA33, "sending TEvPushNotifyResult", (VirtualGroupId, VirtualGroupId),
+            (RequestId, NextTabletRequestId));
+        NTabletPipe::SendData(SelfId(), PipeId, response.release(), NextTabletRequestId++);
 
         for (auto& [_, kind] : ChannelKinds) {
             IssueAllocateIdsIfNeeded(kind);

@@ -87,8 +87,16 @@ struct TPDiskInfo
     , public TPDiskStatus
 {
     using TPtr = TIntrusivePtr<TPDiskInfo>;
-    TActorId StatusChanger;
-    TStatusChangerState::TPtr StatusChangerState;
+
+    using EIgnoreReason = NKikimrCms::TPDiskInfo::EIgnoreReason;
+
+    EPDiskStatus ActualStatus = EPDiskStatus::ACTIVE;
+    EPDiskStatus PrevStatus = EPDiskStatus::ACTIVE;
+    TInstant LastStatusChange;
+    bool StatusChangeFailed = false;
+    ui32 StatusChangeAttempt = 0;
+    ui32 PrevStatusChangeAttempt = 0;
+    EIgnoreReason IgnoreReason = NKikimrCms::TPDiskInfo::NOT_IGNORED;
 
     explicit TPDiskInfo(EPDiskStatus initialStatus, const ui32& defaultStateLimit, const TLimitsMap& stateLimits);
 
@@ -102,19 +110,52 @@ private:
     bool Touched;
 }; // TPDiskInfo
 
+struct TNodeInfo {
+    TString Host;
+    NActors::TNodeLocation Location;
+};
+
+struct TConfigUpdaterState {
+    ui32 BSCAttempt = 0;
+    ui32 CMSAttempt = 0;
+    bool GotBSCResponse = false;
+    bool GotCMSResponse = false;
+
+    void Clear() {
+        *this = TConfigUpdaterState{};
+    }
+};
+
+/// Main state
+struct TSentinelState: public TSimpleRefCount<TSentinelState> {
+    using TPtr = TIntrusivePtr<TSentinelState>;
+
+    using TNodeId = ui32;
+
+    TMap<TPDiskID, TPDiskInfo::TPtr> PDisks;
+    TMap<TNodeId, TNodeInfo> Nodes;
+    THashSet<ui32> StateUpdaterWaitNodes;
+    TConfigUpdaterState ConfigUpdaterState;
+    TConfigUpdaterState PrevConfigUpdaterState;
+    TMap<TPDiskID, TPDiskInfo::TPtr> ChangeRequests;
+    ui32 StatusChangeAttempt = 0;
+    ui32 ChangeRequestId = 0;
+};
+
 class TClusterMap {
 public:
     using TPDiskIDSet = THashSet<TPDiskID, TPDiskIDHash>;
+    using TPDiskIgnoredMap = THashMap<TPDiskID, TPDiskInfo::EIgnoreReason, TPDiskIDHash>;
     using TDistribution = THashMap<TString, TPDiskIDSet>;
     using TNodeIDSet = THashSet<ui32>;
 
-    TCmsStatePtr State;
+    TSentinelState::TPtr State;
     TDistribution ByDataCenter;
     TDistribution ByRoom;
     TDistribution ByRack;
     THashMap<TString, TNodeIDSet> NodeByRack;
 
-    TClusterMap(TCmsStatePtr state);
+    TClusterMap(TSentinelState::TPtr state);
 
     void AddPDisk(const TPDiskID& id);
 }; // TClusterMap
@@ -129,15 +170,17 @@ class TGuardian : public TClusterMap {
     }
 
 public:
-    explicit TGuardian(TCmsStatePtr state, ui32 dataCenterRatio = 100, ui32 roomRatio = 100, ui32 rackRatio = 100);
+    explicit TGuardian(TSentinelState::TPtr state, ui32 dataCenterRatio = 100, ui32 roomRatio = 100, ui32 rackRatio = 100);
 
-    TPDiskIDSet GetAllowedPDisks(const TClusterMap& all, TString& issues, TPDiskIDSet& disallowed) const;
+    TPDiskIDSet GetAllowedPDisks(const TClusterMap& all, TString& issues, TPDiskIgnoredMap& disallowed) const;
 
 private:
     const ui32 DataCenterRatio;
     const ui32 RoomRatio;
     const ui32 RackRatio;
 }; // TGuardian
+
+IActor* CreateBSCClientActor(const TCmsStatePtr& cmsState);
 
 } // NSentinel
 } // NCms

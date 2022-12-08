@@ -204,6 +204,7 @@ bool TTxInit::ReadEverything(TTransactionContext& txc, const TActorContext& ctx)
             const ui64 pathId = rowset.GetValue<Schema::TableInfo::PathId>();
             auto& table = Self->Tables[pathId];
             table.PathId = pathId;
+            table.TieringUsage = rowset.GetValue<Schema::TableInfo::TieringUsage>();
             if (rowset.HaveValue<Schema::TableInfo::DropStep>() &&
                 rowset.HaveValue<Schema::TableInfo::DropTxId>())
             {

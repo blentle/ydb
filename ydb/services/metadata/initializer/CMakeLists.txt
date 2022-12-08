@@ -6,6 +6,7 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(ut)
 
 add_library(services-metadata-initializer)
 target_link_libraries(services-metadata-initializer PUBLIC
@@ -23,4 +24,9 @@ target_sources(services-metadata-initializer PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/services/metadata/initializer/common.cpp
   ${CMAKE_SOURCE_DIR}/ydb/services/metadata/initializer/controller.cpp
   ${CMAKE_SOURCE_DIR}/ydb/services/metadata/initializer/events.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/initializer/manager.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/initializer/object.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/initializer/snapshot.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/initializer/initializer.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/initializer/fetcher.cpp
 )

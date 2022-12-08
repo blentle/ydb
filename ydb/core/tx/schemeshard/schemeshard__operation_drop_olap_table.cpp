@@ -5,12 +5,11 @@
 #include <ydb/core/base/subdomain.h>
 #include <ydb/core/tx/tiering/cleaner_task.h>
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 namespace {
 
-class TDropParts : public TSubOperationState {
+class TDropParts: public TSubOperationState {
 private:
     TOperationId OperationId;
 
@@ -88,7 +87,7 @@ public:
     }
 };
 
-class TPropose : public TSubOperationState {
+class TPropose: public TSubOperationState {
 private:
     TOperationId OperationId;
 
@@ -177,7 +176,7 @@ public:
     }
 };
 
-class TProposedWaitParts : public TSubOperationState {
+class TProposedWaitParts: public TSubOperationState {
 private:
     TOperationId OperationId;
 
@@ -252,7 +251,7 @@ public:
     }
 };
 
-class TProposedDeleteParts : public TSubOperationState {
+class TProposedDeleteParts: public TSubOperationState {
 private:
     TOperationId OperationId;
 
@@ -271,8 +270,7 @@ private:
         bool isStandalone = false;
         {
             Y_VERIFY(context.SS->ColumnTables.contains(txState->TargetPathId));
-            TColumnTableInfo::TPtr tableInfo = context.SS->ColumnTables.at(txState->TargetPathId);
-            Y_VERIFY(tableInfo);
+            auto tableInfo = context.SS->ColumnTables.GetVerified(txState->TargetPathId);
             isStandalone = tableInfo->IsStandalone();
         }
 
@@ -310,39 +308,33 @@ public:
         Y_VERIFY(txState->TxType == TTxState::TxDropColumnTable);
 
         LOG_INFO_S(context.Ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
-                   DebugHint() << " ProgressState"
-                               << ", at schemeshard: " << ssId);
+            DebugHint() << " ProgressState"
+            << ", at schemeshard: " << ssId);
 
-        if (NBackgroundTasks::TServiceOperator::IsEnabled()) {
-            NSchemeShard::TPath path = NSchemeShard::TPath::Init(txState->TargetPathId, context.SS);
-            TColumnTableInfo::TPtr tableInfo = context.SS->ColumnTables.at(path.Base()->PathId);
-            NSchemeShard::TPath ownerPath = tableInfo->IsStandalone() ? path : path.FindOlapStore();
-            Y_VERIFY(path.IsResolved());
-            NBackgroundTasks::TTask task(std::make_shared<NColumnShard::NTiers::TTaskCleanerActivity>(txState->TargetPathId.LocalPathId, ownerPath.PathString()), nullptr);
+        if (!NBackgroundTasks::TServiceOperator::IsEnabled()) {
+            return Finish(context);
+        }
+        NSchemeShard::TPath path = NSchemeShard::TPath::Init(txState->TargetPathId, context.SS);
+        auto tableInfo = context.SS->ColumnTables.GetVerified(path.Base()->PathId);
+        const TString& tieringId = tableInfo->Description.GetTtlSettings().GetTiering().GetUseTiering();
+        if (!tieringId) {
+            return Finish(context);
+        }
+
+        {
+            NBackgroundTasks::TTask task(std::make_shared<NColumnShard::NTiers::TTaskCleanerActivity>(
+                tieringId, txState->TargetPathId.LocalPathId), nullptr);
             task.SetId(OperationId.SerializeToString());
             context.SS->SelfId().Send(NBackgroundTasks::MakeServiceId(context.SS->SelfId().NodeId()), new NBackgroundTasks::TEvAddTask(std::move(task)));
             return false;
-        } else {
-            return Finish(context);
         }
     }
 };
 
-class TDropColumnTable : public TSubOperation {
+class TDropColumnTable: public TSubOperation {
 public:
-    TDropColumnTable(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {}
+    using TSubOperation::TSubOperation;
 
-    TDropColumnTable(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
-
-public:
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
 
@@ -409,10 +401,6 @@ public:
             result->SetError(NKikimrScheme::StatusPreconditionFailed, errStr);
             return result;
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxDropColumnTable, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         TTxState& txState = context.SS->CreateTx(OperationId, TTxState::TxDropColumnTable, path.Base()->PathId);
         txState.State = TTxState::DropParts;
@@ -422,7 +410,7 @@ public:
         NIceDb::TNiceDb db(context.GetDB());
 
         Y_VERIFY(context.SS->ColumnTables.contains(path.Base()->PathId));
-        TColumnTableInfo::TPtr tableInfo = context.SS->ColumnTables.at(path.Base()->PathId);
+        auto tableInfo = context.SS->ColumnTables.GetVerified(path.Base()->PathId);
 
         if (tableInfo->IsStandalone()) {
             for (auto shardIdx : tableInfo->OwnedColumnShards) {
@@ -498,8 +486,7 @@ public:
             context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
         }
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -530,12 +517,12 @@ public:
     }
 
 private:
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::DropParts;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::DropParts:
             return TTxState::Propose;
         case TTxState::Propose:
@@ -547,8 +534,8 @@ private:
         }
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::DropParts:
             return MakeHolder<TDropParts>(OperationId);
         case TTxState::Propose:
@@ -561,32 +548,17 @@ private:
             return nullptr;
         }
     }
-
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
-private:
-    const TOperationId OperationId;
-    TTxState::ETxState State = TTxState::Invalid;
-    const NKikimrSchemeOp::TModifyScheme Transaction;
 };
 
-} // namespace
+}
 
 ISubOperationBase::TPtr CreateDropColumnTable(TOperationId id, const TTxTransaction& tx) {
-    return new TDropColumnTable(id, tx);
+    return MakeSubOperation<TDropColumnTable>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateDropColumnTable(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TDropColumnTable(id, state);
+    return MakeSubOperation<TDropColumnTable>(id, state);
 }
 
-} // namespace NSchemeShard
-} // namespace NKikimr
+}

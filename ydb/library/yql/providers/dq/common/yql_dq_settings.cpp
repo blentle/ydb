@@ -47,7 +47,6 @@ TDqConfiguration::TDqConfiguration() {
     REGISTER_SETTING(*this, _FallbackOnRuntimeErrors);
     REGISTER_SETTING(*this, WorkerFilter);
     REGISTER_SETTING(*this, _EnablePrecompute);
-    REGISTER_SETTING(*this, EnableGraceJoin);
     REGISTER_SETTING(*this, EnableDqReplicate);
     REGISTER_SETTING(*this, WatermarksMode);
     REGISTER_SETTING(*this, WatermarksGranularityMs);
@@ -55,6 +54,7 @@ TDqConfiguration::TDqConfiguration() {
     REGISTER_SETTING(*this, WatermarksEnableIdlePartitions);
     REGISTER_SETTING(*this, UseAggPhases);
     REGISTER_SETTING(*this, ParallelOperationsLimit).Lower(1).Upper(128);
+    REGISTER_SETTING(*this, HashJoinMode).Parser([](const TString& v) { return FromString<NDq::EHashJoinMode>(v); });
 }
 
 } // namespace NYql

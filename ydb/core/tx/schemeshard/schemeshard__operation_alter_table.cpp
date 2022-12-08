@@ -404,19 +404,14 @@ public:
 };
 
 class TAlterTable: public TSubOperation {
-private:
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
     bool AllowShadowData = false;
 
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::CreateParts;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
             return TTxState::ConfigureParts;
@@ -429,11 +424,10 @@ private:
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
             return THolder(new TCreateParts(OperationId));
@@ -450,29 +444,8 @@ private:
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TAlterTable(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TAlterTable(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
-
+    using TSubOperation::TSubOperation;
 
     void SetAllowShadowDataForBuildIndex() {
         AllowShadowData = true;
@@ -597,16 +570,11 @@ public:
                 return result;
             }
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxAlterTable, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         table->PrepareAlter(alterData);
         PrepareChanges(OperationId, path.Base(), table, bindingChanges, context);
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -627,16 +595,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateAlterTable(TOperationId id, const TTxTransaction& tx) {
-    return new TAlterTable(id, tx);
+    return MakeSubOperation<TAlterTable>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateAlterTable(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TAlterTable(id, state);
+    return MakeSubOperation<TAlterTable>(id, state);
 }
 
 ISubOperationBase::TPtr CreateFinalizeBuildIndexImplTable(TOperationId id, const TTxTransaction& tx) {
@@ -644,6 +611,7 @@ ISubOperationBase::TPtr CreateFinalizeBuildIndexImplTable(TOperationId id, const
     obj->SetAllowShadowDataForBuildIndex();
     return obj.Release();
 }
+
 ISubOperationBase::TPtr CreateFinalizeBuildIndexImplTable(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
     auto obj = MakeHolder<TAlterTable>(id, state);
@@ -710,5 +678,4 @@ TVector<ISubOperationBase::TPtr> CreateConsistentAlterTable(TOperationId id, con
     return result;
 }
 
-}
 }

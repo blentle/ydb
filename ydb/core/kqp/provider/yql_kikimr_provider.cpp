@@ -20,7 +20,6 @@ const TStringBuf CommitModeScheme = "scheme";
 struct TKikimrData {
     THashSet<TStringBuf> DataSourceNames;
     THashSet<TStringBuf> DataSinkNames;
-    THashSet<TStringBuf> KqlNames;
 
     THashSet<TStringBuf> CommitModes;
     THashSet<TStringBuf> SupportedEffects;
@@ -47,9 +46,13 @@ struct TKikimrData {
         DataSinkNames.insert(TKiCreateUser::CallableName());
         DataSinkNames.insert(TKiAlterUser::CallableName());
         DataSinkNames.insert(TKiDropUser::CallableName());
+        DataSinkNames.insert(TKiCreateObject::CallableName());
+        DataSinkNames.insert(TKiAlterObject::CallableName());
+        DataSinkNames.insert(TKiDropObject::CallableName());
         DataSinkNames.insert(TKiCreateGroup::CallableName());
         DataSinkNames.insert(TKiAlterGroup::CallableName());
         DataSinkNames.insert(TKiDropGroup::CallableName());
+        DataSinkNames.insert(TKiDataQueryBlock::CallableName());
         DataSinkNames.insert(TKiDataQuery::CallableName());
         DataSinkNames.insert(TKiExecDataQuery::CallableName());
         DataSinkNames.insert(TKiEffects::CallableName());
@@ -337,12 +340,16 @@ bool TKikimrKey::Extract(const TExprNode& key) {
     } else if (tagName == "role") {
         KeyType = Type::Role;
         Target = key.Child(0)->Child(1)->Child(0)->Content();
+    } else if (tagName == "objectId") {
+        KeyType = Type::Object;
+        Target = key.Child(0)->Child(1)->Child(0)->Content();
+        ObjectType = key.Child(1)->Child(1)->Child(0)->Content();
     } else {
         Ctx.AddError(TIssue(Ctx.GetPosition(key.Child(0)->Pos()), TString("Unexpected tag for kikimr key: ") + tagName));
         return false;
     }
 
-    if (key.ChildrenSize() > 1) {
+    if (key.ChildrenSize() > 1 && KeyType != Type::Object) {
         for (ui32 i = 1; i < key.ChildrenSize(); ++i) {
             auto tag = key.Child(i)->Child(0);
             if (tag->Content() == TStringBuf("view")) {
@@ -491,10 +498,6 @@ const THashSet<TStringBuf>& KikimrDataSinkFunctions() {
     return Singleton<TKikimrData>()->DataSinkNames;
 }
 
-const THashSet<TStringBuf>& KikimrKqlFunctions() {
-    return Singleton<TKikimrData>()->KqlNames;
-}
-
 const THashSet<TStringBuf>& KikimrSupportedEffects() {
     return Singleton<TKikimrData>()->SupportedEffects;
 }
@@ -552,23 +555,43 @@ bool ValidateTableHasIndex(TKikimrTableMetadataPtr metadata, TExprContext& ctx, 
     return true;
 }
 
-bool AddDmlIssue(const TIssue& issue, bool strictDml, TExprContext& ctx) {
-    if (strictDml) {
-        TIssue newIssue;
-        newIssue.SetCode(issue.GetCode(), ESeverity::TSeverityIds_ESeverityId_S_ERROR);
-        newIssue.SetMessage("Detected violation of logical DML constraints. YDB transactions don't see their own"
-            " changes, make sure you perform all table reads before any modifications.");
+bool AddDmlIssue(const TIssue& issue, TExprContext& ctx) {
+    TIssue newIssue;
+    newIssue.SetCode(issue.GetCode(), ESeverity::TSeverityIds_ESeverityId_S_ERROR);
+    newIssue.SetMessage("Detected violation of logical DML constraints. YDB transactions don't see their own"
+        " changes, make sure you perform all table reads before any modifications.");
 
-        newIssue.AddSubIssue(new TIssue(issue));
+    newIssue.AddSubIssue(new TIssue(issue));
 
-        ctx.AddError(newIssue);
-        return false;
-    } else {
-        if (!ctx.AddWarning(issue)) {
-            return false;
+    ctx.AddError(newIssue);
+    return false;
+}
+
+TKiDataQueryBlockSettings TKiDataQueryBlockSettings::Parse(const NNodes::TKiDataQueryBlock& node) {
+    TKiDataQueryBlockSettings settings;
+
+    for (const auto& tuple : node.Settings()) {
+        auto name = tuple.Name().Value();
+        if (name == HasUncommittedChangesReadSettingName) {
+            settings.HasUncommittedChangesRead = true;
         }
-        return true;
     }
+
+    return settings;
+}
+
+NNodes::TCoNameValueTupleList TKiDataQueryBlockSettings::BuildNode(TExprContext& ctx, TPositionHandle pos) const {
+    TVector<TCoNameValueTuple> settings;
+
+    if (HasUncommittedChangesRead) {
+        settings.push_back(Build<TCoNameValueTuple>(ctx, pos)
+            .Name().Build(HasUncommittedChangesReadSettingName)
+            .Done());
+    }
+
+    return Build<TCoNameValueTupleList>(ctx, pos)
+        .Add(settings)
+        .Done();
 }
 
 TKiExecDataQuerySettings TKiExecDataQuerySettings::Parse(TKiExecDataQuery exec) {

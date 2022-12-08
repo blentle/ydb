@@ -2,7 +2,7 @@
 
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/kqp/common/kqp_yql.h>
-#include <ydb/core/kqp/prepare/kqp_query_plan.h>
+#include <ydb/core/kqp/opt/kqp_query_plan.h>
 #include <ydb/core/kqp/provider/yql_kikimr_provider_impl.h>
 
 #include <ydb/library/yql/core/yql_opt_proposed_by_data.h>
@@ -104,6 +104,55 @@ void FillAstAndPlan(IKqpHost::TQueryResult& queryResult, TExprNode* queryRoot, T
     queryResult.QueryPlan = planStream.Str();
 }
 
+template<typename TResult>
+class TKqpFutureResult : public IKikimrAsyncResult<TResult> {
+public:
+    TKqpFutureResult(const NThreading::TFuture<TResult>& future, TExprContext& ctx)
+        : Future(future)
+        , ExprCtx(ctx)
+        , Completed(false) {}
+
+    bool HasResult() const override {
+        if (Completed) {
+            YQL_ENSURE(ExtractedResult.has_value());
+        }
+        return Completed;
+    }
+
+    TResult GetResult() override {
+        YQL_ENSURE(Completed);
+        if (ExtractedResult) {
+            return std::move(*ExtractedResult);
+        }
+        return std::move(Future.ExtractValue());
+    }
+
+    NThreading::TFuture<bool> Continue() override {
+        if (Completed) {
+            return NThreading::MakeFuture(true);
+        }
+
+        if (Future.HasValue()) {
+            ExtractedResult.emplace(std::move(Future.ExtractValue()));
+            ExtractedResult->ReportIssues(ExprCtx.IssueManager);
+
+            Completed = true;
+            return NThreading::MakeFuture(true);
+        }
+
+        return Future.Apply([](const NThreading::TFuture<TResult>& future) {
+            YQL_ENSURE(future.HasValue());
+            return false;
+        });
+    }
+
+private:
+    NThreading::TFuture<TResult> Future;
+    std::optional<TResult> ExtractedResult;
+    TExprContext& ExprCtx;
+    bool Completed;
+};
+
 /*
  * Validate YqlScript.
  */
@@ -174,7 +223,7 @@ private:
 /*
  * Execute Yql/SchemeQuery/YqlScript.
  */
-class TAsyncExecuteYqlResult : public TKqpAsyncExecuteResultBase<IKqpHost::TQueryResult> {
+class TAsyncExecuteYqlResult : public TKqpAsyncResultBase<IKqpHost::TQueryResult> {
 public:
     using TResult = IKqpHost::TQueryResult;
 
@@ -182,7 +231,7 @@ public:
         const TString& cluster, TIntrusivePtr<TKikimrSessionContext> sessionCtx,
         const TResultProviderConfig& resultProviderConfig, IPlanBuilder& planBuilder,
         TMaybe<TSqlVersion> sqlVersion)
-        : TKqpAsyncExecuteResultBase(queryRoot, exprCtx, transformer, sessionCtx->TxPtr())
+        : TKqpAsyncResultBase(queryRoot, exprCtx, transformer)
         , Cluster(cluster)
         , SessionCtx(sessionCtx)
         , ResultProviderConfig(resultProviderConfig)
@@ -226,7 +275,7 @@ private:
 /*
  * Execute prepared Yql/ScanQuery/DataQuery.
  */
-class TAsyncExecutePreparedResult : public TKqpAsyncExecuteResultBase<IKqpHost::TQueryResult> {
+class TAsyncExecutePreparedResult : public TKqpAsyncResultBase<IKqpHost::TQueryResult> {
 public:
     using TResult = IKqpHost::TQueryResult;
 
@@ -234,7 +283,7 @@ public:
         TIntrusivePtr<TKikimrSessionContext> sessionCtx, const IDataProvider::TFillSettings& fillSettings,
         TIntrusivePtr<TExecuteContext> executeCtx, std::shared_ptr<const NKikimrKqp::TPreparedQuery> query,
         TMaybe<TSqlVersion> sqlVersion)
-        : TKqpAsyncExecuteResultBase(queryRoot, exprCtx, transformer, sessionCtx->TxPtr())
+        : TKqpAsyncResultBase(queryRoot, exprCtx, transformer)
         , SessionCtx(sessionCtx)
         , FillSettings(fillSettings)
         , ExecuteCtx(executeCtx)
@@ -286,13 +335,13 @@ private:
 /*
  * Prepare ScanQuery/DataQuery by AST (when called through scripting).
  */
-class TAsyncExecuteKqlResult : public TKqpAsyncExecuteResultBase<IKqpHost::TQueryResult> {
+class TAsyncExecuteKqlResult : public TKqpAsyncResultBase<IKqpHost::TQueryResult> {
 public:
     using TResult = IKqpHost::TQueryResult;
 
     TAsyncExecuteKqlResult(TExprNode* queryRoot, TExprContext& exprCtx, IGraphTransformer& transformer,
         TIntrusivePtr<TKikimrSessionContext> sessionCtx, TExecuteContext& executeCtx)
-        : TKqpAsyncExecuteResultBase(queryRoot, exprCtx, transformer, sessionCtx->TxPtr())
+        : TKqpAsyncResultBase(queryRoot, exprCtx, transformer)
         , SessionCtx(sessionCtx)
         , ExecuteCtx(executeCtx) {}
 
@@ -391,7 +440,6 @@ public:
             YQL_ENSURE(QueryCtx->PrepareOnly);
             YQL_ENSURE(!ExecuteCtx->Settings.CommitTx);
             YQL_ENSURE(!ExecuteCtx->Settings.RollbackTx);
-            YQL_ENSURE(!ExecuteCtx->Settings.IsolationLevel);
 
             if (QueryCtx->Type == EKikimrQueryType::Scan) {
                 AsyncResult = KqpRunner->PrepareScanQuery(Cluster, input.Get(), ctx, ExecuteCtx->Settings);
@@ -672,13 +720,6 @@ public:
         , SessionCtx(sessionCtx)
         , KqpRunner(kqpRunner) {}
 
-    TIntrusivePtr<TAsyncQueryResult> ExecuteKql(const TString&, const TExprNode::TPtr&, TExprContext&,
-        const TExecuteSettings&) override
-    {
-        YQL_ENSURE(false, "Unexpected ExecuteKql call.");
-        return nullptr;
-    }
-
     TIntrusivePtr<TAsyncQueryResult> ExecuteDataQuery(const TString& cluster, const TExprNode::TPtr& query,
         TExprContext& ctx, const TExecuteSettings& settings) override
     {
@@ -722,8 +763,9 @@ public:
                 case EKikimrQueryType::YqlScript:
                     if (useScanQuery) {
                         ui64 rowsLimit = 0;
-                        if (!dataQuery.Results().Empty()) {
-                            rowsLimit = FromString<ui64>(dataQuery.Results().Item(0).RowsLimit());
+                        if (!dataQuery.Blocks().Empty() && !dataQuery.Blocks().Item(0).Results().Empty()) {
+                            const auto& queryBlock = dataQuery.Blocks().Item(0);
+                            rowsLimit = FromString<ui64>(queryBlock.Results().Item(0).RowsLimit());
                         }
 
                         if (SessionCtx->Query().PrepareOnly) {
@@ -761,7 +803,7 @@ public:
                     return nullptr;
                 }
 
-                return MakeIntrusive<TKikimrFutureResult<TQueryResult>>(future, ctx);
+                return MakeIntrusive<TKqpFutureResult<TQueryResult>>(future, ctx);
             }
 
             default:
@@ -800,12 +842,19 @@ private:
             return *settings.UseScanQuery;
         }
 
-        if (query.Effects().ArgCount() > 0) {
+        if (query.Blocks().Size() != 1) {
+            // Don't use ScanQuery for muiltiple blocks query
+            return false;
+        }
+
+        const auto& queryBlock = query.Blocks().Item(0);
+
+        if (queryBlock.Effects().ArgCount() > 0) {
             // Do not use ScanQuery for queries with effects.
             return false;
         }
 
-        if (query.Results().Size() != 1) {
+        if (queryBlock.Results().Size() != 1) {
             // Do not use ScanQuery for queries with multiple result sets.
             return false;
         }
@@ -829,7 +878,7 @@ private:
 
         bool hasIndexReads = false;
         bool hasJoins = false;
-        VisitExpr(query.Results().Ptr(), [&hasIndexReads, &hasJoins] (const TExprNode::TPtr& exprNode) {
+        VisitExpr(queryBlock.Results().Ptr(), [&hasIndexReads, &hasJoins] (const TExprNode::TPtr& exprNode) {
             auto node = TExprBase(exprNode);
 
             if (auto read = node.Maybe<TKiReadTable>()) {
@@ -1237,7 +1286,7 @@ private:
     }
 
     IAsyncQueryResultPtr ExecuteSchemeQueryInternal(const TString& query, bool isSql, TExprContext& ctx) {
-        SetupYqlTransformer(nullptr);
+        SetupYqlTransformer();
 
         SessionCtx->Query().Type = EKikimrQueryType::Ddl;
 
@@ -1284,9 +1333,7 @@ private:
     IAsyncQueryResultPtr PrepareDataQueryInternal(const TString& query, const TPrepareSettings& settings,
         TExprContext& ctx)
     {
-        // TODO: Use empty tx context
-        auto tempTxCtx = MakeIntrusive<TKqpTransactionContext>(/* implicit */ true);
-        SetupYqlTransformer(tempTxCtx);
+        SetupYqlTransformer();
 
         SessionCtx->Query().Type = EKikimrQueryType::Dml;
         SessionCtx->Query().PrepareOnly = true;
@@ -1308,10 +1355,8 @@ private:
     IAsyncQueryResultPtr PrepareDataQueryAstInternal(const TString& queryAst, const TPrepareSettings& settings,
         TExprContext& ctx)
     {
-        // TODO: Use empty tx context
-        TIntrusivePtr<TKikimrTransactionContextBase> tempTxCtx = MakeIntrusive<TKqpTransactionContext>(true);
         IKikimrQueryExecutor::TExecuteSettings execSettings;
-        SetupDataQueryAstTransformer(execSettings, tempTxCtx);
+        SetupDataQueryAstTransformer(execSettings);
 
         SessionCtx->Query().Type = EKikimrQueryType::Dml;
         SessionCtx->Query().PrepareOnly = true;
@@ -1341,7 +1386,7 @@ private:
     }
 
     IAsyncQueryResultPtr PrepareScanQueryInternal(const TString& query, TExprContext& ctx, EKikimrStatsMode statsMode = EKikimrStatsMode::None) {
-        SetupYqlTransformer(nullptr);
+        SetupYqlTransformer();
 
         SessionCtx->Query().Type = EKikimrQueryType::Scan;
         SessionCtx->Query().PrepareOnly = true;
@@ -1381,7 +1426,7 @@ private:
     IAsyncQueryResultPtr ExecuteYqlScriptInternal(const TString& script, NKikimrMiniKQL::TParams&& parameters,
         const TExecScriptSettings& settings, TExprContext& ctx)
     {
-        SetupYqlTransformer(nullptr);
+        SetupYqlTransformer();
 
         SessionCtx->Query().Type = EKikimrQueryType::YqlScript;
         SessionCtx->Query().Deadlines = settings.Deadlines;
@@ -1406,7 +1451,7 @@ private:
     IAsyncQueryResultPtr StreamExecuteYqlScriptInternal(const TString& script, NKikimrMiniKQL::TParams&& parameters,
         const NActors::TActorId& target,const TExecScriptSettings& settings, TExprContext& ctx)
     {
-        SetupYqlTransformer(nullptr);
+        SetupYqlTransformer();
 
         SessionCtx->Query().Type = EKikimrQueryType::YqlScriptStreaming;
         SessionCtx->Query().Deadlines = settings.Deadlines;
@@ -1430,7 +1475,7 @@ private:
     }
 
     IAsyncQueryResultPtr ValidateYqlScriptInternal(const TString& script, TExprContext& ctx) {
-        SetupSession(nullptr);
+        SetupSession();
 
         SessionCtx->Query().Type = EKikimrQueryType::YqlScript;
         SessionCtx->Query().PrepareOnly = true;
@@ -1456,7 +1501,7 @@ private:
     }
 
     IAsyncQueryResultPtr ExplainYqlScriptInternal(const TString& script, TExprContext& ctx) {
-        SetupYqlTransformer(nullptr);
+        SetupYqlTransformer();
 
         SessionCtx->Query().Type = EKikimrQueryType::YqlScript;
         SessionCtx->Query().PrepareOnly = true;
@@ -1473,7 +1518,7 @@ private:
             *PlanBuilder, sqlVersion, true /* UseDqExplain */);
     }
 
-    void SetupSession(TIntrusivePtr<TKikimrTransactionContextBase> txCtx) {
+    void SetupSession() {
         ExprCtx->Reset();
         ExprCtx->Step.Done(TExprStep::ExprEval); // KIKIMR-8067
 
@@ -1484,13 +1529,10 @@ private:
         std::get<2>(TypesCtx->CachedRandom).reset();
 
         SessionCtx->Reset(KeepConfigChanges);
-        if (txCtx) {
-            SessionCtx->SetTx(txCtx);
-        }
     }
 
-    void SetupYqlTransformer(TIntrusivePtr<TKikimrTransactionContextBase> txCtx) {
-        SetupSession(txCtx);
+    void SetupYqlTransformer() {
+        SetupSession();
 
         YqlTransformer->Rewind();
 
@@ -1498,10 +1540,8 @@ private:
         ResultProviderConfig->CommittedResults.clear();
     }
 
-    void SetupDataQueryAstTransformer(const IKikimrQueryExecutor::TExecuteSettings& settings,
-        TIntrusivePtr<TKikimrTransactionContextBase> txCtx = {})
-    {
-        SetupSession(txCtx);
+    void SetupDataQueryAstTransformer(const IKikimrQueryExecutor::TExecuteSettings& settings) {
+        SetupSession();
 
         DataQueryAstTransformer->Rewind();
 
@@ -1546,43 +1586,6 @@ Ydb::Table::QueryStatsCollection::Mode GetStatsMode(NYql::EKikimrStatsMode stats
         default:
             return Ydb::Table::QueryStatsCollection::STATS_COLLECTION_NONE;
     }
-}
-
-TKqpTransactionInfo TKqpTransactionContext::GetInfo() const {
-    TKqpTransactionInfo txInfo;
-
-    // Status
-    if (Invalidated) {
-        txInfo.Status = TKqpTransactionInfo::EStatus::Aborted;
-    } else if (Closed) {
-        txInfo.Status = TKqpTransactionInfo::EStatus::Committed;
-    } else {
-        txInfo.Status = TKqpTransactionInfo::EStatus::Active;
-    }
-
-    // Kind
-    bool hasReads = false;
-    bool hasWrites = false;
-    for (auto& pair : TableOperations) {
-        hasReads = hasReads || (pair.second & KikimrReadOps());
-        hasWrites = hasWrites || (pair.second & KikimrModifyOps());
-    }
-
-    if (hasReads) {
-        txInfo.Kind = hasWrites
-            ? TKqpTransactionInfo::EKind::ReadWrite
-            : TKqpTransactionInfo::EKind::ReadOnly;
-    } else {
-        txInfo.Kind = hasWrites
-            ? TKqpTransactionInfo::EKind::WriteOnly
-            : TKqpTransactionInfo::EKind::Pure;
-    }
-
-    txInfo.TotalDuration = FinishTime - CreationTime;
-    txInfo.ServerDuration = QueriesDuration;
-    txInfo.QueriesCount = QueriesCount;
-
-    return txInfo;
 }
 
 TIntrusivePtr<IKqpHost> CreateKqpHost(TIntrusivePtr<IKqpGateway> gateway,

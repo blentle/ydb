@@ -53,17 +53,19 @@ TPersQueueGroupInfo::TPtr CreatePersQueueGroup(TOperationContext& context,
 
     if ((ui32)op.GetPQTabletConfig().GetPartitionConfig().GetWriteSpeedInBytesPerSecond() > TSchemeShard::MaxPQWriteSpeedPerPartition) {
         status = NKikimrScheme::StatusInvalidParameter;
-        errStr = TStringBuilder()
-                << "Invalid write speed per second in partition specified: " << op.GetPQTabletConfig().GetPartitionConfig().GetWriteSpeedInBytesPerSecond()
-                << " vs " << TSchemeShard::MaxPQWriteSpeedPerPartition;
+        errStr = TStringBuilder() << "Invalid write speed"
+            << ": specified: " << op.GetPQTabletConfig().GetPartitionConfig().GetWriteSpeedInBytesPerSecond() << "bps"
+            << ", max: " << TSchemeShard::MaxPQWriteSpeedPerPartition << "bps";
         return nullptr;
     }
 
-    if ((ui32)op.GetPQTabletConfig().GetPartitionConfig().GetLifetimeSeconds() > TSchemeShard::MaxPQLifetimeSeconds) {
+    const auto lifetimeSeconds = op.GetPQTabletConfig().GetPartitionConfig().GetLifetimeSeconds();
+    if (lifetimeSeconds <= 0 || (ui32)lifetimeSeconds > TSchemeShard::MaxPQLifetimeSeconds) {
         status = NKikimrScheme::StatusInvalidParameter;
-        errStr = TStringBuilder()
-                << "Invalid retention period specified: " << op.GetPQTabletConfig().GetPartitionConfig().GetLifetimeSeconds()
-                << " vs " << TSchemeShard::MaxPQLifetimeSeconds;
+        errStr = TStringBuilder() << "Invalid retention period"
+            << ": specified: " << lifetimeSeconds << "s"
+            << ", min: " << 1 << "s"
+            << ", max: " << TSchemeShard::MaxPQLifetimeSeconds << "s";
         return nullptr;
     }
 
@@ -219,16 +221,12 @@ void ApplySharding(TTxId txId,
 
 
 class TCreatePQ: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::CreateParts;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
             return TTxState::ConfigureParts;
@@ -239,11 +237,10 @@ class TCreatePQ: public TSubOperation {
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
             return THolder(new TCreateParts(OperationId));
@@ -258,28 +255,8 @@ class TCreatePQ: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TCreatePQ(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TCreatePQ(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString& owner, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -462,10 +439,6 @@ public:
         } else {
             pqChannelsBinding = tabletChannelsBinding;
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxCreatePQGroup, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         dstPath.MaterializeLeaf(owner);
         result->SetPathId(dstPath.Base()->PathId.LocalPathId);
@@ -552,8 +525,7 @@ public:
         dstPath.Base()->IncShardsInside(shardsToCreate);
         parentPath.Base()->IncAliveChildren();
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -574,17 +546,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateNewPQ(TOperationId id, const TTxTransaction& tx) {
-    return new TCreatePQ(id, tx);
+    return MakeSubOperation<TCreatePQ>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateNewPQ(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TCreatePQ(id, state);
+    return MakeSubOperation<TCreatePQ>(id, state);
 }
 
-}
 }

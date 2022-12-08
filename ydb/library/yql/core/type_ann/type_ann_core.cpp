@@ -7380,7 +7380,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                 }
                 else {
                     ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Child(i)->Pos()), TStringBuilder() << "Mismatch type argument #" << i
-                        << ", source type: " << *srcType << ", target type: " << *arg.Type));
+                        << ", type diff: " << GetTypeDiff(*arg.Type, *srcType)));
                 }
                 return IGraphTransformer::TStatus::Error;
             }
@@ -11775,6 +11775,12 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["WideSkipBlocks"] = &WideSkipTakeBlocksWrapper;
         Functions["WideTakeBlocks"] = &WideSkipTakeBlocksWrapper;
         Functions["AsScalar"] = &AsScalarWrapper;
+        Functions["BlockCompress"] = &BlockCompressWrapper;
+        Functions["BlockCoalesce"] = &BlockCoalesceWrapper;
+        Functions["BlockAnd"] = &BlockLogicalWrapper;
+        Functions["BlockOr"] = &BlockLogicalWrapper;
+        Functions["BlockXor"] = &BlockLogicalWrapper;
+        Functions["BlockNot"] = &BlockLogicalWrapper;
         ExtFunctions["BlockFunc"] = &BlockFuncWrapper;
         ExtFunctions["BlockBitCast"] = &BlockBitCastWrapper;
         ExtFunctions["BlockCombineAll"] = &BlockCombineAllWrapper;

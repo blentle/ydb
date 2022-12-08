@@ -14,6 +14,17 @@ public:
 
 private:
     TString Table;
+    TString StoreType;
+};
+
+class TClickBenchCommandClean : public NYdb::NConsoleClient::TYdbCommand {
+public:
+    TClickBenchCommandClean();
+    void Config(TConfig& config);
+    int Run(TConfig& config);
+
+private:
+    TString Table;
 };
 
 class TClickBenchCommandRun : public NYdb::NConsoleClient::TYdbCommand {

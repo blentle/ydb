@@ -49,13 +49,14 @@ namespace NKikimr::NBlobDepot {
         struct TToken {};
         std::shared_ptr<TToken> Token = std::make_shared<TToken>();
 
-        // when in decommission mode and not all blocks are yet recovered, then we postpone agent registration
-        THashMap<TActorId, std::deque<std::unique_ptr<IEventHandle>>> RegisterAgentQ;
-
         struct TAgent {
-            std::optional<TActorId> PipeServerId;
-            std::optional<TActorId> AgentId;
-            ui32 ConnectedNodeId;
+            struct TConnection {
+                TActorId PipeServerId;
+                TActorId AgentId;
+                ui32 NodeId;
+            };
+
+            std::optional<TConnection> Connection;
             TInstant ExpirationTimestamp;
             std::optional<ui64> AgentInstanceId;
 
@@ -63,6 +64,9 @@ namespace NKikimr::NBlobDepot {
 
             THashMap<ui8, ui32> InvalidatedStepInFlight;
             THashMap<ui64, THashMap<ui8, ui32>> InvalidateStepRequests;
+
+            THashMap<ui64, std::tuple<ui32, ui64, TActorId>> BlockToDeliver; // TabletId -> (BlockedGeneration, IssuerGuid, ActorId)
+
             THashMap<ui64, std::function<void(TEvBlobDepot::TEvPushNotifyResult::TPtr)>> PushCallbacks;
             ui64 LastRequestId = 0;
 
@@ -70,7 +74,14 @@ namespace NKikimr::NBlobDepot {
             float LastPushedApproximateFreeSpaceShare = 0.0f;
         };
 
-        THashMap<TActorId, std::optional<ui32>> PipeServerToNode;
+        struct TPipeServerContext {
+            std::optional<ui32> NodeId; // as reported by RegisterAgent
+            ui64 NextExpectedMsgId = 1;
+            std::deque<std::unique_ptr<IEventHandle>> PostponeQ;
+            bool PostponeFromAgent = false;
+        };
+
+        THashMap<TActorId, TPipeServerContext> PipeServers;
         THashMap<ui32, TAgent> Agents; // NodeId -> Agent
 
         THashMap<NKikimrBlobDepot::TChannelKind::E, TChannelKind> ChannelKinds;
@@ -81,6 +92,25 @@ namespace NKikimr::NBlobDepot {
             TChannelKind *KindPtr;
             TGivenIdRange GivenIdRanges; // accumulated through all agents
             ui64 NextBlobSeqId = 0;
+            std::set<ui64> SequenceNumbersInFlight; // of blobs being committed
+            std::optional<TBlobSeqId> LastReportedLeastId;
+
+            // Obtain the least BlobSeqId that is not yet committed, but may be written by any agent
+            TBlobSeqId GetLeastExpectedBlobId(ui32 generation) {
+                const auto result = TBlobSeqId::FromSequentalNumber(Index, generation, Min(NextBlobSeqId,
+                    GivenIdRanges.IsEmpty() ? Max<ui64>() : GivenIdRanges.GetMinimumValue(),
+                    SequenceNumbersInFlight.empty() ? Max<ui64>() : *SequenceNumbersInFlight.begin()));
+                // this value can't decrease, because it may lead to data loss
+                Y_VERIFY_S(!LastReportedLeastId || *LastReportedLeastId <= result,
+                    "decreasing LeastExpectedBlobId"
+                    << " LastReportedLeastId# " << LastReportedLeastId->ToString()
+                    << " result# " << result.ToString()
+                    << " NextBlobSeqId# " << NextBlobSeqId
+                    << " GivenIdRanges# " << GivenIdRanges.ToString()
+                    << " SequenceNumbersInFlight# " << FormatList(SequenceNumbersInFlight));
+                LastReportedLeastId.emplace(result);
+                return result;
+            }
         };
         std::vector<TChannelInfo> Channels;
 
@@ -125,10 +155,13 @@ namespace NKikimr::NBlobDepot {
         void StartOperation() {
             InitChannelKinds();
             DoGroupMetricsExchange();
-            StartGroupAssimilator();
             ProcessRegisterAgentQ();
             KickSpaceMonitor();
+            StartDataLoad();
         }
+
+        void StartDataLoad();
+        void OnDataLoadComplete();
 
         void OnDetach(const TActorContext&) override {
             STLOG(PRI_DEBUG, BLOB_DEPOT, BDT26, "OnDetach", (Id, GetLogId()));
@@ -147,10 +180,12 @@ namespace NKikimr::NBlobDepot {
         void InitChannelKinds();
 
         TString GetLogId() const {
+            const auto *executor = Executor();
+            const ui32 generation = executor ? executor->Generation() : 0;
             if (Config.HasVirtualGroupId()) {
-                return TStringBuilder() << "{" << TabletID() << "@" << Config.GetVirtualGroupId() << "}";
+                return TStringBuilder() << "{" << TabletID() << ":" << generation << "@" << Config.GetVirtualGroupId() << "}";
             } else {
-                return TStringBuilder() << "{" << TabletID() << "}";
+                return TStringBuilder() << "{" << TabletID() << ":" << generation << "}";
             }
         }
 
@@ -168,6 +203,7 @@ namespace NKikimr::NBlobDepot {
             StateInitImpl(ev, ctx);
         }
 
+        void HandleFromAgent(STATEFN_SIG);
         void StateWork(STFUNC_SIG);
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////

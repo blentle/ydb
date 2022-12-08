@@ -6,7 +6,7 @@ namespace NYql {
 namespace NDq {
 
 void FillTaskRunnerStats(ui64 taskId, ui32 stageId, const TTaskRunnerStatsBase& taskStats,
-    NDqProto::TDqTaskStats* protoTask, bool withProfileStats)
+    NDqProto::TDqTaskStats* protoTask, bool withProfileStats, const THashMap<ui64, ui64>& ingressBytesMap)
 {
     protoTask->SetTaskId(taskId);
     protoTask->SetStageId(stageId);
@@ -88,6 +88,8 @@ void FillTaskRunnerStats(ui64 taskId, ui32 stageId, const TTaskRunnerStatsBase& 
             protoSource->SetBytes(sourceStats->Bytes);
             protoSource->SetRowsIn(sourceStats->RowsIn);
             protoSource->SetRowsOut(sourceStats->RowsOut);
+            protoSource->SetIngressBytes(ingressBytesMap.Value(inputIndex, 0));
+
             protoSource->SetMaxMemoryUsage(sourceStats->MaxMemoryUsage);
         }
     }

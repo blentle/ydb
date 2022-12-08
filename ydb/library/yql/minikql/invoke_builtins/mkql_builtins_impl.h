@@ -768,16 +768,16 @@ void RegisterBinaryRealFunction(IBuiltinFunctionRegistry& registry, const std::s
 }
 
 void RegisterAdd(IBuiltinFunctionRegistry& registry);
-void RegisterAdd(arrow::compute::FunctionRegistry& registry);
+void RegisterAdd(TKernelFamilyMap& kernelFamilyMap);
 void RegisterAggrAdd(IBuiltinFunctionRegistry& registry);
 void RegisterSub(IBuiltinFunctionRegistry& registry);
-void RegisterSub(arrow::compute::FunctionRegistry& registry);
+void RegisterSub(TKernelFamilyMap& kernelFamilyMap);
 void RegisterMul(IBuiltinFunctionRegistry& registry);
-void RegisterMul(arrow::compute::FunctionRegistry& registry);
+void RegisterMul(TKernelFamilyMap& kernelFamilyMap);
 void RegisterDiv(IBuiltinFunctionRegistry& registry);
-void RegisterDiv(arrow::compute::FunctionRegistry& registry);
+void RegisterDiv(TKernelFamilyMap& kernelFamilyMap);
 void RegisterMod(IBuiltinFunctionRegistry& registry);
-void RegisterMod(arrow::compute::FunctionRegistry& registry);
+void RegisterMod(TKernelFamilyMap& kernelFamilyMap);
 void RegisterIncrement(IBuiltinFunctionRegistry& registry);
 void RegisterDecrement(IBuiltinFunctionRegistry& registry);
 void RegisterBitAnd(IBuiltinFunctionRegistry& registry);
@@ -805,8 +805,6 @@ void RegisterMin(IBuiltinFunctionRegistry& registry);
 void RegisterAggrMax(IBuiltinFunctionRegistry& registry);
 void RegisterAggrMin(IBuiltinFunctionRegistry& registry);
 void RegisterWith(IBuiltinFunctionRegistry& registry);
-
-void AddFunction(arrow::compute::FunctionRegistry& registry, const std::shared_ptr<arrow::compute::ScalarFunction>& f);
 
 inline arrow::internal::Bitmap GetBitmap(const arrow::ArrayData& arr, int index) {
     return arrow::internal::Bitmap{ arr.buffers[index], arr.offset, arr.length };
@@ -861,8 +859,8 @@ inline std::shared_ptr<arrow::DataType> GetPrimitiveDataType<ui64>() {
 }
 
 template <typename T>
-arrow::compute::InputType GetPrimitiveInputArrowType(bool isScalar) {
-    return arrow::compute::InputType(GetPrimitiveDataType<T>(), isScalar ? arrow::ValueDescr::SCALAR : arrow::ValueDescr::ARRAY);
+arrow::compute::InputType GetPrimitiveInputArrowType() {
+    return arrow::compute::InputType(GetPrimitiveDataType<T>(), arrow::ValueDescr::ANY);
 }
 
 template <typename T>
@@ -927,9 +925,31 @@ template<typename TInput1, typename TInput2, typename TOutput,
     template<typename, typename, typename> class TFunc, bool DefaultNulls>
 struct TBinaryKernelExecs;
 
+template<typename TDerived>
+struct TBinaryKernelExecsBase {
+    static arrow::Status Exec(arrow::compute::KernelContext* ctx, const arrow::compute::ExecBatch& batch, arrow::Datum* res) {
+        MKQL_ENSURE(batch.values.size() == 2, "Expected 2 args");
+        const auto& arg1 = batch.values[0];
+        const auto& arg2 = batch.values[1];
+        if (arg1.is_scalar()) {
+            if (arg2.is_scalar()) {
+                return TDerived::ExecScalarScalar(ctx, batch, res);
+            } else {
+                return TDerived::ExecScalarArray(ctx, batch, res);
+            }
+        } else {
+            if (arg2.is_scalar()) {
+                return TDerived::ExecArrayScalar(ctx, batch, res);
+            } else {
+                return TDerived::ExecArrayArray(ctx, batch, res);
+            }
+        }
+    }
+};
+
 template<typename TInput1, typename TInput2, typename TOutput,
         template<typename, typename, typename> class TFunc>
-struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, true>
+struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, true> : TBinaryKernelExecsBase<TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, true>>
 {
     using TFuncInstance = TFunc<TInput1, TInput2, TOutput>;
 
@@ -950,6 +970,7 @@ struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, true>
 
     static arrow::Status ExecScalarArray(arrow::compute::KernelContext*, const arrow::compute::ExecBatch& batch, arrow::Datum* res) {
         MKQL_ENSURE(batch.values.size() == 2, "Expected 2 args");
+        static_assert(!std::is_same<TOutput, bool>::value);
         const auto& arg1 = batch.values[0];
         const auto& arg2 = batch.values[1];
         auto& resArr = *res->array();
@@ -969,6 +990,7 @@ struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, true>
 
     static arrow::Status ExecArrayScalar(arrow::compute::KernelContext*, const arrow::compute::ExecBatch& batch, arrow::Datum* res) {
         MKQL_ENSURE(batch.values.size() == 2, "Expected 2 args");
+        static_assert(!std::is_same<TOutput, bool>::value);
         const auto& arg1 = batch.values[0];
         const auto& arg2 = batch.values[1];
         auto& resArr = *res->array();
@@ -976,8 +998,8 @@ struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, true>
             const auto& arr1 = *arg1.array();
             auto length = arr1.length;
             const auto values1 = arr1.GetValues<TInput1>(1);
-            auto resValues = resArr.GetMutableValues<TOutput>(1);
             const auto val2 = GetPrimitiveScalarValue<TInput2>(*arg2.scalar());
+            auto resValues = resArr.GetMutableValues<TOutput>(1);
             for (int64_t i = 0; i < length; ++i) {
                 resValues[i] = TFuncInstance::Do(values1[i], val2);
             }
@@ -988,6 +1010,7 @@ struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, true>
 
     static arrow::Status ExecArrayArray(arrow::compute::KernelContext*, const arrow::compute::ExecBatch& batch, arrow::Datum* res) {
         MKQL_ENSURE(batch.values.size() == 2, "Expected 2 args");
+        static_assert(!std::is_same<TOutput, bool>::value);
         const auto& arg1 = batch.values[0];
         const auto& arg2 = batch.values[1];
         const auto& arr1 = *arg1.array();
@@ -1008,7 +1031,7 @@ struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, true>
 
 template<typename TInput1, typename TInput2, typename TOutput,
         template<typename, typename, typename> class TFunc>
-struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, false>
+struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, false> : TBinaryKernelExecsBase<TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, false>>
 {
     using TFuncInstance = TFunc<TInput1, TInput2, TOutput>;
 
@@ -1034,6 +1057,7 @@ struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, false>
 
     static arrow::Status ExecScalarArray(arrow::compute::KernelContext*, const arrow::compute::ExecBatch& batch, arrow::Datum* res) {
         MKQL_ENSURE(batch.values.size() == 2, "Expected 2 args");
+        static_assert(!std::is_same<TOutput, bool>::value);
         const auto& arg1 = batch.values[0];
         const auto& arg2 = batch.values[1];
         const auto& arr2 = *arg2.array();
@@ -1068,14 +1092,15 @@ struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, false>
 
     static arrow::Status ExecArrayScalar(arrow::compute::KernelContext*, const arrow::compute::ExecBatch& batch, arrow::Datum* res) {
         MKQL_ENSURE(batch.values.size() == 2, "Expected 2 args");
+        static_assert(!std::is_same<TOutput, bool>::value);
         const auto& arg1 = batch.values[0];
         const auto& arg2 = batch.values[1];
         const auto& arr1 = *arg1.array();
         auto& resArr = *res->array();
         if (arg2.scalar()->is_valid) {
-            const auto val2 = GetPrimitiveScalarValue<TInput1>(*arg2.scalar());
+            const auto val2 = GetPrimitiveScalarValue<TInput2>(*arg2.scalar());
             auto length = arr1.length;
-            const auto values1 = arr1.GetValues<TInput2>(1);
+            const auto values1 = arr1.GetValues<TInput1>(1);
             const auto valid1 = arr1.GetValues<uint8_t>(0);
             const auto nullCount1 = arr1.GetNullCount();
             auto resValues = resArr.GetMutableValues<TOutput>(1);
@@ -1102,6 +1127,7 @@ struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, false>
 
     static arrow::Status ExecArrayArray(arrow::compute::KernelContext*, const arrow::compute::ExecBatch& batch, arrow::Datum* res) {
         MKQL_ENSURE(batch.values.size() == 2, "Expected 2 args");
+        static_assert(!std::is_same<TOutput, bool>::value);
         const auto& arg1 = batch.values[0];
         const auto& arg2 = batch.values[1];
         const auto& arr1 = *arg1.array();
@@ -1135,112 +1161,203 @@ struct TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, false>
     }
 };
 
+class TPlainKernel : public TKernel {
+public:
+    TPlainKernel(const TKernelFamily& family, const std::vector<NUdf::TDataTypeId>& argTypes, NUdf::TDataTypeId returnType, const arrow::compute::ScalarKernel& arrowKernel)
+        : TKernel(family, argTypes, returnType)
+        , ArrowKernel(arrowKernel)
+    {
+    }
+
+    const arrow::compute::ScalarKernel& GetArrowKernel() const final {
+        return ArrowKernel;
+    }
+
+private:
+    const arrow::compute::ScalarKernel ArrowKernel;
+};
+
 template<typename TInput1, typename TInput2, typename TOutput,
     template<typename, typename, typename> class TFunc>
-void AddBinaryKernel(arrow::compute::ScalarFunction& function) {
+void AddBinaryKernel(TKernelFamilyBase& owner) {
     using TFuncInstance = TFunc<TInput1, TInput2, TOutput>;
     using TExecs = TBinaryKernelExecs<TInput1, TInput2, TOutput, TFunc, TFuncInstance::DefaultNulls>;
-    auto nullHandling = TFuncInstance::DefaultNulls ? arrow::compute::NullHandling::INTERSECTION : arrow::compute::NullHandling::COMPUTED_PREALLOCATE;
 
-    arrow::compute::ScalarKernel ss({GetPrimitiveInputArrowType<TInput1>(true), GetPrimitiveInputArrowType<TInput2>(true) }, GetPrimitiveOutputArrowType<TOutput>(), &TExecs::ExecScalarScalar);
-    ss.null_handling = nullHandling;
-    ARROW_OK(function.AddKernel(ss));
+    std::vector<NUdf::TDataTypeId> argTypes({ NUdf::TDataType<TInput1>::Id, NUdf::TDataType<TInput2>::Id });
+    NUdf::TDataTypeId returnType = NUdf::TDataType<TOutput>::Id;
 
-    arrow::compute::ScalarKernel sa({ GetPrimitiveInputArrowType<TInput1>(true), GetPrimitiveInputArrowType<TInput2>(false) }, GetPrimitiveOutputArrowType<TOutput>(), &TExecs::ExecScalarArray);
-    sa.null_handling = nullHandling;
-    ARROW_OK(function.AddKernel(sa));
-
-    arrow::compute::ScalarKernel as({ GetPrimitiveInputArrowType<TInput1>(false), GetPrimitiveInputArrowType<TInput2>(true) }, GetPrimitiveOutputArrowType<TOutput>(), &TExecs::ExecArrayScalar);
-    as.null_handling = nullHandling;
-    ARROW_OK(function.AddKernel(as));
-
-    arrow::compute::ScalarKernel aa({ GetPrimitiveInputArrowType<TInput1>(false), GetPrimitiveInputArrowType<TInput2>(false) }, GetPrimitiveOutputArrowType<TOutput>(), &TExecs::ExecArrayArray);
-    aa.null_handling = nullHandling;
-    ARROW_OK(function.AddKernel(aa));
+    arrow::compute::ScalarKernel k({ GetPrimitiveInputArrowType<TInput1>(), GetPrimitiveInputArrowType<TInput2>() }, GetPrimitiveOutputArrowType<TOutput>(), &TExecs::Exec);
+    k.null_handling = owner.NullMode == TKernelFamily::ENullMode::Default ? arrow::compute::NullHandling::INTERSECTION : arrow::compute::NullHandling::COMPUTED_PREALLOCATE;
+    owner.KernelMap.emplace(argTypes, std::make_unique<TPlainKernel>(owner, argTypes, returnType, k));
 }
 
 template<template<typename, typename, typename> class TFunc>
-void AddBinaryIntegralKernels(arrow::compute::ScalarFunction& function) {
-    AddBinaryKernel<ui8, ui8, ui8, TFunc>(function);
-    AddBinaryKernel<ui8, i8, i8, TFunc>(function);
-    AddBinaryKernel<ui8, ui16, ui16, TFunc>(function);
-    AddBinaryKernel<ui8, i16, i16, TFunc>(function);
-    AddBinaryKernel<ui8, ui32, ui32, TFunc>(function);
-    AddBinaryKernel<ui8, i32, i32, TFunc>(function);
-    AddBinaryKernel<ui8, ui64, ui64, TFunc>(function);
-    AddBinaryKernel<ui8, i64, i64, TFunc>(function);
+void AddBinaryIntegralKernels(TKernelFamilyBase& owner) {
+    AddBinaryKernel<ui8, ui8, ui8, TFunc>(owner);
+    AddBinaryKernel<ui8, i8, i8, TFunc>(owner);
+    AddBinaryKernel<ui8, ui16, ui16, TFunc>(owner);
+    AddBinaryKernel<ui8, i16, i16, TFunc>(owner);
+    AddBinaryKernel<ui8, ui32, ui32, TFunc>(owner);
+    AddBinaryKernel<ui8, i32, i32, TFunc>(owner);
+    AddBinaryKernel<ui8, ui64, ui64, TFunc>(owner);
+    AddBinaryKernel<ui8, i64, i64, TFunc>(owner);
 
-    AddBinaryKernel<i8, ui8, i8, TFunc>(function);
-    AddBinaryKernel<i8, i8, i8, TFunc>(function);
-    AddBinaryKernel<i8, ui16, ui16, TFunc>(function);
-    AddBinaryKernel<i8, i16, i16, TFunc>(function);
-    AddBinaryKernel<i8, ui32, ui32, TFunc>(function);
-    AddBinaryKernel<i8, i32, i32, TFunc>(function);
-    AddBinaryKernel<i8, ui64, ui64, TFunc>(function);
-    AddBinaryKernel<i8, i64, i64, TFunc>(function);
+    AddBinaryKernel<i8, ui8, i8, TFunc>(owner);
+    AddBinaryKernel<i8, i8, i8, TFunc>(owner);
+    AddBinaryKernel<i8, ui16, ui16, TFunc>(owner);
+    AddBinaryKernel<i8, i16, i16, TFunc>(owner);
+    AddBinaryKernel<i8, ui32, ui32, TFunc>(owner);
+    AddBinaryKernel<i8, i32, i32, TFunc>(owner);
+    AddBinaryKernel<i8, ui64, ui64, TFunc>(owner);
+    AddBinaryKernel<i8, i64, i64, TFunc>(owner);
 
-    AddBinaryKernel<ui16, ui8, ui16, TFunc>(function);
-    AddBinaryKernel<ui16, i8, ui16, TFunc>(function);
-    AddBinaryKernel<ui16, ui16, ui16, TFunc>(function);
-    AddBinaryKernel<ui16, i16, i16, TFunc>(function);
-    AddBinaryKernel<ui16, ui32, ui32, TFunc>(function);
-    AddBinaryKernel<ui16, i32, i32, TFunc>(function);
-    AddBinaryKernel<ui16, ui64, ui64, TFunc>(function);
-    AddBinaryKernel<ui16, i64, i64, TFunc>(function);
+    AddBinaryKernel<ui16, ui8, ui16, TFunc>(owner);
+    AddBinaryKernel<ui16, i8, ui16, TFunc>(owner);
+    AddBinaryKernel<ui16, ui16, ui16, TFunc>(owner);
+    AddBinaryKernel<ui16, i16, i16, TFunc>(owner);
+    AddBinaryKernel<ui16, ui32, ui32, TFunc>(owner);
+    AddBinaryKernel<ui16, i32, i32, TFunc>(owner);
+    AddBinaryKernel<ui16, ui64, ui64, TFunc>(owner);
+    AddBinaryKernel<ui16, i64, i64, TFunc>(owner);
 
-    AddBinaryKernel<i16, ui8, i16, TFunc>(function);
-    AddBinaryKernel<i16, i8, i16, TFunc>(function);
-    AddBinaryKernel<i16, ui16, i16, TFunc>(function);
-    AddBinaryKernel<i16, i16, i16, TFunc>(function);
-    AddBinaryKernel<i16, ui32, ui32, TFunc>(function);
-    AddBinaryKernel<i16, i32, i32, TFunc>(function);
-    AddBinaryKernel<i16, ui64, ui64, TFunc>(function);
-    AddBinaryKernel<i16, i64, i64, TFunc>(function);
+    AddBinaryKernel<i16, ui8, i16, TFunc>(owner);
+    AddBinaryKernel<i16, i8, i16, TFunc>(owner);
+    AddBinaryKernel<i16, ui16, i16, TFunc>(owner);
+    AddBinaryKernel<i16, i16, i16, TFunc>(owner);
+    AddBinaryKernel<i16, ui32, ui32, TFunc>(owner);
+    AddBinaryKernel<i16, i32, i32, TFunc>(owner);
+    AddBinaryKernel<i16, ui64, ui64, TFunc>(owner);
+    AddBinaryKernel<i16, i64, i64, TFunc>(owner);
 
-    AddBinaryKernel<ui32, ui8, ui32, TFunc>(function);
-    AddBinaryKernel<ui32, i8, ui32, TFunc>(function);
-    AddBinaryKernel<ui32, ui16, ui32, TFunc>(function);
-    AddBinaryKernel<ui32, i16, ui32, TFunc>(function);
-    AddBinaryKernel<ui32, ui32, ui32, TFunc>(function);
-    AddBinaryKernel<ui32, i32, i32, TFunc>(function);
-    AddBinaryKernel<ui32, ui64, ui64, TFunc>(function);
-    AddBinaryKernel<ui32, i64, i64, TFunc>(function);
+    AddBinaryKernel<ui32, ui8, ui32, TFunc>(owner);
+    AddBinaryKernel<ui32, i8, ui32, TFunc>(owner);
+    AddBinaryKernel<ui32, ui16, ui32, TFunc>(owner);
+    AddBinaryKernel<ui32, i16, ui32, TFunc>(owner);
+    AddBinaryKernel<ui32, ui32, ui32, TFunc>(owner);
+    AddBinaryKernel<ui32, i32, i32, TFunc>(owner);
+    AddBinaryKernel<ui32, ui64, ui64, TFunc>(owner);
+    AddBinaryKernel<ui32, i64, i64, TFunc>(owner);
 
-    AddBinaryKernel<i32, ui8, i32, TFunc>(function);
-    AddBinaryKernel<i32, i8, i32, TFunc>(function);
-    AddBinaryKernel<i32, ui16, i32, TFunc>(function);
-    AddBinaryKernel<i32, i16, i32, TFunc>(function);
-    AddBinaryKernel<i32, ui32, i32, TFunc>(function);
-    AddBinaryKernel<i32, i32, i32, TFunc>(function);
-    AddBinaryKernel<i32, ui64, ui64, TFunc>(function);
-    AddBinaryKernel<i32, i64, i64, TFunc>(function);
+    AddBinaryKernel<i32, ui8, i32, TFunc>(owner);
+    AddBinaryKernel<i32, i8, i32, TFunc>(owner);
+    AddBinaryKernel<i32, ui16, i32, TFunc>(owner);
+    AddBinaryKernel<i32, i16, i32, TFunc>(owner);
+    AddBinaryKernel<i32, ui32, i32, TFunc>(owner);
+    AddBinaryKernel<i32, i32, i32, TFunc>(owner);
+    AddBinaryKernel<i32, ui64, ui64, TFunc>(owner);
+    AddBinaryKernel<i32, i64, i64, TFunc>(owner);
 
-    AddBinaryKernel<ui64, ui8, ui64, TFunc>(function);
-    AddBinaryKernel<ui64, i8, ui64, TFunc>(function);
-    AddBinaryKernel<ui64, ui16, ui64, TFunc>(function);
-    AddBinaryKernel<ui64, i16, ui64, TFunc>(function);
-    AddBinaryKernel<ui64, ui32, ui64, TFunc>(function);
-    AddBinaryKernel<ui64, i32, ui64, TFunc>(function);
-    AddBinaryKernel<ui64, ui64, ui64, TFunc>(function);
-    AddBinaryKernel<ui64, i64, i64, TFunc>(function);
+    AddBinaryKernel<ui64, ui8, ui64, TFunc>(owner);
+    AddBinaryKernel<ui64, i8, ui64, TFunc>(owner);
+    AddBinaryKernel<ui64, ui16, ui64, TFunc>(owner);
+    AddBinaryKernel<ui64, i16, ui64, TFunc>(owner);
+    AddBinaryKernel<ui64, ui32, ui64, TFunc>(owner);
+    AddBinaryKernel<ui64, i32, ui64, TFunc>(owner);
+    AddBinaryKernel<ui64, ui64, ui64, TFunc>(owner);
+    AddBinaryKernel<ui64, i64, i64, TFunc>(owner);
 
-    AddBinaryKernel<i64, ui8, i64, TFunc>(function);
-    AddBinaryKernel<i64, i8, i64, TFunc>(function);
-    AddBinaryKernel<i64, ui16, i64, TFunc>(function);
-    AddBinaryKernel<i64, i16, i64, TFunc>(function);
-    AddBinaryKernel<i64, ui32, i64, TFunc>(function);
-    AddBinaryKernel<i64, i32, i64, TFunc>(function);
-    AddBinaryKernel<i64, ui64, i64, TFunc>(function);
-    AddBinaryKernel<i64, i64, i64, TFunc>(function);
+    AddBinaryKernel<i64, ui8, i64, TFunc>(owner);
+    AddBinaryKernel<i64, i8, i64, TFunc>(owner);
+    AddBinaryKernel<i64, ui16, i64, TFunc>(owner);
+    AddBinaryKernel<i64, i16, i64, TFunc>(owner);
+    AddBinaryKernel<i64, ui32, i64, TFunc>(owner);
+    AddBinaryKernel<i64, i32, i64, TFunc>(owner);
+    AddBinaryKernel<i64, ui64, i64, TFunc>(owner);
+    AddBinaryKernel<i64, i64, i64, TFunc>(owner);
 }
 
 template<template<typename, typename, typename> class TFunc>
-class TBinaryNumericFunction : public arrow::compute::ScalarFunction {
+class TBinaryNumericKernelFamily : public TKernelFamilyBase {
 public:
-    TBinaryNumericFunction(const std::string& name)
-        : ScalarFunction(name, arrow::compute::Arity::Binary(), nullptr)
+    TBinaryNumericKernelFamily(TKernelFamily::ENullMode nullMode = TKernelFamily::ENullMode::Default)
+        : TKernelFamilyBase(nullMode)
     {
         AddBinaryIntegralKernels<TFunc>(*this);
+    }
+};
+
+template<template<typename, typename, typename> class TPred>
+void AddBinaryIntegralPredicateKernels(TKernelFamilyBase& owner) {
+    using TResult = ui8;
+    AddBinaryKernel<ui8, ui8, TResult, TPred>(owner);
+    AddBinaryKernel<ui8, i8, TResult, TPred>(owner);
+    AddBinaryKernel<ui8, ui16, TResult, TPred>(owner);
+    AddBinaryKernel<ui8, i16, TResult, TPred>(owner);
+    AddBinaryKernel<ui8, ui32, TResult, TPred>(owner);
+    AddBinaryKernel<ui8, i32, TResult, TPred>(owner);
+    AddBinaryKernel<ui8, ui64, TResult, TPred>(owner);
+    AddBinaryKernel<ui8, i64, TResult, TPred>(owner);
+
+    AddBinaryKernel<i8, ui8, TResult, TPred>(owner);
+    AddBinaryKernel<i8, i8, TResult, TPred>(owner);
+    AddBinaryKernel<i8, ui16, TResult, TPred>(owner);
+    AddBinaryKernel<i8, i16, TResult, TPred>(owner);
+    AddBinaryKernel<i8, ui32, TResult, TPred>(owner);
+    AddBinaryKernel<i8, i32, TResult, TPred>(owner);
+    AddBinaryKernel<i8, ui64, TResult, TPred>(owner);
+    AddBinaryKernel<i8, i64, TResult, TPred>(owner);
+
+    AddBinaryKernel<ui16, ui8, TResult, TPred>(owner);
+    AddBinaryKernel<ui16, i8, TResult, TPred>(owner);
+    AddBinaryKernel<ui16, ui16, TResult, TPred>(owner);
+    AddBinaryKernel<ui16, i16, TResult, TPred>(owner);
+    AddBinaryKernel<ui16, ui32, TResult, TPred>(owner);
+    AddBinaryKernel<ui16, i32, TResult, TPred>(owner);
+    AddBinaryKernel<ui16, ui64, TResult, TPred>(owner);
+    AddBinaryKernel<ui16, i64, TResult, TPred>(owner);
+
+    AddBinaryKernel<i16, ui8, TResult, TPred>(owner);
+    AddBinaryKernel<i16, i8, TResult, TPred>(owner);
+    AddBinaryKernel<i16, ui16, TResult, TPred>(owner);
+    AddBinaryKernel<i16, i16, TResult, TPred>(owner);
+    AddBinaryKernel<i16, ui32, TResult, TPred>(owner);
+    AddBinaryKernel<i16, i32, TResult, TPred>(owner);
+    AddBinaryKernel<i16, ui64, TResult, TPred>(owner);
+    AddBinaryKernel<i16, i64, TResult, TPred>(owner);
+
+    AddBinaryKernel<ui32, ui8, TResult, TPred>(owner);
+    AddBinaryKernel<ui32, i8, TResult, TPred>(owner);
+    AddBinaryKernel<ui32, ui16, TResult, TPred>(owner);
+    AddBinaryKernel<ui32, i16, TResult, TPred>(owner);
+    AddBinaryKernel<ui32, ui32, TResult, TPred>(owner);
+    AddBinaryKernel<ui32, i32, TResult, TPred>(owner);
+    AddBinaryKernel<ui32, ui64, TResult, TPred>(owner);
+    AddBinaryKernel<ui32, i64, TResult, TPred>(owner);
+
+    AddBinaryKernel<i32, ui8, TResult, TPred>(owner);
+    AddBinaryKernel<i32, i8, TResult, TPred>(owner);
+    AddBinaryKernel<i32, ui16, TResult, TPred>(owner);
+    AddBinaryKernel<i32, i16, TResult, TPred>(owner);
+    AddBinaryKernel<i32, ui32, TResult, TPred>(owner);
+    AddBinaryKernel<i32, i32, TResult, TPred>(owner);
+    AddBinaryKernel<i32, ui64, TResult, TPred>(owner);
+    AddBinaryKernel<i32, i64, TResult, TPred>(owner);
+
+    AddBinaryKernel<ui64, ui8, TResult, TPred>(owner);
+    AddBinaryKernel<ui64, i8, TResult, TPred>(owner);
+    AddBinaryKernel<ui64, ui16, TResult, TPred>(owner);
+    AddBinaryKernel<ui64, i16, TResult, TPred>(owner);
+    AddBinaryKernel<ui64, ui32, TResult, TPred>(owner);
+    AddBinaryKernel<ui64, i32, TResult, TPred>(owner);
+    AddBinaryKernel<ui64, ui64, TResult, TPred>(owner);
+    AddBinaryKernel<ui64, i64, TResult, TPred>(owner);
+
+    AddBinaryKernel<i64, ui8, TResult, TPred>(owner);
+    AddBinaryKernel<i64, i8, TResult, TPred>(owner);
+    AddBinaryKernel<i64, ui16, TResult, TPred>(owner);
+    AddBinaryKernel<i64, i16, TResult, TPred>(owner);
+    AddBinaryKernel<i64, ui32, TResult, TPred>(owner);
+    AddBinaryKernel<i64, i32, TResult, TPred>(owner);
+    AddBinaryKernel<i64, ui64, TResult, TPred>(owner);
+    AddBinaryKernel<i64, i64, TResult, TPred>(owner);
+}
+
+template<template<typename, typename, typename> class TPred>
+class TBinaryNumericPredicateKernelFamily : public TKernelFamilyBase {
+public:
+    TBinaryNumericPredicateKernelFamily()
+    {
+        AddBinaryIntegralPredicateKernels<TPred>(*this);
     }
 };
 

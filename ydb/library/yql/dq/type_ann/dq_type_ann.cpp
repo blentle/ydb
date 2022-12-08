@@ -63,17 +63,16 @@ TStatus AnnotateStage(const TExprNode::TPtr& stage, TExprContext& ctx) {
         return TStatus::Error;
     }
 
-    if constexpr (std::is_same_v<TStage, TDqPhyStage>) {
-        if (!EnsureTuple(*settingsTuple, ctx)) {
+    if (!EnsureTuple(*settingsTuple, ctx)) {
+        return TStatus::Error;
+    }
+
+    for (auto& setting: settingsTuple->Children()) {
+        if (!EnsureTupleMinSize(*setting, 1, ctx)) {
             return TStatus::Error;
         }
-        for (auto& setting: settingsTuple->Children()) {
-            if (!EnsureTupleMinSize(*setting, 1, ctx)) {
-                return TStatus::Error;
-            }
-            if (!EnsureAtom(*setting->Child(0), ctx)) {
-                return TStatus::Error;
-            }
+        if (!EnsureAtom(*setting->Child(0), ctx)) {
+            return TStatus::Error;
         }
     }
 
@@ -721,17 +720,6 @@ TStatus AnnotateDqMapOrDictJoin(const TExprNode::TPtr& input, TExprContext& ctx)
     input->SetTypeAnn(ctx.MakeType<TFlowExprType>(resultRowType));
     return TStatus::Ok;
 }
-
-TStatus AnnotateDqGraceJoin(const TExprNode::TPtr& input, TExprContext& ctx) {
-    auto resultRowType = GetDqJoinResultType<true>(input, true, ctx);
-    if (!resultRowType) {
-        return TStatus::Error;
-    }
-
-    input->SetTypeAnn(ctx.MakeType<TFlowExprType>(resultRowType));
-    return TStatus::Ok;
-}
-
 
 TStatus AnnotateDqCrossJoin(const TExprNode::TPtr& input, TExprContext& ctx) {
     auto resultRowType = GetDqJoinResultType<false>(input, true, ctx);

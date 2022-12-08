@@ -29,8 +29,15 @@ void TColumnShard::SwitchToWork(const TActorContext& ctx) {
     IndexingActor = ctx.Register(CreateIndexingActor(TabletID(), ctx.SelfID));
     CompactionActor = ctx.Register(CreateCompactionActor(TabletID(), ctx.SelfID));
     EvictionActor = ctx.Register(CreateEvictionActor(TabletID(), ctx.SelfID));
-
-    SignalTabletActive(ctx);
+    ui32 tieringsCount = 0;
+    for (auto&& i : Tables) {
+        ActivateTiering(i.first, i.second.TieringUsage);
+        tieringsCount += (i.second.TieringUsage ? 1 : 0);
+    }
+    TieringWaiting = tieringsCount;
+    if (!TieringWaiting) {
+        SignalTabletActive(ctx);
+    }
 }
 
 void TColumnShard::OnActivateExecutor(const TActorContext& ctx) {
@@ -320,7 +327,7 @@ void TColumnShard::SendPeriodicStats() {
             tabletStats->SetDataSize(activeIndexStats.Bytes + TabletCounters->Simple()[COUNTER_COMMITTED_BYTES].Get());
             // TODO: we need row/dataSize counters for evicted data (managed by tablet but stored outside)
             //tabletStats->SetIndexSize(); // TODO: calc size of internal tables
-            //tabletStats->SetLastAccessTime(); // TODO: last read/write time
+            tabletStats->SetLastAccessTime(LastAccessTime.MilliSeconds());
             tabletStats->SetLastUpdateTime(lastIndexUpdate.PlanStep);
         }
     }

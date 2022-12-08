@@ -125,6 +125,10 @@ void TUserToken::AddGroupSID(const TSID& groupSID) {
     bucket.AddValues(groupSID);
 }
 
+bool TUserToken::IsSystemUser() const {
+    return GetUserSID().EndsWith("@" BUILTIN_SYSTEM_DOMAIN);
+}
+
 TSecurityObject::TSecurityObject(const NACLibProto::TSecurityObject& protoSecObj, bool isContainer)
     : NACLibProto::TSecurityObject(protoSecObj)
     , IsContainer(isContainer)
@@ -137,6 +141,9 @@ TSecurityObject::TSecurityObject(const TSID& owner, bool isContainer)
 }
 
 ui32 TSecurityObject::GetEffectiveAccessRights(const TUserToken& user) const {
+    if (user.IsSystemUser()) {
+        return EAccessRights::GenericFull; // the system always has access
+    }
     if (HasOwnerSID() && user.IsExist(GetOwnerSID()))
         return EAccessRights::GenericFull; // the owner always has access
     ui32 deniedAccessRights = EAccessRights::NoAccess;
@@ -161,6 +168,9 @@ ui32 TSecurityObject::GetEffectiveAccessRights(const TUserToken& user) const {
 }
 
 bool TSecurityObject::CheckAccess(ui32 access, const TUserToken& user) const {
+    if (user.IsSystemUser()) {
+        return true; // the system alway has access
+    }
     if (HasOwnerSID() && user.IsExist(GetOwnerSID()))
         return true; // the owner always has access
     if (HasACL()) {
@@ -195,6 +205,9 @@ bool TSecurityObject::CheckGrantAccess(const NACLibProto::TDiffACL& diffACL, con
 }
 
 TSecurityObject TSecurityObject::MergeWithParent(const NACLibProto::TSecurityObject& parent) const {
+    if (GetACL().GetInterruptInheritance()) {
+        return *this;
+    }
     TSecurityObject result(NACLibProto::TSecurityObject(), IsContainer);
     if (HasOwnerSID()) {
         result.SetOwnerSID(GetOwnerSID());
@@ -367,6 +380,9 @@ TACL::TACL(const TString& string) {
 
 std::pair<ui32, ui32> TACL::ApplyDiff(const NACLibProto::TDiffACL& diffACL) Y_NO_SANITIZE("undefined") {
     std::pair<ui32, ui32> modified = {};
+    if (diffACL.HasInterruptInheritance()) {
+        SetInterruptInheritance(diffACL.GetInterruptInheritance());
+    }
     for (const NACLibProto::TDiffACE& diffACE : diffACL.GetDiffACE()) {
         const NACLibProto::TACE& ace = diffACE.GetACE();
         switch (static_cast<EDiffType>(diffACE.GetDiffType())) {
@@ -412,11 +428,17 @@ TString TACL::ToString(const NACLibProto::TACE& ace) {
         case EAccessRights::GenericWrite:
             str << 'W';
             break;
+        case EAccessRights::GenericFullLegacy:
+            str << "FL";
+            break;
         case EAccessRights::GenericFull:
             str << 'F';
             break;
         case EAccessRights::GenericManage:
             str << 'M';
+            break;
+        case EAccessRights::GenericUseLegacy:
+            str << "UL";
             break;
         case EAccessRights::GenericUse:
             str << 'U';
@@ -573,13 +595,25 @@ void TACL::FromString(NACLibProto::TACE& ace, const TString& string) {
             ace.SetAccessRight(EAccessRights::GenericWrite);
             break;
         case 'F':
-            ace.SetAccessRight(EAccessRights::GenericFull);
+            ++it;
+            if (it != string.end() && *it == 'L') {
+                ace.SetAccessRight(EAccessRights::GenericFullLegacy);
+            } else {
+                ace.SetAccessRight(EAccessRights::GenericFull);
+                --it;
+            }
             break;
         case 'M':
             ace.SetAccessRight(EAccessRights::GenericManage);
             break;
         case 'U':
-            ace.SetAccessRight(EAccessRights::GenericUse);
+            ++it;
+            if (it != string.end() && *it == 'L') {
+                ace.SetAccessRight(EAccessRights::GenericUseLegacy);
+            } else {
+                ace.SetAccessRight(EAccessRights::GenericUse);
+                --it;
+            }
             break;
         case '(': {
             ++it;
@@ -701,10 +735,12 @@ void TDiffACL::ClearAccessForSid(const NACLib::TSID& sid) {
 
 TString AccessRightsToString(ui32 accessRights) {
     switch (accessRights) {
+    case EAccessRights::GenericFullLegacy: return "FullLegacy";
     case EAccessRights::GenericFull: return "Full";
     case EAccessRights::GenericWrite: return "Write";
     case EAccessRights::GenericRead: return "Read";
     case EAccessRights::GenericManage: return "Manage";
+    case EAccessRights::GenericUseLegacy: return "UseLegacy";
     case EAccessRights::GenericUse: return "Use";
     }
     TVector<TStringBuf> rights;
@@ -748,6 +784,11 @@ TString AccessRightsToString(ui32 accessRights) {
         result += *it;
     }
     return result;
+}
+
+const NACLib::TUserToken& TSystemUsers::Metadata() {
+    static TUserToken GlobalMetadataUser = TUserToken(BUILTIN_ACL_METADATA, {});
+    return GlobalMetadataUser;
 }
 
 }

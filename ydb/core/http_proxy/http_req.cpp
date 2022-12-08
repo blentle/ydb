@@ -395,13 +395,14 @@ namespace NKikimr::NHttpProxy {
                 ctx.Send(MakeMetricsServiceID(),
                          new TEvServerlessProxy::TEvCounter{
                              1, true, true,
-                             {{"method", Method},
-                              {"cloud", HttpContext.CloudId},
-                              {"folder", HttpContext.FolderId},
-                              {"database", HttpContext.DatabaseId},
-                              {"stream", HttpContext.StreamName},
+                             {{"database", HttpContext.DatabaseName},
+                              {"method", Method},
+                              {"cloud_id", HttpContext.CloudId},
+                              {"folder_id", HttpContext.FolderId},
+                              {"database_id", HttpContext.DatabaseId},
+                              {"topic", HttpContext.StreamName},
                               {"code", TStringBuilder() << (int)StatusToHttpCode(status)},
-                              {"name", "api.http.errors_per_second"}}
+                              {"name", "api.data_streams.errors_per_second"}}
                          });
 
                 HttpContext.ResponseData.Status = status;
@@ -433,7 +434,7 @@ namespace NKikimr::NHttpProxy {
                     FillInputCustomMetrics<TProtoRequest>(Request, HttpContext, ctx);
                     ctx.Send(MakeMetricsServiceID(),
                              new TEvServerlessProxy::TEvCounter{1, true, true,
-                                 BuildLabels(Method, HttpContext, "api.http.requests_per_second")
+                                 BuildLabels(Method, HttpContext, "api.data_streams.requests_per_second")
                              });
                     CreateClient(ctx);
                     return;
@@ -446,7 +447,7 @@ namespace NKikimr::NHttpProxy {
                 TDuration dur = ctx.Now() - StartTime;
                 ctx.Send(MakeMetricsServiceID(),
                          new TEvServerlessProxy::TEvHistCounter{static_cast<i64>(dur.MilliSeconds()), 1,
-                                    BuildLabels(Method, HttpContext, "api.http.requests_duration_milliseconds")
+                             BuildLabels(Method, HttpContext, "api.data_streams.requests_duration_milliseconds")
                         });
             }
 
@@ -460,7 +461,7 @@ namespace NKikimr::NHttpProxy {
 
                     ctx.Send(MakeMetricsServiceID(),
                              new TEvServerlessProxy::TEvCounter{1, true, true,
-                                 BuildLabels(Method, HttpContext, "api.http.success_per_second")
+                                 BuildLabels(Method, HttpContext, "api.data_streams.success_per_second")
                              });
 
                     HttpContext.DoReply(ctx);

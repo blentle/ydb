@@ -36,14 +36,17 @@ private:
     virtual TStatus HandleCreateUser(NNodes::TKiCreateUser node, TExprContext& ctx) = 0;
     virtual TStatus HandleAlterUser(NNodes::TKiAlterUser node, TExprContext& ctx) = 0;
     virtual TStatus HandleDropUser(NNodes::TKiDropUser node, TExprContext& ctx) = 0;
+    virtual TStatus HandleCreateObject(NNodes::TKiCreateObject node, TExprContext& ctx) = 0;
+    virtual TStatus HandleAlterObject(NNodes::TKiAlterObject node, TExprContext& ctx) = 0;
+    virtual TStatus HandleDropObject(NNodes::TKiDropObject node, TExprContext& ctx) = 0;
     virtual TStatus HandleCreateGroup(NNodes::TKiCreateGroup node, TExprContext& ctx) = 0;
     virtual TStatus HandleAlterGroup(NNodes::TKiAlterGroup node, TExprContext& ctx) = 0;
     virtual TStatus HandleDropGroup(NNodes::TKiDropGroup node, TExprContext& ctx) = 0;
     virtual TStatus HandleWrite(NNodes::TExprBase node, TExprContext& ctx) = 0;
     virtual TStatus HandleCommit(NNodes::TCoCommit node, TExprContext& ctx) = 0;
-    virtual TStatus HandleKql(NNodes::TCallable node, TExprContext& ctx) = 0;
     virtual TStatus HandleExecDataQuery(NNodes::TKiExecDataQuery node, TExprContext& ctx) = 0;
     virtual TStatus HandleDataQuery(NNodes::TKiDataQuery node, TExprContext& ctx) = 0;
+    virtual TStatus HandleDataQueryBlock(NNodes::TKiDataQueryBlock node, TExprContext& ctx) = 0;
     virtual TStatus HandleEffects(NNodes::TKiEffects node, TExprContext& ctx) = 0;
 };
 
@@ -53,7 +56,8 @@ public:
         Table,
         TableList,
         TableScheme,
-        Role
+        Role,
+        Object
     };
 
 public:
@@ -83,8 +87,21 @@ public:
         return Target;
     }
 
+    TString GetObjectId() const {
+        Y_VERIFY_DEBUG(KeyType.Defined());
+        Y_VERIFY_DEBUG(KeyType == Type::Object);
+        return Target;
+    }
+
     const TMaybe<TString>& GetView() const {
         return View;
+    }
+
+    const TString& GetObjectType() const {
+        Y_VERIFY_DEBUG(KeyType.Defined());
+        Y_VERIFY_DEBUG(ObjectType.Defined());
+        Y_VERIFY_DEBUG(KeyType == Type::Object);
+        return *ObjectType;
     }
 
     bool Extract(const TExprNode& key);
@@ -93,7 +110,16 @@ private:
     TExprContext& Ctx;
     TMaybe<Type> KeyType;
     TString Target;
+    TMaybe<TString> ObjectType;
     TMaybe<TString> View;
+};
+
+struct TKiDataQueryBlockSettings {
+    static constexpr std::string_view HasUncommittedChangesReadSettingName = "has_uncommitted_changes_read"sv;
+    bool HasUncommittedChangesRead = false;
+
+    static TKiDataQueryBlockSettings Parse(const NNodes::TKiDataQueryBlock& node);
+    NNodes::TCoNameValueTupleList BuildNode(TExprContext& ctx, TPositionHandle pos) const;
 };
 
 struct TKiExecDataQuerySettings {
@@ -103,55 +129,6 @@ struct TKiExecDataQuerySettings {
     NNodes::TCoNameValueTupleList BuildNode(TExprContext& ctx, TPositionHandle pos) const;
 
     static TKiExecDataQuerySettings Parse(NNodes::TKiExecDataQuery exec);
-};
-
-template<typename TResult>
-class TKikimrFutureResult : public IKikimrAsyncResult<TResult> {
-public:
-    TKikimrFutureResult(const NThreading::TFuture<TResult>& future, TExprContext& ctx)
-        : Future(future)
-        , ExprCtx(ctx)
-        , Completed(false) {}
-
-    bool HasResult() const override {
-        if (Completed) {
-            YQL_ENSURE(ExtractedResult.has_value());
-        }
-        return Completed;
-    }
-
-    TResult GetResult() override {
-        YQL_ENSURE(Completed);
-        if (ExtractedResult) {
-            return std::move(*ExtractedResult);
-        }
-        return std::move(Future.ExtractValue());
-    }
-
-    NThreading::TFuture<bool> Continue() override {
-        if (Completed) {
-            return NThreading::MakeFuture(true);
-        }
-
-        if (Future.HasValue()) {
-            ExtractedResult.emplace(std::move(Future.ExtractValue()));
-            ExtractedResult->ReportIssues(ExprCtx.IssueManager);
-
-            Completed = true;
-            return NThreading::MakeFuture(true);
-        }
-
-        return Future.Apply([](const NThreading::TFuture<TResult>& future) {
-            YQL_ENSURE(future.HasValue());
-            return false;
-        });
-    }
-
-private:
-    NThreading::TFuture<TResult> Future;
-    std::optional<TResult> ExtractedResult;
-    TExprContext& ExprCtx;
-    bool Completed;
 };
 
 TAutoPtr<IGraphTransformer> CreateKiSourceTypeAnnotationTransformer(TIntrusivePtr<TKikimrSessionContext> sessionCtx,
@@ -182,9 +159,6 @@ NNodes::TCoAtomList BuildColumnsList(const TKikimrTableDescription& table, TPosi
 const TTypeAnnotationNode* GetReadTableRowType(TExprContext& ctx, const TKikimrTablesData& tablesData,
     const TString& cluster, const TString& table, NNodes::TCoAtomList select, bool withSystemColumns = false);
 
-NKikimrKqp::EIsolationLevel GetIsolationLevel(const TMaybe<TString>& isolationLevel);
-TMaybe<TString> GetIsolationLevel(const NKikimrKqp::EIsolationLevel& isolationLevel);
-
 TYdbOperation GetTableOp(const NNodes::TKiWriteTable& write);
 TVector<NKqpProto::TKqpTableOp> TableOperationsToProto(const NNodes::TCoNameValueTupleList& operations,
     TExprContext& ctx);
@@ -201,7 +175,6 @@ TExprNode::TPtr KiBuildResult(NNodes::TExprBase node,  const TString& cluster, T
 
 const THashSet<TStringBuf>& KikimrDataSourceFunctions();
 const THashSet<TStringBuf>& KikimrDataSinkFunctions();
-const THashSet<TStringBuf>& KikimrKqlFunctions();
 const THashSet<TStringBuf>& KikimrSupportedEffects();
 
 const THashSet<TStringBuf>& KikimrCommitModes();

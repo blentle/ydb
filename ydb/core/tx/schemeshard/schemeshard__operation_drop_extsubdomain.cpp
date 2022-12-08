@@ -35,7 +35,7 @@ public:
 
         TTxState* txState = context.SS->FindTx(OperationId);
 
-        // Initiate asynchonous deletion of all shards
+        // Initiate asynchronous deletion of all shards
         for (auto shard : txState->Shards) {
             context.OnComplete.DeleteShard(shard.Idx);
         }
@@ -133,7 +133,6 @@ public:
     }
 };
 
-
 class TPropose: public TSubOperationState {
 private:
     TOperationId OperationId;
@@ -170,7 +169,7 @@ public:
 
         NIceDb::TNiceDb db(context.GetDB());
 
-        auto pathes = context.SS->ListSubThee(pathId, context.Ctx);
+        auto pathes = context.SS->ListSubTree(pathId, context.Ctx);
         context.SS->DropPathes(pathes, step, OperationId.GetTxId(), db, context.Ctx);
 
         auto parentDir = context.SS->PathsById.at(path->ParentPathId);
@@ -198,9 +197,9 @@ public:
         Y_VERIFY(txState);
         Y_VERIFY(txState->TxType == TTxState::TxForceDropExtSubDomain);
 
-        auto pathes = context.SS->ListSubThee(txState->TargetPathId, context.Ctx);
-        NForceDrop::ValidateNoTrasactionOnPathes(OperationId, pathes, context);
-        context.SS->MarkAsDroping({txState->TargetPathId}, OperationId.GetTxId(), context.Ctx);
+        auto pathes = context.SS->ListSubTree(txState->TargetPathId, context.Ctx);
+        NForceDrop::ValidateNoTransactionOnPathes(OperationId, pathes, context);
+        context.SS->MarkAsDropping({txState->TargetPathId}, OperationId.GetTxId(), context.Ctx);
         NForceDrop::CollectShards(pathes, OperationId, txState, context);
 
         context.OnComplete.ProposeToCoordinator(OperationId, txState->TargetPathId, TStepId(0));
@@ -208,19 +207,13 @@ public:
     }
 };
 
-
 class TDropExtSubdomain: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-
-    TTxState::ETxState State = TTxState::Invalid;
-
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::Propose;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Propose:
             return TTxState::DeleteExternalShards;
         case TTxState::DeleteExternalShards:
@@ -230,11 +223,10 @@ class TDropExtSubdomain: public TSubOperation {
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::Propose:
             return THolder(new TPropose(OperationId));
@@ -249,27 +241,8 @@ class TDropExtSubdomain: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TDropExtSubdomain(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {}
-
-    TDropExtSubdomain(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -324,10 +297,6 @@ public:
             result->SetError(NKikimrScheme::StatusPreconditionFailed, errStr);
             return result;
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxForceDropExtSubDomain, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         TTxState& txState = context.SS->CreateTx(OperationId, TTxState::TxForceDropExtSubDomain, path.Base()->PathId);
         txState.State = TTxState::Waiting;
@@ -359,7 +328,7 @@ public:
             }
         }
 
-        context.SS->MarkAsDroping({path.Base()->PathId}, OperationId.GetTxId(), context.Ctx);
+        context.SS->MarkAsDropping({path.Base()->PathId}, OperationId.GetTxId(), context.Ctx);
 
         txState.State = TTxState::Propose;
         context.OnComplete.ActivateTx(OperationId);
@@ -375,8 +344,7 @@ public:
         context.SS->ClearDescribePathCaches(path.Base());
         context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -411,17 +379,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
-ISubOperationBase::TPtr CreateFroceDropExtSubDomain(TOperationId id, const TTxTransaction& tx) {
-    return new TDropExtSubdomain(id, tx);
+ISubOperationBase::TPtr CreateForceDropExtSubDomain(TOperationId id, const TTxTransaction& tx) {
+    return MakeSubOperation<TDropExtSubdomain>(id, tx);
 }
 
-ISubOperationBase::TPtr CreateFroceDropExtSubDomain(TOperationId id, TTxState::ETxState state) {
+ISubOperationBase::TPtr CreateForceDropExtSubDomain(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TDropExtSubdomain(id, state);
+    return MakeSubOperation<TDropExtSubdomain>(id, state);
 }
 
-}
 }

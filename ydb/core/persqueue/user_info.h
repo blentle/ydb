@@ -179,8 +179,6 @@ struct TUserInfo {
     ui64 ReadRuleGeneration = 0;
     NPersQueue::TTopicConverterPtr TopicConverter;
 
-    std::deque<TSimpleSharedPtr<TEvPQ::TEvSetClientInfo>> UserActs;
-
     std::deque<std::pair<TReadInfo, ui64>> ReadRequests;
 
     TQuotaTracker ReadQuota;
@@ -201,8 +199,6 @@ struct TUserInfo {
     std::shared_ptr<TPercentileCounter> ReadTimeLag;
     bool DoInternalRead = false;
     bool MeterRead = true;
-
-    bool WriteInProgress = false;
 
     bool Parsed = false;
 
@@ -307,7 +303,7 @@ struct TUserInfo {
         if (AppData(ctx)->Counters) {
             if (AppData()->PQConfig.GetTopicsAreFirstClassCitizen()) {
                 LabeledCounters.Reset(new TUserLabeledCounters(
-                    user + "|$x|" + topicConverter->GetClientsideName(), partition, *dbPath));
+                    user + "||" + topicConverter->GetClientsideName(), partition, *dbPath));
 
                 if (DoInternalRead) {
                     SetupStreamCounters(ctx, dcId, ToString<ui32>(partition), cloudId, dbId, folderId);
@@ -326,28 +322,28 @@ struct TUserInfo {
         const TActorContext& ctx, const TString& dcId, const TString& partition,
         const TString& cloudId, const TString& dbId, const TString& folderId
     ) {
-        auto subgroup = NPersQueue::GetCountersForStream(AppData(ctx)->Counters);
+        auto subgroup = NPersQueue::GetCountersForDataStream(AppData(ctx)->Counters);
         auto aggregates =
-            NPersQueue::GetLabelsForStream(TopicConverter, cloudId, dbId, folderId);
+            NPersQueue::GetLabelsForTopic(TopicConverter, cloudId, dbId, folderId);
 
         BytesRead = TMultiCounter(subgroup,
                                   aggregates, {{"consumer", User}},
-                                  {"stream.internal_read.bytes_per_second",
-                                   "stream.outgoing_bytes_per_second"}, true, "name");
+                                  {"api.topic_service.stream_read.bytes_per_second",
+                                   "topic.read_bytes_per_second"}, true, "name");
         MsgsRead = TMultiCounter(subgroup,
                                  aggregates, {{"consumer", User}},
-                                 {"stream.internal_read.records_per_second",
-                                  "stream.outgoing_records_per_second"}, true, "name");
+                                 {"api.topic_service.stream_read.messages_per_second",
+                                  "topic.read_messages_per_second"}, true, "name");
 
         Counter.SetCounter(subgroup,
-                           {{"cloud", cloudId}, {"folder", folderId}, {"database", dbId},
-                            {"stream", TopicConverter->GetFederationPath()},
-                            {"consumer", User}, {"host", dcId}, {"shard", partition}},
-                           {"name", "stream.await_operating_milliseconds", true});
+                           {{"cloud_id", cloudId}, {"folder_id", folderId}, {"database_id", dbId},
+                            {"topic", TopicConverter->GetFederationPath()},
+                            {"consumer", User}, {"host", dcId}, {"partition", partition}},
+                           {"name", "topic.awaiting_consume_milliseconds", true});
 
         ReadTimeLag.reset(new TPercentileCounter(
-                     NPersQueue::GetCountersForStream(AppData(ctx)->Counters), aggregates,
-                     {{"consumer", User}, {"name", "stream.internal_read.time_lags_milliseconds"}}, "bin",
+                     NPersQueue::GetCountersForDataStream(AppData(ctx)->Counters), aggregates,
+                     {{"consumer", User}, {"name", "topic.read_lag_milliseconds"}}, "bin",
                      TVector<std::pair<ui64, TString>>{{100, "100"}, {200, "200"}, {500, "500"},
                                                         {1000, "1000"}, {2000, "2000"},
                                                         {5000, "5000"}, {10'000, "10000"},
@@ -448,7 +444,7 @@ struct TUserInfo {
     void SetImportant(bool important)
     {
         Important = important;
-        if (LabeledCounters) {
+        if (LabeledCounters && !AppData()->PQConfig.GetTopicsAreFirstClassCitizen()) {
             LabeledCounters->SetGroup(User + "/" + (important ? "1" : "0") + "/" + TopicConverter->GetClientsideName());
         }
     }
@@ -507,6 +503,9 @@ public:
 
     THashMap<TString, TUserInfo>& GetAll();
 
+    TUserInfo CreateUserInfo(const TString& user,
+                             const TActorContext& ctx,
+                             TMaybe<ui64> readRuleGeneration = {}) const;
     TUserInfo& Create(
         const TActorContext& ctx, const TString& user, const ui64 readRuleGeneration, bool important, const TString &session,
         ui32 gen, ui32 step, i64 offset, ui64 readOffsetRewindSum, TInstant readFromTimestamp
@@ -518,6 +517,14 @@ public:
 
 private:
     THolder<TReadSpeedLimiterHolder> CreateReadSpeedLimiter(const TString& user) const;
+
+    TUserInfo CreateUserInfo(const TActorContext& ctx,
+                             const TString& user,
+                             const ui64 readRuleGeneration,
+                             bool important,
+                             const TString& session,
+                             ui32 gen, ui32 step, i64 offset, ui64 readOffsetRewindSum,
+                             TInstant readFromTimestamp) const;
 
 private:
     THashMap<TString, TUserInfo> UsersInfo;
@@ -536,7 +543,7 @@ private:
     TString DbId;
     TString DbPath;
     TString FolderId;
-    ui64 CurReadRuleGeneration;
+    mutable ui64 CurReadRuleGeneration;
 };
 
 } //NPQ

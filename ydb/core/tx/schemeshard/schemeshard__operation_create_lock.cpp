@@ -5,33 +5,81 @@
 #include <ydb/core/base/subdomain.h>
 #include <ydb/core/protos/flat_scheme_op.pb.h>
 
+#define LOG_I(stream) LOG_INFO_S  (context.Ctx, NKikimrServices::FLAT_TX_SCHEMESHARD, "[" << context.SS->TabletID() << "] " << stream)
 #define LOG_N(stream) LOG_NOTICE_S(context.Ctx, NKikimrServices::FLAT_TX_SCHEMESHARD, "[" << context.SS->TabletID() << "] " << stream)
 
 namespace NKikimr::NSchemeShard {
 
 namespace {
 
-class TCreateLock: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State;
-
-    TTxState::ETxState NextState() {
-        return TTxState::Done;
+class TPropose: public TSubOperationState {
+    TString DebugHint() const override {
+        return TStringBuilder()
+            << "TCreateLock TPropose"
+            << " opId# " << OperationId << " ";
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
+public:
+    explicit TPropose(TOperationId id)
+        : OperationId(id)
+    {
+        IgnoreMessages(DebugHint(), {});
+    }
+
+    bool ProgressState(TOperationContext& context) override {
+        LOG_I(DebugHint() << "ProgressState");
+
+        const auto* txState = context.SS->FindTx(OperationId);
+        Y_VERIFY(txState);
+        Y_VERIFY(txState->TxType == TTxState::TxCreateLock);
+
+        context.OnComplete.ProposeToCoordinator(OperationId, txState->TargetPathId, TStepId(0));
+        return false;
+    }
+
+    bool HandleReply(TEvPrivate::TEvOperationPlan::TPtr& ev, TOperationContext& context) override {
+        const auto step = TStepId(ev->Get()->StepId);
+
+        LOG_I(DebugHint() << "HandleReply TEvOperationPlan"
+            << ": step# " << step);
+
+        NIceDb::TNiceDb db(context.GetDB());
+        context.SS->ChangeTxState(db, OperationId, TTxState::Done);
+
+        return true;
+    }
+
+private:
+    const TOperationId OperationId;
+
+}; // TPropose
+
+class TCreateLock: public TSubOperation {
+    const bool ProposeToCoordinator;
+
+    TTxState::ETxState NextState() const {
+        if (ProposeToCoordinator) {
+            return TTxState::Propose;
+        } else {
+            return TTxState::Done;
+        }
+    }
+
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
         switch (state) {
         case TTxState::Waiting:
+            return NextState();
+        case TTxState::Propose:
             return TTxState::Done;
         default:
             return TTxState::Invalid;
         }
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
         switch (state) {
-        case TTxState::Waiting:
+        case TTxState::Propose:
+            return THolder(new TPropose(OperationId));
         case TTxState::Done:
             return THolder(new TDone(OperationId));
         default:
@@ -39,28 +87,17 @@ class TCreateLock: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
     explicit TCreateLock(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-        , State(TTxState::Invalid)
+        : TSubOperation(id, tx)
+        , ProposeToCoordinator(AppData()->FeatureFlags.GetEnableChangefeedInitialScan())
     {
     }
 
     explicit TCreateLock(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
+        : TSubOperation(id, state)
+        , ProposeToCoordinator(AppData()->FeatureFlags.GetEnableChangefeedInitialScan())
     {
-        SetState(SelectStateFunc(state));
     }
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
@@ -122,7 +159,7 @@ public:
         result->SetPathId(pathId.LocalPathId);
 
         if (tablePath.LockedBy() == OperationId.GetTxId()) {
-            result->SetError(TEvSchemeShard::EStatus::StatusAlreadyExists, TStringBuilder() << "path checks failed"
+            result->SetError(NKikimrScheme::StatusAlreadyExists, TStringBuilder() << "path checks failed"
                 << ", path already locked by this operation"
                 << ", path: " << tablePath.PathString());
             return result;
@@ -134,39 +171,42 @@ public:
             return result;
         }
 
-        if (!context.SS->CheckInFlightLimit(TTxState::TxCreateLock, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
+        auto guard = context.DbGuard();
+        context.MemChanges.GrabPath(context.SS, pathId);
+        context.MemChanges.GrabNewLongLock(context.SS, pathId, OperationId.GetTxId());
+        context.MemChanges.GrabNewTxState(context.SS, OperationId);
+
+        context.DbChanges.PersistPath(pathId);
+        context.DbChanges.PersistLongLock(pathId, OperationId.GetTxId());
+        context.DbChanges.PersistTxState(OperationId);
+
+        Y_VERIFY(!context.SS->FindTx(OperationId));
+        auto& txState = context.SS->CreateTx(OperationId, TTxState::TxCreateLock, pathId);
+        txState.State = ProposeToCoordinator ? TTxState::Propose : TTxState::Done;
 
         tablePath.Base()->LastTxId = OperationId.GetTxId();
         tablePath.Base()->PathState = NKikimrSchemeOp::EPathState::EPathStateAlter;
 
-        TTxState& txState = context.SS->CreateTx(OperationId, TTxState::TxCreateLock, pathId);
-        txState.State = TTxState::Done;
-
-        NIceDb::TNiceDb db(context.GetDB());
-        context.SS->PersistTxState(db, OperationId);
-
+        Y_VERIFY(context.SS->Tables.contains(pathId));
         auto table = context.SS->Tables.at(pathId);
-        for (const auto& splitTx : table->GetSplitOpsInFlight()) {
-            context.OnComplete.Dependence(splitTx.GetTxId(), OperationId.GetTxId());
+
+        for (const auto& splitOpId : table->GetSplitOpsInFlight()) {
+            context.OnComplete.Dependence(splitOpId.GetTxId(), OperationId.GetTxId());
         }
 
         context.SS->LockedPaths[pathId] = OperationId.GetTxId();
-        context.SS->PersistLongLock(db, OperationId.GetTxId(), pathId);
         context.SS->TabletCounters->Simple()[COUNTER_LOCKS_COUNT].Add(1);
 
         context.OnComplete.ActivateTx(OperationId);
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
-
+        SetState(NextState());
         return result;
     }
 
-    void AbortPropose(TOperationContext&) override {
-        Y_FAIL("no AbortPropose for TCreateLock");
+    void AbortPropose(TOperationContext& context) override {
+        LOG_N("TCreateLock AbortPropose"
+            << ": opId# " << OperationId);
+        context.SS->TabletCounters->Simple()[COUNTER_LOCKS_COUNT].Sub(1);
     }
 
     void AbortUnsafe(TTxId forceDropTxId, TOperationContext& context) override {
@@ -180,12 +220,12 @@ public:
 } // anonymous namespace
 
 ISubOperationBase::TPtr CreateLock(TOperationId id, const TTxTransaction& tx) {
-    return new TCreateLock(id, tx);
+    return MakeSubOperation<TCreateLock>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateLock(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TCreateLock(id, state);
+    return MakeSubOperation<TCreateLock>(id, state);
 }
 
 }

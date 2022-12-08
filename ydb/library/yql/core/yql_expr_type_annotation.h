@@ -191,7 +191,10 @@ const TTypeAnnotationNode* DryType(const TTypeAnnotationNode* type, TExprContext
 const TTypeAnnotationNode* DryType(const TTypeAnnotationNode* type, bool& hasOptional, TExprContext& ctx);
 
 // Key type for left or right join.
+const TTypeAnnotationNode* JoinDryKeyType(const TTypeAnnotationNode* primary, const TTypeAnnotationNode* secondary, TExprContext& ctx);
 const TTypeAnnotationNode* JoinDryKeyType(const TTypeAnnotationNode* primary, const TTypeAnnotationNode* secondary, bool& hasOptional, TExprContext& ctx);
+// Key type for inner or full join.
+const TTypeAnnotationNode* JoinCommonDryType(TPositionHandle position, const TTypeAnnotationNode* one, const TTypeAnnotationNode* two, TExprContext& ctx);
 
 template <bool Strict> // Strict + DryType before - common type for join key.
 const TTypeAnnotationNode* CommonType(TPositionHandle position, const TTypeAnnotationNode* one, const TTypeAnnotationNode* two, TExprContext& ctx);
@@ -276,6 +279,7 @@ bool IsEmptyList(const TTypeAnnotationNode& type);
 bool IsInstantEqual(const TTypeAnnotationNode& type);
 
 TString GetTypeDiff(const TTypeAnnotationNode& left, const TTypeAnnotationNode& right);
+TString GetTypePrettyDiff(const TTypeAnnotationNode& left, const TTypeAnnotationNode& right);
 TExprNode::TPtr ExpandType(TPositionHandle position, const TTypeAnnotationNode& type, TExprContext& ctx);
 
 bool IsSystemMember(const TStringBuf& memberName);
@@ -300,5 +304,6 @@ const TTypeAnnotationNode* GetBlockItemType(const TTypeAnnotationNode& type, boo
 const TTypeAnnotationNode* AggApplySerializedStateType(const TExprNode::TPtr& input, TExprContext& ctx);
 bool GetSumResultType(const TPositionHandle& pos, const TTypeAnnotationNode& itemType, const TTypeAnnotationNode*& retType, TExprContext& ctx);
 bool GetAvgResultType(const TPositionHandle& pos, const TTypeAnnotationNode& itemType, const TTypeAnnotationNode*& retType, TExprContext& ctx);
+bool GetMinMaxResultType(const TPositionHandle& pos, const TTypeAnnotationNode& itemType, const TTypeAnnotationNode*& retType, TExprContext& ctx);
 
 }

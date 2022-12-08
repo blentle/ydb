@@ -493,6 +493,17 @@ public:
         TableDescription.Swap(alterData.TableDescriptionFull.Get());
     }
 
+    static TTableInfo::TPtr DeepCopy(const TTableInfo& other) {
+        TTableInfo::TPtr copy(new TTableInfo(other));
+        // rebuild conditional erase schedule since it uses iterators
+        copy->CondEraseSchedule.clear();
+        for (ui32 i = 0; i < copy->Partitions.size(); ++i) {
+            copy->CondEraseSchedule.push(copy->Partitions.begin() + i);
+        }
+
+        return copy;
+    }
+
     static TAlterDataPtr CreateAlterData(
         TPtr source,
         NKikimrSchemeOp::TTableDescription& descr,
@@ -793,7 +804,8 @@ struct TOlapSchema {
         TString Name;
         NScheme::TTypeInfo Type;
         ui32 KeyOrder = Max<ui32>();
-        // TODO: per-column ACL?
+        bool NotNull = false;
+        // TODO: DefaultValue
 
         bool IsKeyColumn() const { return KeyOrder != Max<ui32>(); }
     };
@@ -825,7 +837,11 @@ struct TOlapSchema {
     }
 
     static bool UpdateProto(NKikimrSchemeOp::TColumnTableSchema& proto, TString& errStr);
-    bool Parse(const NKikimrSchemeOp::TColumnTableSchema& proto, TString& errStr);
+    static bool IsAllowedType(ui32 typeId);
+    static bool IsAllowedFirstPkType(ui32 typeId);
+
+    bool Parse(const NKikimrSchemeOp::TColumnTableSchema& proto, TString& errStr, bool allowNullableKeys);
+    bool Validate(const NKikimrSchemeOp::TColumnTableSchema& opSchema, TEvSchemeShard::EStatus& status, TString& errStr) const;
 };
 
 struct TOlapStoreSchemaPreset : public TOlapSchema {
@@ -870,6 +886,7 @@ struct TOlapStoreInfo : TSimpleRefCount<TOlapStoreInfo> {
     }
 
     void UpdateShardStats(TShardIdx shardIdx, const TPartitionStats& newStats) {
+        Stats.Aggregated.PartCount = ColumnShards.size();
         Stats.PartitionStats[shardIdx]; // insert if none
         Stats.UpdateShardStats(shardIdx, newStats);
     }
@@ -889,9 +906,9 @@ struct TColumnTableInfo : TSimpleRefCount<TColumnTableInfo> {
     TMaybe<TPathId> OlapStorePathId; // PathId of the table store
     TMaybe<TOlapSchema> Schema; // schema for standalone table
 
-    // Current list of column shards
-    TVector<ui64> ColumnShards;
+    TVector<ui64> ColumnShards; // Current list of column shards
     TVector<TShardIdx> OwnedColumnShards;
+    TAggregatedStats Stats;
 
     TColumnTableInfo() = default;
     TColumnTableInfo(ui64 alterVersion, NKikimrSchemeOp::TColumnTableDescription&& description,
@@ -909,7 +926,15 @@ struct TColumnTableInfo : TSimpleRefCount<TColumnTableInfo> {
         return !OwnedColumnShards.empty();
     }
 
-    // TODO: UpdateShardStats(), GetStats() for standalone table
+    const TAggregatedStats& GetStats() const {
+        return Stats;
+    }
+
+    void UpdateShardStats(TShardIdx shardIdx, const TPartitionStats& newStats) {
+        Stats.Aggregated.PartCount = ColumnShards.size();
+        Stats.PartitionStats[shardIdx]; // insert if none
+        Stats.UpdateShardStats(shardIdx, newStats);
+    }
 };
 
 struct TPQShardInfo : TSimpleRefCount<TPQShardInfo> {
@@ -1367,6 +1392,10 @@ struct TSubDomainInfo: TSimpleRefCount<TSubDomainInfo> {
         return TTabletId(ProcessingParams.GetHive());
     }
 
+    void SetTenantHiveIDPrivate(const TTabletId& hiveId) {
+        ProcessingParams.SetHive(ui64(hiveId));
+    }
+
     TTabletId GetTenantSysViewProcessorID() const {
         if (!ProcessingParams.HasSysViewProcessor()) {
             return InvalidTabletId;
@@ -1705,27 +1734,27 @@ struct TSubDomainInfo: TSimpleRefCount<TSubDomainInfo> {
         }
 
         ProcessingParams.ClearCoordinators();
-        TVector<TTabletId> coordinators = FilterTablets(ETabletType::Coordinator, allShards);
+        TVector<TTabletId> coordinators = FilterPrivateTablets(ETabletType::Coordinator, allShards);
         for (TTabletId coordinator: coordinators) {
             ProcessingParams.AddCoordinators(ui64(coordinator));
         }
         CoordinatorSelector = new TCoordinators(ProcessingParams);
 
         ProcessingParams.ClearMediators();
-        TVector<TTabletId> mediators = FilterTablets(ETabletType::Mediator, allShards);
+        TVector<TTabletId> mediators = FilterPrivateTablets(ETabletType::Mediator, allShards);
         for (TTabletId mediator: mediators) {
             ProcessingParams.AddMediators(ui64(mediator));
         }
 
         ProcessingParams.ClearSchemeShard();
-        TVector<TTabletId> schemeshards = FilterTablets(ETabletType::SchemeShard, allShards);
+        TVector<TTabletId> schemeshards = FilterPrivateTablets(ETabletType::SchemeShard, allShards);
         Y_VERIFY_S(schemeshards.size() <= 1, "size was: " << schemeshards.size());
         if (schemeshards.size()) {
             ProcessingParams.SetSchemeShard(ui64(schemeshards.front()));
         }
 
         ProcessingParams.ClearHive();
-        TVector<TTabletId> hives = FilterTablets(ETabletType::Hive, allShards);
+        TVector<TTabletId> hives = FilterPrivateTablets(ETabletType::Hive, allShards);
         Y_VERIFY_S(hives.size() <= 1, "size was: " << hives.size());
         if (hives.size()) {
             ProcessingParams.SetHive(ui64(hives.front()));
@@ -1733,7 +1762,7 @@ struct TSubDomainInfo: TSimpleRefCount<TSubDomainInfo> {
         }
 
         ProcessingParams.ClearSysViewProcessor();
-        TVector<TTabletId> sysViewProcessors = FilterTablets(ETabletType::SysViewProcessor, allShards);
+        TVector<TTabletId> sysViewProcessors = FilterPrivateTablets(ETabletType::SysViewProcessor, allShards);
         Y_VERIFY_S(sysViewProcessors.size() <= 1, "size was: " << sysViewProcessors.size());
         if (sysViewProcessors.size()) {
             ProcessingParams.SetSysViewProcessor(ui64(sysViewProcessors.front()));
@@ -1935,7 +1964,7 @@ private:
     NLoginProto::TSecurityState SecurityState;
     ui64 SecurityStateVersion = 0;
 
-    TVector<TTabletId> FilterTablets(TTabletTypes::EType type, const THashMap<TShardIdx, TShardInfo>& allShards) const {
+    TVector<TTabletId> FilterPrivateTablets(TTabletTypes::EType type, const THashMap<TShardIdx, TShardInfo>& allShards) const {
         TVector<TTabletId> tablets;
         for (auto shardId: PrivateShards) {
 
@@ -2232,10 +2261,11 @@ struct TCdcStreamInfo : public TSimpleRefCount<TCdcStreamInfo> {
     using EFormat = NKikimrSchemeOp::ECdcStreamFormat;
     using EState = NKikimrSchemeOp::ECdcStreamState;
 
-    TCdcStreamInfo(ui64 version, EMode mode, EFormat format, EState state)
+    TCdcStreamInfo(ui64 version, EMode mode, EFormat format, bool vt, EState state)
         : AlterVersion(version)
         , Mode(mode)
         , Format(format)
+        , VirtualTimestamps(vt)
         , State(state)
     {}
 
@@ -2249,14 +2279,17 @@ struct TCdcStreamInfo : public TSimpleRefCount<TCdcStreamInfo> {
         return result;
     }
 
-    static TPtr New(EMode mode, EFormat format) {
-        return new TCdcStreamInfo(0, mode, format, EState::ECdcStreamStateInvalid);
+    static TPtr New(EMode mode, EFormat format, bool vt) {
+        return new TCdcStreamInfo(0, mode, format, vt, EState::ECdcStreamStateInvalid);
     }
 
     static TPtr Create(const NKikimrSchemeOp::TCdcStreamDescription& desc) {
-        TPtr result = New(desc.GetMode(), desc.GetFormat());
+        TPtr result = New(desc.GetMode(), desc.GetFormat(), desc.GetVirtualTimestamps());
         TPtr alterData = result->CreateNextVersion();
         alterData->State = EState::ECdcStreamStateReady;
+        if (desc.HasState()) {
+            alterData->State = desc.GetState();
+        }
 
         return result;
     }
@@ -2264,6 +2297,7 @@ struct TCdcStreamInfo : public TSimpleRefCount<TCdcStreamInfo> {
     ui64 AlterVersion = 1;
     EMode Mode;
     EFormat Format;
+    bool VirtualTimestamps;
     EState State;
 
     TCdcStreamInfo::TPtr AlterData = nullptr;

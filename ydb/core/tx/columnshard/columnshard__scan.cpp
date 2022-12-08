@@ -7,7 +7,7 @@
 #include <ydb/core/tx/columnshard/columnshard_private_events.h>
 #include <ydb/core/tablet_flat/flat_row_celled.h>
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor.h>
-#include <ydb/core/kqp/kqp_compute.h>
+#include <ydb/core/kqp/compute_actor/kqp_compute_events.h>
 #include <ydb/core/actorlib_impl/long_timer.h>
 #include <ydb/library/yql/core/issue/yql_issue.h>
 #include <ydb/library/yql/public/issue/yql_issue_message.h>
@@ -825,7 +825,8 @@ void TColumnShard::Handle(TEvColumnShard::TEvScan::TPtr& ev, const TActorContext
         return;
     }
 
-    ScanTxInFlight.insert({txId, TAppData::TimeProvider->Now()});
+    LastAccessTime = TAppData::TimeProvider->Now();
+    ScanTxInFlight.insert({txId, LastAccessTime});
     SetCounter(COUNTER_SCAN_IN_FLY, ScanTxInFlight.size());
     Execute(new TTxScan(this, ev), ctx);
 }

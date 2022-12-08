@@ -244,10 +244,10 @@ namespace NKikimr::NBlobDepot {
                 , UncertainWrite(uncertainWrite)
             {}
 
-            explicit TValue(const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item, bool uncertainWrite)
+            explicit TValue(const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item)
                 : Meta(item.GetMeta())
                 , Public(false)
-                , UncertainWrite(uncertainWrite)
+                , UncertainWrite(item.GetUncertainWrite())
             {
                 auto *chain = ValueChain.Add();
                 auto *locator = chain->MutableLocator();
@@ -257,8 +257,12 @@ namespace NKikimr::NBlobDepot {
             explicit TValue(EKeepState keepState)
                 : KeepState(keepState)
                 , Public(false)
-                , UncertainWrite(true)
+                , UncertainWrite(false)
             {}
+
+            bool IsWrittenUncertainly() const {
+                return UncertainWrite && !ValueChain.empty();
+            }
 
             void SerializeToProto(NKikimrBlobDepot::TValue *proto) const {
                 if (Meta) {
@@ -329,7 +333,6 @@ namespace NKikimr::NBlobDepot {
             TGenStep IssuedGenStep; // currently in flight or already confirmed
             TGenStep LastConfirmedGenStep;
             bool CollectGarbageRequestInFlight = false;
-            TBlobSeqId LeastExpectedBlobId;
 
             TRecordsPerChannelGroup(ui8 channel, ui32 groupId)
                 : Channel(channel)
@@ -338,7 +341,7 @@ namespace NKikimr::NBlobDepot {
 
             void MoveToTrash(TLogoBlobID id);
             void OnSuccessfulCollect(TData *self);
-            void OnLeastExpectedBlobIdChange(TData *self, TBlobSeqId leastExpectedBlobId);
+            void OnLeastExpectedBlobIdChange(TData *self);
             void ClearInFlight(TData *self);
             void CollectIfPossible(TData *self);
         };
@@ -433,7 +436,7 @@ namespace NKikimr::NBlobDepot {
         bool UpdateKey(TKey key, NTabletFlatExecutor::TTransactionContext& txc, void *cookie, const char *reason,
             T&& callback, TArgs&&... args);
 
-        void UpdateKey(const TKey& key, const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item, bool uncertainWrite,
+        void UpdateKey(const TKey& key, const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item,
             NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
 
         void MakeKeyCertain(const TKey& key);
@@ -441,7 +444,7 @@ namespace NKikimr::NBlobDepot {
 
         TRecordsPerChannelGroup& GetRecordsPerChannelGroup(TLogoBlobID id);
 
-        void AddDataOnLoad(TKey key, TString value, bool uncertainWrite, NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
+        void AddDataOnLoad(TKey key, TString value, bool uncertainWrite);
         void AddDataOnDecommit(const TEvBlobStorage::TEvAssimilateResult::TBlob& blob,
             NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
         void AddTrashOnLoad(TLogoBlobID id);
@@ -457,9 +460,10 @@ namespace NKikimr::NBlobDepot {
         bool OnBarrierShift(ui64 tabletId, ui8 channel, bool hard, TGenStep previous, TGenStep current, ui32& maxItems,
             NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
 
+        void AddFirstMentionedBlob(TLogoBlobID id);
         void AccountBlob(TLogoBlobID id, bool add);
 
-        bool CanBeCollected(ui32 groupId, TBlobSeqId id) const;
+        bool CanBeCollected(TBlobSeqId id) const;
 
         void OnLeastExpectedBlobIdChange(ui8 channel);
 
@@ -483,6 +487,7 @@ namespace NKikimr::NBlobDepot {
         void StartLoad();
         void OnLoadComplete();
         bool IsLoaded() const { return Loaded; }
+        bool IsKeyLoaded(const TKey& key) const { return key <= LastLoadedKey || Data.contains(key); }
 
         void Handle(TEvBlobDepot::TEvResolve::TPtr ev);
         void Handle(TEvBlobStorage::TEvRangeResult::TPtr ev);
@@ -492,6 +497,11 @@ namespace NKikimr::NBlobDepot {
         }
 
         void RenderMainPage(IOutputStream& s);
+
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+        bool BeginCommittingBlobSeqId(TAgent& agent, TBlobSeqId blobSeqId);
+        void EndCommittingBlobSeqId(TAgent& agent, TBlobSeqId blobSeqId);
 
     private:
         void ExecuteIssueGC(ui8 channel, ui32 groupId, TGenStep issuedGenStep,

@@ -251,61 +251,6 @@ public:
                     return RunResOrPullForExec(TResOrPullBase(input), maybeExecQuery.Cast(), ctx, index);
                 }
             }
-
-            IDataProvider::TFillSettings fillSettings = NCommon::GetFillSettings(*input);
-
-            if (auto maybeTableList = TMaybeNode<TCoRight>(pullInput).Input().Maybe<TKiReadTableList>()) {
-                if (!EnsureNotPrepare("tablelist", pullInput->Pos(), SessionCtx->Query(), ctx)) {
-                    return SyncError();
-                }
-
-                TKikimrKey key(ctx);
-                YQL_ENSURE(key.Extract(maybeTableList.Cast().TableKey().Ref()));
-                auto future = Gateway->ListPath(TString(maybeTableList.Cast().DataSource().Cluster()),
-                    key.GetFolderPath());
-
-                return WrapFuture(future, [fillSettings](const IKikimrGateway::TListPathResult& res,
-                    const TExprNode::TPtr& input, TExprContext& ctx)
-                {
-                    auto result = GetTableListResult(res, fillSettings, ctx);
-                    YQL_ENSURE(result);
-
-                    return ctx.NewAtom(input->Pos(), *result);
-                });
-            }
-
-            if (auto maybeTableScheme = TMaybeNode<TCoRight>(pullInput).Input().Maybe<TKiReadTableScheme>()) {
-                if (!EnsureNotPrepare("tablescheme", pullInput->Pos(), SessionCtx->Query(), ctx)) {
-                    return SyncError();
-                }
-
-                TKikimrKey key(ctx);
-                auto cluster = maybeTableScheme.Cast().DataSource().Cluster();
-                YQL_ENSURE(key.Extract(maybeTableScheme.Cast().TableKey().Ref()));
-
-                auto& tableDesc = SessionCtx->Tables().ExistingTable(TString(cluster), key.GetTablePath());
-                TKikimrTableDescription rawTableDesc;
-                rawTableDesc.Metadata = tableDesc.Metadata;
-                rawTableDesc.Load(ctx);
-
-                auto result = GetTableMetadataResult(rawTableDesc, fillSettings, ctx);
-                YQL_ENSURE(result);
-
-                auto resultNode = ctx.NewAtom(input->Pos(), *result);
-
-                return std::make_pair(
-                    IGraphTransformer::TStatus::Async,
-                    MakeFuture(TAsyncTransformCallback([resultNode](const TExprNode::TPtr& input,
-                        TExprNode::TPtr& output, TExprContext& ctx)
-                    {
-                        Y_UNUSED(output);
-                        Y_UNUSED(ctx);
-
-                        input->SetState(TExprNode::EState::ExecutionComplete);
-                        input->SetResult(TExprNode::TPtr(resultNode));
-                        return IGraphTransformer::TStatus::Ok;
-                    })));
-            }
         }
 
         if (input->Content() == "Result") {
@@ -385,7 +330,7 @@ public:
 
 private:
     static TExprNode::TPtr GetResOrPullResult(const TExprNode& node, const IDataProvider::TFillSettings& fillSettings,
-        const TTypeAnnotationNode* resultType, const NKikimrMiniKQL::TResult& resultValue, TExprContext& ctx)
+        const NKikimrMiniKQL::TResult& resultValue, TExprContext& ctx)
     {
         TVector<TString> columnHints(NCommon::GetResOrPullColumnHints(node));
 
@@ -395,30 +340,12 @@ private:
             protoValue = KikimrResultToProto(resultValue, columnHints, fillSettings, resultValue.GetArena());
         }
 
-        // TODO: Fix Void? and Null type difference
-        // YQL_ENSURE(CheckKqpResultType(*protoValue, *resultType, ctx));
-        Y_UNUSED(resultType);
+        YQL_ENSURE(fillSettings.Format == IDataProvider::EResultFormat::Custom);
+        YQL_ENSURE(fillSettings.FormatDetails == KikimrMkqlProtoFormat);
 
-        TExprNode::TPtr resultNode;
-        if (fillSettings.Format == IDataProvider::EResultFormat::Yson) {
-            NYson::EYsonFormat ysonFormat = NCommon::GetYsonFormat(fillSettings);
-
-            auto yson = KqpResultToYson(*protoValue, ysonFormat, ctx);
-            if (!yson) {
-                return nullptr;
-            }
-
-            resultNode = ctx.NewAtom(node.Pos(), *yson);
-        } else {
-            YQL_ENSURE(fillSettings.Format == IDataProvider::EResultFormat::Custom);
-            YQL_ENSURE(fillSettings.FormatDetails == KikimrMkqlProtoFormat);
-
-            TVector<char> buffer(protoValue->ByteSize());
-            Y_PROTOBUF_SUPPRESS_NODISCARD protoValue->SerializeToArray(buffer.data(), buffer.size());
-            resultNode = ctx.NewAtom(node.Pos(), TStringBuf(buffer.data(), buffer.size()));
-        }
-
-        return resultNode;
+        TVector<char> buffer(protoValue->ByteSize());
+        Y_PROTOBUF_SUPPRESS_NODISCARD protoValue->SerializeToArray(buffer.data(), buffer.size());
+        return ctx.NewAtom(node.Pos(), TStringBuf(buffer.data(), buffer.size()));
     }
 
     std::pair<IGraphTransformer::TStatus, TAsyncTransformCallbackFuture> RunResOrPullForExec(TResOrPullBase res,
@@ -447,14 +374,11 @@ private:
             return SyncOk();
         }
 
-        auto executeRightType = exec.Ref().GetTypeAnn()->Cast<TTupleExprType>()->GetItems()[1];
-        auto resultType = executeRightType->Cast<TTupleExprType>()->GetItems()[resultIndex];
-
         YQL_ENSURE(resultIndex < runResult->Results.size());
         auto resultValue = runResult->Results[resultIndex];
         YQL_ENSURE(resultValue);
 
-        auto resResultNode = GetResOrPullResult(res.Ref(), fillSettings, resultType, *resultValue, ctx);
+        auto resResultNode = GetResOrPullResult(res.Ref(), fillSettings, *resultValue, ctx);
 
         res.Ptr()->SetResult(std::move(resResultNode));
         return SyncOk();
@@ -463,6 +387,86 @@ private:
 private:
     TIntrusivePtr<IKikimrGateway> Gateway;
     TIntrusivePtr<TKikimrSessionContext> SessionCtx;
+};
+
+template <class TKiObject, class TSettings>
+class TObjectModifierTransformer {
+private:
+    TIntrusivePtr<IKikimrGateway> Gateway;
+    TIntrusivePtr<TKikimrSessionContext> SessionCtx;
+    TString ActionInfo;
+protected:
+    virtual TFuture<IKikimrGateway::TGenericResult> DoExecute(const TString& cluster, const TSettings& settings) = 0;
+    TIntrusivePtr<IKikimrGateway> GetGateway() const {
+        return Gateway;
+    }
+public:
+    TObjectModifierTransformer(const TString& actionInfo, TIntrusivePtr<IKikimrGateway> gateway, TIntrusivePtr<TKikimrSessionContext> sessionCtx)
+        : Gateway(gateway)
+        , SessionCtx(sessionCtx)
+        , ActionInfo(actionInfo)
+    {
+
+    }
+
+    std::pair<IGraphTransformer::TStatus, TAsyncTransformCallbackFuture> Execute(const TKiObject& kiObject, const TExprNode::TPtr& input, TExprContext& ctx) {
+        if (!EnsureNotPrepare(ActionInfo + " " + kiObject.TypeId(), input->Pos(), SessionCtx->Query(), ctx)) {
+            return SyncError();
+        }
+
+        auto requireStatus = RequireChild(*input, 0);
+        if (requireStatus.Level != IGraphTransformer::TStatus::Ok) {
+            return SyncStatus(requireStatus);
+        }
+
+        auto cluster = TString(kiObject.DataSink().Cluster());
+        TSettings settings;
+        if (!settings.DeserializeFromKi(kiObject)) {
+            return SyncError();
+        }
+        bool prepareOnly = SessionCtx->Query().PrepareOnly;
+        auto future = prepareOnly ? CreateDummySuccess() : DoExecute(cluster, settings);
+
+        return WrapFuture(future,
+            [](const IKikimrGateway::TGenericResult& res, const TExprNode::TPtr& input, TExprContext& ctx) {
+                Y_UNUSED(res);
+                auto resultNode = ctx.NewWorld(input->Pos());
+                return resultNode;
+            }, "Executing " + ActionInfo + " " + kiObject.TypeId());
+    }
+};
+
+class TCreateObjectTransformer: public TObjectModifierTransformer<TKiCreateObject, TCreateObjectSettings> {
+private:
+    using TBase = TObjectModifierTransformer<TKiCreateObject, TCreateObjectSettings>;
+protected:
+    virtual TFuture<IKikimrGateway::TGenericResult> DoExecute(const TString& cluster, const TCreateObjectSettings& settings) override {
+        return GetGateway()->CreateObject(cluster, settings);
+    }
+public:
+    using TBase::TBase;
+};
+
+class TAlterObjectTransformer: public TObjectModifierTransformer<TKiAlterObject, TAlterObjectSettings> {
+private:
+    using TBase = TObjectModifierTransformer<TKiAlterObject, TAlterObjectSettings>;
+protected:
+    virtual TFuture<IKikimrGateway::TGenericResult> DoExecute(const TString& cluster, const TAlterObjectSettings& settings) override {
+        return GetGateway()->AlterObject(cluster, settings);
+    }
+public:
+    using TBase::TBase;
+};
+
+class TDropObjectTransformer: public TObjectModifierTransformer<TKiDropObject, TDropObjectSettings> {
+private:
+    using TBase = TObjectModifierTransformer<TKiDropObject, TDropObjectSettings>;
+protected:
+    virtual TFuture<IKikimrGateway::TGenericResult> DoExecute(const TString& cluster, const TDropObjectSettings& settings) override {
+        return GetGateway()->DropObject(cluster, settings);
+    }
+public:
+    using TBase::TBase;
 };
 
 class TKiSinkCallableExecutionTransformer : public TAsyncCallbackTransformer<TKiSinkCallableExecutionTransformer> {
@@ -966,6 +970,28 @@ public:
                                     ctx.AddError(TIssue(ctx.GetPosition(setting.Name().Pos()),
                                         TStringBuilder() << name << " setting is not supported yet"));
                                     return SyncError();
+                                } else if (name == "virtual_timestamps") {
+                                    auto vt = TString(
+                                        setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Value()
+                                    );
+
+                                    add_changefeed->set_virtual_timestamps(FromString<bool>(to_lower(vt)));
+                                } else if (name == "retention_period") {
+                                    YQL_ENSURE(setting.Value().Maybe<TCoInterval>());
+                                    const auto value = FromString<i64>(
+                                        setting.Value().Cast<TCoInterval>().Literal().Value()
+                                    );
+
+                                    if (value <= 0) {
+                                        ctx.AddError(TIssue(ctx.GetPosition(setting.Name().Pos()),
+                                            TStringBuilder() << name << " must be positive"));
+                                        return SyncError();
+                                    }
+
+                                    const auto duration = TDuration::FromValue(value);
+                                    auto& retention = *add_changefeed->mutable_retention_period();
+                                    retention.set_seconds(duration.Seconds());
+                                    retention.set_nanos(duration.NanoSecondsOfSecond());
                                 } else if (name == "local") {
                                     // nop
                                 } else {
@@ -1112,6 +1138,18 @@ public:
             }, "Executing DROP USER");
         }
 
+        if (auto kiObject = TMaybeNode<TKiCreateObject>(input)) {
+            return TCreateObjectTransformer("CREATE OBJECT", Gateway, SessionCtx).Execute(kiObject.Cast(), input, ctx);
+        }
+
+        if (auto kiObject = TMaybeNode<TKiAlterObject>(input)) {
+            return TAlterObjectTransformer("ALTER OBJECT", Gateway, SessionCtx).Execute(kiObject.Cast(), input, ctx);
+        }
+
+        if (auto kiObject = TMaybeNode<TKiDropObject>(input)) {
+            return TDropObjectTransformer("DROP OBJECT", Gateway, SessionCtx).Execute(kiObject.Cast(), input, ctx);
+        }
+
         if (auto maybeCreateGroup = TMaybeNode<TKiCreateGroup>(input)) {
             if (!EnsureNotPrepare("CREATE GROUP", input->Pos(), SessionCtx->Query(), ctx)) {
                 return SyncError();
@@ -1211,8 +1249,6 @@ private:
         } else {
             auto config = SessionCtx->Config().Snapshot();
 
-            auto isolationLevel = config->IsolationLevel.Get(cluster);
-
             IKikimrQueryExecutor::TExecuteSettings settings;
             settings.CommitTx = true;
             if (mode) {
@@ -1226,20 +1262,12 @@ private:
                 }
             }
 
-            settings.IsolationLevel = isolationLevel;
-            settings.StrictDml = config->StrictDml.Get(cluster).GetRef();
-
             const auto& scanQuery = config->ScanQuery.Get(cluster);
             if (scanQuery) {
                 settings.UseScanQuery = scanQuery.GetRef();
             }
 
             settings.StatsMode = SessionCtx->Query().StatsMode;
-            auto profile = config->Profile.Get(cluster);
-            if (profile && *profile) {
-                // Do not disable profiling if it was enabled at request level
-                settings.StatsMode = EKikimrStatsMode::Full;
-            }
 
             asyncResult = runFunc(settings);
 
@@ -1311,7 +1339,7 @@ private:
     bool ApplyTableOperations(const TString& cluster, const TVector<NKqpProto::TKqpTableOp>& tableOps,
         NKikimrKqp::EIsolationLevel isolationLevel, TExprContext& ctx)
     {
-        bool strictDml = SessionCtx->Config().StrictDml.Get(cluster).GetRef();
+        bool enableImmediateEffects = SessionCtx->Config().FeatureFlags.GetEnableKqpImmediateEffects();
         auto queryType = SessionCtx->Query().Type;
         TVector<NKqpProto::TKqpTableInfo> tableInfo;
 
@@ -1325,10 +1353,12 @@ private:
 
         if (!SessionCtx->HasTx()) {
             TKikimrTransactionContextBase emptyCtx;
-            return emptyCtx.ApplyTableOperations(tableOps, tableInfo, isolationLevel, strictDml, queryType, ctx);
+            return emptyCtx.ApplyTableOperations(tableOps, tableInfo, isolationLevel, enableImmediateEffects,
+                queryType, ctx);
         }
 
-        return SessionCtx->Tx().ApplyTableOperations(tableOps, tableInfo, isolationLevel, strictDml, queryType, ctx);
+        return SessionCtx->Tx().ApplyTableOperations(tableOps, tableInfo, isolationLevel,
+            enableImmediateEffects, queryType, ctx);
     }
 
     bool ApplyDdlOperation(const TString& cluster, TPositionHandle pos, const TString& table,
@@ -1354,34 +1384,6 @@ private:
 };
 
 } // namespace
-
-NKikimrKqp::EIsolationLevel GetIsolationLevel(const TMaybe<TString>& isolationLevel) {
-    YQL_ENSURE(isolationLevel);
-    auto levelStr = *isolationLevel;
-
-    if (levelStr == "ReadStale") {
-        return NKikimrKqp::ISOLATION_LEVEL_READ_STALE;
-    } else if (levelStr == "ReadUncommitted") {
-        return NKikimrKqp::ISOLATION_LEVEL_READ_UNCOMMITTED;
-    } else if (levelStr == "ReadCommitted") {
-        return NKikimrKqp::ISOLATION_LEVEL_READ_COMMITTED;
-    } else if (levelStr == "Serializable") {
-        return NKikimrKqp::ISOLATION_LEVEL_SERIALIZABLE;
-    }
-
-    YQL_ENSURE(false, "Unsupported isolation level: " << levelStr);
-}
-
-TMaybe<TString> GetIsolationLevel(const NKikimrKqp::EIsolationLevel& isolationLevel) {
-    switch (isolationLevel) {
-        case NKikimrKqp::ISOLATION_LEVEL_READ_STALE: return "ReadStale";
-        case NKikimrKqp::ISOLATION_LEVEL_READ_UNCOMMITTED: return "ReadUncommitted";
-        case NKikimrKqp::ISOLATION_LEVEL_READ_COMMITTED: return "ReadCommitted";
-        case NKikimrKqp::ISOLATION_LEVEL_SERIALIZABLE: return "Serializable";
-        default:
-            return TMaybe<TString>();
-    }
-}
 
 TAutoPtr<IGraphTransformer> CreateKiSourceCallableExecutionTransformer(
     TIntrusivePtr<IKikimrGateway> gateway,

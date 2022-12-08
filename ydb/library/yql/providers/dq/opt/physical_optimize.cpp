@@ -3,6 +3,7 @@
 #include <ydb/library/yql/providers/dq/expr_nodes/dqs_expr_nodes.h>
 #include <ydb/library/yql/providers/common/transform/yql_optimize.h>
 #include <ydb/library/yql/dq/opt/dq_opt_phy.h>
+#include <ydb/library/yql/dq/opt/dq_opt_join.h>
 #include <ydb/library/yql/dq/opt/dq_opt.h>
 #include <ydb/library/yql/core/expr_nodes/yql_expr_nodes.h>
 #include <ydb/library/yql/core/yql_opt_utils.h>
@@ -108,17 +109,16 @@ protected:
         }
         const auto& items = GetSeqItemType(wrap.Ref().GetTypeAnn())->Cast<TStructExprType>()->GetItems();
         auto sourceArg = ctx.NewArgument(node.Pos(), "source");
-        bool supportsBlocks = false;
         auto inputType = GetSeqItemType(wrap.Input().Ref().GetTypeAnn());
         while (inputType->GetKind() == ETypeAnnotationKind::Tuple) {
             auto tupleType = inputType->Cast<TTupleExprType>();
-            if (tupleType->GetSize() == 2 && tupleType->GetItems()[1]->GetKind() == ETypeAnnotationKind::Scalar) {
-                supportsBlocks = true;
-                break;
+            if (tupleType->GetSize() > 0) {
+                inputType = tupleType->GetItems()[0];
             }
-
-            inputType = tupleType->GetItems()[0];
         }
+
+        bool supportsBlocks = inputType->GetKind() == ETypeAnnotationKind::Struct &&
+            inputType->Cast<TStructExprType>()->FindItem("_yql_block_length").Defined();
 
         auto wideWrap = ctx.Builder(node.Pos())
             .Callable(UseBlocks && supportsBlocks ? TDqSourceWideBlockWrap::CallableName() : TDqSourceWideWrap::CallableName())
@@ -314,10 +314,10 @@ protected:
 
     template <bool IsGlobal>
     TMaybeNode<TExprBase> BuildJoin(TExprBase node, TExprContext& ctx, IOptimizationContext& optCtx, const TGetParents& getParents) {
-        auto join = node.Cast<TDqJoin>();
+        const auto join = node.Cast<TDqJoin>();
         const TParentsMap* parentsMap = getParents();
-        bool enableGraceJoin = Config->EnableGraceJoin.Get().GetOrElse(false);
-        return DqBuildJoin(join, ctx, optCtx, *parentsMap, IsGlobal, /* pushLeftStage = */ false /* TODO */, enableGraceJoin);
+        const auto mode = Config->HashJoinMode.Get().GetOrElse(EHashJoinMode::Off);
+        return DqBuildJoin(join, ctx, optCtx, *parentsMap, IsGlobal, /* pushLeftStage = */ false /* TODO */, mode);
     }
 
     TMaybeNode<TExprBase> BuildHasItems(TExprBase node, TExprContext& ctx, IOptimizationContext& optCtx) {

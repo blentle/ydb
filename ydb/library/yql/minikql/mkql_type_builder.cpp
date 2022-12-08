@@ -1313,6 +1313,42 @@ private:
 
 namespace NMiniKQL {
 
+bool ConvertArrowType(NUdf::EDataSlot slot, std::shared_ptr<arrow::DataType>& type) {
+    switch (slot) {
+    case NUdf::EDataSlot::Bool:
+    case NUdf::EDataSlot::Uint8:
+        type = arrow::uint8();
+        return true;
+    case NUdf::EDataSlot::Int8:
+        type = arrow::int8();
+        return true;
+    case NUdf::EDataSlot::Uint16:
+    case NUdf::EDataSlot::Date:
+        type = arrow::uint16();
+        return true;
+    case NUdf::EDataSlot::Int16:
+        type = arrow::int16();
+        return true;
+    case NUdf::EDataSlot::Uint32:
+    case NUdf::EDataSlot::Datetime:
+        type = arrow::uint32();
+        return true;
+    case NUdf::EDataSlot::Int32:
+        type = arrow::int32();
+        return true;
+    case NUdf::EDataSlot::Int64:
+    case NUdf::EDataSlot::Interval:
+        type = arrow::int64();
+        return true;
+    case NUdf::EDataSlot::Uint64:
+    case NUdf::EDataSlot::Timestamp:
+        type = arrow::uint64();
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool ConvertArrowType(TType* itemType, bool& isOptional, std::shared_ptr<arrow::DataType>& type) {
     auto unpacked = UnpackOptional(itemType, isOptional);
     if (!unpacked->IsData()) {
@@ -1324,37 +1360,7 @@ bool ConvertArrowType(TType* itemType, bool& isOptional, std::shared_ptr<arrow::
         return false;
     }
 
-    switch (*slot) {
-    case NUdf::EDataSlot::Bool:
-        type = arrow::boolean();
-        return true;
-    case NUdf::EDataSlot::Uint8:
-        type = arrow::uint8();
-        return true;
-    case NUdf::EDataSlot::Int8:
-        type = arrow::int8();
-        return true;
-    case NUdf::EDataSlot::Uint16:
-        type = arrow::uint16();
-        return true;
-    case NUdf::EDataSlot::Int16:
-        type = arrow::int16();
-        return true;
-    case NUdf::EDataSlot::Uint32:
-        type = arrow::uint32();
-        return true;
-    case NUdf::EDataSlot::Int32:
-        type = arrow::int32();
-        return true;
-    case NUdf::EDataSlot::Int64:
-        type = arrow::int64();
-        return true;
-    case NUdf::EDataSlot::Uint64:
-        type = arrow::uint64();
-        return true;
-    default:
-        return false;
-    }
+    return ConvertArrowType(*slot, type);
 }
 
 void TArrowType::Export(ArrowSchema* out) const {

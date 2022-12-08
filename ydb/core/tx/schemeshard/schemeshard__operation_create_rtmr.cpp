@@ -169,16 +169,12 @@ public:
 };
 
 class TCreateRTMR: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::CreateParts;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
             return TTxState::ConfigureParts;
@@ -189,11 +185,10 @@ class TCreateRTMR: public TSubOperation {
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
             return THolder(new TCreateParts(OperationId));
@@ -208,28 +203,8 @@ class TCreateRTMR: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TCreateRTMR(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TCreateRTMR(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString& owner, TOperationContext& context) override {
         const auto ssId = context.SS->SelfTabletId();
@@ -323,10 +298,6 @@ public:
             result->SetError(NKikimrScheme::StatusInvalidParameter, "Unable to construct channel binding with the storage pool");
             return result;
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxCreateRtmrVolume, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         dstPath.MaterializeLeaf(owner);
         result->SetPathId(dstPath.Base()->PathId.LocalPathId);
@@ -401,8 +372,7 @@ public:
         dstPath.Base()->IncShardsInside(shardsToCreate);
         parentPath.Base()->IncAliveChildren();
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -423,17 +393,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateNewRTMR(TOperationId id, const TTxTransaction& tx) {
-    return new TCreateRTMR(id, tx);
+    return MakeSubOperation<TCreateRTMR>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateNewRTMR(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TCreateRTMR(id, state);
+    return MakeSubOperation<TCreateRTMR>(id, state);
 }
 
-}
 }

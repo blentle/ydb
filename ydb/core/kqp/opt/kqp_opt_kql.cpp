@@ -11,45 +11,6 @@ using namespace NYql::NNodes;
 
 namespace {
 
-TExprBase UnwrapReadTableValues(TExprBase input, const TKikimrTableDescription& tableDesc,
-    const TCoAtomList columns, TExprContext& ctx)
-{
-    TCoArgument itemArg = Build<TCoArgument>(ctx, input.Pos())
-        .Name("item")
-        .Done();
-
-    TVector<TExprBase> structItems;
-    for (auto atom : columns) {
-        auto columnType = tableDesc.GetColumnType(TString(atom.Value()));
-        YQL_ENSURE(columnType);
-
-        auto item = Build<TCoNameValueTuple>(ctx, input.Pos())
-            .Name(atom)
-            .Value<TCoCoalesce>()
-                .Predicate<TCoMember>()
-                    .Struct(itemArg)
-                    .Name(atom)
-                    .Build()
-                .Value<TCoDefault>()
-                    .Type(ExpandType(atom.Pos(), *columnType->Cast<TOptionalExprType>()->GetItemType(), ctx))
-                    .Build()
-                .Build()
-            .Done();
-
-        structItems.push_back(item);
-    }
-
-    return Build<TCoMap>(ctx, input.Pos())
-        .Input(input)
-        .Lambda()
-            .Args({itemArg})
-            .Body<TCoAsStruct>()
-                .Add(structItems)
-                .Build()
-            .Build()
-        .Done();
-}
-
 // Replace absent input columns to NULL to perform REPLACE via UPSERT
 std::pair<TExprBase, TCoAtomList> CreateRowsToReplace(const TExprBase& input,
     const TCoAtomList& inputColumns, const TKikimrTableDescription& tableDesc,
@@ -190,22 +151,16 @@ TExprBase BuildReadTable(const TCoAtomList& columns, TPositionHandle pos, const 
 TExprBase BuildReadTable(const TKiReadTable& read, const TKikimrTableDescription& tableData,
     bool withSystemColumns, TExprContext& ctx, const TIntrusivePtr<TKqpOptimizeContext>& kqpCtx)
 {
-    bool unwrapValues = HasSetting(read.Settings().Ref(), "unwrap_values");
-
     const auto& columns = read.GetSelectColumns(ctx, tableData, withSystemColumns);
 
     auto readNode = BuildReadTable(columns, read.Pos(), tableData, ctx, kqpCtx);
 
-    return unwrapValues
-        ? UnwrapReadTableValues(readNode, tableData, columns, ctx)
-        : readNode;
+    return readNode;
 }
 
 TExprBase BuildReadTableIndex(const TKiReadTable& read, const TKikimrTableDescription& tableData,
     const TString& indexName, bool withSystemColumns, TExprContext& ctx)
 {
-    bool unwrapValues = HasSetting(read.Settings().Ref(), "unwrap_values");
-
     auto kqlReadTable = Build<TKqlReadTableIndex>(ctx, read.Pos())
         .Table(BuildTableMeta(tableData, read.Pos(), ctx))
         .Range()
@@ -220,9 +175,7 @@ TExprBase BuildReadTableIndex(const TKiReadTable& read, const TKikimrTableDescri
         .Index().Build(indexName)
         .Done();
 
-    return unwrapValues
-        ? UnwrapReadTableValues(kqlReadTable, tableData, kqlReadTable.Columns(), ctx)
-        : kqlReadTable;
+    return kqlReadTable;
 }
 
 TExprBase BuildUpsertTable(const TKiWriteTable& write, const TCoAtomList& inputColumns,
@@ -748,40 +701,51 @@ TIntrusivePtr<TKikimrTableMetadata> GetIndexMetadata(const TKqlReadTableIndex& r
 TMaybe<TKqlQuery> BuildKqlQuery(TKiDataQuery query, const TKikimrTablesData& tablesData, TExprContext& ctx,
     bool withSystemColumns, const TIntrusivePtr<TKqpOptimizeContext>& kqpCtx)
 {
-    TVector<TExprBase> kqlEffects;
-    for (const auto& effect : query.Effects()) {
-        if (auto maybeWrite = effect.Maybe<TKiWriteTable>()) {
-            auto result = HandleWriteTable(maybeWrite.Cast(), ctx, tablesData);
-            kqlEffects.push_back(result);
+    TVector<TKqlQueryBlock> queryBlocks;
+    queryBlocks.reserve(query.Blocks().Size());
+
+    for (const auto& block : query.Blocks()) {
+        TVector <TExprBase> kqlEffects;
+        for (const auto& effect : block.Effects()) {
+            if (auto maybeWrite = effect.Maybe<TKiWriteTable>()) {
+                auto result = HandleWriteTable(maybeWrite.Cast(), ctx, tablesData);
+                kqlEffects.push_back(result);
+            }
+
+            if (auto maybeUpdate = effect.Maybe<TKiUpdateTable>()) {
+                auto results = HandleUpdateTable(maybeUpdate.Cast(), ctx, tablesData, withSystemColumns, kqpCtx);
+                kqlEffects.insert(kqlEffects.end(), results.begin(), results.end());
+            }
+
+            if (auto maybeDelete = effect.Maybe<TKiDeleteTable>()) {
+                auto results = HandleDeleteTable(maybeDelete.Cast(), ctx, tablesData, withSystemColumns, kqpCtx);
+                kqlEffects.insert(kqlEffects.end(), results.begin(), results.end());
+            }
         }
 
-        if (auto maybeUpdate = effect.Maybe<TKiUpdateTable>()) {
-            auto results = HandleUpdateTable(maybeUpdate.Cast(), ctx, tablesData, withSystemColumns, kqpCtx);
-            kqlEffects.insert(kqlEffects.end(), results.begin(), results.end());
+        TVector <TKqlQueryResult> kqlResults;
+        kqlResults.reserve(block.Results().Size());
+        for (const auto& kiResult : block.Results()) {
+            kqlResults.emplace_back(
+                Build<TKqlQueryResult>(ctx, kiResult.Pos())
+                    .Value(kiResult.Value())
+                    .ColumnHints(kiResult.Columns())
+                    .Done());
         }
 
-        if (auto maybeDelete = effect.Maybe<TKiDeleteTable>()) {
-            auto results = HandleDeleteTable(maybeDelete.Cast(), ctx, tablesData, withSystemColumns, kqpCtx);
-            kqlEffects.insert(kqlEffects.end(), results.begin(), results.end());
-        }
-    }
-
-    TVector<TKqlQueryResult> kqlResults;
-    kqlResults.reserve(query.Results().Size());
-    for (const auto& kiResult : query.Results()) {
-        kqlResults.emplace_back(
-            Build<TKqlQueryResult>(ctx, kiResult.Pos())
-                .Value(kiResult.Value())
-                .ColumnHints(kiResult.Columns())
-                .Done());
+        queryBlocks.emplace_back(Build<TKqlQueryBlock>(ctx, query.Pos())
+            .Results()
+                .Add(kqlResults)
+                .Build()
+             .Effects()
+                .Add(kqlEffects)
+                .Build()
+             .Done());
     }
 
     TKqlQuery kqlQuery = Build<TKqlQuery>(ctx, query.Pos())
-        .Results()
-            .Add(kqlResults)
-            .Build()
-        .Effects()
-            .Add(kqlEffects)
+        .Blocks()
+            .Add(queryBlocks)
             .Build()
         .Done();
 

@@ -42,7 +42,7 @@ public:
         bool isDone = true;
 
         // wait all transaction inside
-        auto pathes = context.SS->ListSubThee(txState->TargetPathId, context.Ctx);
+        auto pathes = context.SS->ListSubTree(txState->TargetPathId, context.Ctx);
         auto relatedTx = context.SS->GetRelatedTransactions(pathes, context.Ctx);
         for (auto otherTxId: relatedTx) {
             if (otherTxId == OperationId.GetTxId()) {
@@ -429,7 +429,7 @@ public:
         shard.Operation = TTxState::ConfigureParts;
 
         TenantSchemeShardId = TTabletId(processing.GetSchemeShard());
-        PathesInside = context.SS->ListSubThee(path.Base()->PathId, context.Ctx);
+        PathesInside = context.SS->ListSubTree(path.Base()->PathId, context.Ctx);
 
         LOG_DEBUG_S(context.Ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
                     DebugHint()
@@ -550,7 +550,7 @@ public:
         auto path = context.SS->PathsById.at(pathId);
 
         path->SwapChildren(HidenChildren); //return back children, now we do not pretend that there no children, we define them as Migrated
-        auto pathsInside = context.SS->ListSubThee(pathId, context.Ctx);
+        auto pathsInside = context.SS->ListSubTree(pathId, context.Ctx);
         pathsInside.erase(pathId);
         for (auto pId: pathsInside) {
             auto item = context.SS->PathsById.at(pId);
@@ -621,7 +621,7 @@ public:
         context.SS->PersistACL(db, item);
         context.SS->ClearDescribePathCaches(item);
 
-        auto subtree = context.SS->ListSubThee(pathId, context.Ctx);
+        auto subtree = context.SS->ListSubTree(pathId, context.Ctx);
         for (const TPathId pathId : subtree) {
             context.OnComplete.RePublishToSchemeBoard(OperationId, pathId);
         }
@@ -831,7 +831,7 @@ public:
         TenantSchemeShardId = subDomain->GetTenantSchemeShardID();
         Y_VERIFY(TenantSchemeShardId);
 
-        auto pathesInside = context.SS->ListSubThee(targetPathId, context.Ctx);
+        auto pathesInside = context.SS->ListSubTree(targetPathId, context.Ctx);
         pathesInside.erase(targetPathId);
         for (auto pId: pathesInside) {
             TPathElement::TPtr item = context.SS->PathsById.at(pId);
@@ -886,7 +886,6 @@ public:
         return false;
     }
 };
-
 
 class TPublishTenant: public TSubOperationState {
 private:
@@ -978,7 +977,7 @@ public:
         }
         IsInited = true;
 
-        auto pathes = context.SS->ListSubThee(pathId, context.Ctx);
+        auto pathes = context.SS->ListSubTree(pathId, context.Ctx);
         pathes.erase(pathId);
 
         auto shards = context.SS->CollectAllShards(pathes);
@@ -1050,19 +1049,14 @@ public:
 };
 
 class TUpgradeSubDomain: public TSubOperation {
-private:
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
     TTxState::ETxState UpgradeSubDomainDecision = TTxState::Invalid;
 
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::Waiting;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Waiting:
             return TTxState::CreateParts;
         case TTxState::CreateParts:
@@ -1073,22 +1067,19 @@ private:
             return TTxState::PublishGlobal;
         case TTxState::PublishGlobal:
             return UpgradeSubDomainDecision;
-
         case TTxState::RewriteOwners:
             return TTxState::PublishTenant;
         case TTxState::PublishTenant:
             return TTxState::DoneMigrateTree;
-
         case TTxState::DeleteTenantSS:
             return TTxState::Invalid;
-
         default:
             return TTxState::Invalid;
         }
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
             return THolder(new TWait(OperationId));
         case TTxState::CreateParts:
@@ -1099,44 +1090,21 @@ private:
             return THolder(new TPublishTenantReadOnly(OperationId));
         case TTxState::PublishGlobal:
             return THolder(new TPublishGlobal(OperationId, UpgradeSubDomainDecision));
-
         case TTxState::RewriteOwners:
             return THolder(new TRewriteOwner(OperationId));
         case TTxState::PublishTenant:
             return THolder(new TPublishTenant(OperationId));
         case TTxState::DoneMigrateTree:
             return THolder(new TDoneMigrateTree(OperationId));
-
         case TTxState::DeleteTenantSS:
             return THolder(new TDeleteTenantSS(OperationId));
-
         default:
             return nullptr;
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TUpgradeSubDomain(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TUpgradeSubDomain(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -1200,7 +1168,7 @@ public:
             TPathElement::EPathType::EPathTypeKesus
         };
 
-        auto pathesInside = context.SS->ListSubThee(pathId, context.Ctx);
+        auto pathesInside = context.SS->ListSubTree(pathId, context.Ctx);
         for (auto pId: pathesInside) {
             if (pId == pathId) {
                 continue;
@@ -1231,10 +1199,6 @@ public:
                                            << ", path state: " << NKikimrSchemeOp::EPathState_Name(pElem->PathState)
                                            << ", locked by: " << context.SS->LockedPaths.at(pId);
             result->SetError(NKikimrScheme::StatusMultipleModifications, msg);
-            return result;
-        }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxUpgradeSubDomain, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
             return result;
         }
 
@@ -1286,9 +1250,9 @@ public:
         path.DomainInfo()->AddInternalShards(txState);
         path.Base()->IncShardsInside();
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
         context.OnComplete.ActivateTx(OperationId);
+
+        SetState(NextState());
         return result;
     }
 
@@ -1366,17 +1330,12 @@ public:
 };
 
 class TUpgradeSubDomainDecision: public TSubOperation {
-private:
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::Done;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Waiting:
             return TTxState::Done;
         default:
@@ -1384,8 +1343,8 @@ private:
         }
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::Done:
             return THolder(new TDecisionDone(OperationId));
@@ -1394,28 +1353,8 @@ private:
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TUpgradeSubDomainDecision(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TUpgradeSubDomainDecision(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -1498,10 +1437,6 @@ public:
             errStr = "Invalid task param";
             result->SetError(NKikimrScheme::StatusInvalidParameter, errStr);
             return result;
-        };
-        if (!context.SS->CheckInFlightLimit(TTxState::TxUpgradeSubDomainDecision, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
         }
 
         TTxState& txState = context.SS->CreateTx(OperationId, TTxState::TxUpgradeSubDomainDecision, path.Base()->PathId);
@@ -1520,11 +1455,9 @@ public:
         LOG_ERROR_S(context.Ctx, NKikimrServices::FLAT_TX_SCHEMESHARD, errMsg);
 
         context.OnComplete.Dependence(txId, OperationId.GetTxId());
-
-        State = NextState();
-        SetState(SelectStateFunc(State));
         context.OnComplete.ActivateTx(OperationId);
 
+        SetState(NextState());
         return result;
     }
 
@@ -1545,26 +1478,24 @@ public:
 
 }
 
-
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateUpgradeSubDomain(TOperationId id, const TTxTransaction& tx) {
-    return new TUpgradeSubDomain(id, tx);
+    return MakeSubOperation<TUpgradeSubDomain>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateUpgradeSubDomain(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TUpgradeSubDomain(id, state);
+    return MakeSubOperation<TUpgradeSubDomain>(id, state);
 }
 
 ISubOperationBase::TPtr CreateUpgradeSubDomainDecision(TOperationId id, const TTxTransaction& tx) {
-    return new TUpgradeSubDomainDecision(id, tx);
+    return MakeSubOperation<TUpgradeSubDomainDecision>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateUpgradeSubDomainDecision(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TUpgradeSubDomainDecision(id, state);
+    return MakeSubOperation<TUpgradeSubDomainDecision>(id, state);
 }
 
 ISubOperationBase::TPtr CreateCompatibleSubdomainDrop(TSchemeShard* ss, TOperationId id, const TTxTransaction& tx) {
@@ -1583,15 +1514,15 @@ ISubOperationBase::TPtr CreateCompatibleSubdomainDrop(TSchemeShard* ss, TOperati
             .NotDeleted();
 
         if (!checks) {
-            return CreateFroceDropSubDomain(id, tx);
+            return CreateForceDropSubDomain(id, tx);
         }
     }
 
     if (path.Base()->IsExternalSubDomainRoot()) {
-        return CreateFroceDropExtSubDomain(id, tx);
+        return CreateForceDropExtSubDomain(id, tx);
     }
 
-    return CreateFroceDropSubDomain(id, tx);
+    return CreateForceDropSubDomain(id, tx);
 }
 
 ISubOperationBase::TPtr CreateCompatibleSubdomainAlter(TSchemeShard* ss, TOperationId id, const TTxTransaction& tx) {
@@ -1621,5 +1552,4 @@ ISubOperationBase::TPtr CreateCompatibleSubdomainAlter(TSchemeShard* ss, TOperat
     return CreateAlterSubDomain(id, tx);
 }
 
-}
 }

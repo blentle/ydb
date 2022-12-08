@@ -44,6 +44,9 @@ sql_stmt_core:
   | create_group_stmt
   | alter_group_stmt
   | drop_role_stmt
+  | create_object_stmt
+  | alter_object_stmt
+  | drop_object_stmt
 ;
 
 expr:
@@ -395,7 +398,7 @@ hopping_window_specification: HOP LPAREN expr COMMA expr COMMA expr COMMA expr R
 
 result_column:
     opt_id_prefix ASTERISK
-  | expr ((AS an_id_or_type) | an_id_pure)?
+  | expr ((AS an_id_or_type) | an_id_as_compat)?
 ;
 
 join_source: ANY? flatten_source (join_op ANY? flatten_source join_constraint?)*;
@@ -409,7 +412,7 @@ flatten_by_arg:
 
 flatten_source: named_single_source (FLATTEN ((OPTIONAL|LIST|DICT)? BY flatten_by_arg | COLUMNS))?;
 
-named_single_source: single_source (((AS an_id) | an_id_pure) pure_column_list?)? (sample_clause | tablesample_clause)?;
+named_single_source: single_source (((AS an_id) | an_id_as_compat) pure_column_list?)? (sample_clause | tablesample_clause)?;
 
 single_source:
     table_ref
@@ -449,6 +452,32 @@ values_source_row_list: values_source_row (COMMA values_source_row)*;
 values_source_row: LPAREN expr_list RPAREN;
 
 simple_values_source: expr_list | select_stmt;
+
+create_object_stmt: CREATE OBJECT object_ref
+    LPAREN TYPE object_type_ref RPAREN
+    create_object_features?
+;
+create_object_features: WITH object_features;
+
+alter_object_stmt: ALTER OBJECT object_ref
+    LPAREN TYPE object_type_ref RPAREN
+    alter_object_features
+;
+alter_object_features: SET object_features;
+
+drop_object_stmt: DROP OBJECT object_ref
+    LPAREN TYPE object_type_ref RPAREN
+    drop_object_features?
+;
+drop_object_features: WITH object_features;
+
+object_feature_value: an_id_or_type | bind_parameter;
+object_feature_kv: an_id_or_type EQUALS object_feature_value;
+object_feature_flag: an_id_or_type;
+object_feature: object_feature_kv | object_feature_flag;
+object_features: object_feature | LPAREN object_feature (COMMA object_feature)* RPAREN;
+
+object_type_ref: an_id_or_type;
 
 create_table_stmt: CREATE (TABLE | TABLESTORE) simple_table_ref LPAREN create_table_entry (COMMA create_table_entry)* RPAREN
     table_inherits?
@@ -530,11 +559,8 @@ local_index: LOCAL;
 changefeed: CHANGEFEED an_id WITH LPAREN changefeed_settings RPAREN;
 changefeed_settings: changefeed_settings_entry (COMMA changefeed_settings_entry)*;
 changefeed_settings_entry: an_id EQUALS changefeed_setting_value;
-changefeed_setting_value:
-    STRING_VALUE
-  | bool_value
-;
-changefeed_alter_settings: 
+changefeed_setting_value: expr;
+changefeed_alter_settings:
     DISABLE
   | SET LPAREN changefeed_settings RPAREN
 ;
@@ -593,7 +619,8 @@ table_hint:
     | SCHEMA EQUALS? LPAREN (struct_arg_positional (COMMA struct_arg_positional)*)? COMMA? RPAREN
 ;
 
-simple_table_ref_core: ((cluster_expr DOT)? id_or_at) | AT? bind_parameter;
+object_ref: (cluster_expr DOT)? id_or_at;
+simple_table_ref_core: object_ref | AT? bind_parameter;
 simple_table_ref: simple_table_ref_core table_hints?;
 into_simple_table_ref: simple_table_ref (ERASE BY pure_column_list)?;
 
@@ -755,6 +782,9 @@ id_hint:
 //  | keyword_hint_uncompat
 ;
 
+id_as_compat: identifier | keyword_as_compat;
+keyword_as_compat: TYPE;
+
 // ANSI-aware versions of various identifiers with support double-quoted identifiers when PRAGMA AnsiQuotedIdentifiers; is present
 an_id: id | STRING_VALUE;
 an_id_or_type: id_or_type | STRING_VALUE;
@@ -766,6 +796,7 @@ an_id_table: id_table | STRING_VALUE;
 an_id_without: id_without | STRING_VALUE;
 an_id_hint: id_hint | STRING_VALUE;
 an_id_pure: identifier | STRING_VALUE;
+an_id_as_compat: id_as_compat | STRING_VALUE;
 
 opt_id_prefix: (an_id DOT)?;
 cluster_expr: (an_id COLON)? (pure_column_or_named | ASTERISK);
@@ -1002,6 +1033,7 @@ keyword_compat: (
   | TEMPORARY
   | THEN
   | TIES
+  | TYPE
   | TO
   | TRANSACTION
   | TRIGGER
@@ -1318,6 +1350,7 @@ TEMP: T E M P;
 TEMPORARY: T E M P O R A R Y;
 THEN: T H E N;
 TIES: T I E S;
+TYPE: T Y P E;
 TO: T O;
 TRANSACTION: T R A N S A C T I O N;
 TRIGGER: T R I G G E R;

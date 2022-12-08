@@ -17,7 +17,7 @@
 
 #include <ydb/public/lib/yson_value/ydb_yson_value.h>
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor.h>
-#include <ydb/core/kqp/kqp.h>
+#include <ydb/core/kqp/common/kqp.h>
 
 #include <library/cpp/actors/core/actorsystem.h>
 #include <library/cpp/actors/core/event_pb.h>
@@ -170,9 +170,9 @@ private:
                 break;
             }
             case NDqProto::COMPUTE_STATE_FINISHED: {
-                YQL_CLOG(DEBUG, ProviderDq) << " " << SelfId() << " Finish TaskId: " << taskId;
                 Executing.erase(taskId);
                 FinishedTasks.insert(taskId);
+                YQL_CLOG(DEBUG, ProviderDq) << " " << SelfId() << " Finish TaskId: " << taskId << ". Tasks finished: " << FinishedTasks.size() << "/" << Tasks.size();
                 break;
             }
         }
@@ -332,6 +332,14 @@ private:
         ADD_COUNTER(WaitTimeUs)
         ADD_COUNTER(WaitOutputTimeUs)
 
+        for (const auto& ingress : s.GetIngress()) {
+            TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "Ingress" + ingress.GetName() + "Bytes"), ingress.GetBytes());
+        }
+
+        for (const auto& egress : s.GetEgress()) {
+            TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "Egress" + egress.GetName() + "Bytes"), egress.GetBytes());
+        }
+
         if (auto v = x.GetMkqlMaxMemoryUsage()) {
             TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "MkqlMaxMemoryUsage"), v);
         }
@@ -411,6 +419,7 @@ private:
 
             ADD_COUNTER(Chunks);
             ADD_COUNTER(Bytes);
+            ADD_COUNTER(IngressBytes)
             ADD_COUNTER(RowsIn);
             ADD_COUNTER(RowsOut);
             ADD_COUNTER(MaxMemoryUsage);
@@ -430,6 +439,7 @@ private:
 
             ADD_COUNTER(Chunks)
             ADD_COUNTER(Bytes);
+            ADD_COUNTER(EgressBytes)
             ADD_COUNTER(RowsIn);
             ADD_COUNTER(RowsOut);
             ADD_COUNTER(MaxMemoryUsage);

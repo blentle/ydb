@@ -331,7 +331,6 @@ namespace NKikimr {
         IMPL_REQUEST(RegisterNode, TNodeRegistrationRequest, TNodeRegistrationResponse)
         IMPL_REQUEST(CmsRequest, TCmsRequest, TCmsResponse)
         IMPL_REQUEST(SqsRequest, TSqsRequest, TSqsResponse)
-        IMPL_REQUEST(S3Listing, TS3ListingRequest, TS3ListingResponse)
         IMPL_REQUEST(LocalMKQL, TLocalMKQL, TResponse)
         IMPL_REQUEST(LocalSchemeTx, TLocalSchemeTx, TResponse)
         IMPL_REQUEST(TabletKillRequest, TTabletKillRequest, TResponse)
@@ -348,6 +347,7 @@ namespace NKikimr {
         IMPL_REQUEST(WhoAmI, TWhoAmI, TResponse)
         IMPL_REQUEST(FillNode, TFillNodeRequest, TResponse)
         IMPL_REQUEST(DrainNode, TDrainNodeRequest, TResponse)
+        IMPL_REQUEST(LoginRequest, TLoginRequest, TResponse)
 
         } // NGRpcProxy
 } // NKikimr

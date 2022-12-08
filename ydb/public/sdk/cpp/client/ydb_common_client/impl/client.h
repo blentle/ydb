@@ -5,6 +5,7 @@
 #undef INCLUDE_YDB_INTERNAL_H
 
 #include <ydb/public/sdk/cpp/client/ydb_types/exceptions/exceptions.h>
+#include <ydb/public/sdk/cpp/client/impl/ydb_internal/common/ssl_credentials.h>
 
 #include <memory>
 
@@ -18,11 +19,10 @@ public:
         const TMaybe<TString>& database,
         const TMaybe<TString>& discoveryEndpoint,
         const TMaybe<EDiscoveryMode>& discoveryMode,
-        const TMaybe<bool>& enableSsl,
-        const TMaybe<TString>& caCert,
+        const TMaybe<TSslCredentials>& sslCredentials,
         const TMaybe<std::shared_ptr<ICredentialsProviderFactory>>& credentialsProviderFactory)
         : Connections_(std::move(connections))
-        , DbDriverState_(Connections_->GetDriverState(database, discoveryEndpoint, discoveryMode, enableSsl, caCert, credentialsProviderFactory))
+        , DbDriverState_(Connections_->GetDriverState(database, discoveryEndpoint, discoveryMode, sslCredentials, credentialsProviderFactory))
     {
         Y_VERIFY(DbDriverState_);
     }
@@ -36,8 +36,7 @@ public:
                 settings.Database_,
                 settings.DiscoveryEndpoint_,
                 settings.DiscoveryMode_,
-                settings.EnableSsl_,
-                settings.CaCert_,
+                settings.SslCredentials_,
                 settings.CredentialsProviderFactory_
             )
         )
@@ -61,7 +60,6 @@ protected:
         TRequest&& request,
         TAsyncRequest<TService, TRequest, TResponse> rpc,
         const TRpcRequestSettings& requestSettings = {},
-        TDuration timeout = TDuration::Zero(),
         const TEndpointKey& preferredEndpoint = TEndpointKey())
     {
         auto promise = NThreading::NewPromise<TStatus>();
@@ -79,7 +77,6 @@ protected:
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
             requestSettings,
-            timeout,
             preferredEndpoint);
 
         return promise.GetFuture();
@@ -89,8 +86,7 @@ protected:
     NThreading::TFuture<TOp> RunOperation(
         TRequest&& request,
         TAsyncRequest<TService, TRequest, TResponse> rpc,
-        const TRpcRequestSettings& requestSettings = {},
-        TDuration timeout = TDuration::Zero())
+        const TRpcRequestSettings& requestSettings = {})
     {
         auto promise = NThreading::NewPromise<TOp>();
 
@@ -110,8 +106,7 @@ protected:
             rpc,
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
-            requestSettings,
-            timeout);
+            requestSettings);
 
         return promise.GetFuture();
     }

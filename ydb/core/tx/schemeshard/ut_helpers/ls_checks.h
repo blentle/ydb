@@ -51,7 +51,8 @@ namespace NLs {
     TCheckFunc StoragePoolsEqual(TSet<TString> poolNames);
     TCheckFunc DomainCoordinators(TVector<ui64> coordinators);
     TCheckFunc DomainMediators(TVector<ui64> mediators);
-    TCheckFunc DomainSchemeshard(ui64 schemeshard);
+    TCheckFunc DomainSchemeshard(ui64 domainSchemeshardId);
+    TCheckFunc DomainHive(ui64 domainHiveId);
     TCheckFunc DomainKey(ui64 pathId, ui64 schemeshardId);
     TCheckFunc DomainKey(TPathId pathId);
     TCheckFunc DomainSettings(ui32 planResolution, ui32 timeCastBucketsPerMediator);
@@ -59,8 +60,9 @@ namespace NLs {
 
     TCheckFunc IsExternalSubDomain(const TString& name);
     void InExternalSubdomain(const NKikimrScheme::TEvDescribeSchemeResult& record);
-    TCheckFunc ExtractTenantSchemeshard(ui64* tenantSchemeShard);
-    TCheckFunc ExtractTenantSysViewProcessor(ui64* tenantSVP);
+    TCheckFunc ExtractTenantSchemeshard(ui64* tenantSchemeShardId);
+    TCheckFunc ExtractTenantSysViewProcessor(ui64* tenantSVPId);
+    TCheckFunc ExtractDomainHive(ui64* domainHiveId);
 
     void NotFinished(const NKikimrScheme::TEvDescribeSchemeResult& record);
     void Finished(const NKikimrScheme::TEvDescribeSchemeResult& record);
@@ -105,8 +107,7 @@ namespace NLs {
     TCheckFunc HasColumnTableTtlSettingsVersion(ui64 ttlSettingsVersion);
     TCheckFunc HasColumnTableTtlSettingsEnabled(const TString& columnName, const TDuration& expireAfter);
     TCheckFunc HasColumnTableTtlSettingsDisabled();
-    TCheckFunc HasColumnTableTtlSettingsTiering(ui32 tierNo, const TString& tierName, const TString& columnName,
-                                              const TDuration& evictAfter);
+    TCheckFunc HasColumnTableTtlSettingsTiering(const TString& tierName);
 
     TCheckFunc CheckPartCount(const TString& name, ui32 partCount, ui32 maxParts, ui32 tabletCount, ui32 groupCount,
                               NKikimrSchemeOp::EPathState pathState = NKikimrSchemeOp::EPathState::EPathStateNoChanges);
@@ -120,6 +121,7 @@ namespace NLs {
     TCheckFunc StreamMode(NKikimrSchemeOp::ECdcStreamMode mode);
     TCheckFunc StreamFormat(NKikimrSchemeOp::ECdcStreamFormat format);
     TCheckFunc StreamState(NKikimrSchemeOp::ECdcStreamState state);
+    TCheckFunc StreamVirtualTimestamps(bool value);
     TCheckFunc RetentionPeriod(const TDuration& value);
 
     TCheckFunc HasBackupInFly(ui64 txId);

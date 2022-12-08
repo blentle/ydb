@@ -35,6 +35,7 @@ add_subdirectory(ut_snapshot)
 add_subdirectory(ut_stats)
 add_subdirectory(ut_testload)
 add_subdirectory(ut_upload_rows)
+add_subdirectory(ut_volatile)
 
 add_library(core-tx-datashard)
 target_compile_options(core-tx-datashard PRIVATE
@@ -135,7 +136,6 @@ target_sources(core-tx-datashard PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard__readset.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard__read_iterator.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard__read_columns.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard__s3.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard__s3_download_txs.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard__s3_upload_txs.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/datashard/datashard__kqp_scan.cpp

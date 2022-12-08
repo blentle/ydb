@@ -61,6 +61,7 @@ target_link_libraries(core-tx-schemeshard PUBLIC
   cpp-deprecated-enum_codegen
   cpp-html-pcdata
   ydb-core-actorlib_impl
+  ydb-core-audit
   ydb-core-base
   ydb-core-blob_depot
   core-blockstore-core
@@ -205,6 +206,8 @@ target_sources(core-tx-schemeshard PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_path_describer.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_path_element.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_path.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_svp_migration.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_tables_storage.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_types.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_ui64id.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_utils.cpp

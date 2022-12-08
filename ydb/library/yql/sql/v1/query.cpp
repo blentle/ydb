@@ -1,5 +1,6 @@
 #include "node.h"
 #include "context.h"
+#include "object_processing.h"
 
 #include <ydb/library/yql/ast/yql_type_string.h>
 #include <ydb/library/yql/core/yql_callable_names.h>
@@ -125,6 +126,12 @@ static INode::TPtr CreateChangefeedDesc(const TChangefeedDescription& desc, cons
     }
     if (desc.Settings.InitialScan) {
         settings = node.L(settings, node.Q(node.Y(node.Q("initial_scan"), desc.Settings.InitialScan)));
+    }
+    if (desc.Settings.VirtualTimestamps) {
+        settings = node.L(settings, node.Q(node.Y(node.Q("virtual_timestamps"), desc.Settings.VirtualTimestamps)));
+    }
+    if (desc.Settings.RetentionPeriod) {
+        settings = node.L(settings, node.Q(node.Y(node.Q("retention_period"), desc.Settings.RetentionPeriod)));
     }
     if (const auto& sink = desc.Settings.SinkSettings) {
         switch (sink->index()) {
@@ -1491,6 +1498,21 @@ private:
     TScopedStatePtr Scoped;
     TSourcePtr FakeSource;
 };
+
+TNodePtr BuildCreateObjectOperation(TPosition pos, const TString& objectId, const TString& typeId,
+    std::map<TString, TDeferredAtom>&& features, const TObjectOperatorContext& context) {
+    return new TCreateObject(pos, objectId, typeId, std::move(features), context);
+}
+TNodePtr BuildAlterObjectOperation(TPosition pos, const TString& secretId, const TString& typeId,
+    std::map<TString, TDeferredAtom>&& features, const TObjectOperatorContext& context)
+{
+    return new TAlterObject(pos, secretId, typeId, std::move(features), context);
+}
+TNodePtr BuildDropObjectOperation(TPosition pos, const TString& secretId, const TString& typeId,
+    std::map<TString, TDeferredAtom>&& options, const TObjectOperatorContext& context)
+{
+    return new TDropObject(pos, secretId, typeId, std::move(options), context);
+}
 
 TNodePtr BuildDropRoles(TPosition pos, const TString& service, const TDeferredAtom& cluster, const TVector<TDeferredAtom>& toDrop, bool isUser, bool force, TScopedStatePtr scoped) {
     return new TDropRoles(pos, service, cluster, toDrop, isUser, force, scoped);

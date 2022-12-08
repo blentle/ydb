@@ -22,6 +22,8 @@ using namespace NYdb::NTable;
 
 namespace {
 
+static const char DefaultTablePath[] = "clickbench/hits";
+
 struct TTestInfo {
     TDuration ColdTime;
     TDuration Min;
@@ -312,7 +314,64 @@ void TClickBenchCommandInit::Config(TConfig& config) {
     config.Opts->AddLongOption('p', "path", "Table name to work with")
         .Optional()
         .RequiredArgument("NAME")
-        .DefaultValue("clickbench/hits")
+        .DefaultValue(DefaultTablePath)
+        .Handler1T<TStringBuf>([this](TStringBuf arg) {
+            if (arg.StartsWith('/')) {
+                ythrow NLastGetopt::TUsageException() << "Path must be relative";
+            }
+            Table = arg;
+        });
+    config.Opts->AddLongOption("store", "Storage type."
+            " Options: row, column\n"
+            "row - use row-based storage engine;\n"
+            "column - use column-based storage engine.")
+        .DefaultValue("column").StoreResult(&StoreType);
+};
+
+int TClickBenchCommandInit::Run(TConfig& config) {
+    StoreType = to_lower(StoreType);
+    TString partitionBy = "";
+    TString storageType = "";
+    TString notNull = "";
+    if (StoreType == "column") {
+        //partitionBy = "PARTITION BY HASH(CounterID)"; Not enough cardinality in CounterID column @sa KIKIMR-16478
+        partitionBy = "PARTITION BY HASH(EventTime)";
+        storageType = "STORE = COLUMN,";
+        notNull = "NOT NULL";
+    } else if (StoreType != "row") {
+        throw yexception() << "Incorrect storage type. Available options: \"row\", \"column\"." << Endl;
+    }
+
+    auto driver = CreateDriver(config);
+
+    TString createSql = NResource::Find("click_bench_schema.sql");
+    TTableClient client(driver);
+
+    SubstGlobal(createSql, "{table}", FullTablePath(config.Database, Table));
+    SubstGlobal(createSql, "{notnull}", notNull);
+    SubstGlobal(createSql, "{partition}", partitionBy);
+    SubstGlobal(createSql, "{store}", storageType);
+
+    ThrowOnError(client.RetryOperationSync([createSql](TSession session) {
+        return session.ExecuteSchemeQuery(createSql).GetValueSync();
+    }));
+
+    Cout << "Table created." << Endl;
+    driver.Stop(true);
+    return 0;
+};
+
+TClickBenchCommandClean::TClickBenchCommandClean()
+    : TYdbCommand("clean", {}, "Drop table")
+{}
+
+void TClickBenchCommandClean::Config(TConfig& config) {
+    NYdb::NConsoleClient::TClientCommand::Config(config);
+    config.SetFreeArgsNum(0);
+    config.Opts->AddLongOption('p', "path", "Table name to work with")
+        .Optional()
+        .RequiredArgument("NAME")
+        .DefaultValue(DefaultTablePath)
         .Handler1T<TStringBuf>([this](TStringBuf arg) {
             if (arg.StartsWith('/')) {
                 ythrow NLastGetopt::TUsageException() << "Path must be relative";
@@ -321,18 +380,24 @@ void TClickBenchCommandInit::Config(TConfig& config) {
         });
 };
 
-int TClickBenchCommandInit::Run(TConfig& config) {
+int TClickBenchCommandClean::Run(TConfig& config) {
     auto driver = CreateDriver(config);
 
-    TString createSql = NResource::Find("click_bench_schema.sql");
+    static const char DropDdlTmpl[] = "DROP TABLE `%s`;";
+    char dropDdl[sizeof(DropDdlTmpl) + 8192*3]; // 32*256 for DbPath
+    TString fullPath = FullTablePath(config.Database, Table);
+    int res = std::sprintf(dropDdl, DropDdlTmpl, fullPath.c_str());
+    if (res < 0) {
+        Cerr << "Failed to generate DROP DDL query for `" << fullPath << "` table." << Endl;
+        return -1;
+    }
     TTableClient client(driver);
 
-    SubstGlobal(createSql, "{table}", FullTablePath(config.Database, Table));
-    ThrowOnError(client.RetryOperationSync([createSql](TSession session) {
-        return session.ExecuteSchemeQuery(createSql).GetValueSync();
+    ThrowOnError(client.RetryOperationSync([dropDdl](TSession session) {
+        return session.ExecuteSchemeQuery(dropDdl).GetValueSync();
     }));
 
-    Cout << "Table created" << Endl;
+    Cout << "Clean succeeded." << Endl;
     driver.Stop(true);
     return 0;
 };
@@ -368,7 +433,7 @@ void TClickBenchCommandRun::Config(TConfig& config) {
     config.Opts->AddLongOption("table", "Table to work with")
         .Optional()
         .RequiredArgument("NAME")
-        .DefaultValue("clickbench/hits")
+        .DefaultValue(DefaultTablePath)
         .Handler1T<TStringBuf>([this](TStringBuf arg) {
             if (arg.StartsWith('/')) {
                 ythrow NLastGetopt::TUsageException() << "Path must be relative";
@@ -424,10 +489,11 @@ int TClickBenchCommandRun::Run(TConfig& config) {
 };
 
 TCommandClickBench::TCommandClickBench()
-    : TClientCommandTree("clickbench")
+    : TClientCommandTree("clickbench", {}, "ClickBench workload (ClickHouse OLAP test)")
 {
     AddCommand(std::make_unique<TClickBenchCommandRun>());
     AddCommand(std::make_unique<TClickBenchCommandInit>());
+    AddCommand(std::make_unique<TClickBenchCommandClean>());
 }
 
 } // namespace NYdb::NConsoleClient

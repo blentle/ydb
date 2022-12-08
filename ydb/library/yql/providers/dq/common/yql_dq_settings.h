@@ -4,6 +4,7 @@
 #include <ydb/library/yql/providers/common/config/yql_setting.h>
 
 #include <ydb/library/yql/core/yql_data_provider.h>
+#include <ydb/library/yql/dq/common/dq_common.h>
 
 #include <library/cpp/string_utils/parse_size/parse_size.h>
 
@@ -74,7 +75,6 @@ struct TDqSettings {
     NCommon::TConfSetting<TString, false> _FallbackOnRuntimeErrors;
     NCommon::TConfSetting<bool, false> _EnablePrecompute;
     NCommon::TConfSetting<bool, false> EnableDqReplicate;
-    NCommon::TConfSetting<bool, false> EnableGraceJoin;
     NCommon::TConfSetting<TString, false> WatermarksMode;
     NCommon::TConfSetting<bool, false> WatermarksEnableIdlePartitions;
     NCommon::TConfSetting<ui64, false> WatermarksGranularityMs;
@@ -83,6 +83,7 @@ struct TDqSettings {
     NCommon::TConfSetting<ui64, false> ParallelOperationsLimit;
 
     NCommon::TConfSetting<TString, false> WorkerFilter;
+    NCommon::TConfSetting<NDq::EHashJoinMode, false> HashJoinMode;
 
     // This options will be passed to executor_actor and worker_actor
     template <typename TProtoConfig>
@@ -122,10 +123,10 @@ struct TDqSettings {
         SAVE_SETTING(ComputeActorType);
         SAVE_SETTING(WatermarksMode);
         SAVE_SETTING(WatermarksEnableIdlePartitions);
-        SAVE_SETTING(EnableGraceJoin);
         SAVE_SETTING(WatermarksGranularityMs);
         SAVE_SETTING(WatermarksLateArrivalDelayMs);
         SAVE_SETTING(UseAggPhases);
+        SAVE_SETTING(HashJoinMode);
 
 #undef SAVE_SETTING
     }

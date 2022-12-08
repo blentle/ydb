@@ -9,23 +9,23 @@
 namespace NKikimr::NMetadataProvider {
 using namespace NInternal::NRequest;
 
-void TDSAccessorRefresher::Handle(TEvRequestResult<TDialogSelect>::TPtr& ev) {
-    const TString startString = CurrentSelection.SerializeAsString();
-
-    auto currentFullReply = ev->Get()->GetResult();
+void TDSAccessorRefresher::Handle(TEvYQLResponse::TPtr& ev) {
+    auto& currentFullReply = ev->Get()->GetResponse();
     Ydb::Table::ExecuteQueryResult qResult;
     currentFullReply.operation().result().UnpackTo(&qResult);
-    Y_VERIFY((size_t)qResult.result_sets().size() == SnapshotConstructor->GetTables().size());
-    *CurrentSelection.mutable_result_sets() = std::move(*qResult.mutable_result_sets());
-    auto parsedSnapshot = SnapshotConstructor->ParseSnapshot(CurrentSelection, RequestedActuality);
+    Y_VERIFY((size_t)qResult.result_sets().size() == SnapshotConstructor->GetManagers().size());
+    *ProposedProto.mutable_result_sets() = std::move(*qResult.mutable_result_sets());
+    auto parsedSnapshot = SnapshotConstructor->ParseSnapshot(ProposedProto, RequestedActuality);
     if (!parsedSnapshot) {
         ALS_ERROR(NKikimrServices::METADATA_PROVIDER) << "cannot parse current snapshot";
     }
 
-    if (!!parsedSnapshot && CurrentSelection.SerializeAsString() != startString) {
-        ALS_INFO(NKikimrServices::METADATA_PROVIDER) << "New refresher data: " << CurrentSelection.DebugString();
-        SnapshotConstructor->EnrichSnapshotData(parsedSnapshot, GetController());
+    if (!!parsedSnapshot && CurrentSelection.SerializeAsString() != ProposedProto.SerializeAsString()) {
+        ALS_INFO(NKikimrServices::METADATA_PROVIDER) << "New refresher data: " << ProposedProto.DebugString();
+        SnapshotConstructor->EnrichSnapshotData(parsedSnapshot, InternalController);
     } else {
+        CurrentSnapshot->SetActuality(RequestedActuality);
+        OnSnapshotRefresh();
         Schedule(Config.GetRefreshPeriod(), new TEvRefresh());
     }
 }
@@ -34,7 +34,9 @@ void TDSAccessorRefresher::Handle(TEvEnrichSnapshotResult::TPtr& ev) {
     RequestedActuality = TInstant::Zero();
     Schedule(Config.GetRefreshPeriod(), new TEvRefresh());
     CurrentSnapshot = ev->Get()->GetEnrichedSnapshot();
+    *CurrentSelection.mutable_result_sets() = std::move(*ProposedProto.mutable_result_sets());
     OnSnapshotModified();
+    OnSnapshotRefresh();
 }
 
 void TDSAccessorRefresher::Handle(TEvEnrichSnapshotProblem::TPtr& ev) {
@@ -43,48 +45,28 @@ void TDSAccessorRefresher::Handle(TEvEnrichSnapshotProblem::TPtr& ev) {
     ALS_INFO(NKikimrServices::METADATA_PROVIDER) << "enrich problem: " << ev->Get()->GetErrorText();
 }
 
-void TDSAccessorRefresher::Handle(TEvRequestResult<TDialogCreateSession>::TPtr& ev) {
-    Ydb::Table::CreateSessionResponse currentFullReply = ev->Get()->GetResult();
-    Ydb::Table::CreateSessionResult session;
-    currentFullReply.operation().result().UnpackTo(&session);
-    const TString sessionId = session.session_id();
-    Y_VERIFY(sessionId);
-    Ydb::Table::ExecuteDataQueryRequest request;
-    TStringBuilder sb;
-    auto& tables = SnapshotConstructor->GetTables();
-    Y_VERIFY(tables.size());
-    for (auto&& i : tables) {
-        sb << "SELECT * FROM `" + EscapeC(i) + "`;";
-    }
-
-    request.mutable_query()->set_yql_text(sb);
-    request.set_session_id(sessionId);
-    request.mutable_tx_control()->mutable_begin_tx()->mutable_snapshot_read_only();
-
-    Register(new TYDBRequest<TDialogSelect>(std::move(request), SelfId(), Config.GetRequestConfig()));
-}
-
 void TDSAccessorRefresher::Handle(TEvRefresh::TPtr& /*ev*/) {
-    Register(new TYDBRequest<TDialogCreateSession>(TDialogCreateSession::TRequest(), SelfId(), Config.GetRequestConfig()));
+    TStringBuilder sb;
+    RequestedActuality = TInstant::Now();
+    auto& managers = SnapshotConstructor->GetManagers();
+    Y_VERIFY(managers.size());
+    for (auto&& i : managers) {
+        sb << "SELECT * FROM `" + EscapeC(i->GetTablePath()) + "`;";
+    }
+    Register(new TYQLQuerySessionedActor(sb, NACLib::TSystemUsers::Metadata(), Config.GetRequestConfig(), InternalController));
 }
 
-void TDSAccessorRefresher::OnInitialized() {
-    Sender<TEvRefresh>().SendTo(SelfId());
-}
-
-TDSAccessorRefresher::TDSAccessorRefresher(const TConfig& config, ISnapshotParser::TPtr snapshotConstructor)
-    : TBase(config.GetRequestConfig())
-    , SnapshotConstructor(snapshotConstructor)
+TDSAccessorRefresher::TDSAccessorRefresher(const TConfig& config, ISnapshotsFetcher::TPtr snapshotConstructor)
+    : SnapshotConstructor(snapshotConstructor)
     , Config(config)
 {
 
 }
 
-ISnapshotAcceptorController::TPtr TDSAccessorRefresher::GetController() const {
-    if (!ControllerImpl) {
-        ControllerImpl = std::make_shared<TSnapshotAcceptorController>(SelfId());
-    }
-    return ControllerImpl;
+void TDSAccessorRefresher::Bootstrap() {
+    RegisterState();
+    InternalController = std::make_shared<TRefreshInternalController>(SelfId());
+    Sender<TEvRefresh>().SendTo(SelfId());
 }
 
 }

@@ -531,6 +531,18 @@ bool TPipeline::LoadTxDetails(TTransactionContext &txc,
         LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD,
                     "LoadTxDetails at " << Self->TabletID() << " got data tx from cache "
                     << tx->GetStep() << ":" << tx->GetTxId());
+    } else if (tx->HasVolatilePrepareFlag()) {
+        // Since transaction is volatile it was never stored on disk, and it
+        // shouldn't have any artifacts yet.
+        tx->FillVolatileTxData(Self, txc, ctx);
+
+        ui32 keysCount = 0;
+        keysCount = tx->ExtractKeys();
+
+        LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD,
+                    "LoadTxDetails at " << Self->TabletID() << " loaded tx from memory "
+                    << tx->GetStep() << ":" << tx->GetTxId() << " keys extracted: "
+                    << keysCount);
     } else {
         NIceDb::TNiceDb db(txc.DB);
         TActorId target;
@@ -618,7 +630,9 @@ bool TPipeline::SaveInReadSet(const TEvTxProcessing::TEvReadSet &rs,
         LOG_NOTICE(ctx, NKikimrServices::TX_DATASHARD,
                    "Unexpected readset in state %" PRIu32 " for %" PRIu64 ":%" PRIu64 " at %" PRIu64,
                    Self->State, step, txId, Self->TabletID());
-        DelayedAcks[TStepOrder(step, txId)] =  std::move(ack);
+        if (ack) {
+            DelayedAcks[TStepOrder(step, txId)] = std::move(ack);
+        }
         return false;
     }
 
@@ -626,9 +640,12 @@ bool TPipeline::SaveInReadSet(const TEvTxProcessing::TEvReadSet &rs,
     if (op) {
         // If input read sets are not loaded yet then
         // it will be added at load.
-        if (op->HasLoadedInRSFlag())
+        if (op->HasLoadedInRSFlag()) {
             op->AddInReadSet(rs.Record);
-        op->AddDelayedAck(THolder(ack.Release()));
+        }
+        if (ack) {
+            op->AddDelayedAck(THolder(ack.Release()));
+        }
         op->AddDelayedInReadSet(rs.Record);
 
         AddCandidateOp(op);
@@ -988,7 +1005,9 @@ void TPipeline::ProposeTx(TOperation::TPtr op, const TStringBuf &txBody, TTransa
 {
     NIceDb::TNiceDb db(txc.DB);
     SetProposed(op->GetTxId(), op->GetTarget());
-    PreserveSchema(db, op->GetMaxStep());
+    if (!op->HasVolatilePrepareFlag()) {
+        PreserveSchema(db, op->GetMaxStep());
+    }
     Self->TransQueue.ProposeTx(db, op, op->GetTarget(), txBody);
     if (Self->IsStopping() && op->GetTarget()) {
         // Send notification if we prepared a tx while shard was stopping

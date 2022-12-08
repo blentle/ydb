@@ -6,6 +6,8 @@
 
 #include <ydb/library/yql/minikql/mkql_node_cast.h>
 
+#include <arrow/array/array_primitive.h>
+
 namespace NKikimr {
 namespace NMiniKQL {
 
@@ -53,11 +55,34 @@ public:
                     continue;
                 }
 
+                std::optional<ui64> filtered;
+                if (FilterColumn_) {
+                    auto filterDatum = TArrowBlock::From(s.Values_[*FilterColumn_]).GetDatum();
+                    if (filterDatum.is_scalar()) {
+                        if (!filterDatum.scalar_as<arrow::BooleanScalar>().value) {
+                            continue;
+                        }
+                    } else {
+                        arrow::BooleanArray arr(filterDatum.array());
+                        ui64 popCount = (ui64)arr.true_count();
+                        if (popCount == 0) {
+                            continue;
+                        }
+
+                        if (popCount < batchLength) {
+                            filtered = popCount;
+                        }
+                    }
+                }
+
                 s.HasValues_ = true;
+                char* ptr = s.AggStates_.data();
                 for (size_t i = 0; i < s.Aggs_.size(); ++i) {
                     if (output[i]) {
-                        s.Aggs_[i]->AddMany(s.Values_.data(), batchLength);
+                        s.Aggs_[i]->AddMany(ptr, s.Values_.data(), batchLength, filtered);
                     }
+
+                    ptr += s.Aggs_[i]->StateSize;
                 }
             } else {
                 s.IsFinished_ = true;
@@ -65,10 +90,13 @@ public:
                     return EFetchResult::Finish;
                 }
 
+                char* ptr = s.AggStates_.data();
                 for (size_t i = 0; i < s.Aggs_.size(); ++i) {
                     if (auto* out = output[i]; out != nullptr) {
-                        *out = s.Aggs_[i]->Finish();
+                        *out = s.Aggs_[i]->FinishOne(ptr);
                     }
+
+                    ptr += s.Aggs_[i]->StateSize;
                 }
 
                 return EFetchResult::One;
@@ -85,6 +113,7 @@ private:
         TVector<std::unique_ptr<IBlockAggregator>> Aggs_;
         bool IsFinished_ = false;
         bool HasValues_ = false;
+        TVector<char> AggStates_;
 
         TState(TMemoryUsageInfo* memInfo, size_t width, std::optional<ui32> filterColumn, const TVector<TAggParams>& params, const THolderFactory& holderFactory)
             : TComputationValue(memInfo)
@@ -95,8 +124,18 @@ private:
                 ValuePointers_[i] = &Values_[i];
             }
 
+            ui32 totalStateSize = 0;
             for (const auto& p : params) {
                 Aggs_.emplace_back(MakeBlockAggregator(p.Name, p.TupleType, filterColumn, p.ArgColumns, holderFactory));
+
+                totalStateSize += Aggs_.back()->StateSize;
+            }
+
+            AggStates_.resize(totalStateSize);
+            char* ptr = AggStates_.data();
+            for (const auto& agg : Aggs_) {
+                agg->InitState(ptr);
+                ptr += agg->StateSize;
             }
         }
     };
@@ -142,7 +181,6 @@ IComputationNode* WrapBlockCombineAll(TCallable& callable, const TComputationNod
         filterColumn = AS_VALUE(TDataLiteral, filterColumnVal->GetItem())->AsValue().Get<ui32>();
     }
 
-    MKQL_ENSURE(!filterColumn, "Filter column is not supported yet");
     auto aggsVal = AS_VALUE(TTupleLiteral, callable.GetInput(3));
     TVector<TAggParams> aggsParams;
     for (ui32 i = 0; i < aggsVal->GetValuesCount(); ++i) {

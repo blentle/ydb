@@ -148,6 +148,19 @@ struct TGreater : public TCompareArithmeticBinary<TLeft, TRight, TGreater<TLeft,
 #endif
 };
 
+template<typename TLeft, typename TRight, typename TOutput>
+struct TGreaterOp;
+
+template<typename TLeft, typename TRight>
+struct TGreaterOp<TLeft, TRight, ui8> : public TGreater<TLeft, TRight, false> {
+    using TBase = TGreater<TLeft, TRight, false>;
+    static constexpr bool DefaultNulls = true;
+    static ui8 Do(TLeft left, TRight right)
+    {
+        return TBase::Do(left, right);
+    }
+};
+
 template<typename TLeft, typename TRight, bool Aggr>
 struct TDiffDateGreater : public TCompareArithmeticBinary<TLeft, TRight, TDiffDateGreater<TLeft, TRight, Aggr>>, public TAggrGreater {
     static bool Do(TLeft left, TRight right)
@@ -271,6 +284,10 @@ void RegisterGreater(IBuiltinFunctionRegistry& registry) {
 
     RegisterAggrCompareStrings<TCustomGreater, TCompareArgsOpt>(registry, aggrName);
     RegisterAggrCompareCustomOpt<NUdf::TDataType<NUdf::TDecimal>, TDecimalAggrGreater, TCompareArgsOpt>(registry, aggrName);
+}
+
+void RegisterGreater(TKernelFamilyMap& kernelFamilyMap) {
+    kernelFamilyMap["Greater"] = std::make_unique<TBinaryNumericPredicateKernelFamily<TGreaterOp>>();
 }
 
 } // namespace NMiniKQL

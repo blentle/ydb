@@ -236,6 +236,27 @@ message TKqpTransaction {
     reserved 5;
 
     optional NKikimrKqp.TKqpSnapshot Snapshot = 6;
+
+    // When true datashard will exchange a generic TReadSetData with other shards
+    optional bool UseGenericReadSets = 7 [default = false];
+}
+
+message TKqpReadRangesSourceSettings {
+    optional TKqpTransaction.TTableMeta Table = 1;
+
+    oneof RangeType {
+        NKikimrTx.TKeyRange FullRange = 2;
+        TKqpTransaction.TTableKeyRange Ranges = 3;
+    }
+
+    repeated TKqpTransaction.TColumnMeta Columns = 4;
+    optional uint64 ItemsLimit = 5;
+    optional bool Reverse = 6;
+    repeated string SkipNullKeys = 7;
+    repeated uint32 KeyColumnTypes = 8;
+    optional EScanDataFormat DataFormat = 9;
+    optional NKikimrProto.TRowVersion Snapshot = 10;
+    optional uint64 ShardIdHint = 11;
 }
 
 message TKqpTaskInfo {
@@ -377,6 +398,7 @@ message TCreateCdcStreamNotice {
     optional NKikimrProto.TPathID PathId = 1;
     optional uint64 TableSchemaVersion = 2;
     optional NKikimrSchemeOp.TCdcStreamDescription StreamDescription = 3;
+    optional string SnapshotName = 4;
 }
 
 message TAlterCdcStreamNotice {
@@ -791,30 +813,6 @@ message TEvPeriodicTableStats {
     optional uint64 TableOwnerId = 12;
 
     optional bool IsDstSplit = 13;
-}
-
-message TEvS3ListingRequest {
-    optional uint64 TableId = 1;
-    optional bytes SerializedKeyPrefix = 2;
-
-    optional string PathColumnPrefix = 3;
-    optional string PathColumnDelimiter = 4;
-
-    optional bytes SerializedStartAfterKeySuffix = 5;
-
-    repeated uint32 ColumnsToReturn = 6;
-    optional uint32 MaxKeys = 7;
-
-    optional string LastCommonPrefix = 8;
-}
-
-message TEvS3ListingResponse {
-    optional uint64 TabletID = 1;
-    optional uint32 Status = 2;
-    optional string ErrorDescription = 3;
-    repeated bytes CommonPrefixesRows = 4;  // TSerializedCellVec
-    repeated bytes ContentsRows = 5;        // TSerializedCellVec
-    optional bool MoreRows = 6;
 }
 
 message TSerializedRowColumnsScheme {

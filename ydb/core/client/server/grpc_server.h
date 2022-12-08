@@ -1,4 +1,5 @@
 #pragma once
+#include "dynamic_node_auth_processor.h"
 
 #include <ydb/core/protos/grpc.grpc.pb.h>
 
@@ -38,7 +39,6 @@ public:
     virtual void Reply(const NKikimrClient::TNodeRegistrationResponse& resp) = 0;
     virtual void Reply(const NKikimrClient::TCmsResponse& resp) = 0;
     virtual void Reply(const NKikimrClient::TSqsResponse& resp) = 0;
-    virtual void Reply(const NKikimrClient::TS3ListingResponse& resp) = 0;
     virtual void Reply(const NKikimrClient::TConsoleResponse& resp) = 0;
 
     //! Send error reply when request wasn't handled properly.
@@ -46,6 +46,8 @@ public:
 
     //! Bind MessageBus context to the request.
     virtual NMsgBusProxy::TBusMessageContext BindBusContext(int type) = 0;
+
+    virtual TVector<TStringBuf> FindClientCert() const = 0;
 
     //! Returns peer address
     virtual TString GetPeer() const = 0;
@@ -57,6 +59,10 @@ class TGRpcService
 {
 public:
     TGRpcService();
+
+    void SetDynamicNodeAuthParams(const TDynamicNodeAuthorizationParams& dynamicNodeAuthorizationParams) {
+        DynamicNodeAuthorizationParams = dynamicNodeAuthorizationParams;
+    }
 
     void InitService(grpc::ServerCompletionQueue* cq, NGrpc::TLoggerPtr logger) override;
     void SetGlobalLimiterHandle(NGrpc::TGlobalLimiter* limiter) override;
@@ -93,6 +99,7 @@ private:
     // In flight request management.
     NGrpc::TGlobalLimiter* Limiter_ = nullptr;
 
+    TDynamicNodeAuthorizationParams DynamicNodeAuthorizationParams = {};
 };
 
 }

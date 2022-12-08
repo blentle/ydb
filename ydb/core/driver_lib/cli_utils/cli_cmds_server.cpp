@@ -208,6 +208,7 @@ protected:
         config.Opts->AddLongOption("feature-flags-file", "File with feature flags to turn new features on/off").OptionalArgument("PATH");
         config.Opts->AddLongOption("rb-file", "File with resource broker customizations").OptionalArgument("PATH");
         config.Opts->AddLongOption("metering-file", "File with metering config").OptionalArgument("PATH");
+        config.Opts->AddLongOption("audit-file", "File with audit config").OptionalArgument("PATH");
         config.Opts->AddLongOption('r', "restarts-count-file", "State for restarts monitoring counter,\nuse empty string to disable\n")
                 .OptionalArgument("PATH").DefaultValue(RestartsCountFile).StoreResult(&RestartsCountFile);
         config.Opts->AddLongOption("compile-inflight-limit", "Limit on parallel programs compilation").OptionalArgument("NUM").StoreResult(&CompileInflightLimit);
@@ -437,6 +438,7 @@ protected:
         OPTION("feature-flags-file", FeatureFlags);
         OPTION("rb-file", ResourceBrokerConfig);
         OPTION("metering-file", MeteringConfig);
+        OPTION("audit-file", AuditConfig);
         OPTION("kqp-file", KQPConfig);
         OPTION("incrhuge-file", IncrHugeConfig);
         OPTION("alloc-file", AllocatorConfig);
@@ -560,14 +562,29 @@ protected:
         if (GRpcPublicHost) {
             auto& conf = *AppConfig.MutableGRpcConfig();
             conf.SetPublicHost(GRpcPublicHost);
+            for (auto& ext : *conf.MutableExtEndpoints()) {
+                if (!ext.HasPublicHost()) {
+                    ext.SetPublicHost(GRpcPublicHost);
+                }
+            }
         }
         if (GRpcPublicPort) {
             auto& conf = *AppConfig.MutableGRpcConfig();
             conf.SetPublicPort(GRpcPublicPort);
+            for (auto& ext : *conf.MutableExtEndpoints()) {
+                if (!ext.HasPublicPort()) {
+                    ext.SetPublicPort(GRpcPublicPort);
+                }
+            }
         }
         if (GRpcsPublicPort) {
             auto& conf = *AppConfig.MutableGRpcConfig();
             conf.SetPublicSslPort(GRpcsPublicPort);
+            for (auto& ext : *conf.MutableExtEndpoints()) {
+                if (!ext.HasPublicSslPort()) {
+                    ext.SetPublicSslPort(GRpcsPublicPort);
+                }
+            }
         }
         for (const auto& addr : GRpcPublicAddressesV4) {
             AppConfig.MutableGRpcConfig()->AddPublicAddressesV4(addr);
@@ -837,8 +854,9 @@ protected:
     {
         // static node
         if (NodeBrokerAddresses.empty() && !NodeBrokerPort) {
-            if (!NodeId)
+            if (!NodeId) {
                 ythrow yexception() << "Either --node [NUM|'static'] or --node-broker[-port] should be specified";
+            }
 
             if (!HierarchicalCfg && RunConfig.PathToConfigCacheFile)
                 LoadCachedConfigsForStaticNode();
@@ -1096,8 +1114,13 @@ private:
         grpcConfig.LoadBalancingPolicy = "round_robin";
         if (endpoint.EnableSsl.Defined()) {
             grpcConfig.EnableSsl = endpoint.EnableSsl.GetRef();
-            if (!PathToInterconnectCaFile.Empty()) {
-                grpcConfig.SslCaCert = ReadFromFile(PathToInterconnectCaFile, "CA certificates");
+            auto& sslCredentials = grpcConfig.SslCredentials;
+            if (PathToGrpcCaFile) {
+                sslCredentials.pem_root_certs = ReadFromFile(PathToGrpcCaFile, "CA certificates");
+            }
+            if (PathToGrpcCertFile && PathToGrpcPrivateKeyFile) {
+                sslCredentials.pem_cert_chain = ReadFromFile(PathToGrpcCertFile, "Client certificates");
+                sslCredentials.pem_private_key = ReadFromFile(PathToGrpcPrivateKeyFile, "Client certificates key");
             }
         }
         return NClient::TKikimr(grpcConfig);

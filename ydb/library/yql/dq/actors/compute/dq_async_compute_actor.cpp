@@ -676,6 +676,8 @@ private:
             Channels->SendChannelDataAck(it->second.ChannelId, inputChannel->FreeSpace);
         }
 
+        TakeInputChannelDataRequests.erase(it);
+
         ResumeExecution();
     }
 
@@ -794,7 +796,7 @@ private:
     void AskCpuQuota() {
         Y_VERIFY(!CpuTimeQuotaAsked);
         if (CpuTimeSpent >= MIN_QUOTED_CPU_TIME) {
-            CA_LOG_D("Ask CPU quota: " << CpuTimeSpent.MilliSeconds() << "ms");
+            CA_LOG_T("Ask CPU quota: " << CpuTimeSpent.MilliSeconds() << "ms");
             Send(QuoterServiceActorId,
                 new NKikimr::TEvQuota::TEvRequest(
                     NKikimr::TEvQuota::EResourceOperator::And,
@@ -832,7 +834,7 @@ private:
     void OnCpuQuotaGiven(NKikimr::TEvQuota::TEvClearance::TPtr& ev) {
         const TDuration delay = TInstant::Now() - CpuTimeQuotaAsked;
         CpuTimeQuotaAsked = TInstant::Zero();
-        CA_LOG_D("CPU quota delay: " << delay.MilliSeconds() << "ms");
+        CA_LOG_T("CPU quota delay: " << delay.MilliSeconds() << "ms");
         if (CpuTimeGetQuotaLatency) {
             CpuTimeGetQuotaLatency->Collect(delay.MilliSeconds());
         }
@@ -843,6 +845,14 @@ private:
         }
 
         ProcessContinueRun();
+    }
+
+    void CheckRunStatus() override {
+        if (!TakeInputChannelDataRequests.empty()) {
+            CA_LOG_T("AsyncCheckRunStatus: TakeInputChannelDataRequests: " << TakeInputChannelDataRequests.size());
+            return;
+        }
+        TBase::CheckRunStatus();
     }
 
 private:

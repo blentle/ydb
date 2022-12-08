@@ -37,6 +37,11 @@ namespace NDataShard {
             ForceOnline = 0x04,
             Immediate = 0x08,
 
+            // Transaction must be prepared as a ditributed transaction, but
+            // must also be volatile, i.e. expect that other participants may
+            // cancel it even after it is planned.
+            VolatilePrepare = 0x10,
+
             PublicFlagsMask = 0x000000000000FFFF,
 
             //////////////////////////////
@@ -834,23 +839,6 @@ struct TEvDataShard {
         TEvPeriodicTableStats(ui64 datashardId, ui64 tableLocalId) {
             Record.SetDatashardId(datashardId);
             Record.SetTableLocalId(tableLocalId);
-        }
-    };
-
-    struct TEvS3ListingRequest : public TEventPB<TEvS3ListingRequest,
-                                                        NKikimrTxDataShard::TEvS3ListingRequest,
-                                                        TEvDataShard::EvS3ListingRequest> {
-        TEvS3ListingRequest() = default;
-    };
-
-    struct TEvS3ListingResponse : public TEventPB<TEvS3ListingResponse,
-                                                        NKikimrTxDataShard::TEvS3ListingResponse,
-                                                        TEvDataShard::EvS3ListingResponse> {
-        TEvS3ListingResponse() = default;
-
-        explicit TEvS3ListingResponse(ui64 tabletId, ui32 status = NKikimrTxDataShard::TError::OK) {
-            Record.SetTabletID(tabletId);
-            Record.SetStatus(status);
         }
     };
 

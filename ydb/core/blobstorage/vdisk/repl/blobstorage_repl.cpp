@@ -35,9 +35,11 @@ namespace NKikimr {
     // TEvReplFinished::TInfo
     ////////////////////////////////////////////////////////////////////////////
     TString TEvReplFinished::TInfo::ToString() const {
-        return Sprintf("{KeyPos: %s Eof: %s ReplicaOk: %" PRIu64 " RecoveryScheduled: %" PRIu64 " DataRecoverySuccess: %"
-            PRIu64 " DataRecoveryFailure: %" PRIu64 "}", KeyPos.ToString().data(), (Eof ? "true" : "false"),
-            ReplicaOk, RecoveryScheduled, DataRecoverySuccess, DataRecoveryFailure);
+        return TStringBuilder()
+            << "{KeyPos# " << KeyPos
+            << " Eof# " << (Eof ? "true" : "false")
+            << " Items# " << Items()
+            << "}";
     }
 
     void TEvReplFinished::TInfo::OutputHtml(IOutputStream &str) const {
@@ -58,7 +60,7 @@ namespace NKikimr {
                         TABLEH() { str << "Value"; }
                     }
                     STRONG() {
-                        PARAM(Summary, DataRecoverySuccess << "/" << RecoveryScheduled << "/" << (ReplicaOk + RecoveryScheduled));
+                        PARAM(Summary, ItemsRecovered << "/" << ItemsPlanned << "/" << ItemsTotal);
                     }
                     PARAM(Start, ToStringLocalTimeUpToSeconds(Start));
                     PARAM(End, ToStringLocalTimeUpToSeconds(End));
@@ -68,16 +70,19 @@ namespace NKikimr {
                     PARAM_V(DonorVDiskId);
                     PARAM_V(DropDonor);
                     GROUP("Plan Generation Stats") {
-                        PARAM_V(ReplicaOk);
-                        PARAM_V(RecoveryScheduled);
-                        PARAM_V(IgnoredDueToGC);
+                        PARAM_V(ItemsTotal);
+                        PARAM_V(ItemsPlanned);
+                        PARAM_V(WorkUnitsTotal);
+                        PARAM_V(WorkUnitsPlanned);
                     }
                     GROUP("Plan Execution Stats") {
-                        PARAM_V(DataRecoverySuccess);
-                        PARAM_V(DataRecoveryFailure);
-                        PARAM_V(DataRecoveryNoParts);
-                        PARAM_V(DataRecoverySkip);
-                        PARAM_V(DataRecoveryPhantomCheck);
+                        PARAM_V(ItemsRecovered);
+                        PARAM_V(ItemsNotRecovered);
+                        PARAM_V(ItemsException);
+                        PARAM_V(ItemsPartiallyRecovered);
+                        PARAM_V(ItemsPhantom);
+                        PARAM_V(ItemsNonPhantom);
+                        PARAM_V(WorkUnitsPerformed);
                     }
                     GROUP("Detailed Stats") {
                         PARAM_V(BytesRecovered);
@@ -85,12 +90,7 @@ namespace NKikimr {
                         PARAM_V(HugeLogoBlobsRecovered);
                         PARAM_V(ChunksWritten);
                         PARAM_V(SstBytesWritten);
-                        PARAM_V(MultipartBlobs);
                         PARAM_V(MetadataBlobs);
-                        PARAM_V(PartsPlanned);
-                        PARAM_V(PartsExact);
-                        PARAM_V(PartsRestored);
-                        PARAM_V(PartsMissing);
                     }
                     GROUP("Durations") {
                         PARAM_V(PreparePlanDuration);
@@ -168,6 +168,7 @@ namespace NKikimr {
         std::deque<std::pair<TVDiskID, TActorId>> Donors;
         std::set<TVDiskID> ConnectedPeerDisks, ConnectedDonorDisks;
         TEvResumeForce *ResumeForceToken = nullptr;
+        TInstant ReplicationEndTime;
 
         friend class TActorBootstrapped<TReplScheduler>;
 
@@ -250,12 +251,11 @@ namespace NKikimr {
             STLOG(PRI_DEBUG, BS_REPL, BSVR15, VDISKP(ReplCtx->VCtx->VDiskLogPrefix, "QUANTUM START"));
 
             LastReplStart = TAppData::TimeProvider->Now();
-            ReplCtx->MonGroup.ReplCurrentUnreplicatedParts() = 0;
-            ReplCtx->MonGroup.ReplCurrentUnreplicatedBytes() = 0;
-            ReplCtx->MonGroup.ReplCurrentPhantoms() = 0;
-            ReplCtx->MonGroup.ReplCurrentNumUnrecoveredPhantomBlobs() = 0;
-            ReplCtx->MonGroup.ReplCurrentNumUnrecoveredNonPhantomBlobs() = 0;
             ReplCtx->MonGroup.ReplUnreplicatedVDisks() = 1;
+            ReplCtx->MonGroup.ReplWorkUnitsRemaining() = -1;
+            ReplCtx->MonGroup.ReplWorkUnitsDone() = 0;
+            ReplCtx->MonGroup.ReplItemsRemaining() = -1;
+            ReplCtx->MonGroup.ReplItemsDone() = 0;
 
             Become(&TThis::StateRepl);
 
@@ -342,7 +342,6 @@ namespace NKikimr {
             bool finished = false;
 
             if (info->Eof) { // when it is the last quantum for some donor, rotate the blob sets
-                ReplCtx->MonGroup.ReplUnreplicatedBlobs() = UnreplicatedBlobsPtr->size();
                 BlobsToReplicatePtr = std::move(UnreplicatedBlobsPtr);
                 UnreplicatedBlobsPtr = std::make_shared<TBlobIdQueue>();
                 if (BlobsToReplicatePtr->empty()) {
@@ -367,14 +366,38 @@ namespace NKikimr {
             }
 
             History.Push(info);
+            
+#ifndef NDEBUG
+            // validate history -- work units must decrease consistently with work units processed
+            TEvReplFinished::TInfoPtr prev = nullptr;
+            for (auto it = History.Begin(); it != History.End(); ++it) {
+                TEvReplFinished::TInfoPtr cur = *it;
+                if (prev) {
+                    Y_VERIFY_DEBUG_S(
+                        cur->WorkUnitsTotal <= prev->WorkUnitsTotal - prev->WorkUnitsPerformed &&
+                        cur->ItemsTotal <= prev->ItemsTotal - prev->ItemsRecovered - prev->ItemsPhantom,
+                        "cur.WorkUnits# " << cur->WorkUnits()
+                        << " prev.WorkUnits# " << prev->WorkUnits()
+                        << " cur.Items# " << cur->Items()
+                        << " prev.Items# " << prev->Items());
+                }
+                Y_VERIFY_DEBUG_S(
+                    cur->WorkUnitsPlanned <= cur->WorkUnitsTotal &&
+                    cur->WorkUnitsPerformed <= cur->WorkUnitsPlanned &&
+                    cur->ItemsPlanned <= cur->ItemsTotal &&
+                    cur->ItemsPlanned == cur->ItemsRecovered + cur->ItemsNotRecovered + cur->ItemsException +
+                        cur->ItemsPartiallyRecovered + cur->ItemsPhantom + cur->ItemsNonPhantom,
+                    "WorkUnits# " << cur->WorkUnits() << " Items# " << cur->Items());
+                prev = cur;
+            }
+#endif
+
+            TDuration timeRemaining;
+
             if (finished) {
                 STLOG(PRI_DEBUG, BS_REPL, BSVR17, VDISKP(ReplCtx->VCtx->VDiskLogPrefix, "REPL COMPLETED"),
                     (BlobsToReplicate, BlobsToReplicatePtr->size()));
                 LastReplEnd = now;
-                ReplCtx->MonGroup.ReplUnreplicatedBytes() = ReplCtx->MonGroup.ReplCurrentUnreplicatedBytes();
-                ReplCtx->MonGroup.ReplPhantoms() = ReplCtx->MonGroup.ReplCurrentPhantoms();
-                ReplCtx->MonGroup.ReplNumUnrecoveredPhantomBlobs() = ReplCtx->MonGroup.ReplCurrentNumUnrecoveredPhantomBlobs();
-                ReplCtx->MonGroup.ReplNumUnrecoveredNonPhantomBlobs() = ReplCtx->MonGroup.ReplCurrentNumUnrecoveredNonPhantomBlobs();
 
                 if (State == WaitQueues || State == Replication) {
                     // release token as we have finished replicating
@@ -382,7 +405,7 @@ namespace NKikimr {
                 }
 
                 Become(&TThis::StateRelax);
-                if (*BlobsToReplicatePtr) {
+                if (!BlobsToReplicatePtr->empty()) {
                     // try again for unreplicated blobs in some future
                     State = Relaxation;
                     Schedule(ReplCtx->VDiskCfg->ReplTimeInterval, new TEvents::TEvWakeup);
@@ -390,13 +413,23 @@ namespace NKikimr {
                     // no more blobs to replicate; replication will not resume
                     State = Finished;
                     ReplCtx->MonGroup.ReplUnreplicatedVDisks() = 0;
+                    ReplCtx->MonGroup.ReplUnreplicatedPhantoms() = 1;
+                    ReplCtx->MonGroup.ReplUnreplicatedNonPhantoms() = 1;
+                    ReplCtx->MonGroup.ReplWorkUnitsRemaining() = 0;
+                    ReplCtx->MonGroup.ReplWorkUnitsDone() = 0;
+                    ReplCtx->MonGroup.ReplItemsRemaining() = 0;
+                    ReplCtx->MonGroup.ReplItemsDone() = 0;
                     TActivationContext::Send(new IEventHandle(TEvBlobStorage::EvReplDone, 0, ReplCtx->SkeletonId,
                         SelfId(), nullptr, 0));
                 }
             } else {
                 STLOG(PRI_DEBUG, BS_REPL, BSVR18, VDISKP(ReplCtx->VCtx->VDiskLogPrefix, "QUANTUM START"));
                 RunRepl(info->KeyPos);
+                timeRemaining = EstimateTimeOfArrival();
             }
+
+            ReplCtx->MonGroup.ReplSecondsRemaining() = timeRemaining.Seconds();
+            ReplicationEndTime = finished ? TInstant::Zero() : TInstant::Now() + timeRemaining;
         }
 
         void RunRepl(const TLogoBlobID& from) {
@@ -443,6 +476,29 @@ namespace NKikimr {
             }
         }
 
+        TDuration EstimateTimeOfArrival() {
+            if (!History) {
+                return {};
+            }
+
+            TEvReplFinished::TInfoPtr first = History.First();
+            TEvReplFinished::TInfoPtr last = History.Last();
+
+            const ui64 workAtBegin = first->WorkUnitsTotal;
+            const ui64 workAtEnd = last->WorkUnitsTotal - last->WorkUnitsPerformed;
+            const TInstant timeAtBegin = first->Start;
+            const TInstant timeAtEnd = last->End;
+
+            if (workAtBegin < workAtEnd || timeAtEnd < timeAtBegin) {
+                Y_VERIFY_DEBUG(false);
+                return {};
+            }
+
+            const double workPerSecond = (workAtBegin - workAtEnd) / (timeAtEnd - timeAtBegin).SecondsFloat();
+
+            return TDuration::Seconds(workAtEnd / workPerSecond);
+        }
+
         void Handle(NMon::TEvHttpInfo::TPtr &ev) {
             Y_VERIFY_DEBUG(ev->Get()->SubRequestId == TDbMon::ReplId);
 
@@ -470,7 +526,8 @@ namespace NKikimr {
                             << "LastReplQuantumStart: " << ToStringLocalTimeUpToSeconds(LastReplQuantumStart) << "<br>"
                             << "LastReplQuantumEnd: " << ToStringLocalTimeUpToSeconds(LastReplQuantumEnd) << "<br>"
                             << "NumConnectedPeerDisks: " << ConnectedPeerDisks.size() << "<br>"
-                            << "ConnectedDonorDisks: " << makeConnectedDonorDisks() << "<br>";
+                            << "ConnectedDonorDisks: " << makeConnectedDonorDisks() << "<br>"
+                            << "ReplicationEndTime: " << ReplicationEndTime << "<br>";
 
                         TABLE_CLASS ("table table-condensed") {
                             CAPTION() STRONG() {str << "Last " << historySize << " replication quantums"; }

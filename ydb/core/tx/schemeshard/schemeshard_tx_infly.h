@@ -116,39 +116,38 @@ struct TTxState {
         item(TxDropBlobDepot, 70) \
         item(TxUpdateMainTableOnIndexMove, 71) \
         item(TxAllocatePQ, 72) \
-
+        item(TxCreateCdcStreamAtTableWithSnapshot, 73) \
+        item(TxAlterExtSubDomainCreateHive, 74) \
 
     // TX_STATE_TYPE_ENUM
-
-    //TxMergeTablePartition only for sensors yet
 
     enum ETxType {
         TX_STATE_TYPE_ENUM(TX_STATE_DECLARE_ENUM)
     };
 
     static TString TypeName(ETxType t) {
-        switch(t) {
+        switch (t) {
             TX_STATE_TYPE_ENUM(TX_STATE_ENUM_NAME)
         default:
             return Sprintf("Unknown tx type %d", t);
         }
     }
     static ui32 TxTypeInFlightCounter(ETxType t) {
-        switch(t) {
+        switch (t) {
             TX_STATE_TYPE_ENUM(TX_STATE_IN_FLIGHT_COUNTER)
         default:
             return COUNTER_IN_FLIGHT_OPS_UNKNOWN;
         }
     }
     static ui32 TxTypeFinishedCounter(ETxType t) {
-        switch(t) {
+        switch (t) {
             TX_STATE_TYPE_ENUM(TX_STATE_FINISHED_COUNTER)
         default:
             return COUNTER_FINISHED_OPS_UNKNOWN;
         }
     }
     static ETxType ConvertToTxType(ESimpleCounters t) {
-        switch(t) {
+        switch (t) {
             TX_STATE_TYPE_ENUM(TX_STATE_FROM_COUNTER)
         default:
             return TTxState::ETxType::TxInvalid;
@@ -190,7 +189,7 @@ struct TTxState {
     };
 
     static TString StateName(ETxState s) {
-        switch(s) {
+        switch (s) {
             TX_STATE_STATE_ENUM(TX_STATE_ENUM_NAME)
         default:
             return Sprintf("Unknown state %d", s);
@@ -198,6 +197,7 @@ struct TTxState {
     }
     #undef TX_STATE_STATE_ENUM
 
+    #undef TX_STATE_FROM_COUNTER
     #undef TX_STATE_FINISHED_COUNTER
     #undef TX_STATE_IN_FLIGHT_COUNTER
     #undef TX_STATE_ENUM_NAME
@@ -328,6 +328,7 @@ struct TTxState {
             return true;
         case TxInitializeBuildIndex: //this is more like alter
         case TxCreateCdcStreamAtTable:
+        case TxCreateCdcStreamAtTableWithSnapshot:
             return false;
         case TxCreateLock: //this is more like alter
         case TxDropLock: //this is more like alter
@@ -371,6 +372,7 @@ struct TTxState {
         case TxUpgradeSubDomain:
         case TxUpgradeSubDomainDecision:
         case TxAlterExtSubDomain:
+        case TxAlterExtSubDomainCreateHive:
         case TxAlterUserAttributes:
         case TxAlterTableIndex:
         case TxAlterSolomonVolume:
@@ -427,6 +429,7 @@ struct TTxState {
         case TxFillIndex:
         case TxCreateCdcStream:
         case TxCreateCdcStreamAtTable:
+        case TxCreateCdcStreamAtTableWithSnapshot:
         case TxCreateSequence:
         case TxCreateReplication:
         case TxCreateBlobDepot:
@@ -455,6 +458,7 @@ struct TTxState {
         case TxUpgradeSubDomain:
         case TxUpgradeSubDomainDecision:
         case TxAlterExtSubDomain:
+        case TxAlterExtSubDomainCreateHive:
         case TxAlterUserAttributes:
         case TxAlterTableIndex:
         case TxAlterSolomonVolume:
@@ -514,6 +518,7 @@ struct TTxState {
         case TxCreateTableIndex:
         case TxCreateCdcStream:
         case TxCreateCdcStreamAtTable:
+        case TxCreateCdcStreamAtTableWithSnapshot:
         case TxCreateSequence:
         case TxCreateReplication:
         case TxCreateBlobDepot:
@@ -537,6 +542,7 @@ struct TTxState {
         case TxAlterKesus:
         case TxAlterSubDomain:
         case TxAlterExtSubDomain:
+        case TxAlterExtSubDomainCreateHive:
         case TxUpgradeSubDomain:
         case TxUpgradeSubDomainDecision:
         case TxAlterUserAttributes:
@@ -554,6 +560,96 @@ struct TTxState {
         case TxInvalid:
             Y_VERIFY_DEBUG("UNREACHEBLE");
             Y_UNREACHABLE();
+        }
+    }
+
+    static ETxType ConvertToTxType(NKikimrSchemeOp::EOperationType opType) {
+        switch (opType) {
+            case NKikimrSchemeOp::ESchemeOpMkDir: return TxMkDir;
+            case NKikimrSchemeOp::ESchemeOpCreateTable: return TxCreateTable;
+            case NKikimrSchemeOp::ESchemeOpCreatePersQueueGroup: return TxCreatePQGroup;
+            case NKikimrSchemeOp::ESchemeOpDropTable: return TxDropTable;
+            case NKikimrSchemeOp::ESchemeOpDropPersQueueGroup: return TxDropPQGroup;
+            case NKikimrSchemeOp::ESchemeOpAlterTable: return TxAlterTable;
+            case NKikimrSchemeOp::ESchemeOpAlterPersQueueGroup: return TxAlterPQGroup;
+            case NKikimrSchemeOp::ESchemeOpModifyACL: return TxModifyACL;
+            case NKikimrSchemeOp::ESchemeOpRmDir: return TxRmDir;
+            case NKikimrSchemeOp::ESchemeOpSplitMergeTablePartitions: return TxSplitTablePartition;
+            case NKikimrSchemeOp::ESchemeOpBackup: return TxBackup;
+            case NKikimrSchemeOp::ESchemeOpCreateSubDomain: return TxCreateSubDomain;
+            case NKikimrSchemeOp::ESchemeOpDropSubDomain: return TxDropSubDomain;
+            case NKikimrSchemeOp::ESchemeOpCreateRtmrVolume: return TxCreateRtmrVolume;
+            case NKikimrSchemeOp::ESchemeOpCreateBlockStoreVolume: return TxCreateBlockStoreVolume;
+            case NKikimrSchemeOp::ESchemeOpAlterBlockStoreVolume: return TxAlterBlockStoreVolume;
+            case NKikimrSchemeOp::ESchemeOpAssignBlockStoreVolume: return TxAssignBlockStoreVolume;
+            case NKikimrSchemeOp::ESchemeOpDropBlockStoreVolume: return TxDropBlockStoreVolume;
+            case NKikimrSchemeOp::ESchemeOpCreateKesus: return TxCreateKesus;
+            case NKikimrSchemeOp::ESchemeOpDropKesus: return TxDropKesus;
+            case NKikimrSchemeOp::ESchemeOpForceDropSubDomain: return TxForceDropSubDomain;
+            case NKikimrSchemeOp::ESchemeOpCreateSolomonVolume: return TxCreateSolomonVolume;
+            case NKikimrSchemeOp::ESchemeOpDropSolomonVolume: return TxDropSolomonVolume;
+            case NKikimrSchemeOp::ESchemeOpAlterKesus: return TxAlterKesus;
+            case NKikimrSchemeOp::ESchemeOpAlterSubDomain: return TxAlterSubDomain;
+            case NKikimrSchemeOp::ESchemeOpAlterUserAttributes: return TxAlterUserAttributes;
+            case NKikimrSchemeOp::ESchemeOpForceDropUnsafe: return TxForceDropSubDomain;
+            case NKikimrSchemeOp::ESchemeOpCreateIndexedTable: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpCreateTableIndex: return TxCreateTableIndex;
+            case NKikimrSchemeOp::ESchemeOpCreateConsistentCopyTables: return TxCopyTable;
+            case NKikimrSchemeOp::ESchemeOpDropTableIndex: return TxDropTableIndex;
+            case NKikimrSchemeOp::ESchemeOpCreateExtSubDomain: return TxCreateExtSubDomain;
+            case NKikimrSchemeOp::ESchemeOpAlterExtSubDomain: return TxAlterExtSubDomain;
+            case NKikimrSchemeOp::ESchemeOpForceDropExtSubDomain: return TxForceDropExtSubDomain;
+            case NKikimrSchemeOp::ESchemeOp_DEPRECATED_35: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpUpgradeSubDomain: return TxUpgradeSubDomain;
+            case NKikimrSchemeOp::ESchemeOpUpgradeSubDomainDecision: return TxUpgradeSubDomainDecision;
+            case NKikimrSchemeOp::ESchemeOpCreateIndexBuild: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpInitiateBuildIndexMainTable: return TxInitializeBuildIndex;
+            case NKikimrSchemeOp::ESchemeOpCreateLock: return TxCreateLock;
+            case NKikimrSchemeOp::ESchemeOpApplyIndexBuild: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpFinalizeBuildIndexMainTable: return TxFinalizeBuildIndex;
+            case NKikimrSchemeOp::ESchemeOpAlterTableIndex: return TxAlterTableIndex;
+            case NKikimrSchemeOp::ESchemeOpAlterSolomonVolume: return TxAlterSolomonVolume;
+            case NKikimrSchemeOp::ESchemeOpDropLock: return TxDropLock;
+            case NKikimrSchemeOp::ESchemeOpFinalizeBuildIndexImplTable: return TxAlterTable;
+            case NKikimrSchemeOp::ESchemeOpInitiateBuildIndexImplTable: return TxCreateTable;
+            case NKikimrSchemeOp::ESchemeOpDropIndex: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpDropTableIndexAtMainTable: return TxDropTableIndexAtMainTable;
+            case NKikimrSchemeOp::ESchemeOpCancelIndexBuild: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpCreateFileStore: return TxCreateFileStore;
+            case NKikimrSchemeOp::ESchemeOpAlterFileStore: return TxAlterFileStore;
+            case NKikimrSchemeOp::ESchemeOpDropFileStore: return TxDropFileStore;
+            case NKikimrSchemeOp::ESchemeOpRestore: return TxRestore;
+            case NKikimrSchemeOp::ESchemeOpCreateColumnStore: return TxCreateOlapStore;
+            case NKikimrSchemeOp::ESchemeOpAlterColumnStore: return TxAlterOlapStore;
+            case NKikimrSchemeOp::ESchemeOpDropColumnStore: return TxDropOlapStore;
+            case NKikimrSchemeOp::ESchemeOpCreateColumnTable: return TxCreateColumnTable;
+            case NKikimrSchemeOp::ESchemeOpAlterColumnTable: return TxAlterColumnTable;
+            case NKikimrSchemeOp::ESchemeOpDropColumnTable: return TxDropColumnTable;
+            case NKikimrSchemeOp::ESchemeOpAlterLogin: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpCreateCdcStream: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpCreateCdcStreamImpl: return TxCreateCdcStream;
+            case NKikimrSchemeOp::ESchemeOpCreateCdcStreamAtTable: return TxCreateCdcStreamAtTable;
+            case NKikimrSchemeOp::ESchemeOpAlterCdcStream: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpAlterCdcStreamImpl: return TxAlterCdcStream;
+            case NKikimrSchemeOp::ESchemeOpAlterCdcStreamAtTable: return TxAlterCdcStreamAtTable;
+            case NKikimrSchemeOp::ESchemeOpDropCdcStream: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpDropCdcStreamImpl: return TxDropCdcStream;
+            case NKikimrSchemeOp::ESchemeOpDropCdcStreamAtTable: return TxDropCdcStreamAtTable;
+            case NKikimrSchemeOp::ESchemeOpMoveTable: return TxMoveTable;
+            case NKikimrSchemeOp::ESchemeOpMoveTableIndex: return TxMoveTableIndex;
+            case NKikimrSchemeOp::ESchemeOpCreateSequence: return TxCreateSequence;
+            case NKikimrSchemeOp::ESchemeOpAlterSequence: return TxAlterSequence;
+            case NKikimrSchemeOp::ESchemeOpDropSequence: return TxDropSequence;
+            case NKikimrSchemeOp::ESchemeOpCreateReplication: return TxCreateReplication;
+            case NKikimrSchemeOp::ESchemeOpAlterReplication: return TxAlterReplication;
+            case NKikimrSchemeOp::ESchemeOpDropReplication: return TxDropReplication;
+            case NKikimrSchemeOp::ESchemeOpCreateBlobDepot: return TxCreateBlobDepot;
+            case NKikimrSchemeOp::ESchemeOpAlterBlobDepot: return TxAlterBlobDepot;
+            case NKikimrSchemeOp::ESchemeOpDropBlobDepot: return TxDropBlobDepot;
+            case NKikimrSchemeOp::ESchemeOpMoveIndex: return TxInvalid;
+            case NKikimrSchemeOp::ESchemeOpAllocatePersQueueGroup: return TxAllocatePQ;
+            case NKikimrSchemeOp::ESchemeOpDeallocatePersQueueGroup: return TxInvalid;
+            default: return TxInvalid;
         }
     }
 };

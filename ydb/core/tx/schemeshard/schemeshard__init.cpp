@@ -1390,7 +1390,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
 
         if (!Self->IsShemeShardConfigured()) {
             LOG_NOTICE_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
-                         "TTxInit, SS hasn't been configured jet"
+                         "TTxInit, SS hasn't been configured yet"
                              << ", state: " << (ui64)Self->InitState
                              << ", at schemeshard: " << Self->TabletID());
             return true;
@@ -1576,14 +1576,14 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
 
                     ui64 alterVersion = rowset.GetValue<Schema::SubDomains::AlterVersion>();
                     ui64 planResolution = rowset.GetValue<Schema::SubDomains::PlanResolution>();
-                    ui32 timeCastBukets = rowset.GetValue<Schema::SubDomains::TimeCastBuckets>();
+                    ui32 timeCastBuckets = rowset.GetValue<Schema::SubDomains::TimeCastBuckets>();
                     TPathId resourcesDomainId = TPathId(
                         rowset.GetValue<Schema::SubDomains::ResourcesDomainOwnerPathId>(),
                         rowset.GetValue<Schema::SubDomains::ResourcesDomainLocalPathId>());
                     TSubDomainInfo::TPtr domainInfo = new TSubDomainInfo(
                         alterVersion,
                         planResolution,
-                        timeCastBukets,
+                        timeCastBuckets,
                         resourcesDomainId);
                     Self->SubDomains[pathId] = domainInfo;
                     Self->IncrementPathDbRefCount(pathId);
@@ -1645,7 +1645,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
 
                     ui64 alterVersion = rowset.GetValue<Schema::SubDomainsAlterData::AlterVersion>();
                     ui64 planResolution = rowset.GetValue<Schema::SubDomainsAlterData::PlanResolution>();
-                    ui32 timeCastBukets = rowset.GetValue<Schema::SubDomainsAlterData::TimeCastBuckets>();
+                    ui32 timeCastBuckets = rowset.GetValue<Schema::SubDomainsAlterData::TimeCastBuckets>();
 
                     TPathId resourcesDomainId = TPathId(
                         rowset.GetValue<Schema::SubDomainsAlterData::ResourcesDomainOwnerPathId>(),
@@ -1667,7 +1667,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                     alter = new TSubDomainInfo(
                         alterVersion,
                         planResolution,
-                        timeCastBukets,
+                        timeCastBuckets,
                         resourcesDomainId);
 
                     TTabletId sharedHiveId = rowset.GetValue<Schema::SubDomainsAlterData::SharedHiveId>();
@@ -2811,6 +2811,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 auto alterVersion = rowset.GetValue<Schema::CdcStream::AlterVersion>();
                 auto mode = rowset.GetValue<Schema::CdcStream::Mode>();
                 auto format = rowset.GetValue<Schema::CdcStream::Format>();
+                auto vt = rowset.GetValueOrDefault<Schema::CdcStream::VirtualTimestamps>(false);
                 auto state = rowset.GetValue<Schema::CdcStream::State>();
 
                 Y_VERIFY_S(Self->PathsById.contains(pathId), "Path doesn't exist, pathId: " << pathId);
@@ -2821,7 +2822,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                     << ", path type: " << NKikimrSchemeOp::EPathType_Name(path->PathType));
 
                 Y_VERIFY(!Self->CdcStreams.contains(pathId));
-                Self->CdcStreams[pathId] = new TCdcStreamInfo(alterVersion, mode, format, state);
+                Self->CdcStreams[pathId] = new TCdcStreamInfo(alterVersion, mode, format, vt, state);
                 Self->IncrementPathDbRefCount(pathId);
 
                 if (!rowset.Next()) {
@@ -2846,6 +2847,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 auto alterVersion = rowset.GetValue<Schema::CdcStreamAlterData::AlterVersion>();
                 auto mode = rowset.GetValue<Schema::CdcStreamAlterData::Mode>();
                 auto format = rowset.GetValue<Schema::CdcStreamAlterData::Format>();
+                auto vt = rowset.GetValueOrDefault<Schema::CdcStreamAlterData::VirtualTimestamps>(false);
                 auto state = rowset.GetValue<Schema::CdcStreamAlterData::State>();
 
                 Y_VERIFY_S(Self->PathsById.contains(pathId), "Path doesn't exist, pathId: " << pathId);
@@ -2857,14 +2859,14 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
 
                 if (!Self->CdcStreams.contains(pathId)) {
                     Y_VERIFY(alterVersion == 1);
-                    Self->CdcStreams[pathId] = TCdcStreamInfo::New(mode, format);
+                    Self->CdcStreams[pathId] = TCdcStreamInfo::New(mode, format, vt);
                     Self->IncrementPathDbRefCount(pathId);
                 }
 
                 auto stream = Self->CdcStreams.at(pathId);
                 Y_VERIFY(stream->AlterData == nullptr);
                 Y_VERIFY(stream->AlterVersion < alterVersion);
-                stream->AlterData = new TCdcStreamInfo(alterVersion, mode, format, state);
+                stream->AlterData = new TCdcStreamInfo(alterVersion, mode, format, vt, state);
 
                 Y_VERIFY_S(Self->PathsById.contains(path->ParentPathId), "Parent path is not found"
                     << ", cdc stream pathId: " << pathId
@@ -2927,6 +2929,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
             }
         }
 
+        // Initialize SubDomains
         {
             for(auto item: Self->SubDomains) {
                 auto pathId = item.first;
@@ -3461,8 +3464,8 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
         for (TOperationId opId: forceDropOpIds) {
             TTxState* txState = Self->FindTx(opId);
             Y_VERIFY(txState);
-            auto pathes = Self->ListSubThee(txState->TargetPathId, ctx);
-            Self->MarkAsDroping(pathes, opId.GetTxId(), ctx);
+            auto pathes = Self->ListSubTree(txState->TargetPathId, ctx);
+            Self->MarkAsDropping(pathes, opId.GetTxId(), ctx);
         }
 
         // Read txid dependencies
@@ -4466,9 +4469,8 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         rowset.GetValue<Schema::ColumnTables::StandaloneSharding>()));
                 }
 
-                TColumnTableInfo::TPtr tableInfo = new TColumnTableInfo(alterVersion,
-                    std::move(description), std::move(sharding), std::move(storeSharding));
-                Self->ColumnTables[pathId] = tableInfo;
+                auto tableInfo = Self->ColumnTables.BuildNew(pathId, new TColumnTableInfo(alterVersion,
+                    std::move(description), std::move(sharding), std::move(storeSharding)));
                 Self->IncrementPathDbRefCount(pathId);
 
                 if (tableInfo->OlapStorePathId) {
@@ -4516,8 +4518,8 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
 
                 TColumnTableInfo::TPtr alterData = new TColumnTableInfo(alterVersion,
                     std::move(description), std::move(sharding), std::move(storeSharding), std::move(alterBody));
-
-                Self->ColumnTables[pathId]->AlterData = alterData;
+                auto ctInfo = Self->ColumnTables.TakeVerified(pathId);
+                ctInfo->AlterData = alterData;
 
                 if (!rowset.Next()) {
                     return false;

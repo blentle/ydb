@@ -375,9 +375,7 @@ message TOlapColumnDescription {
     optional string Type = 3;
     optional uint32 TypeId = 4; // TypeId cannot be set explicitly, use Type
     optional NKikimrProto.TTypeInfo TypeInfo = 6;
-
-    // TODO: Intermediate codecs such as Delta, DubleDelta, dictionary encoding, etc.
-    //TCompressionOptions Compression = 5;
+    optional bool NotNull = 7;
 }
 
 message TAlterOlapColumn {
@@ -425,10 +423,6 @@ message TColumnTableSchema {
     //optional EColumnCodec DefaultCompressionCodec = 6; // deprecated, not used before replace
     //optional int32 DefaultCompressionLevel = 7; // deprecated, not used before replace
     optional TCompressionOptions DefaultCompression = 8;
-
-    // Storage tiers usage flag.
-    // Tiers detail information contains in storage_path/parent/.external_info/tiers
-    optional bool EnableTiering = 10 [default = false];
 }
 
 message TAlterColumnTableSchema {
@@ -476,15 +470,8 @@ message TColumnDataLifeCycle {
         optional TTTLSettings.EUnit ColumnUnit = 3;
     }
 
-    message TStorageTier {
-        optional string Name = 1; // name of TStorageTierConfig in TColumnTableSchema
-        optional TTtl Eviction = 2;
-    }
-
     message TStorageTiering {
-        // An ordered list of tiers. Data moves from tier0 to tier1, from tier1 to tier2 and so on.
-        // Setting a single tier is logically equivalent to setting a TTL (but with named storage tier).
-        repeated TStorageTier Tiers = 1;
+        optional string UseTiering = 1;
     }
 
     message TDisabled {
@@ -709,6 +696,7 @@ enum ECdcStreamState {
     ECdcStreamStateInvalid = 0;
     ECdcStreamStateReady = 1;
     ECdcStreamStateDisabled = 2;
+    ECdcStreamStateScan = 3;
 }
 
 enum ECdcStreamMode {
@@ -730,6 +718,7 @@ message TCdcStreamDescription {
     optional string Name = 1;
     optional ECdcStreamMode Mode = 2;
     optional ECdcStreamFormat Format = 6;
+    optional bool VirtualTimestamps = 7;
     optional NKikimrProto.TPathID PathId = 3;
     optional ECdcStreamState State = 4;
     optional uint64 SchemaVersion = 5;
@@ -892,7 +881,7 @@ message TS3Settings {
 message TTaskCleaner {
     optional uint64 PathId = 1;
     optional TS3Settings StorageSettings = 2;
-    optional string OwnerPath = 3;
+    optional string TieringId = 3;
 }
 
 message TBackupTask {
@@ -1283,6 +1272,9 @@ enum EOperationType {
 
     ESchemeOpAllocatePersQueueGroup = 83;
     ESchemeOpDeallocatePersQueueGroup = 84;
+
+    // AlterExtSubDomain suboperations
+    ESchemeOpAlterExtSubDomainCreateHive = 85;
 }
 
 message TApplyIf {

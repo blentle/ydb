@@ -3,6 +3,7 @@
 #include "context.h"
 #include "node.h"
 #include "sql_call_param.h"
+#include "object_processing.h"
 #include "ydb/library/yql/ast/yql_ast.h"
 #include <ydb/library/yql/parser/lexer_common/hints.h>
 #include <ydb/library/yql/parser/proto_ast/collect_issues/collect_issues.h>
@@ -129,6 +130,28 @@ static TString Id(const TRule_id_or_type& node, TTranslation& ctx) {
             return Id(node.GetAlt_id_or_type1().GetRule_id1(), ctx);
         case TRule_id_or_type::kAltIdOrType2:
             return ctx.Identifier(node.GetAlt_id_or_type2().GetRule_type_id1().GetToken1());
+        default:
+            Y_FAIL("You should change implementation according to grammar changes");
+    }
+}
+
+static TString Id(const TRule_id_as_compat& node, TTranslation& ctx) {
+    switch (node.Alt_case()) {
+        case TRule_id_as_compat::kAltIdAsCompat1:
+            return Id(node.GetAlt_id_as_compat1().GetRule_identifier1(), ctx);
+        case TRule_id_as_compat::kAltIdAsCompat2:
+            return ctx.Token(node.GetAlt_id_as_compat2().GetRule_keyword_as_compat1().GetToken1());
+        default:
+            Y_FAIL("You should change implementation according to grammar changes");
+    }
+}
+
+static TString Id(const TRule_an_id_as_compat& node, TTranslation& ctx) {
+    switch (node.Alt_case()) {
+        case TRule_an_id_as_compat::kAltAnIdAsCompat1:
+            return Id(node.GetAlt_an_id_as_compat1().GetRule_id_as_compat1(), ctx);
+        case TRule_an_id_as_compat::kAltAnIdAsCompat2:
+            return IdContentFromString(ctx.Context(), ctx.Token(node.GetAlt_an_id_as_compat2().GetToken1()));
         default:
             Y_FAIL("You should change implementation according to grammar changes");
     }
@@ -496,27 +519,6 @@ static TIdentifier IdEx(const TRule& node, TTranslation& ctx) {
     return TIdentifier(pos, name);
 }
 
-static TString OptIdPrefixAsStr(const TRule_opt_id_prefix& node, TTranslation& ctx, const TString& defaultStr = {}) {
-    if (!node.HasBlock1()) {
-        return defaultStr;
-    }
-    return Id(node.GetBlock1().GetRule_an_id1(), ctx);
-}
-
-static TString OptIdPrefixAsStr(const TRule_opt_id_prefix_or_type& node, TTranslation& ctx, const TString& defaultStr = {}) {
-    if (!node.HasBlock1()) {
-        return defaultStr;
-    }
-    return Id(node.GetBlock1().GetRule_an_id_or_type1(), ctx);
-}
-
-static void PureColumnListStr(const TRule_pure_column_list& node, TTranslation& ctx, TVector<TString>& outList) {
-    outList.push_back(Id(node.GetRule_an_id2(), ctx));
-    for (auto& block: node.GetBlock3()) {
-        outList.push_back(Id(block.GetRule_an_id2(), ctx));
-    }
-}
-
 static bool NamedNodeImpl(const TRule_bind_parameter& node, TString& name, TTranslation& ctx) {
     // bind_parameter: DOLLAR (an_id_or_type | TRUE | FALSE);
     TString id;
@@ -541,6 +543,27 @@ static bool NamedNodeImpl(const TRule_bind_parameter& node, TString& name, TTran
 
     name = dollar + id;
     return true;
+}
+
+static TString OptIdPrefixAsStr(const TRule_opt_id_prefix& node, TTranslation& ctx, const TString& defaultStr = {}) {
+    if (!node.HasBlock1()) {
+        return defaultStr;
+    }
+    return Id(node.GetBlock1().GetRule_an_id1(), ctx);
+}
+
+static TString OptIdPrefixAsStr(const TRule_opt_id_prefix_or_type& node, TTranslation& ctx, const TString& defaultStr = {}) {
+    if (!node.HasBlock1()) {
+        return defaultStr;
+    }
+    return Id(node.GetBlock1().GetRule_an_id_or_type1(), ctx);
+}
+
+static void PureColumnListStr(const TRule_pure_column_list& node, TTranslation& ctx, TVector<TString>& outList) {
+    outList.push_back(Id(node.GetRule_an_id2(), ctx));
+    for (auto& block: node.GetBlock3()) {
+        outList.push_back(Id(block.GetRule_an_id2(), ctx));
+    }
 }
 
 static bool NamedNodeImpl(const TRule_opt_bind_parameter& node, TString& name, bool& isOptional, TTranslation& ctx) {
@@ -637,83 +660,6 @@ static bool CreateTableIndex(const TRule_table_index& node, TTranslation& ctx, T
         for (const auto& inner : block.GetBlock4()) {
             indexes.back().DataColumns.emplace_back(IdEx(inner.GetRule_an_id_schema2(), ctx));
         }
-    }
-
-    return true;
-}
-
-static bool ChangefeedSettingsEntry(const TRule_changefeed_settings_entry& node, TTranslation& ctx, TChangefeedSettings& settings, bool alter) {
-    const auto id = IdEx(node.GetRule_an_id1(), ctx);
-    if (alter) {
-        // currently we don't support alter settings
-        ctx.Error() << to_upper(id.Name) << " alter is not supported";
-        return false;
-    }
-
-    const TToken* token = nullptr;
-    const auto& setting = node.GetRule_changefeed_setting_value3();
-    switch (setting.Alt_case()) {
-    case TRule_changefeed_setting_value::kAltChangefeedSettingValue1:
-        token = &setting.GetAlt_changefeed_setting_value1().GetToken1();
-        break;
-    case TRule_changefeed_setting_value::kAltChangefeedSettingValue2:
-        token = &setting.GetAlt_changefeed_setting_value2().GetRule_bool_value1().GetToken1();
-        break;
-    default:
-        return false;
-    }
-
-    YQL_ENSURE(token);
-    const TString value(ctx.Token(*token));
-    const auto pos = GetPos(*token);
-
-    if (to_lower(id.Name) == "sink_type") {
-        auto parsed = StringContent(ctx.Context(), pos, value);
-        YQL_ENSURE(parsed.Defined());
-        if (to_lower(parsed->Content) == "local") {
-            settings.SinkSettings = TChangefeedSettings::TLocalSinkSettings();
-        } else {
-            ctx.Context().Error() << "Unknown changefeed sink type: " << to_upper(parsed->Content);
-            return false;
-        }
-    } else if (to_lower(id.Name) == "mode") {
-        settings.Mode = BuildLiteralSmartString(ctx.Context(), value);
-    } else if (to_lower(id.Name) == "format") {
-        settings.Format = BuildLiteralSmartString(ctx.Context(), value);
-    } else if (to_lower(id.Name) == "initial_scan") {
-        bool v;
-        if (!TryFromString<bool>(to_lower(value), v)) {
-            ctx.Context().Error(id.Pos) << "Invalid changefeed setting: " << id.Name;
-            return false;
-        }
-        settings.InitialScan = BuildLiteralBool(pos, v);
-    } else {
-        ctx.Context().Error(id.Pos) << "Unknown changefeed setting: " << id.Name;
-        return false;
-    }
-
-    return true;
-}
-
-static bool ChangefeedSettings(const TRule_changefeed_settings& node, TTranslation& ctx, TChangefeedSettings& settings, bool alter) {
-    if (!ChangefeedSettingsEntry(node.GetRule_changefeed_settings_entry1(), ctx, settings, alter)) {
-        return false;
-    }
-
-    for (auto& block : node.GetBlock2()) {
-        if (!ChangefeedSettingsEntry(block.GetRule_changefeed_settings_entry2(), ctx, settings, alter)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static bool CreateChangefeed(const TRule_changefeed& node, TTranslation& ctx, TVector<TChangefeedDescription>& changefeeds) {
-    changefeeds.emplace_back(IdEx(node.GetRule_an_id2(), ctx));
-
-    if (!ChangefeedSettings(node.GetRule_changefeed_settings5(), ctx, changefeeds.back().Settings, false)) {
-        return false;
     }
 
     return true;
@@ -896,6 +842,10 @@ protected:
     bool IsDistinctOptSet(const TRule_opt_set_quantifier& node) const;
     bool IsDistinctOptSet(const TRule_opt_set_quantifier& node, TPosition& distinctPos) const;
 
+    bool AddObjectFeature(std::map<TString, TDeferredAtom>& result, const TRule_object_feature& feature);
+    bool BindParameterClause(const TRule_bind_parameter& node, TDeferredAtom& result);
+    bool ObjectFeatureValueClause(const TRule_object_feature_value & node, TDeferredAtom & result);
+    bool ParseObjectFeatures(std::map<TString, TDeferredAtom> & result, const TRule_object_features & features);
     bool RoleNameClause(const TRule_role_name& node, TDeferredAtom& result, bool allowSystemRoles);
     bool RoleParameters(const TRule_create_user_option& node, TRoleParameters& result) ;
 private:
@@ -1821,6 +1771,97 @@ bool TSqlTranslation::FillFamilySettings(const TRule_family_settings& settingsNo
     return true;
 }
 
+static bool ChangefeedSettingsEntry(const TRule_changefeed_settings_entry& node, TSqlExpression& ctx, TChangefeedSettings& settings, bool alter) {
+    const auto id = IdEx(node.GetRule_an_id1(), ctx);
+    if (alter) {
+        // currently we don't support alter settings
+        ctx.Error() << to_upper(id.Name) << " alter is not supported";
+        return false;
+    }
+
+    const auto& setting = node.GetRule_changefeed_setting_value3();
+    auto exprNode = ctx.Build(setting.GetRule_expr1());
+
+    if (!exprNode) {
+        ctx.Context().Error(id.Pos) << "Invalid changefeed setting: " << id.Name;
+        return false;
+    }
+
+    if (to_lower(id.Name) == "sink_type") {
+        if (!exprNode->IsLiteral() || exprNode->GetLiteralType() != "String") {
+            ctx.Context().Error() << "Literal of String type is expected for " << id.Name;
+            return false;
+        }
+
+        const auto value = exprNode->GetLiteralValue();
+        if (to_lower(value) == "local") {
+            settings.SinkSettings = TChangefeedSettings::TLocalSinkSettings();
+        } else {
+            ctx.Context().Error() << "Unknown changefeed sink type: " << value;
+            return false;
+        }
+    } else if (to_lower(id.Name) == "mode") {
+        if (!exprNode->IsLiteral() || exprNode->GetLiteralType() != "String") {
+            ctx.Context().Error() << "Literal of String type is expected for " << id.Name;
+            return false;
+        }
+        settings.Mode = exprNode;
+    } else if (to_lower(id.Name) == "format") {
+        if (!exprNode->IsLiteral() || exprNode->GetLiteralType() != "String") {
+            ctx.Context().Error() << "Literal of String type is expected for " << id.Name;
+            return false;
+        }
+        settings.Format = exprNode;
+    } else if (to_lower(id.Name) == "initial_scan") {
+        if (!exprNode->IsLiteral() || exprNode->GetLiteralType() != "Bool") {
+            ctx.Context().Error() << "Literal of Bool type is expected for " << id.Name;
+            return false;
+        }
+        settings.InitialScan = exprNode;
+    } else if (to_lower(id.Name) == "virtual_timestamps") {
+        if (!exprNode->IsLiteral() || exprNode->GetLiteralType() != "Bool") {
+            ctx.Context().Error() << "Literal of Bool type is expected for " << id.Name;
+            return false;
+        }
+        settings.VirtualTimestamps = exprNode;
+    } else if (to_lower(id.Name) == "retention_period") {
+        if (exprNode->GetOpName() != "Interval") {
+            ctx.Context().Error() << "Literal of Interval type is expected for " << id.Name;
+            return false;
+        }
+        settings.RetentionPeriod = exprNode;
+    } else {
+        ctx.Context().Error(id.Pos) << "Unknown changefeed setting: " << id.Name;
+        return false;
+    }
+
+    return true;
+}
+
+static bool ChangefeedSettings(const TRule_changefeed_settings& node, TSqlExpression& ctx, TChangefeedSettings& settings, bool alter) {
+    if (!ChangefeedSettingsEntry(node.GetRule_changefeed_settings_entry1(), ctx, settings, alter)) {
+        return false;
+    }
+
+    for (auto& block : node.GetBlock2()) {
+        if (!ChangefeedSettingsEntry(block.GetRule_changefeed_settings_entry2(), ctx, settings, alter)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool CreateChangefeed(const TRule_changefeed& node, TSqlExpression& ctx, TVector<TChangefeedDescription>& changefeeds) {
+    changefeeds.emplace_back(IdEx(node.GetRule_an_id2(), ctx));
+
+    if (!ChangefeedSettings(node.GetRule_changefeed_settings5(), ctx, changefeeds.back().Settings, false)) {
+        return false;
+    }
+
+    return true;
+}
+
 bool TSqlTranslation::CreateTableEntry(const TRule_create_table_entry& node, TCreateTableParameters& params)
 {
     switch (node.Alt_case()) {
@@ -1938,7 +1979,8 @@ bool TSqlTranslation::CreateTableEntry(const TRule_create_table_entry& node, TCr
         {
             // changefeed
             auto& changefeed = node.GetAlt_create_table_entry5().GetRule_changefeed1();
-            if (!CreateChangefeed(changefeed, *this, params.Changefeeds)) {
+            TSqlExpression expr(Ctx, Mode);
+            if (!CreateChangefeed(changefeed, expr, params.Changefeeds)) {
                 return false;
             }
             break;
@@ -3143,13 +3185,13 @@ bool TSqlTranslation::SimpleTableRefCoreImpl(const TRule_simple_table_ref_core& 
     TDeferredAtom cluster = Context().Scoped->CurrCluster;
     switch (node.Alt_case()) {
     case TRule_simple_table_ref_core::AltCase::kAltSimpleTableRefCore1: {
-        if (node.GetAlt_simple_table_ref_core1().GetBlock1().HasBlock1()) {
+        if (node.GetAlt_simple_table_ref_core1().GetRule_object_ref1().HasBlock1()) {
             if (Mode == NSQLTranslation::ESqlMode::LIMITED_VIEW) {
                 Error() << "Cluster should not be used in limited view";
                 return false;
             }
 
-            if (!ClusterExpr(node.GetAlt_simple_table_ref_core1().GetBlock1().GetBlock1().GetRule_cluster_expr1(), false, service, cluster)) {
+            if (!ClusterExpr(node.GetAlt_simple_table_ref_core1().GetRule_object_ref1().GetBlock1().GetRule_cluster_expr1(), false, service, cluster)) {
                 return false;
             }
         }
@@ -3160,7 +3202,7 @@ bool TSqlTranslation::SimpleTableRefCoreImpl(const TRule_simple_table_ref_core& 
         }
 
         result = TTableRef(Context().MakeName("table"), service, cluster, nullptr);
-        auto tableOrAt = Id(node.GetAlt_simple_table_ref_core1().GetBlock1().GetRule_id_or_at2(), *this);
+        auto tableOrAt = Id(node.GetAlt_simple_table_ref_core1().GetRule_object_ref1().GetRule_id_or_at2(), *this);
         auto tableAndView = TableKeyImpl(tableOrAt, "", *this);
         result.Keys = BuildTableKey(Context().Pos(), result.Service, result.Cluster,
             TDeferredAtom(Context().Pos(), tableAndView.first), tableAndView.second);
@@ -6050,7 +6092,7 @@ bool TSqlSelect::SelectTerm(TVector<TNodePtr>& terms, const TRule_result_column&
                         label = Id(alt.GetBlock2().GetAlt1().GetBlock1().GetRule_an_id_or_type2(), *this);
                         break;
                     case TRule_result_column_TAlt2_TBlock2::kAlt2:
-                        label = Id(alt.GetBlock2().GetAlt2().GetRule_an_id_pure1(), *this);
+                        label = Id(alt.GetBlock2().GetAlt2().GetRule_an_id_as_compat1(), *this);
                         if (!Ctx.AnsiOptionalAs) {
                             // AS is mandatory
                             Ctx.Error() << "Expecting mandatory AS here. Did you miss comma? Please add PRAGMA AnsiOptionalAs; for ANSI compatibility";
@@ -6193,7 +6235,7 @@ TSourcePtr TSqlSelect::NamedSingleSource(const TRule_named_single_source& node, 
                 label = Id(node.GetBlock2().GetBlock1().GetAlt1().GetBlock1().GetRule_an_id2(), *this);
                 break;
             case TRule_named_single_source_TBlock2_TBlock1::kAlt2:
-                label = Id(node.GetBlock2().GetBlock1().GetAlt2().GetRule_an_id_pure1(), *this);
+                label = Id(node.GetBlock2().GetBlock1().GetAlt2().GetRule_an_id_as_compat1(), *this);
                 if (!Ctx.AnsiOptionalAs) {
                     // AS is mandatory
                     Ctx.Error() << "Expecting mandatory AS here. Did you miss comma? Please add PRAGMA AnsiOptionalAs; for ANSI compatibility";
@@ -6407,22 +6449,17 @@ bool TSqlTranslation::IsDistinctOptSet(const TRule_opt_set_quantifier& node, TPo
 bool TSqlTranslation::RoleNameClause(const TRule_role_name& node, TDeferredAtom& result, bool allowSystemRoles) {
     // role_name: an_id_or_type | bind_parameter;
     switch (node.Alt_case()) {
-        case TRule_role_name::kAltRoleName1: {
+        case TRule_role_name::kAltRoleName1:
+        {
             TString name = Id(node.GetAlt_role_name1().GetRule_an_id_or_type1(), *this);
             result = TDeferredAtom(Ctx.Pos(), name);
             break;
         }
-        case TRule_role_name::kAltRoleName2: {
-            TString paramName;
-            if (!NamedNodeImpl(node.GetAlt_role_name2().GetRule_bind_parameter1(), paramName, *this)) {
+        case TRule_role_name::kAltRoleName2:
+        {
+            if (!BindParameterClause(node.GetAlt_role_name2().GetRule_bind_parameter1(), result)) {
                 return false;
             }
-            auto named = GetNamedNode(paramName);
-            if (!named) {
-                return false;
-            }
-
-            result = MakeAtomFromExpression(Ctx, named);
             break;
         }
         default:
@@ -8219,9 +8256,9 @@ TNodePtr TSqlIntoTable::Build(const TRule_into_table_stmt& node) {
     bool isBinding = false;
     switch (tableRefCore.Alt_case()) {
         case TRule_simple_table_ref_core::AltCase::kAltSimpleTableRefCore1: {
-            if (tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().HasBlock1()) {
-                const auto& clusterExpr = tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().GetBlock1().GetRule_cluster_expr1();
-                bool hasAt = tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().GetRule_id_or_at2().HasBlock1();
+            if (tableRefCore.GetAlt_simple_table_ref_core1().GetRule_object_ref1().HasBlock1()) {
+                const auto& clusterExpr = tableRefCore.GetAlt_simple_table_ref_core1().GetRule_object_ref1().GetBlock1().GetRule_cluster_expr1();
+                bool hasAt = tableRefCore.GetAlt_simple_table_ref_core1().GetRule_object_ref1().GetRule_id_or_at2().HasBlock1();
                 bool result = !hasAt ?
                     ClusterExprOrBinding(clusterExpr, service, cluster, isBinding) : ClusterExpr(clusterExpr, false, service, cluster);
                 if (!result) {
@@ -8234,7 +8271,7 @@ TNodePtr TSqlIntoTable::Build(const TRule_into_table_stmt& node) {
                 return nullptr;
             }
 
-            auto id = Id(tableRefCore.GetAlt_simple_table_ref_core1().GetBlock1().GetRule_id_or_at2(), *this);
+            auto id = Id(tableRefCore.GetAlt_simple_table_ref_core1().GetRule_object_ref1().GetRule_id_or_at2(), *this);
             nameOrAt = std::make_pair(id.first, TDeferredAtom(Ctx.Pos(), id.second));
             break;
         }
@@ -8597,7 +8634,11 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             }
             TVector<TNodePtr> nodes;
             auto subquery = nodeExpr->GetSource();
-            if (subquery) {
+            if (subquery && Mode == NSQLTranslation::ESqlMode::LIBRARY && Ctx.ScopeLevel == 0) {
+                for (size_t i = 0; i < names.size(); ++i) {
+                    nodes.push_back(BuildInvalidSubqueryRef(subquery->GetPos()));
+                }
+            } else if (subquery) {
                 const auto alias = Ctx.MakeName("subquerynode");
                 const auto ref = Ctx.MakeName("subquery");
                 blocks.push_back(BuildSubquery(subquery, alias,
@@ -8653,10 +8694,17 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                 return false;
             }
 
-            if (rule.HasBlock9() && isTablestore) {
-                Context().Error(GetPos(rule.GetBlock9().GetRule_table_partition_by1().GetToken1()))
-                    << "PARTITION BY is not supported for TABLESTORE";
-                return false;
+            if (rule.HasBlock9()) {
+                if (isTablestore) {
+                    Context().Error(GetPos(rule.GetBlock9().GetRule_table_partition_by1().GetToken1()))
+                        << "PARTITION BY is not supported for TABLESTORE";
+                    return false;
+                }
+                const auto list = rule.GetBlock9().GetRule_table_partition_by1().GetRule_pure_column_list4();
+                params.PartitionByColumns.push_back(IdEx(list.GetRule_an_id2(), *this));
+                for (auto& node : list.GetBlock3()) {
+                    params.PartitionByColumns.push_back(IdEx(node.GetRule_an_id2(), *this));
+                }
             }
 
             if (rule.HasBlock10()) {
@@ -9000,7 +9048,8 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             AddStatementToBlocks(blocks, stmt);
             break;
         }
-        case TRule_sql_stmt_core::kAltSqlStmtCore25: {
+        case TRule_sql_stmt_core::kAltSqlStmtCore25:
+        {
             // drop_role_stmt: DROP (USER|GROUP) (IF EXISTS)? role_name (COMMA role_name)* COMMA?;
             Ctx.BodyPart();
             auto& node = core.GetAlt_sql_stmt_core25().GetRule_drop_role_stmt1();
@@ -9033,6 +9082,76 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             }
 
             AddStatementToBlocks(blocks, BuildDropRoles(pos, service, cluster, roles, isUser, force, Ctx.Scoped));
+            break;
+        }
+        case TRule_sql_stmt_core::kAltSqlStmtCore26:
+        {
+            // create_object_stmt: CREATE OBJECT name (TYPE type [WITH k=v,...]);
+            auto& node = core.GetAlt_sql_stmt_core26().GetRule_create_object_stmt1();
+            TObjectOperatorContext context(Ctx.Scoped);
+            if (node.GetRule_object_ref3().HasBlock1()) {
+                if (!ClusterExpr(node.GetRule_object_ref3().GetBlock1().GetRule_cluster_expr1(),
+                    false, context.ServiceId, context.Cluster)) {
+                    return false;
+                }
+            }
+
+            const TString& objectId = Id(node.GetRule_object_ref3().GetRule_id_or_at2(), *this).second;
+            const TString& typeId = Id(node.GetRule_object_type_ref6().GetRule_an_id_or_type1(), *this);
+            std::map<TString, TDeferredAtom> kv;
+            if (node.HasBlock8()) {
+                if (!ParseObjectFeatures(kv, node.GetBlock8().GetRule_create_object_features1().GetRule_object_features2())) {
+                    return false;
+                }
+            }
+
+            AddStatementToBlocks(blocks, BuildCreateObjectOperation(Ctx.Pos(), objectId, typeId, std::move(kv), context));
+            break;
+        }
+        case TRule_sql_stmt_core::kAltSqlStmtCore27:
+        {
+            // create_object_stmt: ALTER OBJECT name (TYPE type [SET k=v,...]);
+            auto& node = core.GetAlt_sql_stmt_core27().GetRule_alter_object_stmt1();
+            TObjectOperatorContext context(Ctx.Scoped);
+            if (node.GetRule_object_ref3().HasBlock1()) {
+                if (!ClusterExpr(node.GetRule_object_ref3().GetBlock1().GetRule_cluster_expr1(),
+                    false, context.ServiceId, context.Cluster)) {
+                    return false;
+                }
+            }
+
+            const TString& objectId = Id(node.GetRule_object_ref3().GetRule_id_or_at2(), *this).second;
+            const TString& typeId = Id(node.GetRule_object_type_ref6().GetRule_an_id_or_type1(), *this);
+            std::map<TString, TDeferredAtom> kv;
+            if (!ParseObjectFeatures(kv, node.GetRule_alter_object_features8().GetRule_object_features2())) {
+                return false;
+            }
+
+            AddStatementToBlocks(blocks, BuildAlterObjectOperation(Ctx.Pos(), objectId, typeId, std::move(kv), context));
+            break;
+        }
+        case TRule_sql_stmt_core::kAltSqlStmtCore28:
+        {
+            // create_object_stmt: DROP OBJECT name (TYPE type [WITH k=v,...]);
+            auto& node = core.GetAlt_sql_stmt_core28().GetRule_drop_object_stmt1();
+            TObjectOperatorContext context(Ctx.Scoped);
+            if (node.GetRule_object_ref3().HasBlock1()) {
+                if (!ClusterExpr(node.GetRule_object_ref3().GetBlock1().GetRule_cluster_expr1(),
+                    false, context.ServiceId, context.Cluster)) {
+                    return false;
+                }
+            }
+
+            const TString& objectId = Id(node.GetRule_object_ref3().GetRule_id_or_at2(), *this).second;
+            const TString& typeId = Id(node.GetRule_object_type_ref6().GetRule_an_id_or_type1(), *this);
+            std::map<TString, TDeferredAtom> kv;
+            if (node.HasBlock8()) {
+                if (!ParseObjectFeatures(kv, node.GetBlock8().GetRule_drop_object_features1().GetRule_object_features2())) {
+                    return false;
+                }
+            }
+
+            AddStatementToBlocks(blocks, BuildDropObjectOperation(Ctx.Pos(), objectId, typeId, std::move(kv), context));
             break;
         }
         default:
@@ -9397,7 +9516,8 @@ void TSqlQuery::AlterTableRenameIndexTo(const TRule_alter_table_rename_index_to&
 }
 
 bool TSqlQuery::AlterTableAddChangefeed(const TRule_alter_table_add_changefeed& node, TAlterTableParameters& params) {
-    return CreateChangefeed(node.GetRule_changefeed2(), *this, params.AddChangefeeds);
+    TSqlExpression expr(Ctx, Mode);
+    return CreateChangefeed(node.GetRule_changefeed2(), expr, params.AddChangefeeds);
 }
 
 bool TSqlQuery::AlterTableAlterChangefeed(const TRule_alter_table_alter_changefeed& node, TAlterTableParameters& params) {
@@ -9413,7 +9533,8 @@ bool TSqlQuery::AlterTableAlterChangefeed(const TRule_alter_table_alter_changefe
         case TRule_changefeed_alter_settings::kAltChangefeedAlterSettings2: {
             // SET
             const auto& rule = alter.GetAlt_changefeed_alter_settings2().GetRule_changefeed_settings3();
-            if (!ChangefeedSettings(rule, *this, params.AlterChangefeeds.back().Settings, true)) {
+            TSqlExpression expr(Ctx, Mode);
+            if (!ChangefeedSettings(rule, expr, params.AlterChangefeeds.back().Settings, true)) {
                 return false;
             }
             break;
@@ -10510,6 +10631,79 @@ NYql::TAstParseResult SqlToYql(const TString& query, const NSQLTranslation::TTra
         ctx.WarningPolicy.Clear();
     }
     return res;
+}
+
+bool TSqlTranslation::BindParameterClause(const TRule_bind_parameter& node, TDeferredAtom& result) {
+    TString paramName;
+    if (!NamedNodeImpl(node, paramName, *this)) {
+        return false;
+    }
+    auto named = GetNamedNode(paramName);
+    if (!named) {
+        return false;
+    }
+
+    result = MakeAtomFromExpression(Ctx, named);
+    return true;
+}
+
+bool TSqlTranslation::ObjectFeatureValueClause(const TRule_object_feature_value& node, TDeferredAtom& result) {
+    // object_feature_value: an_id_or_type | bind_parameter;
+    switch (node.Alt_case()) {
+        case TRule_object_feature_value::kAltObjectFeatureValue1:
+        {
+            TString name = Id(node.GetAlt_object_feature_value1().GetRule_an_id_or_type1(), *this);
+            result = TDeferredAtom(Ctx.Pos(), name);
+            break;
+        }
+        case TRule_object_feature_value::kAltObjectFeatureValue2:
+        {
+            if (!BindParameterClause(node.GetAlt_object_feature_value2().GetRule_bind_parameter1(), result)) {
+                return false;
+            }
+            break;
+        }
+        default:
+            Y_FAIL("You should change implementation according to grammar changes");
+    }
+    return true;
+}
+
+bool TSqlTranslation::AddObjectFeature(std::map<TString, TDeferredAtom>& result, const TRule_object_feature& feature) {
+    if (feature.has_alt_object_feature1()) {
+        auto& kv = feature.GetAlt_object_feature1().GetRule_object_feature_kv1();
+        const TString& key = Id(kv.GetRule_an_id_or_type1(), *this);
+        auto& ruleValue = kv.GetRule_object_feature_value3();
+        TDeferredAtom value;
+        if (!ObjectFeatureValueClause(ruleValue, value)) {
+            return false;
+        }
+        result[key] = value;
+    } else if (feature.has_alt_object_feature2()) {
+        result[Id(feature.GetAlt_object_feature2().GetRule_object_feature_flag1().GetRule_an_id_or_type1(), *this)] = TDeferredAtom();
+    }
+    return true;
+}
+
+bool TSqlTranslation::ParseObjectFeatures(std::map<TString, TDeferredAtom>& result, const TRule_object_features& features) {
+    if (features.has_alt_object_features1()) {
+        if (!AddObjectFeature(result, features.alt_object_features1().GetRule_object_feature1())) {
+            return false;
+        }
+
+    } else if (features.has_alt_object_features2()) {
+        if (!AddObjectFeature(result, features.alt_object_features2().GetRule_object_feature2())) {
+            return false;
+        }
+        for (auto&& i : features.alt_object_features2().GetBlock3()) {
+            if (!AddObjectFeature(result, i.GetRule_object_feature2())) {
+                return false;
+            }
+        }
+    } else {
+        return false;
+    }
+    return true;
 }
 
 } // namespace NSQLTranslationV1

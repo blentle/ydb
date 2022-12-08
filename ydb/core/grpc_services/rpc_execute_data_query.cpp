@@ -93,20 +93,7 @@ void SerializeQueryRequest(std::shared_ptr<NGRpcService::IRequestCtxMtSafe>& in,
         }
     }
 
-    if (req->parametersSize() != 0) {
-        try {
-            ConvertYdbParamsToMiniKQLParams(req->parameters(), *dst->MutableRequest()->MutableParameters());
-        } catch (const std::exception& ex) {
-            auto issue = MakeIssue(NKikimrIssues::TIssuesIds::DEFAULT_ERROR, "Failed to parse query parameters.");
-            issue.AddSubIssue(MakeIntrusive<NYql::TIssue>(NYql::ExceptionToIssue(ex)));
-
-            NYql::TIssues issues;
-            issues.AddIssue(issue);
-            dst->SetYdbStatus(Ydb::StatusIds::BAD_REQUEST);
-            NYql::IssuesToMessage(issues, dst->MutableQueryIssues());
-            return;
-        }
-    }
+    dst->MutableRequest()->MutableYdbParameters()->insert(req->parameters().begin(), req->parameters().end());
 }
 
 class TExecuteDataQueryRPC : public TRpcKqpRequestActor<TExecuteDataQueryRPC, TEvExecuteDataQueryRequest> {
@@ -215,35 +202,6 @@ public:
             FillQueryStats(*to->mutable_query_stats(), from);
             to->mutable_query_stats()->set_query_ast(from.GetQueryAst());
             return;
-        }
-
-        // TODO: For compatibility with old kqp workers, deprecate.
-        if (from.GetProfile().KqlProfilesSize() == 1) {
-            const auto& kqlProlfile = from.GetProfile().GetKqlProfiles(0);
-            const auto& phases = kqlProlfile.GetMkqlProfiles();
-            for (const auto& s : phases) {
-                if (s.HasTxStats()) {
-                    const auto& tableStats = s.GetTxStats().GetTableAccessStats();
-                    auto* phase = to->mutable_query_stats()->add_query_phases();
-                    phase->set_duration_us(s.GetTxStats().GetDurationUs());
-                    for (const auto& ts : tableStats) {
-                        auto* tableAccess = phase->add_table_access();
-                        tableAccess->set_name(ts.GetTableInfo().GetName());
-                        if (ts.HasSelectRow()) {
-                            ConvertReadStats(ts.GetSelectRow(), tableAccess->mutable_reads());
-                        }
-                        if (ts.HasSelectRange()) {
-                            ConvertReadStats(ts.GetSelectRange(), tableAccess->mutable_reads());
-                        }
-                        if (ts.HasUpdateRow()) {
-                            ConvertWriteStats(ts.GetUpdateRow(), tableAccess->mutable_updates());
-                        }
-                        if (ts.HasEraseRow()) {
-                            ConvertWriteStats(ts.GetEraseRow(), tableAccess->mutable_deletes());
-                        }
-                    }
-                }
-            }
         }
     }
 

@@ -279,8 +279,6 @@ public:
             return ExecuteGRpcRequest<NMsgBusProxy::TBusChooseProxy>(&NGRpcProxy::TGRpcClient::ChooseProxy, promise, request);
         case NMsgBusProxy::MTYPE_CLIENT_SQS_REQUEST:
             return ExecuteGRpcRequest<NMsgBusProxy::TBusSqsRequest, NMsgBusProxy::TBusSqsResponse>(&NGRpcProxy::TGRpcClient::SqsRequest, promise, request);
-        case NMsgBusProxy::MTYPE_CLIENT_S3_LISTING_REQUEST:
-            return ExecuteGRpcRequest<NMsgBusProxy::TBusS3ListingRequest, NMsgBusProxy::TBusS3ListingResponse>(&NGRpcProxy::TGRpcClient::S3Listing, promise, request);
         case NMsgBusProxy::MTYPE_CLIENT_INTERCONNECT_DEBUG:
             return ExecuteGRpcRequest<NMsgBusProxy::TBusInterconnectDebug>(&NGRpcProxy::TGRpcClient::InterconnectDebug, promise, request);
         case NMsgBusProxy::MTYPE_CLIENT_CONSOLE_REQUEST:
@@ -293,6 +291,8 @@ public:
             return ExecuteGRpcRequest<NMsgBusProxy::TBusDrainNode, NMsgBusProxy::TBusResponse>(&NGRpcProxy::TGRpcClient::DrainNode, promise, request);
         case NMsgBusProxy::MTYPE_CLIENT_FILL_NODE:
             return ExecuteGRpcRequest<NMsgBusProxy::TBusFillNode, NMsgBusProxy::TBusResponse>(&NGRpcProxy::TGRpcClient::FillNode, promise, request);
+        case NMsgBusProxy::MTYPE_CLIENT_LOGIN_REQUEST:
+            return ExecuteGRpcRequest<NMsgBusProxy::TBusLoginRequest, NMsgBusProxy::TBusResponse>(&NGRpcProxy::TGRpcClient::LoginRequest, promise, request);
         default:
             Y_FAIL("%s", (TStringBuilder() << "unexpected message type# " << type).data());
         }

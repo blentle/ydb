@@ -1,6 +1,7 @@
 #include "kqp_opt_impl.h"
 
 #include <ydb/core/kqp/common/kqp_yql.h>
+#include <ydb/core/kqp/opt/peephole/kqp_opt_peephole.h>
 
 #include <ydb/library/yql/core/yql_expr_optimize.h>
 #include <ydb/library/yql/dq/opt/dq_opt.h>
@@ -273,31 +274,23 @@ private:
 
             bindingsMap.emplace(std::move(paramName), std::move(paramBinding));
 
+            YQL_ENSURE(!TDqConnection::Match(node.Get()));
             return true;
         };
 
         VisitExpr(stage.Program().Body().Ptr(), bindingsBuilder);
+        for (ui32 i = 0; i < stage.Inputs().Size(); ++i) {
+            auto input = stage.Inputs().Item(i);
+            if (input.Maybe<TDqSource>()) {
+                VisitExpr(input.Ptr(), bindingsBuilder);
+            }
+        }
 
         TVector<TExprBase> newInputs;
         TVector<TCoArgument> newArgs;
         TNodeOnNodeOwnedMap argsMap;
 
-        for (ui32 i = 0; i < stage.Inputs().Size(); ++i) {
-            const auto& input = stage.Inputs().Item(i);
-            const auto& inputArg = stage.Program().Args().Arg(i);
-
-            auto maybeBinding = input.Maybe<TKqpTxResultBinding>();
-
-            if (!maybeBinding.IsValid()) {
-                auto newArg = ctx.NewArgument(inputArg.Pos(), inputArg.Name());
-                newInputs.push_back(input);
-                newArgs.emplace_back(TCoArgument(newArg));
-                argsMap.emplace(inputArg.Raw(), std::move(newArg));
-                continue;
-            }
-
-            auto binding = maybeBinding.Cast();
-
+        auto makeParameterBinding = [&ctx, &bindingsMap] (TKqpTxResultBinding binding, TPositionHandle pos) {
             TString paramName = TStringBuilder() << ParamNamePrefix
                 << "tx_result_binding_" << binding.TxIndex().Value() << "_" << binding.ResultIndex().Value();
 
@@ -307,9 +300,9 @@ private:
             type = type->Cast<TTypeExprType>()->GetType();
             YQL_ENSURE(type);
 
-            TExprBase parameter = Build<TCoParameter>(ctx, input.Pos())
+            TExprBase parameter = Build<TCoParameter>(ctx, pos)
                 .Name().Build(paramName)
-                .Type(ExpandType(input.Pos(), *type, ctx))
+                .Type(ExpandType(pos, *type, ctx))
                 .Done();
 
             // TODO: (Iterator|ToStream (Parameter ...)) -> (ToFlow (Parameter ...))
@@ -319,7 +312,7 @@ private:
 //                    .Done();
 //            }
 
-            auto paramBinding = Build<TKqpParamBinding>(ctx, input.Pos())
+            auto paramBinding = Build<TKqpParamBinding>(ctx, pos)
                 .Name().Build(paramName)
                 .Binding(binding)
                 .Done();
@@ -331,7 +324,37 @@ private:
                     << ", first: " << KqpExprToPrettyString(inserted.first->second.Binding().Ref(), ctx)
                     << ", second: " << KqpExprToPrettyString(binding, ctx));
             }
-            argsMap.emplace(inputArg.Raw(), parameter.Ptr());
+            return parameter;
+        };
+
+        TNodeOnNodeOwnedMap sourceReplaceMap;
+        for (ui32 i = 0; i < stage.Inputs().Size(); ++i) {
+            const auto& input = stage.Inputs().Item(i);
+            const auto& inputArg = stage.Program().Args().Arg(i);
+
+            if (auto source = input.Maybe<TDqSource>()) {
+                VisitExpr(input.Ptr(),
+                    [&](const TExprNode::TPtr& node) {
+                        TExprBase expr(node);
+                        YQL_ENSURE(!expr.Maybe<TDqConnection>().IsValid());
+                        if (auto binding = expr.Maybe<TKqpTxResultBinding>()) {
+                            sourceReplaceMap.emplace(node.Get(), makeParameterBinding(binding.Cast(), node->Pos()).Ptr());
+                        }
+                        return true;
+                    });
+            }
+
+            auto maybeBinding = input.Maybe<TKqpTxResultBinding>();
+
+            if (!maybeBinding.IsValid()) {
+                auto newArg = ctx.NewArgument(inputArg.Pos(), inputArg.Name());
+                newInputs.push_back(input);
+                newArgs.emplace_back(TCoArgument(newArg));
+                argsMap.emplace(inputArg.Raw(), std::move(newArg));
+                continue;
+            }
+
+            argsMap.emplace(inputArg.Raw(), makeParameterBinding(maybeBinding.Cast(), input.Pos()).Ptr());
         }
 
         auto inputs = Build<TExprList>(ctx, stage.Pos())
@@ -339,7 +362,7 @@ private:
             .Done();
 
         return Build<TDqPhyStage>(ctx, stage.Pos())
-            .Inputs(ctx.ReplaceNodes(inputs.Ptr(), stagesMap))
+            .Inputs(ctx.ReplaceNodes(ctx.ReplaceNodes(inputs.Ptr(), stagesMap), sourceReplaceMap))
             .Program()
                 .Args(newArgs)
                 .Body(ctx.ReplaceNodes(stage.Program().Body().Ptr(), argsMap))
@@ -386,6 +409,29 @@ private:
     EKikimrQueryType QueryType;
     bool IsPrecompute;
 };
+
+TVector<TDqPhyPrecompute> PrecomputeInputs(const TDqStage& stage) {
+    TVector<TDqPhyPrecompute> result;
+    for (const auto& input : stage.Inputs()) {
+        if (auto maybePrecompute = input.Maybe<TDqPhyPrecompute>()) {
+            result.push_back(maybePrecompute.Cast());
+        } else if (auto maybeSource = input.Maybe<TDqSource>()) {
+            VisitExpr(maybeSource.Cast().Ptr(),
+                  [&] (const TExprNode::TPtr& ptr) {
+                    TExprBase node(ptr);
+                    if (auto maybePrecompute = node.Maybe<TDqPhyPrecompute>()) {
+                        result.push_back(maybePrecompute.Cast());
+                        return false;
+                    }
+                    if (auto maybeConnection = node.Maybe<TDqConnection>()) {
+                        YQL_ENSURE(false, "unexpected connection in source");
+                    }
+                    return true;
+                  });
+        }
+    }
+    return result;
+}
 
 class TKqpBuildTxsTransformer : public TSyncTransformerBase {
 public:
@@ -434,39 +480,41 @@ public:
         }
 
         TVector<TExprBase> queryResults;
-        if (!query.Results().Empty()) {
-            auto tx = BuildTx(query.Results().Ptr(), ctx, false);
-            if (!tx) {
-                return TStatus::Error;
+        for (const auto& block : query.Blocks()) {
+            if (!block.Results().Empty()) {
+                auto tx = BuildTx(block.Results().Ptr(), ctx, false);
+                if (!tx) {
+                    return TStatus::Error;
+                }
+
+                BuildCtx->PhysicalTxs.emplace_back(tx.Cast());
+
+                for (ui32 i = 0; i < block.Results().Size(); ++i) {
+                    const auto& result = block.Results().Item(i);
+                    auto binding = Build<TKqpTxResultBinding>(ctx, block.Pos())
+                        .Type(ExpandType(block.Pos(), *result.Value().Ref().GetTypeAnn(), ctx))
+                        .TxIndex()
+                            .Build(ToString(BuildCtx->PhysicalTxs.size() - 1))
+                        .ResultIndex()
+                            .Build(ToString(i))
+                        .Done();
+
+                    queryResults.emplace_back(std::move(binding));
+                }
             }
 
-            BuildCtx->PhysicalTxs.emplace_back(tx.Cast());
+            if (!block.Effects().Empty()) {
+                auto tx = BuildTx(block.Effects().Ptr(), ctx, /* isPrecompute */ false);
+                if (!tx) {
+                    return TStatus::Error;
+                }
 
-            for (ui32 i = 0; i < query.Results().Size(); ++i) {
-                const auto& result = query.Results().Item(i);
-                auto binding = Build<TKqpTxResultBinding>(ctx, query.Pos())
-                    .Type(ExpandType(query.Pos(), *result.Value().Ref().GetTypeAnn(), ctx))
-                    .TxIndex()
-                        .Build(ToString(BuildCtx->PhysicalTxs.size() - 1))
-                    .ResultIndex()
-                        .Build(ToString(i))
-                    .Done();
+                if (!CheckEffectsTx(tx.Cast(), ctx)) {
+                    return TStatus::Error;
+                }
 
-                queryResults.emplace_back(std::move(binding));
+                BuildCtx->PhysicalTxs.emplace_back(tx.Cast());
             }
-        }
-
-        if (!query.Effects().Empty()) {
-            auto tx = BuildTx(query.Effects().Ptr(), ctx, /* isPrecompute */ false);
-            if (!tx) {
-                return TStatus::Error;
-            }
-
-            if (!CheckEffectsTx(tx.Cast(), ctx)) {
-                return TStatus::Error;
-            }
-
-            BuildCtx->PhysicalTxs.emplace_back(tx.Cast());
         }
 
         TKqpPhyQuerySettings querySettings;
@@ -555,26 +603,29 @@ private:
             }
 
             auto stage = maybeStage.Cast();
+            auto precomputeInputs = PrecomputeInputs(stage);
+            for (auto& precompute : precomputeInputs) {
+                auto precomputeStage = precompute.Connection().Output().Stage();
+                precomputes.emplace(precomputeStage.Raw(), precomputeStage.Ptr());
+                dependencies.emplace(stage.Raw(), stage.Ptr());
+            }
 
             for (const auto& input : stage.Inputs()) {
-                const TExprNode* inputStage;
-
-                if (auto maybePrecompute = input.Maybe<TDqPhyPrecompute>()) {
-                    auto precomputeStage = maybePrecompute.Cast().Connection().Output().Stage();
-                    precomputes.emplace(precomputeStage.Raw(), precomputeStage.Ptr());
-                    dependencies.emplace(stage.Raw(), stage.Ptr());
-                    inputStage = precomputeStage.Raw();
+                if (input.Maybe<TDqPhyPrecompute>()) {
+                    continue;
                 } else if (auto maybeConnection = input.Maybe<TDqConnection>()) {
-                    inputStage = maybeConnection.Cast().Output().Stage().Raw();
+                    const TExprNode* inputStage = maybeConnection.Cast().Output().Stage().Raw();
+                    if (dependencies.contains(inputStage)) {
+                        dependencies.emplace(stage.Raw(), stage.Ptr());
+                    }
+                } else if (auto maybeSource = input.Maybe<TDqSource>()) {
+                    // handled in PrecomputeInputs
+                    continue;
                 } else if (input.Maybe<TKqpTxResultBinding>()) {
                     // ok
                     continue;
                 } else {
                     YQL_ENSURE(false, "Unexpected stage input: " << input.Ref().Content());
-                }
-
-                if (dependencies.contains(inputStage)) {
-                    dependencies.emplace(stage.Raw(), stage.Ptr());
                 }
             }
 
@@ -617,15 +668,9 @@ private:
 
         for (auto& [_, stagePtr] : dependantStagesMap) {
             TDqStage stage(stagePtr);
+            auto precomputes = PrecomputeInputs(stage);
 
-            for (const auto& input : stage.Inputs()) {
-                auto maybePrecompute = input.Maybe<TDqPhyPrecompute>();
-
-                if (!maybePrecompute.IsValid()) {
-                    continue;
-                }
-
-                auto precompute = maybePrecompute.Cast();
+            for (const auto& precompute : precomputes) {
                 auto precomputeConnection = precompute.Connection();
                 auto precomputeStage = precomputeConnection.Output().Stage();
 

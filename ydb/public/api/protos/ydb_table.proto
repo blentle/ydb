@@ -12,6 +12,7 @@ import "ydb/public/api/protos/ydb_status_codes.proto";
 import "ydb/public/api/protos/ydb_formats.proto";
 
 import "google/protobuf/empty.proto";
+import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
 package Ydb.Table;
@@ -147,6 +148,10 @@ message Changefeed {
     ChangefeedMode.Mode mode = 2;
     // Format of the data
     ChangefeedFormat.Format format = 3;
+    // How long data in changefeed's underlying topic should be stored
+    google.protobuf.Duration retention_period = 4;
+    // Emit virtual timestamps of changes along with data or not
+    bool virtual_timestamps = 5;
 }
 
 message ChangefeedDescription {
@@ -164,6 +169,8 @@ message ChangefeedDescription {
     ChangefeedFormat.Format format = 3;
     // State of the feed
     State state = 4;
+    // State of emitting of virtual timestamps along with data
+    bool virtual_timestamps = 5;
 }
 
 message StoragePool {
@@ -402,8 +409,8 @@ message ColumnFamily {
 }
 
 message PartitioningSettings {
-    // List of columns (primary key prefix) to partition by
-    reserved 1; // partition_by
+    // List of columns to partition by
+    repeated string partition_by = 1;
     // Enable auto partitioning on reaching upper or lower partition size bound
     Ydb.FeatureFlag.Status partitioning_by_size = 2;
     // Preferred partition size for auto partitioning by size, Mb
@@ -1003,15 +1010,9 @@ message ReadTableResponse {
     // Issues
     repeated Ydb.Issue.IssueMessage issues = 2;
     // Optional snapshot that corresponds to the returned data
-    ReadTableSnapshot snapshot = 4;
+    VirtualTimestamp snapshot = 4;
     // Read table result
     ReadTableResult result = 3;
-}
-
-// Specifies a point in database time that corresponds to the data
-message ReadTableSnapshot {
-    uint64 plan_step = 1;
-    uint64 tx_id = 2;
 }
 
 // Result of read table request

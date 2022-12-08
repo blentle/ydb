@@ -15,6 +15,52 @@ namespace NScheme {
 using namespace NThreading;
 using namespace Ydb::Scheme;
 
+TVirtualTimestamp::TVirtualTimestamp(ui64 planStep, ui64 txId)
+    : PlanStep(planStep)
+    , TxId(txId)
+{}
+
+TVirtualTimestamp::TVirtualTimestamp(const ::Ydb::VirtualTimestamp& proto)
+    : TVirtualTimestamp(proto.plan_step(), proto.tx_id())
+{}
+
+TString TVirtualTimestamp::ToString() const {
+    TString result;
+    TStringOutput out(result);
+    Out(out);
+    return result;
+}
+
+void TVirtualTimestamp::Out(IOutputStream& o) const {
+    o << "{ plan_step: " << PlanStep
+      << ", tx_id: " << TxId
+      << " }";
+}
+
+bool TVirtualTimestamp::operator<(const TVirtualTimestamp& rhs) const {
+    return PlanStep < rhs.PlanStep && TxId < rhs.TxId;
+}
+
+bool TVirtualTimestamp::operator<=(const TVirtualTimestamp& rhs) const {
+    return PlanStep <= rhs.PlanStep && TxId <= rhs.TxId;
+}
+
+bool TVirtualTimestamp::operator>(const TVirtualTimestamp& rhs) const {
+    return PlanStep > rhs.PlanStep && TxId > rhs.TxId;
+}
+
+bool TVirtualTimestamp::operator>=(const TVirtualTimestamp& rhs) const {
+    return PlanStep >= rhs.PlanStep && TxId >= rhs.TxId;
+}
+
+bool TVirtualTimestamp::operator==(const TVirtualTimestamp& rhs) const {
+    return PlanStep == rhs.PlanStep && TxId == rhs.TxId;
+}
+
+bool TVirtualTimestamp::operator!=(const TVirtualTimestamp& rhs) const {
+    return !(*this == rhs);
+}
+
 static ESchemeEntryType ConvertProtoEntryType(::Ydb::Scheme::Entry::Type entry) {
     switch (entry) {
     case ::Ydb::Scheme::Entry::DIRECTORY:
@@ -44,6 +90,17 @@ static ESchemeEntryType ConvertProtoEntryType(::Ydb::Scheme::Entry::Type entry) 
     }
 }
 
+TSchemeEntry::TSchemeEntry(const ::Ydb::Scheme::Entry& proto)
+    : Name(proto.name())
+    , Owner(proto.owner())
+    , Type(ConvertProtoEntryType(proto.type()))
+    , SizeBytes(proto.size_bytes())
+    , CreatedAt(proto.created_at())
+{
+    PermissionToSchemeEntry(proto.effective_permissions(), &EffectivePermissions);
+    PermissionToSchemeEntry(proto.permissions(), &Permissions);
+}
+
 class TSchemeClient::TImpl : public TClientImplCommon<TSchemeClient::TImpl> {
 public:
     TImpl(std::shared_ptr<TGRpcConnectionsImpl>&& connections, const TCommonClientSettings& settings)
@@ -56,8 +113,7 @@ public:
         return RunSimple<Ydb::Scheme::V1::SchemeService, MakeDirectoryRequest, MakeDirectoryResponse>(
             std::move(request),
             &Ydb::Scheme::V1::SchemeService::Stub::AsyncMakeDirectory,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TAsyncStatus RemoveDirectory(const TString& path, const TRemoveDirectorySettings& settings) {
@@ -67,8 +123,7 @@ public:
         return RunSimple<Ydb::Scheme::V1::SchemeService, RemoveDirectoryRequest, RemoveDirectoryResponse>(
             std::move(request),
             &Ydb::Scheme::V1::SchemeService::Stub::AsyncRemoveDirectory,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TAsyncDescribePathResult DescribePath(const TString& path, const TDescribePathSettings& settings) {
@@ -79,21 +134,12 @@ public:
 
         auto extractor = [promise]
             (google::protobuf::Any* any, TPlainStatus status) mutable {
-                TSchemeEntry entry;
+                DescribePathResult result;
                 if (any) {
-                    DescribePathResult result;
                     any->UnpackTo(&result);
-                    entry.Name = result.self().name();
-                    entry.Owner = result.self().owner();
-                    entry.Type = ConvertProtoEntryType(result.self().type());
-                    entry.SizeBytes = result.self().size_bytes();
-                    PermissionToSchemeEntry(result.self().effective_permissions(), &entry.EffectivePermissions);
-                    PermissionToSchemeEntry(result.self().permissions(), &entry.Permissions);
                 }
 
-                TDescribePathResult val(std::move(entry),
-                    TStatus(std::move(status)));
-                promise.SetValue(std::move(val));
+                promise.SetValue(TDescribePathResult(TStatus(std::move(status)), result.self()));
             };
 
         Connections_->RunDeferred<Ydb::Scheme::V1::SchemeService, DescribePathRequest, DescribePathResponse>(
@@ -102,8 +148,7 @@ public:
             &Ydb::Scheme::V1::SchemeService::Stub::AsyncDescribePath,
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
 
         return promise.GetFuture();
     }
@@ -116,27 +161,17 @@ public:
 
         auto extractor = [promise]
             (google::protobuf::Any* any, TPlainStatus status) mutable {
-                TSchemeEntry entry;
-                TVector<TSchemeEntry> children;
+                ListDirectoryResult result;
                 if (any) {
-                    ListDirectoryResult result;
                     any->UnpackTo(&result);
-                    entry.Name = result.self().name();
-                    entry.Owner = result.self().owner();
-                    entry.Type = ConvertProtoEntryType(result.self().type());
-
-                    for (const auto& child : result.children()) {
-                        TSchemeEntry tmp;
-                        tmp.Name = child.name();
-                        tmp.Owner = child.owner();
-                        tmp.Type = ConvertProtoEntryType(child.type());
-                        children.push_back(tmp);
-                    }
                 }
 
-                TListDirectoryResult val(std::move(children), std::move(entry),
-                    TStatus(std::move(status)));
-                promise.SetValue(std::move(val));
+                TVector<TSchemeEntry> children(Reserve(result.children().size()));
+                for (const auto& child : result.children()) {
+                    children.emplace_back(child);
+                }
+
+                promise.SetValue(TListDirectoryResult(TStatus(std::move(status)), result.self(), std::move(children)));
             };
 
         Connections_->RunDeferred<Ydb::Scheme::V1::SchemeService, ListDirectoryRequest, ListDirectoryResponse>(
@@ -145,8 +180,7 @@ public:
             &Ydb::Scheme::V1::SchemeService::Stub::AsyncListDirectory,
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
 
         return promise.GetFuture();
 
@@ -191,31 +225,31 @@ public:
         return RunSimple<Ydb::Scheme::V1::SchemeService, ModifyPermissionsRequest, ModifyPermissionsResponse>(
             std::move(request),
             &Ydb::Scheme::V1::SchemeService::Stub::AsyncModifyPermissions,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
 };
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TDescribePathResult::TDescribePathResult(TSchemeEntry&& entry, TStatus&& status)
+TDescribePathResult::TDescribePathResult(TStatus&& status, const TSchemeEntry& entry)
     : TStatus(std::move(status))
-    , Entry_(std::move(entry)) {}
+    , Entry_(entry)
+{}
 
-TSchemeEntry TDescribePathResult::GetEntry() const {
+const TSchemeEntry& TDescribePathResult::GetEntry() const {
     CheckStatusOk("TDescribePathResult::GetEntry");
     return Entry_;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TListDirectoryResult::TListDirectoryResult(TVector<TSchemeEntry>&& children, TSchemeEntry&& self,
-    TStatus&& status)
-    : TDescribePathResult(std::move(self), std::move(status))
-    , Children_(std::move(children)) {}
+TListDirectoryResult::TListDirectoryResult(TStatus&& status, const TSchemeEntry& self, TVector<TSchemeEntry>&& children)
+    : TDescribePathResult(std::move(status), self)
+    , Children_(std::move(children))
+{}
 
-TVector<TSchemeEntry> TListDirectoryResult::GetChildren() const {
+const TVector<TSchemeEntry>& TListDirectoryResult::GetChildren() const {
     CheckStatusOk("TListDirectoryResult::GetChildren");
     return Children_;
 }
@@ -252,3 +286,7 @@ TAsyncStatus TSchemeClient::ModifyPermissions(const TString& path,
 
 } // namespace NScheme
 } // namespace NYdb
+
+Y_DECLARE_OUT_SPEC(, NYdb::NScheme::TVirtualTimestamp, o, x) {
+    return x.Out(o);
+}

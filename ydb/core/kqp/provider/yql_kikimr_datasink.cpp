@@ -95,6 +95,24 @@ private:
         return TStatus::Error;
     }
 
+    TStatus HandleCreateObject(TKiCreateObject node, TExprContext& ctx) override {
+        ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
+            << "CreateObject is not yet implemented for intent determination transformer"));
+        return TStatus::Error;
+    }
+
+    TStatus HandleAlterObject(TKiAlterObject node, TExprContext& ctx) override {
+        ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
+            << "AlterObject is not yet implemented for intent determination transformer"));
+        return TStatus::Error;
+    }
+
+    TStatus HandleDropObject(TKiDropObject node, TExprContext& ctx) override {
+        ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
+            << "DropObject is not yet implemented for intent determination transformer"));
+        return TStatus::Error;
+    }
+
     TStatus HandleCreateGroup(TKiCreateGroup node, TExprContext& ctx) override {
         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
             << "CreateGroup is not yet implemented for intent determination transformer"));
@@ -221,6 +239,8 @@ private:
 
             case TKikimrKey::Type::Role:
                 return TStatus::Ok;
+            case TKikimrKey::Type::Object:
+                return TStatus::Ok;
         }
 
         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), "Invalid table key type."));
@@ -228,6 +248,13 @@ private:
     }
 
     TStatus HandleCommit(TCoCommit node, TExprContext& ctx) override {
+        Y_UNUSED(node);
+        Y_UNUSED(ctx);
+
+        return TStatus::Ok;
+    }
+
+    TStatus HandleDataQueryBlock(TKiDataQueryBlock node, TExprContext& ctx) override {
         Y_UNUSED(node);
         Y_UNUSED(ctx);
 
@@ -250,13 +277,6 @@ private:
     }
 
     TStatus HandleEffects(TKiEffects node, TExprContext& ctx) override {
-        Y_UNUSED(node);
-        Y_UNUSED(ctx);
-
-        return TStatus::Ok;
-    }
-
-    TStatus HandleKql(TCallable node, TExprContext& ctx) override {
         Y_UNUSED(node);
         Y_UNUSED(ctx);
 
@@ -358,9 +378,7 @@ public:
             return node.Child(1)->Child(0)->Content() == KikimrProviderName;
         }
 
-        if (KikimrDataSinkFunctions().contains(node.Content()) ||
-            KikimrKqlFunctions().contains(node.Content()))
-        {
+        if (KikimrDataSinkFunctions().contains(node.Content())) {
             return true;
         }
 
@@ -383,7 +401,11 @@ public:
             || node.IsCallable(TKiDropUser::CallableName())
             || node.IsCallable(TKiCreateGroup::CallableName())
             || node.IsCallable(TKiAlterGroup::CallableName())
-            || node.IsCallable(TKiDropGroup::CallableName())) {
+            || node.IsCallable(TKiDropGroup::CallableName())
+            || node.IsCallable(TKiCreateObject::CallableName())
+            || node.IsCallable(TKiAlterObject::CallableName())
+            || node.IsCallable(TKiDropObject::CallableName()))
+{
             return true;
         }
 
@@ -397,33 +419,8 @@ public:
     }
 
     bool CollectDiagnostics(NYson::TYsonWriter& writer) override {
-        auto& execResults = SessionCtx->Query().Results;
-        if (!std::find_if(execResults.begin(), execResults.end(),
-            [] (const auto& pair) { return pair.second.Profile; }))
-        {
-            return false;
-        }
-
-        writer.OnBeginMap();
-        writer.OnKeyedItem("KqlProfiles");
-        writer.OnBeginList();
-
-        for (auto& pair : execResults) {
-            auto& result = pair.second;
-            if (result.Profile) {
-                writer.OnListItem();
-
-                YQL_ENSURE(result.Profile->GetKqlProfiles().size() == 1);
-                auto& kqlProfile = result.Profile->GetKqlProfiles(0);
-
-                KikimrProfileToYson(kqlProfile, writer);
-            }
-        }
-
-        writer.OnEndList();
-        writer.OnEndMap();
-
-        return true;
+        Y_UNUSED(writer);
+        return false;
     }
 
     TExprNode::TPtr RewriteIO(const TExprNode::TPtr& node, TExprContext& ctx) override {
@@ -545,6 +542,44 @@ public:
 
             case TKikimrKey::Type::TableList:
                 break;
+            case TKikimrKey::Type::Object:
+            {
+                NCommon::TWriteObjectSettings settings = NCommon::ParseWriteObjectSettings(TExprList(node->Child(4)), ctx);
+                YQL_ENSURE(settings.Mode);
+                auto mode = settings.Mode.Cast();
+
+                if (mode == "createObject") {
+                    return Build<TKiCreateObject>(ctx, node->Pos())
+                        .World(node->Child(0))
+                        .DataSink(node->Child(1))
+                        .ObjectId().Build(key.GetObjectId())
+                        .TypeId().Build(key.GetObjectType())
+                        .Features(settings.Features)
+                        .Done()
+                        .Ptr();
+                } else if (mode == "alterObject") {
+                    return Build<TKiAlterObject>(ctx, node->Pos())
+                        .World(node->Child(0))
+                        .DataSink(node->Child(1))
+                        .ObjectId().Build(key.GetObjectId())
+                        .TypeId().Build(key.GetObjectType())
+                        .Features(settings.Features)
+                        .Done()
+                        .Ptr();
+                } else if (mode == "dropObject") {
+                    return Build<TKiDropObject>(ctx, node->Pos())
+                        .World(node->Child(0))
+                        .DataSink(node->Child(1))
+                        .ObjectId().Build(key.GetObjectId())
+                        .TypeId().Build(key.GetObjectType())
+                        .Features(settings.Features)
+                        .Done()
+                        .Ptr();
+                } else {
+                    YQL_ENSURE(false, "unknown Object operation mode \"" << TString(mode) << "\"");
+                }
+                break;
+            }
 
             case TKikimrKey::Type::Role: {
                 NCommon::TWriteRoleSettings settings = NCommon::ParseWriteRoleSettings(TExprList(node->Child(4)), ctx);
@@ -681,6 +716,18 @@ IGraphTransformer::TStatus TKiSinkVisitorTransformer::DoTransform(TExprNode::TPt
         return HandleDropTable(node.Cast(), ctx);
     }
 
+    if (auto node = TMaybeNode<TKiCreateObject>(input)) {
+        return HandleCreateObject(node.Cast(), ctx);
+    }
+
+    if (auto node = TMaybeNode<TKiAlterObject>(input)) {
+        return HandleAlterObject(node.Cast(), ctx);
+    }
+
+    if (auto node = TMaybeNode<TKiDropObject>(input)) {
+        return HandleDropObject(node.Cast(), ctx);
+    }
+
     if (auto node = TMaybeNode<TKiCreateUser>(input)) {
         return HandleCreateUser(node.Cast(), ctx);
     }
@@ -713,6 +760,10 @@ IGraphTransformer::TStatus TKiSinkVisitorTransformer::DoTransform(TExprNode::TPt
         return HandleCommit(node.Cast(), ctx);
     }
 
+    if (auto node = callable.Maybe<TKiDataQueryBlock>()) {
+        return HandleDataQueryBlock(node.Cast(), ctx);
+    }
+
     if (auto node = callable.Maybe<TKiDataQuery>()) {
         return HandleDataQuery(node.Cast(), ctx);
     }
@@ -723,10 +774,6 @@ IGraphTransformer::TStatus TKiSinkVisitorTransformer::DoTransform(TExprNode::TPt
 
     if (auto node = callable.Maybe<TKiEffects>()) {
         return HandleEffects(node.Cast(), ctx);
-    }
-
-    if (KikimrKqlFunctions().contains(callable.CallableName())) {
-        return HandleKql(callable, ctx);
     }
 
     ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TStringBuilder() << "(Kikimr DataSink) Unsupported function: "

@@ -1,22 +1,62 @@
 # -*- coding: utf-8 -*-
+import functools
 import logging
 import os
 import time
-import functools
-
+import copy
 import pytest
-from hamcrest import (
-    assert_that,
-    contains_inanyorder,
-    not_none,
-)
 
-import ydb
-
+from hamcrest import assert_that, contains_inanyorder, not_none
 from tornado import gen
 from tornado.ioloop import IOLoop
 
+import ydb
+from ydb.tests.library.common.types import Erasure
+from ydb.tests.library.harness.util import LogLevels
+
 logger = logging.getLogger(__name__)
+
+
+# local configuration for the ydb cluster (fetched by ydb_cluster_configuration fixture)
+CLUSTER_CONFIG = dict(
+    erasure=Erasure.NONE,
+    nodes=1,
+    enable_metering=True,
+    disable_mvcc=True,
+    additional_log_configs={
+        'TX_PROXY': LogLevels.DEBUG,
+        'KQP_PROXY': LogLevels.DEBUG,
+        'KQP_WORKER': LogLevels.DEBUG,
+        'KQP_GATEWAY': LogLevels.DEBUG,
+        'GRPC_PROXY': LogLevels.TRACE,
+        'KQP_YQL': LogLevels.DEBUG,
+        'TX_DATASHARD': LogLevels.DEBUG,
+        'FLAT_TX_SCHEMESHARD': LogLevels.DEBUG,
+        'SCHEMESHARD_DESCRIBE': LogLevels.DEBUG,
+
+        'SCHEME_BOARD_POPULATOR': LogLevels.DEBUG,
+
+        'SCHEME_BOARD_REPLICA': LogLevels.ERROR,
+        'SCHEME_BOARD_SUBSCRIBER': LogLevels.ERROR,
+        'TX_PROXY_SCHEME_CACHE': LogLevels.ERROR,
+
+        'CMS': LogLevels.DEBUG,
+        'CMS_TENANTS': LogLevels.DEBUG,
+    },
+)
+
+
+@pytest.fixture(scope='module', params=[True, False], ids=['enable_alter_database_create_hive_first--true', 'enable_alter_database_create_hive_first--false'])
+def enable_alter_database_create_hive_first(request):
+    return request.param
+
+
+# ydb_fixtures.ydb_cluster_configuration local override
+@pytest.fixture(scope='module')
+def ydb_cluster_configuration(enable_alter_database_create_hive_first):
+    conf = copy.deepcopy(CLUSTER_CONFIG)
+    conf['enable_alter_database_create_hive_first'] = enable_alter_database_create_hive_first
+    return conf
 
 
 def test_fixtures(ydb_hostel_db, ydb_serverless_db):
@@ -25,7 +65,7 @@ def test_fixtures(ydb_hostel_db, ydb_serverless_db):
     )
 
 
-def test_create_table(ydb_hostel_db, ydb_serverless_db, ydb_endpoint, metering_file_path, ydb_private_client):
+def test_create_table(ydb_hostel_db, ydb_serverless_db, ydb_endpoint):
     logger.debug(
         "test for serverless db %s over hostel db %s", ydb_serverless_db, ydb_hostel_db
     )
@@ -145,7 +185,7 @@ def test_turn_on_serverless_storage_billing(ydb_hostel_db, ydb_serverless_db, yd
         pool.retry_operation_sync(drop_table, None, os.path.join(database, "dirA1", "dirB1", "table"))
 
 
-def test_create_table_with_quotas(ydb_hostel_db, ydb_quoted_serverless_db, ydb_endpoint, ydb_cluster):
+def test_create_table_with_quotas(ydb_hostel_db, ydb_quoted_serverless_db, ydb_endpoint):
     logger.debug(
         "test for serverless db %s over hostel db %s", ydb_quoted_serverless_db, ydb_hostel_db
     )

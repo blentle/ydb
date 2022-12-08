@@ -75,7 +75,7 @@ namespace NKikimr::NBlobDepot {
         struct Data : Table<4> {
             struct Key : Column<1, NScheme::NTypeIds::String> {};
             struct Value : Column<2, NScheme::NTypeIds::String> {};
-            struct UncertainWrite : Column<3, NScheme::NTypeIds::Bool> { static constexpr Type Default = true; };
+            struct UncertainWrite : Column<3, NScheme::NTypeIds::Bool> { static constexpr Type Default = false; };
 
             using TKey = TableKey<Key>;
             using TColumns = TableColumns<
@@ -86,6 +86,7 @@ namespace NKikimr::NBlobDepot {
 
             static constexpr ui64 PrechargeRows = 10'000;
             static constexpr ui64 PrechargeBytes = 1'000'000;
+            using Precharge = NoAutoPrecharge;
         };
 
         struct Trash : Table<5> {
@@ -96,6 +97,7 @@ namespace NKikimr::NBlobDepot {
 
             static constexpr ui64 PrechargeRows = 10'000;
             static constexpr ui64 PrechargeBytes = 1'000'000;
+            using Precharge = NoAutoPrecharge;
         };
 
         struct GC : Table<6> {
@@ -109,6 +111,7 @@ namespace NKikimr::NBlobDepot {
 
             static constexpr ui64 PrechargeRows = 10'000;
             static constexpr ui64 PrechargeBytes = 1'000'000;
+            using Precharge = NoAutoPrecharge;
         };
 
         using TTables = SchemaTables<

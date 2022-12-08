@@ -23,7 +23,6 @@ namespace NKikimr {
         using TNodeRegistrationResponseCallback = TCallback<NKikimrClient::TNodeRegistrationResponse>;
         using TCmsResponseCallback = TCallback<NKikimrClient::TCmsResponse>;
         using TSqsResponseCallback = TCallback<NKikimrClient::TSqsResponse>;
-        using TS3ListingResponseCallback = TCallback<NKikimrClient::TS3ListingResponse>;
         using TConsoleResponseCallback = TCallback<NKikimrClient::TConsoleResponse>;
 
         using TFinishCallback = std::function<void (const TGrpcError*)>;
@@ -91,11 +90,6 @@ namespace NKikimr {
             void SqsRequest(const NKikimrClient::TSqsRequest& request, TSqsResponseCallback callback);
 
             /////////////////////////////////////////////////////////////////////////////////////////////////
-            // S3 LISTING INTERFACE
-            /////////////////////////////////////////////////////////////////////////////////////////////////
-            void S3Listing(const NKikimrClient::TS3ListingRequest& request, TS3ListingResponseCallback callback);
-
-            /////////////////////////////////////////////////////////////////////////////////////////////////
             // CONSOLE INTERFACE
             /////////////////////////////////////////////////////////////////////////////////////////////////
             void ConsoleRequest(const NKikimrClient::TConsoleRequest& request, TConsoleResponseCallback callback);
@@ -134,6 +128,8 @@ namespace NKikimr {
             void WhoAmI(const NKikimrClient::TWhoAmI& request, TResponseCallback callback);
             void FillNode(const NKikimrClient::TFillNodeRequest& request, TResponseCallback callback);
             void DrainNode(const NKikimrClient::TDrainNodeRequest& request, TResponseCallback callback);
+
+            void LoginRequest(const NKikimrClient::TLoginRequest& request, TResponseCallback callback);
         };
 
     } // NGRpcProxy

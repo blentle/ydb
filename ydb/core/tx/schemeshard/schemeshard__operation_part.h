@@ -115,7 +115,7 @@ public:
     void AddAuditLogFragment(TAuditLogFragment&& op) {
         AuditLogFragments.push_back(std::move(op));
     }
-    
+
     void ClearAuditLogFragments() {
         AuditLogFragments.clear();
     }
@@ -162,7 +162,7 @@ public:
 
     TDbGuard DbGuard() {
         return TDbGuard(*this);
-     }
+    }
 };
 
 using TProposeRequest = NKikimr::NSchemeShard::TEvSchemeShard::TEvModifySchemeTransaction;
@@ -197,8 +197,12 @@ public:
     // call it inside multipart operations after failed propose
     virtual void AbortPropose(TOperationContext& context) = 0;
 
-    //call it only before execute ForceDrop operaion for path
+    // call it only before execute ForceDrop operaion for path
     virtual void AbortUnsafe(TTxId forceDropTxId, TOperationContext& context) = 0;
+
+    // getters
+    virtual const TOperationId& GetOperationId() const = 0;
+    virtual const TTxTransaction& GetTransaction() const = 0;
 };
 
 class TSubOperationState {
@@ -230,37 +234,104 @@ public:
     virtual bool ProgressState(TOperationContext& context) = 0;
 };
 
-class TSubOperation: public ISubOperationBase {
-private:
-    TSubOperationState::TPtr Base = nullptr;
+class TSubOperationBase: public ISubOperationBase {
+protected:
+    const TOperationId OperationId;
+    const TTxTransaction Transaction;
 
 public:
-    virtual void StateDone(TOperationContext& context) = 0;
+    explicit TSubOperationBase(const TOperationId& id)
+        : OperationId(id)
+    {
+    }
 
-    void SetState(TSubOperationState::TPtr state) {
-        Base = std::move(state);
+    explicit TSubOperationBase(const TOperationId& id, const TTxTransaction& tx)
+        : OperationId(id)
+        , Transaction(tx)
+    {
+    }
+
+    const TOperationId& GetOperationId() const override final {
+        return OperationId;
+    }
+
+    const TTxTransaction& GetTransaction() const override final {
+        return Transaction;
+    }
+};
+
+class TSubOperation: public TSubOperationBase {
+    TTxState::ETxState State = TTxState::Invalid;
+    TSubOperationState::TPtr Base = nullptr;
+
+protected:
+    virtual TTxState::ETxState NextState(TTxState::ETxState state) const = 0;
+    virtual TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) = 0;
+
+    virtual void StateDone(TOperationContext& context) {
+        auto state = NextState(GetState());
+        SetState(state);
+
+        if (state != TTxState::Invalid) {
+            context.OnComplete.ActivateTx(OperationId);
+        }
+    }
+
+public:
+    using TSubOperationBase::TSubOperationBase;
+
+    explicit TSubOperation(const TOperationId& id, TTxState::ETxState state)
+        : TSubOperationBase(id)
+        , State(state)
+    {
+    }
+
+    TTxState::ETxState GetState() const {
+        return State;
+    }
+
+    void SetState(TTxState::ETxState state) {
+        State = state;
+        Base = SelectStateFunc(state);
     }
 
     void ProgressState(TOperationContext& context) override {
         Y_VERIFY(Base);
-        bool isDone = Base->ProgressState(context);
+        const bool isDone = Base->ProgressState(context);
         if (isDone) {
             StateDone(context);
         }
     }
 
-    #define DefaultHandleReply(TEvType, ...)          \
-        void HandleReply(TEvType::TPtr& ev, TOperationContext& context) override {      \
-            Y_VERIFY(Base);                             \
-            bool isDone = Base->HandleReply(ev, context);   \
-            if (isDone) {                               \
-                StateDone(context);                     \
-            }                                           \
+    #define DefaultHandleReply(TEvType, ...)                                       \
+        void HandleReply(TEvType::TPtr& ev, TOperationContext& context) override { \
+            Y_VERIFY(Base);                                                        \
+            bool isDone = Base->HandleReply(ev, context);                          \
+            if (isDone) {                                                          \
+                StateDone(context);                                                \
+            }                                                                      \
         }
 
         SCHEMESHARD_INCOMING_EVENTS(DefaultHandleReply)
     #undef DefaultHandleReply
 };
+
+template <typename T>
+ISubOperationBase::TPtr MakeSubOperation(const TOperationId& id) {
+    return new T(id);
+}
+
+template <typename T, typename... Args>
+ISubOperationBase::TPtr MakeSubOperation(const TOperationId& id, const TTxTransaction& tx, Args&&... args) {
+    return new T(id, tx, std::forward<Args>(args)...);
+}
+
+template <typename T, typename... Args>
+ISubOperationBase::TPtr MakeSubOperation(const TOperationId& id, TTxState::ETxState state, Args&&... args) {
+    auto result = MakeHolder<T>(id, state, std::forward<Args>(args)...);
+    result->SetState(state);
+    return result.Release();
+}
 
 ISubOperationBase::TPtr CreateReject(TOperationId id, THolder<TProposeResponse> response);
 ISubOperationBase::TPtr CreateReject(TOperationId id, NKikimrScheme::EStatus status, const TString& message);
@@ -277,8 +348,8 @@ ISubOperationBase::TPtr CreateModifyACL(TOperationId id, TTxState::ETxState stat
 ISubOperationBase::TPtr CreateAlterUserAttrs(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateAlterUserAttrs(TOperationId id, TTxState::ETxState state);
 
-ISubOperationBase::TPtr CreateFroceDropUnsafe(TOperationId id, const TTxTransaction& tx);
-ISubOperationBase::TPtr CreateFroceDropUnsafe(TOperationId id, TTxState::ETxState state);
+ISubOperationBase::TPtr CreateForceDropUnsafe(TOperationId id, const TTxTransaction& tx);
+ISubOperationBase::TPtr CreateForceDropUnsafe(TOperationId id, TTxState::ETxState state);
 
 ISubOperationBase::TPtr CreateNewTable(TOperationId id, const TTxTransaction& tx, const THashSet<TString>& localSequences = { });
 ISubOperationBase::TPtr CreateNewTable(TOperationId id, TTxState::ETxState state);
@@ -313,8 +384,8 @@ ISubOperationBase::TPtr CreateUpdateMainTableOnIndexMove(TOperationId id, TTxSta
 TVector<ISubOperationBase::TPtr> CreateNewCdcStream(TOperationId id, const TTxTransaction& tx, TOperationContext& context);
 ISubOperationBase::TPtr CreateNewCdcStreamImpl(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateNewCdcStreamImpl(TOperationId id, TTxState::ETxState state);
-ISubOperationBase::TPtr CreateNewCdcStreamAtTable(TOperationId id, const TTxTransaction& tx);
-ISubOperationBase::TPtr CreateNewCdcStreamAtTable(TOperationId id, TTxState::ETxState state);
+ISubOperationBase::TPtr CreateNewCdcStreamAtTable(TOperationId id, const TTxTransaction& tx, bool initialScan);
+ISubOperationBase::TPtr CreateNewCdcStreamAtTable(TOperationId id, TTxState::ETxState state, bool initialScan);
 // Alter
 TVector<ISubOperationBase::TPtr> CreateAlterCdcStream(TOperationId id, const TTxTransaction& tx, TOperationContext& context);
 ISubOperationBase::TPtr CreateAlterCdcStreamImpl(TOperationId id, const TTxTransaction& tx);
@@ -406,17 +477,26 @@ ISubOperationBase::TPtr CreateUpgradeSubDomainDecision(TOperationId id, TTxState
 ISubOperationBase::TPtr CreateDropSubdomain(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateDropSubdomain(TOperationId id, TTxState::ETxState state);
 
-ISubOperationBase::TPtr CreateFroceDropSubDomain(TOperationId id, const TTxTransaction& tx);
-ISubOperationBase::TPtr CreateFroceDropSubDomain(TOperationId id, TTxState::ETxState state);
+ISubOperationBase::TPtr CreateForceDropSubDomain(TOperationId id, const TTxTransaction& tx);
+ISubOperationBase::TPtr CreateForceDropSubDomain(TOperationId id, TTxState::ETxState state);
 
+
+/// ExtSubDomain
+// Create
 ISubOperationBase::TPtr CreateExtSubDomain(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateExtSubDomain(TOperationId id, TTxState::ETxState state);
 
+// Alter
+TVector<ISubOperationBase::TPtr> CreateCompatibleAlterExtSubDomain(TOperationId nextId, const TTxTransaction& tx, TOperationContext& context);
 ISubOperationBase::TPtr CreateAlterExtSubDomain(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateAlterExtSubDomain(TOperationId id, TTxState::ETxState state);
+ISubOperationBase::TPtr CreateAlterExtSubDomainCreateHive(TOperationId id, const TTxTransaction& tx);
+ISubOperationBase::TPtr CreateAlterExtSubDomainCreateHive(TOperationId id, TTxState::ETxState state);
 
-ISubOperationBase::TPtr CreateFroceDropExtSubDomain(TOperationId id, const TTxTransaction& tx);
-ISubOperationBase::TPtr CreateFroceDropExtSubDomain(TOperationId id, TTxState::ETxState state);
+// Drop
+ISubOperationBase::TPtr CreateForceDropExtSubDomain(TOperationId id, const TTxTransaction& tx);
+ISubOperationBase::TPtr CreateForceDropExtSubDomain(TOperationId id, TTxState::ETxState state);
+
 
 ISubOperationBase::TPtr CreateNewKesus(TOperationId id, const TTxTransaction& tx);
 ISubOperationBase::TPtr CreateNewKesus(TOperationId id, TTxState::ETxState state);

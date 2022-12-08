@@ -8,28 +8,52 @@ namespace NKikimr::NBlobDepot {
     void TBlobDepot::Handle(TEvBlobDepot::TEvCommitBlobSeq::TPtr ev) {
         class TTxCommitBlobSeq : public NTabletFlatExecutor::TTransactionBase<TBlobDepot> {
             const ui32 NodeId;
+            const ui64 AgentInstanceId;
             std::unique_ptr<TEvBlobDepot::TEvCommitBlobSeq::THandle> Request;
             std::unique_ptr<IEventHandle> Response;
+            std::vector<TBlobSeqId> BlobSeqIds;
 
         public:
-            TTxCommitBlobSeq(TBlobDepot *self, ui32 nodeId, std::unique_ptr<TEvBlobDepot::TEvCommitBlobSeq::THandle> request)
+            TTxCommitBlobSeq(TBlobDepot *self, TAgent& agent, std::unique_ptr<TEvBlobDepot::TEvCommitBlobSeq::THandle> request)
                 : TTransactionBase(self)
-                , NodeId(nodeId)
+                , NodeId(agent.Connection->NodeId)
+                , AgentInstanceId(*agent.AgentInstanceId)
                 , Request(std::move(request))
-            {}
+            {
+                const ui32 generation = Self->Executor()->Generation();
+                for (const auto& item : Request->Get()->Record.GetItems()) {
+                    if (TData::TValue::Validate(item) && !item.GetCommitNotify()) {
+                        const auto blobSeqId = TBlobSeqId::FromProto(item.GetBlobLocator().GetBlobSeqId());
+                        if (Self->Data->CanBeCollected(blobSeqId)) {
+                            // check for internal sanity -- we can't issue barriers on given ids without confirmed trimming
+                            Y_VERIFY_S(blobSeqId.Generation < generation, "committing trimmed BlobSeqId"
+                                << " BlobSeqId# " << blobSeqId.ToString()
+                                << " Id# " << Self->GetLogId());
+                        } else if (Self->Data->BeginCommittingBlobSeqId(agent, blobSeqId)) {
+                            BlobSeqIds.push_back(blobSeqId);
+                        }
+                    }
+                }
+            }
 
             bool Execute(TTransactionContext& txc, const TActorContext&) override {
+                TAgent& agent = Self->GetAgent(NodeId);
+                if (!agent.Connection || agent.AgentInstanceId != AgentInstanceId) { // agent disconnected while transaction was in queue -- drop this request
+                    return true;
+                }
+
+                if (!LoadMissingKeys(txc)) {
+                    return false;
+                }
+
                 NIceDb::TNiceDb db(txc.DB);
 
                 NKikimrBlobDepot::TEvCommitBlobSeqResult *responseRecord;
                 std::tie(Response, responseRecord) = TEvBlobDepot::MakeResponseFor(*Request, Self->SelfId());
 
-                TAgent& agent = Self->GetAgent(NodeId);
                 const ui32 generation = Self->Executor()->Generation();
 
                 for (const auto& item : Request->Get()->Record.GetItems()) {
-                    auto key = TData::TKey::FromBinaryKey(item.GetKey(), Self->Config);
-
                     auto *responseItem = responseRecord->AddItems();
                     if (!TData::TValue::Validate(item)) {
                         responseItem->SetStatus(NKikimrProto::ERROR);
@@ -41,15 +65,14 @@ namespace NKikimr::NBlobDepot {
                     responseItem->SetStatus(NKikimrProto::OK);
 
                     const auto blobSeqId = TBlobSeqId::FromProto(blobLocator.GetBlobSeqId());
-                    const bool canBeCollected = Self->Data->CanBeCollected(blobLocator.GetGroupId(), blobSeqId);
+                    const bool canBeCollected = Self->Data->CanBeCollected(blobSeqId);
+
+                    auto key = TData::TKey::FromBinaryKey(item.GetKey(), Self->Config);
 
                     STLOG(PRI_DEBUG, BLOB_DEPOT, BDT68, "TTxCommitBlobSeq process key", (Id, Self->GetLogId()),
                         (Key, key), (Item, item), (CanBeCollected, canBeCollected), (Generation, generation));
 
-                    if (blobSeqId.Generation == generation) {
-                        // check for internal sanity -- we can't issue barriers on given ids without confirmed trimming
-                        Y_VERIFY_S(!canBeCollected || item.GetCommitNotify(), "BlobSeqId# " << blobSeqId.ToString());
-                    } else if (canBeCollected) {
+                    if (canBeCollected) {
                         // we can't accept this record, because it is potentially under already issued barrier
                         responseItem->SetStatus(NKikimrProto::ERROR);
                         responseItem->SetErrorReason("generation race");
@@ -75,35 +98,34 @@ namespace NKikimr::NBlobDepot {
                             responseItem->SetStatus(NKikimrProto::RACE);
                         }
                     } else {
-                        Self->Data->UpdateKey(key, item, item.GetUncertainWrite(), txc, this);
-                        if (blobSeqId.Generation == generation) {
-                            // mark given blob as committed only when it was issued in current generation -- only for this
-                            // generation we have correct GivenIdRanges; and we can do this only after updating key as the
-                            // callee function may trigger garbage collection
-                            MarkGivenIdCommitted(agent, blobSeqId);
-                        }
+                        Self->Data->UpdateKey(key, item, txc, this);
                     }
                 }
 
                 return true;
             }
 
-            void MarkGivenIdCommitted(TAgent& agent, const TBlobSeqId& blobSeqId) {
-                Y_VERIFY(blobSeqId.Channel < Self->Channels.size());
-
-                const ui64 value = blobSeqId.ToSequentialNumber();
-                STLOG(PRI_DEBUG, BLOB_DEPOT, BDT18, "MarkGivenIdCommitted", (Id, Self->GetLogId()),
-                    (AgentId, agent.ConnectedNodeId), (BlobSeqId, blobSeqId), (Value, value),
-                    (GivenIdRanges, Self->Channels[blobSeqId.Channel].GivenIdRanges),
-                    (Agent.GivenIdRanges, agent.GivenIdRanges[blobSeqId.Channel]));
-
-                agent.GivenIdRanges[blobSeqId.Channel].RemovePoint(value, nullptr);
-
-                bool wasLeast;
-                Self->Channels[blobSeqId.Channel].GivenIdRanges.RemovePoint(value, &wasLeast);
-                if (wasLeast) {
-                    Self->Data->OnLeastExpectedBlobIdChange(blobSeqId.Channel);
+            bool LoadMissingKeys(TTransactionContext& txc) {
+                NIceDb::TNiceDb db(txc.DB);
+                if (Self->Data->IsLoaded()) {
+                    return true;
                 }
+                bool success = true;
+                for (const auto& item : Request->Get()->Record.GetItems()) {
+                    auto key = TData::TKey::FromBinaryKey(item.GetKey(), Self->Config);
+                    if (Self->Data->IsKeyLoaded(key)) {
+                        continue;
+                    }
+                    using Table = Schema::Data;
+                    auto row = db.Table<Table>().Key(item.GetKey()).Select();
+                    if (!row.IsReady()) {
+                        success = false;
+                    } else if (row.IsValid()) {
+                        Self->Data->AddDataOnLoad(std::move(key), row.GetValue<Table::Value>(),
+                            row.GetValueOrDefault<Table::UncertainWrite>());
+                    }
+                }
+                return success;
             }
 
             bool CheckKeyAgainstBarrier(const TData::TKey& key, TString *error) {
@@ -128,13 +150,16 @@ namespace NKikimr::NBlobDepot {
             }
 
             void Complete(const TActorContext&) override {
+                TAgent& agent = Self->GetAgent(NodeId);
+                for (const TBlobSeqId blobSeqId : BlobSeqIds) {
+                    Self->Data->EndCommittingBlobSeqId(agent, blobSeqId);
+                }
                 Self->Data->CommitTrash(this);
                 TActivationContext::Send(Response.release());
             }
         };
 
-        TAgent& agent = GetAgent(ev->Recipient);
-        Execute(std::make_unique<TTxCommitBlobSeq>(this, agent.ConnectedNodeId,
+        Execute(std::make_unique<TTxCommitBlobSeq>(this, GetAgent(ev->Recipient),
             std::unique_ptr<TEvBlobDepot::TEvCommitBlobSeq::THandle>(ev.Release())));
     }
 
@@ -142,7 +167,7 @@ namespace NKikimr::NBlobDepot {
         TAgent& agent = GetAgent(ev->Recipient);
         const ui32 generation = Executor()->Generation();
 
-        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT57, "TEvDiscardSpoiledBlobSeq", (Id, GetLogId()), (AgentId, agent.ConnectedNodeId),
+        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT57, "TEvDiscardSpoiledBlobSeq", (Id, GetLogId()), (AgentId, agent.Connection->NodeId),
             (Msg, ev->Get()->Record));
 
         // FIXME(alexvru): delete uncertain keys containing this BlobSeqId as they were never written
@@ -151,11 +176,15 @@ namespace NKikimr::NBlobDepot {
             const auto blobSeqId = TBlobSeqId::FromProto(item);
             if (blobSeqId.Generation == generation) {
                 Y_VERIFY(blobSeqId.Channel < Channels.size());
+                auto& channel = Channels[blobSeqId.Channel];
+
+                const TBlobSeqId leastExpectedBlobIdBefore = channel.GetLeastExpectedBlobId(generation);
+
                 const ui64 value = blobSeqId.ToSequentialNumber();
-                agent.GivenIdRanges[blobSeqId.Channel].RemovePoint(value, nullptr);
-                bool wasLeast;
-                Channels[blobSeqId.Channel].GivenIdRanges.RemovePoint(value, &wasLeast);
-                if (wasLeast) {
+                agent.GivenIdRanges[blobSeqId.Channel].RemovePoint(value);
+                Channels[blobSeqId.Channel].GivenIdRanges.RemovePoint(value);
+
+                if (channel.GetLeastExpectedBlobId(generation) != leastExpectedBlobIdBefore) {
                     Data->OnLeastExpectedBlobIdChange(blobSeqId.Channel);
                 }
             }

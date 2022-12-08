@@ -2792,7 +2792,7 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         ])", FormatResultSetYson(result.GetResultSet(0)));
     }
 
-    // https://st.yandex-team.ru/KIKIMR-14022
+    // KIKIMR-14022
     Y_UNIT_TEST(JoinSameKey) {
         auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetTableClient();
@@ -3404,6 +3404,26 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
         UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
         CompareYson(R"([])", FormatResultSetYson(result.GetResultSet(0)));
+    }
+
+    Y_UNIT_TEST(FlatMapLambdaInnerPrecompute) {
+        auto settings = TKikimrSettings()
+            .SetEnablePredicateExtractForDataQueries(false);
+        TKikimrRunner kikimr{settings};
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        auto result = session.ExecuteDataQuery(R"(
+            --!syntax_v1
+
+            $rows = SELECT * FROM KeyValue;
+            $cnt = SELECT count(*) FROM $rows;
+            $join = SELECT l.Value AS value FROM $rows as l LEFT JOIN EightShard AS r on l.Key = r.Key;
+
+            $check = SELECT count(*) FROM $join;
+            SELECT * FROM EightShard WHERE $check = $cnt;
+        )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
     }
 }
 

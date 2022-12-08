@@ -1932,7 +1932,6 @@ public:
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
             rpcSettings,
-            settings.ClientTimeout_,
             TEndpointKey(preferedLocation, 0));
 
         std::weak_ptr<TDbDriverState> state = DbDriverState_;
@@ -1976,7 +1975,6 @@ public:
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
             TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_,
             session->GetEndpointKey());
 
         return keepAliveResultPromise.GetFuture();
@@ -1987,8 +1985,7 @@ public:
         return RunSimple<Ydb::Table::V1::TableService, Ydb::Table::CreateTableRequest,Ydb::Table::CreateTableResponse>(
             std::move(request),
             &Ydb::Table::V1::TableService::Stub::AsyncCreateTable,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TFuture<TStatus> AlterTable(Ydb::Table::AlterTableRequest&& request, const TAlterTableSettings& settings)
@@ -1996,8 +1993,7 @@ public:
         return RunSimple<Ydb::Table::V1::TableService, Ydb::Table::AlterTableRequest, Ydb::Table::AlterTableResponse>(
             std::move(request),
             &Ydb::Table::V1::TableService::Stub::AsyncAlterTable,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TAsyncOperation AlterTableLong(Ydb::Table::AlterTableRequest&& request, const TAlterTableSettings& settings)
@@ -2008,8 +2004,7 @@ public:
         return RunOperation<TableService, AlterTableRequest, AlterTableResponse, TOperation>(
             std::move(request),
             &Ydb::Table::V1::TableService::Stub::AsyncAlterTable,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TFuture<TStatus> CopyTable(const TString& sessionId, const TString& src, const TString& dst,
@@ -2023,8 +2018,7 @@ public:
         return RunSimple<Ydb::Table::V1::TableService, Ydb::Table::CopyTableRequest, Ydb::Table::CopyTableResponse>(
             std::move(request),
             &Ydb::Table::V1::TableService::Stub::AsyncCopyTable,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TFuture<TStatus> CopyTables(Ydb::Table::CopyTablesRequest&& request, const TCopyTablesSettings& settings)
@@ -2032,8 +2026,7 @@ public:
         return RunSimple<Ydb::Table::V1::TableService, Ydb::Table::CopyTablesRequest, Ydb::Table::CopyTablesResponse>(
             std::move(request),
             &Ydb::Table::V1::TableService::Stub::AsyncCopyTables,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TFuture<TStatus> RenameTables(Ydb::Table::RenameTablesRequest&& request, const TRenameTablesSettings& settings)
@@ -2041,8 +2034,7 @@ public:
         return RunSimple<Ydb::Table::V1::TableService, Ydb::Table::RenameTablesRequest, Ydb::Table::RenameTablesResponse>(
             std::move(request),
             &Ydb::Table::V1::TableService::Stub::AsyncRenameTables,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TFuture<TStatus> DropTable(const TString& sessionId, const TString& path, const TDropTableSettings& settings) {
@@ -2053,8 +2045,7 @@ public:
         return RunSimple<Ydb::Table::V1::TableService, Ydb::Table::DropTableRequest, Ydb::Table::DropTableResponse>(
             std::move(request),
             &Ydb::Table::V1::TableService::Stub::AsyncDropTable,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TAsyncDescribeTableResult DescribeTable(const TString& sessionId, const TString& path, const TDescribeTableSettings& settings) {
@@ -2092,8 +2083,7 @@ public:
             &Ydb::Table::V1::TableService::Stub::AsyncDescribeTable,
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
 
         return promise.GetFuture();
     }
@@ -2175,7 +2165,6 @@ public:
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
             TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_,
             session.SessionImpl_->GetEndpointKey());
 
         return promise.GetFuture();
@@ -2191,8 +2180,7 @@ public:
         return RunSimple<Ydb::Table::V1::TableService, Ydb::Table::ExecuteSchemeQueryRequest, Ydb::Table::ExecuteSchemeQueryResponse>(
             std::move(request),
             &Ydb::Table::V1::TableService::Stub::AsyncExecuteSchemeQuery,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
     }
 
     TAsyncBeginTransactionResult BeginTransaction(const TSession& session, const TTxSettings& txSettings,
@@ -2225,7 +2213,6 @@ public:
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
             TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_,
             session.SessionImpl_->GetEndpointKey());
 
         return promise.GetFuture();
@@ -2264,7 +2251,6 @@ public:
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
             TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_,
             session.SessionImpl_->GetEndpointKey());
 
         return promise.GetFuture();
@@ -2281,7 +2267,6 @@ public:
             std::move(request),
             &Ydb::Table::V1::TableService::Stub::AsyncRollbackTransaction,
             TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_,
             session.SessionImpl_->GetEndpointKey());
     }
 
@@ -2316,7 +2301,6 @@ public:
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
             TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_,
             session.SessionImpl_->GetEndpointKey());
 
         return promise.GetFuture();
@@ -2389,7 +2373,6 @@ public:
             std::move(request),
             &Ydb::Table::V1::TableService::Stub::AsyncDeleteSession,
             TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_,
             sessionImpl->GetEndpointKey());
     }
 
@@ -2504,8 +2487,7 @@ public:
             &Ydb::Table::V1::TableService::Stub::AsyncBulkUpsert,
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
 
         return promise.GetFuture();
     }
@@ -2544,8 +2526,7 @@ public:
             &Ydb::Table::V1::TableService::Stub::AsyncBulkUpsert,
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
-            TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_);
+            TRpcRequestSettings::Make(settings));
 
         return promise.GetFuture();
     }
@@ -2759,7 +2740,6 @@ private:
             DbDriverState_,
             INITIAL_DEFERRED_CALL_DELAY,
             TRpcRequestSettings::Make(settings),
-            settings.ClientTimeout_,
             session.SessionImpl_->GetEndpointKey());
 
         return promise.GetFuture();
@@ -3637,7 +3617,8 @@ TSession::TSession(std::shared_ptr<TTableClient::TImpl> client, const TString& s
 
 TSession::TSession(std::shared_ptr<TTableClient::TImpl> client, std::shared_ptr<TImpl> sessionid)
     : Client_(client)
-    , SessionImpl_(sessionid) {}
+    , SessionImpl_(sessionid)
+{}
 
 TFuture<TStatus> TSession::CreateTable(const TString& path, TTableDescription&& tableDesc,
         const TCreateTableSettings& settings)
@@ -3967,16 +3948,19 @@ const TString& TSession::GetId() const {
 ////////////////////////////////////////////////////////////////////////////////
 
 TTxControl::TTxControl(const TTransaction& tx)
-    : TxId_(tx.GetId()) {}
+    : TxId_(tx.GetId())
+{}
 
 TTxControl::TTxControl(const TTxSettings& begin)
-    : BeginTx_(begin) {}
+    : BeginTx_(begin)
+{}
 
 ////////////////////////////////////////////////////////////////////////////////
 
 TTransaction::TTransaction(const TSession& session, const TString& txId)
     : Session_(session)
-    , TxId_(txId) {}
+    , TxId_(txId)
+{}
 
 TAsyncCommitTransactionResult TTransaction::Commit(const TCommitTxSettings& settings) {
     return Session_.Client_->CommitTransaction(Session_, *this, settings);
@@ -3990,12 +3974,14 @@ TAsyncStatus TTransaction::Rollback(const TRollbackTxSettings& settings) {
 
 TDataQuery::TDataQuery(const TSession& session, const TString& text, const TString& id)
     : Impl_(new TImpl(session, text, session.Client_->Settings_.KeepDataQueryText_, id,
-                      session.Client_->Settings_.AllowRequestMigration_)) {}
+                      session.Client_->Settings_.AllowRequestMigration_))
+{}
 
 TDataQuery::TDataQuery(const TSession& session, const TString& text, const TString& id,
     const ::google::protobuf::Map<TString, Ydb::Type>& types)
     : Impl_(new TImpl(session, text, session.Client_->Settings_.KeepDataQueryText_, id,
-                      session.Client_->Settings_.AllowRequestMigration_, types)) {}
+                      session.Client_->Settings_.AllowRequestMigration_, types))
+{}
 
 const TString& TDataQuery::GetId() const {
     return Impl_->GetId();
@@ -4055,7 +4041,8 @@ TAsyncDataQueryResult TDataQuery::Execute(const TTxControl& txControl, const TPa
 
 TCreateSessionResult::TCreateSessionResult(TStatus&& status, TSession&& session)
     : TStatus(std::move(status))
-    , Session_(std::move(session)) {}
+    , Session_(std::move(session))
+{}
 
 TSession TCreateSessionResult::GetSession() const {
     CheckStatusOk("TCreateSessionResult::GetSession");
@@ -4066,7 +4053,8 @@ TSession TCreateSessionResult::GetSession() const {
 
 TKeepAliveResult::TKeepAliveResult(TStatus&& status, ESessionStatus sessionStatus)
     : TStatus(std::move(status))
-    , SessionStatus(sessionStatus) {}
+    , SessionStatus(sessionStatus)
+{}
 
 ESessionStatus TKeepAliveResult::GetSessionStatus() const {
     return SessionStatus;
@@ -4077,7 +4065,8 @@ ESessionStatus TKeepAliveResult::GetSessionStatus() const {
 TPrepareQueryResult::TPrepareQueryResult(TStatus&& status, const TDataQuery& query, bool fromCache)
     : TStatus(std::move(status))
     , PreparedQuery_(query)
-    , FromCache_(fromCache) {}
+    , FromCache_(fromCache)
+{}
 
 TDataQuery TPrepareQueryResult::GetQuery() const {
     CheckStatusOk("TPrepareQueryResult");
@@ -4093,8 +4082,9 @@ bool TPrepareQueryResult::IsQueryFromCache() const {
 
 TExplainQueryResult::TExplainQueryResult(TStatus&& status, TString&& plan, TString&& ast)
     : TStatus(std::move(status))
-    , Plan_(plan)
-    , Ast_(ast) {}
+    , Plan_(std::move(plan))
+    , Ast_(std::move(ast))
+{}
 
 const TString& TExplainQueryResult::GetPlan() const {
     CheckStatusOk("TExplainQueryResult::GetPlan");
@@ -4110,8 +4100,9 @@ const TString& TExplainQueryResult::GetAst() const {
 
 TDescribeTableResult::TDescribeTableResult(TStatus&& status, Ydb::Table::DescribeTableResult&& desc,
     const TDescribeTableSettings& describeSettings)
-    : TStatus(std::move(status))
-    , TableDescription_(std::move(desc), describeSettings) {}
+    : NScheme::TDescribePathResult(std::move(status), desc.self())
+    , TableDescription_(std::move(desc), describeSettings)
+{}
 
 TTableDescription TDescribeTableResult::GetTableDescription() const {
     CheckStatusOk("TDescribeTableResult::GetTableDescription");
@@ -4174,7 +4165,8 @@ const TString TDataQueryResult::GetQueryPlan() const {
 
 TBeginTransactionResult::TBeginTransactionResult(TStatus&& status, TTransaction transaction)
     : TStatus(std::move(status))
-    , Transaction_(transaction) {}
+    , Transaction_(transaction)
+{}
 
 const TTransaction& TBeginTransactionResult::GetTransaction() const {
     CheckStatusOk("TDataQueryResult::GetTransaction");
@@ -4185,7 +4177,8 @@ const TTransaction& TBeginTransactionResult::GetTransaction() const {
 
 TCommitTransactionResult::TCommitTransactionResult(TStatus&& status, const TMaybe<TQueryStats>& queryStats)
     : TStatus(std::move(status))
-    , QueryStats_(queryStats) {}
+    , QueryStats_(queryStats)
+{}
 
 const TMaybe<TQueryStats>& TCommitTransactionResult::GetStats() const {
     return QueryStats_;
@@ -4402,6 +4395,16 @@ TChangefeedDescription::TChangefeedDescription(const Ydb::Table::ChangefeedDescr
     : TChangefeedDescription(FromProto(proto))
 {}
 
+TChangefeedDescription& TChangefeedDescription::WithVirtualTimestamps() {
+    VirtualTimestamps_ = true;
+    return *this;
+}
+
+TChangefeedDescription& TChangefeedDescription::WithRetentionPeriod(const TDuration& value) {
+    RetentionPeriod_ = value;
+    return *this;
+}
+
 const TString& TChangefeedDescription::GetName() const {
     return Name_;
 }
@@ -4414,11 +4417,13 @@ EChangefeedFormat TChangefeedDescription::GetFormat() const {
     return Format_;
 }
 
+bool TChangefeedDescription::GetVirtualTimestamps() const {
+    return VirtualTimestamps_;
+}
+
 template <typename TProto>
 TChangefeedDescription TChangefeedDescription::FromProto(const TProto& proto) {
     EChangefeedMode mode;
-    EChangefeedFormat format;
-
     switch (proto.mode()) {
     case Ydb::Table::ChangefeedMode::MODE_KEYS_ONLY:
         mode = EChangefeedMode::KeysOnly;
@@ -4440,6 +4445,7 @@ TChangefeedDescription TChangefeedDescription::FromProto(const TProto& proto) {
         break;
     }
 
+    EChangefeedFormat format;
     switch (proto.format()) {
     case Ydb::Table::ChangefeedFormat::FORMAT_JSON:
         format = EChangefeedFormat::Json;
@@ -4449,11 +4455,17 @@ TChangefeedDescription TChangefeedDescription::FromProto(const TProto& proto) {
         break;
     }
 
-    return TChangefeedDescription(proto.name(), mode, format);
+    auto ret = TChangefeedDescription(proto.name(), mode, format);
+    if (proto.virtual_timestamps()) {
+        ret.WithVirtualTimestamps();
+    }
+
+    return ret;
 }
 
 void TChangefeedDescription::SerializeTo(Ydb::Table::Changefeed& proto) const {
     proto.set_name(Name_);
+    proto.set_virtual_timestamps(VirtualTimestamps_);
 
     switch (Mode_) {
     case EChangefeedMode::KeysOnly:
@@ -4482,6 +4494,12 @@ void TChangefeedDescription::SerializeTo(Ydb::Table::Changefeed& proto) const {
     case EChangefeedFormat::Unknown:
         break;
     }
+
+    if (RetentionPeriod_) {
+        auto& retention = *proto.mutable_retention_period();
+        retention.set_seconds(RetentionPeriod_->Seconds());
+        retention.set_nanos(RetentionPeriod_->NanoSecondsOfSecond());
+    }
 }
 
 TString TChangefeedDescription::ToString() const {
@@ -4495,13 +4513,20 @@ void TChangefeedDescription::Out(IOutputStream& o) const {
     o << "{ name: \"" << Name_ << "\""
       << ", mode: " << Mode_ << ""
       << ", format: " << Format_ << ""
-    << " }";
+      << ", virtual_timestamps: " << (VirtualTimestamps_ ? "on": "off") << "";
+
+    if (RetentionPeriod_) {
+        o << ", retention_period: " << *RetentionPeriod_;
+    }
+
+    o << " }";
 }
 
 bool operator==(const TChangefeedDescription& lhs, const TChangefeedDescription& rhs) {
     return lhs.GetName() == rhs.GetName()
         && lhs.GetMode() == rhs.GetMode()
-        && lhs.GetFormat() == rhs.GetFormat();
+        && lhs.GetFormat() == rhs.GetFormat()
+        && lhs.GetVirtualTimestamps() == rhs.GetVirtualTimestamps();
 }
 
 bool operator!=(const TChangefeedDescription& lhs, const TChangefeedDescription& rhs) {

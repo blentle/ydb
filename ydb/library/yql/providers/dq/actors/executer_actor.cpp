@@ -76,7 +76,7 @@ private:
         HFunc(TEvAllocateWorkersResponse, OnAllocateWorkersResponse);
         cFunc(TEvents::TEvPoison::EventType, PassAway);
         hFunc(NActors::TEvents::TEvPoisonTaken, Handle);
-        hFunc(TEvDqStats, OnTransientIssues);
+        hFunc(TEvDqStats, OnDqStats);
         HFunc(TEvDqFailure, OnFailure);
         HFunc(TEvGraphFinished, OnGraphFinished);
         HFunc(TEvQueryResponse, OnQueryResponse);
@@ -305,7 +305,7 @@ private:
         PassAway();
     }
 
-    void OnTransientIssues(TEvDqStats::TPtr& ev) {
+    void OnDqStats(TEvDqStats::TPtr& ev) {
         YQL_LOG_CTX_ROOT_SCOPE(TraceId);
         YQL_CLOG(DEBUG, ProviderDq) << __FUNCTION__;
         Send(PrinterId, ev->Release().Release());
@@ -361,7 +361,7 @@ private:
                 YQL_CLOG(DEBUG, ProviderDq) << "WorkerInfo: " << NDqs::NExecutionHelpers::PrettyPrintWorkerInfo(workerInfo, taskMeta.GetStageId());
                 YQL_CLOG(DEBUG, ProviderDq) << "TaskInfo: " << i << "/" << tasks[i].GetId();
                 for (const auto& file: taskMeta.GetFiles()) {
-                    YQL_CLOG(DEBUG, ProviderDq) << " ObjectId: " << file.GetObjectId();
+                    YQL_CLOG(DEBUG, ProviderDq) << " ObjectId: " << file.GetObjectId()  << ", " << file.GetName() << ", " << file.GetLocalPath();
                 }
                 i++;
 

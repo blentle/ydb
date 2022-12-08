@@ -256,10 +256,8 @@ public:
     }
 
     bool UseSeparatePatternAlloc() const {
-        return false;
-        // return Settings.OptLLVM == "OFF";
+        return Context.PatternCache && Settings.OptLLVM == "OFF";
     }
-
 
     TComputationPatternOpts CreatePatternOpts(TScopedAlloc& alloc, TTypeEnvironment& typeEnv) {
         auto validatePolicy = Settings.TerminateOnError ? NUdf::EValidatePolicy::Fail : NUdf::EValidatePolicy::Exception;
@@ -316,6 +314,7 @@ public:
         }
 
         entry->OutputItemTypes.resize(task.OutputsSize());
+        entry->OutputItemTypesRaw.resize(task.OutputsSize());
 
         if (programRoot.GetNode()->GetType()->IsCallable()) {
             auto programResultType = static_cast<const TCallableType*>(programRoot.GetNode()->GetType());
@@ -330,11 +329,13 @@ public:
                     "" << task.OutputsSize() << " != " << variantTupleType->GetElementsCount());
                 for (ui32 i = 0; i < variantTupleType->GetElementsCount(); ++i) {
                     entry->OutputItemTypes[i] = variantTupleType->GetElementType(i);
+                    entry->OutputItemTypesRaw[i] = SerializeNode(entry->OutputItemTypes[i], entry->Env);
                 }
             }
             else {
                 YQL_ENSURE(task.OutputsSize() == 1);
                 entry->OutputItemTypes[0] = programResultItemType;
+                entry->OutputItemTypesRaw[0] = SerializeNode(entry->OutputItemTypes[0], entry->Env);
             }
         }
         else {
@@ -352,12 +353,14 @@ public:
         YQL_ENSURE(task.InputsSize() == programInputsCount);
 
         entry->InputItemTypes.resize(programInputsCount);
+        entry->InputItemTypesRaw.resize(programInputsCount);
         entry->EntryPoints.resize(programInputsCount + 1 /* parameters */);
         for (ui32 i = 0; i < programInputsCount; ++i) {
             auto input = programInputsTuple.GetValue(i);
             TType* type = input.GetStaticType();
             YQL_ENSURE(type->GetKind() == TType::EKind::Stream);
             entry->InputItemTypes[i] = static_cast<TStreamType&>(*type).GetItemType();
+            entry->InputItemTypesRaw[i] = SerializeNode(entry->InputItemTypes[i], entry->Env);
             entry->EntryPoints[i] = input.GetNode();
         }
 
@@ -401,7 +404,11 @@ public:
             entry = cache->Find(program.GetRaw());
             if (!entry) {
                 entry = CreateComputationPattern(task, program.GetRaw());
-                cache->EmplacePattern(task.GetProgram().GetRaw(), entry);
+                if (entry->Pattern->GetSuitableForCache()) {
+                    cache->EmplacePattern(task.GetProgram().GetRaw(), entry);
+                } else {
+                    cache->IncNotSuitablePattern();
+                }
             }
         } else {
             entry = CreateComputationPattern(task, program.GetRaw());
@@ -493,17 +500,19 @@ public:
                 YQL_ENSURE(inputTypeNode, "Failed to deserialize transform input type");
                 transform->TransformInputType = static_cast<TType*>(inputTypeNode);
 
-                auto outputTypeNode = NMiniKQL::DeserializeNode(TStringBuf{transformDesc.GetOutputType()}, typeEnv);
+                TStringBuf outputTypeNodeRaw(transformDesc.GetOutputType());
+                auto outputTypeNode = NMiniKQL::DeserializeNode(outputTypeNodeRaw, typeEnv);
                 YQL_ENSURE(outputTypeNode, "Failed to deserialize transform output type");
                 TType* outputType = static_cast<TType*>(outputTypeNode);
-                if (!outputType->IsSameType(*entry->InputItemTypes[i])) {
+                auto typeCheckLog = [&] () {
                     TStringStream out;
                     out << *outputType << " != " << *entry->InputItemTypes[i];
                     LOG(TStringBuilder() << "Task: " << TaskId << " types is not the same: " << out.Str() << " has NOT been transformed by "
                         << transformDesc.GetType() << " with input type: " << *transform->TransformInputType
                         << " , output type: " << *outputType);
-                    YQL_ENSURE(outputType->IsSameType(*entry->InputItemTypes[i]), "" << out.Str());
-                }
+                    return out.Str();
+                };
+                YQL_ENSURE(outputTypeNodeRaw == entry->InputItemTypesRaw[i], "" << typeCheckLog());
                 LOG(TStringBuilder() << "Task: " << TaskId << " has transform by "
                     << transformDesc.GetType() << " with input type: " << *transform->TransformInputType
                     << " , output type: " << *outputType);
@@ -566,10 +575,11 @@ public:
                 YQL_ENSURE(outputTypeNode, "Failed to deserialize transform output type");
                 transform->TransformOutputType = static_cast<TType*>(outputTypeNode);
 
-                auto inputTypeNode = NMiniKQL::DeserializeNode(TStringBuf{transformDesc.GetInputType()}, typeEnv);
+                TStringBuf inputTypeNodeRaw(transformDesc.GetInputType());
+                auto inputTypeNode = NMiniKQL::DeserializeNode(inputTypeNodeRaw, typeEnv);
                 YQL_ENSURE(inputTypeNode, "Failed to deserialize transform input type");
                 TType* inputType = static_cast<TType*>(inputTypeNode);
-                YQL_ENSURE(inputType->IsSameType(*entry->OutputItemTypes[i]));
+                YQL_ENSURE(inputTypeNodeRaw == entry->OutputItemTypesRaw[i]);
                 LOG(TStringBuilder() << "Task: " << TaskId << " has transform by "
                     << transformDesc.GetType() << " with input type: " << *inputType
                     << " , output type: " << *transform->TransformOutputType);

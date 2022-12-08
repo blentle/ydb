@@ -85,6 +85,7 @@ namespace NKikimr::NBlobDepot {
         const ui64 AgentInstanceId;
         ui64 TabletId = Max<ui64>();
         TActorId PipeId;
+        TActorId PipeServerId;
         bool IsConnected = false;
 
     private:
@@ -107,33 +108,37 @@ namespace NKikimr::NBlobDepot {
         void Bootstrap();
 
 #define FORWARD_STORAGE_PROXY(TYPE) fFunc(TEvBlobStorage::TYPE, HandleStorageProxy);
-        STRICT_STFUNC(StateFunc,
-            cFunc(TEvents::TSystem::Poison, PassAway);
-            hFunc(TEvBlobStorage::TEvConfigureProxy, Handle);
+        void StateFunc(STFUNC_SIG) {
+            STRICT_STFUNC_BODY(
+                cFunc(TEvents::TSystem::Poison, PassAway);
+                hFunc(TEvBlobStorage::TEvConfigureProxy, Handle);
 
-            hFunc(TEvTabletPipe::TEvClientConnected, Handle);
-            hFunc(TEvTabletPipe::TEvClientDestroyed, Handle);
+                hFunc(TEvTabletPipe::TEvClientConnected, Handle);
+                hFunc(TEvTabletPipe::TEvClientDestroyed, Handle);
 
-            hFunc(TEvBlobDepot::TEvPushNotify, Handle);
+                hFunc(TEvBlobDepot::TEvPushNotify, Handle);
 
-            hFunc(TEvBlobDepot::TEvRegisterAgentResult, HandleTabletResponse);
-            hFunc(TEvBlobDepot::TEvAllocateIdsResult, HandleTabletResponse);
-            hFunc(TEvBlobDepot::TEvBlockResult, HandleTabletResponse);
-            hFunc(TEvBlobDepot::TEvQueryBlocksResult, HandleTabletResponse);
-            hFunc(TEvBlobDepot::TEvCollectGarbageResult, HandleTabletResponse);
-            hFunc(TEvBlobDepot::TEvCommitBlobSeqResult, HandleTabletResponse);
-            hFunc(TEvBlobDepot::TEvResolveResult, HandleTabletResponse);
+                hFunc(TEvBlobDepot::TEvRegisterAgentResult, HandleTabletResponse);
+                hFunc(TEvBlobDepot::TEvAllocateIdsResult, HandleTabletResponse);
+                hFunc(TEvBlobDepot::TEvBlockResult, HandleTabletResponse);
+                hFunc(TEvBlobDepot::TEvQueryBlocksResult, HandleTabletResponse);
+                hFunc(TEvBlobDepot::TEvCollectGarbageResult, HandleTabletResponse);
+                hFunc(TEvBlobDepot::TEvCommitBlobSeqResult, HandleTabletResponse);
+                hFunc(TEvBlobDepot::TEvResolveResult, HandleTabletResponse);
 
-            hFunc(TEvBlobStorage::TEvGetResult, HandleOtherResponse);
-            hFunc(TEvBlobStorage::TEvPutResult, HandleOtherResponse);
+                hFunc(TEvBlobStorage::TEvGetResult, HandleOtherResponse);
+                hFunc(TEvBlobStorage::TEvPutResult, HandleOtherResponse);
 
-            ENUMERATE_INCOMING_EVENTS(FORWARD_STORAGE_PROXY)
-            hFunc(TEvBlobStorage::TEvBunchOfEvents, Handle);
-            cFunc(TEvPrivate::EvProcessPendingEvent, HandlePendingEvent);
-            cFunc(TEvPrivate::EvPendingEventQueueWatchdog, HandlePendingEventQueueWatchdog);
+                ENUMERATE_INCOMING_EVENTS(FORWARD_STORAGE_PROXY)
+                hFunc(TEvBlobStorage::TEvBunchOfEvents, Handle);
+                cFunc(TEvPrivate::EvProcessPendingEvent, HandlePendingEvent);
+                cFunc(TEvPrivate::EvPendingEventQueueWatchdog, HandlePendingEventQueueWatchdog);
 
-            cFunc(TEvPrivate::EvQueryWatchdog, HandleQueryWatchdog);
-        );
+                cFunc(TEvPrivate::EvQueryWatchdog, HandleQueryWatchdog);
+            )
+
+            DeletePendingQueries.Clear();
+        }
 #undef FORWARD_STORAGE_PROXY
 
         void PassAway() override {
@@ -171,8 +176,9 @@ namespace NKikimr::NBlobDepot {
 
         using TRequestsInFlight = THashMap<ui64, TRequestInFlight>;
 
-        ui64 NextRequestId = 1;
+        ui64 NextTabletRequestId = 1;
         TRequestsInFlight TabletRequestInFlight;
+        ui64 NextOtherRequestId = 1;
         TRequestsInFlight OtherRequestInFlight;
 
         void RegisterRequest(ui64 id, TRequestSender *sender, TRequestContext::TPtr context,
@@ -237,6 +243,7 @@ namespace NKikimr::NBlobDepot {
             const TMonotonic StartTime;
             std::multimap<TMonotonic, TQuery*>::iterator QueryWatchdogMapIter;
             NLog::EPriority WatchdogPriority = NLog::PRI_WARN;
+            bool Destroyed = false;
 
             static constexpr TDuration WatchdogDuration = TDuration::Seconds(10);
 
@@ -262,6 +269,9 @@ namespace NKikimr::NBlobDepot {
             struct TDeleter {
                 static void Destroy(TQuery *query) { delete query; }
             };
+
+        private:
+            void DoDestroy();
         };
 
         template<typename TEvent>
@@ -287,6 +297,7 @@ namespace NKikimr::NBlobDepot {
         static constexpr size_t MaxPendingEventBytes = 32'000'000; // ~32 MB
         static constexpr TDuration EventExpirationTime = TDuration::Seconds(5);
         TIntrusiveListWithAutoDelete<TQuery, TQuery::TDeleter, TExecutingQueries> ExecutingQueries;
+        TIntrusiveListWithAutoDelete<TQuery, TQuery::TDeleter, TExecutingQueries> DeletePendingQueries;
         std::multimap<TMonotonic, TQuery*> QueryWatchdogMap;
 
         template<ui32 EventType> TQuery *CreateQuery(std::unique_ptr<IEventHandle> ev);
@@ -378,5 +389,8 @@ namespace NKikimr::NBlobDepot {
         TStorageStatusFlags GetStorageStatusFlags() const;
         float GetApproximateFreeSpaceShare() const;
     };
+
+#define BDEV_QUERY(MARKER, TEXT, ...) BDEV(MARKER, TEXT, (VG, Agent.VirtualGroupId), (BDT, Agent.TabletId), \
+                                      (G, Agent.BlobDepotGeneration), (Q, QueryId), __VA_ARGS__)
 
 } // NKikimr::NBlobDepot

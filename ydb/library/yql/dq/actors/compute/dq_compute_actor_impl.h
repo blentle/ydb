@@ -128,6 +128,8 @@ protected:
 public:
     void Bootstrap() {
         try {
+            LogPrefix = TStringBuilder() << "SelfId: " << this->SelfId() << ", TxId: " << TxId << ", task: " << Task.GetId() << ". ";
+
             CA_LOG_D("Start compute actor " << this->SelfId() << ", task: " << Task.GetId());
 
             Channels = new TDqComputeActorChannels(this->SelfId(), TxId, Task, !RuntimeSettings.FailOnUndelivery,
@@ -180,7 +182,6 @@ protected:
         : ExecuterId(executerId)
         , TxId(txId)
         , Task(std::move(task))
-        , LogPrefix(TStringBuilder() << "SelfId: " << this->SelfId() << ", TxId: " << TxId << ", task: " << Task.GetId() << ". ")
         , RuntimeSettings(settings)
         , MemoryLimits(memoryLimits)
         , CanAllocateExtraMemory(RuntimeSettings.ExtraMemoryAllocationPool != 0 && MemoryLimits.AllocateMemoryFn)
@@ -427,7 +428,7 @@ protected:
         CheckRunStatus();
     }
 
-    void CheckRunStatus() {
+    virtual void CheckRunStatus() {
         if (ProcessOutputsState.Inflight != 0) {
             return;
         }
@@ -934,6 +935,7 @@ protected:
     };
 
     struct TAsyncInputInfoBase {
+        TString Type;
         const TString LogPrefix;
         ui64 Index;
         IDqAsyncInputBuffer::TPtr Buffer;
@@ -1007,6 +1009,7 @@ protected:
     };
 
     struct TAsyncOutputInfoBase {
+        TString Type;
         IDqAsyncOutputBuffer::TPtr Buffer;
         IDqComputeActorAsyncOutput* AsyncOutput = nullptr;
         NActors::IActor* Actor = nullptr;
@@ -1485,6 +1488,8 @@ protected:
             if (TaskRunner) { source.Buffer = TaskRunner->GetSource(inputIndex); Y_VERIFY(source.Buffer);}
             Y_VERIFY(AsyncIoFactory);
             const auto& inputDesc = Task.GetInputs(inputIndex);
+            Y_VERIFY(inputDesc.HasSource());
+            source.Type = inputDesc.GetSource().GetType();
             const ui64 i = inputIndex; // Crutch for clang
             CA_LOG_D("Create source for input " << i << " " << inputDesc);
             try {
@@ -1570,6 +1575,8 @@ protected:
             if (TaskRunner) { sink.Buffer = TaskRunner->GetSink(outputIndex); }
             Y_VERIFY(AsyncIoFactory);
             const auto& outputDesc = Task.GetOutputs(outputIndex);
+            Y_VERIFY(outputDesc.HasSink());
+            sink.Type = outputDesc.GetSink().GetType();
             const ui64 i = outputIndex; // Crutch for clang
             CA_LOG_D("Create sink for output " << i << " " << outputDesc);
             try {
@@ -1870,17 +1877,33 @@ public:
             Stat->Clear();
         } else if (auto* taskStats = GetTaskRunnerStats()) { // for task_runner_actor_local
             auto* protoTask = dst->AddTasks();
-            FillTaskRunnerStats(Task.GetId(), Task.GetStageId(), *taskStats, protoTask, (bool) GetProfileStats());
+
+            THashMap<TString, ui64> Ingress;
+            THashMap<TString, ui64> Egress;
+
+            THashMap<ui64, ui64> ingressBytesMap;
+            for (auto& [inputIndex, sourceInfo] : SourcesMap) {
+                if (sourceInfo.AsyncInput) {
+                    auto ingressBytes = sourceInfo.AsyncInput->GetIngressBytes();
+                    ingressBytesMap.emplace(inputIndex, ingressBytes);
+                    Ingress[sourceInfo.Type] = Ingress.Value(sourceInfo.Type, 0) + ingressBytes;
+                }
+            }
+            FillTaskRunnerStats(Task.GetId(), Task.GetStageId(), *taskStats, protoTask, (bool) GetProfileStats(), ingressBytesMap);
 
             // More accurate cpu time counter:
             if (TDerived::HasAsyncTaskRunner) {
                 protoTask->SetCpuTimeUs(BasicStats->CpuTime.MicroSeconds() + taskStats->ComputeCpuTime.MicroSeconds() + taskStats->BuildCpuTime.MicroSeconds());
             }
-
+                
             for (auto& [outputIndex, sinkInfo] : SinksMap) {
+
+                ui64 egressBytes = sinkInfo.AsyncOutput ? sinkInfo.AsyncOutput->GetEgressBytes() : 0;
+
                 if (auto* sinkStats = GetSinkStats(outputIndex, sinkInfo)) {
                     protoTask->SetOutputRows(protoTask->GetOutputRows() + sinkStats->RowsIn);
                     protoTask->SetOutputBytes(protoTask->GetOutputBytes() + sinkStats->Bytes);
+                    Egress[sinkInfo.Type] = Egress.Value(sinkInfo.Type, 0) + egressBytes;
 
                     if (GetProfileStats()) {
                         auto* protoSink = protoTask->AddSinks();
@@ -1890,11 +1913,23 @@ public:
                         protoSink->SetBytes(sinkStats->Bytes);
                         protoSink->SetRowsIn(sinkStats->RowsIn);
                         protoSink->SetRowsOut(sinkStats->RowsOut);
+                        protoSink->SetEgressBytes(egressBytes);
 
                         protoSink->SetMaxMemoryUsage(sinkStats->MaxMemoryUsage);
                         protoSink->SetErrorsCount(sinkInfo.IssuesBuffer.GetAllAddedIssuesCount());
                     }
                 }
+            }
+
+            for (auto& [name, bytes] : Egress) {
+                auto* egressStats = protoTask->AddEgress();
+                egressStats->SetName(name);
+                egressStats->SetBytes(bytes);
+            }
+            for (auto& [name, bytes] : Ingress) {
+                auto* ingressStats = protoTask->AddIngress();
+                ingressStats->SetName(name);
+                ingressStats->SetBytes(bytes);
             }
 
             if (GetProfileStats()) {
@@ -1979,7 +2014,7 @@ protected:
     const NActors::TActorId ExecuterId;
     const TTxId TxId;
     const NDqProto::TDqTask Task;
-    const TString LogPrefix;
+    TString LogPrefix;
     const TComputeRuntimeSettings RuntimeSettings;
     const TComputeMemoryLimits MemoryLimits;
     const bool CanAllocateExtraMemory = false;

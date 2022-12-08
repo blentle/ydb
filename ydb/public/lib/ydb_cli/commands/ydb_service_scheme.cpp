@@ -158,6 +158,8 @@ int TCommandDescribe::PrintPathResponse(TDriver& driver, const NScheme::TDescrib
     switch (entry.Type) {
     case NScheme::ESchemeEntryType::Table:
         return DescribeTable(driver);
+    case NScheme::ESchemeEntryType::ColumnTable:
+        return DescribeColumnTable(driver);
     case NScheme::ESchemeEntryType::PqGroup:
     case NScheme::ESchemeEntryType::Topic:
         return DescribeTopic(driver);
@@ -270,6 +272,21 @@ int TCommandDescribe::DescribeTable(TDriver& driver) {
     return PrintTableResponse(result);
 }
 
+int TCommandDescribe::DescribeColumnTable(TDriver& driver) {
+    NTable::TTableClient client(driver);
+    NTable::TCreateSessionResult sessionResult = client.GetSession(NTable::TCreateSessionSettings()).GetValueSync();
+    ThrowOnError(sessionResult);
+    NTable::TDescribeTableResult result = sessionResult.GetSession().DescribeTable(
+        Path,
+        FillSettings(
+            NTable::TDescribeTableSettings()
+            .WithTableStatistics(ShowTableStats)
+        )
+    ).GetValueSync();
+    ThrowOnError(result);
+    return PrintTableResponse(result);
+}
+
 namespace {
     void PrintColumns(const NTable::TTableDescription& tableDescription) {
         if (!tableDescription.GetTableColumns().size()) {
@@ -297,7 +314,7 @@ namespace {
                 .Column(3, key);
         }
 
-        Cout << table;
+        Cout << "Columns:" << Endl << table;
     }
 
     void PrintIndexes(const NTable::TTableDescription& tableDescription) {
@@ -305,31 +322,19 @@ namespace {
         if (!indexes.size()) {
             return;
         }
-        Cout << Endl << "Indexes: " << Endl;
-        for (const auto& index : indexes) {
-            Cout << index.GetIndexName() << " [" << index.GetIndexType() << "] Index columns: (";
-            const auto& columns = index.GetIndexColumns();
-            for (auto colIt = columns.begin(); colIt != columns.end();) {
-                Cout << (*colIt);
-                if (++colIt != columns.end()) {
-                    Cout << ",";
-                }
-            }
 
-            const auto& cover = index.GetDataColumns();
-            if (!cover) {
-                Cout << ")" << Endl;
-            } else {
-                Cout << ") Cover columns: (";
-                for (auto colIt = cover.begin(); colIt != cover.end();) {
-                    Cout << (*colIt);
-                    if (++colIt != cover.end()) {
-                        Cout << ",";
-                    }
-                }
-                Cout << ")" << Endl;
-            }
+        TPrettyTable table({ "Name", "Type", "Index columns", "Cover columns" },
+            TPrettyTableConfig().WithoutRowDelimiters());
+
+        for (const auto& index : indexes) {
+            table.AddRow()
+                .Column(0, index.GetIndexName())
+                .Column(1, index.GetIndexType())
+                .Column(2, JoinSeq(",", index.GetIndexColumns()))
+                .Column(3, JoinSeq(",", index.GetDataColumns()));
         }
+
+        Cout << Endl << "Indexes:" << Endl << table;
     }
 
     void PrintChangefeeds(const NTable::TTableDescription& tableDescription) {
@@ -338,13 +343,18 @@ namespace {
             return;
         }
 
-        Cout << Endl << "Changefeeds:" << Endl;
+        TPrettyTable table({ "Name", "Mode", "Format", "VirtualTimestamps" },
+            TPrettyTableConfig().WithoutRowDelimiters());
+
         for (const auto& changefeed : changefeeds) {
-            Cout << changefeed.GetName()
-                 << " Mode: " << changefeed.GetMode()
-                 << " Format: " << changefeed.GetFormat()
-                 << Endl;
+            table.AddRow()
+                .Column(0, changefeed.GetName())
+                .Column(1, changefeed.GetMode())
+                .Column(2, changefeed.GetFormat())
+                .Column(3, changefeed.GetVirtualTimestamps() ? "on" : "off");
         }
+
+        Cout << Endl << "Changefeeds:" << Endl << table;
     }
 
     void PrintStorageSettings(const NTable::TTableDescription& tableDescription) {

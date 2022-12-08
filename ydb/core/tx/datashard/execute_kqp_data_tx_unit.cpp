@@ -6,7 +6,7 @@
 #include "datashard_locks_db.h"
 
 #include <ydb/core/engine/minikql/minikql_engine_host.h>
-#include <ydb/core/kqp/rm/kqp_rm.h>
+#include <ydb/core/kqp/rm_service/kqp_rm_service.h>
 
 namespace NKikimr {
 namespace NDataShard {
@@ -204,7 +204,7 @@ EExecutionStatus TExecuteKqpDataTxUnit::Execute(TOperation::TPtr op, TTransactio
         auto& computeCtx = tx->GetDataTx()->GetKqpComputeCtx();
 
         auto result = KqpCompleteTransaction(ctx, tabletId, op->GetTxId(),
-            op->HasKqpAttachedRSFlag() ? nullptr : &op->InReadSets(), dataTx->GetKqpTasks(), tasksRunner, computeCtx);
+            op->HasKqpAttachedRSFlag() ? nullptr : &op->InReadSets(), kqpTx, tasksRunner, computeCtx);
 
         if (!result && computeCtx.HadInconsistentReads()) {
             LOG_T("Operation " << *op << " (execute_kqp_data_tx) at " << tabletId

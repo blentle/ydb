@@ -10,6 +10,8 @@
 #include <util/system/tls.h>
 #include <new>
 #include <unordered_map>
+#include <atomic>
+#include <memory>
 
 namespace NKikimr {
 
@@ -59,6 +61,7 @@ struct TAllocState : public TAlignedPagePool
     TListEntry OffloadedBlocksRoot;
     TListEntry GlobalPAllocList;
     TListEntry* CurrentPAllocList;
+    std::shared_ptr<std::atomic<size_t>> ArrowMemoryUsage = std::make_shared<std::atomic<size_t>>();
     void* MainContext = nullptr;
     void* CurrentContext = nullptr;
 
@@ -210,6 +213,10 @@ inline void* MKQLAllocFastDeprecated(size_t sz, TAllocState* state) {
 
 #ifdef PROFILE_MEMORY_ALLOCATIONS
     auto ret = (TAllocState::TListEntry*)malloc(sizeof(TAllocState::TListEntry) + sz);
+    if (!ret) {
+        throw TMemoryLimitExceededException();
+    }
+
     ret->Link(&state->OffloadedBlocksRoot);
     return ret + 1;
 #endif
@@ -237,6 +244,10 @@ inline void* MKQLAllocFastWithSize(size_t sz, TAllocState* state) {
     if (useMemalloc) {
         state->OffloadAlloc(sizeof(TAllocState::TListEntry) + sz);
         auto ret = (TAllocState::TListEntry*)malloc(sizeof(TAllocState::TListEntry) + sz);
+        if (!ret) {
+            throw TMemoryLimitExceededException();
+        }
+
         ret->Link(&state->OffloadedBlocksRoot);
         return ret + 1;
     }

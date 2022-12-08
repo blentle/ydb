@@ -261,15 +261,11 @@ public:
 };
 
 class TInitializeBuildIndex: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::CreateParts;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
         switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
@@ -285,7 +281,7 @@ class TInitializeBuildIndex: public TSubOperation {
         }
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
         switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
@@ -303,28 +299,8 @@ class TInitializeBuildIndex: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TInitializeBuildIndex(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TInitializeBuildIndex(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -381,49 +357,25 @@ public:
             }
         }
 
-        TString errStr;
-
         TPathElement::TPtr pathEl = dstPath.Base();
         TPathId tablePathId = pathEl->PathId;
         result->SetPathId(tablePathId.LocalPathId);
 
+        TString errStr;
         if (!context.SS->CheckLocks(dstPath.Base()->PathId, Transaction, errStr)) {
             result->SetError(NKikimrScheme::StatusMultipleModifications, errStr);
             return result;
         }
 
-        if (context.SS->TablesWithSnaphots.contains(tablePathId)) {
-            TTxId shapshotTxId = context.SS->TablesWithSnaphots.at(tablePathId);
-            if (OperationId.GetTxId() == shapshotTxId) {
-                // already
-                errStr = TStringBuilder()
-                    << "Snapshot with the same txId already presents for table"
-                    << ", tableId:" << tablePathId
-                    << ", txId: " << OperationId.GetTxId()
-                    << ", snapshotTxId: " << shapshotTxId
-                    << ", snapshotStepId: " << context.SS->SnapshotsStepIds.at(shapshotTxId);
-                result->SetError(TEvSchemeShard::EStatus::StatusAlreadyExists, errStr);
-                return result;
-            }
-
-            errStr = TStringBuilder()
-                << "Snapshot with another txId already presents for table, only one snapshot is allowed for table for now"
-                << ", tableId:" << tablePathId
-                << ", txId: " << OperationId.GetTxId()
-                << ", snapshotTxId: " << shapshotTxId
-                << ", snapshotStepId: " << context.SS->SnapshotsStepIds.at(shapshotTxId);
-            result->SetError(TEvSchemeShard::EStatus::StatusSchemeError, errStr);
-            return result;
-        }
-
-        if (!context.SS->CheckInFlightLimit(TTxState::TxInitializeBuildIndex, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
+        NKikimrScheme::EStatus status;
+        if (!context.SS->CanCreateSnapshot(tablePathId, OperationId.GetTxId(), status, errStr)) {
+            result->SetError(status, errStr);
             return result;
         }
 
         auto guard = context.DbGuard();
         context.MemChanges.GrabPath(context.SS, tablePathId);
-        context.MemChanges.GrabTableSnapshot(context.SS, tablePathId, OperationId.GetTxId());
+        context.MemChanges.GrabNewTableSnapshot(context.SS, tablePathId, OperationId.GetTxId());
         context.MemChanges.GrabNewTxState(context.SS, OperationId);
 
         context.DbChanges.PersistTableSnapshot(tablePathId, OperationId.GetTxId());
@@ -446,8 +398,7 @@ public:
 
         context.OnComplete.ActivateTx(OperationId);
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -475,12 +426,12 @@ public:
 namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateInitializeBuildIndexMainTable(TOperationId id, const TTxTransaction& tx) {
-    return new TInitializeBuildIndex(id, tx);
+    return MakeSubOperation<TInitializeBuildIndex>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateInitializeBuildIndexMainTable(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TInitializeBuildIndex(id, state);
+    return MakeSubOperation<TInitializeBuildIndex>(id, state);
 }
 
 }

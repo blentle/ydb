@@ -118,7 +118,6 @@ public:
     }
 };
 
-
 class TDeleteParts: public TSubOperationState {
 private:
     TOperationId OperationId;
@@ -157,7 +156,6 @@ public:
     }
 
 };
-
 
 class TPropose: public TSubOperationState {
 private:
@@ -273,18 +271,13 @@ public:
     }
 };
 
-
 class TDropPQ: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::DropParts;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::DropParts:
             return TTxState::DeleteParts;
@@ -295,11 +288,10 @@ class TDropPQ: public TSubOperation {
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::DropParts:
             return THolder(new TDropParts(OperationId));
@@ -314,28 +306,8 @@ class TDropPQ: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TDropPQ(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TDropPQ(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     void SetPQBalancer(TPersQueueGroupInfo::TPtr pqGroup, TTxState& txState, TOperationContext& context) {
         auto shardId = pqGroup->BalancerShardIdx;
@@ -469,10 +441,6 @@ public:
             result->SetError(NKikimrScheme::StatusMultipleModifications, "Drop over Create/Alter");
             return result;
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxDropPQGroup, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         TTxState& txState = context.SS->CreateTx(OperationId, TTxState::TxDropPQGroup, path.Base()->PathId);
         // Dirty hack: drop step must not be zero because 0 is treated as "hasn't been dropped"
@@ -504,8 +472,7 @@ public:
             context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
         }
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -540,17 +507,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateDropPQ(TOperationId id, const TTxTransaction& tx) {
-    return new TDropPQ(id, tx);
+    return MakeSubOperation<TDropPQ>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateDropPQ(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TDropPQ(id, state);
+    return MakeSubOperation<TDropPQ>(id, state);
 }
 
-}
 }

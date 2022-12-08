@@ -42,8 +42,6 @@ public:
         TKikimrQueryDeadlines Deadlines;
         TKikimrQueryLimits Limits;
         bool RawResults = false; // TODO: deprecate
-        TMaybe<TString> IsolationLevel; // TODO: deprecate
-        TMaybe<bool> StrictDml; // TODO: deprecate
         TMaybe<bool> UseScanQuery;
         EKikimrStatsMode StatsMode = EKikimrStatsMode::None;
         TMaybe<bool> DocumentApiRestricted;
@@ -51,9 +49,6 @@ public:
     };
 
     virtual ~IKikimrQueryExecutor() {}
-
-    virtual TIntrusivePtr<TAsyncQueryResult> ExecuteKql(const TString& cluster,
-        const TExprNode::TPtr& query, TExprContext& ctx, const TExecuteSettings& settings) = 0;
 
     virtual TIntrusivePtr<TAsyncQueryResult> ExecuteDataQuery(const TString& cluster,
         const TExprNode::TPtr& query, TExprContext& ctx, const TExecuteSettings& settings) = 0;
@@ -274,7 +269,7 @@ const TYdbOperations& KikimrModifyOps();
 const TYdbOperations& KikimrReadOps();
 const TYdbOperations& KikimrRequireUnmodifiedOps();
 
-bool AddDmlIssue(const TIssue& issue, bool strictDml, TExprContext& ctx);
+bool AddDmlIssue(const TIssue& issue, TExprContext& ctx);
 
 class TKikimrTransactionContextBase : public TThrRefBase {
 public:
@@ -318,8 +313,8 @@ public:
 
     template<class IterableKqpTableOps, class IterableKqpTableInfos>
     bool ApplyTableOperations(const IterableKqpTableOps& operations,
-        const IterableKqpTableInfos& tableInfos, NKikimrKqp::EIsolationLevel isolationLevel, bool strictDml,
-        EKikimrQueryType queryType, TExprContext& ctx)
+        const IterableKqpTableInfos& tableInfos, NKikimrKqp::EIsolationLevel isolationLevel,
+        bool enableImmediateEffects, EKikimrQueryType queryType, TExprContext& ctx)
     {
         if (IsClosed()) {
             TString message = TStringBuilder() << "Cannot perform operations on closed transaction.";
@@ -396,8 +391,8 @@ public:
             }
 
             auto& currentOps = TableOperations[table];
-
-            if (currentOps & KikimrModifyOps()) {
+            bool currentModify = currentOps & KikimrModifyOps();
+            if (currentModify && !enableImmediateEffects) {
                 if (KikimrRequireUnmodifiedOps() & newOp) {
                     TString message = TStringBuilder() << "Operation '" << newOp
                         << "' can't be performed on previously modified table: " << table;
@@ -408,7 +403,7 @@ public:
                 if (KikimrReadOps() & newOp) {
                     TString message = TStringBuilder() << "Data modifications previously made to table '" << table
                         << "' in current transaction won't be seen by operation: '" << newOp << "'";
-                    if (!AddDmlIssue(YqlIssue(pos, TIssuesIds::KIKIMR_READ_MODIFIED_TABLE, message), strictDml, ctx)) {
+                    if (!AddDmlIssue(YqlIssue(pos, TIssuesIds::KIKIMR_READ_MODIFIED_TABLE, message), ctx)) {
                         return false;
                     }
                 }
@@ -430,10 +425,10 @@ public:
             // TODO: KIKIMR-3206
             bool currentDelete = currentOps & (TYdbOperation::Delete | TYdbOperation::DeleteOn);
             bool newUpdate = newOp == TYdbOperation::Update;
-            if (currentDelete && newUpdate) {
+            if (currentDelete && newUpdate && !enableImmediateEffects) {
                 TString message = TStringBuilder() << "Operation '" << newOp
                     << "' may lead to unexpected results when applied to table with deleted rows: " << table;
-                if (!AddDmlIssue(YqlIssue(pos, TIssuesIds::KIKIMR_UPDATE_TABLE_WITH_DELETES, message), strictDml, ctx)) {
+                if (!AddDmlIssue(YqlIssue(pos, TIssuesIds::KIKIMR_UPDATE_TABLE_WITH_DELETES, message), ctx)) {
                     return false;
                 }
             }

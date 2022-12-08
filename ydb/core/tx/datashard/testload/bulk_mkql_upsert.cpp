@@ -11,7 +11,7 @@
 #include <google/protobuf/text_format.h>
 
 // * Scheme is hardcoded and it is like default YCSB setup:
-// table name is "usertable", 1 utf8 "key" column, 10 utf8 "field0" - "field9" columns
+// 1 Text "id" column, 10 Bytes "field0" - "field9" columns
 // * row is ~ 1 KB, keys are like user1000385178204227360
 
 namespace NKikimr::NDataShardLoad {
@@ -59,30 +59,30 @@ TUploadRequest GenerateBulkRowRequest(ui64 tableId, ui64 keyNum) {
     return TUploadRequest(request.release());
 }
 
-TUploadRequest GenerateMkqlRowRequest(ui64 /* tableId */, ui64 keyNum) {
+TUploadRequest GenerateMkqlRowRequest(ui64 /* tableId */, ui64 keyNum, const TString& table) {
     static TString programWithoutKey;
 
     if (!programWithoutKey) {
         TString fields;
         for (size_t i = 0; i < 10; ++i) {
-            fields += Sprintf("'('field%lu (Utf8 '%s))", i, Value.data());
+            fields += Sprintf("'('field%lu (String '%s))", i, Value.data());
         }
         TString rowUpd = "(let upd_ '(" + fields + "))";
 
         programWithoutKey = rowUpd;
 
-        programWithoutKey += R"(
+        programWithoutKey += Sprintf(R"(
             (let ret_ (AsList
-                (UpdateRow '__user__usertable row1_ upd_
+                (UpdateRow '__user__%s row1_ upd_
             )))
             (return ret_)
-        ))";
+        ))", table.c_str());
     }
 
     TString key = GetKey(keyNum);
 
     auto programText = Sprintf(R"((
-        (let row1_ '('('key (Utf8 '%s))))
+        (let row1_ '('('id (Utf8 '%s))))
     )", key.data()) + programWithoutKey;
 
     auto request = std::make_unique<TEvTablet::TEvLocalMKQL>();
@@ -91,18 +91,23 @@ TUploadRequest GenerateMkqlRowRequest(ui64 /* tableId */, ui64 keyNum) {
     return TUploadRequest(request.release());
 }
 
-TRequestsVector GenerateRequests(ui64 tableId, ui64 n, ERequestType requestType) {
+TRequestsVector GenerateRequests(
+    ui64 tableId,
+    ui64 keyFrom,
+    ui64 n,
+    ERequestType requestType,
+    const TString& table)
+{
     TRequestsVector requests;
     requests.reserve(n);
 
-    for (size_t i = 0; i < n; ++i) {
-        auto keyNum = RandomNumber(Max<ui64>());
+    for (size_t i = keyFrom; i < keyFrom + n; ++i) {
         switch (requestType) {
         case ERequestType::UpsertBulk:
-            requests.emplace_back(GenerateBulkRowRequest(tableId, keyNum));
+            requests.emplace_back(GenerateBulkRowRequest(tableId, i));
             break;
         case ERequestType::UpsertLocalMkql:
-            requests.emplace_back(GenerateMkqlRowRequest(tableId, keyNum));
+            requests.emplace_back(GenerateMkqlRowRequest(tableId, i, table));
             break;
         default:
             // should not happen, just for compiler
@@ -115,6 +120,7 @@ TRequestsVector GenerateRequests(ui64 tableId, ui64 n, ERequestType requestType)
 
 class TUpsertActor : public TActorBootstrapped<TUpsertActor> {
     const NKikimrDataShardLoad::TEvTestLoadRequest::TUpdateStart Config;
+    const NKikimrDataShardLoad::TEvTestLoadRequest::TTargetShard Target;
     const TActorId Parent;
     const ui64 Tag;
     const ERequestType RequestType;
@@ -136,9 +142,14 @@ public:
         return NKikimrServices::TActivity::DS_LOAD_ACTOR;
     }
 
-    TUpsertActor(const NKikimrDataShardLoad::TEvTestLoadRequest::TUpdateStart& cmd, const TActorId& parent,
-            TIntrusivePtr<::NMonitoring::TDynamicCounters> counters, ui64 tag, ERequestType requestType)
+    TUpsertActor(const NKikimrDataShardLoad::TEvTestLoadRequest::TUpdateStart& cmd,
+                 const NKikimrDataShardLoad::TEvTestLoadRequest::TTargetShard& target,
+                 const TActorId& parent,
+                 TIntrusivePtr<::NMonitoring::TDynamicCounters> counters,
+                 ui64 tag,
+                 ERequestType requestType)
         : Config(cmd)
+        , Target(target)
         , Parent(parent)
         , Tag(tag)
         , RequestType(requestType)
@@ -153,7 +164,12 @@ public:
 
         // note that we generate all requests at once to send at max speed, i.e.
         // do not mess with protobufs, strings, etc when send data
-        Requests = GenerateRequests(Config.GetTableId(), Config.GetRowCount(), RequestType);
+        Requests = GenerateRequests(
+            Target.GetTableId(),
+            Config.GetKeyFrom(),
+            Config.GetRowCount(),
+            RequestType,
+            Target.GetTableName());
 
         Become(&TUpsertActor::StateFunc);
         Connect(ctx);
@@ -162,7 +178,7 @@ public:
 private:
     void Connect(const TActorContext &ctx) {
         LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Tag# " << Tag << " TUpsertActor Connect called");
-        Pipe = Register(NTabletPipe::CreateClient(SelfId(), Config.GetTabletId()));
+        Pipe = Register(NTabletPipe::CreateClient(SelfId(), Target.GetTabletId()));
     }
 
     void Handle(TEvTabletPipe::TEvClientConnected::TPtr ev, const TActorContext& ctx) {
@@ -173,7 +189,7 @@ private:
 
         if (msg->Status != NKikimrProto::OK) {
             TStringStream ss;
-            ss << "Failed to connect to " << Config.GetTabletId() << ", status: " << msg->Status;
+            ss << "Failed to connect to " << Target.GetTabletId() << ", status: " << msg->Status;
             StopWithError(ctx, ss.Str());
             return;
         }
@@ -219,7 +235,7 @@ private:
     }
 
     void Handle(TEvDataShard::TEvUploadRowsResponse::TPtr ev, const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Tag# " << Tag
+        LOG_TRACE_S(ctx, NKikimrServices::DS_LOAD_TEST, "Tag# " << Tag
             << " TUpsertActor received from " << ev->Sender << ": " << ev->Get()->Record);
         --Inflight;
 
@@ -234,7 +250,7 @@ private:
     }
 
     void Handle(TEvTablet::TEvLocalMKQLResponse::TPtr ev, const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Tag# " << Tag
+        LOG_TRACE_S(ctx, NKikimrServices::DS_LOAD_TEST, "Tag# " << Tag
             << " TUpsertActor received from " << ev->Sender << ": " << ev->Get()->Record);
         --Inflight;
 
@@ -252,7 +268,7 @@ private:
         StopWithError(ctx, "delivery failed");
     }
 
-    void Handle(NMon::TEvHttpInfo::TPtr& ev, const TActorContext& ctx) {
+    void Handle(TEvDataShardLoad::TEvTestLoadInfoRequest::TPtr& ev, const TActorContext& ctx) {
         TStringStream str;
         HTML(str) {
             str << "DS bulk upsert load actor# " << Tag << " started on " << StartTs
@@ -263,7 +279,8 @@ private:
             str << " in " << delta << " (" << throughput << " op/s)"
                 << " errors=" << Errors;
         }
-        ctx.Send(ev->Sender, new NMon::TEvHttpInfoRes(str.Str(), ev->Get()->SubRequestId));
+
+        ctx.Send(ev->Sender, new TEvDataShardLoad::TEvTestLoadInfoResponse(Tag, str.Str()));
     }
 
     void HandlePoison(const TActorContext& ctx) {
@@ -281,7 +298,7 @@ private:
 
     STRICT_STFUNC(StateFunc,
         CFunc(TEvents::TSystem::PoisonPill, HandlePoison);
-        HFunc(NMon::TEvHttpInfo, Handle)
+        HFunc(TEvDataShardLoad::TEvTestLoadInfoRequest, Handle)
         HFunc(TEvents::TEvUndelivered, Handle);
         HFunc(TEvDataShard::TEvUploadRowsResponse, Handle);
         HFunc(TEvTablet::TEvLocalMKQLResponse, Handle);
@@ -292,22 +309,26 @@ private:
 
 } // anonymous
 
-NActors::IActor *CreateUpsertBulkActor(const NKikimrDataShardLoad::TEvTestLoadRequest::TUpdateStart& cmd,
-        const NActors::TActorId& parent, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters, ui64 tag)
+IActor *CreateUpsertBulkActor(const NKikimrDataShardLoad::TEvTestLoadRequest::TUpdateStart& cmd,
+        const NKikimrDataShardLoad::TEvTestLoadRequest::TTargetShard& target,
+        const TActorId& parent, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters, ui64 tag)
 {
-    return new TUpsertActor(cmd, parent, std::move(counters), tag, ERequestType::UpsertBulk);
+    return new TUpsertActor(cmd, target, parent, std::move(counters), tag, ERequestType::UpsertBulk);
 }
 
-NActors::IActor *CreateLocalMkqlUpsertActor(const NKikimrDataShardLoad::TEvTestLoadRequest::TUpdateStart& cmd,
-        const NActors::TActorId& parent, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters, ui64 tag)
+IActor *CreateLocalMkqlUpsertActor(const NKikimrDataShardLoad::TEvTestLoadRequest::TUpdateStart& cmd,
+        const NKikimrDataShardLoad::TEvTestLoadRequest::TTargetShard& target,
+        const TActorId& parent, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters, ui64 tag)
 {
-    return new TUpsertActor(cmd, parent, std::move(counters), tag, ERequestType::UpsertLocalMkql);
+    return new TUpsertActor(cmd, target, parent, std::move(counters), tag, ERequestType::UpsertLocalMkql);
 }
 
-NActors::IActor *CreateProposeUpsertActor(const NKikimrDataShardLoad::TEvTestLoadRequest::TUpdateStart& cmd,
-        const NActors::TActorId& parent, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters, ui64 tag)
+IActor *CreateProposeUpsertActor(const NKikimrDataShardLoad::TEvTestLoadRequest::TUpdateStart& cmd,
+        const NKikimrDataShardLoad::TEvTestLoadRequest::TTargetShard& target,
+        const TActorId& parent, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters, ui64 tag)
 {
     Y_UNUSED(cmd);
+    Y_UNUSED(target);
     Y_UNUSED(parent);
     Y_UNUSED(counters);
     Y_UNUSED(tag);

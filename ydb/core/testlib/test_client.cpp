@@ -19,7 +19,6 @@
 #include <ydb/services/ydb/ydb_export.h>
 #include <ydb/services/ydb/ydb_import.h>
 #include <ydb/services/ydb/ydb_operation.h>
-#include <ydb/services/ydb/ydb_s3_internal.h>
 #include <ydb/services/ydb/ydb_scheme.h>
 #include <ydb/services/ydb/ydb_scripting.h>
 #include <ydb/services/ydb/ydb_table.h>
@@ -45,8 +44,9 @@
 #include <ydb/core/security/ticket_parser.h>
 #include <ydb/core/base/user_registry.h>
 #include <ydb/core/health_check/health_check.h>
-#include <ydb/core/kqp/kqp.h>
-#include <ydb/core/kqp/rm/kqp_rm.h>
+#include <ydb/core/kqp/common/kqp.h>
+#include <ydb/core/kqp/rm_service/kqp_rm_service.h>
+#include <ydb/core/kqp/proxy_service/kqp_proxy_service.h>
 #include <ydb/core/metering/metering.h>
 #include <ydb/core/protos/services.pb.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
@@ -70,12 +70,14 @@
 #include <ydb/core/mind/tenant_pool.h>
 #include <ydb/core/mind/tenant_slot_broker.h>
 #include <ydb/core/mind/tenant_node_enumeration.h>
+#include <ydb/core/mind/node_broker.h>
 #include <ydb/core/kesus/tablet/events.h>
 #include <ydb/core/sys_view/service/sysview_service.h>
 #include <ydb/library/yql/minikql/mkql_function_registry.h>
 #include <ydb/library/yql/minikql/invoke_builtins/mkql_builtins.h>
 #include <ydb/library/yql/public/issue/yql_issue_message.h>
 #include <ydb/core/engine/mkql_engine_flat.h>
+#include <ydb/core/driver_lib/run/cert_auth_props.h>
 
 #include <library/cpp/testing/unittest/registar.h>
 #include <ydb/core/kesus/proxy/proxy.h>
@@ -107,8 +109,6 @@
 namespace NKikimr {
 
 namespace Tests {
-
-
 
     TServerSettings& TServerSettings::SetDomainName(const TString& value) {
         StoragePoolTypes.erase("test");
@@ -227,6 +227,11 @@ namespace Tests {
             Runtime->GetAppData(nodeIdx).DataStreamsAuthFactory = Settings->DataStreamsAuthFactory.get();
             Runtime->GetAppData(nodeIdx).PersQueueMirrorReaderFactory = Settings->PersQueueMirrorReaderFactory.get();
 
+            Runtime->GetAppData(nodeIdx).DynamicNameserviceConfig = new TDynamicNameserviceConfig;
+            auto dnConfig = Runtime->GetAppData(nodeIdx).DynamicNameserviceConfig;
+            dnConfig->MaxStaticNodeId = 1023;
+            dnConfig->MaxDynamicNodeId = 1024 + 100;
+
             SetupConfigurators(nodeIdx);
             SetupProxies(nodeIdx);
         }
@@ -290,6 +295,10 @@ namespace Tests {
             system->Register(NGRpcService::CreateGrpcEndpointPublishActor(desc.Get()), TMailboxType::ReadAsFilled, appData.UserPoolId);
         }
 
+        if (!options.SslData.Empty()) {
+            grpcService->SetDynamicNodeAuthParams(NKikimr::GetDynamicNodeAuthorizationParams(Settings->AppConfig.GetClientCertificateAuthorization()));
+        }
+
         auto future = grpcService->Prepare(
             system,
             NMsgBusProxy::CreatePersQueueMetaCacheV2Id(),
@@ -325,7 +334,6 @@ namespace Tests {
         GRpcServer->AddService(new NGRpcService::TGRpcCmsService(system, counters, grpcRequestProxyId, true));
         GRpcServer->AddService(new NGRpcService::TGRpcDiscoveryService(system, counters, grpcRequestProxyId, true));
         GRpcServer->AddService(new NGRpcService::TGRpcYdbClickhouseInternalService(system, counters, appData.InFlightLimiterRegistry, grpcRequestProxyId, true));
-        GRpcServer->AddService(new NGRpcService::TGRpcYdbS3InternalService(system, counters, grpcRequestProxyId, true));
         GRpcServer->AddService(new NQuoter::TRateLimiterGRpcService(system, counters, grpcRequestProxyId));
         GRpcServer->AddService(new NGRpcService::TGRpcYdbLongTxService(system, counters, grpcRequestProxyId, true));
         GRpcServer->AddService(new NGRpcService::TGRpcDataStreamsService(system, counters, grpcRequestProxyId, true));
@@ -415,6 +423,56 @@ namespace Tests {
         app.AddDomain(domain.Release());
     }
 
+    TVector<ui64> TServer::StartPQTablets(ui32 pqTabletsN) {
+        auto getChannelBind = [](const TString& storagePool) {
+            TChannelBind bind;
+            bind.SetStoragePoolName(storagePool);
+            return bind;
+        };
+        TVector<ui64> ids;
+        ids.reserve(pqTabletsN);
+        for (ui32 i = 0; i < pqTabletsN; ++i) {
+            auto tabletId = Tests::ChangeStateStorage(Tests::DummyTablet2 + i + 1, Settings->Domain);
+            TIntrusivePtr<TTabletStorageInfo> tabletInfo =
+                CreateTestTabletInfo(tabletId, TTabletTypes::PersQueue);
+            TIntrusivePtr<TTabletSetupInfo> setupInfo =
+                new TTabletSetupInfo(&CreatePersQueue, TMailboxType::Simple, 0, TMailboxType::Simple, 0);
+
+            static TString STORAGE_POOL = "/Root:test";
+            static TChannelsBindings BINDED_CHANNELS =
+                {getChannelBind(STORAGE_POOL), getChannelBind(STORAGE_POOL), getChannelBind(STORAGE_POOL)};
+
+            ui32 nodeIndex = 0;
+            auto ev =
+                MakeHolder<TEvHive::TEvCreateTablet>(tabletId, 0, TTabletTypes::PersQueue, BINDED_CHANNELS);
+
+            TActorId senderB = Runtime->AllocateEdgeActor(nodeIndex);
+            ui64 hive = ChangeStateStorage(Tests::Hive, Settings->Domain);
+            Runtime->SendToPipe(hive, senderB, ev.Release(), 0, GetPipeConfigWithRetries());
+            TAutoPtr<IEventHandle> handle;
+            auto createTabletReply = Runtime->GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(handle);
+            UNIT_ASSERT(createTabletReply);
+            auto expectedStatus = NKikimrProto::OK;
+            UNIT_ASSERT_EQUAL_C(createTabletReply->Record.GetStatus(), expectedStatus,
+                                (ui32)createTabletReply->Record.GetStatus() << " != " << (ui32)expectedStatus);
+            UNIT_ASSERT_EQUAL_C(createTabletReply->Record.GetOwner(), tabletId,
+                                createTabletReply->Record.GetOwner() << " != " << tabletId);
+            ui64 id = createTabletReply->Record.GetTabletID();
+            while (true) {
+                auto tabletCreationResult =
+                    Runtime->GrabEdgeEventRethrow<TEvHive::TEvTabletCreationResult>(handle);
+                UNIT_ASSERT(tabletCreationResult);
+                if (id == tabletCreationResult->Record.GetTabletID()) {
+                    UNIT_ASSERT_EQUAL_C(tabletCreationResult->Record.GetStatus(), NKikimrProto::OK,
+                        (ui32)tabletCreationResult->Record.GetStatus() << " != " << (ui32)NKikimrProto::OK);
+                    break;
+                }
+            }
+            ids.push_back(id);
+        }
+        return ids;
+    }
+
     void TServer::CreateBootstrapTablets() {
         const ui32 domainId = Settings->Domain;
         Y_VERIFY(TDomainsInfo::MakeTxAllocatorIDFixed(domainId, 1) == ChangeStateStorage(TxAllocator, domainId));
@@ -427,8 +485,10 @@ namespace Tests {
         CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(ChangeStateStorage(Hive, domainId), TTabletTypes::Hive), &CreateDefaultHive);
         CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(MakeBSControllerID(domainId), TTabletTypes::BSController), &CreateFlatBsController);
         CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(MakeTenantSlotBrokerID(domainId), TTabletTypes::TenantSlotBroker), &NTenantSlotBroker::CreateTenantSlotBroker);
-        if (Settings->EnableConsole)
+        if (Settings->EnableConsole) {
             CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(MakeConsoleID(domainId), TTabletTypes::Console), &NConsole::CreateConsole);
+        }
+        CreateTestBootstrapper(*Runtime, CreateTestTabletInfo(MakeNodeBrokerID(domainId), TTabletTypes::NodeBroker), &NNodeBroker::CreateNodeBroker);
     }
 
     void TServer::SetupStorage() {
@@ -2291,37 +2351,6 @@ namespace Tests {
         }
 
         return followerNodes;
-    }
-
-    void TClient::S3Listing(const TString& table, const TString& prefixColumnsPb,
-                            const TString& pathPrefix, const TString& pathDelimiter,
-                            const TString& startAfterSuffixColumnsPb,
-                            const TVector<TString>& columnsToReturn, ui32 maxKeys,
-                            ui32 timeoutMillisec,
-                            NKikimrClient::TS3ListingResponse& res) {
-        TAutoPtr<NMsgBusProxy::TBusS3ListingRequest> request = new NMsgBusProxy::TBusS3ListingRequest();
-        request->Record.SetTableName(table);
-        bool parseOk = ::google::protobuf::TextFormat::ParseFromString(prefixColumnsPb, request->Record.MutableKeyPrefix());
-        UNIT_ASSERT_C(parseOk, "Failed to parse prefix columns: " + prefixColumnsPb);
-        request->Record.SetPathColumnPrefix(pathPrefix);
-        request->Record.SetPathColumnDelimiter(pathDelimiter);
-        if (!startAfterSuffixColumnsPb.empty()) {
-            parseOk = ::google::protobuf::TextFormat::ParseFromString(startAfterSuffixColumnsPb, request->Record.MutableStartAfterKeySuffix());
-            UNIT_ASSERT_C(parseOk, "Failed to parse suffix columns: " + startAfterSuffixColumnsPb);
-        }
-        request->Record.SetMaxKeys(maxKeys);
-        request->Record.SetTimeout(timeoutMillisec);
-        for (const TString& c : columnsToReturn) {
-            request->Record.AddColumnsToReturn(c);
-        }
-
-        TAutoPtr<NBus::TBusMessage> reply;
-        auto status = SyncCall(request, reply);
-        UNIT_ASSERT_VALUES_EQUAL(status, NBus::MESSAGE_OK);
-
-        NKikimrClient::TS3ListingResponse& response = dynamic_cast<NMsgBusProxy::TBusS3ListingResponse*>(reply.Get())->Record;
-
-        res.Swap(&response);
     }
 
     ui64 TClient::GetKesusTabletId(const TString& kesusPath) {

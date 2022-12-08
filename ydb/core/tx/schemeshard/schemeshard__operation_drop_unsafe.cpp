@@ -45,7 +45,6 @@ public:
     }
 };
 
-
 class TPropose: public TSubOperationState {
 private:
     TOperationId OperationId;
@@ -79,7 +78,7 @@ public:
 
         TPathId pathId = txState->TargetPathId;
         TPathElement::TPtr path = context.SS->PathsById.at(pathId);
-        auto pathes = context.SS->ListSubThee(pathId, context.Ctx);
+        auto pathes = context.SS->ListSubTree(pathId, context.Ctx);
 
         NIceDb::TNiceDb db(context.GetDB());
 
@@ -112,9 +111,9 @@ public:
         Y_VERIFY(txState);
         Y_VERIFY(txState->TxType == TTxState::TxForceDropSubDomain);
 
-        auto pathes = context.SS->ListSubThee(txState->TargetPathId, context.Ctx);
-        NForceDrop::ValidateNoTrasactionOnPathes(OperationId, pathes, context);
-        context.SS->MarkAsDroping(pathes, OperationId.GetTxId(), context.Ctx);
+        auto pathes = context.SS->ListSubTree(txState->TargetPathId, context.Ctx);
+        NForceDrop::ValidateNoTransactionOnPathes(OperationId, pathes, context);
+        context.SS->MarkAsDropping(pathes, OperationId.GetTxId(), context.Ctx);
         NForceDrop::CollectShards(pathes, OperationId, txState, context);
 
         context.OnComplete.ProposeToCoordinator(OperationId, txState->TargetPathId, TStepId(0));
@@ -122,30 +121,24 @@ public:
     }
 };
 
-
 class TDropForceUnsafe: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-
-    TTxState::ETxState State = TTxState::Invalid;
     TPathElement::EPathType ExpectedType = TPathElement::EPathType::EPathTypeInvalid;
 
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::Propose;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Propose:
             return TTxState::ProposedDeleteParts;
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::Propose:
             return MakeHolder<TPropose>(OperationId);
@@ -156,27 +149,16 @@ class TDropForceUnsafe: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
+public:
+    explicit TDropForceUnsafe(const TOperationId& id, const TTxTransaction& tx, TPathElement::EPathType expectedType)
+        : TSubOperation(id, tx)
+        , ExpectedType(expectedType)
+    {
     }
 
-public:
-    TDropForceUnsafe(TOperationId id, const TTxTransaction& tx, TPathElement::EPathType expectedType)
-        : OperationId(id)
-        , Transaction(tx)
-        , ExpectedType(expectedType)
-    {}
-
-    TDropForceUnsafe(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
+    explicit TDropForceUnsafe(const TOperationId& id, TTxState::ETxState state)
+        : TSubOperation(id, state)
     {
-        SetState(SelectStateFunc(state));
     }
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
@@ -257,10 +239,6 @@ public:
             result->SetError(NKikimrScheme::StatusPreconditionFailed, errStr);
             return result;
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxForceDropSubDomain, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         TTxState& txState = context.SS->CreateTx(OperationId, TTxState::TxForceDropSubDomain, path.Base()->PathId);
         txState.State = TTxState::Waiting;
@@ -268,7 +246,7 @@ public:
 
         NIceDb::TNiceDb db(context.GetDB());
 
-        auto pathes = context.SS->ListSubThee(path.Base()->PathId, context.Ctx);
+        auto pathes = context.SS->ListSubTree(path.Base()->PathId, context.Ctx);
 
         auto relatedTx = context.SS->GetRelatedTransactions(pathes, context.Ctx);
         for (auto otherTxId: relatedTx) {
@@ -293,7 +271,7 @@ public:
             }
         }
 
-        context.SS->MarkAsDroping(pathes, OperationId.GetTxId(), context.Ctx);
+        context.SS->MarkAsDropping(pathes, OperationId.GetTxId(), context.Ctx);
 
         txState.State = TTxState::Propose;
         context.OnComplete.ActivateTx(OperationId);
@@ -311,8 +289,7 @@ public:
             context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
         }
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -347,26 +324,24 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
-ISubOperationBase::TPtr CreateFroceDropUnsafe(TOperationId id, const TTxTransaction& tx) {
-    return new TDropForceUnsafe(id, tx, TPathElement::EPathType::EPathTypeInvalid);
+ISubOperationBase::TPtr CreateForceDropUnsafe(TOperationId id, const TTxTransaction& tx) {
+    return MakeSubOperation<TDropForceUnsafe>(id, tx, TPathElement::EPathType::EPathTypeInvalid);
 }
 
-ISubOperationBase::TPtr CreateFroceDropUnsafe(TOperationId id, TTxState::ETxState state) {
+ISubOperationBase::TPtr CreateForceDropUnsafe(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TDropForceUnsafe(id, state);
+    return MakeSubOperation<TDropForceUnsafe>(id, state);
 }
 
-ISubOperationBase::TPtr CreateFroceDropSubDomain(TOperationId id, const TTxTransaction& tx) {
-    return new TDropForceUnsafe(id, tx, TPathElement::EPathType::EPathTypeSubDomain);
+ISubOperationBase::TPtr CreateForceDropSubDomain(TOperationId id, const TTxTransaction& tx) {
+    return MakeSubOperation<TDropForceUnsafe>(id, tx, TPathElement::EPathType::EPathTypeSubDomain);
 }
 
-ISubOperationBase::TPtr CreateFroceDropSubDomain(TOperationId id, TTxState::ETxState state) {
+ISubOperationBase::TPtr CreateForceDropSubDomain(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TDropForceUnsafe(id, state);
+    return MakeSubOperation<TDropForceUnsafe>(id, state);
 }
 
-}
 }

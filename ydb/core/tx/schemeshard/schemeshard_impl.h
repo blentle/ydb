@@ -10,6 +10,7 @@
 #include "schemeshard_path.h"
 #include "schemeshard_domain_links.h"
 #include "schemeshard_info_types.h"
+#include "schemeshard_tables_storage.h"
 #include "schemeshard_tx_infly.h"
 #include "schemeshard_utils.h"
 #include "schemeshard_schema.h"
@@ -207,7 +208,8 @@ public:
     THashMap<TPathId, TFileStoreInfo::TPtr> FileStoreInfos;
     THashMap<TPathId, TKesusInfo::TPtr> KesusInfos;
     THashMap<TPathId, TOlapStoreInfo::TPtr> OlapStores;
-    THashMap<TPathId, TColumnTableInfo::TPtr> ColumnTables;
+
+    TTablesStorage ColumnTables;
 
     // it is only because we need to manage undo of upgrade subdomain, finally remove it
     THashMap<TPathId, TVector<TTabletId>> RevertedMigrations;
@@ -254,6 +256,7 @@ public:
     bool EnableBackgroundCompactionServerless = false;
     bool EnableBorrowedSplitCompaction = false;
     bool EnableMoveIndex = false;
+    bool EnableAlterDatabaseCreateHiveFirst = false;
 
     TShardDeleter ShardDeleter;
 
@@ -264,6 +267,8 @@ public:
     TAutoPtr<TSelfPinger> SelfPinger;
 
     TActorId SysPartitionStatsCollector;
+
+    TActorId SVPMigrator;
 
     TDuration StatsMaxExecuteTime;
     TDuration StatsBatchTimeout;
@@ -409,10 +414,6 @@ public:
         const NKikimrConfig::TCompactionConfig::TBorrowedCompactionConfig& config,
         const TActorContext &ctx);
 
-    bool CheckInFlightLimit(
-        const TTxState::ETxType txType,
-        TString& errStr) const;
-
     void StartStopCompactionQueues();
 
     void WaitForTableProfiles(ui64 importId, ui32 itemIdx);
@@ -505,8 +506,11 @@ public:
     TTabletId SelectCoordinator(TTxId txId, TPathElement::TPtr pathEl) const;
 
     bool CheckApplyIf(const NKikimrSchemeOp::TModifyScheme& scheme, TString& errStr);
-    bool CheckLocks(const TPathId pathId, const TTxId lockTxId, TString& errStr);
-    bool CheckLocks(const TPathId pathId, const NKikimrSchemeOp::TModifyScheme &scheme, TString &errStr);
+    bool CheckLocks(const TPathId pathId, const TTxId lockTxId, TString& errStr) const;
+    bool CheckLocks(const TPathId pathId, const NKikimrSchemeOp::TModifyScheme& scheme, TString& errStr) const;
+    bool CheckInFlightLimit(TTxState::ETxType txType, TString& errStr) const;
+    bool CheckInFlightLimit(NKikimrSchemeOp::EOperationType opType, TString& errStr) const;
+    bool CanCreateSnapshot(const TPathId& tablePathId, TTxId txId, NKikimrScheme::EStatus& status, TString& errStr) const;
 
     TShardIdx ReserveShardIdxs(ui64 count);
     TShardIdx NextShardIdx(const TShardIdx& shardIdx, ui64 inc) const;
@@ -526,11 +530,11 @@ public:
 
     THashSet<TShardIdx> CollectAllShards(const THashSet<TPathId>& pathes) const;
     void ExamineTreeVFS(TPathId nodeId, std::function<void(TPathElement::TPtr)> func, const TActorContext& ctx);
-    THashSet<TPathId> ListSubThee(TPathId subdomain_root, const TActorContext& ctx);
+    THashSet<TPathId> ListSubTree(TPathId subdomain_root, const TActorContext& ctx);
     THashSet<TTxId> GetRelatedTransactions(const THashSet<TPathId>& pathes, const TActorContext &ctx);
 
     void MarkAsDroping(TPathElement::TPtr node, TTxId txId, const TActorContext& ctx);
-    void MarkAsDroping(const THashSet<TPathId>& pathes, TTxId txId, const TActorContext& ctx);
+    void MarkAsDropping(const THashSet<TPathId>& pathes, TTxId txId, const TActorContext& ctx);
 
     void UncountNode(TPathElement::TPtr node);
     void MarkAsMigrated(TPathElement::TPtr node, const TActorContext& ctx);
@@ -652,6 +656,7 @@ public:
     void PersistSubDomainState(NIceDb::TNiceDb& db, const TPathId& pathId, const TSubDomainInfo& subDomain);
     void PersistSubDomainSchemeQuotas(NIceDb::TNiceDb& db, const TPathId& pathId, const TSubDomainInfo& subDomain);
     void PersistSubDomainSecurityStateVersion(NIceDb::TNiceDb& db, const TPathId& pathId, const TSubDomainInfo& subDomain);
+    void PersistSubDomainPrivateShards(NIceDb::TNiceDb& db, const TPathId& pathId, const TSubDomainInfo& subDomain);
     void PersistDeleteSubDomainAlter(NIceDb::TNiceDb& db, const TPathId& pathId, const TSubDomainInfo& subDomain);
     void PersistKesusInfo(NIceDb::TNiceDb& db, TPathId pathId, const TKesusInfo::TPtr);
     void PersistKesusVersion(NIceDb::TNiceDb& db, TPathId pathId, const TKesusInfo::TPtr);
@@ -685,7 +690,7 @@ public:
 
     // ColumnTable
     void PersistColumnTable(NIceDb::TNiceDb& db, TPathId pathId, const TColumnTableInfo& tableInfo, bool isAlter = false);
-    void PersistColumnTableRemove(NIceDb::TNiceDb& db, TPathId pathId, bool isAlter = false);
+    void PersistColumnTableRemove(NIceDb::TNiceDb& db, TPathId pathId);
     void PersistColumnTableAlter(NIceDb::TNiceDb& db, TPathId pathId, const TColumnTableInfo& tableInfo);
     void PersistColumnTableAlterRemove(NIceDb::TNiceDb& db, TPathId pathId);
 
@@ -955,6 +960,8 @@ public:
     void Handle(TEvDataShard::TEvCompactTableResult::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvDataShard::TEvCompactBorrowedResult::TPtr &ev, const TActorContext &ctx);
 
+    
+    void Handle(TEvSchemeShard::TEvProcessingRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvSchemeShard::TEvSyncTenantSchemeShard::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvSchemeShard::TEvUpdateTenantSchemeShard::TPtr& ev, const TActorContext& ctx);
 

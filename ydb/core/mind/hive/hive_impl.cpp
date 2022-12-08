@@ -473,6 +473,18 @@ void THive::Handle(TEvPrivate::TEvBootTablets::TPtr&) {
     } else {
         BLOG_D("SubDomain Hive is ready");
 
+        if (!PrimaryDomainKey && Info()->TenantPathId) {
+            //NOTE: Primary(Sub)DomainKey isn't set after loading everything from the local db --
+            // -- this is first time boot or incomplete configuration.
+            BLOG_I("Primary(Sub)DomainKey is not set, setting it from TTabletStorageInfo::TenantPathId to " << Info()->TenantPathId);
+
+            auto msg = MakeHolder<TEvHive::TEvConfigureHive>(TSubDomainKey(Info()->TenantPathId.OwnerId, Info()->TenantPathId.LocalPathId));
+            TEvHive::TEvConfigureHive::TPtr event((TEventHandle<TEvHive::TEvConfigureHive>*) new IEventHandle(
+                TActorId(), TActorId(), msg.Release()
+            ));
+            Execute(CreateConfigureSubdomain(event));
+        }
+
         if (!TabletOwnersSynced) {
             // this code should be removed later
             THolder<TEvHive::TEvRequestTabletOwners> request(new TEvHive::TEvRequestTabletOwners());
@@ -855,12 +867,13 @@ void THive::Handle(TEvHive::TEvReassignTablet::TPtr &ev) {
             for (ui32 i = 0; i < forcedGroupsSize; ++i) {
                 ui32 channel = record.GetChannels(i);
                 Y_VERIFY(channel < channels);
-                THolder<NKikimrBlobStorage::TEvControllerSelectGroups::TGroupParameters> parameters = BuildGroupParametersForChannel(*tablet, channel);
-                if (parameters->HasStoragePoolSpecifier()) {
-                    groups[i].SetStoragePoolName(parameters->GetStoragePoolSpecifier().GetName());
+                auto parameters = BuildGroupParametersForChannel(*tablet, channel);
+                const auto& groupParameters = parameters->GroupParameters;
+                if (groupParameters.HasStoragePoolSpecifier()) {
+                    groups[i].SetStoragePoolName(groupParameters.GetStoragePoolSpecifier().GetName());
                 }
-                if (parameters->HasErasureSpecies()) {
-                    groups[i].SetErasureSpecies(parameters->GetErasureSpecies());
+                if (groupParameters.HasErasureSpecies()) {
+                    groups[i].SetErasureSpecies(groupParameters.GetErasureSpecies());
                 }
                 groups[i].SetGroupID(record.GetForcedGroupIDs(i));
             }
@@ -1216,6 +1229,8 @@ THive::TBestNodeResult THive::FindBestNode(const TTabletInfo& tablet) {
             break;
         }
     }
+    BLOG_TRACE("[FBN] Tablet " << tablet.ToString() << " selected nodes count " << selectedNodes.size());
+
     TNodeInfo* selectedNode = nullptr;
     if (!selectedNodes.empty()) {
         switch (GetNodeSelectStrategy()) {
@@ -1708,6 +1723,8 @@ void THive::Handle(TEvHive::TEvRequestHiveInfo::TPtr& ev) {
             it->second.ActualizeTabletStatistics(now);
             FillTabletInfo(response->Record, it->first, &it->second, record);
         }
+        response->Record.set_starttimetimestamp(StartTime().MilliSeconds());
+        response->Record.set_responsetimestamp(TAppData::TimeProvider->Now().MilliSeconds());
     }
 
     Send(ev->Sender, response.Release(), 0, ev->Cookie);
@@ -2208,12 +2225,17 @@ const TVector<i64>& THive::GetTabletTypeAllowedMetricIds(TTabletTypes::EType typ
     return defaultAllowedMetricIds;
 }
 
-THolder<NKikimrBlobStorage::TEvControllerSelectGroups::TGroupParameters> THive::BuildGroupParametersForChannel(const TLeaderTabletInfo& tablet, ui32 channelId) {
-    THolder<NKikimrBlobStorage::TEvControllerSelectGroups::TGroupParameters> groupParameters = MakeHolder<NKikimrBlobStorage::TEvControllerSelectGroups::TGroupParameters>();
+THolder<TGroupFilter> THive::BuildGroupParametersForChannel(const TLeaderTabletInfo& tablet, ui32 channelId) {
+    auto filter = MakeHolder<TGroupFilter>();
     Y_VERIFY(channelId < tablet.BoundChannels.size());
     const auto& binding = tablet.BoundChannels[channelId];
-    groupParameters->MutableStoragePoolSpecifier()->SetName(binding.GetStoragePoolName());
-    return groupParameters;
+    filter->GroupParameters.MutableStoragePoolSpecifier()->SetName(binding.GetStoragePoolName());
+    if (binding.HasPhysicalGroupsOnly()) {
+        filter->PhysicalGroupsOnly = binding.GetPhysicalGroupsOnly();
+    } else {
+        filter->PhysicalGroupsOnly = channelId < 2; // true for channels 0, 1 by default and false for the others
+    }
+    return filter;
 }
 
 void THive::ExecuteStartTablet(TFullTabletId tabletId, const TActorId& local, ui64 cookie, bool external) {

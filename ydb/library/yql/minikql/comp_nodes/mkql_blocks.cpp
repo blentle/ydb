@@ -90,23 +90,26 @@ private:
 
 std::unique_ptr<TBlockBuilderBase> MakeBlockBuilder(TComputationContext& ctx, NUdf::EDataSlot slot) {
     switch (slot) {
-    case NUdf::EDataSlot::Bool:
-        return std::make_unique<TFixedSizeBlockBuilder<bool, arrow::BooleanBuilder>>(ctx, arrow::boolean());
     case NUdf::EDataSlot::Int8:
         return std::make_unique<TFixedSizeBlockBuilder<i8, arrow::Int8Builder>>(ctx, arrow::int8());
     case NUdf::EDataSlot::Uint8:
+    case NUdf::EDataSlot::Bool:
         return std::make_unique<TFixedSizeBlockBuilder<ui8, arrow::UInt8Builder>>(ctx, arrow::uint8());
     case NUdf::EDataSlot::Int16:
         return std::make_unique<TFixedSizeBlockBuilder<i16, arrow::Int16Builder>>(ctx, arrow::int16());
     case NUdf::EDataSlot::Uint16:
+    case NUdf::EDataSlot::Date:
         return std::make_unique<TFixedSizeBlockBuilder<ui16, arrow::UInt16Builder>>(ctx, arrow::uint16());
     case NUdf::EDataSlot::Int32:
         return std::make_unique<TFixedSizeBlockBuilder<i32, arrow::Int32Builder>>(ctx, arrow::int32());
     case NUdf::EDataSlot::Uint32:
+    case NUdf::EDataSlot::Datetime:
         return std::make_unique<TFixedSizeBlockBuilder<ui32, arrow::UInt32Builder>>(ctx, arrow::uint32());
     case NUdf::EDataSlot::Int64:
+    case NUdf::EDataSlot::Interval:
         return std::make_unique<TFixedSizeBlockBuilder<i64, arrow::Int64Builder>>(ctx, arrow::int64());
     case NUdf::EDataSlot::Uint64:
+    case NUdf::EDataSlot::Timestamp:
         return std::make_unique<TFixedSizeBlockBuilder<ui64, arrow::UInt64Builder>>(ctx, arrow::uint64());
     default:
         MKQL_ENSURE(false, "Unsupported data slot");
@@ -271,7 +274,7 @@ public:
 class TBoolBlockReader : public TBlockReaderBase {
 public:
     NUdf::TUnboxedValuePod Get(const arrow::ArrayData& data, size_t index) final {
-        return NUdf::TUnboxedValuePod(arrow::BitUtil::GetBit(data.GetValues<uint8_t>(1), index));
+        return NUdf::TUnboxedValuePod(arrow::BitUtil::GetBit(data.GetValues<uint8_t>(1, 0), index + data.offset));
     }
 
     NUdf::TUnboxedValuePod GetScalar(const arrow::Scalar& scalar) final {
@@ -281,23 +284,26 @@ public:
 
 std::unique_ptr<TBlockReaderBase> MakeBlockReader(NUdf::EDataSlot slot) {
     switch (slot) {
-    case NUdf::EDataSlot::Bool:
-        return std::make_unique<TBoolBlockReader>();
     case NUdf::EDataSlot::Int8:
         return std::make_unique<TFixedSizeBlockReader<i8>>();
+    case NUdf::EDataSlot::Bool:
     case NUdf::EDataSlot::Uint8:
         return std::make_unique<TFixedSizeBlockReader<ui8>>();
     case NUdf::EDataSlot::Int16:
         return std::make_unique<TFixedSizeBlockReader<i16>>();
     case NUdf::EDataSlot::Uint16:
+    case NUdf::EDataSlot::Date:
         return std::make_unique<TFixedSizeBlockReader<ui16>>();
     case NUdf::EDataSlot::Int32:
         return std::make_unique<TFixedSizeBlockReader<i32>>();
     case NUdf::EDataSlot::Uint32:
+    case NUdf::EDataSlot::Datetime:
         return std::make_unique<TFixedSizeBlockReader<ui32>>();
     case NUdf::EDataSlot::Int64:
+    case NUdf::EDataSlot::Interval:
         return std::make_unique<TFixedSizeBlockReader<i64>>();
     case NUdf::EDataSlot::Uint64:
+    case NUdf::EDataSlot::Timestamp:
         return std::make_unique<TFixedSizeBlockReader<ui64>>();
     default:
         MKQL_ENSURE(false, "Unsupported data slot");
@@ -358,7 +364,7 @@ private:
         }
 
         bool HasValue() const {
-            return arrow::BitUtil::GetBit(Array_->GetValues<uint8_t>(0), Index_ + Array_->offset);
+            return arrow::BitUtil::GetBit(Array_->GetValues<uint8_t>(0, 0), Index_ + Array_->offset);
         }
 
         std::unique_ptr<TBlockReaderBase> Reader_;
@@ -435,7 +441,7 @@ public:
             const auto& array = s.Arrays_[i];
             if (array) {
                 const auto nullCount = array->GetNullCount();
-                if (nullCount == array->length || (nullCount > 0 && !arrow::BitUtil::GetBit(array->GetValues<uint8_t>(0), s.Index_ + array->offset))) {
+                if (nullCount == array->length || (nullCount > 0 && !arrow::BitUtil::GetBit(array->GetValues<uint8_t>(0, 0), s.Index_ + array->offset))) {
                     *(output[i]) = NUdf::TUnboxedValue();
                 } else {
                     *(output[i]) = s.Readers_[i]->Get(*array, s.Index_);
@@ -518,12 +524,10 @@ public:
             result = arrow::MakeNullScalar(Type_);
         } else {
             switch (Slot_) {
-            case NUdf::EDataSlot::Bool:
-                result = arrow::Datum(static_cast<bool>(value.Get<bool>()));
-                break;
             case NUdf::EDataSlot::Int8:
                 result = arrow::Datum(static_cast<int8_t>(value.Get<i8>()));
                 break;
+            case NUdf::EDataSlot::Bool:
             case NUdf::EDataSlot::Uint8:
                 result = arrow::Datum(static_cast<uint8_t>(value.Get<ui8>()));
                 break;
@@ -531,18 +535,22 @@ public:
                 result = arrow::Datum(static_cast<int16_t>(value.Get<i16>()));
                 break;
             case NUdf::EDataSlot::Uint16:
+            case NUdf::EDataSlot::Date:
                 result = arrow::Datum(static_cast<uint16_t>(value.Get<ui16>()));
                 break;
             case NUdf::EDataSlot::Int32:
                 result = arrow::Datum(static_cast<int32_t>(value.Get<i32>()));
                 break;
             case NUdf::EDataSlot::Uint32:
+            case NUdf::EDataSlot::Datetime:
                 result = arrow::Datum(static_cast<uint32_t>(value.Get<ui32>()));
                 break;
             case NUdf::EDataSlot::Int64:
+            case NUdf::EDataSlot::Interval:
                 result = arrow::Datum(static_cast<int64_t>(value.Get<i64>()));
                 break;
             case NUdf::EDataSlot::Uint64:
+            case NUdf::EDataSlot::Timestamp:
                 result = arrow::Datum(static_cast<uint64_t>(value.Get<ui64>()));
                 break;
             default:
@@ -603,6 +611,8 @@ IComputationNode* WrapFromBlocks(TCallable& callable, const TComputationNodeFact
 }
 
 IComputationNode* WrapWideFromBlocks(TCallable& callable, const TComputationNodeFactoryContext& ctx) {
+    MKQL_ENSURE(callable.GetInputsCount() == 1, "Expected 1 args, got " << callable.GetInputsCount());
+
     const auto flowType = AS_TYPE(TFlowType, callable.GetInput(0).GetStaticType());
     const auto tupleType = AS_TYPE(TTupleType, flowType->GetItemType());
     MKQL_ENSURE(tupleType->GetElementsCount() > 0, "Expected at least one column");

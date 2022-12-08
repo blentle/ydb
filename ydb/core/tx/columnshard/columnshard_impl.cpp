@@ -504,8 +504,14 @@ void TColumnShard::RunEnsureTable(const NKikimrTxColumnShard::TCreateTable& tabl
 
         if (tableProto.HasTtlSettings()) {
             *tableVerProto.MutableTtlSettings() = tableProto.GetTtlSettings();
-            Ttl.SetPathTtl(pathId, TTtl::TDescription(tableProto.GetTtlSettings()));
-            SetCounter(COUNTER_TABLE_TTLS, Ttl.PathsCount());
+            auto& ttlInfo = tableProto.GetTtlSettings();
+            if (ttlInfo.HasEnabled()) {
+                Ttl.SetPathTtl(pathId, TTtl::TDescription(ttlInfo));
+                SetCounter(COUNTER_TABLE_TTLS, Ttl.PathsCount());
+            } else if (ttlInfo.HasTiering()) {
+                table.TieringUsage = ttlInfo.GetTiering().GetUseTiering();
+                ActivateTiering(pathId, table.TieringUsage);
+            }
         }
 
         if (!PrimaryIndex) {
@@ -521,7 +527,7 @@ void TColumnShard::RunEnsureTable(const NKikimrTxColumnShard::TCreateTable& tabl
         tableVerProto.SetSchemaPresetVersionAdj(tableProto.GetSchemaPresetVersionAdj());
         tableVerProto.SetTtlSettingsPresetVersionAdj(tableProto.GetTtlSettingsPresetVersionAdj());
 
-        Schema::SaveTableInfo(db, table.PathId);
+        Schema::SaveTableInfo(db, table.PathId, table.TieringUsage);
         Schema::SaveTableVersionInfo(db, table.PathId, version, tableVerProto);
         SetCounter(COUNTER_TABLES, Tables.size());
     } else {
@@ -541,14 +547,15 @@ void TColumnShard::RunAlterTable(const NKikimrTxColumnShard::TAlterTable& alterP
     LOG_S_DEBUG("AlterTable for pathId: " << pathId << " at tablet " << TabletID());
 
     Y_VERIFY(!alterProto.HasSchema(), "Tables with explicit schema are not supported");
-
     auto& info = table.Versions[version];
 
     if (alterProto.HasSchemaPreset()) {
         info.SetSchemaPresetId(EnsureSchemaPreset(db, alterProto.GetSchemaPreset(), version));
     }
 
-    if (alterProto.HasTtlSettings()) {
+    const TString& tieringUsage = alterProto.GetTtlSettings().GetTiering().GetUseTiering();
+    ActivateTiering(pathId, tieringUsage);
+    if (alterProto.HasTtlSettings() && alterProto.GetTtlSettings().HasEnabled()) {
         *info.MutableTtlSettings() = alterProto.GetTtlSettings();
         Ttl.SetPathTtl(pathId, TTtl::TDescription(alterProto.GetTtlSettings()));
     } else {
@@ -556,7 +563,7 @@ void TColumnShard::RunAlterTable(const NKikimrTxColumnShard::TAlterTable& alterP
     }
 
     info.SetSchemaPresetVersionAdj(alterProto.GetSchemaPresetVersionAdj());
-
+    Schema::SaveTableInfo(db, table.PathId, tieringUsage);
     Schema::SaveTableVersionInfo(db, table.PathId, version, info);
 }
 
@@ -838,7 +845,7 @@ std::unique_ptr<TEvPrivate::TEvEviction> TColumnShard::SetupTtl(const THashMap<u
     if (regularTtls.empty()) {
         regularTtls = Ttl.MakeIndexTtlMap(TInstant::Now(), force);
     }
-    const bool tiersUsage = regularTtls.empty() && Tiers && Tiers->IsActive();
+    const bool tiersUsage = regularTtls.empty() && Tiers;
     if (tiersUsage) {
         regularTtls = Tiers->GetTiering();
     }
@@ -950,18 +957,6 @@ NOlap::TIndexInfo TColumnShard::ConvertSchema(const NKikimrSchemeOp::TColumnTabl
         indexInfo.SetDefaultCompression(compression);
     }
 
-    EnableTiering = schema.GetEnableTiering();
-    if (OwnerPath && !Tiers && EnableTiering) {
-        Tiers = std::make_shared<TTiersManager>(TabletID(), SelfId(), OwnerPath);
-    }
-    if (!!Tiers) {
-        if (EnableTiering) {
-            Tiers->Start(Tiers);
-        } else {
-            Tiers->Stop();
-        }
-    }
-
     return indexInfo;
 }
 
@@ -998,14 +993,14 @@ void TColumnShard::MapExternBlobs(const TActorContext& /*ctx*/, NOlap::TReadMeta
 
 void TColumnShard::ExportBlobs(const TActorContext& ctx, ui64 exportNo, const TString& tierName,
     TEvPrivate::TEvExport::TBlobDataMap&& blobsInfo) const {
-    if (auto s3 = GetS3ActorForTier(NTiers::TGlobalTierId(OwnerPath, tierName))) {
+    if (auto s3 = GetS3ActorForTier(tierName)) {
         auto event = std::make_unique<TEvPrivate::TEvExport>(exportNo, tierName, s3, std::move(blobsInfo));
         ctx.Register(CreateExportActor(TabletID(), ctx.SelfID, event.release()));
     }
 }
 
 void TColumnShard::ForgetBlobs(const TActorContext& ctx, const TString& tierName, std::vector<NOlap::TEvictedBlob>&& blobs) const {
-    if (auto s3 = GetS3ActorForTier(NTiers::TGlobalTierId(OwnerPath, tierName))) {
+    if (auto s3 = GetS3ActorForTier(tierName)) {
         auto forget = std::make_unique<TEvPrivate::TEvForget>();
         forget->Evicted = std::move(blobs);
         ctx.Send(s3, forget.release());
@@ -1014,7 +1009,7 @@ void TColumnShard::ForgetBlobs(const TActorContext& ctx, const TString& tierName
 
 bool TColumnShard::GetExportedBlob(const TActorContext& ctx, TActorId dst, ui64 cookie, const TString& tierName,
                                    NOlap::TEvictedBlob&& evicted, std::vector<NOlap::TBlobRange>&& ranges) {
-    if (auto s3 = GetS3ActorForTier(NTiers::TGlobalTierId(OwnerPath, tierName))) {
+    if (auto s3 = GetS3ActorForTier(tierName)) {
         auto get = std::make_unique<TEvPrivate::TEvGetExported>();
         get->DstActor = dst;
         get->DstCookie = cookie;
@@ -1036,29 +1031,50 @@ void TColumnShard::Die(const TActorContext& ctx) {
     return IActor::Die(ctx);
 }
 
-TActorId TColumnShard::GetS3ActorForTier(const NTiers::TGlobalTierId& tierId) const {
+TActorId TColumnShard::GetS3ActorForTier(const TString& tierId) const {
     if (!Tiers) {
         return {};
     }
     return Tiers->GetStorageActorId(tierId);
 }
 
+void TColumnShard::Handle(NTiers::TEvTiersManagerReadyForUsage::TPtr& /*ev*/) {
+    Y_VERIFY(Tiers);
+    Y_VERIFY(Tiers->IsReadyForUsage());
+    if (TieringWaiting) {
+        TieringWaiting = false;
+        SignalTabletActive(TActivationContext::AsActorContext());
+    }
+}
+
 void TColumnShard::Handle(NMetadataProvider::TEvRefreshSubscriberData::TPtr& ev) {
     Y_VERIFY(Tiers);
-    Tiers->TakeConfigs(ev->Get()->GetSnapshot());
-    if (EnableTiering) {
-        Tiers->Start(Tiers);
-    }
+    ALS_INFO(NKikimrServices::TX_COLUMNSHARD) << "test handle NMetadataProvider::TEvRefreshSubscriberData" << ev->Get()->GetSnapshot()->SerializeToString();
+    Tiers->TakeConfigs(ev->Get()->GetSnapshot(), nullptr);
 }
 
 NOlap::TIndexInfo TColumnShard::GetActualIndexInfo(const bool tiersUsage) const {
     auto indexInfo = PrimaryIndex->GetIndexInfo();
-    if (tiersUsage && Tiers && Tiers->IsActive()) {
+    if (tiersUsage && Tiers) {
         for (auto&& i : *Tiers) {
             indexInfo.AddStorageTier(i.second.BuildTierStorage());
         }
     }
     return indexInfo;
+}
+
+void TColumnShard::ActivateTiering(const ui64 pathId, const TString& useTiering) {
+    if (!Tiers) {
+        Tiers = std::make_shared<TTiersManager>(TabletID(), SelfId());
+        Tiers->Start(Tiers);
+    }
+    if (!!Tiers) {
+        if (useTiering) {
+            Tiers->EnablePathId(pathId, useTiering);
+        } else {
+            Tiers->DisablePathId(pathId);
+        }
+    }
 }
 
 }

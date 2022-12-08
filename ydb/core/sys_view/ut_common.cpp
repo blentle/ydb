@@ -1,4 +1,5 @@
 #include "ut_common.h"
+#include <ydb/core/persqueue/ut/common/pq_ut_common.h>
 
 namespace NKikimr {
 namespace NSysView {
@@ -25,7 +26,7 @@ NKikimrSubDomains::TSubDomainSettings GetSubDomainDefaultSettings(const TString 
     return subdomain;
 }
 
-TTestEnv::TTestEnv(ui32 staticNodes, ui32 dynamicNodes, ui32 storagePools, bool enableSVP) {
+TTestEnv::TTestEnv(ui32 staticNodes, ui32 dynamicNodes, ui32 storagePools, ui32 pqTabletsN, bool enableSVP) {
     auto mbusPort = PortManager.GetPort();
     auto grpcPort = PortManager.GetPort();
 
@@ -42,10 +43,8 @@ TTestEnv::TTestEnv(ui32 staticNodes, ui32 dynamicNodes, ui32 storagePools, bool 
     featureFlags.SetEnableBackgroundCompaction(false);
     Settings->SetFeatureFlags(featureFlags);
 
-    if (enableSVP) {
-        Settings->SetEnablePersistentQueryStats(true);
-        Settings->SetEnableDbCounters(true);
-    }
+    Settings->SetEnablePersistentQueryStats(enableSVP);
+    Settings->SetEnableDbCounters(enableSVP);
 
     for (ui32 i : xrange(storagePools)) {
         TString poolName = Sprintf("test%d", i);
@@ -65,6 +64,11 @@ TTestEnv::TTestEnv(ui32 staticNodes, ui32 dynamicNodes, ui32 storagePools, bool 
     Tenants = MakeHolder<Tests::TTenants>(Server);
 
     Client->InitRootScheme("Root");
+
+    if (pqTabletsN) {
+        NKikimr::NPQ::FillPQConfig(Settings->PQConfig, "/Root/PQ", true);
+        PqTabletIds = Server->StartPQTablets(pqTabletsN);
+    }
 
     Endpoint = "localhost:" + ToString(grpcPort);
     DriverConfig = NYdb::TDriverConfig().SetEndpoint(Endpoint);

@@ -18,7 +18,7 @@
 #include <random>
 
 // * Scheme is hardcoded and it is like default YCSB setup:
-// table name is "usertable", 1 utf8 "key" column, 10 utf8 "field0" - "field9" columns
+// 1 utf8 "key" column, 10 utf8 "field0" - "field9" columns
 // * row is ~ 1 KB, keys are like user1000385178204227360
 
 namespace NKikimr::NDataShardLoad {
@@ -405,6 +405,7 @@ enum class EState {
 
 class TReadIteratorLoadScenario : public TActorBootstrapped<TReadIteratorLoadScenario> {
     const NKikimrDataShardLoad::TEvTestLoadRequest::TReadStart Config;
+    const NKikimrDataShardLoad::TEvTestLoadRequest::TTargetShard Target;
     const TActorId Parent;
     TIntrusivePtr<::NMonitoring::TDynamicCounters> Counters;
     const ui64 Tag;
@@ -448,9 +449,13 @@ class TReadIteratorLoadScenario : public TActorBootstrapped<TReadIteratorLoadSce
     ui64 ReadCount = 0;
 
 public:
-    TReadIteratorLoadScenario(const NKikimrDataShardLoad::TEvTestLoadRequest::TReadStart& cmd, const TActorId& parent,
-            TIntrusivePtr<::NMonitoring::TDynamicCounters> counters, ui64 tag)
+    TReadIteratorLoadScenario(const NKikimrDataShardLoad::TEvTestLoadRequest::TReadStart& cmd,
+                              const NKikimrDataShardLoad::TEvTestLoadRequest::TTargetShard& target,
+                              const TActorId& parent,
+                              TIntrusivePtr<::NMonitoring::TDynamicCounters> counters,
+                              ui64 tag)
         : Config(cmd)
+        , Target(target)
         , Parent(parent)
         , Counters(std::move(counters))
         , Tag(tag)
@@ -510,8 +515,9 @@ private:
     }
 
     void DescribePath(const TActorContext& ctx) {
+        TString path = Target.GetWorkingDir() + "/" + Target.GetTableName();
         auto request = std::make_unique<TEvTxUserProxy::TEvNavigate>();
-        request->Record.MutableDescribePath()->SetPath(Config.GetPath());
+        request->Record.MutableDescribePath()->SetPath(path);
         ctx.Send(MakeTxProxyID(), request.release());
     }
 
@@ -543,7 +549,8 @@ private:
 
         LOG_INFO_S(ctx, NKikimrServices::DS_LOAD_TEST, "ReadIteratorLoadScenario# " << Tag
             << " will work with tablet# " << TabletId << " with ownerId# " << OwnerId
-            << " with tableId# " << TableId << " resolved for path# " << Config.GetPath()
+            << " with tableId# " << TableId << " resolved for path# "
+            << Target.GetWorkingDir() << "/" << Target.GetTableName()
             << " with columnsCount# " << AllColumnIds.size() << ", keyColumnCount# " << KeyColumnIds.size());
 
         State = EState::Upsert;
@@ -553,11 +560,19 @@ private:
     void UpsertData(const TActorContext& ctx) {
         NKikimrDataShardLoad::TEvTestLoadRequest::TUpdateStart upsertConfig;
         upsertConfig.SetRowCount(Config.GetRowCount());
-        upsertConfig.SetTabletId(TabletId);
-        upsertConfig.SetTableId(TableId);
         upsertConfig.SetInflight(100); // some good value to upsert fast
 
-        auto* upsertActor = CreateUpsertBulkActor(upsertConfig, SelfId(), Counters, /* meaningless tag */ 1000000);
+        NKikimrDataShardLoad::TEvTestLoadRequest::TTargetShard target;
+        target.SetTabletId(TabletId);
+        target.SetTableId(TableId);
+
+        auto* upsertActor = CreateUpsertBulkActor(
+            upsertConfig,
+            target,
+            SelfId(),
+            Counters,
+            /* meaningless tag */ 1000000);
+
         StartedActors.emplace_back(ctx.Register(upsertActor));
 
         LOG_INFO_S(ctx, NKikimrServices::DS_LOAD_TEST, "ReadIteratorLoadScenario# " << Tag
@@ -782,12 +797,12 @@ private:
         return Die(ctx);
     }
 
-    void Handle(NMon::TEvHttpInfo::TPtr& ev, const TActorContext& ctx) {
+    void Handle(TEvDataShardLoad::TEvTestLoadInfoRequest::TPtr& ev, const TActorContext& ctx) {
         TStringStream str;
         HTML(str) {
             str << "ReadIteratorLoadScenario# " << Tag << " started on " << StartTs;
         }
-        ctx.Send(ev->Sender, new NMon::TEvHttpInfoRes(str.Str(), ev->Get()->SubRequestId));
+        ctx.Send(ev->Sender, new TEvDataShardLoad::TEvTestLoadInfoResponse(Tag, str.Str()));
     }
 
     void HandlePoison(const TActorContext& ctx) {
@@ -813,7 +828,7 @@ private:
 
     STRICT_STFUNC(StateFunc,
         CFunc(TEvents::TSystem::PoisonPill, HandlePoison)
-        HFunc(NMon::TEvHttpInfo, Handle)
+        HFunc(TEvDataShardLoad::TEvTestLoadInfoRequest, Handle)
         HFunc(NSchemeShard::TEvSchemeShard::TEvDescribeSchemeResult, Handle)
         HFunc(TEvDataShardLoad::TEvTestLoadFinished, Handle)
         HFunc(TEvPrivate::TEvKeys, Handle)
@@ -823,10 +838,13 @@ private:
 
 } // anonymous
 
-NActors::IActor *CreateReadIteratorActor(const NKikimrDataShardLoad::TEvTestLoadRequest::TReadStart& cmd,
-        const NActors::TActorId& parent, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters, ui64 tag)
+IActor *CreateReadIteratorActor(
+    const NKikimrDataShardLoad::TEvTestLoadRequest::TReadStart& cmd,
+    const NKikimrDataShardLoad::TEvTestLoadRequest::TTargetShard& target,
+    const TActorId& parent, TIntrusivePtr<::NMonitoring::TDynamicCounters> counters,
+    ui64 tag)
 {
-    return new TReadIteratorLoadScenario(cmd, parent, std::move(counters), tag);
+    return new TReadIteratorLoadScenario(cmd, target, parent, std::move(counters), tag);
 }
 
 } // NKikimr::NDataShardLoad

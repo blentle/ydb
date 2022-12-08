@@ -5,7 +5,7 @@
 #include "setup_sys_locks.h"
 #include "datashard_locks_db.h"
 
-#include <ydb/core/kqp/rm/kqp_rm.h>
+#include <ydb/core/kqp/rm_service/kqp_rm_service.h>
 
 namespace NKikimr {
 namespace NDataShard {
@@ -97,7 +97,7 @@ EExecutionStatus TBuildKqpDataTxOutRSUnit::Execute(TOperation::TPtr op, TTransac
         dataTx->SetReadVersion(DataShard.GetReadWriteVersions(tx).ReadVersion);
 
         if (dataTx->GetKqpComputeCtx().HasPersistentChannels()) {
-            auto result = KqpRunTransaction(ctx, op->GetTxId(), dataTx->GetKqpTasks(), tasksRunner);
+            auto result = KqpRunTransaction(ctx, op->GetTxId(), kqpTx, tasksRunner);
 
             Y_VERIFY_S(!dataTx->GetKqpComputeCtx().HadInconsistentReads(),
                 "Unexpected inconsistent reads in operation " << *op << " when preparing persistent channels");

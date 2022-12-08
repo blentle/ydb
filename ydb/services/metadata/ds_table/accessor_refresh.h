@@ -13,6 +13,17 @@ class TEvRefresh: public NActors::TEventLocal<TEvRefresh, EEvSubscribe::EvRefres
 public:
 };
 
+class TEvYQLResponse: public NActors::TEventLocal<TEvYQLResponse, EEvSubscribe::EvYQLResponse> {
+private:
+    YDB_READONLY_DEF(NInternal::NRequest::TDialogYQLRequest::TResponse, Response);
+public:
+    TEvYQLResponse(const NInternal::NRequest::TDialogYQLRequest::TResponse& r)
+        : Response(r)
+    {
+
+    }
+};
+
 class TEvEnrichSnapshotResult: public NActors::TEventLocal<TEvEnrichSnapshotResult, EEvSubscribe::EvEnrichSnapshotResult> {
 private:
     YDB_READONLY_DEF(ISnapshot::TPtr, EnrichedSnapshot);
@@ -33,11 +44,11 @@ public:
     }
 };
 
-class TSnapshotAcceptorController: public ISnapshotAcceptorController {
+class TRefreshInternalController: public ISnapshotAcceptorController, public NInternal::NRequest::IQueryOutput {
 private:
     const TActorIdentity ActorId;
 public:
-    TSnapshotAcceptorController(const TActorIdentity& actorId)
+    TRefreshInternalController(const TActorIdentity& actorId)
         : ActorId(actorId) {
 
     }
@@ -49,48 +60,50 @@ public:
     virtual void Enriched(ISnapshot::TPtr enrichedSnapshot) override {
         ActorId.Send(ActorId, new TEvEnrichSnapshotResult(enrichedSnapshot));
     }
+
+    virtual void OnReply(const NInternal::NRequest::TDialogYQLRequest::TResponse& response) override {
+        ActorId.Send(ActorId, new TEvYQLResponse(response));
+    }
 };
 
-class TDSAccessorRefresher: public NMetadataInitializer::TDSAccessorInitialized {
+class TDSAccessorRefresher: public NActors::TActorBootstrapped<TDSAccessorRefresher> {
 private:
-    using TBase = NMetadataInitializer::TDSAccessorInitialized;
-    ISnapshotParser::TPtr SnapshotConstructor;
+    using TBase = NActors::TActorBootstrapped<TDSAccessorRefresher>;
+    ISnapshotsFetcher::TPtr SnapshotConstructor;
+    std::shared_ptr<TRefreshInternalController> InternalController;
     YDB_READONLY_DEF(ISnapshot::TPtr, CurrentSnapshot);
     YDB_READONLY_DEF(Ydb::Table::ExecuteQueryResult, CurrentSelection);
+    Ydb::Table::ExecuteQueryResult ProposedProto;
     TInstant RequestedActuality = TInstant::Zero();
     const TConfig Config;
-
-    mutable ISnapshotAcceptorController::TPtr ControllerImpl;
-
-    ISnapshotAcceptorController::TPtr GetController() const;
 protected:
-    virtual void Prepare(NMetadataInitializer::IController::TPtr controller) override {
-        SnapshotConstructor->Prepare(controller);
+    virtual void RegisterState() {
+        Become(&TDSAccessorRefresher::StateMain);
     }
     bool IsReady() const {
         return !!CurrentSnapshot;
     }
-    virtual void OnInitialized() override;
     virtual void OnSnapshotModified() = 0;
+    virtual void OnSnapshotRefresh() = 0;
 public:
-    STFUNC(StateMain) {
+    void Bootstrap();
+
+    STATEFN(StateMain) {
         switch (ev->GetTypeRewrite()) {
-            hFunc(NInternal::NRequest::TEvRequestResult<NInternal::NRequest::TDialogSelect>, Handle);
-            hFunc(NInternal::NRequest::TEvRequestResult<NInternal::NRequest::TDialogCreateSession>, Handle);
+            hFunc(TEvYQLResponse, Handle);
             hFunc(TEvRefresh, Handle);
             hFunc(TEvEnrichSnapshotResult, Handle);
             hFunc(TEvEnrichSnapshotProblem, Handle);
             default:
-                TBase::StateMain(ev, ctx);
+                break;
         }
     }
 
-    TDSAccessorRefresher(const TConfig& config, ISnapshotParser::TPtr snapshotConstructor);
+    TDSAccessorRefresher(const TConfig& config, ISnapshotsFetcher::TPtr snapshotConstructor);
 
     void Handle(TEvEnrichSnapshotResult::TPtr& ev);
     void Handle(TEvEnrichSnapshotProblem::TPtr& ev);
-    void Handle(NInternal::NRequest::TEvRequestResult<NInternal::NRequest::TDialogSelect>::TPtr& ev);
-    void Handle(NInternal::NRequest::TEvRequestResult<NInternal::NRequest::TDialogCreateSession>::TPtr& ev);
+    void Handle(TEvYQLResponse::TPtr& ev);
     void Handle(TEvRefresh::TPtr& ev);
 };
 

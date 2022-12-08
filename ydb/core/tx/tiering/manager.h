@@ -1,10 +1,12 @@
 #pragma once
 #include "external_data.h"
-#include "tier_config.h"
 
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 #include <library/cpp/actors/core/actor.h>
+
+#include <ydb/services/metadata/secret/snapshot.h>
 #include <ydb/services/metadata/service.h>
+
 #include <ydb/library/accessor/accessor.h>
 
 namespace NKikimr::NColumnShard {
@@ -21,44 +23,50 @@ public:
     static NOlap::TCompression ConvertCompression(const NKikimrSchemeOp::TCompressionOptions& compression);
     NOlap::TStorageTier BuildTierStorage() const;
 
-    TManager& Restart(const TTierConfig& config, const bool activity);
+    TManager& Restart(const TTierConfig& config, std::shared_ptr<NMetadata::NSecret::TSnapshot> secrets);
     bool NeedExport() const {
         return Config.NeedExport();
     }
     bool Stop();
-    bool Start();
+    bool Start(std::shared_ptr<NMetadata::NSecret::TSnapshot> secrets);
 };
 }
 
 class TTiersManager {
 private:
     class TActor;
-    using TManagers = TMap<NTiers::TGlobalTierId, NTiers::TManager>;
+    using TManagers = std::unordered_map<TString, NTiers::TManager>;
     ui64 TabletId = 0;
     const TActorId TabletActorId;
-    TString OwnerPath;
     TActor* Actor = nullptr;
+    std::unordered_map<ui64, TString> PathIdTiering;
     YDB_READONLY_DEF(TManagers, Managers);
-    YDB_READONLY_FLAG(Active, false);
+    YDB_READONLY_FLAG(ReadyForUsage, false);
 
+    std::shared_ptr<NMetadata::NSecret::TSnapshot> Secrets;
     NMetadataProvider::ISnapshot::TPtr Snapshot;
-    mutable NMetadataProvider::ISnapshotParser::TPtr ExternalDataManipulation;
+    mutable NMetadataProvider::ISnapshotsFetcher::TPtr ExternalDataManipulation;
 
 public:
-    TTiersManager(const ui64 tabletId, const TActorId& tabletActorId, const TString& ownerPath)
+    TTiersManager(const ui64 tabletId, const TActorId& tabletActorId)
         : TabletId(tabletId)
         , TabletActorId(tabletActorId)
-        , OwnerPath(ownerPath)
     {
     }
     TActorId GetActorId() const;
     THashMap<ui64, NOlap::TTiersInfo> GetTiering() const;
-    void TakeConfigs(NMetadataProvider::ISnapshot::TPtr snapshot);
+    void TakeConfigs(NMetadataProvider::ISnapshot::TPtr snapshot, std::shared_ptr<NMetadata::NSecret::TSnapshot> secrets);
+    void EnablePathId(const ui64 pathId, const TString& tieringId) {
+        PathIdTiering.emplace(pathId, tieringId);
+    }
+    void DisablePathId(const ui64 pathId) {
+        PathIdTiering.erase(pathId);
+    }
     TTiersManager& Start(std::shared_ptr<TTiersManager> ownerPtr);
     TTiersManager& Stop();
-    TActorId GetStorageActorId(const NTiers::TGlobalTierId& tierId);
-    const NTiers::TManager& GetManagerVerified(const NTiers::TGlobalTierId& tierId) const;
-    NMetadataProvider::ISnapshotParser::TPtr GetExternalDataManipulation() const;
+    TActorId GetStorageActorId(const TString& tierId);
+    const NTiers::TManager& GetManagerVerified(const TString& tierId) const;
+    NMetadataProvider::ISnapshotsFetcher::TPtr GetExternalDataManipulation() const;
 
     TManagers::const_iterator begin() const {
         return Managers.begin();

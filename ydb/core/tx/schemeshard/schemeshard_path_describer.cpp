@@ -367,15 +367,17 @@ void TPathDescriber::DescribeOlapStore(TPathId pathId, TPathElement::TPtr pathEl
 }
 
 void TPathDescriber::DescribeColumnTable(TPathId pathId, TPathElement::TPtr pathEl) {
-    const TColumnTableInfo::TPtr tableInfo = *Self->ColumnTables.FindPtr(pathId);
-    Y_VERIFY(tableInfo, "ColumnTable not found");
+    const auto tableInfo = Self->ColumnTables.GetVerified(pathId);
     Y_UNUSED(pathEl);
 
-    auto description = Result->Record.MutablePathDescription()->MutableColumnTableDescription();
+    auto* pathDescription = Result->Record.MutablePathDescription();
+    auto description = pathDescription->MutableColumnTableDescription();
     description->CopyFrom(tableInfo->Description);
     description->MutableSharding()->CopyFrom(tableInfo->Sharding);
 
-    if (!description->HasSchema() && description->HasSchemaPresetId()) {
+    if (tableInfo->IsStandalone()) {
+        FillAggregatedStats(*pathDescription, tableInfo->GetStats());
+    } else {
         const TOlapStoreInfo::TPtr storeInfo = *Self->OlapStores.FindPtr(*tableInfo->OlapStorePathId);
         Y_VERIFY(storeInfo, "OlapStore not found");
 
@@ -1058,6 +1060,7 @@ void TSchemeShard::DescribeCdcStream(const TPathId& pathId, const TString& name,
     desc.SetName(name);
     desc.SetMode(info->Mode);
     desc.SetFormat(info->Format);
+    desc.SetVirtualTimestamps(info->VirtualTimestamps);
     PathIdFromPathId(pathId, desc.MutablePathId());
     desc.SetState(info->State);
     desc.SetSchemaVersion(info->AlterVersion);

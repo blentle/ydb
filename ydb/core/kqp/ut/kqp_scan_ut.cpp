@@ -5,8 +5,8 @@
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor.h>
 
 #include <util/generic/size_literals.h>
-#include <ydb/core/kqp/kqp.h>
-#include <ydb/core/kqp/executer/kqp_executer.h>
+#include <ydb/core/kqp/common/kqp.h>
+#include <ydb/core/kqp/executer_actor/kqp_executer.h>
 
 namespace NKikimr {
 namespace NKqp {
@@ -194,6 +194,17 @@ Y_UNIT_TEST_SUITE(KqpScan) {
             [["1"];["10.123456789"]];
             [["2"];["20.987654321"]]
         ])", StreamResultToYson(it));
+    }
+
+    Y_UNIT_TEST(TaggedScalar) {
+        auto kikimr = DefaultKikimrRunner();
+
+        auto it = kikimr.GetTableClient().StreamExecuteScanQuery(R"(
+                SELECT AsTagged(789, "xxx") AS t;
+            )").GetValueSync();
+
+        UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
+        CompareYson(R"([[789]])", StreamResultToYson(it));
     }
 
     Y_UNIT_TEST(Offset) {
@@ -1958,6 +1969,58 @@ Y_UNIT_TEST_SUITE(KqpScan) {
 
         UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
         CompareYson("[[%false]]", StreamResultToYson(result));
+    }
+
+    Y_UNIT_TEST(DqSource) {
+        TKikimrSettings settings;
+        settings.SetDomainRoot(KikimrDefaultUtDomainRoot);
+        TFeatureFlags flags;
+        flags.SetEnablePredicateExtractForDataQueries(true);
+        flags.SetEnableKqpScanQuerySourceRead(true);
+        settings.SetFeatureFlags(flags);
+        TKikimrRunner kikimr(settings);
+        auto db = kikimr.GetTableClient();
+        CreateSampleTables(kikimr);
+
+        {
+            auto result = db.StreamExecuteScanQuery(R"(
+                SELECT Key, Data FROM `/Root/EightShard` WHERE Key = 101 or (Key >= 202 and Key < 200+4) ORDER BY Key;
+            )").GetValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+            CompareYson(R"([[[101u];[1]];[[202u];[1]];[[203u];[3]]])", StreamResultToYson(result));
+        }
+    }
+
+    Y_UNIT_TEST(DqSourceLiteralRange) {
+        TKikimrSettings settings;
+        settings.SetDomainRoot(KikimrDefaultUtDomainRoot);
+        TFeatureFlags flags;
+        flags.SetEnablePredicateExtractForDataQueries(true);
+        flags.SetEnableKqpScanQuerySourceRead(true);
+        settings.SetFeatureFlags(flags);
+        TKikimrRunner kikimr(settings);
+        auto db = kikimr.GetTableClient();
+        CreateSampleTables(kikimr);
+
+        {
+            auto result = db.StreamExecuteScanQuery(R"(
+                SELECT Key, Data FROM `/Root/EightShard` WHERE Key = 101 ORDER BY Key;
+            )").GetValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+            CompareYson(R"([[[101u];[1]]])", StreamResultToYson(result));
+        }
+
+        {
+            auto params = TParamsBuilder().AddParam("$param").Uint64(101).Build().Build();
+
+            auto result = db.StreamExecuteScanQuery(R"(
+                DECLARE $param as Uint64;
+                SELECT Key, Data FROM `/Root/EightShard` WHERE Key = $param ORDER BY Key;
+            )",
+            params).GetValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+            CompareYson(R"([[[101u];[1]]])", StreamResultToYson(result));
+        }
     }
 
     Y_UNIT_TEST(StreamLookup) {

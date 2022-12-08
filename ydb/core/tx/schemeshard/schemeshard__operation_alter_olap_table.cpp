@@ -10,7 +10,7 @@ using namespace NKikimr;
 using namespace NSchemeShard;
 
 TColumnTableInfo::TPtr ParseParams(
-        const TPath& path, const TColumnTableInfo::TPtr& tableInfo, const TOlapStoreInfo::TPtr& storeInfo,
+        const TPath& path, TTablesStorage::TTableExtractedGuard& tableInfo, const TOlapStoreInfo::TPtr& storeInfo,
         const NKikimrSchemeOp::TAlterColumnTable& alter, const TSubDomainInfo& subDomain,
         NKikimrScheme::EStatus& status, TString& errStr, TOperationContext& context)
 {
@@ -118,8 +118,7 @@ public:
         TPath path = TPath::Init(pathId, context.SS);
         TString pathString = path.PathString();
 
-        TColumnTableInfo::TPtr tableInfo = context.SS->ColumnTables[pathId];
-        Y_VERIFY(tableInfo);
+        auto tableInfo = context.SS->ColumnTables.TakeVerified(pathId);
         TColumnTableInfo::TPtr alterInfo = tableInfo->AlterData;
         Y_VERIFY(alterInfo);
 
@@ -225,15 +224,9 @@ public:
 
         NIceDb::TNiceDb db(context.GetDB());
 
-        TColumnTableInfo::TPtr tableInfo = context.SS->ColumnTables[pathId];
-        Y_VERIFY(tableInfo);
-        TColumnTableInfo::TPtr alterInfo = tableInfo->AlterData;
-        Y_VERIFY(alterInfo);
-        alterInfo->AlterBody.Clear();
-        context.SS->ColumnTables[pathId] = alterInfo;
-
+        auto tableInfo = context.SS->ColumnTables.TakeAlterVerified(pathId);
         context.SS->PersistColumnTableAlterRemove(db, pathId);
-        context.SS->PersistColumnTable(db, pathId, *alterInfo);
+        context.SS->PersistColumnTable(db, pathId, *tableInfo);
 
         auto parentDir = context.SS->PathsById.at(path->ParentPathId);
         if (parentDir->IsLikeDirectory()) {
@@ -347,17 +340,12 @@ public:
 };
 
 class TAlterColumnTable: public TSubOperation {
-private:
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::ConfigureParts;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::ConfigureParts:
             return TTxState::Propose;
         case TTxState::Propose:
@@ -367,11 +355,10 @@ private:
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::ConfigureParts:
             return THolder(new TConfigureParts(OperationId));
         case TTxState::Propose:
@@ -385,28 +372,8 @@ private:
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TAlterColumnTable(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TAlterColumnTable(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -447,8 +414,7 @@ public:
             }
         }
 
-        Y_VERIFY(context.SS->ColumnTables.contains(path.Base()->PathId));
-        TColumnTableInfo::TPtr tableInfo = context.SS->ColumnTables.at(path.Base()->PathId);
+        auto tableInfo = context.SS->ColumnTables.TakeVerified(path.Base()->PathId);
 
         if (!tableInfo->OlapStorePathId) {
             result->SetError(NKikimrScheme::StatusSchemeError,
@@ -497,10 +463,6 @@ public:
             result->SetError(status, errStr);
             return result;
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxAlterColumnTable, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         Y_VERIFY(storeInfo->ColumnTables.contains(path->PathId));
         storeInfo->ColumnTablesUnderOperation.insert(path->PathId);
@@ -538,8 +500,7 @@ public:
 
         context.OnComplete.ActivateTx(OperationId);
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -560,17 +521,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateAlterColumnTable(TOperationId id, const TTxTransaction& tx) {
-    return new TAlterColumnTable(id, tx);
+    return MakeSubOperation<TAlterColumnTable>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateAlterColumnTable(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TAlterColumnTable(id, state);
+    return MakeSubOperation<TAlterColumnTable>(id, state);
 }
 
-}
 }

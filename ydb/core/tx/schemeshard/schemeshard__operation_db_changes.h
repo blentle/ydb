@@ -17,6 +17,7 @@ class TStorageChanges: public TSimpleRefCount<TStorageChanges> {
 
     TDeque<TPathId> Tables;
     TDeque<std::pair<TPathId, TTxId>> TableSnapshots;
+    TDeque<std::pair<TPathId, TTxId>> LongLocks;
 
     TDeque<TShardIdx> Shards;
 
@@ -31,6 +32,8 @@ class TStorageChanges: public TSimpleRefCount<TStorageChanges> {
 
     TDeque<TOperationId> TxStates;
 
+    TDeque<TPathId> AlterSubDomains;
+
 public:
     ~TStorageChanges() = default;
 
@@ -44,6 +47,10 @@ public:
 
     void PersistTableSnapshot(const TPathId& pathId, TTxId snapshotTxId) {
         TableSnapshots.emplace_back(pathId, snapshotTxId);
+    }
+
+    void PersistLongLock(const TPathId& pathId, TTxId lockTxId) {
+        LongLocks.emplace_back(pathId, lockTxId);
     }
 
     void PersistAlterUserAttrs(const TPathId& pathId) {
@@ -76,6 +83,10 @@ public:
 
     void PersistShard(const TShardIdx& shardIdx) {
         Shards.push_back(shardIdx);
+    }
+
+    void PersistSubDomainAlter(const TPathId& pathId) {
+        AlterSubDomains.push_back(pathId);
     }
 
     void Apply(TSchemeShard* ss, NTabletFlatExecutor::TTransactionContext &txc, const TActorContext &ctx);

@@ -173,6 +173,9 @@ struct TBaseSchemeReq: public TActorBootstrapped<TDerived> {
         case NKikimrSchemeOp::ESchemeOpAlterExtSubDomain:
             return *modifyScheme.MutableSubDomain()->MutableName();
 
+        case NKikimrSchemeOp::ESchemeOpAlterExtSubDomainCreateHive:
+            Y_FAIL("no implementation for ESchemeOpAlterExtSubDomainCreateHive");
+
         case NKikimrSchemeOp::ESchemeOpCreateRtmrVolume:
             return *modifyScheme.MutableCreateRtmrVolume()->MutableName();
 
@@ -450,7 +453,7 @@ struct TBaseSchemeReq: public TActorBootstrapped<TDerived> {
         TBase::Die(ctx);
     }
 
-    // https://st.yandex-team.ru/KIKIMR-12624 move that logic to the schemeshard
+    // KIKIMR-12624 move that logic to the schemeshard
     bool CheckTablePrereqs(const NKikimrSchemeOp::TTableDescription &desc, const TString &path, const TActorContext& ctx) {
         // check ad-hoc prereqs for table alter/creation
 
@@ -737,6 +740,7 @@ struct TBaseSchemeReq: public TActorBootstrapped<TDerived> {
         case NKikimrSchemeOp::ESchemeOpDropCdcStreamImpl:
         case NKikimrSchemeOp::ESchemeOpDropCdcStreamAtTable:
         case NKikimrSchemeOp::ESchemeOpMoveTableIndex:
+        case NKikimrSchemeOp::ESchemeOpAlterExtSubDomainCreateHive:
             return false;
         }
         return true;

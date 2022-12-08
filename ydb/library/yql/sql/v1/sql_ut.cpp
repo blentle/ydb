@@ -613,6 +613,157 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
         UNIT_ASSERT(res.Root);
     }
 
+    Y_UNIT_TEST(CreateObjectWithFeatures) {
+        NYql::TAstParseResult res = SqlToYql("USE plato; CREATE OBJECT secretId (TYPE SECRET) WITH (Key1=Value1, K2=V2);");
+        UNIT_ASSERT(res.Root);
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "Write") {
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("'('\"K2\" '\"V2\") '('\"Key1\" '\"Value1\")"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("createObject"));
+            }
+        };
+
+        TWordCountHive elementStat = { {TString("Write"), 0}, {TString("SECRET"), 0} };
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["Write"]);
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["SECRET"]);
+    }
+
+    Y_UNIT_TEST(CreateObjectWithFeaturesAndFlags) {
+        NYql::TAstParseResult res = SqlToYql("USE plato; CREATE OBJECT secretId (TYPE SECRET) WITH (Key1=Value1, K2=V2, RECURSE);");
+        UNIT_ASSERT(res.Root);
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "Write") {
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("'('\"Key1\" '\"Value1\") '('\"RECURSE\")"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("createObject"));
+            }
+        };
+
+        TWordCountHive elementStat = { {TString("Write"), 0}, {TString("SECRET"), 0} };
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["Write"]);
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["SECRET"]);
+    }
+
+    Y_UNIT_TEST(Select1Type) {
+        NYql::TAstParseResult res = SqlToYql("SELECT 1 type;");
+        UNIT_ASSERT(res.Root);
+    }
+
+    Y_UNIT_TEST(SelectTableType) {
+        NYql::TAstParseResult res = SqlToYql("USE plato; SELECT * from T type;");
+        UNIT_ASSERT(res.Root);
+    }
+
+    Y_UNIT_TEST(CreateObjectNoFeatures) {
+        NYql::TAstParseResult res = SqlToYql("USE plato; CREATE OBJECT secretId (TYPE SECRET);");
+        UNIT_ASSERT(res.Root);
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "Write") {
+                UNIT_ASSERT_VALUES_EQUAL(TString::npos, line.find("'features"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("createObject"));
+            }
+        };
+
+        TWordCountHive elementStat = { {TString("Write"), 0}, {TString("SECRET"), 0} };
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["Write"]);
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["SECRET"]);
+    }
+
+    Y_UNIT_TEST(AlterObjectWithFeatures) {
+        NYql::TAstParseResult res = SqlToYql(
+            "USE plato;\n"
+            "declare $path as String;\n"
+            "ALTER OBJECT secretId (TYPE SECRET) SET (Key1=$path, K2=V2);"
+        );
+        UNIT_ASSERT(res.Root);
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "Write") {
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("'features"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("'\"Key1\" (EvaluateAtom \"$path\""));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("'\"K2\" '\"V2\""));
+
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("alterObject"));
+            }
+        };
+
+        TWordCountHive elementStat = { {TString("Write"), 0}, {TString("SECRET"), 0} };
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["Write"]);
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["SECRET"]);
+    }
+
+    Y_UNIT_TEST(AlterObjectNoFeatures) {
+        NYql::TAstParseResult res = SqlToYql("USE plato; ALTER OBJECT secretId (TYPE SECRET);");
+        UNIT_ASSERT(!res.Root);
+        Cerr << Err2Str(res) << Endl;
+    }
+
+    Y_UNIT_TEST(DropObjectNoFeatures) {
+        NYql::TAstParseResult res = SqlToYql("USE plato; DROP OBJECT secretId (TYPE SECRET);");
+        UNIT_ASSERT(res.Root);
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "Write") {
+                UNIT_ASSERT_VALUES_EQUAL(TString::npos, line.find("'features"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("dropObject"));
+            }
+        };
+
+        TWordCountHive elementStat = { {TString("Write"), 0}, {TString("SECRET"), 0} };
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["Write"]);
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["SECRET"]);
+    }
+
+    Y_UNIT_TEST(DropObjectWithFeatures) {
+        NYql::TAstParseResult res = SqlToYql("USE plato; DROP OBJECT secretId (TYPE SECRET) WITH (A, B, C);");
+        UNIT_ASSERT(res.Root);
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "Write") {
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("'features"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("dropObject"));
+            }
+        };
+
+        TWordCountHive elementStat = { {TString("Write"), 0}, {TString("SECRET"), 0} };
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["Write"]);
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["SECRET"]);
+    }
+
+    Y_UNIT_TEST(DropObjectWithOneOption) {
+        NYql::TAstParseResult res = SqlToYql("USE plato; DROP OBJECT secretId (TYPE SECRET) WITH OVERRIDE;");
+        UNIT_ASSERT(res.Root);
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "Write") {
+                Cerr << line << Endl;
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("'features"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("'\"OVERRIDE\""));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("dropObject"));
+            }
+        };
+
+        TWordCountHive elementStat = { {TString("Write"), 0}, {TString("SECRET"), 0} };
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["Write"]);
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["SECRET"]);
+    }
+
     Y_UNIT_TEST(PrimaryKeyParseCorrect) {
         NYql::TAstParseResult res = SqlToYql("USE plato; CREATE TABLE tableName (Key Uint32, Subkey Int64, Value String, PRIMARY KEY (Key, Subkey));");
         UNIT_ASSERT(res.Root);
@@ -1471,7 +1622,13 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
         auto res = SqlToYql(R"( USE plato;
             CREATE TABLE tableName (
                 Key Uint32, PRIMARY KEY (Key),
-                CHANGEFEED feedName WITH (MODE = 'KEYS_ONLY', FORMAT = 'json', INITIAL_SCAN = TRUE)
+                CHANGEFEED feedName WITH (
+                    MODE = 'KEYS_ONLY',
+                    FORMAT = 'json',
+                    INITIAL_SCAN = TRUE,
+                    VIRTUAL_TIMESTAMPS = FALSE,
+                    RETENTION_PERIOD = Interval("P1D")
+                )
             );
         )");
         UNIT_ASSERT_C(res.Root, Err2Str(res));
@@ -1485,6 +1642,9 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("json"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("initial_scan"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("true"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("virtual_timestamps"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("false"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("retention_period"));
             }
         };
 
@@ -3118,7 +3278,33 @@ select FormatType($f());
         )";
         auto res = SqlToYql(req);
         UNIT_ASSERT(!res.Root);
-        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:5:80: Error: Invalid changefeed setting: INITIAL_SCAN\n");
+        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:5:95: Error: Literal of Bool type is expected for INITIAL_SCAN\n");
+    }
+
+    Y_UNIT_TEST(InvalidChangefeedVirtualTimestamps) {
+        auto req = R"(
+            USE plato;
+            CREATE TABLE tableName (
+                Key Uint32, PRIMARY KEY (Key),
+                CHANGEFEED feedName WITH (MODE = "KEYS_ONLY", FORMAT = "json", VIRTUAL_TIMESTAMPS = "foo")
+            );
+        )";
+        auto res = SqlToYql(req);
+        UNIT_ASSERT(!res.Root);
+        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:5:101: Error: Literal of Bool type is expected for VIRTUAL_TIMESTAMPS\n");
+    }
+
+    Y_UNIT_TEST(InvalidChangefeedRetentionPeriod) {
+        auto req = R"(
+            USE plato;
+            CREATE TABLE tableName (
+                Key Uint32, PRIMARY KEY (Key),
+                CHANGEFEED feedName WITH (MODE = "KEYS_ONLY", FORMAT = "json", RETENTION_PERIOD = "foo")
+            );
+        )";
+        auto res = SqlToYql(req);
+        UNIT_ASSERT(!res.Root);
+        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:5:99: Error: Literal of Interval type is expected for RETENTION_PERIOD\n");
     }
 
     Y_UNIT_TEST(ErrJoinWithGroupingSetsWithoutCorrelationName) {
@@ -3364,6 +3550,27 @@ select FormatType($f());
             "SELECT AGGREGATE_BY(AsTuple(value, key), AggregationFactory(\"MAX_BY\", subkey)) FROM plato.Input;",
             "<main>:1:42: Error: Source does not allow column references\n"
             "<main>:1:71: Error: Column reference 'subkey'\n");
+    }
+
+    Y_UNIT_TEST(ErrorInLibraryWithTopLevelNamedSubquery) {
+        TString withUnusedSubq = "$unused = select max(key) from plato.Input;\n"
+                                 "\n"
+                                 "define subquery $foo() as\n"
+                                 "  $count = select count(*) from plato.Input;\n"
+                                 "  select * from plato.Input limit $count / 2;\n"
+                                 "end define;\n"
+                                 "export $foo;\n";
+        UNIT_ASSERT(SqlToYqlWithMode(withUnusedSubq, NSQLTranslation::ESqlMode::LIBRARY).IsOk());
+
+        TString withTopLevelSubq = "$count = select count(*) from plato.Input;\n"
+                                   "\n"
+                                   "define subquery $foo() as\n"
+                                   "  select * from plato.Input limit $count / 2;\n"
+                                   "end define;\n"
+                                   "export $foo;\n";
+        auto res = SqlToYqlWithMode(withTopLevelSubq, NSQLTranslation::ESqlMode::LIBRARY);
+        UNIT_ASSERT(!res.Root);
+        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:1:17: Error: Named subquery can not be used as a top level statement in libraries\n");
     }
 }
 

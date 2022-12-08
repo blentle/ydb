@@ -5024,7 +5024,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardTest) {
                             Columns { Name: "Value"  Family: 0 FamilyName: "default" }
                             )", {NKikimrScheme::StatusInvalidParameter});
 
-//        https://st.yandex-team.ru/KIKIMR-10458
+//        KIKIMR-10458
         TestAlterTable(runtime, ++txId, "/MyRoot", R"(
                             Name: "Table1"
                             Columns { Name: "key"  Family: 0 FamilyName: "ExtBlobsOnHDD" }
@@ -8065,7 +8065,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardTest) {
         auto event = runtime.GrabEdgeEvent<TEvSchemeShard::TEvModifySchemeTransactionResult>();
         UNIT_ASSERT(event);
         UNIT_ASSERT_VALUES_EQUAL(event->Record.GetTxId(), txId);
-        CheckExpected(
+        CheckExpectedStatus(
             { NKikimrScheme::StatusMultipleModifications },
             event->Record.GetStatus(), event->Record.GetReason());
 

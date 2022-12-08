@@ -9,6 +9,12 @@ items:
     href: connect.md
   - name: Global parameters
     href: commands/global-options.md
+  - name: YDB CLI commands
+    items:
+    - name: table attribute add
+      href: table-attribute-add.md
+    - name: table attribute drop
+      href: table-attribute-drop.md
   - name: Working with the DB schema
     items:
     - name: List of objects
@@ -19,12 +25,16 @@ items:
       href: commands/dir.md
     - name: Secondary indexes
       href: commands/secondary_index.md
+    - name: Copying tables
+      href: tools-copy.md
     - name: Renaming tables
       href: commands/tools/rename.md
     - name: Setting TTL parameters
       href: table-ttl-set.md
     - name: Deleting TTL parameters
       href: table-ttl-drop.md
+    - name: Deleting a table
+      href: table-drop.md
   - name: Operations with data
     items:
     - name: Getting a query execution plan and AST
@@ -99,5 +109,7 @@ items:
       href: commands/workload/index.md
     - name: Stock load
       href: commands/workload/stock.md
+    - name: ClickBench load
+      href: workload-click-bench.md
     - name: Key-Value load
       href: workload-kv.md

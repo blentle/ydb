@@ -134,16 +134,12 @@ public:
 };
 
 class TAlterSolomon: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::CreateParts;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
             return TTxState::ConfigureParts;
@@ -154,11 +150,10 @@ class TAlterSolomon: public TSubOperation {
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
             return MakeHolder<TCreateParts>(OperationId);
@@ -173,28 +168,8 @@ class TAlterSolomon: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TAlterSolomon(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-          , Transaction(tx)
-    {
-    }
-
-    TAlterSolomon(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-          , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -288,10 +263,6 @@ public:
             result->SetError(NKikimrScheme::StatusInvalidParameter, "Unable to construct channel binding with the storage pool");
             return result;
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxAlterSolomonVolume, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         result->SetPathId(path.Base()->PathId.LocalPathId);
 
@@ -355,8 +326,7 @@ public:
 
         path.DomainInfo()->AddInternalShards(txState);
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -377,17 +347,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateAlterSolomon(TOperationId id, const TTxTransaction& tx) {
-    return new TAlterSolomon(id, tx);
+    return MakeSubOperation<TAlterSolomon>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateAlterSolomon(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TAlterSolomon(id, state);
+    return MakeSubOperation<TAlterSolomon>(id, state);
 }
 
-}
 }

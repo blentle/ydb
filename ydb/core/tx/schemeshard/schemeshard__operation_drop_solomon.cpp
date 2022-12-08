@@ -45,7 +45,6 @@ public:
     }
 };
 
-
 class TPropose: public TSubOperationState {
 private:
     TOperationId OperationId;
@@ -81,7 +80,7 @@ public:
 
         NIceDb::TNiceDb db(context.GetDB());
 
-        auto pathes = context.SS->ListSubThee(pathId, context.Ctx);
+        auto pathes = context.SS->ListSubTree(pathId, context.Ctx);
         Y_VERIFY(pathes.size() == 1);
         context.SS->DropPathes(pathes, step, OperationId.GetTxId(), db, context.Ctx);
 
@@ -120,29 +119,23 @@ public:
     }
 };
 
-
 class TDropSolomon: public TSubOperation {
-    const TOperationId OperationId;
-    const TTxTransaction Transaction;
-    TTxState::ETxState State = TTxState::Invalid;
-
-    TTxState::ETxState NextState() {
+    static TTxState::ETxState NextState() {
         return TTxState::Propose;
     }
 
-    TTxState::ETxState NextState(TTxState::ETxState state) {
-        switch(state) {
+    TTxState::ETxState NextState(TTxState::ETxState state) const override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::Propose:
             return TTxState::ProposedDeleteParts;
         default:
             return TTxState::Invalid;
         }
-        return TTxState::Invalid;
     }
 
-    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) {
-        switch(state) {
+    TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
+        switch (state) {
         case TTxState::Waiting:
         case TTxState::Propose:
             return THolder(new TPropose(OperationId));
@@ -153,28 +146,8 @@ class TDropSolomon: public TSubOperation {
         }
     }
 
-    void StateDone(TOperationContext& context) override {
-        State = NextState(State);
-
-        if (State != TTxState::Invalid) {
-            SetState(SelectStateFunc(State));
-            context.OnComplete.ActivateTx(OperationId);
-        }
-    }
-
 public:
-    TDropSolomon(TOperationId id, const TTxTransaction& tx)
-        : OperationId(id)
-        , Transaction(tx)
-    {
-    }
-
-    TDropSolomon(TOperationId id, TTxState::ETxState state)
-        : OperationId(id)
-        , State(state)
-    {
-        SetState(SelectStateFunc(state));
-    }
+    using TSubOperation::TSubOperation;
 
     THolder<TProposeResponse> Propose(const TString&, TOperationContext& context) override {
         const TTabletId ssId = context.SS->SelfTabletId();
@@ -225,10 +198,6 @@ public:
             result->SetError(NKikimrScheme::StatusPreconditionFailed, errStr);
             return result;
         }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxDropSolomonVolume, errStr)) {
-            result->SetError(NKikimrScheme::StatusResourceExhausted, errStr);
-            return result;
-        }
 
         TTxState& txState = context.SS->CreateTx(OperationId, TTxState::TxDropSolomonVolume, path.Base()->PathId);
         // Dirty hack: drop step must not be zero because 0 is treated as "hasn't been dropped"
@@ -268,8 +237,7 @@ public:
             context.OnComplete.PublishToSchemeBoard(OperationId, path.Base()->PathId);
         }
 
-        State = NextState();
-        SetState(SelectStateFunc(State));
+        SetState(NextState());
         return result;
     }
 
@@ -304,17 +272,15 @@ public:
 
 }
 
-namespace NKikimr {
-namespace NSchemeShard {
+namespace NKikimr::NSchemeShard {
 
 ISubOperationBase::TPtr CreateDropSolomon(TOperationId id, const TTxTransaction& tx) {
-    return new TDropSolomon(id, tx);
+    return MakeSubOperation<TDropSolomon>(id, tx);
 }
 
 ISubOperationBase::TPtr CreateDropSolomon(TOperationId id, TTxState::ETxState state) {
     Y_VERIFY(state != TTxState::Invalid);
-    return new TDropSolomon(id, state);
+    return MakeSubOperation<TDropSolomon>(id, state);
 }
 
-}
 }

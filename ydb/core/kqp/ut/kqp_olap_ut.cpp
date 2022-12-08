@@ -8,7 +8,7 @@
 #include <contrib/libs/apache/arrow/cpp/src/arrow/ipc/writer.h>
 
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor.h>
-#include <ydb/core/kqp/executer/kqp_executer.h>
+#include <ydb/core/kqp/executer_actor/kqp_executer.h>
 #include <ydb/core/tx/datashard/datashard.h>
 #include <ydb/core/tx/datashard/datashard_ut_common_kqp.h>
 #include <ydb/core/tx/datashard/datashard_ut_common.h>
@@ -73,7 +73,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
              SchemaPresets {
                  Name: "default"
                  Schema {
-                     Columns { Name: "timestamp" Type: "Timestamp" }
+                     Columns { Name: "timestamp" Type: "Timestamp" NotNull: true }
                      #Columns { Name: "resource_type" Type: "Utf8" }
                      Columns { Name: "resource_id" Type: "Utf8" }
                      Columns { Name: "uid" Type: "Utf8" }
@@ -270,8 +270,8 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                                      SchemaPresets {
                                          Name: "default"
                                          Schema {
-                                             Columns { Name: "key" Type: "Int32" }
-                                             Columns { Name: "Bool_column" Type: "Bool" }
+                                             Columns { Name: "key" Type: "Int32" NotNull: true }
+                                             #Columns { Name: "Bool_column" Type: "Bool" }
                                              # Int8, Int16, UInt8, UInt16 is not supported by engine
                                              Columns { Name: "Int8_column" Type: "Int32" }
                                              Columns { Name: "Int16_column" Type: "Int32" }
@@ -283,7 +283,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                                              Columns { Name: "UInt64_column" Type: "Uint64" }
                                              Columns { Name: "Double_column" Type: "Double" }
                                              Columns { Name: "Float_column" Type: "Float" }
-                                             Columns { Name: "Decimal_column" Type: "Decimal" }
+                                             #Columns { Name: "Decimal_column" Type: "Decimal" }
                                              Columns { Name: "String_column" Type: "String" }
                                              Columns { Name: "Utf8_column" Type: "Utf8" }
                                              Columns { Name: "Json_column" Type: "Json" }
@@ -291,7 +291,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                                              Columns { Name: "Timestamp_column" Type: "Timestamp" }
                                              Columns { Name: "Date_column" Type: "Date" }
                                              Columns { Name: "Datetime_column" Type: "Datetime" }
-                                             Columns { Name: "Interval_column" Type: "Interval" }
+                                             #Columns { Name: "Interval_column" Type: "Interval" }
                                              KeyColumnNames: "key"
                                              Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
                                          }
@@ -309,10 +309,12 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
     std::map<std::string, TParams> CreateParametersOfAllTypes(NYdb::NTable::TTableClient& tableClient) {
          return {
+#if 0
             {
                 "Bool",
                 tableClient.GetParamsBuilder().AddParam("$in_value").Bool(false).Build().Build()
             },
+#endif
             {
                 "Int8",
                 tableClient.GetParamsBuilder().AddParam("$in_value").Int8(0).Build().Build()
@@ -373,6 +375,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 "Datetime",
                 tableClient.GetParamsBuilder().AddParam("$in_value").Datetime(TInstant::Now()).Build().Build()
             },
+#if 0
             {
                 "Interval",
                 tableClient.GetParamsBuilder().AddParam("$in_value").Interval(1010).Build().Build()
@@ -381,7 +384,6 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 "Decimal(12,9)",
                 tableClient.GetParamsBuilder().AddParam("$in_value").Decimal(TDecimalValue("10.123456789", 12, 9)).Build().Build()
             },
-#if 0
             {
                 "Json",
                 tableClient.GetParamsBuilder().AddParam("$in_value").Json(R"({"XX":"YY"})").Build().Build()
@@ -402,7 +404,9 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
         auto planRes = CollectStreamResult(res);
         auto ast = planRes.QueryStats->Getquery_ast();
+        Cerr << "JSON Plan:" << Endl;
         Cerr << planRes.PlanJson.GetOrElse("NO_PLAN") << Endl;
+        Cerr << "AST:" << Endl;
         Cerr << ast << Endl;
         for (auto planNode : planNodes) {
             UNIT_ASSERT_C(ast.find(planNode) != std::string::npos,
@@ -1765,6 +1769,62 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         TestAggregations({ testCase });
     }
 
+    Y_UNIT_TEST(Aggregation_MinL) {
+        TAggregationTestCase testCase;
+        testCase.SetQuery(R"(
+                SELECT
+                    MIN(level)
+                FROM `/Root/olapStore/olapTable`
+            )")
+            .SetExpectedReply("[[[0]]]")
+            .AddExpectedPlanOptions("TKqpOlapAgg");
+
+        TestAggregations({ testCase });
+    }
+
+    Y_UNIT_TEST(Aggregation_MaxL) {
+        TAggregationTestCase testCase;
+        testCase.SetQuery(R"(
+                SELECT
+                    MAX(level)
+                FROM `/Root/olapStore/olapTable`
+            )")
+            .SetExpectedReply("[[[4]]]")
+            .AddExpectedPlanOptions("TKqpOlapAgg");
+
+        TestAggregations({ testCase });
+    }
+
+    Y_UNIT_TEST(Aggregation_MinR_GroupL_OrderL) {
+        TAggregationTestCase testCase;
+        testCase.SetQuery(R"(
+                SELECT
+                    level, MIN(resource_id)
+                FROM `/Root/olapStore/olapTable`
+                GROUP BY level
+                ORDER BY level
+            )")
+            .SetExpectedReply("[[[0];[\"10000\"]];[[1];[\"10001\"]];[[2];[\"10002\"]];[[3];[\"10003\"]];[[4];[\"10004\"]]]")
+            .AddExpectedPlanOptions("TKqpOlapAgg");
+
+        TestAggregations({ testCase });
+    }
+
+    Y_UNIT_TEST(Aggregation_MaxR_GroupL_OrderL) {
+        TAggregationTestCase testCase;
+        testCase.SetQuery(R"(
+                SELECT
+                    level, MAX(resource_id)
+                FROM `/Root/olapStore/olapTable`
+                GROUP BY level
+                ORDER BY level
+            )")
+            .SetExpectedReply("[[[0];[\"40995\"]];[[1];[\"40996\"]];[[2];[\"40997\"]];[[3];[\"40998\"]];[[4];[\"40999\"]]]")
+            .AddExpectedPlanOptions("TKqpOlapAgg");
+
+        TestAggregations({ testCase });
+    }
+
     Y_UNIT_TEST(StatsSysView) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false);
@@ -2828,7 +2888,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         };
 
         std::vector<std::string> allTypes = {
-            "Bool",
+            //"Bool",
             "Int8",
             "Int16",
             "Int32",
@@ -2839,13 +2899,13 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             "UInt64",
             "Double",
             "Float",
-            "Decimal(12,9)",
+            //"Decimal(12,9)",
             "String",
             "Utf8",
             "Timestamp",
             "Date",
             "Datetime",
-            "Interval"
+            //"Interval"
         };
 
         std::map<std::string, TParams> parameters = CreateParametersOfAllTypes(tableClient);

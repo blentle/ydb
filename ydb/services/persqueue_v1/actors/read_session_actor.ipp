@@ -617,6 +617,8 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(typename TEvReadInit::TPtr&
         << "_" << "v1";
     CommitsDisabled = false;
 
+    PeerName = ev->Get()->PeerName;
+
     if constexpr (UseMigrationProtocol) {
         RangesMode = init.ranges_mode();
         MaxReadMessagesCount = NormalizeMaxReadMessagesCount(init.read_params().max_read_messages_count());
@@ -631,6 +633,9 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(typename TEvReadInit::TPtr&
         MaxTimeLagMs = 0; // max_lag per topic only
         ReadTimestampMs = 0; // read_from per topic only
         ReadOnlyLocal = true;
+        if (init.reader_name()) {
+            PeerName = init.reader_name();
+        }
     }
 
     if (MaxTimeLagMs < 0) {
@@ -641,7 +646,6 @@ void TReadSessionActor<UseMigrationProtocol>::Handle(typename TEvReadInit::TPtr&
         return CloseSession(PersQueue::ErrorCode::BAD_REQUEST, "start_from_written_at_ms must be nonnegative number", ctx);
     }
 
-    PeerName = ev->Get()->PeerName;
 
     auto getTopicPath = [](const auto& settings) {
         if constexpr (UseMigrationProtocol) {
@@ -808,18 +812,17 @@ void TReadSessionActor<UseMigrationProtocol>::SetupTopicCounters(const NPersQueu
         const TString& cloudId, const TString& dbId, const TString& folderId)
 {
     auto& topicCounters = TopicCounters[topic->GetInternalName()];
-    auto subGroup = NPersQueue::GetCountersForStream(Counters);
-    auto aggr = NPersQueue::GetLabelsForStream(topic, cloudId, dbId, folderId);
+    auto subGroup = NPersQueue::GetCountersForDataStream(Counters);
+    auto aggr = NPersQueue::GetLabelsForTopic(topic, cloudId, dbId, folderId);
     const TVector<std::pair<TString, TString>> cons{{"consumer", ClientPath}};
 
-    topicCounters.PartitionsLocked       = NPQ::TMultiCounter(subGroup, aggr, cons, {"stream.internal_read.partitions_locked_per_second"}, true, "name");
-    topicCounters.PartitionsReleased     = NPQ::TMultiCounter(subGroup, aggr, cons, {"stream.internal_read.partitions_released_per_second"}, true, "name");
-    topicCounters.PartitionsToBeReleased = NPQ::TMultiCounter(subGroup, aggr, cons, {"stream.internal_read.partitions_to_be_released"}, false, "name");
-    topicCounters.PartitionsToBeLocked   = NPQ::TMultiCounter(subGroup, aggr, cons, {"stream.internal_read.partitions_to_be_locked"}, false, "name");
-    topicCounters.PartitionsInfly        = NPQ::TMultiCounter(subGroup, aggr, cons, {"stream.internal_read.partitions_locked"}, false, "name");
-    topicCounters.Errors                 = NPQ::TMultiCounter(subGroup, aggr, cons, {"stream.internal_read.partitions_errors_per_second"}, true, "name");
-    topicCounters.Commits                = NPQ::TMultiCounter(subGroup, aggr, cons, {"stream.internal_read.commits_per_second"}, true, "name");
-    topicCounters.WaitsForData           = NPQ::TMultiCounter(subGroup, aggr, cons, {"stream.internal_read.waits_for_data"}, true, "name");
+    topicCounters.PartitionsLocked       = NPQ::TMultiCounter(subGroup, aggr, cons, {"api.topic_service.stream_read.partitions_locked_per_second"}, true, "name");
+    topicCounters.PartitionsReleased     = NPQ::TMultiCounter(subGroup, aggr, cons, {"api.topic_service.stream_read.partitions_released_per_second"}, true, "name");
+    topicCounters.PartitionsToBeReleased = NPQ::TMultiCounter(subGroup, aggr, cons, {"api.topic_service.stream_read.partitions_to_be_released_count"}, false, "name");
+    topicCounters.PartitionsToBeLocked   = NPQ::TMultiCounter(subGroup, aggr, cons, {"api.topic_service.stream_read.partitions_to_be_locked_count"}, false, "name");
+    topicCounters.PartitionsInfly        = NPQ::TMultiCounter(subGroup, aggr, cons, {"api.topic_service.stream_read.partitions_locked_count"}, false, "name");
+    topicCounters.Errors                 = NPQ::TMultiCounter(subGroup, aggr, cons, {"api.topic_service.stream_read.partitions_errors_per_second"}, true, "name");
+    topicCounters.Commits                = NPQ::TMultiCounter(subGroup, aggr, cons, {"api.topic_service.stream_read.commits_per_second"}, true, "name");
 
     topicCounters.CommitLatency          = CommitLatency;
     topicCounters.SLIBigLatency          = SLIBigLatency;

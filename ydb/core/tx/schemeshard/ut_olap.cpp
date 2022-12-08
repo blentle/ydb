@@ -20,7 +20,7 @@ static const TString defaultStoreSchema = R"(
     SchemaPresets {
         Name: "default"
         Schema {
-            Columns { Name: "timestamp" Type: "Timestamp" }
+            Columns { Name: "timestamp" Type: "Timestamp" NotNull: true }
             Columns { Name: "data" Type: "Utf8" }
             KeyColumnNames: "timestamp"
             Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
@@ -28,11 +28,11 @@ static const TString defaultStoreSchema = R"(
     }
 )";
 
-TString defaultTableSchema = R"(
+static const TString defaultTableSchema = R"(
     Name: "ColumnTable"
     ColumnShardCount: 1
     Schema {
-        Columns { Name: "timestamp" Type: "Timestamp" }
+        Columns { Name: "timestamp" Type: "Timestamp" NotNull: true }
         Columns { Name: "data" Type: "Utf8" }
         KeyColumnNames: "timestamp"
         Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
@@ -164,7 +164,6 @@ Y_UNIT_TEST_SUITE(TOlap) {
                     Columns { Name: "data" Type: "Utf8" }
                     KeyColumnNames: "timestamp"
                     Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
-                    EnableTiering : true
                 }
             }
         )";
@@ -320,7 +319,6 @@ Y_UNIT_TEST_SUITE(TOlap) {
                 Columns { Name: "data" Type: "Utf8" }
                 KeyColumnNames: "timestamp"
                 Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
-                EnableTiering : true
             }
         )", {NKikimrScheme::StatusAccepted});
     }
@@ -410,6 +408,50 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TestLs(runtime, "/MyRoot/MyDir/ColumnTable", false, NLs::PathNotExist);
         TestLsPathId(runtime, 3, NLs::PathStringEqual(""));
+
+        // PARTITION BY ()
+
+        TString otherSchema = R"(
+            Name: "ColumnTable"
+            ColumnShardCount: 4
+            Schema {
+                Columns { Name: "timestamp" Type: "Timestamp" NotNull: true }
+                Columns { Name: "some" Type: "Uint64" NotNull: true }
+                Columns { Name: "data" Type: "Utf8" }
+                KeyColumnNames: "some"
+                Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
+            }
+            Sharding {
+                HashSharding {
+                    Columns: ["some", "data"]
+                }
+            }
+        )";
+
+        TestCreateColumnTable(runtime, ++txId, "/MyRoot/MyDir", otherSchema);
+        env.TestWaitNotification(runtime, txId);
+
+        auto checkFn = [&](const NKikimrScheme::TEvDescribeSchemeResult& record) {
+            UNIT_ASSERT_VALUES_EQUAL(record.GetPath(), "/MyRoot/MyDir/ColumnTable");
+
+            auto& sharding = record.GetPathDescription().GetColumnTableDescription().GetSharding();
+            UNIT_ASSERT_VALUES_EQUAL(sharding.ColumnShardsSize(), 4);
+            UNIT_ASSERT(sharding.HasHashSharding());
+            auto& hashSharding = sharding.GetHashSharding();
+            UNIT_ASSERT_VALUES_EQUAL(hashSharding.ColumnsSize(), 2);
+            UNIT_ASSERT_EQUAL(hashSharding.GetFunction(),
+                              NKikimrSchemeOp::TColumnTableSharding::THashSharding::HASH_FUNCTION_MODULO_N);
+            UNIT_ASSERT_VALUES_EQUAL(hashSharding.GetColumns()[0], "some");
+            UNIT_ASSERT_VALUES_EQUAL(hashSharding.GetColumns()[1], "data");
+        };
+
+        TestLsPathId(runtime, 4, checkFn);
+
+        TestDropColumnTable(runtime, ++txId, "/MyRoot/MyDir", "ColumnTable");
+        env.TestWaitNotification(runtime, txId);
+
+        TestLs(runtime, "/MyRoot/MyDir/ColumnTable", false, NLs::PathNotExist);
+        TestLsPathId(runtime, 4, NLs::PathStringEqual(""));
     }
 
     Y_UNIT_TEST(CreateTableTtl) {
@@ -417,22 +459,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
         TTestEnv env(runtime);
         ui64 txId = 100;
 
-        TString olapSchema = R"(
-            Name: "OlapStore"
-            ColumnShardCount: 1
-            SchemaPresets {
-                Name: "default"
-                Schema {
-                    Columns { Name: "timestamp" Type: "Timestamp" }
-                    Columns { Name: "data" Type: "Utf8" }
-                    KeyColumnNames: "timestamp"
-                    Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
-                    EnableTiering : true
-                }
-            }
-        )";
-
-        TestCreateOlapStore(runtime, ++txId, "/MyRoot", olapSchema);
+        TestCreateOlapStore(runtime, ++txId, "/MyRoot", defaultStoreSchema);
         env.TestWaitNotification(runtime, txId);
 
         TString tableSchema1 = R"(
@@ -471,8 +498,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
             Name: "Table3"
             TtlSettings {
                 Tiering {
-                    Tiers { Name: "tier0" Eviction { ColumnName: "timestamp" ExpireAfterSeconds: 300 } }
-                    Tiers { Name: "tier1" Eviction { ColumnName: "timestamp" ExpireAfterSeconds: 600 } }
+                    UseTiering : "Tiering1"
                 }
             }
         )";
@@ -484,15 +510,13 @@ Y_UNIT_TEST_SUITE(TOlap) {
             NLs::HasColumnTableSchemaPreset("default"),
             NLs::HasColumnTableSchemaVersion(1),
             NLs::HasColumnTableTtlSettingsVersion(1),
-            NLs::HasColumnTableTtlSettingsTiering(0, "tier0", "timestamp", TDuration::Seconds(300)),
-            NLs::HasColumnTableTtlSettingsTiering(1, "tier1", "timestamp", TDuration::Seconds(600))));
+            NLs::HasColumnTableTtlSettingsTiering("Tiering1")));
 
         TString tableSchema4 = R"(
             Name: "Table4"
             TtlSettings {
                 Tiering {
-                    Tiers { Name: "tier0" Eviction { ColumnName: "timestamp" ExpireAfterSeconds: 300 } }
-                    Tiers { Name: "tier1" Eviction { ColumnName: "data" ExpireAfterSeconds: 600 } }
+                    UseTiering : "Tiering1"
                 }
             }
         )";
@@ -564,11 +588,10 @@ Y_UNIT_TEST_SUITE(TOlap) {
             SchemaPresets {
                 Name: "default"
                 Schema {
-                    Columns { Name: "timestamp" Type: "Timestamp" }
+                    Columns { Name: "timestamp" Type: "Timestamp" NotNull: true }
                     Columns { Name: "data" Type: "Utf8" }
                     KeyColumnNames: "timestamp"
                     Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
-                    EnableTiering : true
                 }
             }
         )";
@@ -624,13 +647,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
             Name: "ColumnTable"
             AlterTtlSettings {
                 Tiering {
-                    Tiers {
-                        Name: "tier0"
-                        Eviction {
-                            ColumnName: "timestamp"
-                            ExpireAfterSeconds: 600
-                        }
-                    }
+                    UseTiering : "Tiering1"
                 }
             }
         )", {NKikimrScheme::StatusInvalidParameter});

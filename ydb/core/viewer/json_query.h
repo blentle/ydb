@@ -9,8 +9,8 @@
 #include <library/cpp/protobuf/json/proto2json.h>
 #include <ydb/core/node_whiteboard/node_whiteboard.h>
 #include <ydb/core/grpc_services/rpc_kqp_base.h>
-#include <ydb/core/kqp/kqp.h>
-#include <ydb/core/kqp/executer/kqp_executer.h>
+#include <ydb/core/kqp/common/kqp.h>
+#include <ydb/core/kqp/executer_actor/kqp_executer.h>
 #include <ydb/core/viewer/json/json.h>
 //#include <ydb/public/lib/deprecated/kicli/kicli.h>
 #include <ydb/public/lib/json_value/ydb_json_value.h>
@@ -204,6 +204,10 @@ private:
                     default:
                         return NJson::JSON_UNDEFINED;
                 }
+
+            case NYdb::TTypeParser::ETypeKind::Tagged:
+                valueParser.OpenTagged();
+                return ColumnValueToJsonValue(valueParser);
 
             default:
                 return NJson::JSON_UNDEFINED;
