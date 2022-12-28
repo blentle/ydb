@@ -247,6 +247,7 @@ public:
     TRuntimeNode WideTakeBlocks(TRuntimeNode flow, TRuntimeNode count);
     TRuntimeNode AsScalar(TRuntimeNode value);
     TRuntimeNode BlockCompress(TRuntimeNode flow, ui32 bitmapIndex);
+    TRuntimeNode BlockExpandChunked(TRuntimeNode flow);
     TRuntimeNode BlockCoalesce(TRuntimeNode first, TRuntimeNode second);
 
     //-- logical functions
@@ -257,7 +258,11 @@ public:
 
     TRuntimeNode BlockFunc(const std::string_view& funcName, TType* returnType, const TArrayRef<const TRuntimeNode>& args);
     TRuntimeNode BlockBitCast(TRuntimeNode value, TType* targetType);
-    TRuntimeNode BlockCombineAll(TRuntimeNode flow, ui32 countColumn, std::optional<ui32> filterColumn,
+    TRuntimeNode BlockCombineAll(TRuntimeNode flow, std::optional<ui32> filterColumn,
+        const TArrayRef<const TAggInfo>& aggs, TType* returnType);
+    TRuntimeNode BlockCombineHashed(TRuntimeNode flow, std::optional<ui32> filterColumn, const TArrayRef<ui32>& keys,
+        const TArrayRef<const TAggInfo>& aggs, TType* returnType);
+    TRuntimeNode BlockMergeFinalizeHashed(TRuntimeNode flow, const TArrayRef<ui32>& keys,
         const TArrayRef<const TAggInfo>& aggs, TType* returnType);
 
     // udfs

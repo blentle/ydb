@@ -61,5 +61,8 @@
   }
   ```
 
+- Node.js
+
+  {% include [auth-static](../../../../_includes/nodejs/auth-static.md) %}
 
 {% endlist %}

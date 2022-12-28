@@ -11,11 +11,11 @@ namespace NKikimr::NColumnShard {
 class TTiersManager::TActor: public TActorBootstrapped<TTiersManager::TActor> {
 private:
     std::shared_ptr<TTiersManager> Owner;
-    NMetadataProvider::ISnapshotsFetcher::TPtr SecretsFetcher;
+    NMetadata::NFetcher::ISnapshotsFetcher::TPtr SecretsFetcher;
     std::shared_ptr<NMetadata::NSecret::TSnapshot> SecretsSnapshot;
     std::shared_ptr<NTiers::TConfigsSnapshot> ConfigsSnapshot;
     TActorId GetExternalDataActorId() const {
-        return NMetadataProvider::MakeServiceId(SelfId().NodeId());
+        return NMetadata::NProvider::MakeServiceId(SelfId().NodeId());
     }
 public:
     TActor(std::shared_ptr<TTiersManager> owner)
@@ -29,7 +29,7 @@ public:
     }
     STATEFN(StateMain) {
         switch (ev->GetTypeRewrite()) {
-            hFunc(NMetadataProvider::TEvRefreshSubscriberData, Handle);
+            hFunc(NMetadata::NProvider::TEvRefreshSubscriberData, Handle);
             hFunc(NActors::TEvents::TEvPoison, Handle);
             default:
                 break;
@@ -37,10 +37,10 @@ public:
     }
     void Bootstrap() {
         Become(&TThis::StateMain);
-        Send(GetExternalDataActorId(), new NMetadataProvider::TEvSubscribeExternal(Owner->GetExternalDataManipulation()));
-        Send(GetExternalDataActorId(), new NMetadataProvider::TEvSubscribeExternal(SecretsFetcher));
+        Send(GetExternalDataActorId(), new NMetadata::NProvider::TEvSubscribeExternal(Owner->GetExternalDataManipulation()));
+        Send(GetExternalDataActorId(), new NMetadata::NProvider::TEvSubscribeExternal(SecretsFetcher));
     }
-    void Handle(NMetadataProvider::TEvRefreshSubscriberData::TPtr& ev) {
+    void Handle(NMetadata::NProvider::TEvRefreshSubscriberData::TPtr& ev) {
         auto snapshot = ev->Get()->GetSnapshot();
         if (auto configs = std::dynamic_pointer_cast<NTiers::TConfigsSnapshot>(snapshot)) {
             ConfigsSnapshot = configs;
@@ -57,8 +57,8 @@ public:
         }
     }
     void Handle(NActors::TEvents::TEvPoison::TPtr& /*ev*/) {
-        Send(GetExternalDataActorId(), new NMetadataProvider::TEvUnsubscribeExternal(Owner->GetExternalDataManipulation()));
-        Send(GetExternalDataActorId(), new NMetadataProvider::TEvUnsubscribeExternal(SecretsFetcher));
+        Send(GetExternalDataActorId(), new NMetadata::NProvider::TEvUnsubscribeExternal(Owner->GetExternalDataManipulation()));
+        Send(GetExternalDataActorId(), new NMetadata::NProvider::TEvUnsubscribeExternal(SecretsFetcher));
         PassAway();
     }
 };
@@ -101,7 +101,7 @@ bool TManager::Start(std::shared_ptr<NMetadata::NSecret::TSnapshot> secrets) {
         CreateS3Actor(TabletId, TabletActorId, Config.GetTierName())
     );
     auto s3Config = Config.GetPatchedConfig(secrets);
-    
+
     ctx.Send(newActor, new TEvPrivate::TEvS3Settings(s3Config));
     StorageActorId = newActor;
 #endif
@@ -115,16 +115,7 @@ TManager::TManager(const ui64 tabletId, const NActors::TActorId& tabletActorId, 
 {
 }
 
-NOlap::TStorageTier TManager::BuildTierStorage() const {
-    NOlap::TStorageTier result;
-    result.Name = Config.GetTierName();
-    if (Config.GetProtoConfig().HasCompression()) {
-        result.Compression = ConvertCompression(Config.GetProtoConfig().GetCompression());
-    }
-    return result;
-}
-
-NKikimr::NOlap::TCompression TManager::ConvertCompression(const NKikimrSchemeOp::TCompressionOptions& compression) {
+NKikimr::NOlap::TCompression ConvertCompression(const NKikimrSchemeOp::TCompressionOptions& compression) {
     NOlap::TCompression out;
     if (compression.HasCompressionCodec()) {
         switch (compression.GetCompressionCodec()) {
@@ -147,7 +138,7 @@ NKikimr::NOlap::TCompression TManager::ConvertCompression(const NKikimrSchemeOp:
 }
 }
 
-void TTiersManager::TakeConfigs(NMetadataProvider::ISnapshot::TPtr snapshotExt, std::shared_ptr<NMetadata::NSecret::TSnapshot> secrets) {
+void TTiersManager::TakeConfigs(NMetadata::NFetcher::ISnapshot::TPtr snapshotExt, std::shared_ptr<NMetadata::NSecret::TSnapshot> secrets) {
     auto snapshotPtr = std::dynamic_pointer_cast<NTiers::TConfigsSnapshot>(snapshotExt);
     Y_VERIFY(snapshotPtr);
     Snapshot = snapshotExt;
@@ -216,26 +207,33 @@ const NTiers::TManager& TTiersManager::GetManagerVerified(const TString& tierId)
     return it->second;
 }
 
-NMetadataProvider::ISnapshotsFetcher::TPtr TTiersManager::GetExternalDataManipulation() const {
+NMetadata::NFetcher::ISnapshotsFetcher::TPtr TTiersManager::GetExternalDataManipulation() const {
     if (!ExternalDataManipulation) {
         ExternalDataManipulation = std::make_shared<NTiers::TSnapshotConstructor>();
     }
     return ExternalDataManipulation;
 }
 
-THashMap<ui64, NKikimr::NOlap::TTiersInfo> TTiersManager::GetTiering() const {
-    THashMap<ui64, NKikimr::NOlap::TTiersInfo> result;
+THashMap<ui64, NKikimr::NOlap::TTiering> TTiersManager::GetTiering() const {
+    THashMap<ui64, NKikimr::NOlap::TTiering> result;
     if (!Snapshot) {
         return result;
     }
     auto snapshotPtr = std::dynamic_pointer_cast<NTiers::TConfigsSnapshot>(Snapshot);
     Y_VERIFY(snapshotPtr);
+    auto& tierConfigs = snapshotPtr->GetTierConfigs();
     for (auto&& i : PathIdTiering) {
         auto* tiering = snapshotPtr->GetTieringById(i.second);
-        if (!tiering) {
-
-        } else {
-            result.emplace(i.first, tiering->BuildTiersInfo());
+        if (tiering) {
+            result.emplace(i.first, tiering->BuildOlapTiers());
+            for (auto& [pathId, pathTiering] : result) {
+                for (auto& [name, tier] : pathTiering.TierByName) {
+                    auto it = tierConfigs.find(name);
+                    if (it != tierConfigs.end()) {
+                        tier->Compression = NTiers::ConvertCompression(it->second.GetProtoConfig().GetCompression());
+                    }
+                }
+            }
         }
     }
     return result;

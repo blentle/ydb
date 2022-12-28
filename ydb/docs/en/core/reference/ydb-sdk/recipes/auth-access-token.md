@@ -121,4 +121,8 @@ Below are examples of the code for authentication using a token in different {{ 
    }
    ```
 
+- Node.js
+
+  {% include [auth-access-token](../../../../_includes/nodejs/auth-access-token.md) %}
+
 {% endlist %}

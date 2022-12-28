@@ -114,6 +114,8 @@ namespace {
             ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TStringBuilder() << "Failed to execute node: " << input->Content()));
             return TStatus::Error;
         }
+        void Rewind() final {
+        }
 
     private:
         const TTypeAnnotationContext& Types;
@@ -781,8 +783,9 @@ namespace {
         }
 
         bool ImportUdfs(const TPosition& pos, const TVector<TStringBuf>& args, TExprContext& ctx) {
-            if (args.size() != 1) {
-                ctx.AddError(TIssue(pos, TStringBuilder() << "Expected 1 argument, but got " << args.size()));
+            if (args.size() != 1 && args.size() != 2) {
+                ctx.AddError(TIssue(pos, TStringBuilder()
+                        << "Expected 1 or 2 arguments, but got " << args.size()));
                 return false;
             }
 
@@ -793,9 +796,12 @@ namespace {
 
             // file alias
             const auto& fileAlias = args[0];
+            TString customUdfPrefix = args.size() > 1 ? TString(args[1]) : "";
             const auto key = TUserDataStorage::ComposeUserDataKey(fileAlias);
             TString errorMessage;
-            const TUserDataBlock* udfSource = Types.UserDataStorage->FreezeUdfNoThrow(key, errorMessage);
+            const TUserDataBlock* udfSource = Types.UserDataStorage->FreezeUdfNoThrow(key,
+                                                                                      errorMessage,
+                                                                                      customUdfPrefix);
             if (!udfSource) {
                 ctx.AddError(TIssue(pos, TStringBuilder() << "Unknown file: " << fileAlias << ", details: " << errorMessage));
                 return false;

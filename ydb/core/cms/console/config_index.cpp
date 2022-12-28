@@ -3,8 +3,7 @@
 #include <util/string/builder.h>
 #include <util/string/join.h>
 
-namespace NKikimr {
-namespace NConsole {
+namespace NKikimr::NConsole {
 
 TUsageScope::TUsageScope()
     : Order(0)
@@ -583,7 +582,7 @@ void TConfigModifications::DeepCopyFrom(const TConfigModifications &other)
 
 void TConfigModifications::ApplyTo(TConfigIndex &index) const
 {
-    for (auto id : RemovedItems)
+    for (auto &[id, _] : RemovedItems)
         index.RemoveItem(id);
     for (auto &pr : ModifiedItems)
         index.RemoveItem(pr.first);
@@ -867,5 +866,4 @@ void TSubscriptionModifications::DeepCopyFrom(const TSubscriptionModifications &
     ModifiedCookies = other.ModifiedCookies;
 }
 
-} // namespace NConsole
-} // namespace NKikimr
+} // namespace NKikimr::NConsole

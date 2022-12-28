@@ -140,8 +140,9 @@ TExprNode::TPtr KeepConstraints(TExprNode::TPtr node, const TExprNode& src, TExp
             for (const auto& path : set)
                 if (!path.empty())
                     columns.emplace_back(ctx.NewAtom(node->Pos(), path.front()));
-        if (!columns.empty()) { // TODO: AssumeUnique must support any set of columns.
-            res = ctx.Builder(node->Pos())
+        res = columns.empty() ?
+            ctx.NewCallable(node->Pos(), "AssumeUnique", {std::move(res)}):
+            ctx.Builder(node->Pos())
                 .Callable("AssumeUnique")
                     .Add(0, std::move(res))
                     .List(1)
@@ -149,7 +150,6 @@ TExprNode::TPtr KeepConstraints(TExprNode::TPtr node, const TExprNode& src, TExp
                     .Seal()
                 .Seal()
                 .Build();
-        }
     }
     return res;
 }
@@ -248,60 +248,33 @@ TExprNode::TPtr ExpandFlattenEquiJoin(const TExprNode::TPtr& node, TExprContext&
 
     auto joins = node->Child(node->ChildrenSize() - 2);
     auto columnTypes = GetJoinColumnTypes(*joins, labels, ctx);
-    TMap<TString, std::pair<bool, TVector<TString>>> remap; // column -> isOptional, list of columns
+    TMap<TString, TVector<TString>> remap; // result column -> list of original columns
     for (auto it : labels.Inputs) {
         for (auto item : it.InputType->GetItems()) {
             TString fullName = it.FullName(item->GetName());
             auto type = columnTypes.FindPtr(fullName);
             if (type) {
-                auto columnName = it.ColumnName(fullName);
-                auto iter = remap.find(columnName);
-                if (iter != remap.end()) {
-                    if (iter->second.first) {
-                        // still optional
-                        if ((*type)->GetKind() == ETypeAnnotationKind::Optional) {
-                            iter->second.second.push_back(fullName);
-                        } else {
-                            iter->second.first = false;
-                            iter->second.second.clear();
-                            iter->second.second.push_back(fullName);
-                        }
-                    }
-                    continue;
-                }
-
-                remap.emplace(TString(columnName), std::make_pair((*type)->GetKind() == ETypeAnnotationKind::Optional,
-                    TVector<TString>(1, fullName)));
+                TString columnName(it.ColumnName(fullName));
+                remap[columnName].push_back(fullName);
             }
         }
     }
 
     auto lambdaArg = ctx.NewArgument(node->Pos(), "row");
     TExprNode::TListType remapItems;
-    for (auto& x : remap) {
-        TExprNode::TPtr value;
-        if (x.second.second.size() == 1) {
-            value = ctx.Builder(node->Pos())
+    for (auto& [resultName, sourceNames] : remap) {
+        TExprNode::TListType values;
+        for (auto& column : sourceNames) {
+            values.push_back(ctx.Builder(node->Pos())
                 .Callable("Member")
                     .Add(0, lambdaArg)
-                    .Atom(1, x.second.second.front())
+                    .Atom(1, column)
                 .Seal()
-                .Build();
-        } else {
-            TExprNode::TListType values;
-            for (auto& column : x.second.second) {
-                values.push_back(ctx.Builder(node->Pos())
-                    .Callable("Member")
-                        .Add(0, lambdaArg)
-                        .Atom(1, column)
-                    .Seal()
-                    .Build());
-            }
-
-            value = ctx.NewCallable(node->Pos(), "Coalesce", std::move(values));
+                .Build());
         }
 
-        remapItems.push_back(ctx.NewList(node->Pos(), { ctx.NewAtom(node->Pos(), x.first), value }));
+        TExprNode::TPtr coalesce = ctx.NewCallable(node->Pos(), "Coalesce", std::move(values));
+        remapItems.push_back(ctx.NewList(node->Pos(), { ctx.NewAtom(node->Pos(), resultName), coalesce }));
     }
 
     auto lambdaBody = ctx.NewCallable(node->Pos(), "AsStruct", std::move(remapItems));
@@ -2587,8 +2560,7 @@ TExprNode::TPtr OptimizeReorder(const TExprNode::TPtr& node, TExprContext& ctx) 
     }
 
     if (node->Tail().Tail().GetTypeAnn()->GetKind() == ETypeAnnotationKind::Tuple) {
-        const auto keyType = node->Tail().Tail().GetTypeAnn()->Cast<TTupleExprType>();
-        if (1U == keyType->GetSize()) {
+        if (const auto keyType = node->Tail().Tail().GetTypeAnn()->Cast<TTupleExprType>(); 1U == keyType->GetSize()) {
             YQL_CLOG(DEBUG, Core) << node->Content() << " unpack single item tuple";
             auto unpack = node->Tail().Tail().IsList() ?
                 ctx.Builder(node->Tail().Pos())
@@ -2607,16 +2579,41 @@ TExprNode::TPtr OptimizeReorder(const TExprNode::TPtr& node, TExprContext& ctx) 
                         .Seal()
                     .Seal().Build();
             return ctx.ChangeChild(*node, node->ChildrenSize() - 1U, {std::move(unpack)});
+        } else if (node->Tail().Tail().IsList()) {
+            TNodeSet set(node->Tail().Tail().ChildrenSize());
+            node->Tail().Tail().ForEachChild([&set](const TExprNode& key) { set.emplace(&key); });
+            if (set.size() < node->Tail().Tail().ChildrenSize()) {
+                YQL_CLOG(DEBUG, Core) << node->Content() << " leave " << set.size() << " keys out of " << node->Tail().Tail().ChildrenSize();
+                auto keys = node->Tail().Tail().ChildrenList();
+                auto dirs = node->Child(ascIndex)->IsList() ? node->Child(ascIndex)->ChildrenList() : TExprNode::TListType();
+                for (auto it = keys.cbegin(); keys.cend() != it;) {
+                    if (set.erase(it->Get()))
+                        ++it;
+                    else {
+                        if (!dirs.empty()) {
+                            auto jt = dirs.cbegin();
+                            std::advance(jt, std::distance(keys.cbegin(), it));
+                            dirs.erase(jt);
+                        }
+                        it = keys.erase(it);
+                    }
+                }
+                auto children = node->ChildrenList();
+                children.back() = ctx.DeepCopyLambda(node->Tail(), ctx.NewList(node->Tail().Tail().Pos(), std::move(keys)));
+                if (!dirs.empty())
+                    children[ascIndex] = ctx.ChangeChildren(*children[ascIndex], std::move(dirs));
+                return ctx.ChangeChildren(*node, std::move(children));
+            }
         }
     }
 
-    if (IsTop) {
+    if constexpr (IsTop) {
         if (node->Child(1)->IsCallable("Uint64")) {
             const ui64 count = FromString<ui64>(node->Child(1)->Head().Content());
             if (0 == count) {
                 YQL_CLOG(DEBUG, Core) << node->Content() << " with zero count";
                 auto res = ctx.NewCallable(node->Pos(), GetEmptyCollectionName(node->Head().GetTypeAnn()), {ExpandType(node->Pos(), *node->Head().GetTypeAnn(), ctx)});
-                if (IsSort) {
+                if constexpr (IsSort) {
                     res = ctx.Builder(node->Pos())
                         .Callable("AssumeSorted")
                             .Add(0, std::move(res))

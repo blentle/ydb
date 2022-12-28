@@ -451,10 +451,13 @@ namespace NTypeAnnImpl {
     void TExtContext::RegisterResolvedImport(const IUdfResolver::TImport& import) {
         YQL_ENSURE(import.Modules);
         for (auto& m : *import.Modules) {
-            auto p = Types.UdfModules.emplace(m, import.FileAlias);
+            auto p = Types.UdfModules.emplace(m, TUdfInfo{import.FileAlias, import.Block->CustomUdfPrefix});
             // rework this place when user tries to override another module
-            if (!p.second && p.first->second != import.FileAlias) {
-                ythrow yexception() << "Module name duplicated : module = " << m << ", existing alias = " << p.first->second << ", new alis = " << import.FileAlias;
+            if (!p.second && p.first->second.FileAlias != import.FileAlias) {
+                ythrow yexception()
+                                << "Module name duplicated : module = " << m
+                                << ", existing alias = " << p.first->second.FileAlias
+                                << ", new alis = " << import.FileAlias;
             }
         }
     }
@@ -4446,15 +4449,18 @@ namespace NTypeAnnImpl {
         }
 
         const auto leftType = input->Head().GetTypeAnn();
+        const auto rightType = input->Tail().GetTypeAnn();
+
         auto leftItemType = leftType;
         if (leftType->GetKind() == ETypeAnnotationKind::Optional) {
             leftItemType = leftType->Cast<TOptionalExprType>()->GetItemType();
-        } else if (leftType->GetKind() != ETypeAnnotationKind::Pg) {
+        } else if (leftType->GetKind() != ETypeAnnotationKind::Pg &&
+                   IsSameAnnotation(*RemoveOptionalType(leftType), *RemoveOptionalType(rightType)))
+        {
             output = input->HeadPtr();
             return IGraphTransformer::TStatus::Repeat;
         }
 
-        const auto rightType = input->Tail().GetTypeAnn();
         auto rightItemType = rightType;
         if (leftType->GetKind() != ETypeAnnotationKind::Optional &&
             rightType->GetKind() == ETypeAnnotationKind::Optional) {
@@ -7120,8 +7126,8 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                 }
             }
 
-            auto foundAlias = ctx.Types.UdfModules.FindPtr(moduleName);
-            TStringBuf fileAlias = foundAlias ? *foundAlias : "";
+            auto udfInfo = ctx.Types.UdfModules.FindPtr(moduleName);
+            TStringBuf fileAlias = udfInfo ? udfInfo->FileAlias : "";
             auto ret = ctx.Expr.Builder(input->Pos())
                 .Callable("Udf")
                     .Add(0, input->HeadPtr())
@@ -7695,7 +7701,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
     }
 
     IGraphTransformer::TStatus SqlCallWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
-        if (!EnsureMinMaxArgsCount(*input, 2, 4, ctx.Expr)) {
+        if (!EnsureMinMaxArgsCount(*input, 2, 5, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
 
@@ -7740,9 +7746,17 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         }
 
         TExprNode::TPtr typeConfig;
-        if (input->ChildrenSize() == 4) {
-            typeConfig = input->TailPtr();
+        if (input->ChildrenSize() > 3) {
+            typeConfig = input->Child(3);
             if (!EnsureAtom(*typeConfig, ctx.Expr)) {
+                return IGraphTransformer::TStatus::Error;
+            }
+        }
+        
+        TExprNode::TPtr runConfig;
+        if (input->ChildrenSize() > 4) {
+            runConfig = input->Child(4);
+            if (!EnsureComputable(*runConfig, ctx.Expr)) {
                 return IGraphTransformer::TStatus::Error;
             }
         }
@@ -7750,7 +7764,18 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         TExprNode::TPtr udf = ctx.Expr.Builder(input->Pos())
             .Callable("Udf")
                 .Add(0, udfName)
-                .Callable(1, "Void").Seal()
+                .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
+                    if (runConfig) {
+                        parent
+                            .Add(1, runConfig)
+                            .Seal();
+                    } else {
+                        parent
+                            .Callable(1, "Void")
+                            .Seal();
+                    }
+                    return parent;
+                })
                 .Callable(2, "TupleType")
                     .Callable(0, "TupleType")
                         .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
@@ -11358,6 +11383,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["Chain1Map"] = &Chain1MapWrapper;
         Functions["LMap"] = &LMapWrapper;
         Functions["OrderedLMap"] = &LMapWrapper;
+        Functions["ShuffleByKeys"] = &ShuffleByKeysWrapper;
         Functions["Struct"] = &StructWrapper;
         Functions["AddMember"] = &AddMemberWrapper;
         Functions["RemoveMember"] = &RemoveMemberWrapper<false>;
@@ -11470,6 +11496,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["StreamType"] = &TypeWrapper<ETypeAnnotationKind::Stream>;
         Functions["FlowType"] = &TypeWrapper<ETypeAnnotationKind::Flow>;
         Functions["BlockType"] = &TypeWrapper<ETypeAnnotationKind::Block>;
+        Functions["ChunkedBlockType"] = &TypeWrapper<ETypeAnnotationKind::ChunkedBlock>;
         Functions["ScalarType"] = &TypeWrapper<ETypeAnnotationKind::Scalar>;
         Functions["Nothing"] = &NothingWrapper;
         Functions["AsOptionalType"] = &AsOptionalTypeWrapper;
@@ -11577,6 +11604,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["AggApply"] = &AggApplyWrapper;
         Functions["AggApplyState"] = &AggApplyWrapper;
         Functions["AggBlockApply"] = &AggBlockApplyWrapper;
+        Functions["AggBlockApplyState"] = &AggBlockApplyWrapper;
         Functions["WinOnRows"] = &WinOnWrapper;
         Functions["WinOnGroups"] = &WinOnWrapper;
         Functions["WinOnRange"] = &WinOnWrapper;
@@ -11774,8 +11802,10 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["WideFromBlocks"] = &WideFromBlocksWrapper;
         Functions["WideSkipBlocks"] = &WideSkipTakeBlocksWrapper;
         Functions["WideTakeBlocks"] = &WideSkipTakeBlocksWrapper;
-        Functions["AsScalar"] = &AsScalarWrapper;
         Functions["BlockCompress"] = &BlockCompressWrapper;
+        Functions["BlockExpandChunked"] = &BlockExpandChunkedWrapper;
+
+        Functions["AsScalar"] = &AsScalarWrapper;
         Functions["BlockCoalesce"] = &BlockCoalesceWrapper;
         Functions["BlockAnd"] = &BlockLogicalWrapper;
         Functions["BlockOr"] = &BlockLogicalWrapper;
@@ -11783,7 +11813,11 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["BlockNot"] = &BlockLogicalWrapper;
         ExtFunctions["BlockFunc"] = &BlockFuncWrapper;
         ExtFunctions["BlockBitCast"] = &BlockBitCastWrapper;
+
         ExtFunctions["BlockCombineAll"] = &BlockCombineAllWrapper;
+        ExtFunctions["BlockCombineHashed"] = &BlockCombineHashedWrapper;
+        ExtFunctions["BlockMergeFinalizeHashed"] = &BlockMergeFinalizeHashedWrapper;
+        ExtFunctions["BlockMergeManyFinalizeHashed"] = &BlockMergeFinalizeHashedWrapper;
 
         Functions["AsRange"] = &AsRangeWrapper;
         Functions["RangeCreate"] = &RangeCreateWrapper;
@@ -11942,6 +11976,15 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
             }
 
             return ret;
+        }
+
+        void Rewind() final {
+            for (auto& x : Types.DataSources) {
+                x->GetIntentDeterminationTransformer().Rewind();
+            }
+            for (auto& x : Types.DataSinks) {
+                x->GetIntentDeterminationTransformer().Rewind();
+            }
         }
 
     private:

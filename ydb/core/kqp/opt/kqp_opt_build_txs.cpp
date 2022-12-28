@@ -55,6 +55,9 @@ public:
         }
     }
 
+    void Rewind() final {
+    }
+
 private:
     EPhysicalTxType GetPhyTxType(bool allStagesArePure) {
         if (QueryType == EKikimrQueryType::Scan) {
@@ -466,10 +469,7 @@ public:
     }
 
     TStatus DoTransform(TExprNode::TPtr inputExpr, TExprNode::TPtr& outputExpr, TExprContext& ctx) final {
-        if (TKqpPhysicalQuery::Match(inputExpr.Get())) {
-            outputExpr = inputExpr;
-            return TStatus::Ok;
-        }
+        outputExpr = inputExpr;
 
         YQL_CLOG(DEBUG, ProviderKqp) << ">>> TKqpBuildTxsTransformer: " << KqpExprToPrettyString(*inputExpr, ctx);
 
@@ -479,76 +479,45 @@ public:
             return *status;
         }
 
-        TVector<TExprBase> queryResults;
-        for (const auto& block : query.Blocks()) {
-            if (!block.Results().Empty()) {
-                auto tx = BuildTx(block.Results().Ptr(), ctx, false);
-                if (!tx) {
-                    return TStatus::Error;
-                }
-
-                BuildCtx->PhysicalTxs.emplace_back(tx.Cast());
-
-                for (ui32 i = 0; i < block.Results().Size(); ++i) {
-                    const auto& result = block.Results().Item(i);
-                    auto binding = Build<TKqpTxResultBinding>(ctx, block.Pos())
-                        .Type(ExpandType(block.Pos(), *result.Value().Ref().GetTypeAnn(), ctx))
-                        .TxIndex()
-                            .Build(ToString(BuildCtx->PhysicalTxs.size() - 1))
-                        .ResultIndex()
-                            .Build(ToString(i))
-                        .Done();
-
-                    queryResults.emplace_back(std::move(binding));
-                }
+        if (!query.Results().Empty()) {
+            auto tx = BuildTx(query.Results().Ptr(), ctx, false);
+            if (!tx) {
+                return TStatus::Error;
             }
 
-            if (!block.Effects().Empty()) {
-                auto tx = BuildTx(block.Effects().Ptr(), ctx, /* isPrecompute */ false);
-                if (!tx) {
-                    return TStatus::Error;
-                }
+            BuildCtx->PhysicalTxs.emplace_back(tx.Cast());
 
-                if (!CheckEffectsTx(tx.Cast(), ctx)) {
-                    return TStatus::Error;
-                }
+            for (ui32 i = 0; i < query.Results().Size(); ++i) {
+                const auto& result = query.Results().Item(i);
+                auto binding = Build<TKqpTxResultBinding>(ctx, query.Pos())
+                    .Type(ExpandType(query.Pos(), *result.Value().Ref().GetTypeAnn(), ctx))
+                    .TxIndex()
+                        .Build(ToString(BuildCtx->PhysicalTxs.size() - 1))
+                    .ResultIndex()
+                        .Build(ToString(i))
+                    .Done();
 
-                BuildCtx->PhysicalTxs.emplace_back(tx.Cast());
+                BuildCtx->QueryResults.emplace_back(std::move(binding));
             }
         }
 
-        TKqpPhyQuerySettings querySettings;
+        if (!query.Effects().Empty()) {
+            auto tx = BuildTx(query.Effects().Ptr(), ctx, /* isPrecompute */ false);
+            if (!tx) {
+                return TStatus::Error;
+            }
 
-        switch (KqpCtx->QueryCtx->Type) {
-            case EKikimrQueryType::Dml: {
-                querySettings.Type = EPhysicalQueryType::Data;
-                break;
+            if (!CheckEffectsTx(tx.Cast(), ctx)) {
+                return TStatus::Error;
             }
-            case EKikimrQueryType::Scan: {
-                querySettings.Type = EPhysicalQueryType::Scan;
-                break;
-            }
-            default: {
-                YQL_ENSURE(false, "Unexpected query type: " << KqpCtx->QueryCtx->Type);
-            }
+
+            BuildCtx->PhysicalTxs.emplace_back(tx.Cast());
         }
 
-        auto phyQuery = Build<TKqpPhysicalQuery>(ctx, query.Pos())
-            .Transactions()
-                .Add(BuildCtx->PhysicalTxs)
-                .Build()
-            .Results()
-                .Add(queryResults)
-                .Build()
-            .Settings(querySettings.BuildNode(ctx, query.Pos()))
-            .Done();
-
-        outputExpr = phyQuery.Ptr();
-        return TStatus(TStatus::Repeat, true);
+        return TStatus::Ok;
     }
 
     void Rewind() final {
-        TSyncTransformerBase::Rewind();
         DataTxTransformer->Rewind();
         ScanTxTransformer->Rewind();
     }
@@ -639,7 +608,6 @@ private:
 
     TMaybe<TStatus> TryBuildPrecomputeTx(const TKqlQuery& query, TExprNode::TPtr& output, TExprContext& ctx) {
         auto [precomputeStagesMap, dependantStagesMap] = GatherPrecomputeDependencies(query);
-
         if (precomputeStagesMap.empty()) {
             return {};
         }

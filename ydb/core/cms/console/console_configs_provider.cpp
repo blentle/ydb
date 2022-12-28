@@ -7,8 +7,7 @@
 
 #include <library/cpp/actors/core/interconnect.h>
 
-namespace NKikimr {
-namespace NConsole {
+namespace NKikimr::NConsole {
 
 namespace {
 
@@ -410,7 +409,7 @@ void TConfigsProvider::ApplyConfigModifications(const TConfigModifications &modi
     TSubscriptionSet subscriptions;
     TInMemorySubscriptionSet inMemorySubscriptions;
 
-    for (auto id : modifications.RemovedItems) {
+    for (auto &[id, _] : modifications.RemovedItems) {
         auto item = ConfigIndex.GetItem(id);
         LOG_TRACE_S(ctx, NKikimrServices::CMS_CONFIGS, "TConfigsProvider: remove " << item->ToString());
         ConfigIndex.RemoveItem(id);
@@ -1085,5 +1084,4 @@ void TConfigsProvider::Handle(TEvPrivate::TEvUpdateSubscriptions::TPtr &ev, cons
     ApplySubscriptionModifications(ev->Get()->Modifications, ctx);
 }
 
-} // namespace NConsole
-} // namespace NKikimr
+} // namespace NKikimr::NConsole

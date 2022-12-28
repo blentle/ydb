@@ -352,6 +352,7 @@ class TBlobStorageGroupPutRequest : public TBlobStorageGroupRequestActor<TBlobSt
         RootCauseTrack.RenderTrack(PutImpl.Blobs[blobIdx].Orbit);
         LWTRACK(DSProxyPutReply, PutImpl.Blobs[blobIdx].Orbit);
         putResult->Orbit = std::move(PutImpl.Blobs[blobIdx].Orbit);
+        putResult->WrittenBeyondBarrier = PutImpl.WrittenBeyondBarrier[blobIdx];
         if (!IsManyPuts) {
             SendResponse(std::move(putResult), TimeStatsEnabled ? &TimeStats : nullptr);
         } else {
@@ -387,7 +388,7 @@ class TBlobStorageGroupPutRequest : public TBlobStorageGroupRequestActor<TBlobSt
             }
             TEvBlobStorage::TEvPut *put;
 
-            TContiguousData buffer = TContiguousData(item.Buffer); //TODO(innokentii) prevent compaction
+            TRcBuf buffer = TRcBuf(item.Buffer); //TODO(innokentii) prevent compaction
             char* data = buffer.GetContiguousSpanMut().data();
             Decrypt(data, data, 0, buffer.size(), item.BlobId, *Info);
 

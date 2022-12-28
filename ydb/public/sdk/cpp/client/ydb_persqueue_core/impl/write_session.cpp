@@ -246,8 +246,9 @@ void TWriteSession::OnCdsResponse(
                 OnSeqNoShift = false;
             } else { // Switched from initial cluster to second one;
                 Y_VERIFY(CurrentCluster == InitialCluster);
-                if (!AutoSeqNoMode.Defined() || !(*AutoSeqNoMode))
+                if (AutoSeqNoMode.GetOrElse(true)) {
                     OnSeqNoShift = true;
+                }
             }
 
         }
@@ -300,11 +301,6 @@ ui64 TWriteSession::GetNextSeqNoImpl(const TMaybe<ui64>& seqNo) {
     ui64 seqNoValue = LastSeqNo + 1;
     if (!AutoSeqNoMode.Defined()) {
         AutoSeqNoMode = !seqNo.Defined();
-        //! Disable SeqNo shift for manual SeqNo mode;
-        if (seqNo.Defined()) {
-            OnSeqNoShift = false;
-            SeqNoShift = 0;
-        }
     }
     if (seqNo.Defined()) {
         if (*AutoSeqNoMode) {
@@ -315,9 +311,13 @@ ui64 TWriteSession::GetNextSeqNoImpl(const TMaybe<ui64>& seqNo) {
             ThrowFatalError(
                 "Cannot call write() with defined SeqNo on WriteSession running in auto-seqNo mode"
             );
+
         } else {
             seqNoValue = *seqNo;
         }
+        //! Disable SeqNo shift for manual SeqNo mode;
+        OnSeqNoShift = false;
+        SeqNoShift = 0;
     } else if (!(*AutoSeqNoMode)) {
         DbDriverState->Log.Write(
             TLOG_ERR,
@@ -695,7 +695,7 @@ TWriteSession::TProcessSrvMessageResult TWriteSession::ProcessServerMessageImpl(
             // SeqNo increased, so there's a risk of loss, apply SeqNo shift.
             // MinUnsentSeqNo must be > 0 if anything was ever sent yet
             if (MinUnsentSeqNo && OnSeqNoShift && newLastSeqNo > MinUnsentSeqNo) {
-                 SeqNoShift = newLastSeqNo - MinUnsentSeqNo;
+                SeqNoShift = newLastSeqNo - MinUnsentSeqNo;
             }
             result.InitSeqNo = newLastSeqNo;
             LastSeqNo = newLastSeqNo;

@@ -108,7 +108,13 @@ private:
 
         auto& externBlobs = ReadMetadataRanges[ReadMetadataIndex]->ExternBlobs;
         bool fallback = externBlobs && externBlobs->count(blobRange.BlobId);
-        Send(BlobCacheActorId, new NBlobCache::TEvBlobCache::TEvReadBlobRange(blobRange, true, fallback));
+
+        NBlobCache::TReadBlobRangeOptions readOpts {
+            .CacheAfterRead = true,
+            .Fallback = fallback,
+            .IsBackgroud = false
+        };
+        Send(BlobCacheActorId, new NBlobCache::TEvBlobCache::TEvReadBlobRange(blobRange, std::move(readOpts)));
         ++InFlightReads;
         InFlightReadBytes += blobRange.Size;
         return true;
@@ -407,7 +413,8 @@ private:
             "Scan " << ScanActorId << " send ScanData to " << ComputeActorId
             << " txId: " << TxId << " scanId: " << ScanId << " gen: " << ScanGen << " table: " << TablePath
             << " bytes: " << Bytes << " rows: " << Rows << " page faults: " << Result->PageFaults
-            << " finished: " << Result->Finished << " pageFault: " << Result->PageFault);
+            << " finished: " << Result->Finished << " pageFault: " << Result->PageFault
+            << " arrow schema:\n" << (Result->ArrowBatch ? Result->ArrowBatch->schema()->ToString() : ""));
 
         if (PeerFreeSpace < Bytes) {
             PeerFreeSpace = 0;

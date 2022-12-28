@@ -1,5 +1,4 @@
 #pragma once
-#include "manager.h"
 #include <library/cpp/actors/core/actor.h>
 #include <library/cpp/actors/core/actorid.h>
 #include <library/cpp/actors/core/events.h>
@@ -16,7 +15,7 @@
 #include <ydb/services/metadata/manager/table_record.h>
 #include <ydb/services/metadata/manager/alter.h>
 
-namespace NKikimr::NMetadataProvider {
+namespace NKikimr::NMetadata::NFetcher {
 
 class ISnapshot;
 
@@ -24,8 +23,8 @@ class ISnapshotAcceptorController {
 public:
     using TPtr = std::shared_ptr<ISnapshotAcceptorController>;
     virtual ~ISnapshotAcceptorController() = default;
-    virtual void Enriched(std::shared_ptr<ISnapshot> enrichedSnapshot) = 0;
-    virtual void EnrichProblem(const TString& errorMessage) = 0;
+    virtual void OnSnapshotEnriched(std::shared_ptr<ISnapshot> enrichedSnapshot) = 0;
+    virtual void OnSnapshotEnrichError(const TString& errorMessage) = 0;
 };
 
 class ISnapshot {
@@ -54,10 +53,10 @@ public:
 
 class ISnapshotsFetcher {
 private:
-    mutable std::vector<NMetadata::IOperationsManager::TPtr> Managers;
+    mutable std::vector<IClassBehaviour::TPtr> Managers;
 protected:
     virtual ISnapshot::TPtr CreateSnapshot(const TInstant actuality) const = 0;
-    virtual std::vector<NMetadata::IOperationsManager::TPtr> DoGetManagers() const = 0;
+    virtual std::vector<IClassBehaviour::TPtr> DoGetManagers() const = 0;
 public:
     using TPtr = std::shared_ptr<ISnapshotsFetcher>;
 
@@ -65,10 +64,10 @@ public:
     ISnapshot::TPtr ParseSnapshot(const Ydb::Table::ExecuteQueryResult& rawData, const TInstant actuality) const;
 
     virtual void EnrichSnapshotData(ISnapshot::TPtr original, ISnapshotAcceptorController::TPtr controller) const {
-        controller->Enriched(original);
+        controller->OnSnapshotEnriched(original);
     }
 
-    const std::vector<NMetadata::IOperationsManager::TPtr>& GetManagers() const {
+    const std::vector<IClassBehaviour::TPtr>& GetManagers() const {
         if (Managers.empty()) {
             Managers = DoGetManagers();
         }

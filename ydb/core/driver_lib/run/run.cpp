@@ -100,6 +100,7 @@
 #include <ydb/services/ydb/ydb_logstore.h>
 #include <ydb/services/ydb/ydb_long_tx.h>
 #include <ydb/services/ydb/ydb_operation.h>
+#include <ydb/services/ydb/ydb_query.h>
 #include <ydb/services/ydb/ydb_scheme.h>
 #include <ydb/services/ydb/ydb_scripting.h>
 #include <ydb/services/ydb/ydb_table.h>
@@ -122,6 +123,7 @@
 #include <library/cpp/actors/prof/tag.h>
 #include <ydb/library/yql/minikql/invoke_builtins/mkql_builtins.h>
 
+#include <util/charset/wide.h>
 #include <util/folder/dirut.h>
 #include <util/system/file.h>
 #include <util/system/getpid.h>
@@ -203,7 +205,12 @@ public:
             TVector<TString> defaultUserSIDs(securityConfig.GetDefaultUserSIDs().begin(), securityConfig.GetDefaultUserSIDs().end());
             appData->DefaultUserSIDs = std::move(defaultUserSIDs);
         }
-        appData->AllAuthenticatedUsers = securityConfig.GetAllAuthenticatedUsers();
+        if (securityConfig.HasAllAuthenticatedUsers()) {
+            const TString& allUsersGroup = Strip(securityConfig.GetAllAuthenticatedUsers());
+            if (allUsersGroup) {
+                appData->AllAuthenticatedUsers = allUsersGroup;
+            }
+        }
 
         appData->FeatureFlags = Config.GetFeatureFlags();
         appData->AllowHugeKeyValueDeletes = Config.GetFeatureFlags().GetAllowHugeKeyValueDeletes();
@@ -571,6 +578,8 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
         names["logstore"] = &hasLogStore;
         TServiceCfg hasAuth = services.empty();
         names["auth"] = &hasAuth;
+        TServiceCfg hasQueryService = services.empty();
+        names["query_service"] = &hasQueryService;
 
         std::unordered_set<TString> enabled;
         for (const auto& name : services) {
@@ -797,6 +806,11 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
             server.AddService(new NGRpcService::TGRpcFqPrivateTaskService(ActorSystem.Get(), Counters, grpcRequestProxyId));
         }   /* REMOVE */ else /* THIS else as well and separate ifs */ if (hasYandexQueryPrivate) {
             server.AddService(new NGRpcService::TGRpcFqPrivateTaskService(ActorSystem.Get(), Counters, grpcRequestProxyId));
+        }
+
+        if (hasQueryService) {
+            server.AddService(new NGRpcService::TGRpcYdbQueryService(ActorSystem.Get(), Counters,
+                grpcRequestProxyId, hasDataStreams.IsRlAllowed()));
         }
 
         if (hasLogStore) {
@@ -1205,7 +1219,7 @@ void TKikimrRunner::InitializeActorSystem(
                 "Load",
                 false,
                 ActorSystem.Get(),
-                MakeBlobStorageLoadID(runConfig.NodeId));
+                MakeLoadServiceID(runConfig.NodeId));
 
             Monitoring->RegisterActorPage(
                 ActorsMonPage,
@@ -1466,7 +1480,7 @@ TIntrusivePtr<TServiceInitializersList> TKikimrRunner::CreateServiceInitializers
     }
 
     if (serviceMask.EnableAuditWriter) {
-        sil->AddServiceInitializer(new TAuditWriterInitializer(runConfig));
+        sil->AddServiceInitializer(new TAuditWriterInitializer(runConfig, ModuleFactories));
     }
 
     if (serviceMask.EnableLongTxService) {

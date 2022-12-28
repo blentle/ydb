@@ -26,40 +26,55 @@ namespace NNeh {
         }
     };
 
-    class TWaitQueue {
+    class TWaitQueue: public TThrRefBase {
     public:
-        struct TWaitHandle {
-            inline TWaitHandle() noexcept
-                : Signalled(false)
-                , Parent(nullptr)
-            {
+        class TWaitHandle {
+        public:
+
+            ~TWaitHandle() {
+                SwapWaitQueue(nullptr);
             }
 
-            inline void Signal() noexcept {
-                TGuard<TSpinLock> lock(M_);
+            void Signal() noexcept {
+                Signalled_ = true;
 
-                Signalled = true;
-
-                if (Parent) {
-                    Parent->Notify(this);
+                if (TIntrusivePtr<TWaitQueue> q = SwapWaitQueue(nullptr)) {
+                    q->Notify(this);
                 }
             }
 
-            inline void Register(TWaitQueue* parent) noexcept {
-                TGuard<TSpinLock> lock(M_);
+            void Register(TIntrusivePtr<TWaitQueue>& waitQueue) noexcept {
+                if (Signalled_) {
+                    waitQueue->Notify(this);
+                    SwapWaitQueue(nullptr);
+                    return;
+                }
 
-                Parent = parent;
+                waitQueue->Ref();
+                SwapWaitQueue(waitQueue.Get());
 
-                if (Signalled) {
-                    if (Parent) {
-                        Parent->Notify(this);
+                if (Signalled_) {
+                    if (TIntrusivePtr<TWaitQueue> q = SwapWaitQueue(nullptr)) {
+                        q->Notify(this);
                     }
                 }
             }
 
-            NAtomic::TBool Signalled;
-            TWaitQueue* Parent;
-            TSpinLock M_;
+            bool Signalled() const {
+                return Signalled_;
+            }
+
+            void ResetState() {
+                Signalled_ = false;
+                SwapWaitQueue(nullptr);
+            }
+        private:
+            TIntrusivePtr<TWaitQueue> SwapWaitQueue(TWaitQueue* newQueue) noexcept {
+                return TIntrusivePtr<TWaitQueue>(AtomicSwap(&WaitQueue_, newQueue), TIntrusivePtr<TWaitQueue>::TNoIncrement());
+            }
+        private:
+            NAtomic::TBool Signalled_ = false;
+            TWaitQueue* WaitQueue_ = nullptr;
         };
 
         inline bool Wait(const TInstant& deadLine) noexcept {
@@ -110,14 +125,10 @@ namespace NNeh {
 
     static inline bool WaitForOne(TWaitHandle& wh, const TInstant& deadLine) {
         TSignalled func;
-        TWaitQueue hndl;
-        wh.Register(&hndl);
+        auto hndl = MakeIntrusive<TWaitQueue>();
+        wh.Register(hndl);
 
-        Y_DEFER {
-            wh.Register(nullptr);
-        };
-
-        WaitForMultipleObj(hndl, deadLine, func);
+        WaitForMultipleObj(*hndl, deadLine, func);
 
         return func.Signalled;
     }

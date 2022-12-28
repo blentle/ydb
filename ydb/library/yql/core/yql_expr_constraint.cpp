@@ -363,12 +363,19 @@ private:
     }
 
     TStatus AssumeUniqueWrap(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) const {
-        std::vector<std::string_view> columns;
-        columns.reserve(input->Child(1)->ChildrenSize());
-        for (const auto& column: input->Child(1)->Children()) {
-            columns.emplace_back(column->Content());
+        TUniqueConstraintNode::TFullSetType sets;
+        for (auto i = 1U; i < input->ChildrenSize(); ++i) {
+            TUniqueConstraintNode::TSetType columns;
+            columns.reserve(input->Child(i)->ChildrenSize());
+            for (const auto& column: input->Child(i)->Children())
+                columns.insert_unique(TConstraintNode::TPathType(1U, column->Content()));
+            sets.insert_unique(std::move(columns));
         }
-        input->AddConstraint(ctx.MakeConstraint<TUniqueConstraintNode>(columns));
+
+        if (sets.empty())
+            sets.insert_unique(TUniqueConstraintNode::TSetType{TConstraintNode::TPathType()});
+
+        input->AddConstraint(ctx.MakeConstraint<TUniqueConstraintNode>(std::move(sets)));
         return FromFirst<TPassthroughConstraintNode, TSortedConstraintNode, TEmptyConstraintNode, TVarIndexConstraintNode>(input, output, ctx);
     }
 
@@ -379,7 +386,7 @@ private:
             return status;
         }
 
-        if (UseSort) {
+        if constexpr (UseSort) {
             if (auto sorted = DeduceSortConstraint(*input->Child(0), *input->Child(2), *input->Child(3), ctx)) {
                 input->AddConstraint(sorted);
             }
@@ -777,7 +784,7 @@ private:
                         break;
                 }
 
-                if (auto mapping = TPartOfUniqueConstraintNode::GetCommonMapping(node.Head().GetConstraint<TUniqueConstraintNode>(), node.Head().GetConstraint<TPartOfUniqueConstraintNode>()); !mapping.empty()) {
+                if (auto mapping = TPartOfUniqueConstraintNode::GetCommonMapping(GetDetailedUinique(node.Head().GetConstraint<TUniqueConstraintNode>(), *node.Head().GetTypeAnn(), ctx), node.Head().GetConstraint<TPartOfUniqueConstraintNode>()); !mapping.empty()) {
                     constraints.emplace_back(ctx.MakeConstraint<TPartOfUniqueConstraintNode>(std::move(mapping)));
                 }
                 if (const auto groupBy = node.Head().GetConstraint<TGroupByConstraintNode>()) {
@@ -846,7 +853,7 @@ private:
         }
 
         if (const auto lambdaUnique = GetConstraintFromLambda<TPartOfUniqueConstraintNode, WideOutput>(input->Tail(), ctx)) {
-            if (const auto unique = input->Head().GetConstraint<TUniqueConstraintNode>()) {
+            if (const auto unique = GetDetailedUinique(input->Head().GetConstraint<TUniqueConstraintNode>(), *input->Head().GetTypeAnn(), ctx)) {
                 if (const auto complete = TPartOfUniqueConstraintNode::MakeComplete(ctx, lambdaUnique->GetColumnMapping(), unique)) {
                     input->AddConstraint(complete);
                 }
@@ -2462,6 +2469,17 @@ private:
         return fields;
     }
 
+    static const TUniqueConstraintNode* GetDetailedUinique(const TUniqueConstraintNode* unique,  const TTypeAnnotationNode& type, TExprContext& ctx) {
+        if (!unique)
+            return nullptr;
+
+        if (const auto& sets = unique->GetAllSets(); sets.size() != 1U || sets.cbegin()->size() != 1U || !sets.cbegin()->cbegin()->empty())
+            return unique;
+
+        const auto& columns = GetAllItemTypeFields(type, ctx);
+        return columns.empty() ? nullptr : ctx.MakeConstraint<TUniqueConstraintNode>(columns);
+    }
+
     static const TStructExprType* GetNonEmptyStructItemType(const TTypeAnnotationNode& type) {
         const TTypeAnnotationNode* itemType = GetItemType(type);
         if (!itemType || itemType->GetKind() != ETypeAnnotationKind::Struct) {
@@ -2472,22 +2490,12 @@ private:
     }
 
     static const TSortedConstraintNode* DeduceSortConstraint(const TExprNode& list, const TExprNode& directions, const TExprNode& keyExtractor, TExprContext& ctx) {
-        // Ignore Sort with empty key tuple
-        if (directions.GetTypeAnn()->GetKind() == ETypeAnnotationKind::Tuple &&
-            directions.GetTypeAnn()->Cast<TTupleExprType>()->GetSize() == 0) {
-
-            return nullptr;
-        }
-
         if (GetSeqItemType(list.GetTypeAnn())->GetKind() == ETypeAnnotationKind::Struct) {
-            TVector<bool> dirs;
-            TVector<TStringBuf> keys;
-            ExtractSimpleSortTraits(directions, keyExtractor, dirs, keys);
-            YQL_ENSURE(dirs.size() == keys.size());
-            TSortedConstraintNode::TContainerType content;
-            for (auto i = 0U; i < keys.size(); ++i)
-                content.emplace_back(TSortedConstraintNode::TContainerType::value_type::first_type{keys[i]}, dirs[i]);
-            if (!content.empty()) {
+            if (const auto& columns = ExtractSimpleSortTraits(directions, keyExtractor); !columns.empty()) {
+                TSortedConstraintNode::TContainerType content(columns.size());
+                std::transform(columns.cbegin(), columns.cend(), content.begin(), [](const std::pair<std::string_view, bool>& item) {
+                   return TSortedConstraintNode::TContainerType::value_type({item.first}, item.second);
+                });
                 return ctx.MakeConstraint<TSortedConstraintNode>(std::move(content));
             }
         }
@@ -2621,6 +2629,9 @@ public:
         Y_UNUSED(ctx);
         return UpdateAllChildLambdasConstraints(*input);
     }
+
+    void Rewind() final {
+    }
 };
 
 class TConstraintTransformer : public TGraphTransformerBase {
@@ -2686,6 +2697,14 @@ public:
         }
 
         return combinedStatus;
+    }
+
+    void Rewind() final {
+        CallableTransformer->Rewind();
+        CallableInputs.clear();
+        Processed.clear();
+        HasRenames = false;
+        CurrentFunctions = {};
     }
 
 private:

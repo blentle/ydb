@@ -51,7 +51,8 @@ public:
         auto& event = *ev->Get();
         const TUnifiedBlobId& blobId = event.BlobRange.BlobId;
         if (event.Status != NKikimrProto::EReplyStatus::OK) {
-            LOG_S_ERROR("TEvReadBlobRangeResult cannot get blob " << blobId << " status " << event.Status
+            LOG_S_ERROR("TEvReadBlobRangeResult cannot get blob " << blobId
+                << " status " << NKikimrProto::EReplyStatus_Name(event.Status)
                 << " at tablet " << TabletId << " (index)");
 
             BlobsToRead.erase(blobId);
@@ -107,7 +108,12 @@ private:
 
     void SendReadRequest(const NBlobCache::TBlobRange& blobRange) {
         Y_VERIFY(blobRange.Size);
-        Send(BlobCacheActorId, new NBlobCache::TEvBlobCache::TEvReadBlobRange(blobRange, false, false));
+        NBlobCache::TReadBlobRangeOptions readOpts {
+            .CacheAfterRead = false,
+            .Fallback = false,
+            .IsBackgroud = true
+        };
+        Send(BlobCacheActorId, new NBlobCache::TEvBlobCache::TEvReadBlobRange(blobRange, std::move(readOpts)));
     }
 
     void Index(const TActorContext& ctx) {

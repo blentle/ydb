@@ -5,8 +5,7 @@
 
 #include <library/cpp/testing/unittest/registar.h>
 
-namespace NKikimr {
-namespace NConsole {
+namespace NKikimr::NConsole {
 
 using namespace NUT;
 
@@ -281,12 +280,18 @@ TConfigModifications MakeDiffAddItems()
 TConfigModifications MakeDiffRemoveItems()
 {
     TConfigModifications result;
-    result.RemovedItems.insert(ITEM_DOMAIN_LOG_1.GetId().GetId());
-    result.RemovedItems.insert(ITEM_NODE1_LOG_1.GetId().GetId());
-    result.RemovedItems.insert(ITEM_HOST1_LOG_1.GetId().GetId());
-    result.RemovedItems.insert(ITEM_TENANT1_LOG_1.GetId().GetId());
-    result.RemovedItems.insert(ITEM_TYPE1_LOG_1.GetId().GetId());
-    result.RemovedItems.insert(ITEM_TENANT1_TYPE1_LOG_1.GetId().GetId());
+    result.RemovedItems[ITEM_DOMAIN_LOG_1.GetId().GetId()]
+        = new TConfigItem(ITEM_DOMAIN_LOG_1);
+    result.RemovedItems[ITEM_NODE1_LOG_1.GetId().GetId()]
+        = new TConfigItem(ITEM_NODE1_LOG_1);
+    result.RemovedItems[ITEM_HOST1_LOG_1.GetId().GetId()]
+        = new TConfigItem(ITEM_HOST1_LOG_1);
+    result.RemovedItems[ITEM_TENANT1_LOG_1.GetId().GetId()]
+        = new TConfigItem(ITEM_TENANT1_LOG_1);
+    result.RemovedItems[ITEM_TYPE1_LOG_1.GetId().GetId()]
+        = new TConfigItem(ITEM_TYPE1_LOG_1);
+    result.RemovedItems[ITEM_TENANT1_TYPE1_LOG_1.GetId().GetId()]
+        = new TConfigItem(ITEM_TENANT1_TYPE1_LOG_1);
     return result;
 }
 
@@ -367,15 +372,19 @@ TConfigModifications MakeDiffForAllAffected(bool domainAffected)
     TConfigModifications result;
     if (domainAffected) {
         result.AddedItems.push_back(new TConfigItem(ITEM_DOMAIN_POOL_1));
-        result.RemovedItems.insert(ITEM_DOMAIN_LOG_1.GetId().GetId());
+        result.RemovedItems[ITEM_DOMAIN_LOG_1.GetId().GetId()]
+            = new TConfigItem(ITEM_DOMAIN_LOG_1);
     }
     AddScopeModification(result, ITEM_TENANT2_LOG_1, ITEM_TYPE2_LOG_1);
     AddScopeModification(result, ITEM_TENANT3_TYPE3_LOG_1, ITEM_TYPE2_LOG_1);
     result.AddedItems.push_back(new TConfigItem(ITEM_TENANT3_POOL_1));
     result.AddedItems.push_back(new TConfigItem(ITEM_TYPE3_POOL_1));
-    result.RemovedItems.insert(ITEM_TYPE1_LOG_1.GetId().GetId());
-    result.RemovedItems.insert(ITEM_TENANT1_LOG_1.GetId().GetId());
-    result.RemovedItems.insert(ITEM_TENANT2_TYPE2_LOG_1.GetId().GetId());
+    result.RemovedItems[ITEM_TYPE1_LOG_1.GetId().GetId()]
+        = new TConfigItem(ITEM_TYPE1_LOG_1);
+    result.RemovedItems[ITEM_TENANT1_LOG_1.GetId().GetId()]
+        = new TConfigItem(ITEM_TENANT1_LOG_1);
+    result.RemovedItems[ITEM_TENANT2_TYPE2_LOG_1.GetId().GetId()]
+        = new TConfigItem(ITEM_TENANT2_TYPE2_LOG_1);
     return result;
 }
 
@@ -1638,5 +1647,4 @@ public:
 
 UNIT_TEST_SUITE_REGISTRATION(TModificationsValidatorTests);
 
-} // namespace NConsole
-} // namespace NKikimr
+} // namespace NKikimr::NConsole

@@ -1003,25 +1003,22 @@ NUdf::TCastResultOptions CastResult(const TDictExprType* source, const TDictExpr
 
 template <bool Strong, bool AllOrAnyElements = true>
 NUdf::TCastResultOptions CastResult(const TTupleExprType* source, const TTupleExprType* target) {
-    if (!target->GetSize()) {
-        return source->GetSize() ? NUdf::ECastOptions::Impossible : NUdf::ECastOptions::Complete;
-    }
-
     const auto& sItems = source->GetItems();
     const auto& tItems = target->GetItems();
 
     NUdf::TCastResultOptions result = NUdf::ECastOptions::Complete;
     for (size_t i = 0U; i < std::max(sItems.size(), tItems.size()); ++i) {
         if (i >= sItems.size()) {
-            if (AllOrAnyElements && !tItems[i]->IsOptionalOrNull()) {
-                return NUdf::ECastOptions::Impossible;
+            if constexpr (AllOrAnyElements) {
+                if (!tItems[i]->IsOptionalOrNull())
+                    return NUdf::ECastOptions::Impossible;
             }
         } else if (i >= tItems.size()) {
             if (sItems[i]->GetKind() != ETypeAnnotationKind::Null) {
                 if (sItems[i]->IsOptionalOrNull()) {
                     result |= Strong ? NUdf::ECastOptions::MayFail : NUdf::ECastOptions::MayLoseData;
                 } else {
-                    if (Strong && AllOrAnyElements) {
+                    if constexpr (Strong && AllOrAnyElements) {
                         return NUdf::ECastOptions::Impossible;
                     } else {
                         result |= AllOrAnyElements ? NUdf::ECastOptions::AnywayLoseData : NUdf::ECastOptions::MayFail;
@@ -1046,18 +1043,18 @@ NUdf::TCastResultOptions CastResult(const TStructExprType* source, const TStruct
     }
 
     NUdf::TCastResultOptions result = NUdf::ECastOptions::Complete;
-    bool hasCommon = false;
     for (const auto& field : fields) {
         if (!field.second.front()) {
-            if (AllOrAnyMembers && !field.second.back()->IsOptionalOrNull()) {
-                return NUdf::ECastOptions::Impossible;
+            if constexpr (AllOrAnyMembers) {
+                if (!field.second.back()->IsOptionalOrNull())
+                    return NUdf::ECastOptions::Impossible;
             }
         } else if (!field.second.back()) {
             if (field.second.front()->GetKind() != ETypeAnnotationKind::Null) {
                 if (field.second.front()->IsOptionalOrNull()) {
                     result |= Strong ? NUdf::ECastOptions::MayFail : NUdf::ECastOptions::MayLoseData;
                 } else {
-                    if (Strong && AllOrAnyMembers) {
+                    if constexpr (Strong && AllOrAnyMembers) {
                         return NUdf::ECastOptions::Impossible;
                     } else {
                         result |= AllOrAnyMembers ? NUdf::ECastOptions::AnywayLoseData : NUdf::ECastOptions::MayFail;
@@ -1065,7 +1062,6 @@ NUdf::TCastResultOptions CastResult(const TStructExprType* source, const TStruct
                 }
             }
         } else {
-            hasCommon = true;
             result |= CastResult<Strong>(field.second.front(), field.second.back());
         }
 
@@ -1073,7 +1069,7 @@ NUdf::TCastResultOptions CastResult(const TStructExprType* source, const TStruct
             return NUdf::ECastOptions::Impossible;
         }
     }
-    return hasCommon ? result : NUdf::ECastOptions::Impossible;
+    return result;
 }
 
 template <bool Strong>
@@ -1625,10 +1621,11 @@ const TTypeAnnotationNode* DryType(const TTypeAnnotationNode* type, TExprContext
     return nullptr;
 }
 
-const TTypeAnnotationNode* JoinDryKeyType(const TTypeAnnotationNode* primary, const TTypeAnnotationNode* secondary, TExprContext& ctx) {
-    if (const auto dry = DryType(primary, ctx))
+const TTypeAnnotationNode* JoinDryKeyType(bool outer, const TTypeAnnotationNode* primary, const TTypeAnnotationNode* secondary, TExprContext& ctx) {
+    bool hasOptional = false;
+    if (const auto dry = DryType(primary, hasOptional, ctx))
         if (!((NUdf::ECastOptions::AnywayLoseData | NUdf::ECastOptions::Impossible) & CastResult<true>(secondary, dry)))
-            return dry;
+            return hasOptional && outer ? ctx.MakeType<TOptionalExprType>(dry) : dry;
     return nullptr;
 }
 
@@ -1639,16 +1636,17 @@ const TTypeAnnotationNode* JoinDryKeyType(const TTypeAnnotationNode* primary, co
     return nullptr;
 }
 
-const TTypeAnnotationNode* JoinCommonDryType(TPositionHandle position, const TTypeAnnotationNode* one, const TTypeAnnotationNode* two, TExprContext& ctx) {
-    auto dryOne = DryType(one, ctx);
-    auto dryTwo = DryType(two, ctx);
+const TTypeAnnotationNode* JoinCommonDryKeyType(TPositionHandle position, bool outer, const TTypeAnnotationNode* one, const TTypeAnnotationNode* two, TExprContext& ctx) {
+    bool optOne = false, optTwo = false;
+    auto dryOne = DryType(one, optOne, ctx);
+    auto dryTwo = DryType(two, optTwo, ctx);
     if (!(dryOne && dryTwo))
         return nullptr;
 
-    if (dryOne->GetKind() == ETypeAnnotationKind::Optional && dryTwo->GetKind() != ETypeAnnotationKind::Optional)
-        dryTwo = ctx.MakeType<TOptionalExprType>(dryTwo);
-    else  if (dryOne->GetKind() != ETypeAnnotationKind::Optional && dryTwo->GetKind() == ETypeAnnotationKind::Optional)
+    if (outer && (optOne || optTwo)) {
         dryOne = ctx.MakeType<TOptionalExprType>(dryOne);
+        dryTwo = ctx.MakeType<TOptionalExprType>(dryTwo);
+    }
 
     return CommonType<true>(position, dryOne, dryTwo, ctx);
 }
@@ -2699,7 +2697,7 @@ bool EnsureWideFlowType(TPositionHandle position, const TTypeAnnotationNode& typ
     return true;
 }
 
-bool EnsureWideFlowBlockType(const TExprNode& node, TTypeAnnotationNode::TListType& blockItemTypes, TExprContext& ctx) {
+bool EnsureWideFlowBlockType(const TExprNode& node, TTypeAnnotationNode::TListType& blockItemTypes, TExprContext& ctx, bool allowChunked) {
     if (!EnsureWideFlowType(node, ctx)) {
         return false;
     }
@@ -2712,7 +2710,7 @@ bool EnsureWideFlowBlockType(const TExprNode& node, TTypeAnnotationNode::TListTy
 
     bool isScalar;
     for (const auto& type : items) {
-        if (!EnsureBlockOrScalarType(node.Pos(), *type, ctx)) {
+        if (!EnsureBlockOrScalarType(node.Pos(), *type, ctx, allowChunked)) {
             return false;
         }
 
@@ -5330,18 +5328,21 @@ bool HasContextFuncs(const TExprNode& input) {
     return needCtx;
 }
 
-bool EnsureBlockOrScalarType(const TExprNode& node, TExprContext& ctx) {
+bool EnsureBlockOrScalarType(const TExprNode& node, TExprContext& ctx, bool allowChunked) {
     if (HasError(node.GetTypeAnn(), ctx) || !node.GetTypeAnn()) {
         YQL_ENSURE(node.Type() == TExprNode::Lambda);
         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder() << "Expected block or scalar type, but got lambda"));
         return false;
     }
 
-    return EnsureBlockOrScalarType(node.Pos(), *node.GetTypeAnn(), ctx);
+    return EnsureBlockOrScalarType(node.Pos(), *node.GetTypeAnn(), ctx, allowChunked);
 }
 
-bool EnsureBlockOrScalarType(TPositionHandle position, const TTypeAnnotationNode& type, TExprContext& ctx) {
-    if (HasError(&type, ctx) || (type.GetKind() != ETypeAnnotationKind::Block && type.GetKind() != ETypeAnnotationKind::Scalar)) {
+bool EnsureBlockOrScalarType(TPositionHandle position, const TTypeAnnotationNode& type, TExprContext& ctx, bool allowChunked) {
+    bool valid = allowChunked ? type.IsAnyBlockOrScalar() :
+        (type.GetKind() == ETypeAnnotationKind::Block ||
+         type.GetKind() == ETypeAnnotationKind::Scalar);
+    if (HasError(&type, ctx) || !valid) {
         ctx.AddError(TIssue(ctx.GetPosition(position), TStringBuilder() << "Expected block or scalar type, but got: " << type));
         return false;
     }
@@ -5350,11 +5351,14 @@ bool EnsureBlockOrScalarType(TPositionHandle position, const TTypeAnnotationNode
 }
 
 const TTypeAnnotationNode* GetBlockItemType(const TTypeAnnotationNode& type, bool& isScalar) {
-    auto kind = type.GetKind();
-    YQL_ENSURE(kind == ETypeAnnotationKind::Block || kind == ETypeAnnotationKind::Scalar);
+    YQL_ENSURE(type.IsAnyBlockOrScalar());
+    const auto kind = type.GetKind();
     if (kind == ETypeAnnotationKind::Block) {
         isScalar = false;
         return type.Cast<TBlockExprType>()->GetItemType();
+    } else if (kind == ETypeAnnotationKind::ChunkedBlock) {
+        isScalar = false;
+        return type.Cast<TChunkedBlockExprType>()->GetItemType();
     } else {
         isScalar = true;
         return type.Cast<TScalarExprType>()->GetItemType();
@@ -5407,10 +5411,10 @@ const TTypeAnnotationNode* AggApplySerializedStateType(const TExprNode::TPtr& in
     }
 }
 
-bool GetSumResultType(const TPositionHandle& pos, const TTypeAnnotationNode& itemType, const TTypeAnnotationNode*& retType, TExprContext& ctx) {
+bool GetSumResultType(const TPositionHandle& pos, const TTypeAnnotationNode& inputType, const TTypeAnnotationNode*& retType, TExprContext& ctx) {
     bool isOptional;
     const TDataExprType* lambdaType;
-    if(IsDataOrOptionalOfData(&itemType, isOptional, lambdaType)) {
+    if(IsDataOrOptionalOfData(&inputType, isOptional, lambdaType)) {
         auto lambdaTypeSlot = lambdaType->GetSlot();
         const TTypeAnnotationNode *sumResultType = nullptr;
         if (IsDataTypeSigned(lambdaTypeSlot)) {
@@ -5434,28 +5438,28 @@ bool GetSumResultType(const TPositionHandle& pos, const TTypeAnnotationNode& ite
 
         retType = sumResultType;
         return true;
-    } else if (IsNull(itemType)) {
+    } else if (IsNull(inputType)) {
         retType = ctx.MakeType<TNullExprType>();
         return true;
     } else {
         ctx.AddError(TIssue(ctx.GetPosition(pos),
-            TStringBuilder() << "Unsupported type: " << FormatType(&itemType) << ". Expected Data or Optional of Data."));
+            TStringBuilder() << "Unsupported type: " << FormatType(&inputType) << ". Expected Data or Optional of Data."));
         return false;
     }
 }
 
-bool GetAvgResultType(const TPositionHandle& pos, const TTypeAnnotationNode& itemType, const TTypeAnnotationNode*& retType, TExprContext& ctx) {
+bool GetAvgResultType(const TPositionHandle& pos, const TTypeAnnotationNode& inputType, const TTypeAnnotationNode*& retType, TExprContext& ctx) {
     bool isOptional;
     const TDataExprType* lambdaType;
-    if(IsDataOrOptionalOfData(&itemType, isOptional, lambdaType)) {
+    if(IsDataOrOptionalOfData(&inputType, isOptional, lambdaType)) {
         auto lambdaTypeSlot = lambdaType->GetSlot();
         const TTypeAnnotationNode *avgResultType = nullptr;
         if (IsDataTypeNumeric(lambdaTypeSlot)) {
             avgResultType = ctx.MakeType<TDataExprType>(EDataSlot::Double);
         } else if (IsDataTypeDecimal(lambdaTypeSlot)) {
-            avgResultType = &itemType;
+            avgResultType = &inputType;
         } else if (IsDataTypeInterval(lambdaTypeSlot)) {
-            avgResultType = &itemType;
+            avgResultType = &inputType;
         } else {
             ctx.AddError(TIssue(ctx.GetPosition(pos),
                 TStringBuilder() << "Unsupported column type: " << lambdaTypeSlot));
@@ -5468,23 +5472,65 @@ bool GetAvgResultType(const TPositionHandle& pos, const TTypeAnnotationNode& ite
 
         retType = avgResultType;
         return true;
-    } else if (IsNull(itemType)) {
+    } else if (IsNull(inputType)) {
         retType = ctx.MakeType<TNullExprType>();
         return true;
     } else {
         ctx.AddError(TIssue(ctx.GetPosition(pos),
-            TStringBuilder() << "Unsupported type: " << FormatType(&itemType) << ". Expected Data or Optional of Data."));
+            TStringBuilder() << "Unsupported type: " << FormatType(&inputType) << ". Expected Data or Optional of Data."));
         return false;
     }
 }
 
-bool GetMinMaxResultType(const TPositionHandle& pos, const TTypeAnnotationNode& itemType, const TTypeAnnotationNode*& retType, TExprContext& ctx) {
-    if (!itemType.IsComparable()) {
-        ctx.AddError(TIssue(ctx.GetPosition(pos), TStringBuilder() << "Expected comparable type, but got: " << itemType));
+bool GetAvgResultTypeOverState(const TPositionHandle& pos, const TTypeAnnotationNode& inputType, const TTypeAnnotationNode*& retType, TExprContext& ctx) {
+    if (IsNull(inputType)) {
+        retType = &inputType;
+    } else {
+        auto itemType = &inputType;
+        bool isOptional = false;
+        if (itemType->GetKind() == ETypeAnnotationKind::Optional) {
+            isOptional = true;
+            itemType = itemType->Cast<TOptionalExprType>()->GetItemType();
+        }
+
+        if (!EnsureTupleTypeSize(pos, itemType, 2, ctx)) {
+            return false;
+        }
+
+        auto tupleType = itemType->Cast<TTupleExprType>();
+        auto sumType = tupleType->GetItems()[0];
+        const TTypeAnnotationNode* sumTypeOut;
+        if (!GetSumResultType(pos, *sumType, sumTypeOut, ctx)) {
+            return false;
+        }
+
+        if (!IsSameAnnotation(*sumType, *sumTypeOut)) {
+            ctx.AddError(TIssue(ctx.GetPosition(pos),
+                TStringBuilder() << "Mismatch sum type, expected: " << *sumType << ", but got: " << *sumTypeOut));
+            return false;
+        }
+
+        auto countType = tupleType->GetItems()[1];
+        if (!EnsureSpecificDataType(pos, *countType, EDataSlot::Uint64, ctx)) {
+            return false;
+        }
+
+        retType = sumType;
+        if (isOptional) {
+            retType = ctx.MakeType<TOptionalExprType>(retType);
+        }
+    }
+
+    return true;
+}
+
+bool GetMinMaxResultType(const TPositionHandle& pos, const TTypeAnnotationNode& inputType, const TTypeAnnotationNode*& retType, TExprContext& ctx) {
+    if (!inputType.IsComparable()) {
+        ctx.AddError(TIssue(ctx.GetPosition(pos), TStringBuilder() << "Expected comparable type, but got: " << inputType));
         return false;
     }
 
-    retType = &itemType;
+    retType = &inputType;
     return true;
 }
 

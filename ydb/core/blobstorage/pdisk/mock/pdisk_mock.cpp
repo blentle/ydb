@@ -492,7 +492,7 @@ public:
                     }
                     isStartingPoint = cr.IsStartingPoint;
                 }
-                owner.Log.emplace_back(msg->Signature.GetUnmasked(), TContiguousData(msg->Data), msg->Lsn);
+                owner.Log.emplace_back(msg->Signature.GetUnmasked(), TRcBuf(msg->Data), msg->Lsn);
                 owner.LogDataSize += msg->Data.size();
                 if (isStartingPoint) {
                     owner.StartingPoints[msg->Signature.GetUnmasked()] = owner.Log.back();
@@ -758,6 +758,7 @@ public:
         auto res = std::make_unique<NPDisk::TEvCheckSpaceResult>(NKikimrProto::OK, GetStatusFlags(),
             Impl.GetNumFreeChunks(), Impl.TotalChunks, Impl.TotalChunks - Impl.GetNumFreeChunks(),
             Impl.Owners.size(), TString());
+        res->Occupancy = (double)res->UsedChunks / res->TotalChunks;
         Impl.FindOwner(msg, res); // to ensure correct owner/round
         Send(ev->Sender, res.release());
     }

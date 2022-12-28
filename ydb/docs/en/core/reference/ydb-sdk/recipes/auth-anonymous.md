@@ -90,4 +90,8 @@ Below are examples of the code for anonymous authentication in different {{ ydb-
    }
    ```
 
+- Node.js
+
+  {% include [auth-anonymous](../../../../_includes/nodejs/auth-anonymous.md) %}
+
 {% endlist %}

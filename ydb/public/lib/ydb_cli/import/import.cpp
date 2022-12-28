@@ -19,6 +19,7 @@
 
 #include <deque>
 
+#include <library/cpp/string_utils/csv/csv.h>
 #include <contrib/libs/apache/arrow/cpp/src/arrow/api.h>
 #include <contrib/libs/apache/arrow/cpp/src/arrow/io/api.h>
 #include <contrib/libs/apache/arrow/cpp/src/arrow/ipc/api.h>
@@ -44,7 +45,7 @@ TStatus MakeStatus(EStatus code = EStatus::SUCCESS, const TString& error = {}) {
 
 }
 
-TImportFileClient::TImportFileClient(const TDriver& driver)
+TImportFileClient::TImportFileClient(const TDriver& driver, const TClientCommand::TConfig& rootConfig)
     : OperationClient(std::make_shared<NOperation::TOperationClient>(driver))
     , SchemeClient(std::make_shared<NScheme::TSchemeClient>(driver))
     , TableClient(std::make_shared<NTable::TTableClient>(driver))
@@ -53,11 +54,11 @@ TImportFileClient::TImportFileClient(const TDriver& driver)
         .OperationTimeout(TDuration::Seconds(30))
         .ClientTimeout(TDuration::Seconds(35));
     RetrySettings
-        .MaxRetries(10);
+        .MaxRetries(100000).Verbose(rootConfig.IsVerbose());
 }
 
 TStatus TImportFileClient::Import(const TString& filePath, const TString& dbPath, const TImportFileSettings& settings) {
-    if (! filePath.empty()) {
+    if (!filePath.empty()) {
         const TFsPath dataFile(filePath);
         if (!dataFile.Exists()) {
             return MakeStatus(EStatus::BAD_REQUEST,
@@ -134,7 +135,6 @@ TAsyncStatus TImportFileClient::UpsertCsvBuffer(const TString& dbPath, const TSt
 
 TStatus TImportFileClient::UpsertCsv(IInputStream& input, const TString& dbPath,
                                      const TImportFileSettings& settings) {
-    TString line;
     TString buffer;
 
     Ydb::Formats::CsvSettings csvSettings;
@@ -150,18 +150,19 @@ TStatus TImportFileClient::UpsertCsv(IInputStream& input, const TString& dbPath,
         special = true;
     }
 
-    // Do not use csvSettings.skip_rows.
-    for (ui32 i = 0; i < settings.SkipRows_; ++i) {
-        input.ReadLine(line);
-    }
-
+    NCsvFormat::TLinesSplitter splitter(input);
     TString headerRow;
     if (settings.Header_) {
-        input.ReadLine(headerRow);
+        headerRow = splitter.ConsumeLine();
         headerRow += '\n';
         buffer = headerRow;
         csvSettings.set_header(true);
         special = true;
+    }
+
+    // Do not use csvSettings.skip_rows.
+    for (ui32 i = 0; i < settings.SkipRows_; ++i) {
+        splitter.ConsumeLine();
     }
 
     if (special) {
@@ -172,14 +173,19 @@ TStatus TImportFileClient::UpsertCsv(IInputStream& input, const TString& dbPath,
 
     std::deque<TAsyncStatus> inFlightRequests;
 
-    // TODO: better read
-    // * read serveral lines a time
-    // * support endlines inside quotes
-    // ReadLine() should count quotes for it and stop the line then counter is odd.
-    while (size_t sz = input.ReadLine(line)) {
+    ui32 idx = 0;
+    ui64 readSize = 0;
+    const ui32 mb100 = 1 << 27;
+    ui64 nextBorder = mb100;
+    while (TString line = splitter.ConsumeLine()) {
         buffer += line;
-        buffer += '\n'; // TODO: keep original endline?
-
+        buffer += '\n';
+        readSize += line.size();
+        ++idx;
+        if (readSize >= nextBorder && RetrySettings.Verbose_) {
+            nextBorder += mb100;
+            Cerr << "Processed " << 1.0 * readSize / (1 << 20) << "Mb and " << idx << " records" << Endl;
+        }
         if (buffer.Size() >= settings.BytesPerRequest_) {
             auto status = WaitForQueue(inFlightRequests, settings.MaxInFlightRequests_);
             if (!status.IsSuccess()) {
@@ -187,7 +193,6 @@ TStatus TImportFileClient::UpsertCsv(IInputStream& input, const TString& dbPath,
             }
 
             inFlightRequests.push_back(UpsertCsvBuffer(dbPath, buffer));
-
             buffer = headerRow;
         }
     }

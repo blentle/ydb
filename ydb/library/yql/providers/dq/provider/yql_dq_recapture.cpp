@@ -19,6 +19,7 @@
 namespace NYql {
 
 using namespace NNodes;
+using namespace NKikimr::NMiniKQL;
 
 namespace {
 

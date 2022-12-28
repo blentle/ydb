@@ -80,6 +80,7 @@ class TFlowExprType;
 class TEmptyListExprType;
 class TEmptyDictExprType;
 class TBlockExprType;
+class TChunkedBlockExprType;
 class TScalarExprType;
 
 const size_t DefaultMistypeDistance = 3;
@@ -114,6 +115,7 @@ struct TTypeAnnotationVisitor {
     virtual void Visit(const TEmptyListExprType& type) = 0;
     virtual void Visit(const TEmptyDictExprType& type) = 0;
     virtual void Visit(const TBlockExprType& type) = 0;
+    virtual void Visit(const TChunkedBlockExprType& type) = 0;
     virtual void Visit(const TScalarExprType& type) = 0;
 };
 
@@ -130,7 +132,8 @@ enum ETypeAnnotationFlags : ui32 {
     TypeHasManyValues = 0x200,
     TypeHasBareYson = 0x400,
     TypeHasNestedOptional = 0x800,
-    TypeNonPresortable = 0x1000
+    TypeNonPresortable = 0x1000,
+    TypeHasDynamicSize = 0x2000,
 };
 
 const ui64 TypeHashMagic = 0x10000;
@@ -231,6 +234,15 @@ public:
     bool IsOptionalOrNull() const {
         auto kind = GetKind();
         return kind == ETypeAnnotationKind::Optional || kind == ETypeAnnotationKind::Null || kind == ETypeAnnotationKind::Pg;
+    }
+
+    bool IsAnyBlockOrScalar() const {
+        auto kind = GetKind();
+        return kind == ETypeAnnotationKind::Block || kind == ETypeAnnotationKind::ChunkedBlock || kind == ETypeAnnotationKind::Scalar;
+    }
+
+    bool HasFixedSizeRepr() const {
+        return (GetFlags() & (TypeHasDynamicSize | TypeNonPersistable | TypeNonComputable)) == 0;
     }
 
     bool IsSingleton() const {
@@ -549,7 +561,7 @@ public:
     static constexpr ETypeAnnotationKind KindValue = ETypeAnnotationKind::List;
 
     TListExprType(ui64 hash, const TTypeAnnotationNode* itemType)
-        : TTypeAnnotationNode(KindValue, itemType->GetFlags(), hash)
+        : TTypeAnnotationNode(KindValue, itemType->GetFlags() | TypeHasDynamicSize, hash)
         , ItemType(itemType)
     {
     }
@@ -652,6 +664,33 @@ private:
     const TTypeAnnotationNode* ItemType;
 };
 
+class TChunkedBlockExprType : public TTypeAnnotationNode {
+public:
+    static constexpr ETypeAnnotationKind KindValue = ETypeAnnotationKind::ChunkedBlock;
+
+    TChunkedBlockExprType(ui64 hash, const TTypeAnnotationNode* itemType)
+        : TTypeAnnotationNode(KindValue, itemType->GetFlags() | TypeNonPersistable, hash)
+        , ItemType(itemType)
+    {
+    }
+
+    static ui64 MakeHash(const TTypeAnnotationNode* itemType) {
+        ui64 hash = TypeHashMagic | (ui64)ETypeAnnotationKind::ChunkedBlock;
+        return StreamHash(itemType->GetHash(), hash);
+    }
+
+    const TTypeAnnotationNode* GetItemType() const {
+        return ItemType;
+    }
+
+    bool operator==(const TChunkedBlockExprType& other) const {
+        return GetItemType() == other.GetItemType();
+    }
+
+private:
+    const TTypeAnnotationNode* ItemType;
+};
+
 class TScalarExprType : public TTypeAnnotationNode {
 public:
     static constexpr ETypeAnnotationKind KindValue = ETypeAnnotationKind::Scalar;
@@ -706,6 +745,10 @@ public:
 
         if (slot == NUdf::EDataSlot::Yson) {
             ret |= TypeHasBareYson;
+        }
+
+        if (props & NUdf::StringType) {
+            ret |= TypeHasDynamicSize;
         }
 
         return ret;
@@ -772,6 +815,7 @@ class TPgExprType : public TTypeAnnotationNode {
 public:
     static constexpr ETypeAnnotationKind KindValue = ETypeAnnotationKind::Pg;
 
+    // TODO: TypeHasDynamicSize for Pg types
     TPgExprType(ui64 hash, ui32 typeId)
         : TTypeAnnotationNode(KindValue, GetFlags(typeId), hash)
         , TypeId(typeId)
@@ -924,7 +968,8 @@ public:
     static constexpr ETypeAnnotationKind KindValue = ETypeAnnotationKind::Dict;
 
     TDictExprType(ui64 hash, const TTypeAnnotationNode* keyType, const TTypeAnnotationNode* payloadType)
-        : TTypeAnnotationNode(KindValue, TypeNonComparable | keyType->GetFlags() | payloadType->GetFlags(), hash)
+        : TTypeAnnotationNode(KindValue, TypeNonComparable | TypeHasDynamicSize |
+                              keyType->GetFlags() | payloadType->GetFlags(), hash)
         , KeyType(keyType)
         , PayloadType(payloadType)
     {
@@ -1356,6 +1401,9 @@ inline bool TTypeAnnotationNode::Equals(const TTypeAnnotationNode& node) const {
     case ETypeAnnotationKind::Block:
         return static_cast<const TBlockExprType&>(*this) == static_cast<const TBlockExprType&>(node);
 
+    case ETypeAnnotationKind::ChunkedBlock:
+        return static_cast<const TChunkedBlockExprType&>(*this) == static_cast<const TChunkedBlockExprType&>(node);
+
     case ETypeAnnotationKind::Scalar:
         return static_cast<const TScalarExprType&>(*this) == static_cast<const TScalarExprType&>(node);
 
@@ -1418,6 +1466,8 @@ inline void TTypeAnnotationNode::Accept(TTypeAnnotationVisitor& visitor) const {
         return visitor.Visit(static_cast<const TMultiExprType&>(*this));
     case ETypeAnnotationKind::Block:
         return visitor.Visit(static_cast<const TBlockExprType&>(*this));
+    case ETypeAnnotationKind::ChunkedBlock:
+        return visitor.Visit(static_cast<const TChunkedBlockExprType&>(*this));
     case ETypeAnnotationKind::Scalar:
         return visitor.Visit(static_cast<const TScalarExprType&>(*this));
     case ETypeAnnotationKind::LastType:
@@ -2342,6 +2392,11 @@ struct TMakeTypeImpl<TFlowExprType> {
 template <>
 struct TMakeTypeImpl<TBlockExprType> {
     static const TBlockExprType* Make(TExprContext& ctx, const TTypeAnnotationNode* itemType);
+};
+
+template <>
+struct TMakeTypeImpl<TChunkedBlockExprType> {
+    static const TChunkedBlockExprType* Make(TExprContext& ctx, const TTypeAnnotationNode* itemType);
 };
 
 template <>

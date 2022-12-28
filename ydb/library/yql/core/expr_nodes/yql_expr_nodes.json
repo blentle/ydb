@@ -1632,10 +1632,10 @@
         },
         {
             "Name": "TCoAssumeUnique",
-            "Base": "TCoInputBase",
+            "Base": "TFreeArgCallable",
             "Match": {"Type": "Callable", "Name": "AssumeUnique"},
             "Children": [
-                {"Index": 1, "Name": "UniqueBy", "Type": "TCoAtomList"}
+                {"Index": 0, "Name": "Input", "Type": "TExprBase"}
             ]
         },
         {
@@ -2247,9 +2247,27 @@
             "Base": "TCoInputBase",
             "Match": {"Type": "Callable", "Name": "BlockCombineAll"},
             "Children": [
-                {"Index": 1, "Name": "CountColumn", "Type": "TCoAtom"},
-                {"Index": 2, "Name": "FilterColumn", "Type": "TExprBase"},
+                {"Index": 1, "Name": "FilterColumn", "Type": "TExprBase"},
+                {"Index": 2, "Name": "Aggregations", "Type": "TExprList"}
+            ]
+        },
+        {
+            "Name": "TCoBlockCombineHashed",
+            "Base": "TCoInputBase",
+            "Match": {"Type": "Callable", "Name": "BlockCombineHashed"},
+            "Children": [
+                {"Index": 1, "Name": "FilterColumn", "Type": "TExprBase"},
+                {"Index": 2, "Name": "Keys", "Type": "TCoAtomList"},
                 {"Index": 3, "Name": "Aggregations", "Type": "TExprList"}
+            ]
+        },
+        {
+            "Name": "TCoShuffleByKeys",
+            "Base": "TCoInputBase",
+            "Match": {"Type": "Callable", "Name": "ShuffleByKeys"},
+            "Children": [
+                {"Index": 1, "Name": "KeySelectorLambda", "Type": "TCoLambda"},
+                {"Index": 2, "Name": "ListHandlerLambda", "Type": "TCoLambda"}
             ]
         }
     ]

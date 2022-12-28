@@ -6,40 +6,10 @@
 # original buildsystem will not be accepted.
 
 
-add_subdirectory(ut)
-
-add_library(services-metadata-secret)
-target_link_libraries(services-metadata-secret PUBLIC
-  contrib-libs-cxxsupp
-  yutil
-  cpp-actors-core
-  ydb-core-base
-  core-grpc_services-local_rpc
-  core-grpc_services-base
-  ydb-core-grpc_services
-  services-metadata-request
-)
-target_sources(services-metadata-secret PRIVATE
-  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/secret/secret.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/secret/access.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/secret/snapshot.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/secret/initializer.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/secret/fetcher.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/secret/checker_secret.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/secret/checker_access.cpp
-)
-
-add_global_library_for(services-metadata-secret.global services-metadata-secret)
-target_link_libraries(services-metadata-secret.global PUBLIC
-  contrib-libs-cxxsupp
-  yutil
-  cpp-actors-core
-  ydb-core-base
-  core-grpc_services-local_rpc
-  core-grpc_services-base
-  ydb-core-grpc_services
-  services-metadata-request
-)
-target_sources(services-metadata-secret.global PRIVATE
-  ${CMAKE_SOURCE_DIR}/ydb/services/metadata/secret/manager.cpp
-)
+if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" AND UNIX AND NOT APPLE AND NOT ANDROID)
+  include(CMakeLists.linux-aarch64.txt)
+elseif (APPLE)
+  include(CMakeLists.darwin.txt)
+elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" AND UNIX AND NOT APPLE AND NOT ANDROID)
+  include(CMakeLists.linux.txt)
+endif()

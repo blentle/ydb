@@ -15,6 +15,8 @@ class TKiSourceVisitorTransformer: public TSyncTransformerBase {
 public:
     TStatus DoTransform(TExprNode::TPtr input, TExprNode::TPtr& output, TExprContext& ctx) final;
 
+    void Rewind() override {
+    }
 private:
     virtual TStatus HandleKiRead(NNodes::TKiReadBase node, TExprContext& ctx) = 0;
     virtual TStatus HandleRead(NNodes::TExprBase node, TExprContext& ctx) = 0;
@@ -26,6 +28,8 @@ class TKiSinkVisitorTransformer : public TSyncTransformerBase {
 public:
     TStatus DoTransform(TExprNode::TPtr input, TExprNode::TPtr& output, TExprContext& ctx) final;
 
+    void Rewind() override {
+    }
 private:
     virtual TStatus HandleWriteTable(NNodes::TKiWriteTable node, TExprContext& ctx) = 0;
     virtual TStatus HandleUpdateTable(NNodes::TKiUpdateTable node, TExprContext& ctx) = 0;
@@ -45,7 +49,7 @@ private:
     virtual TStatus HandleWrite(NNodes::TExprBase node, TExprContext& ctx) = 0;
     virtual TStatus HandleCommit(NNodes::TCoCommit node, TExprContext& ctx) = 0;
     virtual TStatus HandleExecDataQuery(NNodes::TKiExecDataQuery node, TExprContext& ctx) = 0;
-    virtual TStatus HandleDataQuery(NNodes::TKiDataQuery node, TExprContext& ctx) = 0;
+    virtual TStatus HandleDataQueryBlocks(NNodes::TKiDataQueryBlocks node, TExprContext& ctx) = 0;
     virtual TStatus HandleDataQueryBlock(NNodes::TKiDataQueryBlock node, TExprContext& ctx) = 0;
     virtual TStatus HandleEffects(NNodes::TKiEffects node, TExprContext& ctx) = 0;
 };
@@ -170,7 +174,7 @@ void TableDescriptionToTableInfo(const TKikimrTableDescription& desc, TYdbOperat
     TVector<NKqpProto::TKqpTableInfo>& infos);
 
 // Optimizer rules
-TExprNode::TPtr KiBuildQuery(NNodes::TExprBase node, TExprContext& ctx);
+TExprNode::TPtr KiBuildQuery(NNodes::TExprBase node, TExprContext& ctx, TIntrusivePtr<TKikimrTablesData> tablesData);
 TExprNode::TPtr KiBuildResult(NNodes::TExprBase node,  const TString& cluster, TExprContext& ctx);
 
 const THashSet<TStringBuf>& KikimrDataSourceFunctions();

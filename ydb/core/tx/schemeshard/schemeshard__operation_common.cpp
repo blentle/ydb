@@ -208,7 +208,7 @@ bool NTableState::CollectSchemaChanged(
     auto shardIdx = context.SS->MustGetShardIdx(datashardId);
     Y_VERIFY(context.SS->ShardInfos.contains(shardIdx));
 
-    // Save this notification if was received earlier than the Tx swithched to ProposedWaitParts state
+    // Save this notification if was received earlier than the Tx switched to ProposedWaitParts state
     ui32 generation = evRecord.GetGeneration();
     auto pTablet = txState.SchemeChangeNotificationReceived.FindPtr(shardIdx);
     if (pTablet && pTablet->second >= generation) {
@@ -267,7 +267,7 @@ void NTableState::AckAllSchemaChanges(const TOperationId &operationId, TTxState 
     TTabletId ssId = context.SS->SelfTabletId();
 
     LOG_INFO_S(context.Ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
-                "all shard schema changes has been recieved"
+                "all shard schema changes has been received"
                     << ", operationId: " << operationId
                     << ", at schemeshard: " << ssId);
 
@@ -587,10 +587,10 @@ TSet<ui32> AllIncomingEvents() {
     return result;
 }
 
-void NForceDrop::CollectShards(const THashSet<TPathId>& pathes, TOperationId operationId, TTxState *txState, TOperationContext &context) {
+void NForceDrop::CollectShards(const THashSet<TPathId>& paths, TOperationId operationId, TTxState *txState, TOperationContext &context) {
     NIceDb::TNiceDb db(context.GetDB());
 
-    auto shards = context.SS->CollectAllShards(pathes);
+    auto shards = context.SS->CollectAllShards(paths);
     for (auto shardIdx: shards) {
         Y_VERIFY_S(context.SS->ShardInfos.contains(shardIdx), "Unknown shardIdx " << shardIdx);
         auto& shardInfo = context.SS->ShardInfos.at(shardIdx);
@@ -614,16 +614,16 @@ void NForceDrop::CollectShards(const THashSet<TPathId>& pathes, TOperationId ope
     context.SS->PersistTxState(db, operationId);
 }
 
-void NForceDrop::ValidateNoTransactionOnPathes(TOperationId operationId, const THashSet<TPathId>& pathes, TOperationContext &context) {
-    // it is not supposed that someone transaction is able to materialise in dropping subdomain
-    // all transaction should check parent dir status
-    // however, it is better to check that all locks are ours
-    auto transactions = context.SS->GetRelatedTransactions(pathes, context.Ctx);
+void NForceDrop::ValidateNoTransactionOnPaths(TOperationId operationId, const THashSet<TPathId>& paths, TOperationContext &context) {
+    // No transaction should materialize in a subdomain that is being deleted --
+    // -- all operations should be checking parent dir status at Propose stage.
+    // However, it is better to verify that, just in case.
+    auto transactions = context.SS->GetRelatedTransactions(paths, context.Ctx);
     for (auto otherTxId: transactions) {
         if (otherTxId == operationId.GetTxId()) {
             continue;
         }
-        Y_VERIFY_S(false, "transaction: " << otherTxId << " found on deleted subdomain");
+        Y_VERIFY_S(false, "unexpected transaction: " << otherTxId << " found on the subdomain being deleted by transaction " << operationId.GetTxId());
     }
 }
 

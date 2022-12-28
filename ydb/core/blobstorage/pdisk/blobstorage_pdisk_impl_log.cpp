@@ -174,7 +174,7 @@ void TPDisk::ProcessChunk0(const NPDisk::TEvReadLogResult &readLogResult) {
     TGuard<TMutex> guard(StateMutex);
     ui64 writePosition = 0;
     ui64 lastLsn = 0;
-    TContiguousData lastSysLogRecord = ProcessReadSysLogResult(writePosition, lastLsn, readLogResult);
+    TRcBuf lastSysLogRecord = ProcessReadSysLogResult(writePosition, lastLsn, readLogResult);
     if (lastSysLogRecord.size() == 0) {
         LOG_ERROR_S(*ActorSystem, NKikimrServices::BS_PDISK, "PDiskId# " << (ui32)PDiskId
             << " lastSysLogRecord.Size()# 0 writePosition# " << writePosition
@@ -386,7 +386,7 @@ void TPDisk::PrintChunksDebugInfo() {
     LOG_INFO_S(*ActorSystem, NKikimrServices::BS_PDISK, print());
 }
 
-TContiguousData TPDisk::ProcessReadSysLogResult(ui64 &outWritePosition, ui64 &outLsn,
+TRcBuf TPDisk::ProcessReadSysLogResult(ui64 &outWritePosition, ui64 &outLsn,
         const NPDisk::TEvReadLogResult &readLogResult) {
     ui64 sectorIdx = (readLogResult.NextPosition.OffsetInChunk + Format.SectorSize - 1) / Format.SectorSize;
     ui64 firstSysLogSectorIdx = Format.FirstSysLogSectorIdx();
@@ -401,11 +401,11 @@ TContiguousData TPDisk::ProcessReadSysLogResult(ui64 &outWritePosition, ui64 &ou
             << " ProcessReadSysLogResult Results.size()# 0"
             << " Marker# BPD54");
         outLsn = 0;
-        TContiguousData data;
+        TRcBuf data;
         return data;
     }
     ui64 lastSysLogLsn = readLogResult.Results[0].Lsn;
-    TContiguousData data = readLogResult.Results[0].Data;
+    TRcBuf data = readLogResult.Results[0].Data;
     for (ui32 i = 1; i < readLogResult.Results.size(); ++i) {
         if (lastSysLogLsn < readLogResult.Results[i].Lsn) {
             lastSysLogLsn = readLogResult.Results[i].Lsn;
@@ -659,7 +659,8 @@ bool TPDisk::AllocateLogChunks(ui32 chunksNeeded, ui32 chunksContainingPayload, 
 
     // Check space and free it if needed
     using TColor = NKikimrBlobStorage::TPDiskSpaceColor;
-    TColor::E color = Keeper.EstimateSpaceColor(keeperOwner, chunksNeeded);
+    double occupancy;
+    TColor::E color = Keeper.EstimateSpaceColor(keeperOwner, chunksNeeded, &occupancy);
     if (color >= TColor::RED && !isAllowedForSpaceRed) {
         return false;
     }
@@ -1288,6 +1289,11 @@ void TPDisk::ProcessReadLogResult(const NPDisk::TEvReadLogResult &evReadLogResul
                 params.TotalChunks = Format.DiskSizeChunks();
                 params.ExpectedOwnerCount = Cfg->ExpectedSlotCount;
                 params.SysLogSize = Format.SystemChunkCount; // sysLogSize = chunk 0 + additional SysLog chunks
+                if (Format.IsDiskSmall() && Cfg->FeatureFlags.GetEnableSmallDiskOptimization()) {
+                    params.SeparateCommonLog = false;
+                } else {
+                    params.SeparateCommonLog = true;
+                }
                 params.CommonLogSize = LogChunks.size();
                 params.SpaceColorBorder = Cfg->SpaceColorBorder;
                 for (ui32 ownerId = OwnerBeginUser; ownerId < OwnerEndUser; ++ownerId) {

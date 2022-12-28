@@ -18,7 +18,7 @@ static const bool ENABLE_SCHEMESHARD_LOG = true;
 static const bool ENABLE_DATASHARD_LOG = false;
 static const bool ENABLE_COORDINATOR_MEDIATOR_LOG = false;
 static const bool ENABLE_SCHEMEBOARD_LOG = false;
-static const bool ENABLE_OLAP_LOG = false;
+static const bool ENABLE_COLUMNSHARD_LOG = false;
 static const bool ENABLE_EXPORT_LOG = false;
 
 using namespace NKikimr;
@@ -230,10 +230,10 @@ private:
         if (!SchemeTxWaiters.contains(txId))
             return;
 
-        // Notifify all waiters and forget TxId
+        // Notify all waiters and forget TxId
         for (TActorId waiter : SchemeTxWaiters[txId]) {
             LOG_DEBUG_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
-                        "tests -- TTxNotificationSubscriber satisfy subsriber"
+                        "tests -- TTxNotificationSubscriber satisfy subscriber"
                         << ", waiter: " << waiter
                         << ", txId: " << txId);
             ctx.Send(waiter, new TEvSchemeShard::TEvNotifyTxCompletionResult(txId));
@@ -324,7 +324,7 @@ public:
     {}
 
 private:
-    using TPreSerialisedMessage = std::pair<ui32, TIntrusivePtr<TEventSerializedData>>; // ui32 it's a type
+    using TPreSerializedMessage = std::pair<ui32, TIntrusivePtr<TEventSerializedData>>; // ui32 it's a type
 
 private:
     void StateWork(TAutoPtr<NActors::IEventHandle> &ev, const NActors::TActorContext &ctx) {
@@ -379,7 +379,7 @@ private:
 
         // Save TxId, forward to schemeshard
         SchemeTxWaiters[txId] = ev->Sender;
-        OnlineRequests[txId] = GetSerialisedMessage(ev->ReleaseBase());
+        OnlineRequests[txId] = GetSerializedMessage(ev->ReleaseBase());
         SendToSchemeshard(txId, ctx);
     }
 
@@ -440,8 +440,8 @@ private:
             SchemeShardPipe = ctx.Register(NTabletPipe::CreateClient(ctx.SelfID, SchemeshardTabletId, GetPipeConfigWithRetries()));
         }
 
-        TPreSerialisedMessage& preSerialisedMessages = OnlineRequests[txId];
-        NTabletPipe::SendData(ctx, SchemeShardPipe, preSerialisedMessages.first, preSerialisedMessages.second, 0);
+        TPreSerializedMessage& preSerializedMessages = OnlineRequests[txId];
+        NTabletPipe::SendData(ctx, SchemeShardPipe, preSerializedMessages.first, preSerializedMessages.second, 0);
     }
 
     void Handle(TEvents::TEvPoisonPill::TPtr, const TActorContext &ctx) {
@@ -451,18 +451,18 @@ private:
         Die(ctx);
     }
 
-    TPreSerialisedMessage GetSerialisedMessage(TAutoPtr<IEventBase> message) {
+    TPreSerializedMessage GetSerializedMessage(TAutoPtr<IEventBase> message) {
         TAllocChunkSerializer serializer;
         const bool success = message->SerializeToArcadiaStream(&serializer);
         Y_VERIFY(success);
         TIntrusivePtr<TEventSerializedData> data = serializer.Release(message->IsExtendedFormat());
-        return TPreSerialisedMessage(message->Type(), data);
+        return TPreSerializedMessage(message->Type(), data);
     }
 
 private:
     ui64 SchemeshardTabletId;
     TActorId SchemeShardPipe;
-    THashMap<ui64, TPreSerialisedMessage> OnlineRequests;
+    THashMap<ui64, TPreSerializedMessage> OnlineRequests;
     THashMap<ui64, TActorId> SchemeTxWaiters;
 };
 
@@ -620,10 +620,8 @@ void NSchemeShardUT_Private::TTestEnv::SetupLogging(TTestActorRuntime &runtime) 
         runtime.SetLogPriority(NKikimrServices::TX_MEDIATOR_TABLETQUEUE, NActors::NLog::PRI_DEBUG);
     }
 
-    runtime.SetLogPriority(NKikimrServices::TX_OLAPSHARD, NActors::NLog::PRI_NOTICE);
     runtime.SetLogPriority(NKikimrServices::TX_COLUMNSHARD, NActors::NLog::PRI_NOTICE);
-    if (ENABLE_OLAP_LOG) {
-        runtime.SetLogPriority(NKikimrServices::TX_OLAPSHARD, NActors::NLog::PRI_DEBUG);
+    if (ENABLE_COLUMNSHARD_LOG) {
         runtime.SetLogPriority(NKikimrServices::TX_COLUMNSHARD, NActors::NLog::PRI_DEBUG);
     }
 }
@@ -693,11 +691,11 @@ void NSchemeShardUT_Private::TestWaitNotification(NActors::TTestActorRuntime &ru
 }
 
 void NSchemeShardUT_Private::TTestEnv::TestWaitNotification(NActors::TTestActorRuntime &runtime, TSet<ui64> txIds, ui64 schemeshardId) {
-    if (!TxNotificationSubcribers.contains(schemeshardId)) {
-        TxNotificationSubcribers[schemeshardId] = CreateNotificationSubscriber(runtime, schemeshardId);
+    if (!TxNotificationSubscribers.contains(schemeshardId)) {
+        TxNotificationSubscribers[schemeshardId] = CreateNotificationSubscriber(runtime, schemeshardId);
     }
 
-    NSchemeShardUT_Private::TestWaitNotification(runtime, txIds, TxNotificationSubcribers.at(schemeshardId));
+    NSchemeShardUT_Private::TestWaitNotification(runtime, txIds, TxNotificationSubscribers.at(schemeshardId));
 }
 
 void NSchemeShardUT_Private::TTestEnv::TestWaitNotification(TTestActorRuntime &runtime, int txId, ui64 schemeshardId) {
@@ -878,7 +876,11 @@ NSchemeShardUT_Private::TTestWithReboots::TTestWithReboots(bool killOnCommit, NS
 }
 
 void NSchemeShardUT_Private::TTestWithReboots::Run(std::function<void (TTestActorRuntime &, bool &)> testScenario) {
-    Run(testScenario, true);
+    //NOTE: Run testScenario only with (datashard) log batching disabled.
+    // It is safe because log batching could only hide problems by potentially "glueing"
+    // sequential transactions together and thus eliminating a chance of something bad happen
+    // in between those transactions. So running tests without log batching is more thorough.
+    // (Also tests run slightly faster without log batching).
     Run(testScenario, false);
 }
 

@@ -181,7 +181,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardMoveTest) {
                            {NLs::PathNotExist});
 
         {
-            //seccess op
+            //success op
             ++txId;
             auto first = MoveTableRequest(txId,  "/MyRoot/Table2", "/MyRoot/Moved2");
             auto second = MoveTableRequest(txId,  "/MyRoot/Table1", "/MyRoot/Table2");
@@ -662,6 +662,47 @@ Y_UNIT_TEST_SUITE(TSchemeShardMoveTest) {
                             NLs::ShardsInsideDomain(0)});
     }
 
+    Y_UNIT_TEST(ResetCachedPath) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        ui64 txId = 100;
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+              Name: "Table"
+              Columns { Name: "key"   Type: "Uint32" }
+              Columns { Name: "value" Type: "Utf8" }
+              KeyColumnNames: ["key"]
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        // split table to cache current path
+        TestSplitTable(runtime, ++txId, "/MyRoot/Table", Sprintf(R"(
+            SourceTabletId: %lu
+            SplitBoundary {
+                KeyPrefix {
+                    Tuple { Optional { Uint32: 2 } }
+                }
+            }
+        )", TTestTxConfig::FakeHiveTablets));
+        env.TestWaitNotification(runtime, txId);
+
+        TestMoveTable(runtime, ++txId, "/MyRoot/Table", "/MyRoot/TableMove");
+        env.TestWaitNotification(runtime, txId);
+
+        // another split to override path with a previously cached value
+        TestSplitTable(runtime, ++txId, "/MyRoot/TableMove", Sprintf(R"(
+            SourceTabletId: %lu
+            SourceTabletId: %lu
+        )", TTestTxConfig::FakeHiveTablets + 1, TTestTxConfig::FakeHiveTablets + 2));
+        env.TestWaitNotification(runtime, txId);
+
+        TestAlterTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "TableMove"
+            Columns { Name: "add" Type: "Utf8" }
+        )");
+        env.TestWaitNotification(runtime, txId);
+    }
+
     Y_UNIT_TEST(Index) {
         TTestBasicRuntime runtime;
         TTestEnv env(runtime);
@@ -947,7 +988,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardMoveTest) {
         )");
         env.TestWaitNotification(runtime, txId);
 
-        AsyncBuilIndex(runtime,  ++txId, TTestTxConfig::SchemeShard, "/MyRoot", "/MyRoot/Table", "Sync", {"value0"});
+        AsyncBuildIndex(runtime,  ++txId, TTestTxConfig::SchemeShard, "/MyRoot", "/MyRoot/Table", "Sync", {"value0"});
 
         TVector<THolder<IEventHandle>> suppressed;
         auto id = txId;
@@ -1020,13 +1061,13 @@ Y_UNIT_TEST_SUITE(TSchemeShardMoveTest) {
         UNIT_ASSERT(req1.GetErrors().empty());
 
         {
-            TVector<THolder<IEventHandle>> supressed;
-            auto defOberver = SetSuppressObserver(runtime, supressed, NDataShard::TEvChangeExchange::EvApplyRecords);
+            TVector<THolder<IEventHandle>> suppressed;
+            auto defObserver = SetSuppressObserver(runtime, suppressed, NDataShard::TEvChangeExchange::EvApplyRecords);
 
             req1.Plan(TTestTxConfig::Coordinator);
 
-            WaitForSuppressed(runtime, supressed, 1, defOberver);
-            UNIT_ASSERT(supressed.size() == 1);
+            WaitForSuppressed(runtime, suppressed, 1, defObserver);
+            UNIT_ASSERT(suppressed.size() == 1);
         }
 
         {

@@ -85,7 +85,14 @@ void MakeAuditLog(const TTxId& txId, const THolder<TProposeResponse>& response, 
             AUDIT_PART("subject", context.GetSubject())
             AUDIT_PART("status", NKikimrScheme::EStatus_Name(response->Record.GetStatus()))
             AUDIT_PART("reason", response->Record.GetReason(), response->Record.HasReason())
-            AUDIT_PART("operation", (*it).ToString())
+            AUDIT_PART("operation", it->GetOperation())
+            AUDIT_PART("path", it->GetPath())
+            AUDIT_PART("src path", it->GetSrcPath())
+            AUDIT_PART("dst path", it->GetDstPath())
+            AUDIT_PART("set owner", it->GetSetOwner())
+            AUDIT_PART("add access", it->GetAddAccess())
+            AUDIT_PART("remove access", it->GetRemoveAccess())
+            AUDIT_PART("protobuf request", it->GetProtoRequest())
         );
     }
 }
@@ -1154,7 +1161,7 @@ ISubOperationBase::TPtr TOperation::ConstructPart(NKikimrSchemeOp::EOperationTyp
         Y_FAIL("multipart operations are handled before, also they require transaction details");
 
     case NKikimrSchemeOp::EOperationType::ESchemeOp_DEPRECATED_35:
-        Y_FAIL("imposible");
+        Y_FAIL("impossible");
 
     // Move
     case NKikimrSchemeOp::EOperationType::ESchemeOpMoveTable:
@@ -1162,7 +1169,7 @@ ISubOperationBase::TPtr TOperation::ConstructPart(NKikimrSchemeOp::EOperationTyp
     case NKikimrSchemeOp::EOperationType::ESchemeOpMoveTableIndex:
         return CreateMoveTableIndex(NextPartId(), tx);
     case NKikimrSchemeOp::EOperationType::ESchemeOpMoveIndex:
-        Y_FAIL("imposible");
+        Y_FAIL("impossible");
 
     // Replication
     case NKikimrSchemeOp::EOperationType::ESchemeOpCreateReplication:
@@ -1269,15 +1276,15 @@ void TOperation::AddNotifySubscriber(const TActorId& actorId) {
 void TOperation::DoNotify(TSchemeShard*, TSideEffects& sideEffects, const TActorContext& ctx) {
     Y_VERIFY(IsReadyToNotify());
 
-    for (auto& subsriber: Subscribers) {
+    for (auto& subscriber: Subscribers) {
         THolder<TEvSchemeShard::TEvNotifyTxCompletionResult> msg = MakeHolder<TEvSchemeShard::TEvNotifyTxCompletionResult>(ui64(TxId));
         LOG_DEBUG_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
                     "TOperation DoNotify"
                         << " send TEvNotifyTxCompletionResult"
-                        << " to actorId: " << subsriber
+                        << " to actorId: " << subscriber
                         << " message: " << msg->Record.ShortDebugString());
 
-        sideEffects.Send(subsriber, msg.Release(), ui64(TxId));
+        sideEffects.Send(subscriber, msg.Release(), ui64(TxId));
     }
 
     Subscribers.clear();

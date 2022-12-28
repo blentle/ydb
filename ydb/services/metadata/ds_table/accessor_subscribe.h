@@ -1,11 +1,11 @@
 #pragma once
 #include "accessor_refresh.h"
 
-namespace NKikimr::NMetadataProvider {
+namespace NKikimr::NMetadata::NProvider {
 
 class TDSAccessorNotifier;
 
-class TEvAsk: public NActors::TEventLocal<TEvAsk, EEvSubscribe::EvAskLocal> {
+class TEvAsk: public NActors::TEventLocal<TEvAsk, EEvents::EvAskLocal> {
 private:
     YDB_READONLY_DEF(TActorId, RequesterId);
 public:
@@ -15,7 +15,7 @@ public:
     }
 };
 
-class TEvSubscribe: public NActors::TEventLocal<TEvSubscribe, EEvSubscribe::EvSubscribeLocal> {
+class TEvSubscribe: public NActors::TEventLocal<TEvSubscribe, EEvents::EvSubscribeLocal> {
 private:
     YDB_READONLY_DEF(TActorId, SubscriberId);
 public:
@@ -25,7 +25,7 @@ public:
     }
 };
 
-class TEvUnsubscribe: public NActors::TEventLocal<TEvUnsubscribe, EEvSubscribe::EvUnsubscribeLocal> {
+class TEvUnsubscribe: public NActors::TEventLocal<TEvUnsubscribe, EEvents::EvUnsubscribeLocal> {
 private:
     YDB_READONLY_DEF(TActorId, SubscriberId);
 public:
@@ -41,15 +41,11 @@ private:
     std::set<NActors::TActorId> Subscribed;
     std::map<TInstant, std::set<NActors::TActorId>> Asked;
 protected:
-    virtual void RegisterState() override {
-        Become(&TDSAccessorNotifier::StateMain);
-    }
+    virtual void OnBootstrap() override;
     virtual void OnSnapshotModified() override;
     virtual void OnSnapshotRefresh() override;
 public:
-    using TBase::Handle;
-
-    TDSAccessorNotifier(const TConfig& config, ISnapshotsFetcher::TPtr sParser)
+    TDSAccessorNotifier(const TConfig& config, NFetcher::ISnapshotsFetcher::TPtr sParser)
         : TBase(config, sParser) {
     }
 
@@ -73,7 +69,7 @@ class TExternalData: public TDSAccessorNotifier {
 private:
     using TBase = TDSAccessorNotifier;
 public:
-    TExternalData(const TConfig& config, ISnapshotsFetcher::TPtr sParser)
+    TExternalData(const TConfig& config, NFetcher::ISnapshotsFetcher::TPtr sParser)
         : TBase(config, sParser) {
 
     }

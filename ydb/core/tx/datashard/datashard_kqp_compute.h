@@ -122,6 +122,9 @@ private:
 class TKqpDatashardApplyContext : public NUdf::IApplyContext {
 public:
     IEngineFlatHost* Host = nullptr;
+    TKqpTableStats* ShardTableStats = nullptr;
+    TKqpTableStats* TaskTableStats = nullptr;
+    TTypeEnvironment* Env = nullptr;
 };
 
 IComputationNode* WrapKqpWideReadTableRanges(TCallable& callable, const TComputationNodeFactoryContext& ctx,

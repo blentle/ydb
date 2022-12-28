@@ -54,7 +54,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
                 new NPDisk::TEvCheckSpace(1, 1),
                 NKikimrProto::CORRUPTED);
         testCtx.TestResponse<NPDisk::TEvLogResult>(
-                new NPDisk::TEvLog(1, 1, 0, TContiguousData(TString()), TLsnSeg(1, 1), nullptr),
+                new NPDisk::TEvLog(1, 1, 0, TRcBuf(TString()), TLsnSeg(1, 1), nullptr),
                 NKikimrProto::CORRUPTED);
         testCtx.TestResponse<NPDisk::TEvReadLogResult>(
                 new NPDisk::TEvReadLog(1, 1, NPDisk::TLogPosition{0, 0}),
@@ -338,7 +338,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         ui32 lsn = 2;
         for (ui32 i = 0; i < 100'000; ++i) {
             testCtx.Send(new NPDisk::TEvLog(evInitRes->PDiskParams->Owner, evInitRes->PDiskParams->OwnerRound, 0,
-                        TContiguousData(TString("abc")), TLsnSeg(lsn, lsn), nullptr));
+                        TRcBuf(TString("abc")), TLsnSeg(lsn, lsn), nullptr));
             ++lsn;
             const auto logRes = testCtx.Recv<NPDisk::TEvLogResult>();
             if (logRes->Status != NKikimrProto::OK) {
@@ -466,7 +466,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
 
         //ui32 errors = 0;
         ui32 lsn = 2;
-        TContiguousData logData = TContiguousData(PrepareData(4096));
+        TRcBuf logData = TRcBuf(PrepareData(4096));
         for (ui32 i = 0; i < 1000; ++i) {
             testCtx.Send(new NPDisk::TEvLog(evInitRes->PDiskParams->Owner, evInitRes->PDiskParams->OwnerRound, 0,
                         logData, TLsnSeg(lsn, lsn), nullptr));
@@ -774,13 +774,46 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
     }
 
     Y_UNIT_TEST(SmallDisk) {
-        for (ui64 diskSizeGb : {512, 200, 100, 80, 40, 20}) {
-            Cerr << "DiskSize " << diskSizeGb << "GB" << Endl;
+        for (ui64 diskSizeGb : {40, 20, 10}) {
             ui64 diskSize = diskSizeGb << 30;
             TActorTestContext testCtx({ 
                 .IsBad = false,
                 .DiskSize = diskSize,
+                .SmallDisk = true,
             });
+
+            ui64 dataMb = 0;
+            for (ui32 i = 0; i < 200; ++i) {
+                TVDiskMock mock(&testCtx);
+                testCtx.Send(new NPDisk::TEvYardInit(mock.OwnerRound.fetch_add(1), mock.VDiskID, testCtx.TestCtx.PDiskGuid));
+                const auto evInitRes = testCtx.Recv<NPDisk::TEvYardInitResult>();
+
+                if (evInitRes->Status == NKikimrProto::OK) {
+                    std::vector<ui32> chunks;
+                    while (true) {
+                        testCtx.Send(new NPDisk::TEvChunkReserve(evInitRes->PDiskParams->Owner, evInitRes->PDiskParams->OwnerRound, 1));
+                        auto resp = testCtx.Recv<NPDisk::TEvChunkReserveResult>();
+                        if (resp->Status == NKikimrProto::OK) {
+                            ui32 chunk = resp->ChunkIds.front();
+                            chunks.push_back(chunk);
+                            TString data(NPDisk::SmallDiskMaximumChunkSize, '0');
+                            testCtx.TestResponse<NPDisk::TEvChunkWriteResult>(new NPDisk::TEvChunkWrite(
+                                evInitRes->PDiskParams->Owner, evInitRes->PDiskParams->OwnerRound,
+                                chunk, 0, new NPDisk::TEvChunkWrite::TStrokaBackedUpParts(data), nullptr, false, 0), 
+                                NKikimrProto::OK);
+                            dataMb += NPDisk::SmallDiskMaximumChunkSize >> 20;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (chunks.empty()) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            UNIT_ASSERT_GE(dataMb, diskSizeGb * 1024 * 0.85);
         }
     }
 }

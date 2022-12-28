@@ -330,10 +330,27 @@ void FillLookup(const TKqpLookupTable& lookup, NKqpProto::TKqpPhyOpLookup& looku
     }
 }
 
-void FillOlapProgram(const TCoLambda& process, const TKikimrTableMetadata& tableMeta,
-    NKqpProto::TKqpPhyOpReadOlapRanges& readProto)
+std::vector<std::string> GetResultColumnNames(const NKikimr::NMiniKQL::TType* resultType) {
+    YQL_ENSURE(resultType->GetKind() == NKikimr::NMiniKQL::TType::EKind::Struct
+                || resultType->GetKind() == NKikimr::NMiniKQL::TType::EKind::Tuple);
+
+    auto* resultStructType = static_cast<const NKikimr::NMiniKQL::TStructType*>(resultType);
+    ui32 resultColsCount = resultStructType->GetMembersCount();
+
+    std::vector<std::string> resultColNames;
+    resultColNames.reserve(resultColsCount);
+
+    for (ui32 i = 0; i < resultColsCount; ++i) {
+        resultColNames.emplace_back(resultStructType->GetMemberName(i));
+    }
+    return resultColNames;
+}
+
+void FillOlapProgram(const TCoLambda& process, const NKikimr::NMiniKQL::TType* miniKqlResultType,
+    const TKikimrTableMetadata& tableMeta, NKqpProto::TKqpPhyOpReadOlapRanges& readProto)
 {
-    CompileOlapProgram(process, tableMeta, readProto);
+    auto resultColNames = GetResultColumnNames(miniKqlResultType);
+    CompileOlapProgram(process, tableMeta, readProto, resultColNames);
 }
 
 class TKqpQueryCompiler : public IKqpQueryCompiler {
@@ -355,7 +372,7 @@ public:
         Alloc.Acquire();
     }
 
-    bool CompilePhysicalQuery(const TKqpPhysicalQuery& query, const TKiDataQuery& dataQuery,
+    bool CompilePhysicalQuery(const TKqpPhysicalQuery& query, const TKiDataQueryBlocks& dataQueryBlocks,
         NKqpProto::TKqpPhyQuery& queryProto, TExprContext& ctx) final
     {
         TGuard<TScopedAlloc> allocGuard(Alloc);
@@ -364,23 +381,22 @@ public:
         YQL_ENSURE(querySettings.Type);
         queryProto.SetType(GetPhyQueryType(*querySettings.Type));
 
-        for (const auto& queryBlock : dataQuery.Blocks()) {
+        for (const auto& queryBlock : dataQueryBlocks) {
             auto queryBlockSettings = TKiDataQueryBlockSettings::Parse(queryBlock);
             if (queryBlockSettings.HasUncommittedChangesRead) {
                 queryProto.SetHasUncommittedChangesRead(true);
-                break;
             }
-        }
 
-        auto ops = TableOperationsToProto(dataQuery.Operations(), ctx);
-        for (auto& op : ops) {
-            const auto tableName = op.GetTable();
-            auto operation = static_cast<TYdbOperation>(op.GetOperation());
+            auto ops = TableOperationsToProto(queryBlock.Operations(), ctx);
+            for (auto& op : ops) {
+                const auto tableName = op.GetTable();
+                auto operation = static_cast<TYdbOperation>(op.GetOperation());
 
-            *queryProto.AddTableOps() = std::move(op);
+                *queryProto.AddTableOps() = std::move(op);
 
-            const auto& desc = TablesData->GetTable(Cluster, tableName);
-            TableDescriptionToTableInfo(desc, operation, *queryProto.MutableTableInfos());
+                const auto& desc = TablesData->GetTable(Cluster, tableName);
+                TableDescriptionToTableInfo(desc, operation, *queryProto.MutableTableInfos());
+            }
         }
 
         for (const auto& tx : query.Transactions()) {
@@ -527,8 +543,9 @@ private:
                 FillTable(readTableRanges.Table(), *tableOp.MutableTable());
                 FillColumns(readTableRanges.Columns(), *tableMeta, tableOp, true);
                 FillReadRanges(readTableRanges, *tableMeta, *tableOp.MutableReadOlapRange());
-                FillOlapProgram(readTableRanges.Process(), *tableMeta, *tableOp.MutableReadOlapRange());
-                FillResultType(readTableRanges.Process().Ref().GetTypeAnn(), *tableOp.MutableReadOlapRange());
+                auto miniKqlResultType = GetMKqlResultType(readTableRanges.Process().Ref().GetTypeAnn());
+                FillOlapProgram(readTableRanges.Process(), miniKqlResultType, *tableMeta, *tableOp.MutableReadOlapRange());
+                FillResultType(miniKqlResultType, *tableOp.MutableReadOlapRange());
             } else if (node.Maybe<TCoSort>()) {
                 hasSort = true;
             } else if (node.Maybe<TCoMapJoinCore>()) {
@@ -828,12 +845,17 @@ private:
         YQL_ENSURE(false, "Unexpected connection type: " << connection.CallableName());
     }
 
-    void FillResultType(const TTypeAnnotationNode* resultType, NKqpProto::TKqpPhyOpReadOlapRanges& opProto)
+    void FillResultType(NKikimr::NMiniKQL::TType* miniKqlResultType, NKqpProto::TKqpPhyOpReadOlapRanges& opProto)
+    {
+        ExportTypeToProto(miniKqlResultType, *opProto.MutableResultType());
+    }
+
+    NKikimr::NMiniKQL::TType* GetMKqlResultType(const TTypeAnnotationNode* resultType)
     {
         YQL_ENSURE(resultType->GetKind() == NYql::ETypeAnnotationKind::Flow, "Unexpected type: " << NYql::FormatType(resultType));
         TProgramBuilder pgmBuilder(TypeEnv, FuncRegistry);
         const auto resultItemType = resultType->Cast<TFlowExprType>()->GetItemType();
-        ExportTypeToProto(CompileType(pgmBuilder, *resultItemType), *opProto.MutableResultType());
+        return CompileType(pgmBuilder, *resultItemType);
     }
 
 private:

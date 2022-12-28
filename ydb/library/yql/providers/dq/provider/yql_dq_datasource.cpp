@@ -1,4 +1,5 @@
 #include "yql_dq_datasource.h"
+#include "yql_dq_datasource_constraints.h"
 #include "yql_dq_datasource_type_ann.h"
 #include "yql_dq_state.h"
 
@@ -34,15 +35,18 @@ using namespace NKikimr::NMiniKQL;
 using namespace NNodes;
 using namespace NDq;
 
+namespace {
+
 class TDqDataProviderSource: public TDataProviderBase {
 public:
-    TDqDataProviderSource(const TDqStatePtr& state, TExecTransformerFactory execTransformerFactory)
+    TDqDataProviderSource(const TDqState::TPtr& state, TExecTransformerFactory execTransformerFactory)
         : State(state)
         , ConfigurationTransformer([this]() {
             return MakeHolder<NCommon::TProviderConfigurationTransformer>(State->Settings, *State->TypeCtx, TString{DqProviderName});
         })
         , ExecTransformer([this, execTransformerFactory] () { return THolder<IGraphTransformer>(execTransformerFactory(State)); })
         , TypeAnnotationTransformer([] () { return CreateDqsDataSourceTypeAnnotationTransformer(); })
+        , ConstraintsTransformer([] () { return CreateDqDataSourceConstraintTransformer(); })
     { }
 
     TStringBuf GetName() const override {
@@ -52,6 +56,11 @@ public:
     IGraphTransformer& GetTypeAnnotationTransformer(bool instantOnly) override {
         Y_UNUSED(instantOnly);
         return *TypeAnnotationTransformer;
+    }
+
+    IGraphTransformer& GetConstraintTransformer(bool instantOnly, bool subGraph) override {
+        Y_UNUSED(instantOnly && subGraph);
+        return *ConstraintsTransformer;
     }
 
     IGraphTransformer& GetConfigurationTransformer() override {
@@ -117,8 +126,8 @@ public:
             return node;
         }
 
-        if (!TDqCnUnionAll::Match(node.Get())) {
-            ctx.AddError(TIssue(node->Pos(ctx), "Last connection must be union all"));
+        if (!(TDqCnUnionAll::Match(node.Get()) || TDqCnMerge::Match(node.Get()))) {
+            ctx.AddError(TIssue(node->Pos(ctx), "Last connection must be union all or merge"));
             return {};
         }
 
@@ -156,7 +165,7 @@ public:
     }
 
     bool CanPullResult(const TExprNode& node, TSyncMap& syncList, bool& canRef) override {
-        if (!TDqCnUnionAll::Match(&node)) {
+        if (!(TDqCnUnionAll::Match(&node) || TDqCnMerge::Match(&node))) {
             return false;
         }
 
@@ -226,17 +235,21 @@ public:
         if (ExecTransformer) {
             ExecTransformer->Rewind();
             TypeAnnotationTransformer->Rewind();
+            ConstraintsTransformer->Rewind();
         }
     }
 
 private:
-    TDqStatePtr State;
+    const TDqState::TPtr State;
     TLazyInitHolder<IGraphTransformer> ConfigurationTransformer;
     TLazyInitHolder<IGraphTransformer> ExecTransformer;
     TLazyInitHolder<TVisitorTransformerBase> TypeAnnotationTransformer;
+    TLazyInitHolder<IGraphTransformer> ConstraintsTransformer;
 };
 
-TIntrusivePtr<IDataProvider> CreateDqDataSource(const TDqStatePtr& state, TExecTransformerFactory execTransformerFactory) {
+}
+
+TIntrusivePtr<IDataProvider> CreateDqDataSource(const TDqState::TPtr& state, TExecTransformerFactory execTransformerFactory) {
     return new TDqDataProviderSource(state, execTransformerFactory);
 }
 

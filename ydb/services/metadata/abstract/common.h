@@ -11,9 +11,9 @@
 #include <ydb/core/base/events.h>
 #include <ydb/library/accessor/accessor.h>
 
-namespace NKikimr::NMetadataProvider {
+namespace NKikimr::NMetadata::NProvider {
 
-enum EEvSubscribe {
+enum EEvents {
     EvRefreshSubscriberData = EventSpaceBegin(TKikimrEvents::ES_METADATA_PROVIDER),
     EvRefresh,
     EvEnrichSnapshotResult,
@@ -28,16 +28,25 @@ enum EEvSubscribe {
     EvAlterObjects,
     EvPrepareManager,
     EvManagerPrepared,
+    EvTimeout,
+    EvTableDescriptionFailed,
+    EvTableDescriptionSuccess,
+    EvAccessorSimpleResult,
+    EvAccessorSimpleError,
+    EvAccessorSimpleTableAbsent,
+    EvPathExistsCheckFailed,
+    EvPathExistsCheckResult,
+    EvStartMetadataService,
     EvEnd
 };
 
-static_assert(EEvSubscribe::EvEnd < EventSpaceEnd(TKikimrEvents::ES_METADATA_PROVIDER), "expect EvEnd < EventSpaceEnd(TKikimrEvents::ES_METADATA_PROVIDER)");
+static_assert(EEvents::EvEnd < EventSpaceEnd(TKikimrEvents::ES_METADATA_PROVIDER), "expect EvEnd < EventSpaceEnd(TKikimrEvents::ES_METADATA_PROVIDER)");
 
 class TEvRefreshSubscriberData: public NActors::TEventLocal<TEvRefreshSubscriberData, EvRefreshSubscriberData> {
 private:
-    YDB_READONLY_DEF(ISnapshot::TPtr, Snapshot);
+    YDB_READONLY_DEF(NFetcher::ISnapshot::TPtr, Snapshot);
 public:
-    TEvRefreshSubscriberData(ISnapshot::TPtr snapshot)
+    TEvRefreshSubscriberData(NFetcher::ISnapshot::TPtr snapshot)
         : Snapshot(snapshot) {
 
     }

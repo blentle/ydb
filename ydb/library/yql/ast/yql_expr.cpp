@@ -570,6 +570,17 @@ namespace {
                         return nullptr;
 
                     return Expr.MakeType<TBlockExprType>(r);
+                } else if (content == TStringBuf("ChunkedBlock")) {
+                    if (node.GetChildrenCount() != 2) {
+                        AddError(node, "Bad chunked block type annotation");
+                        return nullptr;
+                    }
+
+                    auto r = CompileTypeAnnotationNode(*node.GetChild(1));
+                    if (!r)
+                        return nullptr;
+
+                    return Expr.MakeType<TChunkedBlockExprType>(r);
                 } else if (content == TStringBuf("Scalar")) {
                     if (node.GetChildrenCount() != 2) {
                         AddError(node, "Bad scalar type annotation");
@@ -833,6 +844,14 @@ namespace {
         {
             auto type = annotation.Cast<TBlockExprType>();
             auto self = TAstNode::NewLiteralAtom(TPosition(), TStringBuf("Block"), pool);
+            auto itemType = ConvertTypeAnnotationToAst(*type->GetItemType(), pool, refAtoms);
+            return TAstNode::NewList(TPosition(), pool, self, itemType);
+        }
+
+        case ETypeAnnotationKind::ChunkedBlock:
+        {
+            auto type = annotation.Cast<TChunkedBlockExprType>();
+            auto self = TAstNode::NewLiteralAtom(TPosition(), TStringBuf("ChunkedBlock"), pool);
             auto itemType = ConvertTypeAnnotationToAst(*type->GetItemType(), pool, refAtoms);
             return TAstNode::NewList(TPosition(), pool, self, itemType);
         }
@@ -2678,24 +2697,25 @@ TExprNode::TPtr TExprContext::FuseLambdas(const TExprNode& outer, const TExprNod
     auto body = ReplaceNodes(GetLambdaBody(inner), innerReplaces);
 
     TExprNode::TListType newBody;
+    auto outerBody = GetLambdaBody(outer);
     if (outerArgs.ChildrenSize() + 1U == inner.ChildrenSize()) {
         auto i = 0U;
         TNodeOnNodeOwnedMap outerReplaces(outerArgs.ChildrenSize());
         outerArgs.ForEachChild([&](const TExprNode& arg) {
             YQL_ENSURE(outerReplaces.emplace(&arg, std::move(body[i++])).second);
         });
-        newBody = ReplaceNodes(GetLambdaBody(outer), outerReplaces);
+        newBody = ReplaceNodes(std::move(outerBody), outerReplaces);
     } else if (1U == outerArgs.ChildrenSize()) {
-        const auto& outerBody = GetLambdaBody(outer);
         newBody.reserve(newBody.size() * body.size());
         for (auto item : body) {
             for (auto root : outerBody) {
                 newBody.emplace_back(ReplaceNode(TExprNode::TPtr(root), outerArgs.Head(), TExprNode::TPtr(item)));
             }
         }
+    } else {
+        YQL_ENSURE(outerBody.empty(), "Incompatible lambdas for fuse.");
     }
 
-    YQL_ENSURE(!newBody.empty(), "Incompatible lambdas for fuse.");
     return NewLambda(outer.Pos(), NewArguments(inner.Head().Pos(), std::move(newArgNodes)), std::move(newBody));
 }
 
@@ -3370,6 +3390,15 @@ const TBlockExprType* TMakeTypeImpl<TBlockExprType>::Make(TExprContext& ctx, con
         return found;
 
     return AddType<TBlockExprType>(ctx, hash, itemType);
+}
+
+const TChunkedBlockExprType* TMakeTypeImpl<TChunkedBlockExprType>::Make(TExprContext& ctx, const TTypeAnnotationNode* itemType) {
+    const auto hash = TChunkedBlockExprType::MakeHash(itemType);
+    TChunkedBlockExprType sample(hash, itemType);
+    if (const auto found = FindType(sample, ctx))
+        return found;
+
+    return AddType<TChunkedBlockExprType>(ctx, hash, itemType);
 }
 
 const TScalarExprType* TMakeTypeImpl<TScalarExprType>::Make(TExprContext& ctx, const TTypeAnnotationNode* itemType) {

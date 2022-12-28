@@ -4,25 +4,41 @@
 #include <util/generic/yexception.h>
 #include <vector>
 
+#include <util/digest/city.h>
+#include <util/generic/scope.h>
+
 namespace NKikimr {
 namespace NMiniKQL {
 
 //TODO: only POD key & payloads are now supported
-template <typename TKey, typename TEqual, typename THash, typename TDeriv>
+template <typename TKey, typename TEqual, typename THash, typename TAllocator, typename TDeriv>
 class TRobinHoodHashBase {
 protected:
     using TPSLStorage = i32;
 
     explicit TRobinHoodHashBase(ui64 initialCapacity = 1u << 8)
         : Capacity(initialCapacity)
+        , Allocator()
+        , SelfHash(GetSelfHash(this))
     {
         Y_ENSURE((Capacity & (Capacity - 1)) == 0);
     }
 
+    ~TRobinHoodHashBase() {
+        if (Data) {
+            Allocator.deallocate(Data, DataEnd - Data);
+        }
+    }
+
+    TRobinHoodHashBase(const TRobinHoodHashBase&) = delete;
+    TRobinHoodHashBase(TRobinHoodHashBase&&) = delete;
+    void operator=(const TRobinHoodHashBase&) = delete;
+    void operator=(TRobinHoodHashBase&&) = delete;
+
 public:
-    // returns payload pointer for Map or nullptr for Set
-    Y_FORCE_INLINE void* Insert(TKey key, bool& isNew) {
-        auto ret = InsertImpl(key, isNew, Capacity, Data);
+    // returns iterator
+    Y_FORCE_INLINE char* Insert(TKey key, bool& isNew) {
+        auto ret = InsertImpl(key, isNew, Capacity, Data, DataEnd);
         Size += isNew ? 1 : 0;
         return ret;
     }
@@ -39,19 +55,19 @@ public:
     }
 
     const char* Begin() const {
-        return Data.data();
+        return Data;
     }
 
     const char* End() const {
-        return Data.data() + Data.size();
+        return DataEnd;
     }
 
     char* Begin() {
-        return Data.data();
+        return Data;
     }
 
     char* End() {
-        return Data.data() + Data.size();
+        return DataEnd;
     }
 
     void Advance(char*& ptr) {
@@ -62,12 +78,20 @@ public:
         ptr += AsDeriv().GetCellSize();
     }
 
+    bool IsValid(const char* ptr) {
+        return GetPSL(ptr) >= 0;
+    }
+
     static const TPSLStorage& GetPSL(const char* ptr) {
         return *(const TPSLStorage*)ptr;
     }
 
     static const TKey& GetKey(const char* ptr) {
         return *(const TKey*)(ptr + sizeof(TPSLStorage));
+    }
+
+    static TKey& GetKey(char* ptr) {
+        return *(TKey*)(ptr + sizeof(TPSLStorage));
     }
 
     const void* GetPayload(const char* ptr) {
@@ -78,102 +102,113 @@ public:
         return *(TPSLStorage*)ptr;
     }
 
-    static TKey& GetKey(char* ptr) {
-        return *(TKey*)(ptr + sizeof(TPSLStorage));
-    }
-
-    void* GetPayload(char* ptr) {
+    void* GetMutablePayload(char* ptr) {
         return AsDeriv().GetPayloadImpl(ptr);
     }
 
 private:
-    Y_FORCE_INLINE void* InsertImpl(TKey key, bool& isNew, ui64 capacity, std::vector<char>& data) {
+    Y_FORCE_INLINE char* InsertImpl(TKey key, bool& isNew, ui64 capacity, char* data, char* dataEnd) {
         isNew = false;
-        ui64 bucket = THash()(key) & (capacity - 1);
-        char* ptr = data.data() + AsDeriv().GetCellSize() * bucket;
+        ui64 bucket = (SelfHash ^ THash()(key)) & (capacity - 1);
+        char* ptr = data + AsDeriv().GetCellSize() * bucket;
         TPSLStorage distance = 0;
-        void* returnPayload;
+        char* returnPtr;
+        typename TDeriv::TPayloadStore tmpPayload;
         for (;;) {
             if (GetPSL(ptr) < 0) {
                 isNew = true;
                 GetPSL(ptr) = distance;
                 GetKey(ptr) = key;
-                return GetPayload(ptr);
+                return ptr;
             }
 
             if (TEqual()(GetKey(ptr), key)) {
-                return GetPayload(ptr);
+                return ptr;
             }
 
             if (distance > GetPSL(ptr)) {
                 // swap keys & state
-                returnPayload = GetPayload(ptr);
+                returnPtr = ptr;
                 std::swap(distance, GetPSL(ptr));
                 std::swap(key, GetKey(ptr));
-                AsDeriv().SavePayload(returnPayload);
+                AsDeriv().SavePayload(GetPayload(ptr), tmpPayload);
                 isNew = true;
 
                 ++distance;
-                AdvancePointer(ptr, data);
+                AdvancePointer(ptr, data, dataEnd);
                 break;
             }
 
             ++distance;
-            AdvancePointer(ptr, data);
+            AdvancePointer(ptr, data, dataEnd);
         }
 
         for (;;) {
             if (GetPSL(ptr) < 0) {
                 GetPSL(ptr) = distance;
                 GetKey(ptr) = key;
-                AsDeriv().RestorePayload(GetPayload(ptr));
-                return returnPayload; // for original key
+                AsDeriv().RestorePayload(GetMutablePayload(ptr), tmpPayload);
+                return returnPtr; // for original key
             }
 
             if (distance > GetPSL(ptr)) {
                 // swap keys & state
                 std::swap(distance, GetPSL(ptr));
                 std::swap(key, GetKey(ptr));
-                AsDeriv().SwapPayload(GetPayload(ptr));
+                AsDeriv().SwapPayload(GetMutablePayload(ptr), tmpPayload);
             }
 
             ++distance;
-            AdvancePointer(ptr, data);
+            AdvancePointer(ptr, data, dataEnd);
         }
     }
 
     void Grow() {
-        std::vector<char> newData;
         auto newCapacity = Capacity * 2;
-        Allocate(newCapacity, newData);
+        char *newData, *newDataEnd;
+        Allocate(newCapacity, newData, newDataEnd);
+        Y_DEFER {
+            Allocator.deallocate(newData, newDataEnd - newData);
+        };
+
         for (auto iter = Begin(); iter != End(); Advance(iter)) {
             if (GetPSL(iter) < 0) {
                 continue;
             }
 
             bool isNew;
-            auto payload = InsertImpl(GetKey(iter), isNew, newCapacity, newData);
-            AsDeriv().CopyPayload(payload, GetPayload(iter));
+            auto newIter = InsertImpl(GetKey(iter), isNew, newCapacity, newData, newDataEnd);
+            Y_ASSERT(isNew);
+            AsDeriv().CopyPayload(GetMutablePayload(newIter), GetPayload(iter));
         }
 
-        Data.swap(newData);
         Capacity = newCapacity;
+        std::swap(Data, newData);
+        std::swap(DataEnd, newDataEnd);
     }
 
-    void AdvancePointer(char*& ptr, std::vector<char>& data) const {
+    void AdvancePointer(char*& ptr, char* begin, char* end) const {
         ptr += AsDeriv().GetCellSize();
-        ptr = (ptr == data.data() + data.size()) ? data.data() : ptr;
+        ptr = (ptr == end) ? begin : ptr;
+    }
+
+    static ui64 GetSelfHash(void* self) {
+        char buf[sizeof(void*)];
+        *(void**)buf = self;
+        return CityHash64(buf, sizeof(buf));
     }
 
 protected:
     void Init() {
-        Allocate(Capacity, Data);
+        Allocate(Capacity, Data, DataEnd);
     }
 
 private:
-    void Allocate(ui64 capacity, std::vector<char>& data) const {
-        data.resize(AsDeriv().GetCellSize() * capacity);
-        char* ptr = data.data();
+    void Allocate(ui64 capacity, char*& data, char*& dataEnd) {
+        ui64 bytes = capacity * AsDeriv().GetCellSize();
+        data = Allocator.allocate(bytes);
+        dataEnd = data + bytes;
+        char* ptr = data;
         for (ui64 i = 0; i < capacity; ++i) {
             GetPSL(ptr) = -1;
             ptr += AsDeriv().GetCellSize();
@@ -191,14 +226,18 @@ private:
 private:
     ui64 Size = 0;
     ui64 Capacity;
-    std::vector<char> Data;
+    TAllocator Allocator;
+    const ui64 SelfHash;
+    char* Data = nullptr;
+    char* DataEnd = nullptr;
 };
 
-template <typename TKey, typename TEqual = std::equal_to<TKey>, typename THash = std::hash<TKey>>
-class TRobinHoodHashMap : public TRobinHoodHashBase<TKey, TEqual, THash, TRobinHoodHashMap<TKey, TEqual, THash>> {
+template <typename TKey, typename TEqual = std::equal_to<TKey>, typename THash = std::hash<TKey>, typename TAllocator = std::allocator<char>>
+class TRobinHoodHashMap : public TRobinHoodHashBase<TKey, TEqual, THash, TAllocator, TRobinHoodHashMap<TKey, TEqual, THash, TAllocator>> {
 public:
-    using TSelf = TRobinHoodHashMap<TKey, TEqual, THash>;
-    using TBase = TRobinHoodHashBase<TKey, TEqual, THash, TSelf>;
+    using TSelf = TRobinHoodHashMap<TKey, TEqual, THash, TAllocator>;
+    using TBase = TRobinHoodHashBase<TKey, TEqual, THash, TAllocator, TSelf>;
+    using TPayloadStore = int;
 
     explicit TRobinHoodHashMap(ui32 payloadSize, ui64 initialCapacity = 1u << 8)
         : TBase(initialCapacity)
@@ -226,15 +265,18 @@ public:
         memcpy(dst, src, PayloadSize);
     }
 
-    void SavePayload(const void* p) {
+    void SavePayload(const void* p, int& store) {
+        Y_UNUSED(store);
         memcpy(TmpPayload.data(), p, PayloadSize);
     }
 
-    void RestorePayload(void* p) {
+    void RestorePayload(void* p, const int& store) {
+        Y_UNUSED(store);
         memcpy(p, TmpPayload.data(), PayloadSize);
     }
 
-    void SwapPayload(void* p) {
+    void SwapPayload(void* p, int& store) {
+        Y_UNUSED(store);
         memcpy(TmpPayload2.data(), p, PayloadSize);
         memcpy(p, TmpPayload.data(), PayloadSize);
         TmpPayload2.swap(TmpPayload);
@@ -243,14 +285,58 @@ public:
 private:
     const ui32 CellSize;
     const ui32 PayloadSize;
-    std::vector<char> TmpPayload, TmpPayload2;
+    using TVec = std::vector<char, TAllocator>;
+    TVec TmpPayload, TmpPayload2;
 };
 
-template <typename TKey, typename TEqual = std::equal_to<TKey>, typename THash = std::hash<TKey>>
-class TRobinHoodHashSet : public TRobinHoodHashBase<TKey, TEqual, THash, TRobinHoodHashSet<TKey, TEqual, THash>> {
+template <typename TKey, typename TPayload, typename TEqual = std::equal_to<TKey>, typename THash = std::hash<TKey>, typename TAllocator = std::allocator<char>>
+class TRobinHoodHashFixedMap : public TRobinHoodHashBase<TKey, TEqual, THash, TAllocator, TRobinHoodHashFixedMap<TKey, TPayload, TEqual, THash, TAllocator>> {
 public:
-    using TSelf = TRobinHoodHashSet<TKey, TEqual, THash>;
-    using TBase = TRobinHoodHashBase<TKey, TEqual, THash, TSelf>;
+    using TSelf = TRobinHoodHashFixedMap<TKey, TPayload, TEqual, THash, TAllocator>;
+    using TBase = TRobinHoodHashBase<TKey, TEqual, THash, TAllocator, TSelf>;
+    using TPayloadStore = TPayload;
+
+    explicit TRobinHoodHashFixedMap(ui64 initialCapacity = 1u << 8)
+        : TBase(initialCapacity)
+    {
+        TBase::Init();
+    }
+
+    ui32 GetCellSize() const {
+        return sizeof(typename TBase::TPSLStorage) + sizeof(TKey) + sizeof(TPayload);
+    }
+
+    void* GetPayloadImpl(char* ptr) {
+        return ptr + sizeof(typename TBase::TPSLStorage) + sizeof(TKey);
+    }
+
+    const void* GetPayloadImpl(const char* ptr) {
+        return ptr + sizeof(typename TBase::TPSLStorage) + sizeof(TKey);
+    }
+
+    void CopyPayload(void* dst, const void* src) {
+        *(TPayload*)dst = *(const TPayload*)src;
+    }
+
+    void SavePayload(const void* p, TPayload& store) {
+        store = *(const TPayload*)p;
+    }
+
+    void RestorePayload(void* p, const TPayload& store) {
+        *(TPayload*)p = store;
+    }
+
+    void SwapPayload(void* p, TPayload& store) {
+        std::swap(*(TPayload*)p, store);
+    }
+};
+
+template <typename TKey, typename TEqual = std::equal_to<TKey>, typename THash = std::hash<TKey>, typename TAllocator = std::allocator<char>>
+class TRobinHoodHashSet : public TRobinHoodHashBase<TKey, TEqual, THash, TAllocator, TRobinHoodHashSet<TKey, TEqual, THash, TAllocator>> {
+public:
+    using TSelf = TRobinHoodHashSet<TKey, TEqual, THash, TAllocator>;
+    using TBase = TRobinHoodHashBase<TKey, TEqual, THash, TAllocator, TSelf>;
+    using TPayloadStore = int;
 
     explicit TRobinHoodHashSet(ui64 initialCapacity = 1u << 8)
         : TBase(initialCapacity)
@@ -277,16 +363,19 @@ public:
         Y_UNUSED(src);
     }
 
-    void SavePayload(const void* p) {
+    void SavePayload(const void* p, int& store) {
         Y_UNUSED(p);
+        Y_UNUSED(store);
     }
 
-    void RestorePayload(void* p) {
+    void RestorePayload(void* p, const int& store) {
         Y_UNUSED(p);
+        Y_UNUSED(store);
     }
 
-    void SwapPayload(void* p) {
+    void SwapPayload(void* p, int& store) {
         Y_UNUSED(p);
+        Y_UNUSED(store);
     }
 };
 

@@ -51,6 +51,9 @@ using namespace NYql;
 
 namespace NSQLTranslationV1 {
 
+TNodePtr BuildSqlCall(TContext& ctx, TPosition pos, const TString& module, const TString& name, const TVector<TNodePtr>& args,
+    TNodePtr positionalArgs, TNodePtr namedArgs, TNodePtr customUserType, const TDeferredAtom& typeConfig, TNodePtr runConfig);
+
 using NALPDefault::SQLv1LexerTokens;
 
 using namespace NSQLv1Generated;
@@ -1107,6 +1110,24 @@ public:
     TNodePtr BuildCall() {
         TVector<TNodePtr> args;
         bool warnOnYqlNameSpace = true;
+
+        TUdfNode* udf_node = Node ? dynamic_cast<TUdfNode*>(Node.Get()) : nullptr;
+        if (udf_node) {
+            if (!udf_node->DoInit(Ctx, nullptr)) {
+                return nullptr;
+            }
+            TNodePtr positional_args = BuildTuple(Pos, PositionalArgs);
+            TNodePtr positional = positional_args->Y("TypeOf", positional_args);
+            TNodePtr named_args = BuildStructure(Pos, NamedArgs);
+            TNodePtr named = named_args->Y("TypeOf", named_args);
+
+            TNodePtr custom_user_type = new TCallNodeImpl(Pos, "TupleType", {positional, named, udf_node->GetExternalTypes()});
+
+            return BuildSqlCall(Ctx, Pos, udf_node->GetModule(), udf_node->GetFunction(),
+                                args, positional_args, named_args, custom_user_type,
+                                udf_node->GetTypeConfig(), udf_node->GetRunConfig());
+        }
+
         if (Node && !Node->FuncName()) {
             Module = "YQL";
             Func = NamedArgs.empty() ? "Apply" : "NamedApply";
@@ -9634,7 +9655,7 @@ TNodePtr TSqlQuery::PragmaStatement(const TRule_pragma_stmt& stmt, bool& success
             Ctx.PragmaAllowDotInAlias = true;
             Ctx.IncrementMonCounter("sql_pragma", "AllowDotInAlias");
         } else if (normalizedPragma == "udf") {
-            if (values.size() != 1 || pragmaValueDefault) {
+            if ((values.size() != 1 && values.size() != 2) || pragmaValueDefault) {
                 Error() << "Expected file alias as pragma value";
                 Ctx.IncrementMonCounter("sql_errors", "BadPragmaValue");
                 return {};
@@ -10058,9 +10079,15 @@ TNodePtr TSqlQuery::PragmaStatement(const TRule_pragma_stmt& stmt, bool& success
         } else if (normalizedPragma == "emitaggapply") {
             Ctx.EmitAggApply = true;
             Ctx.IncrementMonCounter("sql_pragma", "EmitAggApply");
+        } else if (normalizedPragma == "disableemitaggapply") {
+            Ctx.EmitAggApply = false;
+            Ctx.IncrementMonCounter("sql_pragma", "DisableEmitAggApply");
         } else if (normalizedPragma == "useblocks") {
             Ctx.UseBlocks = true;
             Ctx.IncrementMonCounter("sql_pragma", "UseBlocks");
+        } else if (normalizedPragma == "disableuseblocks") {
+            Ctx.UseBlocks = false;
+            Ctx.IncrementMonCounter("sql_pragma", "DisableUseBlocks");
         } else {
             Error() << "Unknown pragma: " << pragma;
             Ctx.IncrementMonCounter("sql_errors", "UnknownPragma");

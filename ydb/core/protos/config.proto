@@ -66,6 +66,10 @@ message TActorSystemConfig {
         optional uint32 MaxThreads = 13; // Higher balancing bound, should be not lower than `Threads`
         optional uint32 BalancingPriority = 14; // Priority of pool to obtain cpu due to balancing (higher is better)
         optional uint64 ToleratedLatencyUs = 15; // p100-latency threshold indicating that more cpus are required by pool
+
+        // Actorsystem 1.4
+        optional int32 Priority = 16;
+        optional int32 MaxAvgPingDeviation = 17;
     }
 
     message TScheduler {
@@ -711,7 +715,7 @@ message TFeatureFlags {
     optional bool AllowStreamExecuteYqlScript = 42 [default = true];
     optional bool EnableKqpScanOverPersistentSnapshot = 43 [default = true]; // deprecated: always true
     optional bool EnableOlapSchemaOperations = 44 [default = true];
-    optional bool EnableVPatch = 45 [default = true];
+    optional bool EnableVPatch = 45 [default = false];
     optional bool EnableMvccSnapshotReads = 46 [default = true];
     optional Tribool EnableMvcc = 47 [default = VALUE_TRUE];
     optional bool EnableSchemeTransactionsAtSchemeShard = 48 [default = true];
@@ -746,13 +750,16 @@ message TFeatureFlags {
     optional bool EnableKqpDataQueryStreamLookup = 75 [default = false];
     optional bool EnableBorrowedSplitCompaction = 76 [default = true];
     optional bool EnableChangefeedInitialScan = 77 [default = false];
-    optional bool EnableKqpScanQuerySourceRead = 78 [default = false];
+    reserved 78; // EnableKqpScanQuerySourceRead
     optional bool EnableDynamicNodeAuthorization = 79 [default = false];
     optional bool EnableKqpImmediateEffects = 80 [default = false];
     optional bool EnableDataShardGenericReadSets = 81 [default = false];
     // enable alter database operation to create subdomain's system tablets
     // directly in subdomain's hive
     optional bool EnableAlterDatabaseCreateHiveFirst = 82 [default = false];
+    reserved 83; // EnableKqpDataQuerySourceRead
+    optional bool EnableSmallDiskOptimization = 84 [default = true];
+    optional bool EnableDataShardVolatileTransactions = 85 [default = false];
 }
 
 
@@ -1065,7 +1072,7 @@ message TTableServiceConfig {
         reserved 13;
         reserved 14;
         optional TShardsScanningPolicy ShardsScanningPolicy = 16;
-        optional uint64 KqpPatternCacheCapacityBytes = 17 [default = 0]; // 0 is for disable
+        optional uint64 KqpPatternCacheCapacityBytes = 17 [default = 104857600]; // 100 MiB, 0 is for disable
     }
 
     message TSpillingServiceConfig {
@@ -1203,6 +1210,9 @@ message TTableServiceConfig {
     reserved 23; // optional bool EnableKqpSessionActor = 23 [default = true];
     reserved 24; // optional bool EnableKqpPatternCacheLiteral = 24 [default = false];
     reserved 25; // optional bool EnableKqpPatternCacheCompute = 25 [default = false];
+
+    optional bool EnableKqpScanQuerySourceRead = 26 [default = false];
+    optional bool EnableKqpDataQuerySourceRead = 27 [default = false];
 };
 
 // Config describes immediate controls and allows
@@ -1392,7 +1402,8 @@ message TAuditConfig {
     }
 
     optional string AuditFilePath = 1;
-    optional EFormat Format = 2;
+    optional EFormat Format = 2 [default = JSON];
+    optional string LogName = 3;
 };
 
 message THiveTabletLimit {

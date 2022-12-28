@@ -61,4 +61,8 @@ Below are examples of the code for authentication based on a username and token 
   }
   ```
 
+- Node.js
+
+  {% include [auth-static](../../../../_includes/nodejs/auth-static.md) %}
+
 {% endlist %}

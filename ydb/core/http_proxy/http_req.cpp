@@ -6,6 +6,7 @@
 
 #include <library/cpp/actors/http/http_proxy.h>
 #include <library/cpp/cgiparam/cgiparam.h>
+#include <library/cpp/digest/old_crc/crc.h>
 #include <library/cpp/http/misc/parsed_request.h>
 #include <library/cpp/http/server/response.h>
 #include <library/cpp/json/json_reader.h>
@@ -197,6 +198,7 @@ namespace NKikimr::NHttpProxy {
     constexpr TStringBuf REQUEST_FORWARDED_FOR = "x-forwarded-for";
     constexpr TStringBuf REQUEST_TARGET_HEADER = "x-amz-target";
     constexpr TStringBuf REQUEST_CONTENT_TYPE_HEADER = "content-type";
+    constexpr TStringBuf CRC32_HEADER = "x-amz-crc32";
     static const TString CREDENTIAL_PARAM = "credential";
 
     template<class TProtoService, class TProtoRequest, class TProtoResponse, class TProtoResult, class TProtoCall, class TRpcEv>
@@ -392,6 +394,18 @@ namespace NKikimr::NHttpProxy {
             }
 
             void ReplyWithError(const TActorContext& ctx, NYdb::EStatus status, const TString& errorText) {
+                /* deprecated metric: */ ctx.Send(MakeMetricsServiceID(),
+                         new TEvServerlessProxy::TEvCounter{
+                             1, true, true,
+                             {{"method", Method},
+                              {"cloud", HttpContext.CloudId},
+                              {"folder", HttpContext.FolderId},
+                              {"database", HttpContext.DatabaseId},
+                              {"stream", HttpContext.StreamName},
+                              {"code", TStringBuilder() << (int)StatusToHttpCode(status)},
+                              {"name", "api.http.errors_per_second"}}
+                         });
+
                 ctx.Send(MakeMetricsServiceID(),
                          new TEvServerlessProxy::TEvCounter{
                              1, true, true,
@@ -402,9 +416,9 @@ namespace NKikimr::NHttpProxy {
                               {"database_id", HttpContext.DatabaseId},
                               {"topic", HttpContext.StreamName},
                               {"code", TStringBuilder() << (int)StatusToHttpCode(status)},
-                              {"name", "api.data_streams.errors_per_second"}}
+                              {"name", "api.http.data_streams.response.count"}}
                          });
-
+                //TODO: add api.http.response.count
                 HttpContext.ResponseData.Status = status;
                 HttpContext.ResponseData.ErrorText = errorText;
                 HttpContext.DoReply(ctx);
@@ -432,10 +446,15 @@ namespace NKikimr::NHttpProxy {
                     }
 
                     FillInputCustomMetrics<TProtoRequest>(Request, HttpContext, ctx);
+                    /* deprecated metric: */ ctx.Send(MakeMetricsServiceID(),
+                             new TEvServerlessProxy::TEvCounter{1, true, true,
+                                 BuildLabels(Method, HttpContext, "api.http.requests_per_second", setStreamPrefix)
+                             });
                     ctx.Send(MakeMetricsServiceID(),
                              new TEvServerlessProxy::TEvCounter{1, true, true,
-                                 BuildLabels(Method, HttpContext, "api.data_streams.requests_per_second")
+                                 BuildLabels(Method, HttpContext, "api.http.data_streams.request.count")
                              });
+                    //TODO: add api.http.request.count
                     CreateClient(ctx);
                     return;
                 }
@@ -445,10 +464,15 @@ namespace NKikimr::NHttpProxy {
 
             void ReportLatencyCounters(const TActorContext& ctx) {
                 TDuration dur = ctx.Now() - StartTime;
+                /* deprecated metric: */ ctx.Send(MakeMetricsServiceID(),
+                         new TEvServerlessProxy::TEvHistCounter{static_cast<i64>(dur.MilliSeconds()), 1,
+                             BuildLabels(Method, HttpContext, "api.http.requests_duration_milliseconds", setStreamPrefix)
+                        });
                 ctx.Send(MakeMetricsServiceID(),
                          new TEvServerlessProxy::TEvHistCounter{static_cast<i64>(dur.MilliSeconds()), 1,
-                             BuildLabels(Method, HttpContext, "api.data_streams.requests_duration_milliseconds")
+                             BuildLabels(Method, HttpContext, "api.http.data_streams.response.duration_milliseconds")
                         });
+                //TODO: add api.http.response.duration_milliseconds
             }
 
             void HandleGrpcResponse(TEvServerlessProxy::TEvGrpcRequestResult::TPtr ev,
@@ -459,11 +483,22 @@ namespace NKikimr::NHttpProxy {
                         *(dynamic_cast<TProtoResult*>(ev->Get()->Message.Get())), HttpContext, ctx);
                     ReportLatencyCounters(ctx);
 
-                    ctx.Send(MakeMetricsServiceID(),
+                    /* deprecated metric: */ ctx.Send(MakeMetricsServiceID(),
                              new TEvServerlessProxy::TEvCounter{1, true, true,
-                                 BuildLabels(Method, HttpContext, "api.data_streams.success_per_second")
+                                 BuildLabels(Method, HttpContext, "api.http.success_per_second", setStreamPrefix)
                              });
-
+                    ctx.Send(MakeMetricsServiceID(),
+                             new TEvServerlessProxy::TEvCounter{
+                                 1, true, true,
+                                 {{"database", HttpContext.DatabaseName},
+                                  {"method", Method},
+                                  {"cloud_id", HttpContext.CloudId},
+                                  {"folder_id", HttpContext.FolderId},
+                                  {"database_id", HttpContext.DatabaseId},
+                                  {"topic", HttpContext.StreamName},
+                                  {"code", "200"},
+                                  {"name", "api.http.data_streams.response.count"}}
+                         });
                     HttpContext.DoReply(ctx);
                 } else {
                     auto retryClass =
@@ -646,7 +681,7 @@ namespace NKikimr::NHttpProxy {
         if (DatabaseName == "/") {
            DatabaseName = "";
         }
-
+        //TODO: find out databaseId
         ParseHeaders(Request->Headers);
     }
 
@@ -674,8 +709,8 @@ namespace NKikimr::NHttpProxy {
                 new NHttp::THttpOutgoingResponse(request, "HTTP", "1.1", status, message);
             response->Set<&NHttp::THttpResponse::Connection>(request->GetConnection());
             response->Set(REQUEST_ID_HEADER_EXT, RequestId);
-
             if (!contentType.empty() && !body.empty()) {
+                response->Set(CRC32_HEADER, ToString(crc32(body.data(), body.size())));
                 response->Set<&NHttp::THttpResponse::ContentType>(contentType);
                 if (!request->Endpoint->CompressContentTypes.empty()) {
                     contentType = contentType.Before(';');
@@ -695,6 +730,16 @@ namespace NKikimr::NHttpProxy {
             }
             return response;
         };
+        auto strByMimeAws = [](MimeTypes contentType) {
+            switch (contentType) {
+            case MIME_JSON:
+                return "application/x-amz-json-1.1";
+            case MIME_CBOR:
+                return "application/x-amz-cbor-1.1";
+            default:
+                return strByMime(contentType);
+            }
+        };
 
         if (ResponseData.Status == NYdb::EStatus::SUCCESS) {
             LOG_SP_INFO_S(ctx, NKikimrServices::HTTP_PROXY, "reply ok");
@@ -707,11 +752,12 @@ namespace NKikimr::NHttpProxy {
             ResponseData.Body["message"] = ResponseData.ErrorText;
             ResponseData.Body["__type"] = StatusToErrorType(ResponseData.Status);
         }
+
         auto response = createResponse(
             Request,
             TStringBuilder() << (ui32)StatusToHttpCode(ResponseData.Status),
             StatusToErrorType(ResponseData.Status),
-            strByMime(ContentType),
+            strByMimeAws(ContentType),
             ResponseData.DumpBody(ContentType)
         );
 
@@ -749,7 +795,7 @@ namespace NKikimr::NHttpProxy {
         switch (contentType) {
         case MIME_CBOR: {
             auto toCborStr = NJson::WriteJson(Body, false);
-            auto toCbor =  nlohmann::json::to_cbor({toCborStr.begin(), toCborStr.end()});
+            auto toCbor = nlohmann::json::to_cbor(nlohmann::json::parse(toCborStr, nullptr, false));
             return {(char*)&toCbor[0], toCbor.size()};
         }
         default: {
@@ -760,8 +806,8 @@ namespace NKikimr::NHttpProxy {
     }
 
     void THttpRequestContext::RequestBodyToProto(NProtoBuf::Message* request) {
-        auto requestJsonStr = Request->Body;
-        if (requestJsonStr.empty()) {
+        TStringBuf requestStr = Request->Body;
+        if (requestStr.empty()) {
             throw NKikimr::NSQS::TSQSException(NKikimr::NSQS::NErrors::MALFORMED_QUERY_STRING) <<
                 "Empty body";
         }
@@ -771,28 +817,26 @@ namespace NKikimr::NHttpProxy {
             listStreamsRequest->set_recurse(true);
         }
 
-        std::string bufferStr;
         switch (ContentType) {
         case MIME_CBOR: {
-            // CborToProto(HttpContext.Request->Body, request);
-            auto fromCbor = nlohmann::json::from_cbor(Request->Body.begin(),
-                                                      Request->Body.end(), true, false);
+            auto fromCbor = nlohmann::json::from_cbor(requestStr.begin(), requestStr.end(),
+                                                      true, false,
+                                                      nlohmann::json::cbor_tag_handler_t::ignore);
             if (fromCbor.is_discarded()) {
                 throw NKikimr::NSQS::TSQSException(NKikimr::NSQS::NErrors::MALFORMED_QUERY_STRING) <<
                     "Can not parse request body from CBOR";
             } else {
-                bufferStr = fromCbor.dump();
-                requestJsonStr = TStringBuf(bufferStr.begin(), bufferStr.end());
+                NlohmannJsonToProto(fromCbor, request);
             }
+            break;
         }
         case MIME_JSON: {
-            NJson::TJsonValue requestBody;
-            auto fromJson = NJson::ReadJsonTree(requestJsonStr, &requestBody);
-            if (fromJson) {
-                JsonToProto(requestBody, request);
-            } else {
+            auto fromJson = nlohmann::json::parse(requestStr, nullptr, false);
+            if (fromJson.is_discarded()) {
                 throw NKikimr::NSQS::TSQSException(NKikimr::NSQS::NErrors::MALFORMED_QUERY_STRING) <<
                     "Can not parse request body from JSON";
+            } else {
+                NlohmannJsonToProto(fromJson, request);
             }
             break;
         }

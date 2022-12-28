@@ -60,7 +60,8 @@ public:
             Y_VERIFY(blobData.size() == blobId.Size, "%u vs %u", (ui32)blobData.size(), blobId.Size);
             Blobs[blobId] = blobData;
         } else {
-            LOG_S_ERROR("TEvReadBlobRangeResult cannot get blob " << blobId.ToString() << " status " << event.Status
+            LOG_S_ERROR("TEvReadBlobRangeResult cannot get blob " << blobId.ToString()
+                << " status " << NKikimrProto::EReplyStatus_Name(event.Status)
                 << " at tablet " << TabletId << " (compaction)");
             TxEvent->PutStatus = event.Status;
             if (TxEvent->PutStatus == NKikimrProto::UNKNOWN) {
@@ -106,8 +107,13 @@ private:
     void SendReadRequest(std::vector<NBlobCache::TBlobRange>&& ranges, bool isExternal) {
         Y_VERIFY(!ranges.empty());
 
+        NBlobCache::TReadBlobRangeOptions readOpts {
+            .CacheAfterRead = false,
+            .Fallback = isExternal,
+            .IsBackgroud = true
+        };
         Send(BlobCacheActorId,
-             new NBlobCache::TEvBlobCache::TEvReadBlobRangeBatch(std::move(ranges), false, isExternal));
+             new NBlobCache::TEvBlobCache::TEvReadBlobRangeBatch(std::move(ranges), std::move(readOpts)));
     }
 
     void CompactGranules(const TActorContext& ctx) {

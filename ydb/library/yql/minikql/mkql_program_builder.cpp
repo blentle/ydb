@@ -1513,6 +1513,13 @@ TRuntimeNode TProgramBuilder::BlockCompress(TRuntimeNode flow, ui32 bitmapIndex)
     return TRuntimeNode(callableBuilder.Build(), false);
 }
 
+TRuntimeNode TProgramBuilder::BlockExpandChunked(TRuntimeNode flow) {
+    ValidateBlockFlowType(flow.GetStaticType());
+    TCallableBuilder callableBuilder(Env, __func__, flow.GetStaticType());
+    callableBuilder.Add(flow);
+    return TRuntimeNode(callableBuilder.Build(), false);
+}
+
 TRuntimeNode TProgramBuilder::BlockCoalesce(TRuntimeNode first, TRuntimeNode second) {
     auto firstType = AS_TYPE(TBlockType, first.GetStaticType());
     auto secondType = AS_TYPE(TBlockType, second.GetStaticType());
@@ -5308,7 +5315,7 @@ TRuntimeNode TProgramBuilder::BlockBitCast(TRuntimeNode value, TType* targetType
     return TRuntimeNode(builder.Build(), false);
 }
 
-TRuntimeNode TProgramBuilder::BlockCombineAll(TRuntimeNode flow, ui32 countColumn, std::optional<ui32> filterColumn,
+TRuntimeNode TProgramBuilder::BlockCombineAll(TRuntimeNode flow, std::optional<ui32> filterColumn,
     const TArrayRef<const TAggInfo>& aggs, TType* returnType) {
     if constexpr (RuntimeVersion < 31U) {
         THROW yexception() << "Runtime version (" << RuntimeVersion << ") too old for " << __func__;
@@ -5316,13 +5323,77 @@ TRuntimeNode TProgramBuilder::BlockCombineAll(TRuntimeNode flow, ui32 countColum
 
     TCallableBuilder builder(Env, __func__, returnType);
     builder.Add(flow);
-    builder.Add(NewDataLiteral<ui32>(countColumn));
     if (!filterColumn) {
         builder.Add(NewEmptyOptionalDataLiteral(NUdf::TDataType<ui32>::Id));
     } else {
         builder.Add(NewOptional(NewDataLiteral<ui32>(*filterColumn)));
     }
 
+    TVector<TRuntimeNode> aggsNodes;
+    for (const auto& agg : aggs) {
+        TVector<TRuntimeNode> params;
+        params.push_back(NewDataLiteral<NUdf::EDataSlot::String>(agg.Name));
+        for (const auto& col : agg.ArgsColumns) {
+            params.push_back(NewDataLiteral<ui32>(col));
+        }
+
+        aggsNodes.push_back(NewTuple(params));
+    }
+
+    builder.Add(NewTuple(aggsNodes));
+    return TRuntimeNode(builder.Build(), false);
+}
+
+TRuntimeNode TProgramBuilder::BlockCombineHashed(TRuntimeNode flow, std::optional<ui32> filterColumn, const TArrayRef<ui32>& keys,
+    const TArrayRef<const TAggInfo>& aggs, TType* returnType) {
+    if constexpr (RuntimeVersion < 31U) {
+        THROW yexception() << "Runtime version (" << RuntimeVersion << ") too old for " << __func__;
+    }
+
+    TCallableBuilder builder(Env, __func__, returnType);
+    builder.Add(flow);
+    if (!filterColumn) {
+        builder.Add(NewEmptyOptionalDataLiteral(NUdf::TDataType<ui32>::Id));
+    } else {
+        builder.Add(NewOptional(NewDataLiteral<ui32>(*filterColumn)));
+    }
+
+    TVector<TRuntimeNode> keyNodes;
+    for (const auto& key : keys) {
+        keyNodes.push_back(NewDataLiteral<ui32>(key));
+    }
+
+    builder.Add(NewTuple(keyNodes));
+    TVector<TRuntimeNode> aggsNodes;
+    for (const auto& agg : aggs) {
+        TVector<TRuntimeNode> params;
+        params.push_back(NewDataLiteral<NUdf::EDataSlot::String>(agg.Name));
+        for (const auto& col : agg.ArgsColumns) {
+            params.push_back(NewDataLiteral<ui32>(col));
+        }
+
+        aggsNodes.push_back(NewTuple(params));
+    }
+
+    builder.Add(NewTuple(aggsNodes));
+    return TRuntimeNode(builder.Build(), false);
+}
+
+TRuntimeNode TProgramBuilder::BlockMergeFinalizeHashed(TRuntimeNode flow, const TArrayRef<ui32>& keys,
+    const TArrayRef<const TAggInfo>& aggs, TType* returnType) {
+    if constexpr (RuntimeVersion < 31U) {
+        THROW yexception() << "Runtime version (" << RuntimeVersion << ") too old for " << __func__;
+    }
+
+    TCallableBuilder builder(Env, __func__, returnType);
+    builder.Add(flow);
+
+    TVector<TRuntimeNode> keyNodes;
+    for (const auto& key : keys) {
+        keyNodes.push_back(NewDataLiteral<ui32>(key));
+    }
+
+    builder.Add(NewTuple(keyNodes));
     TVector<TRuntimeNode> aggsNodes;
     for (const auto& agg : aggs) {
         TVector<TRuntimeNode> params;

@@ -151,12 +151,12 @@ struct TPartitionConfigMerger {
     static bool ApplyChanges(
         NKikimrSchemeOp::TPartitionConfig& result,
         const NKikimrSchemeOp::TPartitionConfig& src, const NKikimrSchemeOp::TPartitionConfig& changes,
-        const TAppData* appData, TString& errDesr);
+        const TAppData* appData, TString& errDescr);
 
     static bool ApplyChangesInColumnFamilies(
         NKikimrSchemeOp::TPartitionConfig& result,
         const NKikimrSchemeOp::TPartitionConfig& src, const NKikimrSchemeOp::TPartitionConfig& changes,
-        TString& errDesr);
+        TString& errDescr);
 
     static THashMap<ui32, size_t> DeduplicateColumnFamiliesById(NKikimrSchemeOp::TPartitionConfig& config);
     static THashMap<ui32, size_t> DeduplicateStorageRoomsById(NKikimrSchemeOp::TPartitionConfig& config);
@@ -578,7 +578,7 @@ public:
 
     void UpdateShardStats(TShardIdx datashardIdx, const TPartitionStats& newStats);
 
-    void RegisterSplitMegreOp(TOperationId txId, const TTxState& txState);
+    void RegisterSplitMergeOp(TOperationId txId, const TTxState& txState);
 
     bool IsShardInSplitMergeOp(TShardIdx idx) const;
     void FinishSplitMergeOp(TOperationId txId);
@@ -599,13 +599,18 @@ public:
     bool TryAddShardToMerge(const TSplitSettings& splitSettings,
                             const TForceShardSplitSettings& forceShardSplitSettings,
                             TShardIdx shardIdx, TVector<TShardIdx>& shardsToMerge,
-                            THashSet<TTabletId>& partOwners, ui64& totalSize, float& totalLoad) const;
+                            THashSet<TTabletId>& partOwners, ui64& totalSize, float& totalLoad,
+                            const TTableInfo* mainTableForIndex) const;
 
     bool CheckCanMergePartitions(const TSplitSettings& splitSettings,
                                  const TForceShardSplitSettings& forceShardSplitSettings,
-                                 TShardIdx shardIdx, TVector<TShardIdx>& shardsToMerge) const;
+                                 TShardIdx shardIdx, TVector<TShardIdx>& shardsToMerge,
+                                 const TTableInfo* mainTableForIndex) const;
 
-    bool CheckSplitByLoad(const TSplitSettings& splitSettings, TShardIdx shardIdx, ui64 dataSize, ui64 rowCount) const;
+    bool CheckSplitByLoad(
+            const TSplitSettings& splitSettings, TShardIdx shardIdx,
+            ui64 dataSize, ui64 rowCount,
+            const TTableInfo* mainTableForIndex) const;
 
     bool IsSplitBySizeEnabled(const TForceShardSplitSettings& params) const {
         // Respect unspecified SizeToSplit when force shard splits are disabled
@@ -634,12 +639,54 @@ public:
         return Partitions.size() > GetMaxPartitionsCount() && !params.DisableForceShardSplit;
     }
 
-    bool IsSplitByLoadEnabled() const {
-        return PartitionConfig().GetPartitioningPolicy().GetSplitByLoadSettings().GetEnabled();
+    NKikimrSchemeOp::TSplitByLoadSettings GetEffectiveSplitByLoadSettings(
+            const TTableInfo* mainTableForIndex) const
+    {
+        NKikimrSchemeOp::TSplitByLoadSettings settings;
+
+        if (mainTableForIndex) {
+            // Merge main table settings first
+            // Index settings will override these
+            settings.MergeFrom(
+                mainTableForIndex->PartitionConfig()
+                .GetPartitioningPolicy()
+                .GetSplitByLoadSettings());
+        }
+
+        // Merge local table settings last, they take precedence
+        settings.MergeFrom(
+            PartitionConfig()
+            .GetPartitioningPolicy()
+            .GetSplitByLoadSettings());
+
+        return settings;
     }
 
-    bool IsMergeByLoadEnabled() const {
-        return IsSplitByLoadEnabled();
+    bool IsSplitByLoadEnabled(const TTableInfo* mainTableForIndex) const {
+        // We cannot split when external blobs are enabled
+        if (PartitionConfigHasExternalBlobsEnabled(PartitionConfig())) {
+            return false;
+        }
+
+        const auto& policy = PartitionConfig().GetPartitioningPolicy();
+        if (policy.HasSplitByLoadSettings() && policy.GetSplitByLoadSettings().HasEnabled()) {
+            // Always prefer any explicit setting
+            return policy.GetSplitByLoadSettings().GetEnabled();
+        }
+
+        if (mainTableForIndex) {
+            // Enable by default for indexes, when enabled for the main table
+            // TODO: consider always enabling by default
+            const auto& mainPolicy = mainTableForIndex->PartitionConfig().GetPartitioningPolicy();
+            return mainPolicy.GetSplitByLoadSettings().GetEnabled();
+        }
+
+        // Disable by default for normal tables
+        return false;
+    }
+
+    bool IsMergeByLoadEnabled(const TTableInfo* mainTableForIndex) const {
+        return IsSplitByLoadEnabled(mainTableForIndex);
     }
 
     ui64 GetShardSizeToSplit(const TForceShardSplitSettings& params) const {
@@ -1116,7 +1163,7 @@ struct TPersQueueGroupInfo : TSimpleRefCount<TPersQueueGroupInfo> {
     TString BootstrapConfig;
     THashMap<TShardIdx, TPQShardInfo::TPtr> Shards; // key - shardIdx
     TKeySchema KeySchema;
-    TPersQueueGroupInfo::TPtr AlterData; // changes to be applyed
+    TPersQueueGroupInfo::TPtr AlterData; // changes to be applied
     TTabletId BalancerTabletID = InvalidTabletId;
     TShardIdx BalancerShardIdx = InvalidShardIdx;
 
@@ -2230,7 +2277,7 @@ struct TTableIndexInfo : public TSimpleRefCount<TTableIndexInfo> {
 
     static TPtr Create(const NKikimrSchemeOp::TIndexCreationConfig& config, TString& errMsg) {
         if (!config.KeyColumnNamesSize()) {
-            errMsg += TStringBuilder() << "no key colums in index creation config";
+            errMsg += TStringBuilder() << "no key columns in index creation config";
             return nullptr;
         }
 

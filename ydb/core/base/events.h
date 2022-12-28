@@ -156,6 +156,8 @@ struct TKikimrEvents : TEvents {
         ES_YDB_AUDIT_LOG,
         ES_METADATA_MANAGER,
         ES_METADATA_SECRET,
+        ES_TEST_LOAD,
+        ES_GRPC_CANCELATION,
     };
 };
 

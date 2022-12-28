@@ -339,7 +339,7 @@ namespace NKikimr::NBlobDepot {
                 , GroupId(groupId)
             {}
 
-            void MoveToTrash(TLogoBlobID id);
+            void MoveToTrash(TData *self, TLogoBlobID id);
             void OnSuccessfulCollect(TData *self);
             void OnLeastExpectedBlobIdChange(TData *self);
             void ClearInFlight(TData *self);
@@ -348,11 +348,14 @@ namespace NKikimr::NBlobDepot {
 
         bool Loaded = false;
         std::map<TKey, TValue> Data;
+        std::set<TKey> LoadSkip; // keys to skip while loading
         THashMap<TLogoBlobID, ui32> RefCount;
         THashMap<std::tuple<ui8, ui32>, TRecordsPerChannelGroup> RecordsPerChannelGroup;
         std::optional<TKey> LastLoadedKey; // keys are being loaded in ascending order
         std::optional<TLogoBlobID> LastAssimilatedBlobId;
         ui64 TotalStoredDataSize = 0;
+        ui64 TotalStoredTrashSize = 0;
+        ui64 InFlightTrashSize = 0;
 
         friend class TGroupAssimilator;
 
@@ -369,7 +372,7 @@ namespace NKikimr::NBlobDepot {
         class TTxIssueGC;
         class TTxConfirmGC;
 
-        class TTxLoad;
+        class TTxDataLoad;
 
         class TTxLoadSpecificKeys;
         class TTxResolve;
@@ -382,8 +385,12 @@ namespace NKikimr::NBlobDepot {
         std::deque<TKey> KeysMadeCertain; // but not yet committed
         bool CommitCertainKeysScheduled = false;
 
+        struct TCollectCmd {
+            ui64 QueryId;
+            ui32 GroupId;
+        };
         ui64 LastCollectCmdId = 0;
-        std::unordered_map<ui64, ui32> CollectCmdToGroup;
+        std::unordered_map<ui64, TCollectCmd> CollectCmds;
 
     public:
         TData(TBlobDepot *self);
@@ -443,8 +450,10 @@ namespace NKikimr::NBlobDepot {
         void HandleCommitCertainKeys();
 
         TRecordsPerChannelGroup& GetRecordsPerChannelGroup(TLogoBlobID id);
+        TRecordsPerChannelGroup& GetRecordsPerChannelGroup(ui8 channel, ui32 groupId);
 
-        void AddDataOnLoad(TKey key, TString value, bool uncertainWrite);
+        void AddLoadSkip(TKey key);
+        void AddDataOnLoad(TKey key, TString value, bool uncertainWrite, bool skip);
         void AddDataOnDecommit(const TEvBlobStorage::TEvAssimilateResult::TBlob& blob,
             NTabletFlatExecutor::TTransactionContext& txc, void *cookie);
         void AddTrashOnLoad(TLogoBlobID id);
@@ -487,7 +496,7 @@ namespace NKikimr::NBlobDepot {
         void StartLoad();
         void OnLoadComplete();
         bool IsLoaded() const { return Loaded; }
-        bool IsKeyLoaded(const TKey& key) const { return key <= LastLoadedKey || Data.contains(key); }
+        bool IsKeyLoaded(const TKey& key) const { return key <= LastLoadedKey || Data.contains(key) || LoadSkip.contains(key); }
 
         void Handle(TEvBlobDepot::TEvResolve::TPtr ev);
         void Handle(TEvBlobStorage::TEvRangeResult::TPtr ev);
@@ -502,6 +511,12 @@ namespace NKikimr::NBlobDepot {
 
         bool BeginCommittingBlobSeqId(TAgent& agent, TBlobSeqId blobSeqId);
         void EndCommittingBlobSeqId(TAgent& agent, TBlobSeqId blobSeqId);
+
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    
+        TMonotonic LastRecordsValidationTimestamp;
+
+        void ValidateRecords();
 
     private:
         void ExecuteIssueGC(ui8 channel, ui32 groupId, TGenStep issuedGenStep,

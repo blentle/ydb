@@ -19,8 +19,7 @@
 
 #include <util/generic/set.h>
 
-namespace NKikimr {
-namespace NConsole {
+namespace NKikimr::NConsole {
 
 using NTabletFlatExecutor::ITransaction;
 using NTabletFlatExecutor::TTransactionBase;
@@ -42,6 +41,8 @@ public:
         ConfigKeyNextConfigItemId,
         ConfigKeyNextTxId,
         ConfigKeyNextSubscriptionId,
+        ConfigKeyNextLogItemId,
+        ConfigKeyMinLogItemId,
     };
 
 private:
@@ -90,6 +91,7 @@ private:
             FFunc(TEvConsole::EvCheckConfigUpdatesRequest, ForwardToConfigsManager);
             FFunc(TEvConsole::EvConfigNotificationResponse, ForwardToConfigsManager);
             FFunc(TEvConsole::EvConfigureRequest, ForwardToConfigsManager);
+            FFunc(TEvConsole::EvGetLogTailRequest, ForwardToConfigsManager);
             FFunc(TEvConsole::EvCreateTenantRequest, ForwardToTenantsManager);
             FFunc(TEvConsole::EvDescribeTenantOptionsRequest, ForwardToTenantsManager);
             FFunc(TEvConsole::EvGetConfigItemsRequest, ForwardToConfigsManager);
@@ -169,5 +171,4 @@ private:
     TActorId NetClassifierUpdaterId;
 };
 
-} // namespace NConsole
-} // namespace NKikimr
+} // namespace NKikimr::NConsole

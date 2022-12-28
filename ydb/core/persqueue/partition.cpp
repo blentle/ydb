@@ -37,6 +37,17 @@ static const ui32 MAX_USERS = 1000;
 static const ui64 SET_OFFSET_COOKIE = 1;
 static const ui32 MAX_TXS = 1000;
 
+auto GetStepAndTxId(ui64 step, ui64 txId)
+{
+    return std::make_pair(step, txId);
+}
+
+template<class E>
+auto GetStepAndTxId(const E& event)
+{
+    return GetStepAndTxId(event.Step, event.TxId);
+}
+
 struct TPartition::THasDataReq {
     ui64 Num;
     ui64 Offset;
@@ -392,10 +403,17 @@ void RequestInfoRange(const TActorContext& ctx, const TActorId& dst, ui32 partit
 }
 
 void RequestMetaRead(const TActorContext& ctx, const TActorId& dst, ui32 partition) {
+    auto addKey = [](NKikimrClient::TKeyValueRequest& request, TKeyPrefix::EType type, ui32 partition) {
+        auto read = request.AddCmdRead();
+        TKeyPrefix key{type, partition};
+        read->SetKey(key.Data(), key.Size());
+    };
+
     THolder<TEvKeyValue::TEvRequest> request(new TEvKeyValue::TEvRequest);
-    auto read = request->Record.AddCmdRead();
-    TKeyPrefix key{TKeyPrefix::TypeMeta, partition};
-    read->SetKey(key.Data(), key.Size());
+
+    addKey(request->Record, TKeyPrefix::TypeMeta, partition);
+    addKey(request->Record, TKeyPrefix::TypeTxMeta, partition);
+
     ctx.Send(dst, request.Release());
 }
 
@@ -458,9 +476,10 @@ void TPartition::FillReadFromTimestamps(const NKikimrPQ::TPQTabletConfig& config
 }
 
 TPartition::TPartition(ui64 tabletId, ui32 partition, const TActorId& tablet, const TActorId& blobCache,
-                       const NPersQueue::TTopicConverterPtr& topicConverter, bool isLocalDC, TString dcId,
+                       const NPersQueue::TTopicConverterPtr& topicConverter, bool isLocalDC, TString dcId, bool isServerless,
                        const NKikimrPQ::TPQTabletConfig& config, const TTabletCountersBase& counters,
-                       bool newPartition)
+                       bool newPartition,
+                       TVector<TTransaction> distrTxs)
     : TabletID(tabletId)
     , Partition(partition)
     , Config(config)
@@ -480,10 +499,12 @@ TPartition::TPartition(ui64 tabletId, ui32 partition, const TActorId& tablet, co
     , GapSize(0)
     , CloudId(config.GetYcCloudId())
     , DbId(config.GetYdbDatabaseId())
+    , DbPath(config.GetYdbDatabasePath())
+    , IsServerless(isServerless)
     , FolderId(config.GetYcFolderId())
     , UsersInfoStorage(
             DCId, TabletID, TopicConverter, Partition, counters, Config,
-            CloudId, DbId, config.GetYdbDatabasePath(), FolderId
+            CloudId, DbId, config.GetYdbDatabasePath(), IsServerless, FolderId
     )
     , ReadingTimestamp(false)
     , Cookie(0)
@@ -514,6 +535,12 @@ TPartition::TPartition(ui64 tabletId, ui32 partition, const TActorId& tablet, co
     }
 
     TabletCounters.Populate(counters);
+
+    if (!distrTxs.empty()) {
+        std::move(distrTxs.begin(), distrTxs.end(),
+                  std::back_inserter(DistrTxs));
+        TxInProgress = DistrTxs.front().Predicate.Defined();
+    }
 }
 
 void TPartition::HandleMonitoring(TEvPQ::TEvMonRequest::TPtr& ev, const TActorContext& ctx) {
@@ -813,10 +840,10 @@ void TPartition::SetupTopicCounters(const TActorContext& ctx) {
             {10240_KB, "10240kb"}, {65536_KB, "65536kb"}, {999'999'999, "99999999kb"}}, true));
 
     subGroup = GetServiceCounters(counters, "pqproxy|writeSession");
-    BytesWritten = NKikimr::NPQ::TMultiCounter(subGroup, labels, {}, {"BytesWritten" + suffix}, true);
+    BytesWrittenTotal = NKikimr::NPQ::TMultiCounter(subGroup, labels, {}, {"BytesWritten" + suffix}, true);
     BytesWrittenUncompressed = NKikimr::NPQ::TMultiCounter(subGroup, labels, {}, {"UncompressedBytesWritten" + suffix}, true);
     BytesWrittenComp = NKikimr::NPQ::TMultiCounter(subGroup, labels, {}, {"CompactedBytesWritten" + suffix}, true);
-    MsgsWritten = NKikimr::NPQ::TMultiCounter(subGroup, labels, {}, {"MessagesWritten" + suffix}, true);
+    MsgsWrittenTotal = NKikimr::NPQ::TMultiCounter(subGroup, labels, {}, {"MessagesWritten" + suffix}, true);
 
     TVector<NPersQueue::TPQLabelsInfo> aggr = {{{{"Account", TopicConverter->GetAccount()}}, {"total"}}};
     ui32 border = AppData(ctx)->PQConfig.GetWriteLatencyBigMs();
@@ -851,21 +878,23 @@ void TPartition::SetupTopicCounters(const TActorContext& ctx) {
 void TPartition::SetupStreamCounters(const TActorContext& ctx) {
     const auto topicName = TopicConverter->GetModernName();
     auto counters = AppData(ctx)->Counters;
-    auto labels = NPersQueue::GetLabelsForTopic(TopicConverter, CloudId, DbId, FolderId);
-
+    auto labels = NPersQueue::GetLabelsForTopic(TopicConverter, CloudId, DbId, DbPath, FolderId);
+/*
     WriteBufferIsFullCounter.SetCounter(
-        NPersQueue::GetCountersForDataStream(counters),
-        {{"cloud_id", CloudId},
+        NPersQueue::GetCountersForTopic(counters, IsServerless),
+        {
+         {"database", DbPath},
+         {"cloud_id", CloudId},
          {"folder_id", FolderId},
          {"database_id", DbId},
          {"topic", TopicConverter->GetFederationPath()},
          {"host", DCId},
          {"partition", ToString<ui32>(Partition)}},
-        {"name", "api.topic_service.stream_write.buffer_brimmed_milliseconds", true});
-
+        {"name", "api.grpc.topic.stream_write.buffer_brimmed_milliseconds", true});
+*/
     InputTimeLag = THolder<NKikimr::NPQ::TPercentileCounter>(new NKikimr::NPQ::TPercentileCounter(
-        NPersQueue::GetCountersForDataStream(counters), labels,
-                    {{"name", "topic.write_lag_milliseconds"}}, "bin",
+        NPersQueue::GetCountersForTopic(counters, IsServerless), labels,
+                    {{"name", "topic.write.lag_milliseconds"}}, "bin",
                     TVector<std::pair<ui64, TString>>{
                         {100, "100"}, {200, "200"}, {500, "500"},
                         {1000, "1000"}, {2000, "2000"}, {5000, "5000"},
@@ -873,8 +902,8 @@ void TPartition::SetupStreamCounters(const TActorContext& ctx) {
                         {180'000,"180000"}, {9'999'999, "999999"}}, true));
 
     MessageSize = THolder<NKikimr::NPQ::TPercentileCounter>(new NKikimr::NPQ::TPercentileCounter(
-        NPersQueue::GetCountersForDataStream(counters), labels,
-                    {{"name", "topic.written_message_size_bytes"}}, "bin",
+        NPersQueue::GetCountersForTopic(counters, IsServerless), labels,
+                    {{"name", "topic.write.message_size_bytes"}}, "bin",
                     TVector<std::pair<ui64, TString>>{
                         {1024, "1024"}, {5120, "5120"}, {10'240, "10240"},
                         {20'480, "20480"}, {51'200, "51200"}, {102'400, "102400"},
@@ -882,19 +911,25 @@ void TPartition::SetupStreamCounters(const TActorContext& ctx) {
                         {2'097'152,"2097152"}, {5'242'880, "5242880"}, {10'485'760, "10485760"},
                         {67'108'864, "67108864"}, {999'999'999, "99999999"}}, true));
 
-    BytesWritten = NKikimr::NPQ::TMultiCounter(
-        NPersQueue::GetCountersForDataStream(counters), labels, {},
-                    {"api.topic_service.stream_write.bytes_per_second",
-                     "topic.written_bytes_per_second"} , true, "name");
-    MsgsWritten = NKikimr::NPQ::TMultiCounter(
-        NPersQueue::GetCountersForDataStream(counters), labels, {},
-                    {"api.topic_service.stream_write.messages_per_second",
-                     "topic.written_messages_per_second"}, true, "name");
+    BytesWrittenGrpc = NKikimr::NPQ::TMultiCounter(
+        NPersQueue::GetCountersForTopic(counters, IsServerless), labels, {},
+                    {"api.grpc.topic.stream_write.bytes"} , true, "name");
+    BytesWrittenTotal = NKikimr::NPQ::TMultiCounter(
+        NPersQueue::GetCountersForTopic(counters, IsServerless), labels, {},
+                    {"topic.write.bytes"} , true, "name");
+
+    MsgsWrittenGrpc = NKikimr::NPQ::TMultiCounter(
+        NPersQueue::GetCountersForTopic(counters, IsServerless), labels, {},
+                    {"api.grpc.topic.stream_write.messages"}, true, "name");
+    MsgsWrittenTotal = NKikimr::NPQ::TMultiCounter(
+        NPersQueue::GetCountersForTopic(counters, IsServerless), labels, {},
+                    {"topic.write.messages"}, true, "name");
+
 
     BytesWrittenUncompressed = NKikimr::NPQ::TMultiCounter(
 
-        NPersQueue::GetCountersForDataStream(counters), labels, {},
-                    {"topic.written_uncompressed_bytes_per_second"}, true, "name");
+        NPersQueue::GetCountersForTopic(counters, IsServerless), labels, {},
+                    {"topic.write.uncompressed_bytes"}, true, "name");
 
     TVector<NPersQueue::TPQLabelsInfo> aggr = {{{{"Account", TopicConverter->GetAccount()}}, {"total"}}};
     ui32 border = AppData(ctx)->PQConfig.GetWriteLatencyBigMs();
@@ -907,8 +942,8 @@ void TPartition::SetupStreamCounters(const TActorContext& ctx) {
     if (IsQuotingEnabled() && !TopicWriteQuotaResourcePath.empty()) {
         TopicWriteQuotaWaitCounter = THolder<NKikimr::NPQ::TPercentileCounter>(
             new NKikimr::NPQ::TPercentileCounter(
-                NPersQueue::GetCountersForDataStream(counters), labels,
-                            {{"name", "api.topic_service.stream_write.topic_throttled_milliseconds"}}, "bin",
+                NPersQueue::GetCountersForTopic(counters, IsServerless), labels,
+                            {{"name", "api.grpc.topic.stream_write.topic_throttled_milliseconds"}}, "bin",
                             TVector<std::pair<ui64, TString>>{
                                 {0, "0"}, {1, "1"}, {5, "5"}, {10, "10"},
                                 {20, "20"}, {50, "50"}, {100, "100"}, {500, "500"},
@@ -918,8 +953,8 @@ void TPartition::SetupStreamCounters(const TActorContext& ctx) {
 
     PartitionWriteQuotaWaitCounter = THolder<NKikimr::NPQ::TPercentileCounter>(
         new NKikimr::NPQ::TPercentileCounter(
-            NPersQueue::GetCountersForDataStream(counters), labels,
-                        {{"name", "api.topic_service.stream_write.partition_throttled_milliseconds"}}, "bin",
+            NPersQueue::GetCountersForTopic(counters, IsServerless), labels,
+                        {{"name", "api.grpc.topic.stream_write.partition_throttled_milliseconds"}}, "bin",
                         TVector<std::pair<ui64, TString>>{
                             {0, "0"}, {1, "1"}, {5, "5"}, {10, "10"},
                             {20, "20"}, {50, "50"}, {100, "100"}, {500, "500"},
@@ -1042,7 +1077,6 @@ void TPartition::HandleWakeup(const TActorContext& ctx) {
             avg.Update(now);
         }
     }
-
     WriteBufferIsFullCounter.UpdateWorkingTime(now);
 
     WriteLagMs.Update(0, now);
@@ -1383,21 +1417,14 @@ void TPartition::HandleGetDiskStatus(const NKikimrClient::TResponse& response, c
     RequestMetaRead(ctx, Tablet, Partition);
 }
 
-void TPartition::HandleMetaRead(const NKikimrClient::TKeyValueResponse::TReadResult& response, const TActorContext& ctx) {
-    NKikimrPQ::TPartitionMeta meta;
-    switch (response.GetStatus()) {
-        case NKikimrProto::OK: {
-            bool res = meta.ParseFromString(response.GetValue());
-            Y_VERIFY(res);
-            /* Bring back later, when switch to 21-2 will be unable
-                StartOffset = meta.GetStartOffset();
-                EndOffset = meta.GetEndOffset();
-                if (StartOffset == EndOffset) {
-                    NewHead.Offset = Head.Offset = EndOffset;
-                }
-            */
+void TPartition::HandleMetaRead(const NKikimrClient::TResponse& response, const TActorContext& ctx)
+{
+    auto handleReadResult = [&](const NKikimrClient::TKeyValueResponse::TReadResult& response,
+                                auto&& action) {
+        switch (response.GetStatus()) {
+        case NKikimrProto::OK:
+            action(response);
             break;
-        }
         case NKikimrProto::NODATA:
             break;
         case NKikimrProto::ERROR:
@@ -1410,13 +1437,40 @@ void TPartition::HandleMetaRead(const NKikimrClient::TKeyValueResponse::TReadRes
         default:
             Cerr << "ERROR " << response.GetStatus() << "\n";
             Y_FAIL("bad status");
+        };
     };
+
+    auto loadMeta = [](const NKikimrClient::TKeyValueResponse::TReadResult& response) {
+        NKikimrPQ::TPartitionMeta meta;
+        bool res = meta.ParseFromString(response.GetValue());
+        Y_VERIFY(res);
+        /* Bring back later, when switch to 21-2 will be unable
+           StartOffset = meta.GetStartOffset();
+           EndOffset = meta.GetEndOffset();
+           if (StartOffset == EndOffset) {
+           NewHead.Offset = Head.Offset = EndOffset;
+           }
+           */
+    };
+    handleReadResult(response.GetReadResult(0), loadMeta);
+
+    auto loadTxMeta = [this](const NKikimrClient::TKeyValueResponse::TReadResult& response) {
+        NKikimrPQ::TPartitionTxMeta meta;
+        bool res = meta.ParseFromString(response.GetValue());
+        Y_VERIFY(res);
+
+        if (meta.HasPlanStep()) {
+            PlanStep = meta.GetPlanStep();
+        }
+        if (meta.HasTxId()) {
+            TxId = meta.GetTxId();
+        }
+    };
+    handleReadResult(response.GetReadResult(1), loadTxMeta);
 
     InitState = WaitInfoRange;
     RequestInfoRange(ctx, Tablet, Partition, "");
 }
-
-
 
 void TPartition::HandleInfoRangeRead(const NKikimrClient::TKeyValueResponse::TReadRangeResult& range, const TActorContext& ctx) {
     //megaqc check here all results
@@ -1677,8 +1731,8 @@ void TPartition::HandleOnInit(TEvKeyValue::TEvResponse::TPtr& ev, const TActorCo
             HandleGetDiskStatus(response, ctx);
             break;
         case WaitMetaRead:
-            Y_VERIFY(response.ReadResultSize() == 1);
-            HandleMetaRead(response.GetReadResult(0), ctx);
+            Y_VERIFY(response.ReadResultSize() == 2);
+            HandleMetaRead(response, ctx);
             break;
         case WaitInfoRange:
             Y_VERIFY(response.ReadRangeResultSize() == 1);
@@ -2258,6 +2312,77 @@ void TPartition::Handle(TEvPersQueue::TEvProposeTransaction::TPtr& ev, const TAc
     AddImmediateTx(ev->Release());
 
     ProcessTxsAndUserActs(ctx);
+}
+
+void TPartition::Handle(TEvPQ::TEvTxCalcPredicate::TPtr& ev, const TActorContext& ctx)
+{
+    AddDistrTx(ev->Release());
+
+    ProcessTxsAndUserActs(ctx);
+}
+
+void TPartition::Handle(TEvPQ::TEvTxCommit::TPtr& ev, const TActorContext& ctx)
+{
+    if (PlanStep.Defined() && TxId.Defined()) {
+        if (GetStepAndTxId(*ev->Get()) <= GetStepAndTxId(*PlanStep, *TxId)) {
+            ctx.Send(Tablet, MakeCommitDone(ev->Get()->Step, ev->Get()->TxId).Release());
+            return;
+        }
+    }
+
+    Y_VERIFY(TxInProgress);
+
+    Y_VERIFY(!DistrTxs.empty());
+    TTransaction& t = DistrTxs.front();
+
+    Y_VERIFY(GetStepAndTxId(*ev->Get()) == GetStepAndTxId(*t.Tx));
+    Y_VERIFY(t.Predicate.Defined() && *t.Predicate);
+
+    for (auto& operation : t.Tx->Operations) {
+        TUserInfo& userInfo = GetOrCreatePendingUser(operation.GetConsumer(), ctx);
+
+        Y_VERIFY(userInfo.Offset == (i64)operation.GetBegin());
+
+        userInfo.Offset = operation.GetEnd();
+        userInfo.Session = "";
+    }
+
+    PlanStep = t.Tx->Step;
+    TxId = t.Tx->TxId;
+    TxIdHasChanged = true;
+
+    ScheduleReplyCommitDone(t.Tx->Step, t.Tx->TxId);
+
+    RemoveDistrTx();
+    TxInProgress = false;
+
+    ContinueProcessTxsAndUserActs(ctx);
+}
+
+void TPartition::Handle(TEvPQ::TEvTxRollback::TPtr& ev, const TActorContext& ctx)
+{
+    if (PlanStep.Defined() && TxId.Defined()) {
+        if (GetStepAndTxId(*ev->Get()) <= GetStepAndTxId(*PlanStep, *TxId)) {
+            return;
+        }
+    }
+
+    Y_VERIFY(TxInProgress);
+
+    Y_VERIFY(!DistrTxs.empty());
+    TTransaction& t = DistrTxs.front();
+
+    Y_VERIFY(GetStepAndTxId(*ev->Get()) == GetStepAndTxId(*t.Tx));
+    Y_VERIFY(t.Predicate.Defined());
+
+    PlanStep = t.Tx->Step;
+    TxId = t.Tx->TxId;
+    TxIdHasChanged = true;
+
+    RemoveDistrTx();
+    TxInProgress = false;
+
+    ContinueProcessTxsAndUserActs(ctx);
 }
 
 void TPartition::Handle(TEvPQ::TEvSetClientInfo::TPtr& ev, const TActorContext& ctx) {
@@ -3595,7 +3720,15 @@ void TPartition::HandleSetOffsetResponse(ui64 cookie, const TActorContext& ctx) 
     AffectedUsers.clear();
 
     UsersInfoWriteInProgress = false;
+
+    TxIdHasChanged = false;
+
     ProcessTxsAndUserActs(ctx);
+}
+
+void TPartition::AddDistrTx(TSimpleSharedPtr<TEvPQ::TEvTxCalcPredicate> event)
+{
+    DistrTxs.emplace_back(std::move(event));
 }
 
 void TPartition::AddImmediateTx(TSimpleSharedPtr<TEvPersQueue::TEvProposeTransaction> tx)
@@ -3642,7 +3775,7 @@ size_t TPartition::GetUserActCount(const TString& consumer) const
 
 void TPartition::ProcessTxsAndUserActs(const TActorContext& ctx)
 {
-    if (UsersInfoWriteInProgress || (ImmediateTxs.empty() && UserActs.empty())) {
+    if (UsersInfoWriteInProgress || (ImmediateTxs.empty() && UserActs.empty() && DistrTxs.empty()) || TxInProgress) {
         return;
     }
 
@@ -3650,33 +3783,99 @@ void TPartition::ProcessTxsAndUserActs(const TActorContext& ctx)
     Y_VERIFY(Replies.empty());
     Y_VERIFY(AffectedUsers.empty());
 
+    ContinueProcessTxsAndUserActs(ctx);
+}
+
+void TPartition::ContinueProcessTxsAndUserActs(const TActorContext& ctx)
+{
+    if (!DistrTxs.empty()) {
+        ProcessDistrTxs(ctx);
+
+        if (!DistrTxs.empty()) {
+            return;
+        }
+    }
+
     ProcessUserActs(ctx);
     ProcessImmediateTxs(ctx);
 
     THolder<TEvKeyValue::TEvRequest> request(new TEvKeyValue::TEvRequest);
-
     request->Record.SetCookie(SET_OFFSET_COOKIE);
 
-    for (auto& user : AffectedUsers) {
-        TKeyPrefix ikey(TKeyPrefix::TypeInfo, Partition, TKeyPrefix::MarkUser);
-        ikey.Append(user.c_str(), user.size());
-        TKeyPrefix ikeyDeprecated(TKeyPrefix::TypeInfo, Partition, TKeyPrefix::MarkUserDeprecated);
-        ikeyDeprecated.Append(user.c_str(), user.size());
-
-        if (TUserInfo* userInfo = GetPendingUserIfExists(user)) {
-            AddCmdWrite(request->Record,
-                        ikey, ikeyDeprecated,
-                        userInfo->Offset, userInfo->Generation, userInfo->Step, userInfo->Session,
-                        userInfo->ReadOffsetRewindSum,
-                        userInfo->ReadRuleGeneration);
-        } else {
-            AddCmdDeleteRange(request->Record,
-                              ikey, ikeyDeprecated);
-        }
+    if (TxIdHasChanged) {
+        AddCmdWriteTxMeta(request->Record,
+                          *PlanStep, *TxId);
     }
+    AddCmdWriteUserInfos(request->Record);
 
     ctx.Send(Tablet, request.Release());
     UsersInfoWriteInProgress = true;
+}
+
+void TPartition::RemoveDistrTx()
+{
+    Y_VERIFY(!DistrTxs.empty());
+
+    DistrTxs.pop_front();
+}
+
+void TPartition::ProcessDistrTxs(const TActorContext& ctx)
+{
+    Y_VERIFY(!TxInProgress);
+
+    while (!TxInProgress && !DistrTxs.empty()) {
+        ProcessDistrTx(ctx);
+    }
+}
+
+void TPartition::ProcessDistrTx(const TActorContext& ctx)
+{
+    Y_VERIFY(!TxInProgress);
+
+    Y_VERIFY(!DistrTxs.empty());
+    TTransaction& t = DistrTxs.front();
+
+    bool predicate = true;
+
+    for (auto& operation : t.Tx->Operations) {
+        const TString& consumer = operation.GetConsumer();
+
+        if (!UsersInfoStorage.GetIfExists(consumer)) {
+            predicate = false;
+            break;
+        }
+
+        bool isAffectedConsumer = AffectedUsers.contains(consumer);
+        TUserInfo& userInfo = GetOrCreatePendingUser(consumer, ctx);
+
+        if (operation.GetBegin() > operation.GetEnd()) {
+            // BAD_REQUEST
+            predicate = false;
+        } else if (userInfo.Offset != (i64)operation.GetBegin()) {
+            // ABORTED
+            predicate = false;
+        } else if (operation.GetEnd() > EndOffset) {
+            // BAD_REQUEST
+            predicate = false;
+        }
+
+        if (!predicate) {
+            if (!isAffectedConsumer) {
+                AffectedUsers.erase(consumer);
+            }
+            break;
+        }
+    }
+
+    t.Predicate = predicate;
+
+    auto response = MakeHolder<TEvPQ::TEvTxCalcPredicateResult>(t.Tx->Step,
+                                                                t.Tx->TxId,
+                                                                Partition,
+                                                                predicate);
+    ctx.Send(Tablet, response.Release());
+
+    TxInProgress = true;
 }
 
 void TPartition::ProcessImmediateTxs(const TActorContext& ctx)
@@ -3964,6 +4163,12 @@ void TPartition::ScheduleReplyPropose(const NKikimrPQ::TEvProposeTransaction& ev
                                           statusCode).Release());
 }
 
+void TPartition::ScheduleReplyCommitDone(ui64 step, ui64 txId)
+{
+    Replies.emplace_back(Tablet,
+                         MakeCommitDone(step, txId).Release());
+}
+
 void TPartition::AddCmdDeleteRange(NKikimrClient::TKeyValueRequest& request,
                                    const TKeyPrefix& ikey, const TKeyPrefix& ikeyDeprecated)
 {
@@ -4015,6 +4220,45 @@ void TPartition::AddCmdWrite(NKikimrClient::TKeyValueRequest& request,
     write->SetKey(ikeyDeprecated.Data(), ikeyDeprecated.Size());
     write->SetValue(idataDeprecated.Data(), idataDeprecated.Size());
     write->SetStorageChannel(NKikimrClient::TKeyValueRequest::INLINE);
+}
+
+void TPartition::AddCmdWriteTxMeta(NKikimrClient::TKeyValueRequest& request,
+                                   ui64 step, ui64 txId)
+{
+    TKeyPrefix ikey(TKeyPrefix::TypeTxMeta, Partition);
+
+    NKikimrPQ::TPartitionTxMeta meta;
+    meta.SetPlanStep(step);
+    meta.SetTxId(txId);
+
+    TString out;
+    Y_PROTOBUF_SUPPRESS_NODISCARD meta.SerializeToString(&out);
+
+    auto write = request.AddCmdWrite();
+    write->SetKey(ikey.Data(), ikey.Size());
+    write->SetValue(out.c_str(), out.size());
+    write->SetStorageChannel(NKikimrClient::TKeyValueRequest::INLINE);
+}
+
+void TPartition::AddCmdWriteUserInfos(NKikimrClient::TKeyValueRequest& request)
+{
+    for (auto& user : AffectedUsers) {
+        TKeyPrefix ikey(TKeyPrefix::TypeInfo, Partition, TKeyPrefix::MarkUser);
+        ikey.Append(user.c_str(), user.size());
+        TKeyPrefix ikeyDeprecated(TKeyPrefix::TypeInfo, Partition, TKeyPrefix::MarkUserDeprecated);
+        ikeyDeprecated.Append(user.c_str(), user.size());
+
+        if (TUserInfo* userInfo = GetPendingUserIfExists(user)) {
+            AddCmdWrite(request,
+                        ikey, ikeyDeprecated,
+                        userInfo->Offset, userInfo->Generation, userInfo->Step, userInfo->Session,
+                        userInfo->ReadOffsetRewindSum,
+                        userInfo->ReadRuleGeneration);
+        } else {
+            AddCmdDeleteRange(request,
+                              ikey, ikeyDeprecated);
+        }
+    }
 }
 
 TUserInfo& TPartition::GetOrCreatePendingUser(const TString& user,
@@ -4116,6 +4360,11 @@ THolder<TEvPersQueue::TEvProposeTransactionResult> TPartition::MakeReplyPropose(
     return response;
 }
 
+THolder<TEvPQ::TEvTxCommitDone> TPartition::MakeCommitDone(ui64 step, ui64 txId)
+{
+    return MakeHolder<TEvPQ::TEvTxCommitDone>(step, txId, Partition);
+}
+
 void TPartition::ScheduleUpdateAvailableSize(const TActorContext& ctx) {
     ctx.Schedule(UPDATE_AVAIL_SIZE_INTERVAL, new TEvPQ::TEvUpdateAvailableSize());
 }
@@ -4153,14 +4402,19 @@ void TPartition::HandleWriteResponse(const TActorContext& ctx) {
     TabletCounters.Cumulative()[COUNTER_PQ_WRITE_BYTES_OK].Increment(WriteNewSize);
     TabletCounters.Percentile()[COUNTER_PQ_WRITE_CYCLE_BYTES].IncrementFor(WriteCycleSize);
     TabletCounters.Percentile()[COUNTER_PQ_WRITE_NEW_BYTES].IncrementFor(WriteNewSize);
-    if (BytesWritten)
-        BytesWritten.Inc(WriteNewSizeInternal);
+    if (BytesWrittenGrpc)
+        BytesWrittenGrpc.Inc(WriteNewSizeInternal);
+    if (BytesWrittenTotal)
+        BytesWrittenTotal.Inc(WriteNewSize);
+
     if (BytesWrittenUncompressed)
         BytesWrittenUncompressed.Inc(WriteNewSizeUncompressed);
     if (BytesWrittenComp)
         BytesWrittenComp.Inc(WriteCycleSize);
-    if (MsgsWritten)
-        MsgsWritten.Inc(WriteNewMessagesInternal);
+    if (MsgsWrittenGrpc)
+        MsgsWrittenGrpc.Inc(WriteNewMessagesInternal);
+    if (MsgsWrittenTotal)
+        MsgsWrittenTotal.Inc(WriteNewMessages);
 
     //All ok
     auto now = ctx.Now();
@@ -4665,7 +4919,7 @@ bool TPartition::AppendHeadWithNewWrites(TEvKeyValue::TEvRequest* request, const
         }
 
         WriteNewSize += p.Msg.SourceId.size() + p.Msg.Data.size();
-        WriteNewSizeInternal = p.Msg.External ? 0 : WriteNewSize;
+        WriteNewSizeInternal += p.Msg.External ? 0 : (p.Msg.SourceId.size() + p.Msg.Data.size());
         WriteNewSizeUncompressed += p.Msg.UncompressedSize + p.Msg.SourceId.size();
         if (p.Msg.PartNo == 0) {
              ++WriteNewMessages;

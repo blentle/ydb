@@ -68,13 +68,23 @@ TExprNode::TPtr Now0Arg(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnn
 }
 
 bool IsArgumentsOnlyLambda(const TExprNode& lambda, TVector<ui32>& argIndices) {
+    TNodeMap<ui32> args;
+    for (ui32 i = 0; i < lambda.Head().ChildrenSize(); ++i) {
+        args.insert(std::make_pair(lambda.Head().Child(i), i));
+    }
+
     for (ui32 i = 1; i < lambda.ChildrenSize(); ++i) {
         auto root = lambda.Child(i);
-        if (!root->IsArgument() || root->GetLambdaLevel() > 0) {
+        if (!root->IsArgument()) {
             return false;
         }
 
-        argIndices.push_back(root->GetArgIndex());
+        auto it = args.find(root);
+        if (it == args.end()) {
+            return false;
+        }
+
+        argIndices.push_back(it->second);
     }
 
     return true;
@@ -100,10 +110,21 @@ TExprNode::TPtr RebuildArgumentsOnlyLambdaForBlocks(const TExprNode& lambda, TEx
     return ctx.NewLambda(lambda.Pos(), ctx.NewArguments(lambda.Pos(), std::move(newArgs)), std::move(newRoots));
 }
 
+TExprNode::TPtr OptimizeWideFromBlocks(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& types) {
+    Y_UNUSED(types);
+    if (node->Head().IsCallable("BlockExpandChunked")) {
+        // WideFromBlocks accepts chunked input
+        YQL_CLOG(DEBUG, Core) << "Drop " << node->Head().Content() << " under " << node->Content();
+        return ctx.ChangeChild(*node, 0, node->Head().HeadPtr());
+    }
+
+    return node;
+}
+
 TExprNode::TPtr OptimizeWideToBlocks(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& types) {
     Y_UNUSED(types);
     if (node->Head().IsCallable("WideFromBlocks")) {
-        YQL_CLOG(DEBUG, Core) << "Drop " << node->Head().Content() << " under " << node->Content();
+        YQL_CLOG(DEBUG, Core) << "Drop " << node->Content() << " over " << node->Head().Content();
         return node->Head().HeadPtr();
     }
 
@@ -2456,7 +2477,7 @@ TExprNode::TPtr ExpandMux(const TExprNode::TPtr& node, TExprContext& ctx) {
     return node;
 }
 
-TExprNode::TPtr ExpandLMap(const TExprNode::TPtr& node, TExprContext& ctx) {
+TExprNode::TPtr ExpandLMapOrShuffleByKeys(const TExprNode::TPtr& node, TExprContext& ctx) {
     YQL_CLOG(DEBUG, CorePeepHole) << "Expand " << node->Content();
     return ctx.Builder(node->Pos())
         .Callable("Collect")
@@ -4441,7 +4462,7 @@ bool CollectBlockRewrites(const TMultiExprType* multiInputType, bool keepInputCo
 
     TVector<const TTypeAnnotationNode*> allInputTypes;
     for (const auto& i : multiInputType->GetItems()) {
-        if (i->GetKind() == ETypeAnnotationKind::Block || i->GetKind() == ETypeAnnotationKind::Scalar) {
+        if (i->IsAnyBlockOrScalar()) {
             return false;
         }
 
@@ -4567,8 +4588,10 @@ bool CollectBlockRewrites(const TMultiExprType* multiInputType, bool keepInputCo
             auto child = node->Child(i);
             if (child->IsComplete()) {
                 argTypes.push_back(ctx.MakeType<TScalarExprType>(child->GetTypeAnn()));
-            } else {
+            } else if (child->GetTypeAnn()->HasFixedSizeRepr()) {
                 argTypes.push_back(ctx.MakeType<TBlockExprType>(child->GetTypeAnn()));
+            } else {
+                argTypes.push_back(ctx.MakeType<TChunkedBlockExprType>(child->GetTypeAnn()));
             }
         }
 
@@ -4594,6 +4617,7 @@ bool CollectBlockRewrites(const TMultiExprType* multiInputType, bool keepInputCo
                                 .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
                                     for (ui32 i = 1; i < node->ChildrenSize(); ++i) {
                                         auto child = node->Child(i);
+                                        // TODO: check if ClickHouse UDF accepts ChunkedBlock as argument
                                         auto originalTypeNode = node->Head().Child(2)->Head().Child(i - 1);
                                         parent.Callable(i - 1, child->IsComplete() ? "ScalarType" : "BlockType")
                                             .Add(0, originalTypeNode)
@@ -4725,11 +4749,15 @@ TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext&
 
     YQL_CLOG(DEBUG, CorePeepHole) << "Convert " << node->Content() << " to blocks, extra nodes: " << newNodes
                                   << ", extra columns: " << rewritePositions.size();
+
+    // TODO: since arrow kernels handle chunked blocks automatically, we may need an optimizer that drops such BlockExpandChunked
     auto ret = ctx.Builder(node->Pos())
         .Callable("WideFromBlocks")
             .Callable(0, "WideMap")
-                .Callable(0, "WideToBlocks")
-                    .Add(0, node->HeadPtr())
+                .Callable(0, "BlockExpandChunked")
+                    .Callable(0, "WideToBlocks")
+                        .Add(0, node->HeadPtr())
+                    .Seal()
                 .Seal()
                 .Add(1, blockLambda)
             .Seal()
@@ -4760,8 +4788,10 @@ TExprNode::TPtr OptimizeWideFilterBlocks(const TExprNode::TPtr& node, TExprConte
 
     auto blockMapped = ctx.Builder(node->Pos())
         .Callable("WideMap")
-            .Callable(0, "WideToBlocks")
-                .Add(0, node->HeadPtr())
+            .Callable(0, "BlockExpandChunked")
+                .Callable(0, "WideToBlocks")
+                    .Add(0, node->HeadPtr())
+                .Seal()
             .Seal()
             .Add(1, blockLambda)
         .Seal()
@@ -4775,7 +4805,9 @@ TExprNode::TPtr OptimizeWideFilterBlocks(const TExprNode::TPtr& node, TExprConte
         YQL_ENSURE(it->second == multiInputType->GetSize(), "Block filter column must follow original input columns");
         auto result = ctx.Builder(node->Pos())
             .Callable("BlockCompress")
-                .Add(0, blockMapped)
+                .Callable(0, "BlockExpandChunked")
+                    .Add(0, blockMapped)
+                .Seal()
                 .Atom(1, ToString(it->second), TNodeFlags::Default)
             .Seal()
             .Build();
@@ -4783,7 +4815,9 @@ TExprNode::TPtr OptimizeWideFilterBlocks(const TExprNode::TPtr& node, TExprConte
         if (node->ChildrenSize() == 3) {
             result = ctx.Builder(node->Pos())
                 .Callable("WideTakeBlocks")
-                    .Add(0, result)
+                    .Callable(0, "BlockExpandChunked")
+                        .Add(0, result)
+                    .Seal()
                     .Add(1, node->ChildPtr(2))
                 .Seal()
                 .Build();
@@ -4855,7 +4889,7 @@ TExprNode::TPtr OptimizeSkipTakeToBlocks(const TExprNode::TPtr& node, TExprConte
     }
 
     const auto& allTypes = flowItemType->Cast<TMultiExprType>()->GetItems();
-    if (AnyOf(allTypes, [](const TTypeAnnotationNode* type) { return type->GetKind() == ETypeAnnotationKind::Block; })) {
+    if (AnyOf(allTypes, [](const TTypeAnnotationNode* type) { return type->IsAnyBlockOrScalar(); })) {
         return node;
     }
 
@@ -4872,8 +4906,10 @@ TExprNode::TPtr OptimizeSkipTakeToBlocks(const TExprNode::TPtr& node, TExprConte
     return ctx.Builder(node->Pos())
         .Callable("WideFromBlocks")
             .Callable(0, newName)
-                .Callable(0, "WideToBlocks")
-                    .Add(0, node->HeadPtr())
+                .Callable(0, "BlockExpandChunked")
+                    .Callable(0, "WideToBlocks")
+                        .Add(0, node->HeadPtr())
+                    .Seal()
                 .Seal()
                 .Add(1, node->ChildPtr(1))
             .Seal()
@@ -4881,20 +4917,30 @@ TExprNode::TPtr OptimizeSkipTakeToBlocks(const TExprNode::TPtr& node, TExprConte
         .Build();
 }
 
-TExprNode::TPtr UpdateBlockCombineAllColumns(const TExprNode::TPtr& node, std::optional<ui32> filterColumn, const TVector<ui32>& argIndices, TExprContext& ctx) {
+TExprNode::TPtr UpdateBlockCombineColumns(const TExprNode::TPtr& node, std::optional<ui32> filterColumn, const TVector<ui32>& argIndices, TExprContext& ctx) {
     auto combineChildren = node->ChildrenList();
     combineChildren[0] = node->Head().HeadPtr();
-    combineChildren[1] = ctx.NewAtom(node->Pos(), ToString(argIndices[FromString<ui32>(combineChildren[1]->Content())]));
     if (filterColumn) {
-        YQL_ENSURE(combineChildren[2]->IsCallable("Void"), "Filter column is already used");
-        combineChildren[2] = ctx.NewAtom(node->Pos(), ToString(*filterColumn));
+        YQL_ENSURE(combineChildren[1]->IsCallable("Void"), "Filter column is already used");
+        combineChildren[1] = ctx.NewAtom(node->Pos(), ToString(*filterColumn));
     } else {
-        if (!combineChildren[2]->IsCallable("Void")) {
-            combineChildren[2] = ctx.NewAtom(node->Pos(), ToString(argIndices[FromString<ui32>(combineChildren[2]->Content())]));
+        if (!combineChildren[1]->IsCallable("Void")) {
+            combineChildren[1] = ctx.NewAtom(node->Pos(), ToString(argIndices[FromString<ui32>(combineChildren[1]->Content())]));
         }
     }
 
-    auto payloadNodes = combineChildren[3]->ChildrenList();
+    const bool hashed = node->Content().EndsWith("Hashed");
+    if (hashed) {
+        auto keyNodes = combineChildren[2]->ChildrenList();
+        for (auto& p : keyNodes) {
+            p = ctx.NewAtom(node->Pos(), ToString(argIndices[FromString<ui32>(p->Content())]));
+        }
+
+        combineChildren[2] = ctx.ChangeChildren(*combineChildren[2], std::move(keyNodes));
+    }
+
+    auto payloadIndex = hashed ? 3 : 2;
+    auto payloadNodes = combineChildren[payloadIndex]->ChildrenList();
     for (auto& p : payloadNodes) {
         YQL_ENSURE(p->IsList() && p->ChildrenSize() >= 1 && p->Head().IsCallable("AggBlockApply"), "Expected AggBlockApply");
         auto payloadArgs = p->ChildrenList();
@@ -4905,11 +4951,11 @@ TExprNode::TPtr UpdateBlockCombineAllColumns(const TExprNode::TPtr& node, std::o
         p = ctx.ChangeChildren(*p, std::move(payloadArgs));
     }
 
-    combineChildren[3] = ctx.ChangeChildren(*combineChildren[3], std::move(payloadNodes));
+    combineChildren[payloadIndex] = ctx.ChangeChildren(*combineChildren[payloadIndex], std::move(payloadNodes));
     return ctx.ChangeChildren(*node, std::move(combineChildren));
 }
 
-TExprNode::TPtr OptimizeBlockCombineAll(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& types) {
+TExprNode::TPtr OptimizeBlockCombine(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& types) {
     Y_UNUSED(types);
     if (node->Head().IsCallable("WideMap")) {
         const auto& lambda = node->Head().Tail();
@@ -4917,11 +4963,11 @@ TExprNode::TPtr OptimizeBlockCombineAll(const TExprNode::TPtr& node, TExprContex
         bool onlyArguments = IsArgumentsOnlyLambda(lambda, argIndices);
         if (onlyArguments) {
             YQL_CLOG(DEBUG, CorePeepHole) << "Drop renaming WideMap under " << node->Content();
-            return UpdateBlockCombineAllColumns(node, {}, argIndices, ctx);
+            return UpdateBlockCombineColumns(node, {}, argIndices, ctx);
         }
     }
 
-    if (node->Head().IsCallable("BlockCompress") && node->Child(2)->IsCallable("Void")) {
+    if (node->Head().IsCallable("BlockCompress") && node->Child(1)->IsCallable("Void")) {
         auto filterIndex = FromString<ui32>(node->Head().Child(1)->Content());
         TVector<ui32> argIndices;
         argIndices.resize(node->Head().GetTypeAnn()->Cast<TFlowExprType>()->GetItemType()->Cast<TMultiExprType>()->GetSize());
@@ -4930,7 +4976,7 @@ TExprNode::TPtr OptimizeBlockCombineAll(const TExprNode::TPtr& node, TExprContex
         }
 
         YQL_CLOG(DEBUG, CorePeepHole) << "Fuse " << node->Content() << " with " << node->Head().Content();
-        return UpdateBlockCombineAllColumns(node, filterIndex, argIndices, ctx);
+        return UpdateBlockCombineColumns(node, filterIndex, argIndices, ctx);
     }
 
     return node;
@@ -6542,6 +6588,11 @@ TExprNode::TPtr ExpandCheckedMinus(const TExprNode::TPtr& node, TExprContext& ct
         .Build();
 }
 
+TExprNode::TPtr DropUnordered(const TExprNode::TPtr& node, TExprContext&) {
+    YQL_CLOG(DEBUG, CorePeepHole) << "Drop " << node->Content();
+    return node->HeadPtr();
+}
+
 ui64 ToDate(ui64 now)      { return std::min<ui64>(NUdf::MAX_DATE - 1U, now / 86400000000ull); }
 ui64 ToDatetime(ui64 now)  { return std::min<ui64>(NUdf::MAX_DATETIME - 1U, now / 1000000ull); }
 ui64 ToTimestamp(ui64 now) { return std::min<ui64>(NUdf::MAX_TIMESTAMP - 1ULL, now); }
@@ -6668,8 +6719,9 @@ struct TPeepHoleRules {
         {"OrderedFilter", &ExpandFilter},
         {"TakeWhile", &ExpandFilter<false>},
         {"SkipWhile", &ExpandFilter<true>},
-        {"LMap", &ExpandLMap},
-        {"OrderedLMap", &ExpandLMap},
+        {"LMap", &ExpandLMapOrShuffleByKeys},
+        {"OrderedLMap", &ExpandLMapOrShuffleByKeys},
+        {"ShuffleByKeys", &ExpandLMapOrShuffleByKeys},
         {"ExpandMap", &OptimizeExpandMap},
         {"MultiMap", &OptimizeMultiMap<false>},
         {"OrderedMultiMap", &OptimizeMultiMap<true>},
@@ -6690,6 +6742,7 @@ struct TPeepHoleRules {
         {"NarrowMultiMap", &OptimizeWideMaps},
         {"WideMap", &OptimizeWideMaps},
         {"NarrowMap", &OptimizeWideMaps},
+        {"Unordered", &DropUnordered},
     };
 
     static constexpr std::initializer_list<TExtPeepHoleOptimizerMap::value_type> FinalStageExtRulesInit = {
@@ -6711,10 +6764,12 @@ struct TPeepHoleRules {
         {"WideMap", &OptimizeWideMapBlocks},
         {"NarrowMap", &OptimizeWideMapBlocks},
         {"WideFilter", &OptimizeWideFilterBlocks},
+        {"WideFromBlocks", &OptimizeWideFromBlocks},
         {"WideToBlocks", &OptimizeWideToBlocks},
         {"Skip", &OptimizeSkipTakeToBlocks},
         {"Take", &OptimizeSkipTakeToBlocks},
-        {"BlockCombineAll", &OptimizeBlockCombineAll},
+        {"BlockCombineAll", &OptimizeBlockCombine},
+        {"BlockCombineHashed", &OptimizeBlockCombine},
     };
 
     TPeepHoleRules()

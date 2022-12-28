@@ -27,7 +27,6 @@
 #include <ydb/core/blobstorage/backpressure/unisched.h>
 #include <ydb/core/blobstorage/nodewarden/node_warden.h>
 #include <ydb/core/blobstorage/other/mon_get_blob_page.h>
-#include <ydb/core/blobstorage/testload/test_load_actor.h>
 #include <ydb/core/blobstorage/vdisk/common/blobstorage_event_filter.h>
 
 #include <ydb/core/client/minikql_compile/mkql_compile_service.h>
@@ -65,6 +64,8 @@
 #include <ydb/core/kqp/common/kqp.h>
 #include <ydb/core/kqp/proxy_service/kqp_proxy_service.h>
 #include <ydb/core/kqp/rm_service/kqp_rm_service.h>
+
+#include <ydb/core/load_test/service_actor.h>
 
 #include <ydb/core/metering/metering.h>
 
@@ -236,20 +237,36 @@ static TCpuMask ParseAffinity(const TConfig& cfg) {
     return result;
 }
 
+TDuration GetSelfPingInterval(const NKikimrConfig::TActorSystemConfig& systemConfig) {
+    return systemConfig.HasSelfPingInterval()
+        ? TDuration::MicroSeconds(systemConfig.GetSelfPingInterval())
+        : TDuration::MilliSeconds(10);
+}
+
 void AddExecutorPool(
     TCpuManagerConfig& cpuManager,
     const NKikimrConfig::TActorSystemConfig::TExecutor& poolConfig,
     const NKikimrConfig::TActorSystemConfig& systemConfig,
     ui32 poolId,
     ui32 maxActivityType,
-    ui32& unitedThreads)
+    ui32& unitedThreads,
+    const NKikimr::TAppData* appData)
 {
+    const auto counters = GetServiceCounters(appData->Counters, "utils");
     switch (poolConfig.GetType()) {
     case NKikimrConfig::TActorSystemConfig::TExecutor::BASIC: {
         TBasicExecutorPoolConfig basic;
         basic.PoolId = poolId;
         basic.PoolName = poolConfig.GetName();
-        basic.Threads = poolConfig.GetThreads();
+        if (poolConfig.HasMaxAvgPingDeviation()) {
+            auto poolGroup = counters->GetSubgroup("execpool", basic.PoolName);
+            auto &poolInfo = cpuManager.PingInfoByPool[poolId];
+            poolInfo.AvgPingCounter = poolGroup->GetCounter("SelfPingAvgUs", false);
+            poolInfo.AvgPingCounterWithSmallWindow = poolGroup->GetCounter("SelfPingAvgUsIn1s", false);
+            TDuration maxAvgPing = GetSelfPingInterval(systemConfig) + TDuration::MicroSeconds(poolConfig.GetMaxAvgPingDeviation());
+            poolInfo.MaxAvgPingUs = maxAvgPing.MicroSeconds();
+        }
+        basic.Threads = Max(poolConfig.GetThreads(), poolConfig.GetMaxThreads());
         basic.SpinThreshold = poolConfig.GetSpinThreshold();
         basic.Affinity = ParseAffinity(poolConfig.GetAffinity());
         basic.RealtimePriority = poolConfig.GetRealtimePriority();
@@ -265,6 +282,10 @@ void AddExecutorPool(
             basic.EventsPerMailbox = systemConfig.GetEventsPerMailbox();
         }
         Y_VERIFY(basic.EventsPerMailbox != 0);
+        basic.MinThreadCount = poolConfig.GetMinThreads();
+        basic.MaxThreadCount = poolConfig.GetMaxThreads();
+        basic.DefaultThreadCount = poolConfig.GetThreads();
+        basic.Priority = poolConfig.GetPriority();
         cpuManager.Basic.emplace_back(std::move(basic));
         break;
     }
@@ -350,11 +371,14 @@ static TUnitedWorkersConfig CreateUnitedWorkersConfig(const NKikimrConfig::TActo
     return result;
 }
 
-static TCpuManagerConfig CreateCpuManagerConfig(const NKikimrConfig::TActorSystemConfig& config, ui32 maxActivityType) {
+static TCpuManagerConfig CreateCpuManagerConfig(const NKikimrConfig::TActorSystemConfig& config, ui32 maxActivityType,
+                                                const NKikimr::TAppData* appData)
+{
     TCpuManagerConfig cpuManager;
     ui32 unitedThreads = 0;
+    cpuManager.PingInfoByPool.resize(config.GetExecutor().size());
     for (int poolId = 0; poolId < config.GetExecutor().size(); poolId++) {
-        AddExecutorPool(cpuManager, config.GetExecutor(poolId), config, poolId, maxActivityType, unitedThreads);
+        AddExecutorPool(cpuManager, config.GetExecutor(poolId), config, poolId, maxActivityType, unitedThreads, appData);
     }
     cpuManager.UnitedWorkers = CreateUnitedWorkersConfig(config.GetUnitedWorkers(), unitedThreads);
     return cpuManager;
@@ -550,7 +574,7 @@ void TBasicServicesInitializer::InitializeServices(NActors::TActorSystemSetup* s
 
     setup->NodeId = NodeId;
     setup->MaxActivityType = GetActivityTypeCount();
-    setup->CpuManager = CreateCpuManagerConfig(systemConfig, setup->MaxActivityType);
+    setup->CpuManager = CreateCpuManagerConfig(systemConfig, setup->MaxActivityType, appData);
     for (ui32 poolId = 0; poolId != setup->GetExecutorsCount(); ++poolId) {
         const auto &execConfig = systemConfig.GetExecutor(poolId);
         if (execConfig.HasInjectMadSquirrels()) {
@@ -1740,9 +1764,11 @@ void TSelfPingInitializer::InitializeServices(
     for (size_t poolId = 0; poolId < setup->GetExecutorsCount(); ++poolId) {
         const auto& poolName = setup->GetPoolName(poolId);
         auto poolGroup = counters->GetSubgroup("execpool", poolName);
-        auto counter = poolGroup->GetCounter("SelfPingMaxUs", false);
+        auto maxPingCounter = poolGroup->GetCounter("SelfPingMaxUs", false);
+        auto avgPingCounter = poolGroup->GetCounter("SelfPingAvgUs", false);
+        auto avgPingCounterWithSmallWindow = poolGroup->GetCounter("SelfPingAvgUsIn1s", false);
         auto cpuTimeCounter = poolGroup->GetCounter("CpuMatBenchNs", false);
-        IActor* selfPingActor = CreateSelfPingActor(selfPingInterval, counter, cpuTimeCounter);
+        IActor* selfPingActor = CreateSelfPingActor(selfPingInterval, maxPingCounter, avgPingCounter, avgPingCounterWithSmallWindow, cpuTimeCounter);
         setup->LocalServices.push_back(std::make_pair(TActorId(),
                                                       TActorSetupCmd(selfPingActor,
                                                                      TMailboxType::HTSwap,
@@ -1829,8 +1855,8 @@ TLoadInitializer::TLoadInitializer(const TKikimrRunConfig& runConfig)
 {}
 
 void TLoadInitializer::InitializeServices(NActors::TActorSystemSetup *setup, const NKikimr::TAppData *appData) {
-    IActor *bsActor = CreateTestLoadActor(appData->Counters);
-    setup->LocalServices.emplace_back(MakeBlobStorageLoadID(NodeId), TActorSetupCmd(bsActor, TMailboxType::HTSwap, appData->UserPoolId));
+    IActor *bsActor = CreateLoadTestActor(appData->Counters);
+    setup->LocalServices.emplace_back(MakeLoadServiceID(NodeId), TActorSetupCmd(bsActor, TMailboxType::HTSwap, appData->UserPoolId));
     // FIXME: correct service id
 
     IActor *dsActor = NDataShardLoad::CreateTestLoadActor(appData->Counters);
@@ -2017,15 +2043,15 @@ TMetadataProviderInitializer::TMetadataProviderInitializer(const TKikimrRunConfi
 }
 
 void TMetadataProviderInitializer::InitializeServices(NActors::TActorSystemSetup* setup, const NKikimr::TAppData* appData) {
-    NMetadataProvider::TConfig serviceConfig;
+    NMetadata::NProvider::TConfig serviceConfig;
     if (Config.HasMetadataProviderConfig()) {
         Y_VERIFY(serviceConfig.DeserializeFromProto(Config.GetMetadataProviderConfig()));
     }
 
     if (serviceConfig.IsEnabled()) {
-        auto service = NMetadataProvider::CreateService(serviceConfig);
+        auto service = NMetadata::NProvider::CreateService(serviceConfig);
         setup->LocalServices.push_back(std::make_pair(
-            NMetadataProvider::MakeServiceId(NodeId),
+            NMetadata::NProvider::MakeServiceId(NodeId),
             TActorSetupCmd(service, TMailboxType::HTSwap, appData->UserPoolId)));
     }
 }
@@ -2306,28 +2332,23 @@ void TMeteringWriterInitializer::InitializeServices(TActorSystemSetup* setup, co
         TActorSetupCmd(actor.Release(), TMailboxType::HTSwap, appData->IOPoolId)));
 }
 
-TAuditWriterInitializer::TAuditWriterInitializer(const TKikimrRunConfig &runConfig)
+TAuditWriterInitializer::TAuditWriterInitializer(const TKikimrRunConfig &runConfig, std::shared_ptr<TModuleFactories> factories)
     : IKikimrServicesInitializer(runConfig)
+    , Factories(factories)
+    , KikimrRunConfig(runConfig)
 {
 }
 
 void TAuditWriterInitializer::InitializeServices(TActorSystemSetup* setup, const TAppData* appData)
 {
-    if (!Config.HasAuditConfig() || !Config.GetAuditConfig().HasAuditFilePath() || !Config.GetAuditConfig().HasFormat()) {
+    TAutoPtr<TLogBackend> fileBackend;
+    if (Factories && Factories->AuditLogBackendFactory) {
+        Factories->AuditLogBackendFactory->CreateLogBackend(KikimrRunConfig, appData->Counters);
+    }
+    if (!fileBackend)
         return;
-    }
 
-    const auto& filePath = Config.GetAuditConfig().GetAuditFilePath();
     const auto format = Config.GetAuditConfig().GetFormat();
-
-    THolder<TFileLogBackend> fileBackend;
-    try {
-        fileBackend = MakeHolder<TFileLogBackend>(filePath);
-    } catch (const TFileError& ex) {
-        Cerr << "TAuditWriterInitializer: failed to open file '" << filePath << "': " << ex.what() << Endl;
-        exit(1);
-    }
-
     auto actor = NAudit::CreateAuditWriter(std::move(fileBackend), format);
 
     setup->LocalServices.push_back(std::pair<TActorId, TActorSetupCmd>(

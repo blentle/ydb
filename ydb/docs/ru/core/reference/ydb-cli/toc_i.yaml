@@ -31,8 +31,8 @@ items:
       href: commands/tools/rename.md
     - name: Установка параметров TTL
       href: table-ttl-set.md
-    - name: Удаление параметров TTL
-      href: table-ttl-drop.md
+    - name: Сброс параметров TTL
+      href: table-ttl-reset.md
     - name: Удаление таблицы
       href: table-drop.md
   - name: Работа с данными

@@ -5,8 +5,7 @@
 #include <ydb/core/scheme/scheme_types_defs.h>
 #include <ydb/core/tablet_flat/flat_cxx_database.h>
 
-namespace NKikimr {
-namespace NConsole {
+namespace NKikimr::NConsole {
 
 struct Schema : NIceDb::Schema {
     struct Config : Table<1> {
@@ -101,6 +100,16 @@ struct Schema : NIceDb::Schema {
         using TColumns = TableColumns<Tenant, Host, Port, Kind>;
     };
 
+    struct LogRecords : Table<7> {
+        struct Id : Column<1, NScheme::NTypeIds::Uint64> {};
+        struct Timestamp : Column<2, NScheme::NTypeIds::Uint64> {};
+        struct UserSID : Column<3, NScheme::NTypeIds::String> {};
+        struct Data : Column<4, NScheme::NTypeIds::String> {};
+
+        using TKey = TableKey<Id>;
+        using TColumns = TableColumns<Id, Timestamp, UserSID, Data>;
+    };
+
     struct ConfigItems : Table<100> {
         struct Id : Column<1, NScheme::NTypeIds::Uint64> {};
         struct Generation : Column<2, NScheme::NTypeIds::Uint64> {};
@@ -143,10 +152,9 @@ struct Schema : NIceDb::Schema {
     };
 
     using TTables = SchemaTables<Config, Tenants, TenantPools, TenantUnits, RemovedTenants,
-                                 RegisteredUnits, ConfigItems, ConfigSubscriptions, DisabledValidators>;
+                                 RegisteredUnits, LogRecords, ConfigItems, ConfigSubscriptions, DisabledValidators>;
     using TSettings = SchemaSettings<ExecutorLogBatching<true>,
                                      ExecutorLogFlushPeriod<TDuration::MicroSeconds(512).GetValue()>>;
 };
 
-} // namespace NConsole
-} // namespace NKikimr
+} // namespace NKikimr::NConsole

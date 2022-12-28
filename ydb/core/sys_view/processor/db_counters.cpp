@@ -339,7 +339,7 @@ void TSysViewProcessor::AttachExternalCounters() {
         ->GetSubgroup("database_id", DatabaseId)
         ->RegisterSubgroup("host", "", ExternalGroup);
 
-    GetServiceCounters(AppData()->Counters, "labeled", false)
+    GetServiceCounters(AppData()->Counters, "labeled_serverless", false)
         ->GetSubgroup("database", Database)
         ->GetSubgroup("cloud_id", CloudId)
         ->GetSubgroup("folder_id", FolderId)
@@ -367,7 +367,7 @@ void TSysViewProcessor::DetachExternalCounters() {
     GetServiceCounters(AppData()->Counters, "ydb_serverless", false)
         ->RemoveSubgroup("database", Database);
 
-    GetServiceCounters(AppData()->Counters, "labeled", false)
+    GetServiceCounters(AppData()->Counters, "labeled_serverless", false)
         ->RemoveSubgroup("database", Database);
 }
 
@@ -414,6 +414,7 @@ void TSysViewProcessor::Handle(TEvSysView::TEvSendDbCountersRequest::TPtr& ev) {
         incomingServicesSet.insert(service);
 
         auto& simpleState = state.Simple[service];
+        simpleState.Clear();
         SwapStatefulCounters(&simpleState, *serviceCounters.MutableCounters());
 
         auto& aggrState = AggregatedCountersState[service];
@@ -472,7 +473,7 @@ void TSysViewProcessor::Handle(TEvSysView::TEvSendDbLabeledCountersRequest::TPtr
         incomingServicesSet.insert(service);
 
         auto& simpleState = state.Simple[service];
-        simpleState.ClearLabeledCounters();
+        simpleState.Clear();
         SwapStatefulCounters(&simpleState, *serviceCounters.MutableCounters());
     }
 

@@ -12,6 +12,8 @@
 namespace NKikimr::NColumnShard {
 namespace NTiers {
 
+NOlap::TCompression ConvertCompression(const NKikimrSchemeOp::TCompressionOptions& compression);
+
 class TManager {
 private:
     ui64 TabletId = 0;
@@ -20,8 +22,6 @@ private:
     YDB_READONLY_DEF(NActors::TActorId, StorageActorId);
 public:
     TManager(const ui64 tabletId, const NActors::TActorId& tabletActorId, const TTierConfig& config);
-    static NOlap::TCompression ConvertCompression(const NKikimrSchemeOp::TCompressionOptions& compression);
-    NOlap::TStorageTier BuildTierStorage() const;
 
     TManager& Restart(const TTierConfig& config, std::shared_ptr<NMetadata::NSecret::TSnapshot> secrets);
     bool NeedExport() const {
@@ -44,8 +44,8 @@ private:
     YDB_READONLY_FLAG(ReadyForUsage, false);
 
     std::shared_ptr<NMetadata::NSecret::TSnapshot> Secrets;
-    NMetadataProvider::ISnapshot::TPtr Snapshot;
-    mutable NMetadataProvider::ISnapshotsFetcher::TPtr ExternalDataManipulation;
+    NMetadata::NFetcher::ISnapshot::TPtr Snapshot;
+    mutable NMetadata::NFetcher::ISnapshotsFetcher::TPtr ExternalDataManipulation;
 
 public:
     TTiersManager(const ui64 tabletId, const TActorId& tabletActorId)
@@ -54,8 +54,8 @@ public:
     {
     }
     TActorId GetActorId() const;
-    THashMap<ui64, NOlap::TTiersInfo> GetTiering() const;
-    void TakeConfigs(NMetadataProvider::ISnapshot::TPtr snapshot, std::shared_ptr<NMetadata::NSecret::TSnapshot> secrets);
+    THashMap<ui64, NOlap::TTiering> GetTiering() const;
+    void TakeConfigs(NMetadata::NFetcher::ISnapshot::TPtr snapshot, std::shared_ptr<NMetadata::NSecret::TSnapshot> secrets);
     void EnablePathId(const ui64 pathId, const TString& tieringId) {
         PathIdTiering.emplace(pathId, tieringId);
     }
@@ -66,7 +66,7 @@ public:
     TTiersManager& Stop();
     TActorId GetStorageActorId(const TString& tierId);
     const NTiers::TManager& GetManagerVerified(const TString& tierId) const;
-    NMetadataProvider::ISnapshotsFetcher::TPtr GetExternalDataManipulation() const;
+    NMetadata::NFetcher::ISnapshotsFetcher::TPtr GetExternalDataManipulation() const;
 
     TManagers::const_iterator begin() const {
         return Managers.begin();

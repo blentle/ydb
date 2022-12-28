@@ -1,7 +1,7 @@
 #include "accessor_subscribe.h"
 #include <library/cpp/actors/core/log.h>
 
-namespace NKikimr::NMetadataProvider {
+namespace NKikimr::NMetadata::NProvider {
 
 void TDSAccessorNotifier::OnSnapshotModified() {
     auto snapshot = GetCurrentSnapshot();
@@ -52,6 +52,11 @@ void TDSAccessorNotifier::OnSnapshotRefresh() {
             ++it;
         }
     }
+}
+
+void TDSAccessorNotifier::OnBootstrap() {
+    TBase::OnBootstrap();
+    Become(&TDSAccessorNotifier::StateMain);
 }
 
 }

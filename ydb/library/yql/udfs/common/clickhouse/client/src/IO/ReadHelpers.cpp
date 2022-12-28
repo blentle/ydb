@@ -10,6 +10,8 @@
 #include <common/find_symbols.h>
 #include <stdlib.h>
 
+#include <util/datetime/base.h>
+
 #ifdef __SSE2__
     #include <emmintrin.h>
 #endif
@@ -1164,6 +1166,128 @@ bool loadAtPosition(ReadBuffer & in, Memory<> & memory, char * & current)
     current = in.position();
 
     return loaded_more;
+}
+
+void readDateTimeTextISO(time_t & x, ReadBuffer & istr) {
+    char prefix[26] = {};
+    int offset = 0;
+    for (const auto& len: {20, 25}) {
+        istr.readStrict(prefix + offset, len - offset);
+        offset = len;
+        TInstant result;
+        if (TInstant::TryParseIso8601(TStringBuf{prefix, prefix + len}, result)) {
+            x = result.GetValue() / 1000000;
+            return;
+        }
+    }
+    throw yexception() << "error in datetime parsing. Input data: " << prefix;
+}
+
+int formatMinLength(const String& format)
+{
+    char prefix[100] = {};
+    struct tm input_tm = {};
+    return strftime(prefix, 100, format.c_str(), &input_tm);
+}
+
+int formatMaxLength(const String& format)
+{
+    char prefix[100] = {};
+    struct tm input_tm = {};
+    input_tm.tm_sec = 20;
+    input_tm.tm_min = 20;
+    input_tm.tm_hour = 20;
+    input_tm.tm_mday = 20;
+    input_tm.tm_mon = 10;
+    input_tm.tm_year = 1900;
+    input_tm.tm_wday = 1;
+    input_tm.tm_yday = 365;
+    return strftime(prefix, 100, format.c_str(), &input_tm);
+}
+
+char* readDateTimeTextFormat(time_t & x, char* str, const String& format)
+{
+    struct tm input_tm;
+    memset(&input_tm, 0, sizeof(tm));
+    input_tm.tm_mday = 1;
+    auto ptr = strptime(str, format.c_str(), &input_tm);
+    if (ptr == nullptr) {
+        ythrow yexception() << "Can't parse date " << str << " in " << format << " format";
+    }
+    x = TimeGM(&input_tm);
+    return ptr;
+}
+
+void readDateTimeTextFormat(time_t & x, ReadBuffer & istr, const String& format)
+{
+    int min_length = formatMinLength(format);
+    int max_length = formatMaxLength(format);
+    if (min_length <= 0 || max_length <= 0) {
+        ythrow yexception() << "Can't parse date, too long format: " << format;
+    }
+    char prefix[100] = {};
+    int offset = 0;
+    struct tm input_tm = {};
+    for (int length = min_length; length <= max_length; length++) {
+        istr.readStrict(prefix + offset, length - offset);
+        offset = length;
+        auto ptr = strptime(prefix, format.c_str(), &input_tm);
+        if (ptr == nullptr) {
+            continue;
+        }
+        x = TimeGM(&input_tm);
+        return;
+    }
+    ythrow yexception() << "Can't parse date " << prefix << " in " << format << " format";
+}
+
+void readDateTimeTextPOSIX(time_t & x, ReadBuffer & istr)
+{
+    char prefix[20] = {};
+    istr.readStrict(prefix, 19);
+    readDateTimeTextFormat(x, prefix, "%Y-%m-%d %H:%M:%S");
+}
+
+void readTimestampTextISO(DateTime64 & x, ReadBuffer & istr) {
+    char prefix[28] = {};
+    int offset = 0;
+    for (const auto& len: {20, 24, 25, 27}) {
+        istr.readStrict(prefix + offset, len - offset);
+        offset = len;
+        TInstant result;
+        if (TInstant::TryParseIso8601(TStringBuf{prefix, prefix + len}, result)) {
+            x = result.GetValue();
+            return;
+        }
+    }
+    throw yexception() << "error in timestamp parsing. Input data: " << prefix;
+}
+
+char* readTimestampTextFormat(DateTime64 & x, char* str, const String& format)
+{
+    struct tm input_tm;
+    memset(&input_tm, 0, sizeof(tm));
+    input_tm.tm_mday = 1;
+    auto ptr = strptime(str, format.c_str(), &input_tm);
+    if (ptr == nullptr) {
+        ythrow yexception() << "Can't parse date " << str << " in " << format << " format";
+    }
+    x = TimeGM(&input_tm) * 1000000;
+    return ptr;
+}
+
+void readTimestampTextFormat(DateTime64 & x, ReadBuffer & istr, const String& format)
+{
+    time_t tmp = {};
+    readDateTimeTextFormat(tmp, istr, format);
+    x = tmp * 1000000;
+}
+
+void readTimestampTextPOSIX(DateTime64 & x, ReadBuffer & istr)
+{
+    char prefix[20] = {};
+    istr.readStrict(prefix, 19);
+    readTimestampTextFormat(x, prefix, "%Y-%m-%d %H:%M:%S");
 }
 
 }

@@ -218,6 +218,8 @@ public:
         return TStatus::Ok;
     }
 
+    void Rewind() final {
+    }
 private:
     struct TExecInfo {
         TKiExecDataQuery Node;
@@ -1326,7 +1328,7 @@ private:
         auto runFunc = [this, cluster, execQuery, &ctx](const IKikimrQueryExecutor::TExecuteSettings& settings)
             -> TIntrusivePtr<IKikimrQueryExecutor::TAsyncQueryResult>
         {
-            return QueryExecutor->ExecuteDataQuery(cluster, execQuery.Query().Ptr(), ctx, settings);
+            return QueryExecutor->ExecuteDataQuery(cluster, execQuery.QueryBlocks().Ptr(), ctx, settings);
         };
 
         auto finalizeFunc = [] (TExprBase node, const IKikimrQueryExecutor::TQueryResult& result, TExprContext& ctx) {

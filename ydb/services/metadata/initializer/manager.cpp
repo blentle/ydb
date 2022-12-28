@@ -1,12 +1,20 @@
 #include "manager.h"
 #include "initializer.h"
 
-namespace NKikimr::NMetadataInitializer {
+namespace NKikimr::NMetadata::NInitializer {
 
-TManager::TFactory::TRegistrator<TManager> TManager::Registrator(TManager::GetTypeIdStatic());
+void TManager::DoPrepareObjectsBeforeModification(std::vector<TDBInitialization>&& objects,
+    NModifications::IAlterPreparationController<TDBInitialization>::TPtr controller,
+    const TModificationContext& /*context*/) const
+{
+    controller->PreparationFinished(std::move(objects));
+}
 
-NMetadata::IInitializationBehaviour::TPtr TManager::DoGetInitializationBehaviour() const {
-    return std::make_shared<TInitializer>();
+NModifications::TOperationParsingResult TManager::DoBuildPatchFromSettings(
+    const NYql::TObjectSettingsImpl& /*settings*/,
+    const TModificationContext& /*context*/) const {
+    NInternal::TTableRecord result;
+    return result;
 }
 
 }

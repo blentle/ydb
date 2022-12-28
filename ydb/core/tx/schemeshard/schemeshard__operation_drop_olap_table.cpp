@@ -71,7 +71,7 @@ public:
                     context.Ctx.SelfID,
                     ui64(OperationId.GetTxId()),
                     columnShardTxBody,
-                    context.SS->SelectProcessingPrarams(txState->TargetPathId));
+                    context.SS->SelectProcessingParams(txState->TargetPathId));
 
                 context.OnComplete.BindMsgToPipe(OperationId, tabletId, shard.Idx, event.release());
             }
@@ -316,7 +316,7 @@ public:
         }
         NSchemeShard::TPath path = NSchemeShard::TPath::Init(txState->TargetPathId, context.SS);
         auto tableInfo = context.SS->ColumnTables.GetVerified(path.Base()->PathId);
-        const TString& tieringId = tableInfo->Description.GetTtlSettings().GetTiering().GetUseTiering();
+        const TString& tieringId = tableInfo->Description.GetTtlSettings().GetUseTiering();
         if (!tieringId) {
             return Finish(context);
         }

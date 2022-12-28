@@ -29,6 +29,7 @@ private:
 
     TBlackboard Blackboard;
     TBatchedVec<bool> IsDone;
+    TBatchedVec<bool> WrittenBeyondBarrier;
     TStorageStatusFlags StatusFlags;
     float ApproximateFreeSpaceShare;
     TIntrusivePtr<TBlobStorageGroupProxyMon> Mon;
@@ -109,6 +110,7 @@ public:
         , Info(info)
         , Blackboard(info, state, ev->HandleClass, NKikimrBlobStorage::EGetHandleClass::AsyncRead, false)
         , IsDone(1)
+        , WrittenBeyondBarrier(1)
         , StatusFlags(0)
         , ApproximateFreeSpaceShare(0.f)
         , Mon(mon)
@@ -131,6 +133,7 @@ public:
         , Info(info)
         , Blackboard(info, state, putHandleClass, NKikimrBlobStorage::EGetHandleClass::AsyncRead, false)
         , IsDone(events.size())
+        , WrittenBeyondBarrier(events.size())
         , StatusFlags(0)
         , ApproximateFreeSpaceShare(0.f)
         , Mon(mon)
@@ -304,6 +307,7 @@ public:
             case NKikimrProto::OK:
             case NKikimrProto::ALREADY:
                 Blackboard.AddPutOkResponse(blobId, orderNumber);
+                WrittenBeyondBarrier[blobIdx] = record.GetWrittenBeyondBarrier();
                 break;
             default:
                 ErrorDescription = TStringBuilder() << "Unexpected status# " << status;
@@ -496,7 +500,7 @@ protected:
                 } else if constexpr (isVMultiPut) {
                     // this request MUST originate from the TEvPut, so the Span field must be filled in
                     Y_VERIFY(put.Span);
-                    outVPutEvents.back()->AddVPut(put.Id, TContiguousData(TRope(put.Buffer)), &cookie, put.ExtraBlockChecks, put.Span->GetTraceId());
+                    outVPutEvents.back()->AddVPut(put.Id, TRcBuf(TRope(put.Buffer)), &cookie, put.ExtraBlockChecks, put.Span->GetTraceId());
                 }
 
                 if (put.IsHandoff) {

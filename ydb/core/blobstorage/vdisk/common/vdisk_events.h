@@ -815,12 +815,12 @@ namespace NKikimr {
             return sum;
         }
 
-        void StorePayload(NKikimrBlobStorage::TVMultiPutItem &item, const TContiguousData &buffer);
+        void StorePayload(NKikimrBlobStorage::TVMultiPutItem &item, const TRcBuf &buffer);
 
 
         TRope GetItemBuffer(ui64 itemIdx) const;
 
-        void AddVPut(const TLogoBlobID &logoBlobId, const TContiguousData &buffer, ui64 *cookie,
+        void AddVPut(const TLogoBlobID &logoBlobId, const TRcBuf &buffer, ui64 *cookie,
                 std::vector<std::pair<ui64, ui32>> *extraBlockChecks, NWilson::TTraceId traceId) {
             NKikimrBlobStorage::TVMultiPutItem *item = Record.AddItems();
             LogoBlobIDFromLogoBlobID(logoBlobId, item->MutableBlobID());
@@ -938,7 +938,7 @@ namespace NKikimr {
         }
 
         void AddVPutResult(NKikimrProto::EReplyStatus status, const TString& errorReason, const TLogoBlobID &logoBlobId,
-                ui64 *cookie, ui32 statusFlags = 0)
+                ui64 *cookie, ui32 statusFlags = 0, bool writtenBeyondBarrier = false)
         {
             NKikimrBlobStorage::TVMultiPutResultItem *item = Record.AddItems();
             item->SetStatus(status);
@@ -950,6 +950,9 @@ namespace NKikimr {
                 item->SetCookie(*cookie);
             }
             item->SetStatusFlags(statusFlags);
+            if (writtenBeyondBarrier) {
+                item->SetWrittenBeyondBarrier(true);
+            }
         }
 
         void MakeError(NKikimrProto::EReplyStatus status, const TString& errorReason,
@@ -1475,7 +1478,7 @@ namespace NKikimr {
             diffBlock->SetBuffer(buffer);
         }
 
-        void AddDiff(ui64 startIdx, const TContiguousData &buffer) {
+        void AddDiff(ui64 startIdx, const TRcBuf &buffer) {
             TLogoBlobID id = LogoBlobIDFromLogoBlobID(this->Record.GetOriginalBlobId());
             Y_VERIFY(startIdx < id.BlobSize());
             REQUEST_VALGRIND_CHECK_MEM_IS_DEFINED(&buffer, sizeof(buffer));
@@ -1927,7 +1930,7 @@ namespace NKikimr {
             r->SetBuffer(buffer.data(), buffer.size());
         }
 
-        void AddDiff(ui64 startIdx, const TContiguousData &buffer) {
+        void AddDiff(ui64 startIdx, const TRcBuf &buffer) {
             REQUEST_VALGRIND_CHECK_MEM_IS_DEFINED(buffer.data(), buffer.size());
 
             NKikimrBlobStorage::TDiffBlock *r = Record.AddDiffs();
@@ -1991,7 +1994,7 @@ namespace NKikimr {
             Record.MutableMsgQoS()->SetExtQueueId(NKikimrBlobStorage::EVDiskQueueId::PutAsyncBlob);
         }
 
-        void AddDiff(ui64 startIdx, const TContiguousData &buffer) {
+        void AddDiff(ui64 startIdx, const TRcBuf &buffer) {
             REQUEST_VALGRIND_CHECK_MEM_IS_DEFINED(buffer.data(), buffer.size());
 
             NKikimrBlobStorage::TDiffBlock *r = Record.AddDiffs();
@@ -2980,6 +2983,33 @@ namespace NKikimr {
                     TEvBlobStorage::EvGetLogoBlobResponse>
     {
         TEvGetLogoBlobResponse() = default;
+    };
+
+    struct TEvGetLogoBlobIndexStatRequest
+        : public TEventPB<TEvGetLogoBlobIndexStatRequest,
+                    NKikimrVDisk::GetLogoBlobIndexStatRequest,
+                    TEvBlobStorage::EvGetLogoBlobIndexStatRequest>
+    {
+        TEvGetLogoBlobIndexStatRequest() = default;
+    };
+
+    struct TEvGetLogoBlobIndexStatResponse
+        : public TEvVResultBasePB<TEvGetLogoBlobIndexStatResponse,
+                    NKikimrVDisk::GetLogoBlobIndexStatResponse,
+                    TEvBlobStorage::EvGetLogoBlobIndexStatResponse>
+    {
+        TEvGetLogoBlobIndexStatResponse() = default;
+
+        TEvGetLogoBlobIndexStatResponse(NKikimrProto::EReplyStatus status, const TVDiskID &, const TInstant &now,
+                const ::NMonitoring::TDynamicCounters::TCounterPtr &counterPtr, const NVDiskMon::TLtcHistoPtr &histoPtr)
+            : TEvVResultBasePB(now, counterPtr, histoPtr, TInterconnectChannels::IC_BLOBSTORAGE_SMALL_MSG)
+        {
+            Record.set_status(NKikimrProto::EReplyStatus_Name(status));
+        }
+
+        void SetError() {
+            Record.set_status(NKikimrProto::EReplyStatus_Name(NKikimrProto::ERROR));
+        }
     };
 
 } // NKikimr

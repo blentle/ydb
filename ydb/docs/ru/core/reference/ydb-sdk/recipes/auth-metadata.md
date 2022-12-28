@@ -90,4 +90,8 @@
   }
   ```
 
+- Node.js
+
+  {% include [auth-metadata](../../../../_includes/nodejs/auth-metadata.md) %}
+
 {% endlist %}

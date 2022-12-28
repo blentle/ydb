@@ -369,7 +369,7 @@ private:
             f.SetSize(TFile(path, OpenExisting | RdOnly).GetLength());
             uploadList->emplace(f);
         }
-
+        bool fallbackFlag = false;
         for (TNode* node : explorer.GetNodes()) {
             node->Freeze(typeEnv);
 
@@ -470,6 +470,12 @@ private:
                     } else if (name == TStringBuf("Udf") || name == TStringBuf("ScriptUdf")) {
                         const TString udfName(AS_VALUE(TDataLiteral, callable.GetInput(0))->AsValue().AsStringRef());
                         const auto moduleName = ModuleName(udfName);
+                        TString customUdfPrefix;
+                        const auto& udfModules = State->TypeCtx->UdfModules;
+                        auto it = udfModules.find(moduleName);
+                        if (it != udfModules.end()) {
+                            customUdfPrefix = it->second.Prefix;
+                        }
 
                         YQL_CLOG(DEBUG, ProviderDq) << "Try to resolve " << moduleName;
                         TMaybe<TFilePathWithMd5> udfPathWithMd5 = State->TypeCtx->UdfResolver->GetSystemModulePath(moduleName);
@@ -487,6 +493,7 @@ private:
                             f.SetObjectId(objectId);
                             f.SetObjectType(IDqGateway::TFileResource::EUDF_FILE);
                             f.SetSize(TFile(filePath, OpenExisting | RdOnly).GetLength());
+                            f.SetCustomUdfPrefix(customUdfPrefix);
                             uploadList->emplace(f);
                         }
 
@@ -513,7 +520,6 @@ private:
         }
 
         i64 dataLimit = static_cast<i64>(4_GB);
-        bool fallbackFlag = false;
         if (sizeSum > dataLimit) {
             YQL_CLOG(WARN, ProviderDq) << "Too much data: " << sizeSum << " > " << dataLimit;
             fallbackFlag = true;

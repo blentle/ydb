@@ -147,6 +147,37 @@ NUdf::TUnboxedValuePod OwnedPointerDatumToPod(Datum datum) {
     return NUdf::TUnboxedValuePod(std::move(ref));
 }
 
+class TVPtrHolder {
+public:
+    TVPtrHolder() {
+        new(Dummy) TBoxedValueWithFree();
+    }
+
+    static bool IsBoxedVPtr(Datum ptr) {
+        return *(const uintptr_t*)((char*)ptr - PallocHdrSize) == *(const uintptr_t*)Instance.Dummy;
+    }
+
+private:
+    char Dummy[sizeof(NUdf::IBoxedValue)];
+
+    static TVPtrHolder Instance;
+};
+
+TVPtrHolder TVPtrHolder::Instance;
+
+NUdf::TUnboxedValuePod AnyDatumToPod(Datum datum, bool passByValue) {
+    if (passByValue) {
+        return ScalarDatumToPod(datum);
+    }
+
+    if (TVPtrHolder::IsBoxedVPtr(datum)) {
+        // returned one of arguments
+        return OwnedPointerDatumToPod(datum);
+    }
+
+    return PointerDatumToPod(datum);
+}
+
 Datum PointerDatumFromPod(const NUdf::TUnboxedValuePod& value) {
     return (Datum)(((const char*)value.AsBoxed().Get()) + PallocHdrSize);
 }
@@ -236,24 +267,6 @@ const MemoryContextMethods MkqlMethods = {
 #endif
 };
 
-class TVPtrHolder {
-public:
-    TVPtrHolder() {
-        new(Dummy) TBoxedValueWithFree();
-    }
-
-    static bool IsBoxedVPtr(Datum ptr) {
-        return *(const uintptr_t*)((char*)ptr - PallocHdrSize) == *(const uintptr_t*)Instance.Dummy;
-    }
-
-private:
-    char Dummy[sizeof(NUdf::IBoxedValue)];
-
-    static TVPtrHolder Instance;
-};
-
-TVPtrHolder TVPtrHolder::Instance;
-
 inline ui32 MakeTypeIOParam(const NPg::TTypeDesc& desc) {
     return desc.ElementTypeId ? desc.ElementTypeId : desc.TypeId;
 }
@@ -304,7 +317,7 @@ public:
         {
             auto ret = FInfo.fn_addr(callInfo);
             Y_ENSURE(!callInfo->isnull);
-            return TypeDesc.PassByValue ? ScalarDatumToPod(ret) : PointerDatumToPod(ret);
+            return AnyDatumToPod(ret, TypeDesc.PassByValue);
         }
         PG_CATCH();
         {
@@ -361,7 +374,7 @@ public:
         }
 
         MemSize = SizeForFunctionCallInfo(numArgs);
-        Ptr = MKQLAllocWithSize(MemSize);
+        Ptr = TWithDefaultMiniKQLAlloc::AllocWithSize(MemSize);
         auto& callInfo = Ref();
         Zero(callInfo);
         callInfo.flinfo = &CopyFmgrInfo; // client may mutate fn_extra
@@ -376,7 +389,7 @@ public:
 
     ~TFunctionCallInfo() {
         if (Ptr) {
-            MKQLFreeWithSize(Ptr, MemSize);
+            TWithDefaultMiniKQLAlloc::FreeWithSize(Ptr, MemSize);
         }
     }
 
@@ -393,13 +406,13 @@ private:
 class TReturnSetInfo {
 public:
     TReturnSetInfo() {
-        Ptr = MKQLAllocWithSize(sizeof(ReturnSetInfo));
+        Ptr = TWithDefaultMiniKQLAlloc::AllocWithSize(sizeof(ReturnSetInfo));
         Zero(Ref());
         Ref().type = T_ReturnSetInfo;
     }
 
     ~TReturnSetInfo() {
-        MKQLFreeWithSize(Ptr, sizeof(ReturnSetInfo));
+        TWithDefaultMiniKQLAlloc::FreeWithSize(Ptr, sizeof(ReturnSetInfo));
     }
 
     ReturnSetInfo& Ref() {
@@ -551,16 +564,7 @@ private:
                 return NUdf::TUnboxedValuePod();
             }
 
-            if (this->RetTypeDesc.PassByValue) {
-                return ScalarDatumToPod(ret);
-            }
-
-            if (TVPtrHolder::IsBoxedVPtr(ret)) {
-                // returned one of arguments
-                return OwnedPointerDatumToPod(ret);
-            }
-
-            return PointerDatumToPod(ret);
+            return AnyDatumToPod(ret, this->RetTypeDesc.PassByValue);
         }
         PG_CATCH();
         {
@@ -641,13 +645,8 @@ private:
 
                     if (callInfo.isnull) {
                         value = NUdf::TUnboxedValuePod();
-                    } else if (RetTypeDesc.PassByValue) {
-                        value = ScalarDatumToPod(ret);
-                    } else if (TVPtrHolder::IsBoxedVPtr(ret)) {
-                        // returned one of arguments
-                        value = OwnedPointerDatumToPod(ret);
                     } else {
-                        value = PointerDatumToPod(ret);
+                        value = AnyDatumToPod(ret, RetTypeDesc.PassByValue);
                     }
 
                     return true;
@@ -864,14 +863,14 @@ public:
             auto lb = ARR_LBOUND(arr);
             auto nitems = ArrayGetNItems(ndim, dims);
 
-            Datum* elems = (Datum*)MKQLAllocWithSize(nitems * sizeof(Datum));
+            Datum* elems = (Datum*)TWithDefaultMiniKQLAlloc::AllocWithSize(nitems * sizeof(Datum));
             Y_DEFER {
-                MKQLFreeWithSize(elems, nitems * sizeof(Datum));
+                TWithDefaultMiniKQLAlloc::FreeWithSize(elems, nitems * sizeof(Datum));
             };
 
-            bool* nulls = (bool*)MKQLAllocWithSize(nitems);
+            bool* nulls = (bool*)TWithDefaultMiniKQLAlloc::AllocWithSize(nitems);
             Y_DEFER {
-                MKQLFreeWithSize(nulls, nitems);
+                TWithDefaultMiniKQLAlloc::FreeWithSize(nulls, nitems);
             };
 
             array_iter iter;
@@ -898,7 +897,7 @@ public:
                 ScalarDatumFromPod(value) :
                 PointerDatumFromPod(value);
             auto ret = ConvertDatum(datum, state, typeMod);
-            return TargetTypeDesc.PassByValue ? ScalarDatumToPod(ret) : PointerDatumToPod(ret);
+            return AnyDatumToPod(ret, TargetTypeDesc.PassByValue);
         }
     }
 
@@ -1272,14 +1271,14 @@ public:
             args.push_back(value);
         }
 
-        Datum* dvalues = (Datum*)MKQLAllocWithSize(nelems * sizeof(Datum));
+        Datum* dvalues = (Datum*)TWithDefaultMiniKQLAlloc::AllocWithSize(nelems * sizeof(Datum));
         Y_DEFER {
-            MKQLFreeWithSize(dvalues, nelems * sizeof(Datum));
+            TWithDefaultMiniKQLAlloc::FreeWithSize(dvalues, nelems * sizeof(Datum));
         };
 
-        bool *dnulls = (bool*)MKQLAllocWithSize(nelems);
+        bool *dnulls = (bool*)TWithDefaultMiniKQLAlloc::AllocWithSize(nelems);
         Y_DEFER {
-            MKQLFreeWithSize(dnulls, nelems);
+            TWithDefaultMiniKQLAlloc::FreeWithSize(dnulls, nelems);
         };
 
         TPAllocScope call;
@@ -1978,7 +1977,7 @@ NUdf::TUnboxedValue PgValueFromNativeBinary(const TStringBuf binary, ui32 pgType
             errMsg << "Not all data has been consumed by 'recv' function: " << NPg::LookupProc(receiveFuncId).Name << ", data size: " << stringInfo.len << ", consumed size: " << stringInfo.cursor;
             UdfTerminate(errMsg.c_str());
         }
-        return typeInfo.PassByValue ? ScalarDatumToPod(x) : PointerDatumToPod(x);
+        return AnyDatumToPod(x, typeInfo.PassByValue);
     }
     PG_CATCH();
     {
@@ -2024,7 +2023,7 @@ NUdf::TUnboxedValue PgValueFromNativeText(const TStringBuf text, ui32 pgTypeId) 
 
         auto x = finfo.fn_addr(callInfo);
         Y_ENSURE(!callInfo->isnull);
-        return typeInfo.PassByValue ? ScalarDatumToPod(x) : PointerDatumToPod(x);
+        return AnyDatumToPod(x, typeInfo.PassByValue);
     }
     PG_CATCH();
     {
@@ -2164,9 +2163,9 @@ NUdf::TUnboxedValue ReadSkiffPg(TPgType* type, NCommon::TInputBuf& buf) {
         ui32 size;
         buf.ReadMany((char*)&size, sizeof(size));
         CHECK_STRING_LENGTH_UNSIGNED(size);
-        char* s = (char*)MKQLAllocWithSize(size);
+        char* s = (char*)TWithDefaultMiniKQLAlloc::AllocWithSize(size);
         Y_DEFER {
-            MKQLFreeWithSize(s, size);
+            TWithDefaultMiniKQLAlloc::FreeWithSize(s, size);
         };
 
         buf.ReadMany(s, size);
@@ -2571,15 +2570,15 @@ NUdf::TUnboxedValue DecodePresortPGValue(TPgType* type, TStringBuf& input, TVect
 
 void* PgInitializeContext(const std::string_view& contextType) {
     if (contextType == "Agg") {
-        auto ctx = (AggState*)MKQLAllocWithSize(sizeof(AggState));
+        auto ctx = (AggState*)TWithDefaultMiniKQLAlloc::AllocWithSize(sizeof(AggState));
         Zero(*ctx);
         *(NodeTag*)ctx = T_AggState;
-        ctx->curaggcontext = (ExprContext*)MKQLAllocWithSize(sizeof(ExprContext));
+        ctx->curaggcontext = (ExprContext*)TWithDefaultMiniKQLAlloc::AllocWithSize(sizeof(ExprContext));
         Zero(*ctx->curaggcontext);
         ctx->curaggcontext->ecxt_per_tuple_memory = (MemoryContext)&((TMainContext*)TlsAllocState->MainContext)->Data;
         return ctx;
     } else if (contextType == "WinAgg") {
-        auto ctx = (WindowAggState*)MKQLAllocWithSize(sizeof(WindowAggState));
+        auto ctx = (WindowAggState*)TWithDefaultMiniKQLAlloc::AllocWithSize(sizeof(WindowAggState));
         Zero(*ctx);
         *(NodeTag*)ctx = T_WindowAggState;
         ctx->curaggcontext = (MemoryContext)&((TMainContext*)TlsAllocState->MainContext)->Data;
@@ -2591,10 +2590,10 @@ void* PgInitializeContext(const std::string_view& contextType) {
 
 void PgDestroyContext(const std::string_view& contextType, void* ctx) {
     if (contextType == "Agg") {
-        MKQLFreeWithSize(((AggState*)ctx)->curaggcontext, sizeof(ExprContext));
-        MKQLFreeWithSize(ctx, sizeof(AggState));
+        TWithDefaultMiniKQLAlloc::FreeWithSize(((AggState*)ctx)->curaggcontext, sizeof(ExprContext));
+        TWithDefaultMiniKQLAlloc::FreeWithSize(ctx, sizeof(AggState));
     } else if (contextType == "WinAgg") {
-        MKQLFreeWithSize(ctx, sizeof(WindowAggState));
+        TWithDefaultMiniKQLAlloc::FreeWithSize(ctx, sizeof(WindowAggState));
     } else {
         Y_FAIL("Unsupported context type");
     }
@@ -2930,11 +2929,9 @@ class TPgTypeDescriptor
     : public NYql::NPg::TTypeDesc
 {
 public:
-    TPgTypeDescriptor()
-    {}
-
     explicit TPgTypeDescriptor(const NYql::NPg::TTypeDesc& desc)
         : NYql::NPg::TTypeDesc(desc)
+        , YdbTypeName(desc.Name + ".pg") // to distinguish from native ydb types (e.g. "int8")
     {
         if (TypeId == ArrayTypeId) {
             const auto& typeDesc = NYql::NPg::LookupType(ElementTypeId);
@@ -2978,13 +2975,8 @@ public:
         };
         PG_TRY();
         {
-            if (PassByValue) {
-                datumL = ScalarDatumFromData(dataL, sizeL);
-                datumR = ScalarDatumFromData(dataR, sizeR);
-            } else {
-                datumL = PointerDatumFromData(dataL, sizeL);
-                datumR = PointerDatumFromData(dataR, sizeR);
-            }
+            datumL = Receive(dataL, sizeL);
+            datumR = Receive(dataR, sizeR);
             FmgrInfo finfo;
             InitFunc(CompareProcId, &finfo, 2, 2);
             LOCAL_FCINFO(callInfo, 2);
@@ -3003,7 +2995,7 @@ public:
         PG_CATCH();
         {
             // TODO
-            Y_VERIFY(false, "PG error in Compare");
+            Y_FAIL("PG error in Compare");
         }
         PG_END_TRY();
         return 0;
@@ -3020,11 +3012,7 @@ public:
         };
         PG_TRY();
         {
-            if (PassByValue) {
-                datum = ScalarDatumFromData(data, size);
-            } else {
-                datum = PointerDatumFromData(data, size);
-            }
+            datum = Receive(data, size);
             FmgrInfo finfo;
             InitFunc(HashProcId, &finfo, 1, 1);
             LOCAL_FCINFO(callInfo, 1);
@@ -3042,7 +3030,7 @@ public:
         PG_CATCH();
         {
             // TODO
-            Y_VERIFY(false, "PG error in Hash");
+            Y_FAIL("PG error in Hash");
         }
         PG_END_TRY();
         return 0;
@@ -3096,7 +3084,7 @@ public:
         PG_CATCH();
         {
             // TODO
-            Y_VERIFY(false, "PG error in NativeBinaryFromNativeText");
+            Y_FAIL("PG error in NativeBinaryFromNativeText");
         }
         PG_END_TRY();
         return 0;
@@ -3117,11 +3105,7 @@ public:
         };
         PG_TRY();
         {
-            if (PassByValue) {
-                datum = ScalarDatumFromData(binary.Data(), binary.Size());
-            } else {
-                datum = PointerDatumFromData(binary.Data(), binary.Size());
-            }
+            datum = Receive(binary.Data(), binary.Size());
             FmgrInfo finfo;
             InitFunc(OutFuncId, &finfo, 1, 1);
             LOCAL_FCINFO(callInfo, 1);
@@ -3139,46 +3123,14 @@ public:
         PG_CATCH();
         {
             // TODO
-            Y_VERIFY(false, "PG error in NativeTextFromNativeBinary");
+            Y_FAIL("PG error in NativeTextFromNativeBinary");
         }
         PG_END_TRY();
         return 0;
     }
 
 private:
-    Datum ScalarDatumFromData(const char* data, size_t size) const {
-        switch (TypeId) {
-        case BOOLOID:
-            Y_ENSURE(size == sizeof(bool));
-            return BoolGetDatum(ReadUnaligned<bool>(data));
-        case CHAROID:
-            Y_ENSURE(size == sizeof(char));
-            return CharGetDatum(ReadUnaligned<char>(data));
-        case INT2OID:
-            Y_ENSURE(size == sizeof(i16));
-            return Int16GetDatum(ReadUnaligned<i16>(data));
-        case INT4OID:
-            Y_ENSURE(size == sizeof(i32));
-            return Int32GetDatum(ReadUnaligned<i32>(data));
-        case INT8OID:
-            Y_ENSURE(size == sizeof(i64));
-            return Int64GetDatum(ReadUnaligned<i64>(data));
-        case FLOAT4OID:
-            Y_ENSURE(size == sizeof(float));
-            return Float4GetDatum(ReadUnaligned<float>(data));
-        case FLOAT8OID:
-            Y_ENSURE(size == sizeof(double));
-            return Float8GetDatum(ReadUnaligned<double>(data));
-        default: {
-            Y_ENSURE(size <= sizeof(ui64));
-            ui64 val = 0;
-            std::memcpy(&val, data, size);
-            return (Datum)val;
-        }
-        }
-    }
-
-    Datum PointerDatumFromData(const char* data, size_t size) const {
+    Datum Receive(const char* data, size_t size) const {
         StringInfoData stringInfo;
         stringInfo.data = (char*)data;
         stringInfo.len = size;
@@ -3211,6 +3163,7 @@ private:
     }
 
 public:
+    const TString YdbTypeName;
     ui32 StoredSize = 0; // size in local db, 0 for variable size
 };
 
@@ -3241,8 +3194,9 @@ public:
 
 private:
     void InitType(ui32 pgTypeId, const NYql::NPg::TTypeDesc& type) {
-        PgTypeDescriptors[pgTypeId] = TPgTypeDescriptor(type);
-        ByName[type.Name] = pgTypeId;
+        auto desc = TPgTypeDescriptor(type);
+        ByName[desc.YdbTypeName] = pgTypeId;
+        PgTypeDescriptors.emplace(pgTypeId, desc);
     }
 
 private:
@@ -3268,7 +3222,7 @@ const char* PgTypeNameFromTypeDesc(void* typeDesc) {
     if (!typeDesc) {
         return "";
     }
-    return static_cast<TPgTypeDescriptor*>(typeDesc)->Name.data();
+    return static_cast<TPgTypeDescriptor*>(typeDesc)->YdbTypeName.data();
 }
 
 void* TypeDescFromPgTypeName(const TStringBuf name) {

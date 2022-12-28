@@ -79,7 +79,7 @@ TDbLabeledCounters::TDbLabeledCounters(::NMonitoring::TDynamicCounterPtr counter
 {}
 
 void TDbLabeledCounters::ToProto(NKikimr::NSysView::TDbServiceCounters& counters) {
-    counters.ClearLabeledCounters();
+    counters.Clear();
     for (auto& bucket : LabeledCountersByGroup.Buckets) {
         TWriteGuard guard(bucket.GetLock());
         for (auto& [group, labeledCounters] : bucket.GetMap()) {
@@ -101,6 +101,7 @@ void TDbLabeledCounters::FromProto(NKikimr::NSysView::TDbServiceCounters& counte
         // that's why we iterate the group in reverse order
         // this comes from: ydb/core/persqueue/user_info.h:310 (TUserInfo::TUserInfo)
         std::reverse(groups.begin(), groups.end());
+
         for (size_t i = 0; i < groups.size(); ++i) {
             if (i != 1) {
                 countersGroup = countersGroup->GetSubgroup(groupNames[i], groups[i]);

@@ -14,6 +14,7 @@ namespace NKikimr::NBlobDepot {
             bool PutsIssued = false;
             bool WaitingForCommitBlobSeq = false;
             bool IsInFlight = false;
+            bool WrittenBeyondBarrier = false;
             NKikimrBlobDepot::TEvCommitBlobSeq CommitBlobSeq;
             TBlobSeqId BlobSeqId;
 
@@ -33,9 +34,6 @@ namespace NKikimr::NBlobDepot {
             }
 
             void Initiate() override {
-                BDEV_QUERY(BDEV09, "TEvPut_new", (U.BlobId, Request.Id), (U.BufferSize, Request.Buffer.size()),
-                    (U.HandleClass, Request.HandleClass));
-
                 if (Request.Buffer.size() > MaxBlobSize) {
                     return EndWithError(NKikimrProto::ERROR, "blob is way too big");
                 } else if (Request.Buffer.size() != Request.Id.BlobSize()) {
@@ -97,6 +95,9 @@ namespace NKikimr::NBlobDepot {
                     IsInFlight = true;
                 }
 
+                BDEV_QUERY(BDEV09, "TEvPut_new", (U.BlobId, Request.Id), (U.BufferSize, Request.Buffer.size()),
+                    (U.HandleClass, Request.HandleClass));
+
                 Y_VERIFY(CommitBlobSeq.ItemsSize() == 0);
                 auto *commitItem = CommitBlobSeq.AddItems();
                 commitItem->SetKey(Request.Id.AsBinaryString());
@@ -108,15 +109,15 @@ namespace NKikimr::NBlobDepot {
                     locator->SetFooterLen(sizeof(TVirtualGroupBlobFooter));
                 }
 
-                TContiguousData footerData;
+                TRcBuf footerData;
                 if (!SuppressFooter) {
-                    footerData = TContiguousData::Uninitialized(sizeof(TVirtualGroupBlobFooter));
+                    footerData = TRcBuf::Uninitialized(sizeof(TVirtualGroupBlobFooter));
                     auto& footer = *reinterpret_cast<TVirtualGroupBlobFooter*>(footerData.UnsafeGetDataMut());
                     memset(&footer, 0, sizeof(footer));
                     footer.StoredBlobId = Request.Id;
                 }
 
-                auto put = [&](EBlobType type, TContiguousData&& buffer) {
+                auto put = [&](EBlobType type, TRcBuf&& buffer) {
                     const auto& [id, groupId] = kind.MakeBlobId(Agent, BlobSeqId, type, 0, buffer.size());
                     Y_VERIFY(!locator->HasGroupId() || locator->GetGroupId() == groupId);
                     locator->SetGroupId(groupId);
@@ -132,17 +133,17 @@ namespace NKikimr::NBlobDepot {
 
                 if (SuppressFooter) {
                     // write the blob as is, we don't need footer for this kind
-                    put(EBlobType::VG_DATA_BLOB, TContiguousData(std::move(Request.Buffer)));
+                    put(EBlobType::VG_DATA_BLOB, TRcBuf(std::move(Request.Buffer)));
                 } else if (Request.Buffer.size() + sizeof(TVirtualGroupBlobFooter) <= MaxBlobSize) {
                     // write single blob with footer
                     TRope buffer = TRope(std::move(Request.Buffer));
                     buffer.Insert(buffer.End(), std::move(footerData));
                     buffer.Compact();
-                    put(EBlobType::VG_COMPOSITE_BLOB, TContiguousData(std::move(buffer)));
+                    put(EBlobType::VG_COMPOSITE_BLOB, TRcBuf(std::move(buffer)));
                 } else {
                     // write data blob and blob with footer
-                    put(EBlobType::VG_DATA_BLOB, TContiguousData(std::move(Request.Buffer)));
-                    put(EBlobType::VG_FOOTER_BLOB, TContiguousData(std::move(footerData)));
+                    put(EBlobType::VG_DATA_BLOB, TRcBuf(std::move(Request.Buffer)));
+                    put(EBlobType::VG_FOOTER_BLOB, TRcBuf(std::move(footerData)));
                 }
 
                 if (IssueUncertainWrites) {
@@ -187,12 +188,8 @@ namespace NKikimr::NBlobDepot {
                 Y_VERIFY(numErased || BlobSeqId.Generation < Agent.BlobDepotGeneration);
             }
 
-            void OnUpdateBlock(bool success) override {
-                if (success) {
-                    CheckBlocks(); // just restart request
-                } else {
-                    EndWithError(NKikimrProto::ERROR, "BlobDepot tablet disconnected");
-                }
+            void OnUpdateBlock() override {
+                CheckBlocks(); // just restart request
             }
 
             void OnIdAllocated() override {
@@ -217,6 +214,10 @@ namespace NKikimr::NBlobDepot {
 
                 BDEV_QUERY(BDEV11, "TEvPut_resultFromProxy", (BlobId, msg.Id), (Status, msg.Status),
                     (ErrorReason, msg.ErrorReason));
+
+                if (msg.Status == NKikimrProto::OK && msg.WrittenBeyondBarrier) {
+                    WrittenBeyondBarrier = true;
+                }
 
                 --PutsInFlight;
                 if (msg.Status != NKikimrProto::OK) {
@@ -261,18 +262,25 @@ namespace NKikimr::NBlobDepot {
             }
 
             void EndWithError(NKikimrProto::EReplyStatus status, const TString& errorReason) {
-                BDEV_QUERY(BDEV12, "TEvPut_end", (Status, status), (ErrorReason, errorReason));
+                if (BlobSeqId) {
+                    BDEV_QUERY(BDEV12, "TEvPut_end", (Status, status), (ErrorReason, errorReason));
+                }
                 TBlobStorageQuery::EndWithError(status, errorReason);
             }
 
             void EndWithSuccess() {
-                BDEV_QUERY(BDEV13, "TEvPut_end", (Status, NKikimrProto::OK));
+                if (BlobSeqId) {
+                    BDEV_QUERY(BDEV13, "TEvPut_end", (Status, NKikimrProto::OK));
+                }
 
                 if (IssueUncertainWrites) { // send a notification
                     auto *item = CommitBlobSeq.MutableItems(0);
                     item->SetCommitNotify(true);
                     IssueCommitBlobSeq(false);
                 }
+
+                // ensure that blob was written not beyond the barrier, or it will be lost otherwise
+                Y_VERIFY(!WrittenBeyondBarrier);
 
                 TBlobStorageQuery::EndWithSuccess(std::make_unique<TEvBlobStorage::TEvPutResult>(NKikimrProto::OK, Request.Id,
                     Agent.GetStorageStatusFlags(), Agent.VirtualGroupId, Agent.GetApproximateFreeSpaceShare()));

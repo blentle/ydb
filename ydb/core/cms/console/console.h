@@ -7,8 +7,7 @@
 #include <ydb/core/protos/console_tenant.pb.h>
 #include <ydb/public/api/protos/ydb_cms.pb.h>
 
-namespace NKikimr {
-namespace NConsole {
+namespace NKikimr::NConsole {
 
 struct TEvConsole {
     enum EEv {
@@ -41,6 +40,7 @@ struct TEvConsole {
         EvConfigSubscriptionCanceled,
         EvConfigSubscriptionNotification,
         EvUpdateTenantPoolConfig,
+        EvGetLogTailRequest,
 
         // responses
         EvCreateTenantResponse = EvCreateTenantRequest + 1024,
@@ -70,6 +70,7 @@ struct TEvConsole {
         EvToggleConfigValidatorResponse,
         EvConfigSubscriptionResponse,
         EvConfigSubscriptionError,
+        EvGetLogTailResponse,
 
         EvEnd
     };
@@ -270,9 +271,15 @@ struct TEvConsole {
     struct TEvToggleConfigValidatorRequest : public TEventShortDebugPB<TEvToggleConfigValidatorRequest, NKikimrConsole::TToggleConfigValidatorRequest, EvToggleConfigValidatorRequest> {};
 
     struct TEvToggleConfigValidatorResponse : public TEventShortDebugPB<TEvToggleConfigValidatorResponse, NKikimrConsole::TToggleConfigValidatorResponse, EvToggleConfigValidatorResponse> {};
+
+    //////////////////////////////////////////////////
+    // AUDIT
+    //////////////////////////////////////////////////
+    struct TEvGetLogTailRequest : public TEventPB<TEvGetLogTailRequest, NKikimrConsole::TGetLogTailRequest, EvGetLogTailRequest> {};
+
+    struct TEvGetLogTailResponse : public TEventPB<TEvGetLogTailResponse, NKikimrConsole::TGetLogTailResponse, EvGetLogTailResponse> {};
 };
 
 IActor *CreateConsole(const TActorId &tablet, TTabletStorageInfo *info);
 
-} // namespace NConsole
-} // namespace NKikimr
+} // namespace NKikimr::NConsole

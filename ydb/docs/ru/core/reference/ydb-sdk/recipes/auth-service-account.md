@@ -94,4 +94,14 @@
   }
   ```
 
+- Node.js
+  
+  Загрузка данных сервисного аккаунта из файла:
+
+  {% include [auth-sa-file](../../../../_includes/nodejs/auth-sa-file.md) %}
+
+  Загрузка данных сервисного аккаунта из стороннего источника (например, из хранилища секретов):
+
+  {% include [auth-sa-data](../../../../_includes/nodejs/auth-sa-data.md) %}
+
 {% endlist %}
