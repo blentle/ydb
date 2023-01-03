@@ -15,30 +15,68 @@ namespace NKqp {
 
 using namespace NYql;
 
-void BuildKqpExecuterResult(const NKqpProto::TKqpPhyResult& txResult, TKqpExecuterTxResult& result) {
-    result.IsStream = txResult.GetIsStream();
-    result.ItemType.CopyFrom(txResult.GetItemType());
+void TEvKqpExecuter::TEvTxResponse::InitTxResult(const NKqpProto::TKqpPhyTx& tx) {
+    ui32 i = TxResults.size();
+    TxResults.resize(TxResults.size() + tx.GetResults().size());
 
-    if (txResult.ColumnHintsSize() > 0) {
-        TVector<TString> columnHints;
-        columnHints.reserve(txResult.GetColumnHints().size());
-        std::copy(txResult.GetColumnHints().begin(), txResult.GetColumnHints().end(), std::back_inserter(columnHints));
+    for (const auto& txResult : tx.GetResults()) {
+        auto& result = TxResults[i++];
+        result.IsStream = txResult.GetIsStream();
+        result.MkqlItemType = ImportTypeFromProto(txResult.GetItemType(), AllocState->TypeEnv);
 
-        result.ResultItemType.ConstructInPlace(TKqpProtoBuilder::ApplyColumnHints(result.ItemType, columnHints));
+        if (txResult.ColumnHintsSize() > 0) {
+            result.ColumnOrder.reserve(txResult.GetColumnHints().size());
+            auto* structType = static_cast<NKikimr::NMiniKQL::TStructType*>(result.MkqlItemType);
+            THashMap<TString, ui32> memberIndices;
+            for(ui32 i = 0; i < structType->GetMembersCount(); ++i) {
+                memberIndices[TString(structType->GetMemberName(i))] = i;
+            }
+
+            NKikimrMiniKQL::TType resultItemType;
+            resultItemType.SetKind(NKikimrMiniKQL::Struct);
+            for(auto& name: txResult.GetColumnHints()) {
+                auto it = memberIndices.find(name);
+                YQL_ENSURE(it != memberIndices.end(), "undetermined column name: " << name);
+                result.ColumnOrder.push_back(it->second);
+            }
+        }
     }
 }
 
-void BuildKqpExecuterResults(const NKqpProto::TKqpPhyTx& tx, TVector<TKqpExecuterTxResult>& results) {
-    ui32 i = results.size();
-    results.resize(results.size() + tx.GetResults().size());
-
-    for (auto& resultProto : tx.GetResults()) {
-        BuildKqpExecuterResult(resultProto, results[i++]);
+void TEvKqpExecuter::TEvTxResponse::TakeResult(ui32 idx, const NYql::NDqProto::TData& rows) {
+    YQL_ENSURE(idx < TxResults.size());
+    ResultRowsCount += rows.GetRaw().size();
+    ResultRowsBytes += rows.GetRows();
+    auto guard = AllocState->TypeEnv.BindAllocator();
+    auto& result = TxResults[idx];
+    if (rows.GetRows() || !result.IsStream) {
+        NDq::TDqDataSerializer dataSerializer(
+            AllocState->TypeEnv, AllocState->HolderFactory,
+            static_cast<NDqProto::EDataTransportVersion>(rows.GetTransportVersion()));
+        dataSerializer.Deserialize(rows, result.MkqlItemType, result.Rows);
     }
+}
+
+TEvKqpExecuter::TEvTxResponse::~TEvTxResponse() {
+    if (!TxResults.empty()) {
+        with_lock(AllocState->Alloc) {
+            TxResults.crop(0);
+        }
+    }
+}
+
+void TEvKqpExecuter::TEvTxResponse::TakeResult(ui32 idx, NKikimr::NMiniKQL::TUnboxedValueVector& rows) {
+    YQL_ENSURE(idx < TxResults.size());
+    ResultRowsCount += rows.size();
+    auto& txResult = TxResults[idx];
+    auto serializer = NYql::NDq::TDqDataSerializer(
+        AllocState->TypeEnv, AllocState->HolderFactory, NDqProto::DATA_TRANSPORT_UV_PICKLE_1_0);
+    auto buffer = serializer.Serialize(rows, txResult.MkqlItemType);
+    serializer.Deserialize(buffer, txResult.MkqlItemType, txResult.Rows);
 }
 
 void PrepareKqpTaskParameters(const NKqpProto::TKqpPhyStage& stage, const TStageInfo& stageInfo, const TTask& task,
-    NDqProto::TDqTask& dqTask, const NMiniKQL::TTypeEnvironment& typeEnv, const NMiniKQL::THolderFactory& holderFactory)
+    NDqProto::TDqTask& dqTask, const NMiniKQL::TTypeEnvironment& typeEnv, const NMiniKQL::THolderFactory&)
 {
     auto g = typeEnv.BindAllocator();
     for (auto& paramName : stage.GetProgramParameters()) {
@@ -46,16 +84,13 @@ void PrepareKqpTaskParameters(const NKqpProto::TKqpPhyStage& stage, const TStage
         if (auto* taskParam = task.Meta.Params.FindPtr(paramName)) {
             dqParams[paramName] = *taskParam;
         } else {
-            auto* paramValue = stageInfo.Meta.Tx.Params.Values.FindPtr(paramName);
-            YQL_ENSURE(paramValue);
-            dqParams[paramName] = NDq::TDqDataSerializer::SerializeParam(*paramValue, typeEnv, holderFactory);
+            dqParams[paramName] = stageInfo.Meta.Tx.Params->SerializeParamValue(paramName);
         }
     }
 }
 
 std::pair<TString, TString> SerializeKqpTasksParametersForOlap(const NKqpProto::TKqpPhyStage& stage,
-    const TStageInfo& stageInfo, const TTask& task, const NMiniKQL::THolderFactory& holderFactory,
-    const NMiniKQL::TTypeEnvironment& typeEnv)
+    const TStageInfo& stageInfo, const TTask& task)
 {
     std::vector<std::shared_ptr<arrow::Field>> columns;
     std::vector<std::shared_ptr<arrow::Array>> data;
@@ -76,10 +111,7 @@ std::pair<TString, TString> SerializeKqpTasksParametersForOlap(const NKqpProto::
             continue;
         }
 
-        const NYql::NDq::TMkqlValueRef* mkqlValue = stageInfo.Meta.Tx.Params.Values.FindPtr(name);
-
-        auto [type, value] = ImportValueFromProto(mkqlValue->GetType(), mkqlValue->GetValue(), typeEnv, holderFactory);
-
+        auto [type, value] = stageInfo.Meta.Tx.Params->GetParameterUnboxedValue(name);
         YQL_ENSURE(NYql::NArrow::IsArrowCompatible(type), "Incompatible parameter type. Can't convert to arrow");
 
         std::unique_ptr<arrow::ArrayBuilder> builder = NYql::NArrow::MakeArrowBuilder(type);

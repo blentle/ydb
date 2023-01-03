@@ -1129,7 +1129,9 @@ bool TSchemeShard::CheckApplyIf(const NKikimrSchemeOp::TModifyScheme &scheme, TS
             if (requiredVersion != actualVersion) {
                 errStr = TStringBuilder()
                     << "fail user constraint in ApplyIf section:"
-                    << " path version mismatch, path with id " << pathEl->PathId
+                    //FIXME: revert to misspelled text as there is dependency on it in the nbs code.
+                    // Dependency on text should be replaced by introducing special error code.
+                    << " path version mistmach, path with id " << pathEl->PathId
                     << " has actual version " << actualVersion
                     << " but version " << requiredVersion << " was required";
                 return false;
@@ -6311,12 +6313,7 @@ void TSchemeShard::SubscribeConsoleConfigs(const TActorContext &ctx) {
 
 void TSchemeShard::Handle(TEvents::TEvUndelivered::TPtr&, const TActorContext& ctx) {
     LOG_WARN_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD, "Cannot subscribe to console configs");
-    TableProfilesLoaded = true;
-
-    auto waiters = std::move(TableProfilesWaiters);
-    for (const auto& [importId, itemIdx] : waiters) {
-        Execute(CreateTxProgressImport(importId, itemIdx), ctx);
-    }
+    LoadTableProfiles(nullptr, ctx);
 }
 
 void TSchemeShard::ApplyConsoleConfigs(const NKikimrConfig::TAppConfig& appConfig, const TActorContext& ctx) {
@@ -6336,13 +6333,9 @@ void TSchemeShard::ApplyConsoleConfigs(const NKikimrConfig::TAppConfig& appConfi
     }
 
     if (appConfig.HasTableProfilesConfig()) {
-        TableProfiles.Load(appConfig.GetTableProfilesConfig());
-        TableProfilesLoaded = true;
-
-        auto waiters = std::move(TableProfilesWaiters);
-        for (const auto& [importId, itemIdx] : waiters) {
-            Execute(CreateTxProgressImport(importId, itemIdx), ctx);
-        }
+        LoadTableProfiles(&appConfig.GetTableProfilesConfig(), ctx);
+    } else {
+        LoadTableProfiles(nullptr, ctx);
     }
 
     if (IsSchemeShardConfigured()) {

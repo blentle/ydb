@@ -273,66 +273,6 @@ private:
 };
 
 /*
- * Execute prepared Yql/ScanQuery/DataQuery.
- */
-class TAsyncExecutePreparedResult : public TKqpAsyncResultBase<IKqpHost::TQueryResult> {
-public:
-    using TResult = IKqpHost::TQueryResult;
-
-    TAsyncExecutePreparedResult(TExprNode* queryRoot, TExprContext& exprCtx, IGraphTransformer& transformer,
-        TIntrusivePtr<TKikimrSessionContext> sessionCtx, const IDataProvider::TFillSettings& fillSettings,
-        TIntrusivePtr<TExecuteContext> executeCtx, std::shared_ptr<const NKikimrKqp::TPreparedQuery> query,
-        TMaybe<TSqlVersion> sqlVersion)
-        : TKqpAsyncResultBase(queryRoot, exprCtx, transformer)
-        , SessionCtx(sessionCtx)
-        , FillSettings(fillSettings)
-        , ExecuteCtx(executeCtx)
-        , Query(query)
-        , SqlVersion(sqlVersion) {}
-
-    void FillResult(TResult& queryResult) const override {
-        for (const auto& result : SessionCtx->Query().PreparedQuery->GetResults()) {
-            YQL_ENSURE(result.GetKqlIndex() < ExecuteCtx->QueryResults.size());
-            const auto& execResult = ExecuteCtx->QueryResults[result.GetKqlIndex()];
-
-            YQL_ENSURE(result.GetResultIndex() < execResult.Results.size());
-            const auto& resultValue = execResult.Results[result.GetResultIndex()];
-
-            auto fillSettings = FillSettings;
-            if (result.GetRowsLimit()) {
-                fillSettings.RowsLimitPerWrite = result.GetRowsLimit();
-            }
-            TVector<TString> columnHints(result.GetColumnHints().begin(), result.GetColumnHints().end());
-            auto protoResult = KikimrResultToProto(*resultValue, columnHints, fillSettings,
-                queryResult.ProtobufArenaPtr.get());
-
-            queryResult.Results.push_back(protoResult);
-        }
-
-        queryResult.QueryAst = SessionCtx->Query().PreparedQuery->GetPhysicalQuery().GetQueryAst();
-
-        if (Query) {
-            queryResult.PreparedQuery = Query;
-        }
-
-        if (ExecuteCtx->QueryResults.size() == 1) {
-            auto& execResult = ExecuteCtx->QueryResults[0];
-            queryResult.QueryStats.Swap(&execResult.QueryStats);
-            queryResult.QueryPlan = SerializeAnalyzePlan(queryResult.QueryStats);
-        }
-
-        queryResult.SqlVersion = SqlVersion;
-    }
-
-private:
-    TIntrusivePtr<TKikimrSessionContext> SessionCtx;
-    IDataProvider::TFillSettings FillSettings;
-    TIntrusivePtr<TExecuteContext> ExecuteCtx;
-    mutable std::shared_ptr<const NKikimrKqp::TPreparedQuery> Query;
-    TMaybe<TSqlVersion> SqlVersion;
-};
-
-/*
  * Prepare ScanQuery/DataQuery by AST (when called through scripting).
  */
 class TAsyncExecuteKqlResult : public TKqpAsyncResultBase<IKqpHost::TQueryResult> {
@@ -501,21 +441,21 @@ private:
     TPromise<void> Promise;
 };
 
-NKikimrMiniKQL::TParams* ValidateParameter(const TString& name, const TTypeAnnotationNode& type,
-    const TPosition& pos, TKikimrParamsMap& parameters, TExprContext& ctx)
+const NKikimrMiniKQL::TParams* ValidateParameter(const TString& name, const TTypeAnnotationNode& type,
+    const TPosition& pos, TQueryData& parameters, TExprContext& ctx)
 {
-    auto parameter = parameters.FindPtr(name);
+    auto parameter = parameters.GetParameterMiniKqlValue(name);
     if (!parameter) {
         if (type.GetKind() == ETypeAnnotationKind::Optional) {
-            auto& newParameter = parameters[name];
-
-            if (!ExportTypeToKikimrProto(type, *newParameter.MutableType(), ctx)) {
+            NKikimrMiniKQL::TParams param;
+            if (!ExportTypeToKikimrProto(type, *param.MutableType(), ctx)) {
                 ctx.AddError(YqlIssue(pos, TIssuesIds::KIKIMR_BAD_REQUEST,
                     TStringBuilder() << "Failed to export parameter type: " << name));
                 return nullptr;
             }
 
-            return &newParameter;
+            parameters.AddMkqlParam(name, param.GetType(), param.GetValue());
+            return parameters.GetParameterMiniKqlValue(name);
         }
 
         ctx.AddError(YqlIssue(pos, TIssuesIds::KIKIMR_BAD_REQUEST,
@@ -582,7 +522,7 @@ public:
                     }
 
                     auto parameterValue = ValidateParameter(TString(name), *expectedType, ctx.GetPosition(parameter.Pos()),
-                        queryCtx->Parameters, ctx);
+                        *(queryCtx->QueryData), ctx);
                     if (!parameterValue) {
                         return nullptr;
                     }
@@ -647,7 +587,7 @@ public:
                 return IGraphTransformer::TStatus::Error;
             }
 
-            if (!ValidateParameter(paramDesc.GetName(), *expectedType, TPosition(), QueryCtx->Parameters, ctx)) {
+            if (!ValidateParameter(paramDesc.GetName(), *expectedType, TPosition(), *(QueryCtx->QueryData), ctx)) {
                 return IGraphTransformer::TStatus::Error;
             }
         }
@@ -820,23 +760,23 @@ public:
     }
 
 private:
-    TKqpParamsMap CollectParameters(const TExprNode::TPtr& query) {
-        TKqpParamsMap paramsMap;
+    TQueryData::TPtr CollectParameters(const TExprNode::TPtr& query) {
+        TQueryData::TPtr result = std::make_shared<TQueryData>(
+            AppData()->FunctionRegistry, AppData()->TimeProvider, AppData()->RandomProvider);
 
         auto queryCtx = SessionCtx->QueryPtr();
-        VisitExpr(query, [queryCtx, &paramsMap] (const TExprNode::TPtr& exprNode) {
+        VisitExpr(query, [queryCtx, &result] (const TExprNode::TPtr& exprNode) {
             if (auto parameter = TMaybeNode<TCoParameter>(exprNode)) {
                 TString name(parameter.Cast().Name().Value());
-                auto paramValue = queryCtx->Parameters.FindPtr(name);
+                auto paramValue = queryCtx->QueryData->GetParameterMiniKqlValue(name);
                 YQL_ENSURE(paramValue);
-
-                paramsMap.Values.emplace(name, *paramValue);
+                result->AddMkqlParam(name, paramValue->GetType(), paramValue->GetValue());
             }
 
             return true;
         });
 
-        return paramsMap;
+        return result;
     }
 
     bool ShouldUseScanQuery(const TKiDataQueryBlocks& queryBlocks, const TExecuteSettings& settings) {
@@ -937,7 +877,7 @@ public:
         , ExprCtx(new TExprContext())
         , ModuleResolver(moduleResolver)
         , KeepConfigChanges(keepConfigChanges)
-        , SessionCtx(new TKikimrSessionContext(config))
+        , SessionCtx(new TKikimrSessionContext(funcRegistry, config, TAppData::TimeProvider, TAppData::RandomProvider))
         , ClustersMap({{Cluster, TString(KikimrProviderName)}})
         , TypesCtx(MakeIntrusive<TTypeAnnotationContext>())
         , PlanBuilder(CreatePlanBuilder(*TypesCtx))
@@ -952,10 +892,7 @@ public:
         }
 
         SessionCtx->SetDatabase(database);
-        SessionCtx->QueryPtr()->TimeProvider = TAppData::TimeProvider;
-        SessionCtx->QueryPtr()->RandomProvider = TAppData::RandomProvider;
-
-        KqpRunner = CreateKqpRunner(Gateway, Cluster, TypesCtx, SessionCtx, *FuncRegistry);
+        KqpRunner = CreateKqpRunner(Gateway, Cluster, TypesCtx, SessionCtx, *FuncRegistry, TAppData::TimeProvider, TAppData::RandomProvider);
 
         ExprCtx->NodesAllocationLimit = SessionCtx->Config()._KqpExprNodesAllocationLimit.Get().GetRef();
         ExprCtx->StringsAllocationLimit = SessionCtx->Config()._KqpExprStringsAllocationLimit.Get().GetRef();
@@ -1253,7 +1190,7 @@ private:
             .Ptr();
     }
 
-    static bool ParseParameters(NKikimrMiniKQL::TParams&& parameters, TKikimrParamsMap& map,
+    static bool ParseParameters(NKikimrMiniKQL::TParams&& parameters, TQueryData& map,
         TExprContext& ctx)
     {
         if (!parameters.HasType()) {
@@ -1276,12 +1213,9 @@ private:
                 return false;
             }
 
-            NKikimrMiniKQL::TParams param;
-            param.MutableType()->Swap(structType.MutableMember(i)->MutableType());
-            param.MutableValue()->Swap(parameters.MutableValue()->MutableStruct(i));
-
-            auto result = map.emplace(std::make_pair(memberName, std::move(param)));
-            if (!result.second) {
+            auto success = map.AddMkqlParam(
+                memberName, structType.GetMember(i).GetType(), parameters.GetValue().GetStruct(i));
+            if (!success) {
                 ctx.AddError(YqlIssue(TPosition(), TIssuesIds::KIKIMR_BAD_REQUEST,
                     TStringBuilder() << "Duplicate parameter: " << memberName));
                 return false;
@@ -1446,7 +1380,7 @@ private:
             return nullptr;
         }
 
-        if (!ParseParameters(std::move(parameters), SessionCtx->Query().Parameters, ctx)) {
+        if (!ParseParameters(std::move(parameters), *(SessionCtx->Query().QueryData), ctx)) {
             return nullptr;
         }
 
@@ -1472,7 +1406,7 @@ private:
             return nullptr;
         }
 
-        if (!ParseParameters(std::move(parameters), SessionCtx->Query().Parameters, ctx)) {
+        if (!ParseParameters(std::move(parameters), *(SessionCtx->Query().QueryData), ctx)) {
             return nullptr;
         }
 

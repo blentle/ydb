@@ -2962,6 +2962,187 @@ ui32 CollectStateNodes(const TExprNode& initLambda, const TExprNode& updateLambd
     return size;
 }
 
+TExprNode::TPtr ExpandFinalizeByKey(const TExprNode::TPtr& node, TExprContext& ctx) {
+    if (node->GetTypeAnn()->GetKind() == ETypeAnnotationKind::List) {
+        return ctx.NewCallable(node->Pos(), "Collect",
+            { ctx.ChangeChild(*node, 0, ctx.NewCallable(node->Pos(), "ToFlow", { node->HeadPtr() })) });
+    }
+    if (node->GetTypeAnn()->GetKind() == ETypeAnnotationKind::Stream) {
+        return ctx.NewCallable(node->Pos(), "FromFlow",
+            { ctx.ChangeChild(*node, 0, ctx.NewCallable(node->Pos(), "ToFlow", { node->HeadPtr() })) });
+    }
+
+    YQL_CLOG(DEBUG, CorePeepHole) << "Expand " << node->Content() << " over stream or flow";
+
+    TCoFinalizeByKey combine(node);
+
+    const auto inputStructType = GetSeqItemType(combine.PreMapLambda().Body().Ref().GetTypeAnn())->Cast<TStructExprType>();
+    if (!inputStructType) {
+        return node;
+    }
+    const auto inputWidth = inputStructType->GetSize();
+
+    TExprNode::TListType inputFields;
+    inputFields.reserve(inputWidth);
+    for (const auto& item : inputStructType->GetItems()) {
+        inputFields.emplace_back(ctx.NewAtom(combine.PreMapLambda().Pos(), item->GetName()));
+    }
+
+    TExprNode::TListType stateFields, init, update, outputFields;
+    const auto stateWidth = CollectStateNodes(combine.InitHandlerLambda().Ref(), combine.UpdateHandlerLambda().Ref(), stateFields, init, update, ctx);
+
+    auto output = combine.FinishHandlerLambda().Body().Ptr();
+    const auto outputStructType = GetSeqItemType(node->GetTypeAnn())->Cast<TStructExprType>();
+    const ui32 outputWidth = outputStructType ? outputStructType->GetSize() : 1;
+    TExprNode::TListType finish;
+    finish.reserve(outputWidth);
+    if (output->IsCallable("AsStruct")) {
+        output->ForEachChild([&](const TExprNode& child) {
+            outputFields.emplace_back(child.HeadPtr());
+            finish.emplace_back(child.TailPtr());
+        });
+    } else if (outputStructType) {
+        for (const auto& item : outputStructType->GetItems()) {
+            outputFields.emplace_back(ctx.NewAtom(output->Pos(), item->GetName()));
+            finish.emplace_back(ctx.NewCallable(output->Pos(), "Member", { output, outputFields.back() }));
+        }
+    } else {
+        finish.emplace_back(output);
+    }
+
+    const auto uniteToStructure = [&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
+        for (ui32 i = 0U; i < inputWidth; ++i) {
+            parent
+                .List(i)
+                    .Add(0, inputFields[i])
+                    .Arg(1, "items", i)
+                .Seal();
+        }
+        return parent;
+    };
+
+    return ctx.Builder(node->Pos())
+        .Callable("NarrowMap")
+            .Callable(0, "WideCombiner")
+                .Callable(0, "ExpandMap")
+                    .Callable(0, "FlatMap")
+                        .Add(0, combine.Input().Ptr())
+                        .Add(1, combine.PreMapLambda().Ptr())
+                    .Seal()
+                    .Lambda(1)
+                        .Param("item")
+                        .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
+                            for (ui32 i = 0U; i < inputWidth; ++i) {
+                                parent.Callable(i, "Member")
+                                    .Arg(0, "item")
+                                    .Add(1, inputFields[i])
+                                .Seal();
+                            }
+                            return parent;
+                        })
+                    .Seal()
+                .Seal()
+                .Atom(1, "")
+                .Lambda(2)
+                    .Params("items", inputWidth)
+                    .Apply(combine.KeySelectorLambda().Ref())
+                        .With(0)
+                            .Callable("AsStruct")
+                                .Do(uniteToStructure)
+                            .Seal()
+                        .Done()
+                    .Seal()
+                .Seal()
+                .Lambda(3)
+                    .Param("key")
+                    .Params("items", inputWidth)
+                    .ApplyPartial(combine.InitHandlerLambda().Args().Ptr(), std::move(init))
+                        .With(0, "key")
+                        .With(1)
+                            .Callable("AsStruct")
+                                .Do(uniteToStructure)
+                            .Seal()
+                        .Done()
+                    .Seal()
+                .Seal()
+                .Lambda(4)
+                    .Param("key")
+                    .Params("items", inputWidth)
+                    .Params("state", stateWidth)
+                    .ApplyPartial(combine.UpdateHandlerLambda().Args().Ptr(), std::move(update))
+                        .With(0)
+                            .Arg("key")
+                        .Done()
+                        .With(1)
+                            .Callable("AsStruct")
+                                .Do(uniteToStructure)
+                            .Seal()
+                        .Done()
+                        .With(2)
+                            .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
+                                if (stateFields.empty())
+                                    parent.Arg("state", 0);
+                                else {
+                                    auto str = parent.Callable("AsStruct");
+                                    for (ui32 i = 0U; i < stateWidth; ++i) {
+                                        str.List(i)
+                                            .Add(0, stateFields[i])
+                                            .Arg(1, "state", i)
+                                        .Seal();
+                                    }
+                                    str.Seal();
+                                }
+                                return parent;
+                            })
+                        .Done()
+                    .Seal()
+                .Seal()
+                .Lambda(5)
+                    .Param("key")
+                    .Params("state", stateWidth)
+                    .ApplyPartial(combine.FinishHandlerLambda().Args().Ptr(), std::move(finish))
+                        .With(0, "key")
+                        .With(1)
+                            .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
+                                if (stateFields.empty())
+                                    parent.Arg("state", 0);
+                                else {
+                                    auto str = parent.Callable("AsStruct");
+                                    for (ui32 i = 0U; i < stateWidth; ++i) {
+                                        str.List(i)
+                                            .Add(0, std::move(stateFields[i]))
+                                            .Arg(1, "state", i)
+                                        .Seal();
+                                    }
+                                    str.Seal();
+                                }
+                                return parent;
+                            })
+                        .Done()
+                    .Seal()
+                .Seal()
+            .Seal()
+            .Lambda(1)
+                .Params("items", outputWidth)
+                .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
+                    if (outputFields.empty())
+                        parent.Arg("items", 0);
+                    else {
+                        auto str = parent.Callable("AsStruct");
+                        for (ui32 i = 0U; i < outputWidth; ++i) {
+                            str.List(i)
+                                .Add(0, std::move(outputFields[i]))
+                                .Arg(1, "items", i)
+                            .Seal();
+                        }
+                        str.Seal();
+                    }
+                    return parent;
+                })
+            .Seal()
+        .Seal().Build();
+}
+
 // TODO: move in context
 using TLiteralStructIndexMap = std::unordered_map<std::string_view, ui32>;
 using TLieralStructsCacheMap = std::unordered_map<const TExprNode*, TLiteralStructIndexMap>;
@@ -3952,8 +4133,10 @@ TExprNode::TPtr OptimizeChopper(const TExprNode::TPtr& node, TExprContext& ctx) 
 using TTupleExpandMap = std::vector<std::optional<ui32>>;
 using TStructExpandMap = std::vector<std::optional<std::vector<std::string_view>>>;
 
+using TListExpandMap = std::map<ui32, const TTypeAnnotationNode*>;
+
 template<bool LiteralOnly>
-std::array<std::optional<ui32>, 2U> GetExpandMapsForLambda(const TExprNode& lambda, TTupleExpandMap& tupleExpndMap, TStructExpandMap& structExpndMap) {
+std::array<std::optional<ui32>, 2U> GetExpandMapsForLambda(const TExprNode& lambda, TTupleExpandMap& tupleExpndMap, TStructExpandMap& structExpndMap, TListExpandMap* listExpndMap = nullptr) {
     const auto original = lambda.ChildrenSize() - 1U;
     tupleExpndMap.resize(original);
 
@@ -3962,8 +4145,15 @@ std::array<std::optional<ui32>, 2U> GetExpandMapsForLambda(const TExprNode& lamb
 
     for (ui32 i = 0U; i < original; ++i) {
         switch (const auto child = lambda.Child(i + 1U); child->GetTypeAnn()->GetKind()) {
+            case ETypeAnnotationKind::Dict:
+            case ETypeAnnotationKind::List:
+            case ETypeAnnotationKind::Pg:
+                if (listExpndMap) {
+                    listExpndMap->emplace(i, child->GetTypeAnn());
+                }
+                break;
             case ETypeAnnotationKind::Tuple:
-                if (!LiteralOnly || child->IsList()){
+                if (!LiteralOnly || child->IsList()) {
                     ++flatByStruct;
                     hasTuple = true;
                     const auto size = child->GetTypeAnn()->Cast<TTupleExprType>()->GetSize();
@@ -4195,12 +4385,57 @@ TExprNode::TListType&& DropUnused(TExprNode::TListType&& list, const std::vector
     return std::move(list);
 }
 
+TExprNode::TPtr UnpickleInput(TExprNode::TPtr originalLambda, TListExpandMap& listExpandMap, TExprContext& ctx) {
+        auto size = originalLambda->Head().ChildrenSize();
+        return ctx.Builder(originalLambda->Pos())
+            .Lambda()
+                .Params("out", size)
+                .Apply(originalLambda)
+                    .Do([&](TExprNodeReplaceBuilder& inner) -> TExprNodeReplaceBuilder& {
+                        for (ui32 j = 0U; j < size; ++j) {
+                            auto it = listExpandMap.find(j);
+                            if (it == listExpandMap.end()) {
+                                inner.With(j, "out", j);
+                                continue;
+                            } else {
+                                inner
+                                    .With(j)
+                                        .Callable("Unpickle")
+                                            .Arg(0, "out", j)
+                                            .Add(1, ExpandType(originalLambda->Pos(), *it->second, ctx))
+                                        .Seal()
+                                    .Done()
+                                    ;
+                            }
+                        }
+                        return inner;
+                    })
+                .Seal()
+            .Seal().Build();
+}
+
 TExprNode::TPtr OptimizeWideCombiner(const TExprNode::TPtr& node, TExprContext& ctx) {
     const auto originalKeySize = node->Child(2U)->ChildrenSize() - 1U;
     TTupleExpandMap tupleExpandMap(originalKeySize);
     TStructExpandMap structExpandMap(originalKeySize);
 
-    const auto needKeyFlatten = GetExpandMapsForLambda<false>(*node->Child(2U), tupleExpandMap, structExpandMap);
+    TListExpandMap listExpandMap;
+    const auto needKeyFlatten = GetExpandMapsForLambda<false>(*node->Child(2U), tupleExpandMap, structExpandMap, &listExpandMap);
+
+    if (listExpandMap.size()) {
+        auto children = node->ChildrenList();
+        TExprNode::TListType extractorKeys = NYql::GetLambdaBody(*node->Child(2U));
+        for (auto&& i : listExpandMap) {
+            extractorKeys[i.first] = ctx.NewCallable(node->Pos(), "StablePickle", { extractorKeys[i.first] });
+        }
+        children[2U] = ctx.DeepCopyLambda(*children[2U], std::move(extractorKeys));
+
+        children[3U] = UnpickleInput(children[3U], listExpandMap, ctx);
+        children[4U] = UnpickleInput(children[4U], listExpandMap, ctx);
+        children[5U] = UnpickleInput(children[5U], listExpandMap, ctx);
+
+        return ctx.ChangeChildren(*node, std::move(children));
+    }
 
     if (needKeyFlatten.front()) {
         const auto flattenSize = *needKeyFlatten.front();
@@ -4418,6 +4653,9 @@ struct TBlockRules {
         {"<=", { "LessOrEqual" } },
         {">",  { "Greater" } },
         {">=", { "GreaterOrEqual" } },
+
+        // size kernel
+        {"Size", { "Size" } },
     };
 
     TBlockRules()
@@ -4469,9 +4707,9 @@ bool CollectBlockRewrites(const TMultiExprType* multiInputType, bool keepInputCo
         allInputTypes.push_back(i);
     }
 
-    bool supportedInputTypes = false;
-    YQL_ENSURE(types.ArrowResolver->AreTypesSupported(ctx.GetPosition(lambda->Pos()), allInputTypes, supportedInputTypes, ctx));
-    if (!supportedInputTypes) {
+    auto resolveStatus = types.ArrowResolver->AreTypesSupported(ctx.GetPosition(lambda->Pos()), allInputTypes, ctx);
+    YQL_ENSURE(resolveStatus != IArrowResolver::ERROR);
+    if (resolveStatus != IArrowResolver::OK) {
         return false;
     }
 
@@ -4539,52 +4777,30 @@ bool CollectBlockRewrites(const TMultiExprType* multiInputType, bool keepInputCo
             ++newNodes;
             return true;
         }
-        if (node->IsCallable("Apply") && node->Head().IsCallable("Udf")) {
+        const bool isUdf = node->IsCallable("Apply") && node->Head().IsCallable("Udf");
+        if (isUdf) {
             auto func = node->Head().Head().Content();
             if (!func.StartsWith("ClickHouse.")) {
                 return true;
             }
+        }
 
+        {
             TVector<const TTypeAnnotationNode*> allTypes;
             allTypes.push_back(node->GetTypeAnn());
-            for (ui32 i = 1; i < node->ChildrenSize(); ++i) {
+            for (ui32 i = isUdf ? 1 : 0; i < node->ChildrenSize(); ++i) {
                 allTypes.push_back(node->Child(i)->GetTypeAnn());
             }
 
-            bool supported = false;
-            YQL_ENSURE(types.ArrowResolver->AreTypesSupported(ctx.GetPosition(node->Pos()), allTypes, supported, ctx));
-            if (!supported) {
+            auto resolveStatus = types.ArrowResolver->AreTypesSupported(ctx.GetPosition(node->Pos()), allTypes, ctx);
+            YQL_ENSURE(resolveStatus != IArrowResolver::ERROR);
+            if (resolveStatus != IArrowResolver::OK) {
                 return true;
-            }
-
-            funcArgs.push_back(nullptr);
-        } else {
-            auto fit = funcs.find(node->Content());
-            if (fit == funcs.end()) {
-                return true;
-            }
-
-            arrowFunctionName = fit->second.Name;
-            funcArgs.push_back(ctx.NewAtom(node->Pos(), arrowFunctionName));
-        }
-
-        for (ui32 i = arrowFunctionName.empty() ? 1 : 0; i < node->ChildrenSize(); ++i) {
-            auto child = node->Child(i);
-            if (child->IsComplete()) {
-                funcArgs.push_back(ctx.NewCallable(node->Pos(), "AsScalar", { node->ChildPtr(i) }));
-            } else {
-                auto rit = rewrites.find(child);
-                if (rit == rewrites.end()) {
-                    return true;
-                }
-
-                funcArgs.push_back(rit->second);
             }
         }
 
-        const TTypeAnnotationNode* outType = nullptr;
         TVector<const TTypeAnnotationNode*> argTypes;
-        for (ui32 i = arrowFunctionName.empty() ? 1 : 0; i < node->ChildrenSize(); ++i) {
+        for (ui32 i = isUdf ? 1 : 0; i < node->ChildrenSize(); ++i) {
             auto child = node->Child(i);
             if (child->IsComplete()) {
                 argTypes.push_back(ctx.MakeType<TScalarExprType>(child->GetTypeAnn()));
@@ -4595,20 +4811,15 @@ bool CollectBlockRewrites(const TMultiExprType* multiInputType, bool keepInputCo
             }
         }
 
-        if (!arrowFunctionName.empty()) {
-            YQL_ENSURE(types.ArrowResolver->LoadFunctionMetadata(ctx.GetPosition(node->Pos()), arrowFunctionName, argTypes, outType, ctx));
-            if (!outType) {
-                return true;
-            }
-
-            bool isScalar;
-            if (!IsSameAnnotation(*node->GetTypeAnn(), *GetBlockItemType(*outType, isScalar))) {
-                return true;
-            }
-
-            rewrites[node.Get()] = ctx.NewCallable(node->Pos(), "BlockFunc", std::move(funcArgs));
+        const TTypeAnnotationNode* outType = node->GetTypeAnn();
+        if (outType->HasFixedSizeRepr()) {
+            outType = ctx.MakeType<TBlockExprType>(outType);
         } else {
-            funcArgs[0] = ctx.Builder(node->Head().Pos())
+            outType = ctx.MakeType<TChunkedBlockExprType>(outType);
+        }
+
+        if (isUdf) {
+            funcArgs.push_back(ctx.Builder(node->Head().Pos())
                 .Callable("Udf")
                     .Add(0, node->Head().ChildPtr(0))
                     .Add(1, node->Head().ChildPtr(1))
@@ -4634,11 +4845,39 @@ bool CollectBlockRewrites(const TMultiExprType* multiInputType, bool keepInputCo
                     .Seal()
                     .Add(3, node->Head().ChildPtr(3))
                 .Seal()
-                .Build();
+                .Build());
+        } else {
+            auto fit = funcs.find(node->Content());
+            if (fit == funcs.end()) {
+                return true;
+            }
 
-            rewrites[node.Get()] = ctx.NewCallable(node->Pos(), "Apply", std::move(funcArgs));
+            arrowFunctionName = fit->second.Name;
+            funcArgs.push_back(ctx.NewAtom(node->Pos(), arrowFunctionName));
+
+            auto resolveStatus = types.ArrowResolver->LoadFunctionMetadata(ctx.GetPosition(node->Pos()), arrowFunctionName, argTypes, outType, ctx);
+            YQL_ENSURE(resolveStatus != IArrowResolver::ERROR);
+            if (resolveStatus != IArrowResolver::OK) {
+                return true;
+            }
+            funcArgs.push_back(ExpandType(node->Pos(), *outType, ctx));
         }
 
+        for (ui32 i = isUdf ? 1 : 0; i < node->ChildrenSize(); ++i) {
+            auto child = node->Child(i);
+            if (child->IsComplete()) {
+                funcArgs.push_back(ctx.NewCallable(node->Pos(), "AsScalar", { node->ChildPtr(i) }));
+            } else {
+                auto rit = rewrites.find(child);
+                if (rit == rewrites.end()) {
+                    return true;
+                }
+
+                funcArgs.push_back(rit->second);
+            }
+        }
+
+        rewrites[node.Get()] = ctx.NewCallable(node->Pos(), isUdf ? "Apply" : "BlockFunc", std::move(funcArgs));
         ++newNodes;
         return true;
     });
@@ -4664,9 +4903,9 @@ bool CollectBlockRewrites(const TMultiExprType* multiInputType, bool keepInputCo
         if (lambda->ChildPtr(i)->IsComplete()) {
             TVector<const TTypeAnnotationNode*> allTypes;
             allTypes.push_back(lambda->ChildPtr(i)->GetTypeAnn());
-            bool supported = false;
-            YQL_ENSURE(types.ArrowResolver->AreTypesSupported(ctx.GetPosition(lambda->Pos()), allTypes, supported, ctx));
-            if (supported) {
+            auto resolveStatus = types.ArrowResolver->AreTypesSupported(ctx.GetPosition(lambda->Pos()), allTypes, ctx);
+            YQL_ENSURE(resolveStatus != IArrowResolver::ERROR);
+            if (resolveStatus == IArrowResolver::OK) {
                 rewrites[lambda->Child(i)] = ctx.NewCallable(lambda->Pos(), "AsScalar", { lambda->ChildPtr(i) });
                 ++newNodes;
             }
@@ -4893,11 +5132,10 @@ TExprNode::TPtr OptimizeSkipTakeToBlocks(const TExprNode::TPtr& node, TExprConte
         return node;
     }
 
-    bool supported = false;
-    YQL_ENSURE(types.ArrowResolver->AreTypesSupported(ctx.GetPosition(node->Head().Pos()),
-                                                      TVector<const TTypeAnnotationNode*>(allTypes.begin(), allTypes.end()),
-                                                      supported, ctx));
-    if (!supported) {
+    auto resolveStatus = types.ArrowResolver->AreTypesSupported(ctx.GetPosition(node->Head().Pos()),
+        TVector<const TTypeAnnotationNode*>(allTypes.begin(), allTypes.end()), ctx);
+    YQL_ENSURE(resolveStatus != IArrowResolver::ERROR);
+    if (resolveStatus != IArrowResolver::OK) {
         return node;
     }
 
@@ -6642,6 +6880,7 @@ struct TPeepHoleRules {
         {"And", &OptimizeLogicalDups<true>},
         {"Or", &OptimizeLogicalDups<false>},
         {"CombineByKey", &ExpandCombineByKey},
+        {"FinalizeByKey", &ExpandFinalizeByKey},
         {"SkipNullMembers", &ExpandSkipNullFields<EnableNewOptimizers, false>},
         {"SkipNullElements", &ExpandSkipNullFields<EnableNewOptimizers, true>},
         {"ConstraintsOf", &ExpandConstraintsOf},

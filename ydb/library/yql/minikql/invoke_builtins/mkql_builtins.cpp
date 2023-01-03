@@ -1,6 +1,7 @@
 #include "mkql_builtins.h"
 #include "mkql_builtins_impl.h"
 #include "mkql_builtins_compare.h"
+#include "mkql_builtins_string_kernels.h"
 
 #include <ydb/library/yql/minikql/arrow/arrow_defs.h>
 
@@ -59,7 +60,7 @@ void RegisterUnary(const arrow::compute::FunctionRegistry& registry, std::string
     NUdf::TDataTypeId returnType = NUdf::TDataType<TOutput>::Id;
 
     auto family = std::make_unique<TKernelFamilyBase>();
-    family->KernelMap.emplace(argTypes, std::make_unique<TForeignKernel>(*family, argTypes, returnType, func));
+    family->Adopt(argTypes, returnType, std::make_unique<TForeignKernel>(*family, argTypes, returnType, func));
 
     Y_ENSURE(kernelFamilyMap.emplace(TString(name), std::move(family)).second);
 }
@@ -72,7 +73,7 @@ void RegisterBinary(const arrow::compute::FunctionRegistry& registry, std::strin
     NUdf::TDataTypeId returnType = NUdf::TDataType<TOutput>::Id;
 
     auto family = std::make_unique<TKernelFamilyBase>();
-    family->KernelMap.emplace(argTypes, std::make_unique<TForeignKernel>(*family, argTypes, returnType, func));
+    family->Adopt(argTypes, returnType, std::make_unique<TForeignKernel>(*family, argTypes, returnType, func));
 
     Y_ENSURE(kernelFamilyMap.emplace(TString(name), std::move(family)).second);
 }
@@ -128,6 +129,8 @@ void RegisterDefaultOperations(IBuiltinFunctionRegistry& registry, TKernelFamily
     RegisterGreater(kernelFamilyMap);
     RegisterGreaterOrEqual(registry);
     RegisterGreaterOrEqual(kernelFamilyMap);
+    // Size is missing in registry
+    RegisterSizeBuiltin(kernelFamilyMap);
 }
 
 void PrintType(NUdf::TDataTypeId schemeType, bool isOptional, IOutputStream& out)
@@ -220,9 +223,11 @@ private:
 
     const TDescriptionList& FindCandidates(const std::string_view& name) const;
 
-    const TKernel* FindKernel(const std::string_view& name, const NUdf::TDataTypeId* argTypes, size_t argTypesCount) const final;
+    const TKernel* FindKernel(const std::string_view& name, const NUdf::TDataTypeId* argTypes, size_t argTypesCount, NUdf::TDataTypeId returnType) const final;
 
     void RegisterKernelFamily(const std::string_view& name, std::unique_ptr<TKernelFamily>&& family) final;
+
+    TVector<std::pair<TString, const TKernelFamily*>> GetAllKernelFamilies() const final;
 
     TFunctionsMap Functions;
     TFunctionParamMetadataList ArgumentsMetadata;
@@ -357,17 +362,26 @@ void TBuiltinFunctionRegistry::PrintInfoTo(IOutputStream& out) const
     }
 }
 
-const TKernel* TBuiltinFunctionRegistry::FindKernel(const std::string_view& name, const NUdf::TDataTypeId* argTypes, size_t argTypesCount) const {
+const TKernel* TBuiltinFunctionRegistry::FindKernel(const std::string_view& name, const NUdf::TDataTypeId* argTypes, size_t argTypesCount, NUdf::TDataTypeId returnType) const {
     auto fit = KernelFamilyMap.find(TString(name));
     if (fit == KernelFamilyMap.end()) {
         return nullptr;
     }
 
-    return fit->second->FindKernel(argTypes, argTypesCount);
+    return fit->second->FindKernel(argTypes, argTypesCount, returnType);
 }
 
 void TBuiltinFunctionRegistry::RegisterKernelFamily(const std::string_view& name, std::unique_ptr<TKernelFamily>&& family) {
     Y_ENSURE(KernelFamilyMap.emplace(TString(name), std::move(family)).second);
+}
+
+TVector<std::pair<TString, const TKernelFamily*>> TBuiltinFunctionRegistry::GetAllKernelFamilies() const {
+    TVector<std::pair<TString, const TKernelFamily*>> ret;
+    for (const auto& f : KernelFamilyMap) {
+        ret.emplace_back(std::make_pair(f.first, f.second.get()));
+    }
+
+    return ret;
 }
 
 } // namespace

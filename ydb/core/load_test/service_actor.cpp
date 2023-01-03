@@ -4,6 +4,7 @@
 #include <ydb/core/base/counters.h>
 #include <ydb/public/lib/base/msgbus.h>
 #include <ydb/core/blobstorage/base/blobstorage_events.h>
+#include <ydb/core/load_test/ycsb/test_load_actor.h>
 
 #include <library/cpp/actors/interconnect/interconnect.h>
 #include <library/cpp/json/json_writer.h>
@@ -253,6 +254,19 @@ public:
                 break;
             }
 
+            case NKikimr::TEvLoadTestRequest::CommandCase::kYCSBLoad: {
+                const auto& cmd = record.GetYCSBLoad();
+                tag = GetOrGenerateTag(cmd);
+                if (LoadActors.count(tag) != 0) {
+                    ythrow TLoadActorException() << Sprintf("duplicate load actor with Tag# %" PRIu64, tag);
+                }
+
+                LOG_D("Create new YCSB load actor with tag# " << tag);
+                LoadActors.emplace(tag, TlsActivationContext->Register(NDataShardLoad::CreateTestLoadActor(
+                            cmd, SelfId(), GetServiceCounters(Counters, "load_actor"), tag)));
+                break;
+            }
+
             default: {
                 TString protoTxt;
                 google::protobuf::TextFormat::PrintToString(record, &protoTxt);
@@ -381,7 +395,7 @@ public:
 
         if (mode == "start") {
             TString errorMsg = "ok";
-            auto record = ParseMessage<NKikimr::TEvLoadTestRequest>(request, content);
+            auto record = ParseMessage<NKikimr::TEvLoadTestRequest>(request, params.Get("config"));
             LOG_D( "received config: " << params.Get("config").Quote() << "; proto parse success: " << std::to_string(bool{record}));
 
             ui64 tag = 0;
@@ -561,7 +575,11 @@ public:
                         function sendStartRequest(button, run_all) {
                             $.ajax({
                                 url: "",
-                                data: $('#config').val(),
+                                data: {
+                                    mode: "start",
+                                    all_nodes: run_all,
+                                    config: $('#config').val()
+                                },
                                 method: "POST",
                                 contentType: "application/x-protobuf-text",
                                 success: function(result) {

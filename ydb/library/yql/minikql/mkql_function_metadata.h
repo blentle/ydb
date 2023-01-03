@@ -1,7 +1,9 @@
 #pragma once
 
+#include <ydb/library/yql/minikql/defs.h>
 #include <ydb/library/yql/public/udf/udf_value.h>
 #include <util/digest/numeric.h>
+#include <util/generic/vector.h>
 
 #include <arrow/compute/kernel.h>
 
@@ -69,7 +71,8 @@ public:
     {}
 
     virtual ~TKernelFamily() = default;
-    virtual const TKernel* FindKernel(const NUdf::TDataTypeId* argTypes, size_t argTypesCount) const = 0;
+    virtual const TKernel* FindKernel(const NUdf::TDataTypeId* argTypes, size_t argTypesCount, NUdf::TDataTypeId returnType) const = 0;
+    virtual TVector<const TKernel*> GetAllKernels() const = 0;
 };
 
 class TKernel {
@@ -90,38 +93,33 @@ public:
     virtual ~TKernel() = default;
 };
 
+using TKernelMapKey = std::pair<std::vector<NUdf::TDataTypeId>, NUdf::TDataTypeId>;
 struct TTypeHasher {
-    std::size_t operator()(const std::vector<NUdf::TDataTypeId>& s) const noexcept {
+    std::size_t operator()(const TKernelMapKey& s) const noexcept {
         size_t r = 0;
-        for (const auto& x : s) {
+        for (const auto& x : s.first) {
             r = CombineHashes<size_t>(r, x);
         }
+        r = CombineHashes<size_t>(r, s.second);
 
         return r;
     }
 };
 
-using TKernelMap = std::unordered_map<std::vector<NUdf::TDataTypeId>, std::unique_ptr<TKernel>, TTypeHasher>;
+using TKernelMap = std::unordered_map<TKernelMapKey, std::unique_ptr<TKernel>, TTypeHasher>;
 
 using TKernelFamilyMap = std::unordered_map<TString, std::unique_ptr<TKernelFamily>>;
 
 class TKernelFamilyBase : public TKernelFamily
 {
 public:
-    TKernelFamilyBase(ENullMode nullMode = ENullMode::Default, const arrow::compute::FunctionOptions* functionOptions = nullptr)
-        : TKernelFamily(nullMode, functionOptions)
-    {}
+    TKernelFamilyBase(ENullMode nullMode = ENullMode::Default, const arrow::compute::FunctionOptions* functionOptions = nullptr);
 
-    const TKernel* FindKernel(const NUdf::TDataTypeId* argTypes, size_t argTypesCount) const final {
-        std::vector<NUdf::TDataTypeId> key(argTypes, argTypes + argTypesCount);
-        auto it = KernelMap.find(key);
-        if (it == KernelMap.end()) {
-            return nullptr;
-        }
+    const TKernel* FindKernel(const NUdf::TDataTypeId* argTypes, size_t argTypesCount, NUdf::TDataTypeId returnType) const final;
+    TVector<const TKernel*> GetAllKernels() const final;
 
-        return it->second.get();
-    }
-
+    void Adopt(const std::vector<NUdf::TDataTypeId>& argTypes, NUdf::TDataTypeId returnType, std::unique_ptr<TKernel>&& kernel);
+private:
     TKernelMap KernelMap;
 };
 
@@ -144,9 +142,11 @@ public:
 
     virtual TFunctionDescriptor GetBuiltin(const std::string_view& name, const std::pair<NUdf::TDataTypeId, bool>* argTypes, size_t argTypesCount) const = 0;
 
-    virtual const TKernel* FindKernel(const std::string_view& name, const NUdf::TDataTypeId* argTypes, size_t argTypesCount) const = 0;
+    virtual const TKernel* FindKernel(const std::string_view& name, const NUdf::TDataTypeId* argTypes, size_t argTypesCount, NUdf::TDataTypeId returnType) const = 0;
 
     virtual void RegisterKernelFamily(const std::string_view& name, std::unique_ptr<TKernelFamily>&& family) = 0;
+
+    virtual TVector<std::pair<TString, const TKernelFamily*>> GetAllKernelFamilies() const = 0;
 };
 
 }

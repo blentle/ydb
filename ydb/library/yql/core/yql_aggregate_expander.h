@@ -8,13 +8,14 @@ namespace NYql {
 
 class TAggregateExpander {
 public:
-    TAggregateExpander(bool allowPickle, bool usePartitionsByKeys, const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& typesCtx,
+    TAggregateExpander(bool allowPickle, bool usePartitionsByKeys, const bool useFinalizeByKeys, const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& typesCtx,
         bool forceCompact = false, bool compactForDistinct = false, bool usePhases = false)
         : Node(node)
         , Ctx(ctx)
         , TypesCtx(typesCtx)
         , AllowPickle(allowPickle)
         , UsePartitionsByKeys(usePartitionsByKeys)
+        , UseFinalizeByKeys(useFinalizeByKeys)
         , ForceCompact(forceCompact)
         , CompactForDistinct(compactForDistinct)
         , UsePhases(usePhases)
@@ -66,6 +67,7 @@ private:
     TExprNode::TPtr GeneratePostAggregate(const TExprNode::TPtr& preAgg, const TExprNode::TPtr& keyExtractor);
     TExprNode::TPtr GeneratePreprocessLambda(const TExprNode::TPtr& keyExtractor);
     TExprNode::TPtr GenerateCondenseSwitch(const TExprNode::TPtr& keyExtractor);
+    TExprNode::TPtr BuildFinalizeByKeyLambda(const TExprNode::TPtr& preprocessLambda, const TExprNode::TPtr& keyExtractor);
     TExprNode::TPtr GeneratePostAggregateInitPhase();
     TExprNode::TPtr GeneratePostAggregateSavePhase();
     TExprNode::TPtr GeneratePostAggregateMergePhase();
@@ -76,12 +78,13 @@ private:
     TExprNode::TPtr GeneratePhases();
     void GenerateInitForDistinct(TExprNodeBuilder& parent, ui32& ndx, const TIdxSet& indicies, const TExprNode::TPtr& distinctField);
     TExprNode::TPtr GenerateJustOverStates(const TExprNode::TPtr& input, const TIdxSet& indicies);
+    TExprNode::TPtr SerializeIdxSet(const TIdxSet& indicies);
     TExprNode::TPtr TryGenerateBlockCombineAllOrHashed();
     TExprNode::TPtr TryGenerateBlockMergeFinalizeHashed();
     TExprNode::TPtr TryGenerateBlockCombine();
     TExprNode::TPtr TryGenerateBlockMergeFinalize();
     TExprNode::TPtr MakeInputBlocks(const TExprNode::TPtr& streamArg, TExprNode::TListType& keyIdxs,
-        TVector<TString>& outputColumns, TExprNode::TListType& aggs, bool overState, bool many);
+        TVector<TString>& outputColumns, TExprNode::TListType& aggs, bool overState, bool many, ui32* streamIdxColumn = nullptr);
 
 private:
     static constexpr TStringBuf SessionStartMemberName = "_yql_group_session_start";
@@ -91,6 +94,7 @@ private:
     TTypeAnnotationContext& TypesCtx;
     bool AllowPickle;
     bool UsePartitionsByKeys;
+    bool UseFinalizeByKeys = false;
     bool ForceCompact;
     bool CompactForDistinct;
     bool UsePhases;
@@ -126,9 +130,13 @@ private:
     std::unordered_map<std::string_view, TExprNode::TPtr> UdfWasChanged;
 };
 
-inline TExprNode::TPtr ExpandAggregatePeephole(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& typesCtx) {
-    TAggregateExpander aggExpander(false, true, node, ctx, typesCtx, true);
+inline TExprNode::TPtr ExpandAggregatePeepholeImpl(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& typesCtx, const bool useFinalizeByKey, const bool useBlocks) {
+    TAggregateExpander aggExpander(false, !useFinalizeByKey && !useBlocks, useFinalizeByKey, node, ctx, typesCtx, true);
     return aggExpander.ExpandAggregate();
+}
+
+inline TExprNode::TPtr ExpandAggregatePeephole(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& typesCtx) {
+    return ExpandAggregatePeepholeImpl(node, ctx, typesCtx, false, typesCtx.UseBlocks);
 }
 
 }

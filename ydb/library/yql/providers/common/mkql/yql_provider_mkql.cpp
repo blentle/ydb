@@ -2390,7 +2390,7 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
 
     AddCallable("BlockFunc", [](const TExprNode& node, TMkqlBuildContext& ctx) {
         TVector<TRuntimeNode> args;
-        for (ui32 i = 1; i < node.ChildrenSize(); ++i) {
+        for (ui32 i = 2; i < node.ChildrenSize(); ++i) {
             args.push_back(MkqlBuildExpr(*node.Child(i), ctx));
         }
 
@@ -2473,6 +2473,37 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
 
         auto returnType = BuildType(node, *node.GetTypeAnn(), ctx.ProgramBuilder);
         return ctx.ProgramBuilder.BlockMergeFinalizeHashed(arg, keys, aggs, returnType);
+    });
+
+    AddCallable("BlockMergeManyFinalizeHashed", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        auto arg = MkqlBuildExpr(*node.Child(0), ctx);
+        TVector<ui32> keys;
+        for (const auto& key : node.Child(1)->Children()) {
+            keys.push_back(FromString<ui32>(key->Content()));
+        }
+
+        TVector<TAggInfo> aggs;
+        for (const auto& agg : node.Child(2)->Children()) {
+            TAggInfo info;
+            info.Name = TString(agg->Head().Head().Content());
+            for (ui32 i = 1; i < agg->ChildrenSize(); ++i) {
+                info.ArgsColumns.push_back(FromString<ui32>(agg->Child(i)->Content()));
+            }
+
+            aggs.push_back(info);
+        }
+
+        ui32 streamIndex = FromString<ui32>(node.Child(3)->Content());
+        TVector<TVector<ui32>> streams;
+        for (const auto& child : node.Child(4)->Children()) {
+            auto& stream = streams.emplace_back();
+            for (const auto& atom : child->Children()) {
+                stream.emplace_back(FromString<ui32>(atom->Content()));
+            }
+        }
+
+        auto returnType = BuildType(node, *node.GetTypeAnn(), ctx.ProgramBuilder);
+        return ctx.ProgramBuilder.BlockMergeManyFinalizeHashed(arg, keys, aggs, streamIndex, streams, returnType);
     });
 
     AddCallable("BlockCompress", [](const TExprNode& node, TMkqlBuildContext& ctx) {

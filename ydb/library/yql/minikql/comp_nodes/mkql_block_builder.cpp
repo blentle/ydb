@@ -1,8 +1,8 @@
 #include "mkql_block_builder.h"
-#include "mkql_bit_utils.h"
 
 #include <ydb/library/yql/minikql/arrow/arrow_defs.h>
 #include <ydb/library/yql/minikql/arrow/arrow_util.h>
+#include <ydb/library/yql/minikql/arrow/mkql_bit_utils.h>
 #include <ydb/library/yql/minikql/computation/mkql_computation_node_holders.h>
 #include <ydb/library/yql/minikql/mkql_node_cast.h>
 #include <ydb/library/yql/minikql/mkql_type_builder.h>
@@ -19,7 +19,7 @@ namespace {
 
 bool AlwaysUseChunks(const TType* type) {
     if (type->IsOptional()) {
-        type = AS_TYPE(TOptionalType, type)->GetItemType();
+        return AlwaysUseChunks(AS_TYPE(TOptionalType, type)->GetItemType());
     }
 
     if (type->IsTuple()) {
@@ -42,83 +42,9 @@ bool AlwaysUseChunks(const TType* type) {
 
 std::shared_ptr<arrow::DataType> GetArrowType(TType* type) {
     std::shared_ptr<arrow::DataType> result;
-    bool isOptional;
-    Y_VERIFY(ConvertArrowType(type, isOptional, result));
+    Y_VERIFY(ConvertArrowType(type, result));
     return result;
 }
-
-std::shared_ptr<arrow::Buffer> AllocateBitmapWithReserve(size_t bitCount, arrow::MemoryPool* pool) {
-    // align up to 64 bit
-    bitCount = (bitCount + 63u) & ~size_t(63u);
-    // this simplifies code compression code - we can write single 64 bit word after array boundaries
-    bitCount += 64;
-    return ARROW_RESULT(arrow::AllocateBitmap(bitCount, pool));
-}
-
-std::shared_ptr<arrow::Buffer> MakeDenseBitmap(const ui8* srcSparse, size_t len, arrow::MemoryPool* pool) {
-    auto bitmap = AllocateBitmapWithReserve(len, pool);
-    CompressSparseBitmap(bitmap->mutable_data(), srcSparse, len);
-    return bitmap;
-}
-
-// similar to arrow::TypedBufferBuilder, but with UnsafeAdvance() method
-template<typename T>
-class TTypedBufferBuilder {
-    static_assert(std::is_pod_v<T>);
-    static_assert(!std::is_same_v<T, bool>);
-public:
-    explicit TTypedBufferBuilder(arrow::MemoryPool* pool)
-        : Builder(pool)
-    {
-    }
-
-    inline void Reserve(size_t size) {
-        ARROW_OK(Builder.Reserve(size * sizeof(T)));
-    }
-
-    inline size_t Length() const {
-        return Builder.length() / sizeof(T);
-    }
-
-    inline T* MutableData() {
-        return reinterpret_cast<T*>(Builder.mutable_data());
-    }
-
-    inline T* End() {
-        return MutableData() + Length();
-    }
-
-    inline const T* Data() const {
-        return reinterpret_cast<const T*>(Builder.data());
-    }
-
-    inline void UnsafeAppend(const T* values, size_t count) {
-        std::memcpy(End(), values, count * sizeof(T));
-        UnsafeAdvance(count);
-    }
-
-    inline void UnsafeAppend(size_t count, const T& value) {
-        T* target = End();
-        std::fill(target, target + count, value);
-        UnsafeAdvance(count);
-    }
-
-    inline void UnsafeAppend(T&& value) {
-        *End() = std::move(value);
-        UnsafeAdvance(1);
-    }
-
-    inline void UnsafeAdvance(size_t count) {
-        Builder.UnsafeAdvance(count * sizeof(T));
-    }
-
-    inline std::shared_ptr<arrow::Buffer> Finish() {
-        bool shrinkToFit = false;
-        return ARROW_RESULT(Builder.Finish(shrinkToFit));
-    }
-private:
-    arrow::BufferBuilder Builder;
-};
 
 class TBlockBuilderBase : public IBlockBuilder {
 public:
@@ -363,7 +289,6 @@ public:
                 AppendCurrentOffset();
                 return;
             }
-            NullBuilder->UnsafeAppend(1);
         }
 
         const TStringBuf str = value.AsStringRef();
@@ -381,6 +306,9 @@ public:
 
         AppendCurrentOffset();
         DataBuilder->UnsafeAppend((const ui8*)str.data(), str.size());
+        if constexpr (Nullable) {
+            NullBuilder->UnsafeAppend(1);
+        }
     }
 
     void DoAddDefault() final {
@@ -629,6 +557,79 @@ private:
     std::unique_ptr<TTypedBufferBuilder<ui8>> NullBuilder;
 };
 
+class TExternalOptionalBlockBuilder : public TBlockBuilderBase {
+public:
+    TExternalOptionalBlockBuilder(TType* type, arrow::MemoryPool& pool, size_t maxLen, std::unique_ptr<TBlockBuilderBase>&& inner)
+        : TBlockBuilderBase(type, pool, maxLen)
+        , Inner(std::move(inner))
+    {
+        Reserve();
+    }
+
+    void DoAdd(NUdf::TUnboxedValuePod value) final {
+        if (!value) {
+            NullBuilder->UnsafeAppend(0);
+            Inner->AddDefault();
+            return;
+        }
+
+        NullBuilder->UnsafeAppend(1);
+        Inner->Add(value.GetOptionalValue());
+    }
+
+    void DoAddDefault() final {
+        NullBuilder->UnsafeAppend(1);
+        Inner->AddDefault();
+    }
+
+    void DoAddMany(const arrow::ArrayData& array, const ui8* sparseBitmap, size_t popCount) final {
+        Y_VERIFY(!array.buffers.empty());
+        Y_VERIFY(array.child_data.size() == 1);
+
+        if (array.buffers.front()) {
+            ui8* dstBitmap = NullBuilder->End();
+            CompressAsSparseBitmap(array.GetValues<ui8>(0, 0), array.offset, sparseBitmap, dstBitmap, array.length);
+            NullBuilder->UnsafeAdvance(popCount);
+        } else {
+            NullBuilder->UnsafeAppend(popCount, 1);
+        }
+
+        Inner->AddMany(*array.child_data[0], popCount, sparseBitmap, array.length);
+    }
+
+    TBlockArrayTree::Ptr DoBuildTree(bool finish) final {
+        TBlockArrayTree::Ptr result = std::make_shared<TBlockArrayTree>();
+
+        std::shared_ptr<arrow::Buffer> nullBitmap;
+        const size_t length = GetCurrLen();
+        MKQL_ENSURE(length == NullBuilder->Length(), "Unexpected NullBuilder length");
+        nullBitmap = NullBuilder->Finish();
+        nullBitmap = MakeDenseBitmap(nullBitmap->data(), length, Pool);
+
+        Y_VERIFY(length);
+        result->Payload.push_back(arrow::ArrayData::Make(GetArrowType(Type), length, { nullBitmap }));
+        result->Children.emplace_back(Inner->BuildTree(finish));
+
+        if (!finish) {
+            Reserve();
+        }
+
+        return result;
+    }
+
+private:
+    void Reserve() {
+        NullBuilder = std::make_unique<TTypedBufferBuilder<ui8>>(Pool);
+        NullBuilder->Reserve(MaxLen + 1);
+    }
+
+private:
+    std::unique_ptr<TBlockBuilderBase> Inner;
+    std::unique_ptr<TTypedBufferBuilder<ui8>> NullBuilder;
+};
+
+std::unique_ptr<TBlockBuilderBase> MakeBlockBuilderBase(TType* type, arrow::MemoryPool& pool, size_t maxBlockLength);
+
 template<bool Nullable>
 std::unique_ptr<TBlockBuilderBase> MakeBlockBuilderImpl(TType* type, arrow::MemoryPool& pool, size_t maxLen) {
     if constexpr (Nullable) {
@@ -640,9 +641,7 @@ std::unique_ptr<TBlockBuilderBase> MakeBlockBuilderImpl(TType* type, arrow::Memo
         TVector<std::unique_ptr<TBlockBuilderBase>> children;
         for (ui32 i = 0; i < tupleType->GetElementsCount(); ++i) {
             TType* childType = tupleType->GetElementType(i);
-            auto childBuilder = childType->IsOptional() ?
-                MakeBlockBuilderImpl<true>(childType, pool, maxLen) :
-                MakeBlockBuilderImpl<false>(childType, pool, maxLen);
+            auto childBuilder = MakeBlockBuilderBase(childType, pool, maxLen);
             children.push_back(std::move(childBuilder));
         }
 
@@ -689,12 +688,46 @@ std::unique_ptr<TBlockBuilderBase> MakeBlockBuilderImpl(TType* type, arrow::Memo
     MKQL_ENSURE(false, "Unsupported type");
 }
 
+std::unique_ptr<TBlockBuilderBase> MakeBlockBuilderBase(TType* type, arrow::MemoryPool& pool, size_t maxBlockLength) {
+    TType* unpacked = type;
+    if (type->IsOptional()) {
+        unpacked = AS_TYPE(TOptionalType, type)->GetItemType();
+    }
+
+    if (unpacked->IsOptional()) {
+        // at least 2 levels of optionals
+        ui32 nestLevel = 0;
+        auto currentType = type;
+        auto previousType = type;
+        TVector<TType*> types;
+        do {
+            ++nestLevel;
+            types.push_back(currentType);
+            previousType = currentType;
+            currentType = AS_TYPE(TOptionalType, currentType)->GetItemType();
+        } while (currentType->IsOptional());
+
+        auto builder = MakeBlockBuilderBase(previousType, pool, maxBlockLength);
+        for (ui32 i = 1; i < nestLevel; ++i) {
+            builder = std::make_unique<TExternalOptionalBlockBuilder>(types[nestLevel - 1 - i], pool, maxBlockLength, std::move(builder));
+        }
+
+        return builder;
+    } else {
+        if (type->IsOptional()) {
+            return MakeBlockBuilderImpl<true>(type, pool, maxBlockLength);
+        } else {
+            return MakeBlockBuilderImpl<false>(type, pool, maxBlockLength);
+        }
+    }
+}
+
 } // namespace
 
 size_t CalcMaxBlockItemSize(const TType* type) {
     // we do not count block bitmap size
     if (type->IsOptional()) {
-        type = AS_TYPE(TOptionalType, type)->GetItemType();
+        return CalcMaxBlockItemSize(AS_TYPE(TOptionalType, type)->GetItemType());
     }
 
     if (type->IsTuple()) {
@@ -743,10 +776,7 @@ size_t CalcMaxBlockItemSize(const TType* type) {
 }
 
 std::unique_ptr<IBlockBuilder> MakeBlockBuilder(TType* type, arrow::MemoryPool& pool, size_t maxBlockLength) {
-    if (type->IsOptional()) {
-        return MakeBlockBuilderImpl<true>(type, pool, maxBlockLength);
-    }
-    return MakeBlockBuilderImpl<false>(type, pool, maxBlockLength);
+    return MakeBlockBuilderBase(type, pool, maxBlockLength);
 }
 
 } // namespace NMiniKQL

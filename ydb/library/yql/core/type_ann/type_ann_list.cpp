@@ -4191,8 +4191,12 @@ namespace {
         }
 
         const TTypeAnnotationNode* retItemType = nullptr;
-        if (!EnsureNewSeqType<true, true>(*lambdaFinishHandler, ctx.Expr, &retItemType)) {
-            return IGraphTransformer::TStatus::Error;
+        if (input->Content() == "FinalizeByKey") {
+            retItemType = lambdaFinishHandler->GetTypeAnn();
+        } else {
+            if (!EnsureNewSeqType<true, true>(*lambdaFinishHandler, ctx.Expr, &retItemType)) {
+                return IGraphTransformer::TStatus::Error;
+            }
         }
 
         input->SetTypeAnn(MakeSequenceType(inputTypeKind, *retItemType, ctx.Expr));
@@ -4647,9 +4651,10 @@ namespace {
         return output ? IGraphTransformer::TStatus::Repeat : IGraphTransformer::TStatus::Error;
     }
 
-    IGraphTransformer::TStatus AggregateWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+    IGraphTransformer::TStatus AggregateWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExtContext& ctx) {
         TStringBuf suffix = input->Content();
         YQL_ENSURE(suffix.SkipPrefix("Aggregate"));
+        const bool isMany = suffix == "MergeManyFinalize";
         if (!EnsureMinArgsCount(*input, 3, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
@@ -4683,9 +4688,19 @@ namespace {
             return IGraphTransformer::TStatus::Repeat;
         }
 
+        if (isMany && ctx.Types.UseBlocks && !inputStructType->FindItem("_yql_group_stream_index")) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                TStringBuilder() << "Missing service column: _yql_group_stream_index"));
+            return IGraphTransformer::TStatus::Error;
+        }
+
         auto status = NormalizeTupleOfAtoms(input, 1, output, ctx.Expr);
         if (status != IGraphTransformer::TStatus::Ok) {
             return status;
+        }
+
+        if (!EnsureTuple(*input->Child(2), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
         }
 
         if (input->ChildrenSize() < 4U) {
@@ -4707,6 +4722,7 @@ namespace {
         }
 
         bool isHopping = false;
+        bool hasManyStreams = false;
         const auto settings = input->Child(3);
         if (!EnsureTuple(*settings, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
@@ -4823,11 +4839,32 @@ namespace {
                 if (!EnsureTupleSize(*setting, 1, ctx.Expr)) {
                     return IGraphTransformer::TStatus::Error;
                 }
+            } else if (settingName == "many_streams" && isMany) {
+                if (!EnsureTupleSize(*setting, 2, ctx.Expr)) {
+                    return IGraphTransformer::TStatus::Error;
+                }
+
+                auto value = setting->ChildPtr(1);
+                if (!EnsureTuple(*value, ctx.Expr)) {
+                    return IGraphTransformer::TStatus::Error;
+                }
+
+                if (!ValidateAggManyStreams(*value, input->Child(2)->ChildrenSize(), ctx.Expr)) {
+                    return IGraphTransformer::TStatus::Error;
+                }
+
+                hasManyStreams = true;
             } else {
                 ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(setting->Head().Pos()),
                     TStringBuilder() << "Unexpected setting: " << settingName));
                 return IGraphTransformer::TStatus::Error;
             }
+        }
+
+        if (isMany && !hasManyStreams && ctx.Types.UseBlocks) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(settings->Head().Pos()),
+                "Missing setting: many_streams"));
+            return IGraphTransformer::TStatus::Error;
         }
 
         for (auto& child : input->Child(1)->Children()) {
@@ -4882,7 +4919,7 @@ namespace {
                 }
             }
 
-            const bool isAggApply = child->Child(1)->IsCallable({ "AggApply", "AggApplyState" });
+            const bool isAggApply = child->Child(1)->IsCallable({ "AggApply", "AggApplyState", "AggApplyManyState" });
             const bool isTraits = child->Child(1)->IsCallable("AggregationTraits");
             if (!isAggApply && !isTraits) {
                 ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(child->Child(1)->Pos()), "Expected aggregation traits"));
@@ -5179,6 +5216,7 @@ namespace {
     IGraphTransformer::TStatus AggApplyWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
         Y_UNUSED(output);
         const bool overState = input->Content().EndsWith("State");
+        const bool isMany = input->Content().EndsWith("ManyState");
         if (overState) {
             if (!EnsureArgsCount(*input, 4, ctx.Expr)) {
                 return IGraphTransformer::TStatus::Error;
@@ -5274,6 +5312,15 @@ namespace {
                 }
 
                 input->SetTypeAnn(structType->GetItems()[0]->GetItemType());
+                if (isMany) {
+                    if (input->GetTypeAnn()->GetKind() != ETypeAnnotationKind::Optional) {
+                        ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                            TStringBuilder() << "Expected optional state"));
+                        return IGraphTransformer::TStatus::Error;
+                    }
+
+                    input->SetTypeAnn(input->GetTypeAnn()->Cast<TOptionalExprType>()->GetItemType());
+                }
             } else {
                 input->SetTypeAnn(retType);
             }
@@ -7112,6 +7159,42 @@ namespace {
                 .Add(5, input.ChildPtr(7))
             .Seal()
             .Build();
+    }
+
+    bool ValidateAggManyStreams(const TExprNode& value, ui32 aggCount, TExprContext& ctx) {
+        THashSet<ui32> usedIdxs;
+        for (const auto& child : value.Children()) {
+            if (!EnsureTuple(*child, ctx)) {
+                return false;
+            }
+
+            for (const auto& atom : child->Children()) {
+                if (!EnsureAtom(*atom, ctx)) {
+                    return false;
+                }
+
+                ui32 idx;
+                if (!TryFromString(atom->Content(), idx) || idx >= aggCount) {
+                    ctx.AddError(TIssue(ctx.GetPosition(atom->Pos()),
+                        TStringBuilder() << "Invalid aggregation index: " << atom->Content()));
+                    return false;
+                }
+
+                if (!usedIdxs.insert(idx).second) {
+                    ctx.AddError(TIssue(ctx.GetPosition(atom->Pos()),
+                        TStringBuilder() << "Duplication of aggregation index: " << atom->Content()));
+                    return false;
+                }
+            }
+        }
+
+        if (usedIdxs.size() != aggCount) {
+            ctx.AddError(TIssue(ctx.GetPosition(value.Pos()),
+                TStringBuilder() << "Mismatch of total aggregations count in streams, expected: " << aggCount << ", got: " << usedIdxs.size()));
+            return false;
+        }
+
+        return true;
     }
 } // namespace NTypeAnnImpl
 }

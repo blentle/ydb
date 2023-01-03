@@ -8,6 +8,7 @@
 #include <contrib/libs/apache/arrow/cpp/src/arrow/ipc/writer.h>
 
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor.h>
+#include <ydb/core/formats/ssa_runtime_version.h>
 #include <ydb/core/kqp/executer_actor/kqp_executer.h>
 #include <ydb/core/tx/datashard/datashard.h>
 #include <ydb/core/tx/datashard/datashard_ut_common_kqp.h>
@@ -48,8 +49,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         runtime->SetLogPriority(NKikimrServices::KQP_RESOURCE_MANAGER, NActors::NLog::PRI_DEBUG);
         //runtime->SetLogPriority(NKikimrServices::LONG_TX_SERVICE, NActors::NLog::PRI_DEBUG);
         runtime->SetLogPriority(NKikimrServices::TX_COLUMNSHARD, NActors::NLog::PRI_TRACE);
-        //runtime->SetLogPriority(NKikimrServices::TX_COLUMNSHARD_SCAN, NActors::NLog::PRI_DEBUG);
-        //runtime->SetLogPriority(NKikimrServices::TX_OLAPSHARD, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::TX_COLUMNSHARD_SCAN, NActors::NLog::PRI_DEBUG);
         //runtime->SetLogPriority(NKikimrServices::TX_DATASHARD, NActors::NLog::PRI_DEBUG);
         //runtime->SetLogPriority(NKikimrServices::BLOB_CACHE, NActors::NLog::PRI_DEBUG);
         //runtime->SetLogPriority(NKikimrServices::GRPC_SERVER, NActors::NLog::PRI_DEBUG);
@@ -68,26 +68,15 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             TString shardingFunction = "HASH_FUNCTION_CLOUD_LOGS") {
             TActorId sender = Server.GetRuntime()->AllocateEdgeActor();
             CreateTestOlapStore(sender, Sprintf(R"(
-             Name: "%s"
-             ColumnShardCount: %d
-             SchemaPresets {
-                 Name: "default"
-                 Schema {
-                     Columns { Name: "timestamp" Type: "Timestamp" NotNull: true }
-                     #Columns { Name: "resource_type" Type: "Utf8" }
-                     Columns { Name: "resource_id" Type: "Utf8" }
-                     Columns { Name: "uid" Type: "Utf8" }
-                     Columns { Name: "level" Type: "Int32" }
-                     Columns { Name: "message" Type: "Utf8" }
-                     #Columns { Name: "json_payload" Type: "Json" }
-                     #Columns { Name: "ingested_at" Type: "Timestamp" }
-                     #Columns { Name: "saved_at" Type: "Timestamp" }
-                     #Columns { Name: "request_id" Type: "Utf8" }
-                     KeyColumnNames: "timestamp"
-                     Engine: COLUMN_ENGINE_REPLACING_TIMESERIES
-                 }
-             }
-        )", storeName.c_str(), storeShardsCount));
+                Name: "%s"
+                ColumnShardCount: %d
+                SchemaPresets {
+                    Name: "default"
+                    Schema {
+                        %s
+                    }
+                }
+            )", storeName.c_str(), storeShardsCount, PROTO_SCHEMA));
 
             TString shardingColumns = "[\"timestamp\", \"uid\"]";
             if (shardingFunction != "HASH_FUNCTION_CLOUD_LOGS") {
@@ -112,18 +101,37 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         }
     };
 
-    std::shared_ptr<arrow::Schema> GetArrowSchema() {
-        return std::make_shared<arrow::Schema>(
-            std::vector<std::shared_ptr<arrow::Field>>{
-                arrow::field("timestamp", arrow::timestamp(arrow::TimeUnit::TimeUnit::MICRO)),
-                arrow::field("resource_id", arrow::utf8()),
-                arrow::field("uid", arrow::utf8()),
-                arrow::field("level", arrow::int32()),
-                arrow::field("message", arrow::utf8())
-            });
-    }
+    class TClickHelper : public Tests::NCS::TCickBenchHelper {
+    private:
+        using TBase = Tests::NCS::TCickBenchHelper;
+    public:
+        using TBase::TBase;
+
+        TClickHelper(TKikimrRunner& runner)
+            : TBase(runner.GetTestServer())
+        {}
+
+        void CreateClickBenchTable(TString tableName = "benchTable", ui32 shardsCount = 4) {
+            TActorId sender = Server.GetRuntime()->AllocateEdgeActor();
+
+            TBase::CreateTestOlapTable(sender, "", Sprintf(R"(
+                Name: "%s"
+                ColumnShardCount: %d
+                Schema {
+                    %s
+                }
+                Sharding {
+                    HashSharding {
+                        Function: HASH_FUNCTION_MODULO_N
+                        Columns: "EventTime"
+                    }
+                })", tableName.c_str(), shardsCount, PROTO_SCHEMA));
+        }
+    };
 
     void WriteTestData(TKikimrRunner& kikimr, TString testTable, ui64 pathIdBegin, ui64 tsBegin, size_t rowCount) {
+        UNIT_ASSERT(testTable != "/Root/benchTable"); // TODO: check schema instead
+
         TLocalHelper lHelper(kikimr.GetTestServer());
         NYdb::NLongTx::TClient client(kikimr.GetDriver());
 
@@ -131,7 +139,8 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         UNIT_ASSERT_VALUES_EQUAL_C(resBeginTx.Status().GetStatus(), EStatus::SUCCESS, resBeginTx.Status().GetIssues().ToString());
 
         auto txId = resBeginTx.GetResult().tx_id();
-        TString data = lHelper.TestBlob(pathIdBegin, tsBegin, rowCount);
+        auto batch = lHelper.TestArrowBatch(pathIdBegin, tsBegin, rowCount);
+        TString data = NArrow::SerializeBatchNoCompression(batch);
 
         NLongTx::TLongTxWriteResult resWrite =
                 client.Write(txId, testTable, txId, data, Ydb::LongTx::Data::APACHE_ARROW).GetValueSync();
@@ -412,7 +421,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         Cerr << ast << Endl;
         for (auto planNode : planNodes) {
             UNIT_ASSERT_C(ast.find(planNode) != std::string::npos,
-                TStringBuilder() << planNode << " was not pushed down. Query: " << query);
+                TStringBuilder() << planNode << " was not found. Query: " << query);
         }
 
         if (!readNodeType.empty()) {
@@ -1206,7 +1215,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             CompareYson(result, R"([[23000u;]])");
 
             // Check plan
+#if SSA_RUNTIME_VERSION >= 2U
             CheckPlanForAggregatePushdown(query, tableClient, { "TKqpOlapAgg" }, "TableFullScan");
+#else
+            CheckPlanForAggregatePushdown(query, tableClient, { "CombineCore" }, "");
+#endif
         }
     }
 
@@ -1247,7 +1260,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             CompareYson(result, R"([[[0];4600u];[[1];4600u];[[2];4600u];[[3];4600u];[[4];4600u]])");
 
             // Check plan
+#if SSA_RUNTIME_VERSION >= 2U
             CheckPlanForAggregatePushdown(query, tableClient, { "TKqpOlapAgg" }, "TableFullScan");
+#else
+            CheckPlanForAggregatePushdown(query, tableClient, { "CombineCore" }, "");
+#endif
         }
     }
 
@@ -1288,7 +1305,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             CompareYson(result, R"([[23000u;]])");
 
             // Check plan
+#if SSA_RUNTIME_VERSION >= 2U
             CheckPlanForAggregatePushdown(query, tableClient, { "TKqpOlapAgg" }, "TableFullScan");
+#else
+            CheckPlanForAggregatePushdown(query, tableClient, { "Condense" }, "");
+#endif
         }
     }
 
@@ -1408,6 +1429,8 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             if (!Pushdown) {
                 queryFixed << "PRAGMA Kikimr.OptEnableOlapPushdown = \"false\";" << Endl;
             }
+            queryFixed << "PRAGMA Kikimr.OptUseFinalizeByKey;" << Endl;
+            
             queryFixed << Query << Endl;
             Cerr << "REQUEST:\n" << queryFixed << Endl;
             return queryFixed;
@@ -1515,11 +1538,9 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         ui32 numShards = 1;
         ui32 numIterations = 10;
         TLocalHelper(*server).CreateTestOlapTable("olapTable", "olapStore", numShards, numShards);
-        ui32 insertRows = 0;
         const ui32 iterationPackSize = 2000;
         for (ui64 i = 0; i < numIterations; ++i) {
             TLocalHelper(*server).SendDataViaActorSystem("/Root/olapStore/olapTable", 0, 1000000 + i * 1000000, iterationPackSize);
-            insertRows += iterationPackSize;
         }
 
         TAggregationTestCase currentTest;
@@ -1558,6 +1579,66 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         TestAggregationsInternal(cases);
     }
 
+    void TestClickBench(const std::vector<TAggregationTestCase>& cases) {
+        TPortManager tp;
+        ui16 mbusport = tp.GetPort(2134);
+        auto settings = Tests::TServerSettings(mbusport)
+            .SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetNodeCount(2);
+
+        Tests::TServer::TPtr server = new Tests::TServer(settings);
+
+        auto runtime = server->GetRuntime();
+        auto sender = runtime->AllocateEdgeActor();
+
+        InitRoot(server, sender);
+        EnableDebugLogging(runtime);
+
+        TClickHelper(*server).CreateClickBenchTable();
+
+        // write data
+
+        ui32 numIterations = 10;
+        const ui32 iterationPackSize = 2000;
+        for (ui64 i = 0; i < numIterations; ++i) {
+            TClickHelper(*server).SendDataViaActorSystem("/Root/benchTable", 0, 1000000 + i * 1000000,
+                                                         iterationPackSize);
+        }
+
+        TAggregationTestCase currentTest;
+        auto captureEvents = [&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) -> auto {
+            switch (ev->GetTypeRewrite()) {
+                case NKqp::TKqpComputeEvents::EvScanData:
+                {
+                    auto* msg = ev->Get<NKqp::TEvKqpCompute::TEvScanData>();
+                    Y_VERIFY(currentTest.MutableLimitChecker().CheckExpectedLimitOnScanData(msg->ArrowBatch ? msg->ArrowBatch->num_rows() : 0));
+                    Y_VERIFY(currentTest.MutableRecordChecker().CheckExpectedOnScanData(msg->ArrowBatch ? msg->ArrowBatch->num_columns() : 0));
+                    break;
+                }
+                case TEvDataShard::EvKqpScan:
+                {
+                    auto* msg = ev->Get<TEvDataShard::TEvKqpScan>();
+                    Y_VERIFY(currentTest.MutableLimitChecker().CheckExpectedLimitOnScanTask(msg->Record.GetItemsLimit()));
+                    break;
+                }
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        };
+        runtime->SetObserverFunc(captureEvents);
+
+        // selects
+
+        for (auto&& i : cases) {
+            const TString queryFixed = i.GetFixedQuery();
+            currentTest = i;
+            auto streamSender = runtime->AllocateEdgeActor();
+            SendRequest(*runtime, streamSender, MakeStreamRequest(streamSender, queryFixed, false));
+            auto ev = runtime->GrabEdgeEventRethrow<NKqp::TEvKqpCompute::TEvScanData>(streamSender, TDuration::Seconds(10));
+            Y_VERIFY(currentTest.CheckFinished());
+        }
+    }
+
     Y_UNIT_TEST(Aggregation_ResultDistinctCountRI_GroupByL) {
         TAggregationTestCase testCase;
         testCase.SetQuery(R"(
@@ -1583,9 +1664,14 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                     WHERE level = 2
                 )")
             .SetExpectedReply("[[4600u;]]")
+#if SSA_RUNTIME_VERSION >= 2U
             .AddExpectedPlanOptions("TKqpOlapAgg")
             .AddExpectedPlanOptions("KqpOlapFilter")
             .MutableLimitChecker().SetExpectedResultCount(1)
+#else
+            .AddExpectedPlanOptions("KqpOlapFilter")
+            .AddExpectedPlanOptions("Condense")
+#endif
             ;
 
         TestAggregations({ testCase });
@@ -1600,9 +1686,14 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 WHERE level = 2
             )")
             .SetExpectedReply("[[4600u;]]")
+#if SSA_RUNTIME_VERSION >= 2U
             .AddExpectedPlanOptions("TKqpOlapAgg")
             .AddExpectedPlanOptions("KqpOlapFilter")
             .MutableLimitChecker().SetExpectedResultCount(1)
+#else
+            .AddExpectedPlanOptions("CombineCore")
+            .AddExpectedPlanOptions("KqpOlapFilter")
+#endif
             ;
 
         TestAggregations({ testCase });
@@ -1617,9 +1708,14 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 WHERE level = 2
             )")
             .SetExpectedReply("[[4600u;]]")
+#if SSA_RUNTIME_VERSION >= 2U
             .AddExpectedPlanOptions("TKqpOlapAgg")
             .AddExpectedPlanOptions("KqpOlapFilter")
             .MutableLimitChecker().SetExpectedResultCount(1)
+#else
+            .AddExpectedPlanOptions("CombineCore")
+            .AddExpectedPlanOptions("KqpOlapFilter")
+#endif
             ;
 
         TestAggregations({ testCase });
@@ -1739,7 +1835,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 WHERE level = 2
             )")
             .SetExpectedReply("[[4600u;]]")
+#if SSA_RUNTIME_VERSION >= 2U
             .AddExpectedPlanOptions("TKqpOlapAgg")
+#else
+            .AddExpectedPlanOptions("CombineCore")
+#endif
             .AddExpectedPlanOptions("KqpOlapFilter");
 
         TestAggregations({ testCase });
@@ -1753,7 +1853,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 FROM `/Root/olapStore/olapTable`
             )")
             .SetExpectedReply("[[[46000;]]]")
+#if SSA_RUNTIME_VERSION >= 2U
             .AddExpectedPlanOptions("TKqpOlapAgg");
+#else
+            .AddExpectedPlanOptions("CombineCore");
+#endif
 
         TestAggregations({ testCase });
     }
@@ -1768,7 +1872,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 ORDER BY level
             )")
             .SetExpectedReply("[[[0];[0]];[[1];[4600]];[[2];[9200]];[[3];[13800]];[[4];[18400]]]")
+#if SSA_RUNTIME_VERSION >= 2U
             .AddExpectedPlanOptions("TKqpOlapAgg");
+#else
+            .AddExpectedPlanOptions("CombineCore");
+#endif
 
         TestAggregations({ testCase });
     }
@@ -1781,7 +1889,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 FROM `/Root/olapStore/olapTable`
             )")
             .SetExpectedReply("[[[0]]]")
+#if SSA_RUNTIME_VERSION >= 2U
             .AddExpectedPlanOptions("TKqpOlapAgg");
+#else
+            .AddExpectedPlanOptions("CombineCore");
+#endif
 
         TestAggregations({ testCase });
     }
@@ -1794,7 +1906,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 FROM `/Root/olapStore/olapTable`
             )")
             .SetExpectedReply("[[[4]]]")
+#if SSA_RUNTIME_VERSION >= 2U
             .AddExpectedPlanOptions("TKqpOlapAgg");
+#else
+            .AddExpectedPlanOptions("CombineCore");
+#endif
 
         TestAggregations({ testCase });
     }
@@ -1809,7 +1925,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 ORDER BY level
             )")
             .SetExpectedReply("[[[0];[\"10000\"]];[[1];[\"10001\"]];[[2];[\"10002\"]];[[3];[\"10003\"]];[[4];[\"10004\"]]]")
+#if SSA_RUNTIME_VERSION >= 2U
             .AddExpectedPlanOptions("TKqpOlapAgg");
+#else
+            .AddExpectedPlanOptions("CombineCore");
+#endif
 
         TestAggregations({ testCase });
     }
@@ -1824,7 +1944,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 ORDER BY level
             )")
             .SetExpectedReply("[[[0];[\"40995\"]];[[1];[\"40996\"]];[[2];[\"40997\"]];[[3];[\"40998\"]];[[4];[\"40999\"]]]")
+#if SSA_RUNTIME_VERSION >= 2U
             .AddExpectedPlanOptions("TKqpOlapAgg");
+#else
+            .AddExpectedPlanOptions("CombineCore");
+#endif
 
         TestAggregations({ testCase });
     }
@@ -1839,10 +1963,72 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                 ORDER BY c, resource_id DESC LIMIT 3
             )")
             .SetExpectedReply("[[[\"40999\"];[4];1u];[[\"40998\"];[3];1u];[[\"40997\"];[2];1u]]")
+#if SSA_RUNTIME_VERSION >= 2U
+            .AddExpectedPlanOptions("TKqpOlapAgg")
+            .SetExpectedReadNodeType("TableFullScan");
+#else
+            .AddExpectedPlanOptions("CombineCore");
+#endif
+
+        TestAggregations({ testCase });
+    }
+
+    Y_UNIT_TEST(ClickBenchSmoke) {
+        TAggregationTestCase q7;
+        q7.SetQuery(R"(
+                SELECT
+                    AdvEngineID, COUNT(*) as c
+                FROM `/Root/benchTable`
+                WHERE AdvEngineID != 0
+                GROUP BY AdvEngineID
+                ORDER BY c DESC
+            )")
+            //.SetExpectedReply("[[[\"40999\"];[4];1u];[[\"40998\"];[3];1u];[[\"40997\"];[2];1u]]")
             .AddExpectedPlanOptions("TKqpOlapAgg")
             .SetExpectedReadNodeType("TableFullScan");
 
-        TestAggregations({ testCase });
+        TAggregationTestCase q9;
+        q9.SetQuery(R"(
+                SELECT
+                    RegionID, SUM(AdvEngineID), COUNT(*) AS c, avg(ResolutionWidth), COUNT(DISTINCT UserID)
+                FROM `/Root/benchTable`
+                GROUP BY RegionID
+                ORDER BY c DESC
+                LIMIT 10
+            )")
+            //.SetExpectedReply("[[[\"40999\"];[4];1u];[[\"40998\"];[3];1u];[[\"40997\"];[2];1u]]")
+            .AddExpectedPlanOptions("TKqpOlapAgg")
+            .SetExpectedReadNodeType("TableFullScan");
+
+        TAggregationTestCase q12;
+        q12.SetQuery(R"(
+                SELECT
+                    SearchPhrase, count(*) AS c
+                FROM `/Root/benchTable`
+                WHERE SearchPhrase != ''
+                GROUP BY SearchPhrase
+                ORDER BY c DESC
+                LIMIT 10;
+            )")
+            //.SetExpectedReply("[[[\"40999\"];[4];1u];[[\"40998\"];[3];1u];[[\"40997\"];[2];1u]]")
+            .AddExpectedPlanOptions("TKqpOlapAgg")
+            .SetExpectedReadNodeType("TableFullScan");
+
+        TAggregationTestCase q14;
+        q14.SetQuery(R"(
+                SELECT
+                    SearchEngineID, SearchPhrase, count(*) AS c
+                FROM `/Root/benchTable`
+                WHERE SearchPhrase != ''
+                GROUP BY SearchEngineID, SearchPhrase
+                ORDER BY c DESC
+                LIMIT 10;
+            )")
+            //.SetExpectedReply("[[[\"40999\"];[4];1u];[[\"40998\"];[3];1u];[[\"40997\"];[2];1u]]")
+            .AddExpectedPlanOptions("TKqpOlapAgg")
+            .SetExpectedReadNodeType("TableFullScan");
+
+        TestClickBench({ q7, q9, q12, q14 });
     }
 
     Y_UNIT_TEST(StatsSysView) {
@@ -1966,10 +2152,8 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         const ui32 numShards = 10;
         const ui32 numIterations = 10;
         TLocalHelper(*server).CreateTestOlapTable("selectTable", "selectStore", numShards, numShards);
-        ui32 insertRows = 0;
         for(ui64 i = 0; i < numIterations; ++i) {
             TLocalHelper(*server).SendDataViaActorSystem("/Root/selectStore/selectTable", 0, 1000000 + i*1000000, 2000);
-            insertRows += 2000;
         }
 
         ui64 result = 0;
@@ -2121,10 +2305,8 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         const ui32 numShards = 10;
         const ui32 numIterations = 50;
         TLocalHelper(*server).CreateTestOlapTable("largeOlapTable", "largeOlapStore", numShards, numShards);
-        ui32 insertRows = 0;
         for(ui64 i = 0; i < numIterations; ++i) {
             TLocalHelper(*server).SendDataViaActorSystem("/Root/largeOlapStore/largeOlapTable", 0, 1000000 + i*1000000, 2000);
-            insertRows += 2000;
         }
 
         bool hasResult = false;
@@ -2635,28 +2817,27 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             UNIT_ASSERT_VALUES_EQUAL(GetUint64(rows[2].at("PathId")), 3);
         }
 
-        // Uncomment when KIKIMR-16655 will be fixed
-        // {
-        //     auto selectQuery = TString(R"(
-        //         SELECT
-        //             PathId,
-        //             SUM(Rows) as rows,
-        //             SUM(Bytes) as bytes,
-        //             SUM(RawBytes) as bytes_raw,
-        //             SUM(Portions) as portions,
-        //             SUM(Blobs) as blobs
-        //         FROM `/Root/olapStore/.sys/store_primary_index_stats`
-        //         WHERE
-        //             PathId == UInt64("3") AND Kind < UInt32("4")
-        //         GROUP BY PathId
-        //         ORDER BY rows DESC
-        //         LIMIT 10
-        //     )");
+        {
+            auto selectQuery = TString(R"(
+                SELECT
+                    PathId,
+                    SUM(Rows) as rows,
+                    SUM(Bytes) as bytes,
+                    SUM(RawBytes) as bytes_raw,
+                    SUM(Portions) as portions,
+                    SUM(Blobs) as blobs
+                FROM `/Root/olapStore/.sys/store_primary_index_stats`
+                WHERE
+                    PathId == UInt64("3") AND Kind < UInt32("4")
+                GROUP BY PathId
+                ORDER BY rows DESC
+                LIMIT 10
+            )");
 
-        //     auto rows = ExecuteScanQuery(tableClient, selectQuery);
-        //     UNIT_ASSERT_VALUES_EQUAL(rows.size(), 1ull);
-        //     UNIT_ASSERT_VALUES_EQUAL(GetUint64(rows[0].at("PathId")), 3);
-        // }
+            auto rows = ExecuteScanQuery(tableClient, selectQuery);
+            UNIT_ASSERT_VALUES_EQUAL(rows.size(), 1ull);
+            UNIT_ASSERT_VALUES_EQUAL(GetUint64(rows[0].at("PathId")), 3);
+        }
 
         {
             auto selectQuery = TString(R"(
@@ -2681,17 +2862,16 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             UNIT_ASSERT_VALUES_EQUAL(GetUint64(rows[1].at("PathId")), 4);
         }
 
-        // Uncomment when KIKIMR-16655 will be fixed
-        // {
-        //     auto selectQuery = TString(R"(
-        //         SELECT count(*)
-        //         FROM `/Root/olapStore/.sys/store_primary_index_stats`
-        //     )");
+        {
+            auto selectQuery = TString(R"(
+                SELECT count(*)
+                FROM `/Root/olapStore/.sys/store_primary_index_stats`
+            )");
 
-        //     auto rows = ExecuteScanQuery(tableClient, selectQuery);
-        //     // 3 Tables with 3 Shards each and 4 KindId-s of stats
-        //     UNIT_ASSERT_VALUES_EQUAL(GetUint64(rows[0].at("column0")), 3*3*numKinds);
-        // }
+            auto rows = ExecuteScanQuery(tableClient, selectQuery);
+            // 3 Tables with 3 Shards each and 4 KindId-s of stats
+            UNIT_ASSERT_VALUES_EQUAL(GetUint64(rows[0].at("column0")), 3*3*numKinds);
+        }
 
         {
             auto selectQuery = TString(R"(
@@ -2708,22 +2888,21 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             UNIT_ASSERT_GE(GetUint64(rows[0].at("column2")), 3ull);
         }
 
-        // Uncomment when KIKIMR-16655 will be fixed
-        // {
-        //     auto selectQuery = TString(R"(
-        //         SELECT PathId, count(*), sum(Rows), sum(Bytes), sum(RawBytes)
-        //         FROM `/Root/olapStore/.sys/store_primary_index_stats`
-        //         GROUP BY PathId
-        //         ORDER BY PathId
-        //     )");
+        {
+            auto selectQuery = TString(R"(
+                SELECT PathId, count(*), sum(Rows), sum(Bytes), sum(RawBytes)
+                FROM `/Root/olapStore/.sys/store_primary_index_stats`
+                GROUP BY PathId
+                ORDER BY PathId
+            )");
 
-        //     auto rows = ExecuteScanQuery(tableClient, selectQuery);
-        //     UNIT_ASSERT_VALUES_EQUAL(rows.size(), 3ull);
-        //     for (ui64 pathId = 3, row = 0; pathId <= 5; ++pathId, ++row) {
-        //         UNIT_ASSERT_VALUES_EQUAL(GetUint64(rows[row].at("PathId")), pathId);
-        //         UNIT_ASSERT_VALUES_EQUAL(GetUint64(rows[row].at("column1")), 3*numKinds);
-        //     }
-        // }
+            auto rows = ExecuteScanQuery(tableClient, selectQuery);
+            UNIT_ASSERT_VALUES_EQUAL(rows.size(), 3ull);
+            for (ui64 pathId = 3, row = 0; pathId <= 5; ++pathId, ++row) {
+                UNIT_ASSERT_VALUES_EQUAL(GetUint64(rows[row].at("PathId")), pathId);
+                UNIT_ASSERT_VALUES_EQUAL(GetUint64(rows[row].at("column1")), 3*numKinds);
+            }
+        }
     }
 
     Y_UNIT_TEST(PredicatePushdownWithParameters) {
@@ -2958,6 +3137,8 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
                     auto parameter = parameters.find(checkType);
 
                     UNIT_ASSERT_C(parameter != parameters.end(), "No type " << checkType << " in parameters");
+
+                    Cerr << "Test query:\n" << query + predicate << Endl;
 
                     auto it = tableClient.StreamExecuteScanQuery(query + predicate, parameter->second).GetValueSync();
                     // Check for successful execution

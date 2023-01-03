@@ -1,4 +1,5 @@
 #include "type_ann_blocks.h"
+#include "type_ann_list.h"
 
 #include <ydb/library/yql/core/expr_nodes/yql_expr_nodes.h>
 #include <ydb/library/yql/core/yql_expr_type_annotation.h>
@@ -199,7 +200,7 @@ IGraphTransformer::TStatus BlockLogicalWrapper(const TExprNode::TPtr& input, TEx
 
 IGraphTransformer::TStatus BlockFuncWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExtContext& ctx) {
     Y_UNUSED(output);
-    if (!EnsureMinArgsCount(*input, 1U, ctx.Expr)) {
+    if (!EnsureMinArgsCount(*input, 2U, ctx.Expr)) {
         return IGraphTransformer::TStatus::Error;
     }
 
@@ -208,34 +209,25 @@ IGraphTransformer::TStatus BlockFuncWrapper(const TExprNode::TPtr& input, TExprN
     }
 
     auto name = input->Child(0)->Content();
+    Y_UNUSED(name);
+    if (auto status = EnsureTypeRewrite(input->ChildRef(1), ctx.Expr); status != IGraphTransformer::TStatus::Ok) {
+        return status;
+    }
 
-    for (ui32 i = 1; i < input->ChildrenSize(); ++i) {
-        if (!EnsureBlockOrScalarType(*input->Child(i), ctx.Expr)) {
+    auto returnType = input->Child(1)->GetTypeAnn()->Cast<TTypeExprType>()->GetType();
+    const bool allowChunked = true;
+    if (!EnsureBlockOrScalarType(input->Child(1)->Pos(), *returnType, ctx.Expr, allowChunked)) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    for (ui32 i = 2; i < input->ChildrenSize(); ++i) {
+        if (!EnsureBlockOrScalarType(*input->Child(i), ctx.Expr, allowChunked)) {
             return IGraphTransformer::TStatus::Error;
         }
     }
 
-    if (!ctx.Types.ArrowResolver) {
-        ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()), "Arrow resolver isn't available"));
-        return IGraphTransformer::TStatus::Error;
-    }
-
-    const TTypeAnnotationNode* outType = nullptr;
-    TVector<const TTypeAnnotationNode*> argTypes;
-    for (ui32 i = 1; i < input->ChildrenSize(); ++i) {
-        argTypes.push_back(input->Child(i)->GetTypeAnn());
-    }
-
-    if (!ctx.Types.ArrowResolver->LoadFunctionMetadata(ctx.Expr.GetPosition(input->Pos()), name, argTypes, outType, ctx.Expr)) {
-        return IGraphTransformer::TStatus::Error;
-    }
-
-    if (!outType) {
-        ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()), TStringBuilder() << "No such Arrow function: " << name));
-        return IGraphTransformer::TStatus::Error;
-    }
-
-    input->SetTypeAnn(outType);
+    // TODO: more validation
+    input->SetTypeAnn(returnType);
     return IGraphTransformer::TStatus::Ok;
 }
 
@@ -260,14 +252,12 @@ IGraphTransformer::TStatus BlockBitCastWrapper(const TExprNode::TPtr& input, TEx
 
     bool isScalar;
     auto inputType = GetBlockItemType(*input->Child(0)->GetTypeAnn(), isScalar);
-
     auto outputType = input->Child(1)->GetTypeAnn()->Cast<TTypeExprType>()->GetType();
-    bool has = false;
-    if (!ctx.Types.ArrowResolver->HasCast(ctx.Expr.GetPosition(input->Pos()), inputType, outputType, has, ctx.Expr)) {
-        return IGraphTransformer::TStatus::Error;
-    }
 
-    if (!has) {
+    auto castStatus = ctx.Types.ArrowResolver->HasCast(ctx.Expr.GetPosition(input->Pos()), inputType, outputType, ctx.Expr);
+    if (castStatus == IArrowResolver::ERROR) {
+        return IGraphTransformer::TStatus::Error;
+    } else if (castStatus == IArrowResolver::NOT_FOUND) {
         ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()), "No such cast"));
         return IGraphTransformer::TStatus::Error;
     }
@@ -275,9 +265,9 @@ IGraphTransformer::TStatus BlockBitCastWrapper(const TExprNode::TPtr& input, TEx
     if (isScalar) {
         input->SetTypeAnn(ctx.Expr.MakeType<TScalarExprType>(outputType));
     } else {
-        input->SetTypeAnn(ctx.Expr.MakeType<TBlockExprType>(outputType));
+        input->SetTypeAnn(MakeBlockType(*outputType, ctx.Expr));
     }
-    
+
     return IGraphTransformer::TStatus::Ok;
 }
 
@@ -313,6 +303,12 @@ bool ValidateBlockAggs(TPositionHandle pos, const TTypeAnnotationNode::TListType
     for (const auto& agg : aggs.Children()) {
         if (!EnsureTupleMinSize(*agg, 1, ctx)) {
             return false;
+        }
+
+        if (overState) {
+            if (!EnsureTupleSize(*agg, 2, ctx)) {
+                return false;
+            }
         }
 
         auto expectedCallable = overState ? "AggBlockApplyState" : "AggBlockApply";
@@ -433,7 +429,7 @@ IGraphTransformer::TStatus BlockCombineHashedWrapper(const TExprNode::TPtr& inpu
     }
 
     for (auto& t : retMultiType) {
-        t = ctx.Expr.MakeType<TBlockExprType>(t);
+        t = MakeBlockType(*t, ctx.Expr);
     }
 
     retMultiType.push_back(ctx.Expr.MakeType<TScalarExprType>(ctx.Expr.MakeType<TDataExprType>(EDataSlot::Uint64)));
@@ -445,12 +441,12 @@ IGraphTransformer::TStatus BlockCombineHashedWrapper(const TExprNode::TPtr& inpu
 IGraphTransformer::TStatus BlockMergeFinalizeHashedWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExtContext& ctx) {
     Y_UNUSED(output);
     const bool many = input->Content().EndsWith("ManyFinalizeHashed");
-    if (!EnsureArgsCount(*input, 3U, ctx.Expr)) {
+    if (!EnsureArgsCount(*input, many ? 5U : 3U, ctx.Expr)) {
         return IGraphTransformer::TStatus::Error;
     }
 
     TTypeAnnotationNode::TListType blockItemTypes;
-    if (!EnsureWideFlowBlockType(input->Head(), blockItemTypes, ctx.Expr)) {
+    if (!EnsureWideFlowBlockType(input->Head(), blockItemTypes, ctx.Expr, false, !many)) {
         return IGraphTransformer::TStatus::Error;
     }
 
@@ -464,7 +460,27 @@ IGraphTransformer::TStatus BlockMergeFinalizeHashedWrapper(const TExprNode::TPtr
     }
 
     for (auto& t : retMultiType) {
-        t = ctx.Expr.MakeType<TBlockExprType>(t);
+        t = MakeBlockType(*t, ctx.Expr);
+    }
+
+    if (many) {
+        if (!EnsureAtom(*input->Child(3), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        ui32 streamIndex;
+        if (!TryFromString(input->Child(3)->Content(), streamIndex) || streamIndex >= blockItemTypes.size()) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Child(3)->Pos()), "Bad stream index"));
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (!EnsureSpecificDataType(input->Child(3)->Pos(), *blockItemTypes[streamIndex], EDataSlot::Uint32, ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (!ValidateAggManyStreams(*input->Child(4), input->Child(2)->ChildrenSize(), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
     }
 
     retMultiType.push_back(ctx.Expr.MakeType<TScalarExprType>(ctx.Expr.MakeType<TDataExprType>(EDataSlot::Uint64)));
