@@ -1257,7 +1257,7 @@ namespace NTypeAnnImpl {
 
             auto subStructType = itemType->Cast<TStructExprType>();
             for (const auto& y : subStructType->GetItems()) {
-                if (!isOptional || y->GetItemType()->GetKind() == ETypeAnnotationKind::Optional) {
+                if (!isOptional || y->GetItemType()->IsOptionalOrNull()) {
                     allItems.push_back(y);
                 } else {
                     auto newItem = ctx.Expr.MakeType<TItemExprType>(y->GetName(), ctx.Expr.MakeType<TOptionalExprType>(y->GetItemType()));
@@ -11359,6 +11359,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["RFind"] = &FindWrapper;
         Functions["StartsWith"] = &WithWrapper;
         Functions["EndsWith"] = &WithWrapper;
+        Functions["StringContains"] = &WithWrapper;
         Functions["ByteAt"] = &ByteAtWrapper;
         Functions["ListIf"] = &ListIfWrapper;
         Functions["AsList"] = &AsListWrapper<false>;

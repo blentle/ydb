@@ -4519,8 +4519,27 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
     map["IsNotDistinctFrom"] = std::bind(&OptimizeDistinctFrom<true>, _1, _2);
     map["IsDistinctFrom"] = std::bind(&OptimizeDistinctFrom<false>, _1, _2);
 
-    map["StartsWith"] = std::bind(&OptimizeEquality<true>, _1, _2);
-    map["EndsWith"] = std::bind(&OptimizeEquality<true>, _1, _2);
+    map["StartsWith"] = map["EndsWith"] = map["StringContains"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext& /*optCtx*/) {
+        if (node->Tail().IsCallable("String") && node->Tail().Head().Content().empty()) {
+            YQL_CLOG(DEBUG, Core) << node->Content() << " with empty string in second argument";
+            if (node->GetTypeAnn()->GetKind() == ETypeAnnotationKind::Optional) {
+                return ctx.Builder(node->Pos())
+                    .Callable("Map")
+                        .Add(0, node->HeadPtr())
+                        .Lambda(1)
+                            .Param("unwrappedFirstArg")
+                            .Callable("Bool")
+                                .Atom(0, "true", TNodeFlags::Default)
+                            .Seal()
+                        .Seal()
+                    .Seal()
+                    .Build();
+            }
+            return MakeBool<true>(node->Pos(), ctx);
+        }
+
+        return OptimizeEquality<true>(node, ctx);
+    };
 
     map["<"] = map["<="] = map[">"] = map[">="] = std::bind(&OptimizeCompare, _1, _2);;
 

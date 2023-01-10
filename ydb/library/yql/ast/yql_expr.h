@@ -236,9 +236,9 @@ public:
         return kind == ETypeAnnotationKind::Optional || kind == ETypeAnnotationKind::Null || kind == ETypeAnnotationKind::Pg;
     }
 
-    bool IsAnyBlockOrScalar() const {
+    bool IsBlockOrScalar() const {
         auto kind = GetKind();
-        return kind == ETypeAnnotationKind::Block || kind == ETypeAnnotationKind::ChunkedBlock || kind == ETypeAnnotationKind::Scalar;
+        return kind == ETypeAnnotationKind::Block || kind == ETypeAnnotationKind::Scalar;
     }
 
     bool HasFixedSizeRepr() const {
@@ -2772,6 +2772,8 @@ TAstParseResult ConvertToAst(const TExprNode& root, TExprContext& ctx, ui32 anno
 TExprNode::TListType GetLambdaBody(const TExprNode& lambda);
 
 TString SubstParameters(const TString& str, const TMaybe<NYT::TNode>& params, TSet<TString>* usedNames);
+
+const TTypeAnnotationNode* GetSeqItemType(const TTypeAnnotationNode* seq);
 
 } // namespace NYql
 
