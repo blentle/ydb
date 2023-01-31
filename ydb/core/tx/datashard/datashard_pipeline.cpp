@@ -517,6 +517,15 @@ TOperation::TPtr TPipeline::GetActiveOp(ui64 txId)
     return nullptr;
 }
 
+TOperation::TPtr TPipeline::GetVolatileOp(ui64 txId)
+{
+    TOperation::TPtr op = FindOp(txId);
+    if (op && op->HasVolatilePrepareFlag()) {
+        return op;
+    }
+    return nullptr;
+}
+
 bool TPipeline::LoadTxDetails(TTransactionContext &txc,
                               const TActorContext &ctx,
                               TActiveTransaction::TPtr tx)
@@ -638,12 +647,17 @@ bool TPipeline::SaveInReadSet(const TEvTxProcessing::TEvReadSet &rs,
                    "Unexpected readset in state %" PRIu32 " for %" PRIu64 ":%" PRIu64 " at %" PRIu64,
                    Self->State, step, txId, Self->TabletID());
         if (ack) {
-            DelayedAcks[TStepOrder(step, txId)] = std::move(ack);
+            DelayedAcks[TStepOrder(step, txId)].push_back(std::move(ack));
         }
         return false;
     }
 
     TOperation::TPtr op = GetActiveOp(txId);
+    bool active = true;
+    if (!op) {
+        op = GetVolatileOp(txId);
+        active = false;
+    }
     if (op) {
         // If input read sets are not loaded yet then
         // it will be added at load.
@@ -655,8 +669,10 @@ bool TPipeline::SaveInReadSet(const TEvTxProcessing::TEvReadSet &rs,
         }
         op->AddDelayedInReadSet(rs.Record);
 
-        AddCandidateOp(op);
-        Self->PlanQueue.Progress(ctx);
+        if (active) {
+            AddCandidateOp(op);
+            Self->PlanQueue.Progress(ctx);
+        }
 
         return false;
     }
@@ -934,7 +950,9 @@ void TPipeline::CompleteTx(const TOperation::TPtr op, TTransactionContext& txc, 
                    "Will send outdated delayed readset ack for %" PRIu64 ":%" PRIu64 " at %" PRIu64,
                    pr.first.Step, pr.first.TxId, Self->TabletID());
 
-        op->AddDelayedAck(std::move(pr.second));
+        for (auto& ack : pr.second) {
+            op->AddDelayedAck(std::move(ack));
+        }
         DelayedAcks.erase(DelayedAcks.begin());
     }
 

@@ -189,8 +189,8 @@ protected:
         , FunctionRegistry(functionRegistry)
         , CheckpointingMode(GetTaskCheckpointingMode(Task))
         , State(Task.GetCreateSuspended() ? NDqProto::COMPUTE_STATE_UNKNOWN : NDqProto::COMPUTE_STATE_EXECUTING)
-        , MemoryQuota(ownMemoryQuota ? InitMemoryQuota() : nullptr)
         , WatermarksTracker(this->SelfId(), TxId, Task.GetId())
+        , TaskCounters(taskCounters)
         , DqComputeActorMetrics(taskCounters)
         , ComputeActorSpan(NKikimr::TWilsonKqp::ComputeActor, std::move(traceId), "ComputeActor")
         , Running(!Task.GetCreateSuspended())
@@ -199,8 +199,11 @@ protected:
         if (RuntimeSettings.StatsMode >= NDqProto::DQ_STATS_MODE_BASIC) {
             BasicStats = std::make_unique<TBasicStats>();
         }
-        InitializeTask();
         InitMonCounters(taskCounters);
+        InitializeTask();
+        if (ownMemoryQuota) {
+            MemoryQuota = InitMemoryQuota();
+        }
         InitializeWatermarks();
     }
 
@@ -219,8 +222,8 @@ protected:
         , AsyncIoFactory(std::move(asyncIoFactory))
         , FunctionRegistry(functionRegistry)
         , State(Task.GetCreateSuspended() ? NDqProto::COMPUTE_STATE_UNKNOWN : NDqProto::COMPUTE_STATE_EXECUTING)
-        , MemoryQuota(InitMemoryQuota())
         , WatermarksTracker(this->SelfId(), TxId, Task.GetId())
+        , TaskCounters(taskCounters)
         , DqComputeActorMetrics(taskCounters)
         , ComputeActorSpan(NKikimr::TWilsonKqp::ComputeActor, std::move(traceId), "ComputeActor")
         , Running(!Task.GetCreateSuspended())
@@ -228,23 +231,16 @@ protected:
         if (RuntimeSettings.StatsMode >= NDqProto::DQ_STATS_MODE_BASIC) {
             BasicStats = std::make_unique<TBasicStats>();
         }
-        InitializeTask();
         InitMonCounters(taskCounters);
+        InitializeTask();
+        MemoryQuota = InitMemoryQuota();
         InitializeWatermarks();
     }
 
     void InitMonCounters(const ::NMonitoring::TDynamicCounterPtr& taskCounters) {
         if (taskCounters) {
-            MkqlMemoryUsage = taskCounters->GetSubgroup("subsystem", "mkql")->GetCounter("MemoryUsage");
-            MkqlMemoryLimit = taskCounters->GetSubgroup("subsystem", "mkql")->GetCounter("MemoryLimit");
-            MonCountersProvided = true;
-        }
-    }
-
-    void UpdateMonCounters() {
-        if (MonCountersProvided) {
-            *MkqlMemoryUsage = GetProfileStats()->MkqlMaxUsedMemory;
-            *MkqlMemoryLimit = GetMkqlMemoryLimit();
+            MkqlMemoryQuota = taskCounters->GetCounter("MkqlMemoryQuota");
+            OutputChannelSize = taskCounters->GetCounter("OutputChannelSize");
         }
     }
 
@@ -316,6 +312,7 @@ protected:
 protected:
     THolder<TDqMemoryQuota> InitMemoryQuota() {
         return MakeHolder<TDqMemoryQuota>(
+            MkqlMemoryQuota,
             CalcMkqlMemoryLimit(),
             MemoryLimits,
             TxId,
@@ -543,6 +540,10 @@ protected:
                 }
             }
 
+            if (OutputChannelSize) {
+                OutputChannelSize->Sub(OutputChannelsMap.size() * MemoryLimits.ChannelBufferSize);
+            }
+
             for (auto& [_, outputChannel] : OutputChannelsMap) {
                 if (outputChannel.Channel) {
                     outputChannel.Channel->Terminate();
@@ -576,10 +577,30 @@ protected:
         Terminate(success, TIssues({TIssue(message)}));
     }
 
+    void FillExtraData(NDqProto::TEvComputeActorState& state) {
+        auto* extraData = state.MutableExtraData();
+        for (auto& [index, input] : SourcesMap) {
+            if (auto data = input.AsyncInput->ExtraData()) {
+                auto* entry = extraData->AddSourcesExtraData();
+                entry->SetIndex(index);
+                entry->MutableData()->CopyFrom(*data);
+            }
+        }
+        for (auto& [index, input] : InputTransformsMap) {
+            if (auto data = input.AsyncInput->ExtraData()) {
+                auto* entry = extraData->AddInputTransformsData();
+                entry->SetIndex(index);
+                entry->MutableData()->CopyFrom(*data);
+            }
+        }
+    }
+
     void ReportStateAndMaybeDie(NYql::NDqProto::StatusIds::StatusCode statusCode, const TIssues& issues)
     {
         auto execEv = MakeHolder<TEvDqCompute::TEvState>();
         auto& record = execEv->Record;
+
+        FillExtraData(record);
 
         record.SetState(State);
         record.SetStatusCode(statusCode);
@@ -883,7 +904,7 @@ protected:
         const NDqProto::EWatermarksMode WatermarksMode;
         std::optional<NDqProto::TCheckpoint> PendingCheckpoint;
         const NDqProto::ECheckpointingMode CheckpointingMode;
-        ui64 FreeSpace = 0;
+        i64 FreeSpace = 0;
 
         explicit TInputChannelInfo(
                 const TString& logPrefix,
@@ -1060,7 +1081,7 @@ protected:
         }
     }
 
-    virtual i64 AsyncIoFreeSpace(TAsyncInputInfoBase& source) {
+    virtual i64 AsyncInputFreeSpace(TAsyncInputInfoBase& source) {
         return source.Buffer->GetFreeSpace();
     }
 
@@ -1502,7 +1523,8 @@ protected:
                         .TaskParams = taskParams,
                         .ComputeActorId = this->SelfId(),
                         .TypeEnv = typeEnv,
-                        .HolderFactory = holderFactory
+                        .HolderFactory = holderFactory,
+                        .TaskCounters = TaskCounters
                     });
             } catch (const std::exception& ex) {
                 throw yexception() << "Failed to create source " << inputDesc.GetSource().GetType() << ": " << ex.what();
@@ -1612,7 +1634,7 @@ protected:
             return;
         }
 
-        const i64 freeSpace = AsyncIoFreeSpace(info);
+        const i64 freeSpace = AsyncInputFreeSpace(info);
         if (freeSpace > 0) {
             TMaybe<TInstant> watermark;
             NKikimr::NMiniKQL::TUnboxedValueVector batch;
@@ -1645,6 +1667,9 @@ protected:
             }
 
             AsyncInputPush(std::move(batch), info, space, finished);
+        } else {
+            CA_LOG_D("Skip polling async input[" << inputIndex << "]: no free space: " << freeSpace);
+            ContinueExecute(); // If there is no free space in buffer, => we have something to process
         }
     }
 
@@ -1808,6 +1833,10 @@ private:
                 }
             }
         }
+
+        if (OutputChannelSize) {
+            OutputChannelSize->Add(OutputChannelsMap.size() * MemoryLimits.ChannelBufferSize);
+        }
     }
 
     void InitializeWatermarks() {
@@ -1841,6 +1870,11 @@ private:
     virtual const TDqAsyncOutputBufferStats* GetSinkStats(ui64 outputIdx, const TAsyncOutputInfoBase& sinkInfo) const {
         Y_UNUSED(outputIdx);
         return sinkInfo.Buffer ? sinkInfo.Buffer->GetStats() : nullptr;
+    }
+
+    virtual const TDqAsyncInputBufferStats* GetInputTransformStats(ui64 inputIdx, const TAsyncInputTransformInfo& inputTransformInfo) const {
+        Y_UNUSED(inputIdx);
+        return inputTransformInfo.Buffer ? inputTransformInfo.Buffer->GetStats() : nullptr;
     }
 
 public:
@@ -1883,10 +1917,11 @@ public:
 
             THashMap<ui64, ui64> ingressBytesMap;
             for (auto& [inputIndex, sourceInfo] : SourcesMap) {
-                if (sourceInfo.AsyncInput) {
+                if (auto* source = sourceInfo.AsyncInput) {
                     auto ingressBytes = sourceInfo.AsyncInput->GetIngressBytes();
                     ingressBytesMap.emplace(inputIndex, ingressBytes);
                     Ingress[sourceInfo.Type] = Ingress.Value(sourceInfo.Type, 0) + ingressBytes;
+                    source->FillExtraStats(protoTask, last);
                 }
             }
             FillTaskRunnerStats(Task.GetId(), Task.GetStageId(), *taskStats, protoTask, (bool) GetProfileStats(), ingressBytesMap);
@@ -1895,7 +1930,7 @@ public:
             if (TDerived::HasAsyncTaskRunner) {
                 protoTask->SetCpuTimeUs(BasicStats->CpuTime.MicroSeconds() + taskStats->ComputeCpuTime.MicroSeconds() + taskStats->BuildCpuTime.MicroSeconds());
             }
-                
+
             for (auto& [outputIndex, sinkInfo] : SinksMap) {
 
                 ui64 egressBytes = sinkInfo.AsyncOutput ? sinkInfo.AsyncOutput->GetEgressBytes() : 0;
@@ -1917,6 +1952,28 @@ public:
 
                         protoSink->SetMaxMemoryUsage(sinkStats->MaxMemoryUsage);
                         protoSink->SetErrorsCount(sinkInfo.IssuesBuffer.GetAllAddedIssuesCount());
+                    }
+                }
+            }
+
+            for (auto& [inputIndex, transformInfo] : InputTransformsMap) {
+                auto* transformStats = GetInputTransformStats(inputIndex, transformInfo);
+                if (transformStats && GetProfileStats()) {
+                    YQL_ENSURE(transformStats);
+                    ui64 ingressBytes = transformInfo.AsyncInput ? transformInfo.AsyncInput->GetIngressBytes() : 0;
+
+                    auto* protoTransform = protoTask->AddInputTransforms();
+                    protoTransform->SetInputIndex(inputIndex);
+                    protoTransform->SetChunks(transformStats->Chunks);
+                    protoTransform->SetBytes(transformStats->Bytes);
+                    protoTransform->SetRowsIn(transformStats->RowsIn);
+                    protoTransform->SetRowsOut(transformStats->RowsOut);
+                    protoTransform->SetIngressBytes(ingressBytes);
+
+                    protoTransform->SetMaxMemoryUsage(transformStats->MaxMemoryUsage);
+
+                    if (auto* transform = transformInfo.AsyncInput) {
+                        transform->FillExtraStats(protoTask, last);
                     }
                 }
             }
@@ -2051,6 +2108,7 @@ protected:
 
     THolder<TDqMemoryQuota> MemoryQuota;
     TDqComputeActorWatermarks WatermarksTracker;
+    ::NMonitoring::TDynamicCounterPtr TaskCounters;
     TDqComputeActorMetrics DqComputeActorMetrics;
     NWilson::TSpan ComputeActorSpan;
 private:
@@ -2058,9 +2116,8 @@ private:
     TInstant LastSendStatsTime;
     bool PassExceptions = false;
 protected:
-    bool MonCountersProvided = false;
-    ::NMonitoring::TDynamicCounters::TCounterPtr MkqlMemoryUsage;
-    ::NMonitoring::TDynamicCounters::TCounterPtr MkqlMemoryLimit;
+    ::NMonitoring::TDynamicCounters::TCounterPtr MkqlMemoryQuota;
+    ::NMonitoring::TDynamicCounters::TCounterPtr OutputChannelSize;
     THolder<NYql::TCounters> Stat;
 };
 

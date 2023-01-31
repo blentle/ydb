@@ -3,6 +3,8 @@
 #include <ydb/library/yql/public/udf/udf_helpers.h>
 #include <ydb/library/yql/minikql/datetime/datetime.h>
 
+#include <ydb/library/yql/public/udf/arrow/udf_arrow_helpers.h>
+
 #include <util/datetime/base.h>
 
 using namespace NKikimr;
@@ -13,8 +15,327 @@ extern const char SplitName[] = "Split";
 extern const char ToSecondsName[] = "ToSeconds";
 extern const char ToMillisecondsName[] = "ToMilliseconds";
 extern const char ToMicrosecondsName[] = "ToMicroseconds";
+extern const char GetHourName[] = "GetHour";
+extern const char GetMinuteName[] = "GetMinute";
+extern const char GetSecondName[] = "GetSecond";
+extern const char GetMillisecondOfSecondName[] = "GetMillisecondOfSecond";
+extern const char GetMicrosecondOfSecondName[] = "GetMicrosecondOfSecond";
 
 extern const char TMResourceName[] = "DateTime2.TM";
+
+template <const char* TFuncName, typename TResult, ui32 ScaleAfterSeconds>
+class TToUnits {
+public:
+    typedef bool TTypeAwareMarker;
+    using TSignedResult = typename std::make_signed<TResult>::type;
+
+    static TResult DateCore(ui16 value) {
+        return value * ui32(86400) * TResult(ScaleAfterSeconds);
+    }
+
+    static TResult DatetimeCore(ui32 value) {
+        return value * TResult(ScaleAfterSeconds);
+    }
+
+    static TResult TimestampCore(ui64 value) {
+        return TResult(value / (1000000u / ScaleAfterSeconds));
+    }
+
+    static TSignedResult IntervalCore(i64 value) {
+        return TSignedResult(value / (1000000u / ScaleAfterSeconds));
+    }
+
+    static const TStringRef& Name() {
+        static auto name = TStringRef(TFuncName, std::strlen(TFuncName));
+        return name;
+    }
+
+    static bool DeclareSignature(
+        const TStringRef& name,
+        TType* userType,
+        IFunctionTypeInfoBuilder& builder,
+        bool typesOnly)
+    {
+        if (Name() != name) {
+            return false;
+        }
+
+        try {
+            auto typeInfoHelper = builder.TypeInfoHelper();
+            TTupleTypeInspector tuple(*typeInfoHelper, userType);
+            Y_ENSURE(tuple);
+            Y_ENSURE(tuple.GetElementsCount() > 0);
+            TTupleTypeInspector argsTuple(*typeInfoHelper, tuple.GetElementType(0));
+            Y_ENSURE(argsTuple);
+            if (argsTuple.GetElementsCount() != 1) {
+                builder.SetError("Expected one argument");
+                return true;
+            }
+
+
+            auto argType = argsTuple.GetElementType(0);
+            TVector<const TType*> argBlockTypes;
+            argBlockTypes.push_back(argType);
+
+            TBlockTypeInspector block(*typeInfoHelper, argType);
+            if (block) {
+                Y_ENSURE(!block.IsScalar());
+                argType = block.GetItemType();
+            }
+
+            bool isOptional = false;
+            if (auto opt = TOptionalTypeInspector(*typeInfoHelper, argType)) {
+                argType = opt.GetItemType();
+                isOptional = true;
+            }
+
+
+            TDataTypeInspector data(*typeInfoHelper, argType);
+            if (!data) {
+                builder.SetError("Expected data type");
+                return true;
+            }
+
+            auto typeId = data.GetTypeId();
+            if (!(typeId == TDataType<TDate>::Id || typeId == TDataType<TTzDate>::Id ||
+                typeId == TDataType<TDatetime>::Id || typeId == TDataType<TTzDatetime>::Id ||
+                typeId == TDataType<TTimestamp>::Id || typeId == TDataType<TTzTimestamp>::Id ||
+                typeId == TDataType<TInterval>::Id)) {
+                builder.SetError(TStringBuilder() << "Type " << GetDataTypeInfo(GetDataSlot(typeId)).Name << " is not supported");
+            }
+
+            builder.Args()->Add(argsTuple.GetElementType(0)).Done();
+            const TType* retType;
+            if (typeId != TDataType<TInterval>::Id) {
+                retType = builder.SimpleType<TResult>();
+            } else {
+                retType = builder.SimpleType<TSignedResult>();
+            }
+
+            if (isOptional) {
+                retType = builder.Optional()->Item(retType).Build();
+            }
+
+            auto outputType = retType;
+            if (block) {
+                retType = builder.Block(block.IsScalar())->Item(retType).Build();
+            }
+
+            builder.Returns(retType);
+            builder.SupportsBlocks();
+            builder.IsStrict();
+
+            builder.UserType(userType);
+            if (!typesOnly) {
+                if (typeId == TDataType<TDate>::Id || typeId == TDataType<TTzDate>::Id) {
+                    if (block) {
+                        builder.Implementation(new TSimpleArrowUdfImpl(argBlockTypes, outputType, block.IsScalar(),
+                            UnaryPreallocatedExecImpl<ui16, TResult, DateCore>, builder, TString(name), arrow::compute::NullHandling::INTERSECTION));
+                    } else {
+                        builder.Implementation(new TUnaryOverOptionalImpl<ui16, TResult, DateCore>());
+                    }
+                }
+
+                if (typeId == TDataType<TDatetime>::Id || typeId == TDataType<TTzDatetime>::Id) {
+                    if (block) {
+                        builder.Implementation(new TSimpleArrowUdfImpl(argBlockTypes, outputType, block.IsScalar(),
+                            UnaryPreallocatedExecImpl<ui32, TResult, DatetimeCore>, builder, TString(name), arrow::compute::NullHandling::INTERSECTION));
+                    } else {
+                        builder.Implementation(new TUnaryOverOptionalImpl<ui32, TResult, DatetimeCore>());
+                    }
+                }
+
+                if (typeId == TDataType<TTimestamp>::Id || typeId == TDataType<TTzTimestamp>::Id) {
+                    if (block) {
+                        builder.Implementation(new TSimpleArrowUdfImpl(argBlockTypes, outputType, block.IsScalar(),
+                            UnaryPreallocatedExecImpl<ui64, TResult, TimestampCore>, builder, TString(name), arrow::compute::NullHandling::INTERSECTION));
+                    } else {
+                        builder.Implementation(new TUnaryOverOptionalImpl<ui64, TResult, TimestampCore>());
+                    }
+                }
+
+                if (typeId == TDataType<TInterval>::Id) {
+                    if (block) {
+                        builder.Implementation(new TSimpleArrowUdfImpl(argBlockTypes, outputType, block.IsScalar(),
+                            UnaryPreallocatedExecImpl<i64, TSignedResult, IntervalCore>, builder, TString(name), arrow::compute::NullHandling::INTERSECTION));
+                    } else {
+                        builder.Implementation(new TUnaryOverOptionalImpl<i64, TSignedResult, IntervalCore>());
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            builder.SetError(TStringBuf(e.what()));
+        }
+
+        return true;
+    }
+};
+
+template <const char* TFuncName, typename TFieldStorage, TFieldStorage (*FieldFunc)(const TUnboxedValuePod&), ui32 Divisor, ui32 Scale, ui32 Limit, bool Fractional> 
+struct TGetTimeComponent {
+    typedef bool TTypeAwareMarker;
+
+    template <typename TInput, bool AlwaysZero, bool InputFractional>
+    static TFieldStorage Core(TInput val) {
+        if constexpr (AlwaysZero) {
+            return 0;
+        }
+
+        if constexpr (InputFractional) {
+            if constexpr (Fractional) {
+                return (val / Scale) % Limit;
+            } else {
+                return (val / 1000000u / Scale) % Limit;
+            }
+        } else {
+            if constexpr (Fractional) {
+                return 0;
+            } else {
+                return (val / Scale) % Limit;
+            }
+        }
+    }
+
+    class TImpl : public TBoxedValue {
+    public:
+        TUnboxedValue Run(const IValueBuilder* valueBuilder, const TUnboxedValuePod* args) const final {
+            Y_UNUSED(valueBuilder);
+            if (!args[0]) {
+                return {};
+            }
+
+            return TUnboxedValuePod(TFieldStorage((FieldFunc(args[0])) / Divisor));
+        }
+    };
+
+    static const TStringRef& Name() {
+        static auto name = TStringRef(TFuncName, std::strlen(TFuncName));
+        return name;
+    }
+
+    static bool DeclareSignature(
+        const TStringRef& name,
+        TType* userType,
+        IFunctionTypeInfoBuilder& builder,
+        bool typesOnly)
+    {
+        if (Name() != name) {
+            return false;
+        }
+
+        try {
+            auto typeInfoHelper = builder.TypeInfoHelper();
+            TTupleTypeInspector tuple(*typeInfoHelper, userType);
+            if (tuple) {
+                Y_ENSURE(tuple.GetElementsCount() > 0);
+                TTupleTypeInspector argsTuple(*typeInfoHelper, tuple.GetElementType(0));
+                Y_ENSURE(argsTuple);
+                if (argsTuple.GetElementsCount() != 1) {
+                    builder.SetError("Expected one argument");
+                    return true;
+                }
+
+
+                auto argType = argsTuple.GetElementType(0);
+                TVector<const TType*> argBlockTypes;
+                argBlockTypes.push_back(argType);
+
+                TBlockTypeInspector block(*typeInfoHelper, argType);
+                if (block) {
+                    Y_ENSURE(!block.IsScalar());
+                    argType = block.GetItemType();
+                }
+
+                TResourceTypeInspector res(*typeInfoHelper, argType);
+                if (!res) {
+                    bool isOptional = false;
+                    if (auto opt = TOptionalTypeInspector(*typeInfoHelper, argType)) {
+                        argType = opt.GetItemType();
+                        isOptional = true;
+                    }
+
+                    TDataTypeInspector data(*typeInfoHelper, argType);
+                    if (!data) {
+                        builder.SetError("Expected data type");
+                        return true;
+                    }
+
+                    auto typeId = data.GetTypeId();
+                    if (typeId == TDataType<TDate>::Id || 
+                        typeId == TDataType<TDatetime>::Id || 
+                        typeId == TDataType<TTimestamp>::Id) {
+
+                        builder.Args()->Add(argsTuple.GetElementType(0)).Done();
+                        const TType* retType = builder.SimpleType<TFieldStorage>();
+
+                        if (isOptional) {
+                            retType = builder.Optional()->Item(retType).Build();
+                        }
+
+                        auto outputType = retType;
+                        if (block) {
+                            retType = builder.Block(block.IsScalar())->Item(retType).Build();
+                        }
+
+                        builder.Returns(retType);
+                        builder.SupportsBlocks();
+                        builder.IsStrict();
+
+                        builder.UserType(userType);
+                        if (!typesOnly) {
+                            if (typeId == TDataType<TDate>::Id) {
+                                if (block) {
+                                    builder.Implementation(new TSimpleArrowUdfImpl(argBlockTypes, outputType, block.IsScalar(),
+                                        UnaryPreallocatedExecImpl<ui16, TFieldStorage, Core<ui16, true, false>>, builder, TString(name), arrow::compute::NullHandling::INTERSECTION));
+                                } else {
+                                    builder.Implementation(new TUnaryOverOptionalImpl<ui16, TFieldStorage, Core<ui16, true, false>>());
+                                }
+                            }
+
+                            if (typeId == TDataType<TDatetime>::Id) {
+                                if (block) {
+                                    builder.Implementation(new TSimpleArrowUdfImpl(argBlockTypes, outputType, block.IsScalar(),
+                                        UnaryPreallocatedExecImpl<ui32, TFieldStorage, Core<ui32, false, false>>, builder, TString(name), arrow::compute::NullHandling::INTERSECTION));
+                                } else {
+                                    builder.Implementation(new TUnaryOverOptionalImpl<ui32, TFieldStorage, Core<ui32, false, false>>());
+                                }
+                            }
+
+                            if (typeId == TDataType<TTimestamp>::Id) {
+                                if (block) {
+                                    builder.Implementation(new TSimpleArrowUdfImpl(argBlockTypes, outputType, block.IsScalar(),
+                                        UnaryPreallocatedExecImpl<ui64, TFieldStorage, Core<ui64, false, true>>, builder, TString(name), arrow::compute::NullHandling::INTERSECTION));
+                                } else {
+                                    builder.Implementation(new TUnaryOverOptionalImpl<ui64, TFieldStorage, Core<ui64, false, true>>());
+                                }
+                            }
+                        }
+
+                        return true;
+                    }
+                } else {
+                    Y_ENSURE(!block);
+                    if (res.GetTag() != TStringRef::Of(TMResourceName)) {
+                        builder.SetError("Unexpected resource tag");
+                        return true;
+                    }
+                }
+            }
+
+            // default implementation
+            builder.Args()->Add<TResource<TMResourceName>>().Flags(ICallablePayload::TArgumentFlags::AutoMap).Done();
+            builder.Returns<TFieldStorage>();
+            builder.IsStrict();
+            if (!typesOnly) {
+                builder.Implementation(new TImpl());
+            }
+        } catch (const std::exception& e) {
+            builder.SetError(TStringBuf(e.what()));
+        }
+
+        return true;
+    }
+};
 
 namespace {
 
@@ -309,25 +630,25 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
 
     // Make*
 
-    SIMPLE_UDF(TMakeDate, TDate(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TMakeDate, TDate(TAutoMap<TResource<TMResourceName>>)) {
         auto& builder = valueBuilder->GetDateBuilder();
         auto& storage = Reference(args[0]);
         return TUnboxedValuePod(storage.ToDate(builder, false));
     }
 
-    SIMPLE_UDF(TMakeDatetime, TDatetime(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TMakeDatetime, TDatetime(TAutoMap<TResource<TMResourceName>>)) {
         auto& builder = valueBuilder->GetDateBuilder();
         auto& storage = Reference(args[0]);
         return TUnboxedValuePod(storage.ToDatetime(builder));
     }
 
-    SIMPLE_UDF(TMakeTimestamp, TTimestamp(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TMakeTimestamp, TTimestamp(TAutoMap<TResource<TMResourceName>>)) {
         auto& builder = valueBuilder->GetDateBuilder();
         auto& storage = Reference(args[0]);
         return TUnboxedValuePod(storage.ToTimestamp(builder));
     }
 
-    SIMPLE_UDF(TMakeTzDate, TTzDate(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TMakeTzDate, TTzDate(TAutoMap<TResource<TMResourceName>>)) {
         auto& builder = valueBuilder->GetDateBuilder();
         auto& storage = Reference(args[0]);
         TUnboxedValuePod result(storage.ToDate(builder, true));
@@ -335,7 +656,7 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return result;
     }
 
-    SIMPLE_UDF(TMakeTzDatetime, TTzDatetime(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TMakeTzDatetime, TTzDatetime(TAutoMap<TResource<TMResourceName>>)) {
         auto& builder = valueBuilder->GetDateBuilder();
         auto& storage = Reference(args[0]);
         TUnboxedValuePod result(storage.ToDatetime(builder));
@@ -343,7 +664,7 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return result;
     }
 
-    SIMPLE_UDF(TMakeTzTimestamp, TTzTimestamp(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TMakeTzTimestamp, TTzTimestamp(TAutoMap<TResource<TMResourceName>>)) {
         auto& builder = valueBuilder->GetDateBuilder();
         auto& storage = Reference(args[0]);
         TUnboxedValuePod result(storage.ToTimestamp(builder));
@@ -353,17 +674,17 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
 
     // Get*
 
-#define GET_METHOD(field, type)                                          \
-    SIMPLE_UDF(TGet##field, type(TAutoMap<TResource<TMResourceName>>)) { \
-        Y_UNUSED(valueBuilder);                                          \
-        return TUnboxedValuePod(Get##field(args[0]));                    \
+#define GET_METHOD(field, type)                                                 \
+    SIMPLE_STRICT_UDF(TGet##field, type(TAutoMap<TResource<TMResourceName>>)) { \
+        Y_UNUSED(valueBuilder);                                                 \
+        return TUnboxedValuePod(Get##field(args[0]));                           \
     }
 
     GET_METHOD(Year, ui16)
     GET_METHOD(DayOfYear, ui16)
     GET_METHOD(Month, ui8)
 
-    SIMPLE_UDF(TGetMonthName, char*(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TGetMonthName, char*(TAutoMap<TResource<TMResourceName>>)) {
         Y_UNUSED(valueBuilder);
         static const std::array<TUnboxedValue, 12U> monthNames = {{
             TUnboxedValuePod::Embedded(TStringRef::Of("January")),
@@ -385,14 +706,14 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
     GET_METHOD(WeekOfYear, ui8)
     GET_METHOD(WeekOfYearIso8601, ui8)
 
-    SIMPLE_UDF(TGetDayOfMonth, ui8(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TGetDayOfMonth, ui8(TAutoMap<TResource<TMResourceName>>)) {
         Y_UNUSED(valueBuilder);
         return TUnboxedValuePod(GetDay(args[0]));
     }
 
     GET_METHOD(DayOfWeek, ui8)
 
-    SIMPLE_UDF(TGetDayOfWeekName, char*(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TGetDayOfWeekName, char*(TAutoMap<TResource<TMResourceName>>)) {
         Y_UNUSED(valueBuilder);
         static const std::array<TUnboxedValue, 7U> dayNames = {{
             TUnboxedValuePod::Embedded(TStringRef::Of("Monday")),
@@ -406,23 +727,9 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return dayNames.at(GetDayOfWeek(*args) - 1U);
     }
 
-    GET_METHOD(Hour, ui8)
-    GET_METHOD(Minute, ui8)
-    GET_METHOD(Second, ui8)
-
-    SIMPLE_UDF(TGetMillisecondOfSecond, ui32(TAutoMap<TResource<TMResourceName>>)) {
-        Y_UNUSED(valueBuilder);
-        return TUnboxedValuePod(GetMicrosecond(args[0]) / 1000u);
-    }
-
-    SIMPLE_UDF(TGetMicrosecondOfSecond, ui32(TAutoMap<TResource<TMResourceName>>)) {
-        Y_UNUSED(valueBuilder);
-        return TUnboxedValuePod(GetMicrosecond(args[0]));
-    }
-
     GET_METHOD(TimezoneId, ui16)
 
-    SIMPLE_UDF(TGetTimezoneName, char*(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TGetTimezoneName, char*(TAutoMap<TResource<TMResourceName>>)) {
         auto timezoneId = GetTimezoneId(args[0]);
         if (timezoneId >= NUdf::GetTimezones().size()) {
             return TUnboxedValuePod();
@@ -549,13 +856,14 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
                 builder.Implementation(new TUpdate(builder.GetSourcePosition()));
             }
 
+            builder.IsStrict();
             return true;
         }
     };
 
     // From*
 
-    SIMPLE_UDF(TFromSeconds, TOptional<TTimestamp>(TAutoMap<ui32>)) {
+    SIMPLE_STRICT_UDF(TFromSeconds, TOptional<TTimestamp>(TAutoMap<ui32>)) {
         Y_UNUSED(valueBuilder);
         auto res = args[0].Get<ui32>();
         if (!ValidateDatetime(res)) {
@@ -564,7 +872,7 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return TUnboxedValuePod((ui64)(res * 1000000ull));
     }
 
-    SIMPLE_UDF(TFromMilliseconds, TOptional<TTimestamp>(TAutoMap<ui64>)) {
+    SIMPLE_STRICT_UDF(TFromMilliseconds, TOptional<TTimestamp>(TAutoMap<ui64>)) {
         Y_UNUSED(valueBuilder);
         auto res = args[0].Get<ui64>();
         if (res >= MAX_TIMESTAMP / 1000u) {
@@ -573,7 +881,7 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return TUnboxedValuePod(res * 1000u);
     }
 
-    SIMPLE_UDF(TFromMicroseconds, TOptional<TTimestamp>(TAutoMap<ui64>)) {
+    SIMPLE_STRICT_UDF(TFromMicroseconds, TOptional<TTimestamp>(TAutoMap<ui64>)) {
         Y_UNUSED(valueBuilder);
         auto res = args[0].Get<ui64>();
         if (!ValidateTimestamp(res)) {
@@ -582,37 +890,37 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return TUnboxedValuePod(res);
     }
 
-    SIMPLE_UDF(TIntervalFromDays, TOptional<TInterval>(TAutoMap<i32>)) {
+    SIMPLE_STRICT_UDF(TIntervalFromDays, TOptional<TInterval>(TAutoMap<i32>)) {
         Y_UNUSED(valueBuilder);
         const i64 res = i64(args[0].Get<i32>()) * 86400000000ll;
         return ValidateInterval(res) ? TUnboxedValuePod(res) : TUnboxedValuePod();
     }
 
-    SIMPLE_UDF(TIntervalFromHours, TOptional<TInterval>(TAutoMap<i32>)) {
+    SIMPLE_STRICT_UDF(TIntervalFromHours, TOptional<TInterval>(TAutoMap<i32>)) {
         Y_UNUSED(valueBuilder);
         const i64 res = i64(args[0].Get<i32>()) * 3600000000ll;
         return ValidateInterval(res) ? TUnboxedValuePod(res) : TUnboxedValuePod();
     }
 
-    SIMPLE_UDF(TIntervalFromMinutes, TOptional<TInterval>(TAutoMap<i32>)) {
+    SIMPLE_STRICT_UDF(TIntervalFromMinutes, TOptional<TInterval>(TAutoMap<i32>)) {
         Y_UNUSED(valueBuilder);
         const i64 res = i64(args[0].Get<i32>()) * 60000000ll;
         return ValidateInterval(res) ? TUnboxedValuePod(res) : TUnboxedValuePod();
     }
 
-    SIMPLE_UDF(TIntervalFromSeconds, TOptional<TInterval>(TAutoMap<i32>)) {
+    SIMPLE_STRICT_UDF(TIntervalFromSeconds, TOptional<TInterval>(TAutoMap<i32>)) {
         Y_UNUSED(valueBuilder);
         const i64 res = i64(args[0].Get<i32>()) * 1000000ll;
         return ValidateInterval(res) ? TUnboxedValuePod(res) : TUnboxedValuePod();
     }
 
-    SIMPLE_UDF(TIntervalFromMilliseconds, TOptional<TInterval>(TAutoMap<i64>)) {
+    SIMPLE_STRICT_UDF(TIntervalFromMilliseconds, TOptional<TInterval>(TAutoMap<i64>)) {
         Y_UNUSED(valueBuilder);
         const i64 res = i64(args[0].Get<i64>()) * 1000ll;
         return ValidateInterval(res) ? TUnboxedValuePod(res) : TUnboxedValuePod();
     }
 
-    SIMPLE_UDF(TIntervalFromMicroseconds, TOptional<TInterval>(TAutoMap<i64>)) {
+    SIMPLE_STRICT_UDF(TIntervalFromMicroseconds, TOptional<TInterval>(TAutoMap<i64>)) {
         Y_UNUSED(valueBuilder);
         const i64 res = args[0].Get<i64>();
         return ValidateInterval(res) ? TUnboxedValuePod(res) : TUnboxedValuePod();
@@ -620,92 +928,24 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
 
     // To*
 
-    SIMPLE_UDF(TToDays, i32(TAutoMap<TInterval>)) {
+    SIMPLE_STRICT_UDF(TToDays, i32(TAutoMap<TInterval>)) {
         Y_UNUSED(valueBuilder);
         return TUnboxedValuePod(i32(args[0].Get<i64>() / 86400000000ll));
     }
 
-    SIMPLE_UDF(TToHours, i32(TAutoMap<TInterval>)) {
+    SIMPLE_STRICT_UDF(TToHours, i32(TAutoMap<TInterval>)) {
         Y_UNUSED(valueBuilder);
         return TUnboxedValuePod(i32(args[0].Get<i64>() / 3600000000ll));
     }
 
-    SIMPLE_UDF(TToMinutes, i32(TAutoMap<TInterval>)) {
+    SIMPLE_STRICT_UDF(TToMinutes, i32(TAutoMap<TInterval>)) {
         Y_UNUSED(valueBuilder);
         return TUnboxedValuePod(i32(args[0].Get<i64>() / 60000000ll));
     }
 
-#define DECLARE_TO_VALUE(units, TSigned, TUnsigned)                          \
-    template <typename TUserDataType>                                        \
-    class TTo##units : public TBoxedValue {                                  \
-    private:                                                                 \
-        TUnboxedValue Run(                                                   \
-            const IValueBuilder* valueBuilder,                               \
-            const TUnboxedValuePod* args) const override;                    \
-    public:                                                                  \
-        static void DeclareSignature(                                        \
-            TType* userType,                                                 \
-            IFunctionTypeInfoBuilder& builder,                               \
-            bool typesOnly)                                                  \
-        {                                                                    \
-            builder.UserType(userType);                                      \
-            builder.Args()->Add<TUserDataType>()                             \
-                .Flags(ICallablePayload::TArgumentFlags::AutoMap).Done();    \
-                                                                             \
-            if (TDataType<TUserDataType>::Id == TDataType<TInterval>::Id) {  \
-                builder.Returns<TSigned>();                                  \
-            } else {                                                         \
-                builder.Returns<TUnsigned>();                                \
-            }                                                                \
-                                                                             \
-            if (!typesOnly) {                                                \
-                builder.Implementation(new TTo##units<TUserDataType>);       \
-            }                                                                \
-        }                                                                    \
-    };
-
-    DECLARE_TO_VALUE(Seconds, i32, ui32);
-    DECLARE_TO_VALUE(Milliseconds, i64, ui64);
-    DECLARE_TO_VALUE(Microseconds, i64, ui64);
-
-#define TO_METHOD(units, type, expr)        \
-    template <>                             \
-    TUnboxedValue TTo##units<type>::Run(    \
-        const IValueBuilder* valueBuilder,  \
-        const TUnboxedValuePod* args) const \
-    {                                       \
-        Y_UNUSED(valueBuilder);             \
-        EMPTY_RESULT_ON_EMPTY_ARG(0);       \
-        return TUnboxedValuePod(expr);      \
-    }
-
-    TO_METHOD(Seconds, TDate, (ui32)(args[0].Get<ui16>() * 86400u));
-    TO_METHOD(Seconds, TDatetime, args[0].Get<ui32>());
-    TO_METHOD(Seconds, TTimestamp, (ui32)(args[0].Get<ui64>() / 1000000ull));
-    TO_METHOD(Seconds, TInterval, (i64)(args[0].Get<i64>() / 1000000ll));
-    TO_METHOD(Seconds, TTzDate, (ui32)(args[0].Get<ui16>() * 86400u));
-    TO_METHOD(Seconds, TTzDatetime, args[0].Get<ui32>());
-    TO_METHOD(Seconds, TTzTimestamp, (ui32)(args[0].Get<ui64>() / 1000000u));
-
-    TO_METHOD(Milliseconds, TDate, (ui64)(args[0].Get<ui16>() * 86400000ull));
-    TO_METHOD(Milliseconds, TDatetime, (ui64)(args[0].Get<ui32>() * 1000ull));
-    TO_METHOD(Milliseconds, TTimestamp, (ui64)(args[0].Get<ui64>() / 1000ull));
-    TO_METHOD(Milliseconds, TInterval, (i64)(args[0].Get<i64>() / 1000ll));
-    TO_METHOD(Milliseconds, TTzDate, (ui64)(args[0].Get<ui16>() * 86400000ull));
-    TO_METHOD(Milliseconds, TTzDatetime, (ui64)(args[0].Get<ui32>() * 1000ull));
-    TO_METHOD(Milliseconds, TTzTimestamp, (ui64)(args[0].Get<ui64>() / 1000ull));
-
-    TO_METHOD(Microseconds, TDate, (ui64)(args[0].Get<ui16>() * 86400000000ull));
-    TO_METHOD(Microseconds, TDatetime, (ui64)(args[0].Get<ui32>() * 1000000ull));
-    TO_METHOD(Microseconds, TTimestamp, args[0].Get<ui64>());
-    TO_METHOD(Microseconds, TInterval, args[0].Get<i64>());
-    TO_METHOD(Microseconds, TTzDate, (ui64)(args[0].Get<ui16>() * 86400000000ull));
-    TO_METHOD(Microseconds, TTzDatetime, (ui64)(args[0].Get<ui32>() * 1000000ull));
-    TO_METHOD(Microseconds, TTzTimestamp, args[0].Get<ui64>());
-
     // StartOf*
 
-    SIMPLE_UDF(TStartOfYear, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TStartOfYear, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>)) {
         auto result = args[0];
         auto& storage = Reference(result);
         storage.Month = 1;
@@ -722,7 +962,7 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return result;
     }
 
-    SIMPLE_UDF(TStartOfQuarter, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TStartOfQuarter, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>)) {
         auto result = args[0];
         auto& storage = Reference(result);
         storage.Month = (storage.Month - 1) / 3 * 3 + 1;
@@ -739,7 +979,7 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return result;
     }
 
-    SIMPLE_UDF(TStartOfMonth, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TStartOfMonth, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>)) {
         auto result = args[0];
         auto& storage = Reference(result);
         storage.Day = 1;
@@ -755,7 +995,7 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return result;
     }
 
-    SIMPLE_UDF(TStartOfWeek, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TStartOfWeek, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>)) {
         auto result = args[0];
         auto& storage = Reference(result);
         auto& builder = valueBuilder->GetDateBuilder();
@@ -774,7 +1014,7 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return result;
     }
 
-    SIMPLE_UDF(TStartOfDay, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TStartOfDay, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>)) {
         auto result = args[0];
         auto& storage = Reference(result);
         storage.Hour = 0;
@@ -789,7 +1029,7 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return result;
     }
 
-    SIMPLE_UDF(TStartOf, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>, TAutoMap<TInterval>)) {
+    SIMPLE_STRICT_UDF(TStartOf, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>, TAutoMap<TInterval>)) {
         auto result = args[0];
         ui64 interval = std::abs(args[1].Get<i64>());
         if (interval == 0) {
@@ -815,7 +1055,7 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         return result;
     }
 
-    SIMPLE_UDF(TTimeOfDay, TInterval(TAutoMap<TResource<TMResourceName>>)) {
+    SIMPLE_STRICT_UDF(TTimeOfDay, TInterval(TAutoMap<TResource<TMResourceName>>)) {
         Y_UNUSED(valueBuilder);
         auto& storage = Reference(args[0]);
         return TUnboxedValuePod((i64)storage.ToTimeOfDay());
@@ -823,15 +1063,15 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
 
     // Add ...
 
-    SIMPLE_UDF(TShiftYears, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>, i32)) {
+    SIMPLE_STRICT_UDF(TShiftYears, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>, i32)) {
         return DoAddYears(args[0], args[1].Get<i32>(), valueBuilder->GetDateBuilder());
     }
 
-    SIMPLE_UDF(TShiftQuarters, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>, i32)) {
+    SIMPLE_STRICT_UDF(TShiftQuarters, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>, i32)) {
         return DoAddMonths(args[0], 3ll * args[1].Get<i32>(), valueBuilder->GetDateBuilder());
     }
 
-    SIMPLE_UDF(TShiftMonths, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>, i32)) {
+    SIMPLE_STRICT_UDF(TShiftMonths, TOptional<TResource<TMResourceName>>(TAutoMap<TResource<TMResourceName>>, i32)) {
         return DoAddMonths(args[0], args[1].Get<i32>(), valueBuilder->GetDateBuilder());
     }
 
@@ -1466,18 +1706,18 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         }
     };
 
-#define PARSE_SPECIFIC_FORMAT(format)                                                   \
-    SIMPLE_UDF(TParse##format, TOptional<TResource<TMResourceName>>(TAutoMap<char*>)) { \
-        auto str = args[0].AsStringRef();                                               \
-        TInstant instant;                                                               \
-        if (!TInstant::TryParse##format(TStringBuf(str.Data(), str.Size()), instant)) { \
-            return TUnboxedValuePod();                                                  \
-        }                                                                               \
-        auto& builder = valueBuilder->GetDateBuilder();                                 \
-        TUnboxedValuePod result(0);                                                     \
-        auto& storage = Reference(result);                                  \
-        storage.FromTimestamp(builder, instant.MicroSeconds());                         \
-        return result;                                                                  \
+#define PARSE_SPECIFIC_FORMAT(format)                                                          \
+    SIMPLE_STRICT_UDF(TParse##format, TOptional<TResource<TMResourceName>>(TAutoMap<char*>)) { \
+        auto str = args[0].AsStringRef();                                                      \
+        TInstant instant;                                                                      \
+        if (!TInstant::TryParse##format(TStringBuf(str.Data(), str.Size()), instant)) {        \
+            return TUnboxedValuePod();                                                         \
+        }                                                                                      \
+        auto& builder = valueBuilder->GetDateBuilder();                                        \
+        TUnboxedValuePod result(0);                                                            \
+        auto& storage = Reference(result);                                                     \
+        storage.FromTimestamp(builder, instant.MicroSeconds());                                \
+        return result;                                                                         \
     }
 
     PARSE_SPECIFIC_FORMAT(Rfc822);
@@ -1510,11 +1750,11 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         TGetDayOfMonth,
         TGetDayOfWeek,
         TGetDayOfWeekName,
-        TGetHour,
-        TGetMinute,
-        TGetSecond,
-        TGetMillisecondOfSecond,
-        TGetMicrosecondOfSecond,
+        TGetTimeComponent<GetHourName, ui8, GetHour, 1u, 3600u, 24u, false>,
+        TGetTimeComponent<GetMinuteName, ui8, GetMinute, 1u, 60u, 60u, false>,
+        TGetTimeComponent<GetSecondName, ui8, GetSecond, 1u, 1u, 60u, false>,
+        TGetTimeComponent<GetMillisecondOfSecondName, ui32, GetMicrosecond, 1000u, 1000u, 1000u, true>,
+        TGetTimeComponent<GetMicrosecondOfSecondName, ui32, GetMicrosecond, 1u, 1u, 1000000u, true>,
         TGetTimezoneId,
         TGetTimezoneName,
 
@@ -1547,32 +1787,9 @@ NUdf::TUnboxedValuePod DoAddYears(const NUdf::TUnboxedValuePod& date, i64 years,
         TShiftQuarters,
         TShiftMonths,
 
-        TUserDataTypeFuncFactory<true, ToSecondsName, TToSeconds,
-            TDate,
-            TDatetime,
-            TTimestamp,
-            TInterval,
-            TTzDate,
-            TTzDatetime,
-            TTzTimestamp>,
-
-        TUserDataTypeFuncFactory<true, ToMillisecondsName, TToMilliseconds,
-            TDate,
-            TDatetime,
-            TTimestamp,
-            TInterval,
-            TTzDate,
-            TTzDatetime,
-            TTzTimestamp>,
-
-        TUserDataTypeFuncFactory<true, ToMicrosecondsName, TToMicroseconds,
-            TDate,
-            TDatetime,
-            TTimestamp,
-            TInterval,
-            TTzDate,
-            TTzDatetime,
-            TTzTimestamp>,
+        TToUnits<ToSecondsName, ui32, 1>,
+        TToUnits<ToMillisecondsName, ui64, 1000>,
+        TToUnits<ToMicrosecondsName, ui64, 1000000>,
 
         TFormat,
         TParse,

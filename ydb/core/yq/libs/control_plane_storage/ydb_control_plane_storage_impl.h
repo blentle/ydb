@@ -3,7 +3,6 @@
 #include "config.h"
 #include "control_plane_storage.h"
 #include "control_plane_storage_counters.h"
-#include "exceptions.h"
 #include "extractors.h"
 #include "probes.h"
 #include "request_validators.h"
@@ -35,6 +34,7 @@
 #include <ydb/core/yq/libs/control_plane_storage/proto/yq_internal.pb.h>
 #include <ydb/core/yq/libs/db_schema/db_schema.h>
 #include <ydb/core/yq/libs/events/events.h>
+#include <ydb/core/yq/libs/exceptions/exceptions.h>
 #include <ydb/core/yq/libs/quota_manager/events/events.h>
 #include <ydb/core/yq/libs/ydb/util.h>
 #include <ydb/core/yq/libs/ydb/ydb.h>
@@ -90,8 +90,6 @@ inline static bool HasViewAccess(TPermissions permissions, YandexQuery::Acl::Vis
 inline static bool HasManageAccess(TPermissions permissions, YandexQuery::Acl::Visibility entityVisibility, const TString& entityUser, const TString& user) {
     return HasAccessImpl(permissions, entityVisibility, entityUser, user, TPermissions::MANAGE_PRIVATE, TPermissions::MANAGE_PUBLIC);
 }
-
-TAsyncStatus ExecDbRequest(TDbPool::TPtr dbPool, std::function<NYdb::TAsyncStatus(NYdb::NTable::TSession&)> handler);
 
 LWTRACE_USING(YQ_CONTROL_PLANE_STORAGE_PROVIDER);
 
@@ -383,6 +381,30 @@ class TYdbControlPlaneStorageActor : public NActors::TActorBootstrapped<TYdbCont
         RTS_MAX,
     };
 
+    static constexpr std::string_view RequestTypeScopeNames[ERequestTypeScope::RTS_MAX] = {
+        "CreateQuery",
+        "ListQueries",
+        "DescribeQuery",
+        "GetQueryStatus",
+        "ModifyQuery",
+        "DeleteQuery",
+        "ControlQuery",
+        "GetResultData",
+        "ListJobs",
+        "DescribeJob",
+        "CreateConnection",
+        "ListConnections",
+        "DescribeConnection",
+        "ModifyConnection",
+        "DeleteConnection",
+        "CreateBinding",
+        "ListBindings",
+        "DescribeBinding",
+        "ModifyBinding",
+        "DeleteBinding",
+        "PingTask"
+    };
+
     enum ERequestTypeCommon {
         RTC_WRITE_RESULT_DATA,
         RTC_GET_TASK,
@@ -509,43 +531,21 @@ class TYdbControlPlaneStorageActor : public NActors::TActorBootstrapped<TYdbCont
             TMetricsScope key{cloudId, scope};
             TMaybe<TScopeCountersPtr> cacheVal;
             ScopeCounters.Get(key, &cacheVal);
-            if (cacheVal) {
-                return (**cacheVal)[type];
+
+            if (!cacheVal) {
+                cacheVal = std::make_shared<TScopeCounters>();
+                ScopeCounters.Put(key, cacheVal);
             }
 
-            auto scopeRequests = std::make_shared<TScopeCounters>(CreateArray<RTS_MAX, TRequestScopeCountersPtr>({
-                { MakeIntrusive<TRequestScopeCounters>("CreateQuery") },
-                { MakeIntrusive<TRequestScopeCounters>("ListQueries") },
-                { MakeIntrusive<TRequestScopeCounters>("DescribeQuery") },
-                { MakeIntrusive<TRequestScopeCounters>("GetQueryStatus") },
-                { MakeIntrusive<TRequestScopeCounters>("ModifyQuery") },
-                { MakeIntrusive<TRequestScopeCounters>("DeleteQuery") },
-                { MakeIntrusive<TRequestScopeCounters>("ControlQuery") },
-                { MakeIntrusive<TRequestScopeCounters>("GetResultData") },
-                { MakeIntrusive<TRequestScopeCounters>("ListJobs") },
-                { MakeIntrusive<TRequestScopeCounters>("DescribeJob") },
-                { MakeIntrusive<TRequestScopeCounters>("CreateConnection") },
-                { MakeIntrusive<TRequestScopeCounters>("ListConnections") },
-                { MakeIntrusive<TRequestScopeCounters>("DescribeConnection") },
-                { MakeIntrusive<TRequestScopeCounters>("ModifyConnection") },
-                { MakeIntrusive<TRequestScopeCounters>("DeleteConnection") },
-                { MakeIntrusive<TRequestScopeCounters>("CreateBinding") },
-                { MakeIntrusive<TRequestScopeCounters>("ListBindings") },
-                { MakeIntrusive<TRequestScopeCounters>("DescribeBinding") },
-                { MakeIntrusive<TRequestScopeCounters>("ModifyBinding") },
-                { MakeIntrusive<TRequestScopeCounters>("DeleteBinding") },
-                { MakeIntrusive<TRequestScopeCounters>("PingTask") },
-            }));
+            auto scopeRequests = *cacheVal;
 
-            auto scopeCounters = (cloudId ? Counters->GetSubgroup("cloud_id", cloudId) : Counters)
-                                    ->GetSubgroup("scope", scope);
-
-            for (auto& request: *scopeRequests) {
-                request->Register(scopeCounters);
+            if (!(*scopeRequests)[type]) {
+                auto scopeCounters = (cloudId ? Counters->GetSubgroup("cloud_id", cloudId) : Counters)->GetSubgroup("scope", scope);
+                auto requestScoupeCounters = MakeIntrusive<TRequestScopeCounters>(std::string(RequestTypeScopeNames[type]));
+                requestScoupeCounters->Register(scopeCounters);
+                (*scopeRequests)[type] = requestScoupeCounters;
             }
 
-            cacheVal = scopeRequests;
-            ScopeCounters.Put(key, cacheVal);
             return (*scopeRequests)[type];
         }
     };
@@ -720,7 +720,7 @@ private:
                     issues.AddIssues(status.GetIssues());
                     internalIssues.AddIssues(status.GetIssues());
                 }
-            } catch (const TControlPlaneStorageException& exception) {
+            } catch (const TCodeLineException& exception) {
                 NYql::TIssue issue = MakeErrorIssue(exception.Code, exception.GetRawMessage());
                 issues.AddIssue(issue);
                 NYql::TIssue internalIssue = MakeErrorIssue(exception.Code, CurrentExceptionMessage());
@@ -796,7 +796,7 @@ private:
                 } else {
                     issues.AddIssues(status.GetIssues());
                 }
-            } catch (const TControlPlaneStorageException& exception) {
+            } catch (const TCodeLineException& exception) {
                 NYql::TIssue issue = MakeErrorIssue(exception.Code, exception.GetRawMessage());
                 issues.AddIssue(issue);
                 NYql::TIssue internalIssue = MakeErrorIssue(exception.Code, CurrentExceptionMessage());

@@ -311,7 +311,7 @@ message TLogConfig {
     optional bool SysLogToStdErr = 12; // writes logs to stderr as well as in syslog
     optional TUAClientConfig UAClientConfig = 13;
     optional uint64 TimeThresholdMs = 14 [default = 1000];
-    optional bool IgnoreUnknownComponents = 15;
+    optional bool IgnoreUnknownComponents = 15 [default = true];
 }
 
 message TCompileServiceConfig {
@@ -424,6 +424,7 @@ message TInterconnectConfig {
     optional bool SuppressConnectivityCheck = 39 [default = false];
     optional uint32 PreallocatedBufferSize = 40;
     optional uint32 NumPreallocatedBuffers = 41;
+    optional bool EnableExternalDataChannel = 42;
 
     // ballast is added to IC handshake frames to ensure correctness of jumbo frames transmission over network
     optional uint32 HandshakeBallastSize = 14;
@@ -593,7 +594,7 @@ message TMetadataProviderConfig {
 }
 
 message TBackgroundTasksConfig {
-    optional bool Enabled = 1 [default = false];
+    optional bool Enabled = 1 [default = true];
     optional TInternalRequestConfig RequestConfig = 2;
     optional uint32 PullPeriodSeconds = 3 [default = 10];
     optional uint32 PingPeriodSeconds = 4 [default = 2];
@@ -1185,6 +1186,14 @@ message TTableServiceConfig {
         optional uint32 LeakyBucketQuotaBucketDurationSeconds = 6 [default = 60];
     }
 
+    message TAggregationConfig {
+        optional uint32 CSScanMinimalThreads = 29 [default = 16];
+        optional uint32 DSScanMinimalThreads = 30 [default = 4];
+        optional uint32 AggregationComputeThreads = 31 [default = 32];
+        optional uint32 SortScanThreads = 32 [default = 16];
+        optional uint32 JoinScanThreads = 33 [default = 16];
+    }
+
     optional uint32 QueryLimitBytes = 1;
     optional uint32 ParametersLimitBytes = 2;
     optional uint32 SessionsLimitPerNode = 3;
@@ -1213,6 +1222,8 @@ message TTableServiceConfig {
 
     optional bool EnableKqpScanQuerySourceRead = 26 [default = false];
     optional bool EnableKqpDataQuerySourceRead = 27 [default = false];
+    optional uint64 SessionIdleDurationSeconds = 28 [default = 600];
+    optional TAggregationConfig AggregationConfig = 29;
 };
 
 // Config describes immediate controls and allows
@@ -1404,6 +1415,7 @@ message TAuditConfig {
     optional string AuditFilePath = 1;
     optional EFormat Format = 2 [default = JSON];
     optional string LogName = 3;
+    optional bool UnifiedAgentEnable = 4 [default = false];
 };
 
 message THiveTabletLimit {
@@ -1519,6 +1531,8 @@ message TDataShardConfig {
     optional uint64 TtlReadAheadHi = 14 [default = 1048576];
     optional uint64 IdleMemCompactionIntervalSeconds = 15 [default = 60];
     optional uint64 RestoreReadBufferSizeLimit = 16 [default = 268435456]; // 256 MB
+    optional string CdcInitialScanTaskName = 17 [default = "cdc_initial_scan"];
+    optional uint32 CdcInitialScanTaskPriority = 18 [default = 10];
 }
 
 message TSchemeShardConfig {
@@ -1591,6 +1605,9 @@ message TCompactionConfig {
 
         // Compact even if shard has single part and empty memtable
         optional bool CompactSinglePartedShards = 10 [default = false];
+
+        // Do not wakeup earlier, than this interval
+        optional uint64 MinWakeupIntervalMs = 11 [default = 10];
     }
 
     message TBorrowedCompactionConfig {
@@ -1599,6 +1616,9 @@ message TCompactionConfig {
 
         // After this interval we will try to restart
         optional uint64 TimeoutSeconds = 3 [default = 15];
+
+        // Do not wakeup earlier, than this interval
+        optional uint64 MinWakeupIntervalMs = 4 [default = 10];
     }
 
     optional TBackgroundCompactionConfig BackgroundCompactionConfig = 1;
@@ -1716,4 +1736,50 @@ message TAppConfig {
     optional string ClusterYamlConfig = 101;
 
     optional TConfigVersion Version = 102;
+}
+
+message TYdbVersion {
+    optional uint32 Year = 1;
+    optional uint32 Major = 2;
+    optional uint32 Minor = 3;
+    optional uint32 Hotfix = 4;
+}
+
+message TCompatibilityRule {
+    enum EComponentId {
+        Any = 0;
+        Test1 = 1;
+        Test2 = 2;
+        Interconnect = 3;
+    }
+
+    optional string Build = 1;
+    optional TYdbVersion BottomLimit = 2;
+    optional TYdbVersion UpperLimit = 3;
+
+    // don't use enum, because stored data can have values from newer YDB versions,
+    // which are not included in current version
+    optional uint32 ComponentId = 4;
+
+    // don't use Forbidden until it's absolutely necessary
+    optional bool Forbidden = 5 [default = false];
+}
+
+message TCurrentCompatibilityInfo {
+    required string Build = 1;
+
+    // if YdbVersion is empty, build is assumed to be non-stable
+    optional TYdbVersion YdbVersion = 2;
+
+    repeated TCompatibilityRule CanLoadFrom = 3;
+    repeated TCompatibilityRule StoresReadableBy = 4;
+}
+
+message TStoredCompatibilityInfo {
+    required string Build = 1;
+
+    // if YdbVersion is empty, build is assumed to be non-stable
+    optional TYdbVersion YdbVersion = 2;
+
+    repeated TCompatibilityRule ReadableBy = 3;
 }

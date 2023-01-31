@@ -15,38 +15,18 @@ namespace NKqp {
 
 using namespace NYql;
 
-void TEvKqpExecuter::TEvTxResponse::InitTxResult(const NKqpProto::TKqpPhyTx& tx) {
-    ui32 i = TxResults.size();
-    TxResults.resize(TxResults.size() + tx.GetResults().size());
-
-    for (const auto& txResult : tx.GetResults()) {
-        auto& result = TxResults[i++];
-        result.IsStream = txResult.GetIsStream();
-        result.MkqlItemType = ImportTypeFromProto(txResult.GetItemType(), AllocState->TypeEnv);
-
-        if (txResult.ColumnHintsSize() > 0) {
-            result.ColumnOrder.reserve(txResult.GetColumnHints().size());
-            auto* structType = static_cast<NKikimr::NMiniKQL::TStructType*>(result.MkqlItemType);
-            THashMap<TString, ui32> memberIndices;
-            for(ui32 i = 0; i < structType->GetMembersCount(); ++i) {
-                memberIndices[TString(structType->GetMemberName(i))] = i;
-            }
-
-            NKikimrMiniKQL::TType resultItemType;
-            resultItemType.SetKind(NKikimrMiniKQL::Struct);
-            for(auto& name: txResult.GetColumnHints()) {
-                auto it = memberIndices.find(name);
-                YQL_ENSURE(it != memberIndices.end(), "undetermined column name: " << name);
-                result.ColumnOrder.push_back(it->second);
-            }
-        }
+void TEvKqpExecuter::TEvTxResponse::InitTxResult(const TKqpPhyTxHolder::TConstPtr& tx) {
+    TxHolders.push_back(tx);
+    TxResults.reserve(TxResults.size() + tx->GetTxResultsMeta().size());
+    for (const auto& txResult : tx->GetTxResultsMeta()) {
+        TxResults.emplace_back(txResult.IsStream, txResult.MkqlItemType, &txResult.ColumnOrder);
     }
 }
 
 void TEvKqpExecuter::TEvTxResponse::TakeResult(ui32 idx, const NYql::NDqProto::TData& rows) {
     YQL_ENSURE(idx < TxResults.size());
-    ResultRowsCount += rows.GetRaw().size();
-    ResultRowsBytes += rows.GetRows();
+    ResultRowsCount += rows.GetRows();
+    ResultRowsBytes += rows.GetRaw().size();
     auto guard = AllocState->TypeEnv.BindAllocator();
     auto& result = TxResults[idx];
     if (rows.GetRows() || !result.IsStream) {
@@ -72,6 +52,12 @@ void TEvKqpExecuter::TEvTxResponse::TakeResult(ui32 idx, NKikimr::NMiniKQL::TUnb
     auto serializer = NYql::NDq::TDqDataSerializer(
         AllocState->TypeEnv, AllocState->HolderFactory, NDqProto::DATA_TRANSPORT_UV_PICKLE_1_0);
     auto buffer = serializer.Serialize(rows, txResult.MkqlItemType);
+    {
+        auto g = AllocState->TypeEnv.BindAllocator();
+        NKikimr::NMiniKQL::TUnboxedValueVector emptyVector;
+        emptyVector.swap(rows);
+    }
+
     serializer.Deserialize(buffer, txResult.MkqlItemType, txResult.Rows);
 }
 
@@ -159,7 +145,7 @@ TActorId ReportToRl(ui64 ru, const TString& database, const TString& userToken,
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
-    const TMaybe<TString>& userToken, TKqpRequestCounters::TPtr counters)
+    const TMaybe<TString>& userToken, TKqpRequestCounters::TPtr counters, const NKikimrConfig::TTableServiceConfig::TAggregationConfig& aggregation)
 {
     if (request.Transactions.empty()) {
         // commit-only or rollback-only data transaction
@@ -199,7 +185,7 @@ IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TSt
 
     return data
         ? CreateKqpDataExecuter(std::move(request), database, userToken, counters)
-        : CreateKqpScanExecuter(std::move(request), database, userToken, counters);
+        : CreateKqpScanExecuter(std::move(request), database, userToken, counters, aggregation);
 }
 
 } // namespace NKqp

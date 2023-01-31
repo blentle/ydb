@@ -210,6 +210,13 @@ void ConvertYdbTypeToMiniKQLType(const Ydb::Type& input, NKikimrMiniKQL::TType& 
             }
             break;
         }
+        case Ydb::Type::kPgType: {
+            output.SetKind(NKikimrMiniKQL::ETypeKind::Pg);
+            const Ydb::PgType& pgType = input.pg_type();
+            auto pgOut = output.MutablePg();
+            pgOut->Setoid(pgType.Getoid());
+            break;
+        }
         default: {
             ythrow yexception() << "Unknown protobuf type: "
                                 << input.DebugString();
@@ -689,7 +696,11 @@ void ConvertYdbValueToMiniKQLValue(const Ydb::Type& inputType,
             }
             break;
         }
-
+        case Ydb::Type::kPgType: {
+            const auto& stringRef = inputValue.Gettext_value();
+            output.SetText(stringRef.data(), stringRef.size());
+            break;
+        }
         default: {
             throw yexception() << "Unknown protobuf type: "
                                 << inputType.DebugString();
@@ -731,6 +742,7 @@ const THashMap<TString, TACLAttrs> AccessMap_  = {
     { "ydb.database.connect", TACLAttrs(EAccessRights::ConnectDatabase, EInheritanceType::InheritNone) },
     { "ydb.tables.modify", TACLAttrs(EAccessRights(UpdateRow | EraseRow)) },
     { "ydb.tables.read", TACLAttrs(EAccessRights::SelectRow | EAccessRights::ReadAttributes) },
+    { "ydb.generic.list", EAccessRights::GenericList},
     { "ydb.generic.read", EAccessRights::GenericRead },
     { "ydb.generic.write", EAccessRights::GenericWrite },
     { "ydb.generic.use_legacy", EAccessRights::GenericUseLegacy },

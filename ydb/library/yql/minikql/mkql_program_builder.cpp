@@ -1661,20 +1661,45 @@ TRuntimeNode TProgramBuilder::Sort(TRuntimeNode list, TRuntimeNode ascending, co
     return BuildSort(__func__, list, ascending, keyExtractor);
 }
 
+TRuntimeNode TProgramBuilder::WideTop(TRuntimeNode flow, TRuntimeNode count, const std::vector<std::pair<ui32, TRuntimeNode>>& keys)
+{
+    return BuildWideTop(__func__, flow, count, keys);
+}
+
+TRuntimeNode TProgramBuilder::WideTopSort(TRuntimeNode flow, TRuntimeNode count, const std::vector<std::pair<ui32, TRuntimeNode>>& keys)
+{
+    return BuildWideTop(__func__, flow, count, keys);
+}
+
+TRuntimeNode TProgramBuilder::BuildWideTop(const std::string_view& callableName, TRuntimeNode flow, TRuntimeNode count, const std::vector<std::pair<ui32, TRuntimeNode>>& keys) {
+    if constexpr (RuntimeVersion < 33U) {
+        THROW yexception() << "Runtime version (" << RuntimeVersion << ") too old for " << callableName;
+    }
+
+    const auto width = AS_TYPE(TTupleType, AS_TYPE(TFlowType, flow.GetStaticType())->GetItemType())->GetElementsCount();
+    MKQL_ENSURE(!keys.empty() && keys.size() <= width, "Unexpected keys count: " << keys.size());
+
+    TCallableBuilder callableBuilder(Env, callableName, flow.GetStaticType());
+    callableBuilder.Add(flow);
+    callableBuilder.Add(count);
+    std::for_each(keys.cbegin(), keys.cend(), [&](const std::pair<ui32, TRuntimeNode>& key) {
+        MKQL_ENSURE(key.first < width, "Key index too large: " << key.first);
+        callableBuilder.Add(NewDataLiteral(key.first));
+        callableBuilder.Add(key.second);
+    });
+    return TRuntimeNode(callableBuilder.Build(), false);
+}
+
 TRuntimeNode TProgramBuilder::Top(TRuntimeNode flow, TRuntimeNode count, TRuntimeNode ascending, const TUnaryLambda& keyExtractor) {
     if (const auto flowType = flow.GetStaticType(); flowType->IsFlow() || flowType->IsStream()) {
-        const auto itemType = flowType->IsFlow() ? AS_TYPE(TFlowType, flowType)->GetItemType() : AS_TYPE(TStreamType, flowType)->GetItemType();
-        const auto finalKeyExtractor = [&](TRuntimeNode item) { return Nth(item, 1U); };
 
-        return Map(FlatMap(Condense1(flow,
-                [&](TRuntimeNode item) { return AsList(NewTuple({Pickle(item), keyExtractor(item)})); },
+        return FlatMap(Condense1(flow,
+                [&](TRuntimeNode item) { return AsList(item); },
                 [this](TRuntimeNode, TRuntimeNode) { return NewDataLiteral<bool>(false); },
-                [&](TRuntimeNode item, TRuntimeNode state) { return KeepTop(count, state, NewTuple({Pickle(item), keyExtractor(item)}), ascending, finalKeyExtractor); }
+                [&](TRuntimeNode item, TRuntimeNode state) { return KeepTop(count, state, item, ascending, keyExtractor); }
             ),
-            [&](TRuntimeNode list) { return Top(list, count, ascending, finalKeyExtractor); }
-        ), [&](TRuntimeNode item) {
-            return Unpickle(itemType, Nth(item, 0U));
-        });
+            [&](TRuntimeNode list) { return Top(list, count, ascending, keyExtractor); }
+        );
     }
 
     return BuildListNth(__func__, flow, count, ascending, keyExtractor);
@@ -1682,19 +1707,15 @@ TRuntimeNode TProgramBuilder::Top(TRuntimeNode flow, TRuntimeNode count, TRuntim
 
 TRuntimeNode TProgramBuilder::TopSort(TRuntimeNode flow, TRuntimeNode count, TRuntimeNode ascending, const TUnaryLambda& keyExtractor) {
     if (const auto flowType = flow.GetStaticType(); flowType->IsFlow() || flowType->IsStream()) {
-        const auto itemType = flowType->IsFlow() ? AS_TYPE(TFlowType, flowType)->GetItemType() : AS_TYPE(TStreamType, flowType)->GetItemType();
-        const auto finalKeyExtractor = [&](TRuntimeNode item) { return Nth(item, 1U); };
-        return Map(FlatMap(Condense1(flow,
-                [&](TRuntimeNode item) { return AsList(NewTuple({Pickle(item), keyExtractor(item)})); },
+        return FlatMap(Condense1(flow,
+                [&](TRuntimeNode item) { return AsList(item); },
                 [this](TRuntimeNode, TRuntimeNode) { return NewDataLiteral<bool>(false); },
                 [&](TRuntimeNode item, TRuntimeNode state) {
-                    return KeepTop(count, state, NewTuple({Pickle(item), keyExtractor(item)}), ascending, finalKeyExtractor);
+                    return KeepTop(count, state, item, ascending, keyExtractor);
                 }
             ),
-            [&](TRuntimeNode list) { return TopSort(list, count, ascending, finalKeyExtractor); }
-        ), [&](TRuntimeNode item) {
-            return Unpickle(itemType, Nth(item, 0U));
-        });
+            [&](TRuntimeNode list) { return TopSort(list, count, ascending, keyExtractor); }
+        );
     }
 
     if constexpr (RuntimeVersion >= 25U)
@@ -5317,6 +5338,31 @@ TRuntimeNode TProgramBuilder::WithContext(TRuntimeNode input, const std::string_
 
 TRuntimeNode TProgramBuilder::PgInternal0(TType* returnType) {
     TCallableBuilder callableBuilder(Env, __func__, returnType);
+    return TRuntimeNode(callableBuilder.Build(), false);
+}
+
+TRuntimeNode TProgramBuilder::BlockIf(TRuntimeNode condition, TRuntimeNode thenBranch, TRuntimeNode elseBranch) {
+    const auto conditionType = AS_TYPE(TBlockType, condition.GetStaticType());
+    MKQL_ENSURE(AS_TYPE(TDataType, conditionType->GetItemType())->GetSchemeType() == NUdf::TDataType<bool>::Id,
+                "Expected bool as first argument");
+
+    const auto thenType = AS_TYPE(TBlockType, thenBranch.GetStaticType());
+    const auto elseType = AS_TYPE(TBlockType, elseBranch.GetStaticType());
+    MKQL_ENSURE(thenType->GetItemType()->IsSameType(*elseType->GetItemType()), "Different return types in branches.");
+
+    auto returnType = NewBlockType(thenType->GetItemType(), GetResultShape({conditionType, thenType, elseType}));
+    TCallableBuilder callableBuilder(Env, __func__, returnType);
+    callableBuilder.Add(condition);
+    callableBuilder.Add(thenBranch);
+    callableBuilder.Add(elseBranch);
+    return TRuntimeNode(callableBuilder.Build(), false);
+}
+
+TRuntimeNode TProgramBuilder::BlockJust(TRuntimeNode data) {
+    const auto initialType = AS_TYPE(TBlockType, data.GetStaticType());
+    auto returnType = NewBlockType(NewOptionalType(initialType->GetItemType()), initialType->GetShape());
+    TCallableBuilder callableBuilder(Env, __func__, returnType);
+    callableBuilder.Add(data);
     return TRuntimeNode(callableBuilder.Build(), false);
 }
 

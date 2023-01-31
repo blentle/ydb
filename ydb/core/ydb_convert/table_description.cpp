@@ -44,7 +44,7 @@ static Ydb::Type* AddColumn(Ydb::Table::ColumnMeta* newColumn, const TColumn& co
     newColumn->set_name(column.GetName());
 
     Ydb::Type* columnType = nullptr;
-    if (column.GetNotNull()) {
+    if (column.GetNotNull() || protoType == NScheme::NTypeIds::Pg) {
         columnType = newColumn->mutable_type();
     } else {
         columnType = newColumn->mutable_type()->mutable_optional_type()->mutable_item();
@@ -103,6 +103,10 @@ void FillColumnDescriptionImpl(TYdbProto& out,
 
     for (const auto& column : in.GetColumns()) {
         auto newColumn = out.add_columns();
+        Y_ENSURE(
+            column.GetTypeId() != NScheme::NTypeIds::Pg || !column.GetNotNull(),
+            "It is not allowed to create NOT NULL column with pg type"
+        );
         Ydb::Type* columnType = AddColumn(newColumn, column);
 
         if (columnIdToKeyPos.count(column.GetId())) {
@@ -136,6 +140,10 @@ void FillColumnDescription(Ydb::Table::DescribeTableResult& out, const NKikimrSc
     auto& schema = in.GetSchema();
 
     for (const auto& column : schema.GetColumns()) {
+        Y_ENSURE(
+            column.GetTypeId() != NScheme::NTypeIds::Pg || !column.GetNotNull(),
+            "It is not allowed to create NOT NULL column with pg type"
+        );
         auto newColumn = out.add_columns();
         AddColumn(newColumn, column);
     }
@@ -225,7 +233,9 @@ bool FillColumnDescription(NKikimrSchemeOp::TTableDescription& out,
                 return false;
             }
 
-            cd->SetNotNull(true);
+            if (!column.type().has_pg_type()) {
+                cd->SetNotNull(true);
+            }
         }
 
         NScheme::TTypeInfo typeInfo;
@@ -410,7 +420,6 @@ void FillChangefeedDescription(Ydb::Table::DescribeTableResult& out,
         auto changefeed = out.add_changefeeds();
 
         changefeed->set_name(stream.GetName());
-        changefeed->set_state(Ydb::Table::ChangefeedDescription::STATE_ENABLED);
         changefeed->set_virtual_timestamps(stream.GetVirtualTimestamps());
 
         switch (stream.GetMode()) {
@@ -429,6 +438,17 @@ void FillChangefeedDescription(Ydb::Table::DescribeTableResult& out,
         case NKikimrSchemeOp::ECdcStreamFormat::ECdcStreamFormatJson:
             changefeed->set_format(Ydb::Table::ChangefeedFormat::FORMAT_JSON);
             break;
+        default:
+            break;
+        }
+
+        switch (stream.GetState()) {
+        case NKikimrSchemeOp::ECdcStreamState::ECdcStreamStateReady:
+            changefeed->set_state(Ydb::Table::ChangefeedDescription::STATE_ENABLED);
+        case NKikimrSchemeOp::ECdcStreamState::ECdcStreamStateDisabled:
+            changefeed->set_state(Ydb::Table::ChangefeedDescription::STATE_DISABLED);
+        case NKikimrSchemeOp::ECdcStreamState::ECdcStreamStateScan:
+            changefeed->set_state(Ydb::Table::ChangefeedDescription::STATE_INITIAL_SCAN);
         default:
             break;
         }
@@ -463,6 +483,15 @@ bool FillChangefeedDescription(NKikimrSchemeOp::TCdcStreamDescription& out,
         status = Ydb::StatusIds::BAD_REQUEST;
         error = "Invalid changefeed format";
         return false;
+    }
+
+    if (in.initial_scan()) {
+        if (!AppData()->FeatureFlags.GetEnableChangefeedInitialScan()) {
+            status = Ydb::StatusIds::UNSUPPORTED;
+            error = "Changefeed initial scan is not supported yet";
+            return false;
+        }
+        out.SetState(NKikimrSchemeOp::ECdcStreamState::ECdcStreamStateScan);
     }
 
     return true;

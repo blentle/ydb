@@ -257,6 +257,9 @@ public:
     TRuntimeNode BlockOr(TRuntimeNode first, TRuntimeNode second);
     TRuntimeNode BlockXor(TRuntimeNode first, TRuntimeNode second);
 
+    TRuntimeNode BlockIf(TRuntimeNode condition, TRuntimeNode thenBranch, TRuntimeNode elseBranch);
+    TRuntimeNode BlockJust(TRuntimeNode data);
+
     TRuntimeNode BlockFunc(const std::string_view& funcName, TType* returnType, const TArrayRef<const TRuntimeNode>& args);
     TRuntimeNode BlockBitCast(TRuntimeNode value, TType* targetType);
     TRuntimeNode BlockCombineAll(TRuntimeNode flow, std::optional<ui32> filterColumn,
@@ -402,6 +405,9 @@ public:
     TRuntimeNode WideLastCombiner(TRuntimeNode flow, const TWideLambda& keyExtractor, const TBinaryWideLambda& init, const TTernaryWideLambda& update, const TBinaryWideLambda& finish);
     TRuntimeNode WideCondense1(TRuntimeNode stream, const TWideLambda& init, const TWideSwitchLambda& switcher, const TBinaryWideLambda& handler, bool useCtx = false);
 
+    TRuntimeNode WideTop(TRuntimeNode flow, TRuntimeNode count, const std::vector<std::pair<ui32, TRuntimeNode>>& keys);
+    TRuntimeNode WideTopSort(TRuntimeNode flow, TRuntimeNode count, const std::vector<std::pair<ui32, TRuntimeNode>>& keys);
+
     TRuntimeNode Length(TRuntimeNode listOrDict);
     TRuntimeNode Iterator(TRuntimeNode list, const TArrayRef<const TRuntimeNode>& dependentNodes);
     TRuntimeNode EmptyIterator(TType* streamType);
@@ -492,7 +498,7 @@ public:
         const TNarrowLambda& payloadSelector, bool isCompact = false, ui64 itemsCountHint = 0);
     TRuntimeNode NarrowSqueezeToHashedDict(TRuntimeNode stream, bool all, const TNarrowLambda& keySelector,
         const TNarrowLambda& payloadSelector, bool isCompact = false, ui64 itemsCountHint = 0);
-    TRuntimeNode SqueezeToList(TRuntimeNode flow, TRuntimeNode sizeHint);
+    TRuntimeNode SqueezeToList(TRuntimeNode flow, TRuntimeNode limit);
 
     // return list of 2-item tuples with key and payload
     TRuntimeNode DictItems(TRuntimeNode dict);
@@ -716,6 +722,8 @@ private:
     template<bool OnStruct>
     TRuntimeNode BuildFilterNulls(TRuntimeNode list, const TArrayRef<std::conditional_t<OnStruct, const std::string_view, const ui32>>& members,
         const std::conditional_t<OnStruct, std::vector<std::pair<std::string_view, TType*>>, std::vector<TType*>>& filteredItems);
+
+    TRuntimeNode BuildWideTop(const std::string_view& callableName, TRuntimeNode flow, TRuntimeNode count, const std::vector<std::pair<ui32, TRuntimeNode>>& keys);
 
     TRuntimeNode InvokeBinary(const std::string_view& callableName, TType* type, TRuntimeNode data1, TRuntimeNode data2);
     TRuntimeNode AggrCompare(const std::string_view& callableName, TRuntimeNode data1, TRuntimeNode data2);

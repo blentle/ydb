@@ -451,6 +451,7 @@ UDF_ASSERT_TYPE_SIZE(IListTypeBuilder, 8);
 namespace NImpl {
 
 template <typename T> struct TSimpleSignatureHelper;
+template <typename T> struct TSimpleSignatureTypeHelper;
 template <typename T> struct TTypeBuilderHelper;
 template <typename... TArgs> struct TArgsHelper;
 template <typename... TArgs> struct TTupleHelper;
@@ -593,8 +594,7 @@ public:
 #if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 19)
 class IFunctionTypeInfoBuilder9: public IFunctionTypeInfoBuilder8 {
 public:
-    virtual IFunctionTypeInfoBuilder9& BlockImplementationImpl(
-            TUniquePtr<IBoxedValue> impl) = 0;
+    virtual void Unused1() = 0;
 };
 #endif
 
@@ -631,12 +631,22 @@ public:
 class IFunctionTypeInfoBuilder14: public IFunctionTypeInfoBuilder13 {
 public:
     virtual IBlockTypeBuilder::TPtr Block(bool isScalar) const = 0;
-    virtual void Unused1() = 0;
     virtual void Unused2() = 0;
+    virtual void Unused3() = 0;
 };
 #endif
 
-#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 26)
+#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 28)
+class IFunctionTypeInfoBuilder15: public IFunctionTypeInfoBuilder14 {
+public:
+    virtual IFunctionTypeInfoBuilder15& SupportsBlocks() = 0;
+    virtual IFunctionTypeInfoBuilder15& IsStrict() = 0;
+};
+#endif
+
+#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 28)
+using IFunctionTypeInfoBuilderImpl = IFunctionTypeInfoBuilder15;
+#elif UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 26)
 using IFunctionTypeInfoBuilderImpl = IFunctionTypeInfoBuilder14;
 #elif UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 25)
 using IFunctionTypeInfoBuilderImpl = IFunctionTypeInfoBuilder13;
@@ -707,6 +717,11 @@ public:
         return *this;
     }
 
+    template <typename T>
+    TType* SimpleSignatureType() const {
+        return NImpl::TSimpleSignatureTypeHelper<T>::Build(*this);
+    }
+
     IFunctionTypeInfoBuilder& RunConfig(TDataTypeId type) {
         RunConfigImpl(type);
         return *this;
@@ -767,14 +782,6 @@ public:
         const TStringRef& functionName
     ) {
         IRImplementationImpl(moduleIR, moduleIRUniqId, functionName);
-        return *this;
-    }
-#endif
-
-#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 19)
-    IFunctionTypeInfoBuilder& BlockImplementation(
-            TUniquePtr<IBoxedValue> impl) {
-        BlockImplementationImpl(std::move(impl));
         return *this;
     }
 #endif
@@ -1007,6 +1014,16 @@ struct TSimpleSignatureHelper<TReturn(TArgs...)> {
     static void Register(IFunctionTypeInfoBuilder& builder) {
         builder.Returns(TTypeBuilderHelper<TReturn>::Build(builder));
         TArgsHelper<TArgs...>::Add(*builder.Args());
+    }
+};
+
+template <typename TReturn, typename... TArgs>
+struct TSimpleSignatureTypeHelper<TReturn(TArgs...)> {
+    static TType* Build(const IFunctionTypeInfoBuilder& builder) {
+        auto callableBuilder = builder.Callable(sizeof...(TArgs));
+        callableBuilder->Returns(TTypeBuilderHelper<TReturn>::Build(builder));
+        TCallableArgsHelper<TArgs...>::Arg(*callableBuilder, builder);
+        return callableBuilder->Build();
     }
 };
 

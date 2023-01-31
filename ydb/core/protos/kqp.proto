@@ -223,6 +223,7 @@ message TPreparedQuery {
     repeated TParameterDescription Parameters = 4;
     optional string Text = 5;
     optional NKqpProto.TKqpPhyQuery PhysicalQuery = 6;
+    optional bool EnableLlvm = 7;
 };
 
 message TQueryResponse {
@@ -584,7 +585,7 @@ message TEvKillScanTablet {
 }
 
 message TKqpStreamLookupSettings {
-     optional NKqpProto.TKqpPhyTable Table = 1;
+     optional NKqpProto.TKqpPhyTableId Table = 1;
      repeated string KeyColumns = 2;
      repeated string Columns = 3;
      optional TKqpSnapshot Snapshot = 4;

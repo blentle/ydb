@@ -1,5 +1,6 @@
 #include "executor_thread.h"
 #include "actorsystem.h"
+#include "actor.h"
 #include "callstack.h"
 #include "mailbox.h"
 #include "event.h"
@@ -51,16 +52,9 @@ namespace NActors {
             &Ctx.WorkerStats);
     }
 
-    TActorId TExecutorThread::RegisterActor(IActor* actor, TMailboxType::EType mailboxType, ui32 poolId, const TActorId& parentId) {
-        if (poolId == Max<ui32>())
-            return Ctx.Executor->Register(actor, mailboxType, ++RevolvingWriteCounter, parentId ? parentId : CurrentRecipient);
-        else
-            return ActorSystem->Register(actor, mailboxType, poolId, ++RevolvingWriteCounter, parentId ? parentId : CurrentRecipient);
-    }
 
-    TActorId TExecutorThread::RegisterActor(IActor* actor, TMailboxHeader* mailbox, ui32 hint, const TActorId& parentId) {
-        return Ctx.Executor->Register(actor, mailbox, hint, parentId ? parentId : CurrentRecipient);
-    }
+    TExecutorThread::~TExecutorThread()
+    { }
 
     void TExecutorThread::UnregisterActor(TMailboxHeader* mailbox, TActorId actorId) {
         Y_VERIFY_DEBUG(IsUnitedWorker || actorId.PoolID() == ExecutorPool->PoolId && ExecutorPool->ResolveMailbox(actorId.Hint()) == mailbox);
@@ -125,20 +119,25 @@ namespace NActors {
                 SafeTypeName(actorType));
     }
 
-    template <typename TMailbox>
-    void TExecutorThread::Execute(TMailbox* mailbox, ui32 hint) {
+    template <typename TMailbox, bool IsTailExecution>
+    bool TExecutorThread::Execute(TMailbox* mailbox, ui32 hint) {
         Y_VERIFY_DEBUG(DyingActors.empty());
 
         bool reclaimAsFree = false;
 
-        NHPTimer::STime hpstart = GetCycleCountFast();
-        NHPTimer::STime hpprev = hpstart;
+        if constexpr (!IsTailExecution) {
+            Ctx.HPStart = GetCycleCountFast();
+            Ctx.ExecutedEvents = 0;
+        }
+        NHPTimer::STime hpprev = Ctx.HPStart;
 
         IActor* actor = nullptr;
         const std::type_info* actorType = nullptr;
         ui32 prevActivityType = std::numeric_limits<ui32>::max();
         TActorId recipient;
-        for (ui32 executed = 0; executed < Ctx.EventsPerMailbox; ++executed) {
+        bool firstEvent = true;
+        bool preempted = false;
+        for (; Ctx.ExecutedEvents < Ctx.EventsPerMailbox; ++Ctx.ExecutedEvents) {
             TAutoPtr<IEventHandle> ev(mailbox->Pop());
             if (!!ev) {
                 NHPTimer::STime hpnow;
@@ -157,17 +156,18 @@ namespace NActors {
                     CurrentRecipient = recipient;
                     CurrentActorScheduledEventsCounter = 0;
 
-                    if (executed == 0) {
+                    if (firstEvent) {
                         double usec = Ctx.AddActivationStats(AtomicLoad(&mailbox->ScheduleMoment), hpprev);
                         if (usec > 500) {
                             GLOBAL_LWPROBE(ACTORLIB_PROVIDER, SlowActivation, Ctx.PoolId, usec / 1000.0);
                         }
+                        firstEvent = false;
                     }
 
                     i64 usecDeliv = Ctx.AddEventDeliveryStats(ev->SendTime, hpprev);
                     if (usecDeliv > 5000) {
-                        double sinceActivationMs = NHPTimer::GetSeconds(hpprev - hpstart) * 1000.0;
-                        LwTraceSlowDelivery(ev.Get(), actorType, Ctx.PoolId, CurrentRecipient, NHPTimer::GetSeconds(hpprev - ev->SendTime) * 1000.0, sinceActivationMs, executed);
+                        double sinceActivationMs = NHPTimer::GetSeconds(hpprev - Ctx.HPStart) * 1000.0;
+                        LwTraceSlowDelivery(ev.Get(), actorType, Ctx.PoolId, CurrentRecipient, NHPTimer::GetSeconds(hpprev - ev->SendTime) * 1000.0, sinceActivationMs, Ctx.ExecutedEvents);
                     }
 
                     ui32 evTypeForTracing = ev->Type;
@@ -215,6 +215,21 @@ namespace NActors {
 
                 hpprev = hpnow;
 
+                if (TlsThreadContext->CapturedType == ESendingType::Tail) {
+                    AtomicStore(&mailbox->ScheduleMoment, hpnow);
+                    Ctx.IncrementMailboxPushedOutByTailSending();
+                    LWTRACK(MailboxPushedOutByTailSending,
+                            Ctx.Orbit,
+                            Ctx.PoolId,
+                            Ctx.Executor->GetName(),
+                            Ctx.ExecutedEvents + 1,
+                            CyclesToDuration(hpnow - Ctx.HPStart),
+                            Ctx.WorkerId,
+                            recipient.ToString(),
+                            SafeTypeName(actorType));
+                    break;
+                }
+
                 // Soft preemption in united pool
                 if (Ctx.SoftDeadlineTs < (ui64)hpnow) {
                     AtomicStore(&mailbox->ScheduleMoment, hpnow);
@@ -223,53 +238,56 @@ namespace NActors {
                             Ctx.Orbit,
                             Ctx.PoolId,
                             Ctx.Executor->GetName(),
-                            executed + 1,
-                            CyclesToDuration(hpnow - hpstart),
+                            Ctx.ExecutedEvents + 1,
+                            CyclesToDuration(hpnow - Ctx.HPStart),
                             Ctx.WorkerId,
                             recipient.ToString(),
                             SafeTypeName(actorType));
+                    preempted = true;
                     break;
                 }
 
                 // time limit inside one mailbox passed, let others do some work
-                if (hpnow - hpstart > (i64)Ctx.TimePerMailboxTs) {
+                if (hpnow - Ctx.HPStart > (i64)Ctx.TimePerMailboxTs) {
                     AtomicStore(&mailbox->ScheduleMoment, hpnow);
                     Ctx.IncrementMailboxPushedOutByTime();
                     LWTRACK(MailboxPushedOutByTime,
                             Ctx.Orbit,
                             Ctx.PoolId,
                             Ctx.Executor->GetName(),
-                            executed + 1,
-                            CyclesToDuration(hpnow - hpstart),
+                            Ctx.ExecutedEvents + 1,
+                            CyclesToDuration(hpnow - Ctx.HPStart),
                             Ctx.WorkerId,
                             recipient.ToString(),
                             SafeTypeName(actorType));
+                    preempted = true;
                     break;
                 }
 
-                if (executed + 1 == Ctx.EventsPerMailbox) {
+                if (Ctx.ExecutedEvents + 1 == Ctx.EventsPerMailbox) {
                     AtomicStore(&mailbox->ScheduleMoment, hpnow);
                     Ctx.IncrementMailboxPushedOutByEventCount();
                     LWTRACK(MailboxPushedOutByEventCount,
                             Ctx.Orbit,
                             Ctx.PoolId,
                             Ctx.Executor->GetName(),
-                            executed + 1,
-                            CyclesToDuration(hpnow - hpstart),
+                            Ctx.ExecutedEvents + 1,
+                            CyclesToDuration(hpnow - Ctx.HPStart),
                             Ctx.WorkerId,
                             recipient.ToString(),
                             SafeTypeName(actorType));
+                    preempted = true;
                     break;
                 }
             } else {
-                if (executed == 0)
+                if (Ctx.ExecutedEvents == 0)
                     Ctx.IncrementEmptyMailboxActivation();
                 LWTRACK(MailboxEmpty,
                         Ctx.Orbit,
                         Ctx.PoolId,
                         Ctx.Executor->GetName(),
-                        executed,
-                        CyclesToDuration(GetCycleCountFast() - hpstart),
+                        Ctx.ExecutedEvents,
+                        CyclesToDuration(GetCycleCountFast() - Ctx.HPStart),
                         Ctx.WorkerId,
                         recipient.ToString(),
                         SafeTypeName(actor));
@@ -280,6 +298,7 @@ namespace NActors {
         NProfiling::TMemoryTagScope::Reset(0);
         TlsActivationContext = nullptr;
         UnlockFromExecution(mailbox, Ctx.Executor, reclaimAsFree, hint, Ctx.WorkerId, RevolvingWriteCounter);
+        return preempted;
     }
 
     TThreadId TExecutorThread::GetThreadId() const {
@@ -318,7 +337,7 @@ namespace NActors {
         i64 execCycles = 0;
         i64 nonExecCycles = 0;
 
-        auto executeActivation = [&](ui32 activation) {
+        auto executeActivation = [&]<bool IsTailExecution>(ui32 activation) {
             LWTRACK(ActivationBegin, Ctx.Orbit, Ctx.CpuId, Ctx.PoolId, Ctx.WorkerId, NHPTimer::GetSeconds(Ctx.Lease.GetPreciseExpireTs()) * 1e3);
             readyActivationCount++;
             if (TMailboxHeader* header = Ctx.MailboxTable->Get(activation)) {
@@ -326,23 +345,24 @@ namespace NActors {
                     hpnow = GetCycleCountFast();
                     nonExecCycles += hpnow - hpprev;
                     hpprev = hpnow;
+#define EXECUTE_MAILBOX(type) \
+    case TMailboxType:: type: \
+        { \
+            using TMailBox = TMailboxTable:: T ## type ## Mailbox ; \
+            if (Execute<TMailBox, IsTailExecution>(static_cast<TMailBox*>(header), activation)) { \
+                TlsThreadContext->CapturedType = ESendingType::Lazy; \
+            } \
+        } \
+        break \
+// EXECUTE_MAILBOX
                     switch (header->Type) {
-                        case TMailboxType::Simple:
-                            Execute(static_cast<TMailboxTable::TSimpleMailbox*>(header), activation);
-                            break;
-                        case TMailboxType::Revolving:
-                            Execute(static_cast<TMailboxTable::TRevolvingMailbox*>(header), activation);
-                            break;
-                        case TMailboxType::HTSwap:
-                            Execute(static_cast<TMailboxTable::THTSwapMailbox*>(header), activation);
-                            break;
-                        case TMailboxType::ReadAsFilled:
-                            Execute(static_cast<TMailboxTable::TReadAsFilledMailbox*>(header), activation);
-                            break;
-                        case TMailboxType::TinyReadAsFilled:
-                            Execute(static_cast<TMailboxTable::TTinyReadAsFilledMailbox*>(header), activation);
-                            break;
+                        EXECUTE_MAILBOX(Simple);
+                        EXECUTE_MAILBOX(Revolving);
+                        EXECUTE_MAILBOX(HTSwap);
+                        EXECUTE_MAILBOX(ReadAsFilled);
+                        EXECUTE_MAILBOX(TinyReadAsFilled);
                     }
+#undef EXECUTE_MAILBOX
                     hpnow = GetCycleCountFast();
                     execCycles += hpnow - hpprev;
                     hpprev = hpnow;
@@ -364,13 +384,24 @@ namespace NActors {
         };
 
         for (;;) {
-            if (ui32 waitedActivation = std::exchange(TlsThreadContext->WaitedActivation, 0)) {
-                executeActivation(waitedActivation);
-            } else if (ui32 activation = ExecutorPool->GetReadyActivation(Ctx, ++RevolvingReadCounter)) {
-                executeActivation(activation);
-            } else { // no activation means PrepareStop was called so thread must terminate
+            if (TlsThreadContext->CapturedType == ESendingType::Tail) {
+                TlsThreadContext->CapturedType = ESendingType::Lazy;
+                ui32 activation = std::exchange(TlsThreadContext->CapturedActivation, 0);
+                executeActivation.operator()<true>(activation);
+                continue;
+            }
+            Ctx.HasCapturedMessageBox = TlsThreadContext->CapturedActivation;
+            ui32 activation = ExecutorPool->GetReadyActivation(Ctx, ++RevolvingReadCounter);
+            if (!activation) {
+                activation = std::exchange(TlsThreadContext->CapturedActivation, 0);
+            } else if (TlsThreadContext->CapturedActivation) {
+                ui32 capturedActivation = std::exchange(TlsThreadContext->CapturedActivation, 0);
+                ExecutorPool->ScheduleActivation(capturedActivation);
+            }
+            if (!activation) {
                 break;
             }
+            executeActivation.operator()<false>(activation);
         }
         return nullptr;
     }
@@ -573,4 +604,9 @@ namespace NActors {
             }
         }
     }
+
+    void TExecutorThread::GetCurrentStats(TExecutorThreadStats& statsCopy) const {
+        Ctx.GetCurrentStats(statsCopy);
+    }
+
 }

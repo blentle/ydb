@@ -3396,8 +3396,8 @@ namespace {
         }
 
 
-        const auto retItemType = GetSeqItemType(lambdaListHandler->GetTypeAnn());
-        input->SetTypeAnn(MakeSequenceType(input->Head().GetTypeAnn()->GetKind(), *retItemType, ctx.Expr));
+        const auto& retItemType = GetSeqItemType(*lambdaListHandler->GetTypeAnn());
+        input->SetTypeAnn(MakeSequenceType(input->Head().GetTypeAnn()->GetKind(), retItemType, ctx.Expr));
         return IGraphTransformer::TStatus::Ok;
     }
 
@@ -5339,6 +5339,8 @@ namespace {
             }
 
             input->SetTypeAnn(retType);
+        } else if (name == "some") {
+            input->SetTypeAnn(lambda->GetTypeAnn());
         } else {
             ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
                 TStringBuilder() << "Unsupported agg name: " << name));

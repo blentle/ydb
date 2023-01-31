@@ -2,12 +2,14 @@
 
 #include "defs.h"
 
-#include "actorsystem.h"
+//#include "actorsystem.h"
 #include "event.h"
+#include "executor_pool.h"
 #include "lease.h"
 #include "mailbox.h"
 #include "mon_stats.h"
 
+#include <library/cpp/actors/util/cpumask.h>
 #include <library/cpp/actors/util/datetime.h>
 #include <library/cpp/actors/util/intrinsics.h>
 #include <library/cpp/actors/util/thread.h>
@@ -28,6 +30,9 @@ namespace NActors {
         TExecutorThreadStats WorkerStats;
         TPoolId PoolId = MaxPools;
         mutable NLWTrace::TOrbit Orbit;
+        bool HasCapturedMessageBox = false;
+        i64 HPStart = 0;
+        ui32 ExecutedEvents = 0;
 
         TWorkerContext(TWorkerId workerId, TCpuId cpuId, size_t activityVecSize)
             : WorkerId(workerId)
@@ -73,6 +78,10 @@ namespace NActors {
 
         inline void IncrementNonDeliveredEvents() {
             RelaxedStore(&Stats->NonDeliveredEvents, RelaxedLoad(&Stats->NonDeliveredEvents) + 1);
+        }
+
+        inline void IncrementMailboxPushedOutByTailSending() {
+            RelaxedStore(&Stats->MailboxPushedOutByTailSending, RelaxedLoad(&Stats->MailboxPushedOutByTailSending) + 1);
         }
 
         inline void IncrementMailboxPushedOutBySoftPreemption() {
@@ -137,6 +146,7 @@ namespace NActors {
         inline void AddBlockedCycles(i64) {}
         inline void IncrementSentEvents() {}
         inline void IncrementPreemptedEvents() {}
+        inline void IncrementMailboxPushedOutByTailSending() {}
         inline void IncrementMailboxPushedOutBySoftPreemption() {}
         inline void IncrementMailboxPushedOutByTime() {}
         inline void IncrementMailboxPushedOutByEventCount() {}

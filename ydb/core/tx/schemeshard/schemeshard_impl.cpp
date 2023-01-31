@@ -56,14 +56,7 @@ bool ResolvePoolNames(
 
 const TSchemeLimits TSchemeShard::DefaultLimits = {};
 
-void TSchemeShard::ActivateAfterInitialization(const TActorContext& ctx,
-                                                   TSideEffects::TPublications&& delayPublications,
-                                                   const TVector<ui64>& exportIds,
-                                                   const TVector<ui64>& importsIds,
-                                                   TVector<TPathId>&& tablesToClean,
-                                                   TDeque<TPathId>&& blockStoreVolumesToClean
-                                                   )
-{
+void TSchemeShard::ActivateAfterInitialization(const TActorContext& ctx, TActivationOpts&& opts) {
     TPathId subDomainPathId = GetCurrentSubDomainPathId();
     TSubDomainInfo::TPtr domainPtr = ResolveDomainInfo(subDomainPathId);
     LoginProvider.Audience = TPath::Init(subDomainPathId, this).PathString();
@@ -74,14 +67,14 @@ void TSchemeShard::ActivateAfterInitialization(const TActorContext& ctx,
         GetDomainKey(subDomainPathId), sysViewProcessorId ? sysViewProcessorId.GetValue() : 0);
     Send(SysPartitionStatsCollector, evInit.Release());
 
-    Execute(CreateTxInitPopulator(std::move(delayPublications)), ctx);
+    Execute(CreateTxInitPopulator(std::move(opts.DelayPublications)), ctx);
 
-    if (tablesToClean) {
-        Execute(CreateTxCleanTables(std::move(tablesToClean)), ctx);
+    if (opts.TablesToClean) {
+        Execute(CreateTxCleanTables(std::move(opts.TablesToClean)), ctx);
     }
 
-    if (blockStoreVolumesToClean) {
-        Execute(CreateTxCleanBlockStoreVolumes(std::move(blockStoreVolumesToClean)), ctx);
+    if (opts.BlockStoreVolumesToClean) {
+        Execute(CreateTxCleanBlockStoreVolumes(std::move(opts.BlockStoreVolumesToClean)), ctx);
     }
 
     if (IsDomainSchemeShard) {
@@ -114,8 +107,9 @@ void TSchemeShard::ActivateAfterInitialization(const TActorContext& ctx,
         SVPMigrator = Register(CreateSVPMigrator(TabletID(), SelfId(), std::move(migrations)).Release());
     }
 
-    ResumeExports(exportIds, ctx);
-    ResumeImports(importsIds, ctx);
+    ResumeExports(opts.ExportIds, ctx);
+    ResumeImports(opts.ImportsIds, ctx);
+    ResumeCdcStreamScans(opts.CdcStreamScans, ctx);
 
     ParentDomainLink.SendSync(ctx);
 
@@ -139,8 +133,8 @@ ui64 TSchemeShard::Generation() const {
 }
 
 struct TAttachOrder {
-    TGlobalTimestamp DropAt;
-    TGlobalTimestamp CreateAt;
+    TVirtualTimestamp DropAt;
+    TVirtualTimestamp CreateAt;
     TPathId PathId;
 
     explicit TAttachOrder(TPathElement::TPtr path)
@@ -213,6 +207,16 @@ struct TAttachOrder {
 
     }
 };
+
+THolder<TEvDataShard::TEvProposeTransaction> TSchemeShard::MakeDataShardProposal(
+        const TPathId& pathId, const TOperationId& opId,
+        const TString& body, const TActorContext& ctx) const
+{
+    return MakeHolder<TEvDataShard::TEvProposeTransaction>(
+        NKikimrTxDataShard::TX_KIND_SCHEME, TabletID(), ctx.SelfID,
+        ui64(opId.GetTxId()), body, SelectProcessingParams(pathId)
+    );
+}
 
 TTxId TSchemeShard::GetCachedTxId(const TActorContext &ctx) {
     TTxId txId = InvalidTxId;
@@ -509,6 +513,7 @@ void TSchemeShard::ClearDescribePathCaches(const TPathElement::TPtr node, bool f
         Y_VERIFY(Tables.contains(node->PathId));
         TTableInfo::TPtr tabletInfo = Tables.at(node->PathId);
         tabletInfo->PreSerializedPathDescription.clear();
+        tabletInfo->PreSerializedPathDescriptionWithoutRangeKey.clear();
     }
 }
 
@@ -1389,9 +1394,11 @@ TPathElement::EPathState TSchemeShard::CalcPathState(TTxState::ETxType txType, T
     case TTxState::TxAlterColumnTable:
     case TTxState::TxAlterCdcStream:
     case TTxState::TxAlterCdcStreamAtTable:
+    case TTxState::TxAlterCdcStreamAtTableDropSnapshot:
     case TTxState::TxCreateCdcStreamAtTable:
-    case TTxState::TxCreateCdcStreamAtTableWithSnapshot:
+    case TTxState::TxCreateCdcStreamAtTableWithInitialScan:
     case TTxState::TxDropCdcStreamAtTable:
+    case TTxState::TxDropCdcStreamAtTableDropSnapshot:
     case TTxState::TxAlterSequence:
     case TTxState::TxAlterReplication:
     case TTxState::TxAlterBlobDepot:
@@ -1609,6 +1616,10 @@ void TSchemeShard::PersistRemoveCdcStream(NIceDb::TNiceDb &db, const TPathId& pa
     }
 
     db.Table<Schema::CdcStream>().Key(pathId.OwnerId, pathId.LocalPathId).Delete();
+
+    for (const auto& [shardIdx, _] : stream->ScanShards) {
+        RemoveCdcStreamScanShardStatus(db, pathId, shardIdx);
+    }
 
     CdcStreams.erase(pathId);
     DecrementPathDbRefCount(pathId);
@@ -2068,13 +2079,11 @@ void TSchemeShard::PersistSnapshotTable(NIceDb::TNiceDb& db, const TTxId snapsho
 }
 
 void TSchemeShard::PersistSnapshotStepId(NIceDb::TNiceDb& db, const TTxId snapshotId, const TStepId stepId) {
-    db.Table<Schema::SnapshotSteps>().Key(snapshotId).Update(
-        NIceDb::TUpdate<Schema::SnapshotSteps::StepId>(stepId));
+    db.Table<Schema::SnapshotSteps>().Key(snapshotId).Update(NIceDb::TUpdate<Schema::SnapshotSteps::StepId>(stepId));
 }
 
 void TSchemeShard::PersistDropSnapshot(NIceDb::TNiceDb& db, const TTxId snapshotId, const TPathId tableId) {
     db.Table<Schema::SnapshotTables>().Key(snapshotId, tableId.OwnerId, tableId.LocalPathId).Delete();
-
     db.Table<Schema::SnapshotSteps>().Key(snapshotId).Delete();
 }
 
@@ -3613,7 +3622,7 @@ TTabletTypes::EType TSchemeShard::GetTabletType(TTabletId tabletId) const {
     return pShardInfo->TabletType;
 }
 
-TTabletId TSchemeShard::ResolveHive(TPathId pathId, const TActorContext& ctx) const {
+TTabletId TSchemeShard::ResolveHive(TPathId pathId, const TActorContext& ctx, EHiveSelection selection) const {
     if (!PathsById.contains(pathId)) {
         return GetGlobalHive(ctx);
     }
@@ -3621,7 +3630,8 @@ TTabletId TSchemeShard::ResolveHive(TPathId pathId, const TActorContext& ctx) co
     TSubDomainInfo::TPtr subdomain = ResolveDomainInfo(pathId);
 
     // for paths inside subdomain and their shards we choose Hive according to that order: tenant, shared, global
-    if (subdomain->GetTenantHiveID()) {
+
+    if (selection != EHiveSelection::IGNORE_TENANT && subdomain->GetTenantHiveID()) {
         return subdomain->GetTenantHiveID();
     }
 
@@ -3632,12 +3642,16 @@ TTabletId TSchemeShard::ResolveHive(TPathId pathId, const TActorContext& ctx) co
     return GetGlobalHive(ctx);
 }
 
+TTabletId TSchemeShard::ResolveHive(TPathId pathId, const TActorContext& ctx) const {
+    return ResolveHive(pathId, ctx, EHiveSelection::ANY);
+}
+
 TTabletId TSchemeShard::ResolveHive(TShardIdx shardIdx, const TActorContext& ctx) const {
     if (!ShardInfos.contains(shardIdx)) {
         return GetGlobalHive(ctx);
     }
 
-    return ResolveHive(ShardInfos.at(shardIdx).PathId, ctx);
+    return ResolveHive(ShardInfos.at(shardIdx).PathId, ctx, EHiveSelection::ANY);
 }
 
 void TSchemeShard::DoShardsDeletion(const THashSet<TShardIdx>& shardIdxs, const TActorContext& ctx) {
@@ -3953,6 +3967,12 @@ void TSchemeShard::Die(const TActorContext &ctx) {
         ctx.Send(SVPMigrator, new TEvents::TEvPoisonPill());
     }
 
+    if (CdcStreamScanFinalizer) {
+        ctx.Send(CdcStreamScanFinalizer, new TEvents::TEvPoisonPill());
+    }
+
+    IndexBuildPipes.Shutdown(ctx);
+    CdcStreamScanPipes.Shutdown(ctx);
     ShardDeleter.Shutdown(ctx);
     ParentDomainLink.Shutdown(ctx);
 
@@ -4237,6 +4257,11 @@ void TSchemeShard::StateWork(STFUNC_SIG) {
         HFuncTraced(TEvDataShard::TEvBuildIndexProgressResponse, Handle);
         HFuncTraced(TEvPrivate::TEvIndexBuildingMakeABill, Handle);
         // } // NIndexBuilder
+
+        //namespace NCdcStreamScan {
+        HFuncTraced(TEvPrivate::TEvRunCdcStreamScan, Handle);
+        HFuncTraced(TEvDataShard::TEvCdcStreamScanResponse, Handle);
+        // } // NCdcStreamScan
 
         // namespace NLongRunningCommon {
         HFuncTraced(TEvTxAllocatorClient::TEvAllocateResult, Handle);
@@ -4683,8 +4708,7 @@ void TSchemeShard::Handle(TEvDataShard::TEvSchemaChanged::TPtr& ev, const TActor
                    << " for unknown txId " <<  txId
                    << " message# " << ev->Get()->Record.DebugString());
 
-        THolder<TEvDataShard::TEvSchemaChangedResult> event =
-            THolder(new TEvDataShard::TEvSchemaChangedResult(ui64(txId)));
+        auto event = MakeHolder<TEvDataShard::TEvSchemaChangedResult>(ui64(txId));
         ctx.Send(ackTo, event.Release());
         return;
     }
@@ -4696,8 +4720,7 @@ void TSchemeShard::Handle(TEvDataShard::TEvSchemaChanged::TPtr& ev, const TActor
                    << " for unknown part in txId: " <<  txId
                    << " message# " << ev->Get()->Record.DebugString());
 
-        THolder<TEvDataShard::TEvSchemaChangedResult> event =
-            THolder(new TEvDataShard::TEvSchemaChangedResult(ui64(txId)));
+        auto event = MakeHolder<TEvDataShard::TEvSchemaChangedResult>(ui64(txId));
         ctx.Send(ackTo, event.Release());
         return;
     }
@@ -4777,9 +4800,8 @@ void TSchemeShard::Handle(TEvSchemeShard::TEvModifySchemeTransaction::TPtr &ev, 
     if (IsReadOnlyMode) {
         ui64 txId = ev->Get()->Record.GetTxId();
         ui64 selfId = TabletID();
-        THolder<TEvSchemeShard::TEvModifySchemeTransactionResult> result =
-                THolder(new TEvSchemeShard::TEvModifySchemeTransactionResult(
-                    NKikimrScheme::StatusReadOnly, txId, selfId, "Schema is in ReadOnly mode"));
+        auto result = MakeHolder<TEvSchemeShard::TEvModifySchemeTransactionResult>(
+            NKikimrScheme::StatusReadOnly, txId, selfId, "Schema is in ReadOnly mode");
 
         ctx.Send(ev->Sender, result.Release());
 
@@ -4842,6 +4864,11 @@ void TSchemeShard::Handle(TEvTabletPipe::TEvClientConnected::TPtr &ev, const TAc
         return;
     }
 
+    if (CdcStreamScanPipes.Has(clientId)) {
+        Execute(CreatePipeRetry(CdcStreamScanPipes.GetOwnerId(clientId), CdcStreamScanPipes.GetTabletId(clientId)), ctx);
+        return;
+    }
+
     if (ShardDeleter.Has(tabletId, clientId)) {
         ShardDeleter.ResendDeleteRequests(TTabletId(ev->Get()->TabletId), ShardInfos, ctx);
         return;
@@ -4883,6 +4910,11 @@ void TSchemeShard::Handle(TEvTabletPipe::TEvClientDestroyed::TPtr &ev, const TAc
 
     if (IndexBuildPipes.Has(clientId)) {
         Execute(CreatePipeRetry(IndexBuildPipes.GetOwnerId(clientId), IndexBuildPipes.GetTabletId(clientId)), ctx);
+        return;
+    }
+
+    if (CdcStreamScanPipes.Has(clientId)) {
+        Execute(CreatePipeRetry(CdcStreamScanPipes.GetOwnerId(clientId), CdcStreamScanPipes.GetTabletId(clientId)), ctx);
         return;
     }
 
@@ -6224,85 +6256,6 @@ bool TSchemeShard::ReadSysValue(NIceDb::TNiceDb &db, ui64 sysTag, ui64 &value, u
     return true;
 }
 
-TSchemeShard::TDedicatedPipePool::TDedicatedPipePool() {
-    PipeCfg.RetryPolicy = {
-        .MinRetryTime = TDuration::MilliSeconds(100),
-        .MaxRetryTime = TDuration::Seconds(30),
-    };
-}
-
-void TSchemeShard::TDedicatedPipePool::Create(TIndexBuildId ownerTxId, TTabletId dst, THolder<IEventBase> message, const TActorContext &ctx) {
-    Y_VERIFY(!Pipes[ownerTxId].contains(dst));
-
-    TActorId clientId = ctx.ExecutorThread.RegisterActor(NTabletPipe::CreateClient(ctx.SelfID, ui64(dst), PipeCfg));
-
-    Pipes[ownerTxId][dst] = clientId;
-    Owners[clientId] = TOwnerRec(ownerTxId, dst);
-
-    NTabletPipe::SendData(ctx.SelfID, clientId, message.Release(), 0);
-}
-
-void TSchemeShard::TDedicatedPipePool::Close(TIndexBuildId ownerTxId, TTabletId dst, const TActorContext &ctx) {
-    if (!Pipes.contains(ownerTxId)) {
-        return;
-    }
-
-    if (!Pipes.at(ownerTxId).contains(dst)) {
-        return;
-    }
-
-    TActorId actorId = Pipes.at(ownerTxId).at(dst);
-    NTabletPipe::CloseClient(ctx, actorId);
-
-    Owners.erase(actorId);
-
-    Pipes[ownerTxId].erase(dst);
-    if (Pipes[ownerTxId].empty()) {
-        Pipes.erase(ownerTxId);
-    }
-}
-
-ui64 TSchemeShard::TDedicatedPipePool::CloseAll(TIndexBuildId ownerTxId, const TActorContext &ctx) {
-    if (!Pipes.contains(ownerTxId)) {
-        return 0;
-    }
-
-    TVector<TTabletId> tables;
-    tables.reserve(Pipes[ownerTxId].size());
-
-    for (const auto& x: Pipes) {
-        for (const auto& y: x.second) {
-            tables.push_back(y.first);
-        }
-    }
-
-    for (const auto& x: tables) {
-        Close(ownerTxId, x, ctx);
-    }
-
-    return tables.size();
-}
-
-TIndexBuildId TSchemeShard::TDedicatedPipePool::GetOwnerId(TActorId actorId) const {
-    if (!Has(actorId)) {
-        return InvalidIndexBuildId;
-    }
-
-    return Owners.at(actorId).first;
-}
-
-TTabletId TSchemeShard::TDedicatedPipePool::GetTabletId(TActorId actorId) const {
-    if (!Has(actorId)) {
-        return InvalidTabletId;
-    }
-
-    return Owners.at(actorId).second;
-}
-
-bool TSchemeShard::TDedicatedPipePool::Has(TActorId actorId) const {
-    return Owners.contains(actorId);
-}
-
 void TSchemeShard::SubscribeConsoleConfigs(const TActorContext &ctx) {
     ctx.Send(
         NConsole::MakeConfigsDispatcherID(ctx.SelfID.NodeId()),
@@ -6440,6 +6393,7 @@ void TSchemeShard::ConfigureBackgroundCompactionQueue(
 
     compactionConfig.Timeout = TDuration::Seconds(config.GetTimeoutSeconds());
     compactionConfig.WakeupInterval = TDuration::Seconds(config.GetWakeupIntervalSeconds());
+    compactionConfig.MinWakeupInterval = TDuration::MilliSeconds(config.GetMinWakeupIntervalMs());
     compactionConfig.InflightLimit = config.GetInflightLimit();
     compactionConfig.RoundInterval = TDuration::Seconds(config.GetRoundSeconds());
     compactionConfig.MaxRate = config.GetMaxRate();
@@ -6474,6 +6428,7 @@ void TSchemeShard::ConfigureBorrowedCompactionQueue(
 
     compactionConfig.IsCircular = false;
     compactionConfig.Timeout = TDuration::Seconds(config.GetTimeoutSeconds());
+    compactionConfig.MinWakeupInterval = TDuration::MilliSeconds(config.GetMinWakeupIntervalMs());
     compactionConfig.InflightLimit = config.GetInflightLimit();
     compactionConfig.MaxRate = config.GetMaxRate();
 

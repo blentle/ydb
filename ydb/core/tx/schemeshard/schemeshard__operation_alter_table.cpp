@@ -273,16 +273,9 @@ public:
             LOG_DEBUG_S(context.Ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
                         "Propose modify scheme on datashard " << datashardId << " txid: " << OperationId << " at schemeshard" << ssId);
 
-            auto seqNo = context.SS->StartRound(*txState);
-            TString txBody = context.SS->FillAlterTableTxBody(txState->TargetPathId, idx, seqNo);
-            THolder<TEvDataShard::TEvProposeTransaction> event =
-                MakeHolder<TEvDataShard::TEvProposeTransaction>(NKikimrTxDataShard::TX_KIND_SCHEME,
-                                                        ui64(ssId), //owner schemeshard tablet id
-                                                        context.Ctx.SelfID,
-                                                        ui64(OperationId.GetTxId()),
-                                                        txBody,
-                                                        context.SS->SelectProcessingParams(txState->TargetPathId));
-
+            const auto seqNo = context.SS->StartRound(*txState);
+            const auto txBody = context.SS->FillAlterTableTxBody(txState->TargetPathId, idx, seqNo);
+            auto event = context.SS->MakeDataShardProposal(txState->TargetPathId, OperationId, txBody, context.Ctx);
             context.OnComplete.BindMsgToPipe(OperationId, datashardId, idx, event.Release());
         }
 
@@ -430,15 +423,15 @@ class TAlterTable: public TSubOperation {
         switch (state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
-            return THolder(new TCreateParts(OperationId));
+            return MakeHolder<TCreateParts>(OperationId);
         case TTxState::ConfigureParts:
-            return THolder(new TConfigureParts(OperationId));
+            return MakeHolder<TConfigureParts>(OperationId);
         case TTxState::Propose:
-            return THolder(new TPropose(OperationId));
+            return MakeHolder<TPropose>(OperationId);
         case TTxState::ProposedWaitParts:
-            return THolder(new NTableState::TProposedWaitParts(OperationId));
+            return MakeHolder<NTableState::TProposedWaitParts>(OperationId);
         case TTxState::Done:
-            return THolder(new TDone(OperationId));
+            return MakeHolder<TDone>(OperationId);
         default:
             return nullptr;
         }

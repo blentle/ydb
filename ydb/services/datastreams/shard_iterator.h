@@ -1,19 +1,38 @@
 #pragma once
 
 #include <ydb/core/protos/pqconfig.pb.h>
+#include <ydb/core/protos/msgbus_pq.pb.h>
 #include <library/cpp/string_utils/base64/base64.h>
 #include <util/datetime/base.h>
 
 namespace NKikimr::NDataStreams::V1 {
 
 class TShardIterator {
+using TPartitionOffset =
+    std::invoke_result_t<decltype(&NKikimrClient::TCmdReadResult_TResult::GetOffset),
+                         NKikimrClient::TCmdReadResult_TResult>;
+using TYdsSeqNo =
+    std::invoke_result_t<decltype(&NKikimrPQ::TYdsShardIterator::GetSequenceNumber),
+                         NKikimrPQ::TYdsShardIterator>;
+static_assert(std::is_same<TPartitionOffset, TYdsSeqNo>::value,
+              "Types of partition message offset and yds record sequence number should match");
+
+using TCreationTimestamp =
+    std::invoke_result_t<decltype(&NKikimrClient::TCmdReadResult_TResult::GetCreateTimestampMS),
+                         NKikimrClient::TCmdReadResult_TResult>;
+using TYdsTimestamp =
+    std::invoke_result_t<decltype(&NKikimrPQ::TYdsShardIterator::GetReadTimestampMs),
+                         NKikimrPQ::TYdsShardIterator>;
+static_assert(std::is_same<TCreationTimestamp, TYdsTimestamp>::value,
+              "Types of partition message creation timestamp and yds record timestamp should match");
+                  
 public:
 static constexpr ui64 LIFETIME_MS = TDuration::Minutes(5).MilliSeconds();
 
 TShardIterator(const TString& iteratorStr) : Expired{false}, Valid{true} {
     try {
         TString decoded;
-        Base64Decode(iteratorStr, decoded);
+        Base64StrictDecode(iteratorStr, decoded);
         Valid = Proto.ParseFromString(decoded) && IsAlive(TInstant::Now().MilliSeconds());
         Expired = !IsAlive(TInstant::Now().MilliSeconds());
     } catch (std::exception&) {

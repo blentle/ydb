@@ -90,6 +90,7 @@ namespace NKikimr::NBlobDepot {
             std::vector<TLogoBlobID> deleteQ;
             const bool uncertainWriteBefore = value.UncertainWrite;
             const bool wasUncertain = value.IsWrittenUncertainly();
+            const bool wasGoingToAssimilate = value.GoingToAssimilate;
 
             if (!inserted) {
                 EnumerateBlobsForValueChain(value.ValueChain, Self->TabletID(), [&](TLogoBlobID id, ui32, ui32) {
@@ -158,6 +159,9 @@ namespace NKikimr::NBlobDepot {
             auto row = NIceDb::TNiceDb(txc.DB).Table<Schema::Data>().Key(key.MakeBinaryKey());
             switch (outcome) {
                 case EUpdateOutcome::DROP:
+                    if (wasGoingToAssimilate) {
+                        Self->TabletCounters->Simple()[NKikimrBlobDepot::COUNTER_BYTES_TO_DECOMMIT] -= key.GetBlobId().BlobSize();
+                    }
                     UncertaintyResolver->DropKey(key);
                     Data.erase(it);
                     row.Delete();
@@ -176,6 +180,10 @@ namespace NKikimr::NBlobDepot {
                     if (wasUncertain && !value.IsWrittenUncertainly()) {
                         UncertaintyResolver->MakeKeyCertain(key);
                     }
+                    if (wasGoingToAssimilate != value.GoingToAssimilate) {
+                        const i64 sign = value.GoingToAssimilate - wasGoingToAssimilate;
+                        Self->TabletCounters->Simple()[NKikimrBlobDepot::COUNTER_BYTES_TO_DECOMMIT] += key.GetBlobId().BlobSize() * sign;
+                    }
                     ValidateRecords();
                     return true;
 
@@ -187,6 +195,7 @@ namespace NKikimr::NBlobDepot {
     }
 
     const TData::TValue *TData::FindKey(const TKey& key) const {
+        Y_VERIFY(IsKeyLoaded(key));
         const auto it = Data.find(key);
         return it != Data.end() ? &it->second : nullptr;
     }
@@ -194,7 +203,7 @@ namespace NKikimr::NBlobDepot {
     void TData::UpdateKey(const TKey& key, const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item,
             NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
         STLOG(PRI_DEBUG, BLOB_DEPOT, BDT10, "UpdateKey", (Id, Self->GetLogId()), (Key, key), (Item, item));
-        Y_VERIFY(Loaded || IsKeyLoaded(key));
+        Y_VERIFY(IsKeyLoaded(key));
         UpdateKey(key, txc, cookie, "UpdateKey", [&](TValue& value, bool inserted) {
             if (!inserted) { // update value items
                 value.Meta = item.GetMeta();
@@ -206,27 +215,39 @@ namespace NKikimr::NBlobDepot {
                 auto *chain = value.ValueChain.Add();
                 auto *locator = chain->MutableLocator();
                 locator->CopyFrom(item.GetBlobLocator());
+
+                // clear assimilation flag -- we have blob overwritten with fresh copy (of the same data)
+                value.GoingToAssimilate = false;
             }
 
             return EUpdateOutcome::CHANGE;
         }, item);
     }
 
-    void TData::BindToBlob(const TKey& key, TBlobSeqId blobSeqId, NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
-        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT49, "BindToBlob", (Id, Self->GetLogId()), (Key, key), (BlobSeqId, blobSeqId));
-        Y_VERIFY(Loaded || IsKeyLoaded(key));
-        UpdateKey(key, txc, cookie, "BindToBlob", [&](TValue& value, bool inserted) {
-            if (!value.ValueChain.empty()) {
-                return EUpdateOutcome::NO_CHANGE;
-            } else {
+    void TData::BindToBlob(const TKey& key, TBlobSeqId blobSeqId, bool keep, bool doNotKeep, NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
+        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT49, "BindToBlob", (Id, Self->GetLogId()), (Key, key), (BlobSeqId, blobSeqId),
+            (Keep, keep), (DoNotKeep, doNotKeep));
+        Y_VERIFY(IsKeyLoaded(key));
+        UpdateKey(key, txc, cookie, "BindToBlob", [&](TValue& value, bool /*inserted*/) {
+            EUpdateOutcome outcome = EUpdateOutcome::NO_CHANGE;
+            if (doNotKeep && value.KeepState < EKeepState::DoNotKeep) {
+                value.KeepState = EKeepState::DoNotKeep;
+                outcome = EUpdateOutcome::CHANGE;
+            } else if (keep && value.KeepState < EKeepState::Keep) {
+                value.KeepState = EKeepState::Keep;
+                outcome = EUpdateOutcome::CHANGE;
+            }
+            if (value.ValueChain.empty()) {
                 auto *chain = value.ValueChain.Add();
                 auto *locator = chain->MutableLocator();
                 locator->SetGroupId(Self->Info()->GroupFor(blobSeqId.Channel, blobSeqId.Generation));
                 blobSeqId.ToProto(locator->MutableBlobSeqId());
                 locator->SetTotalDataLen(key.GetBlobId().BlobSize());
                 locator->SetFooterLen(0);
-                return inserted ? EUpdateOutcome::DROP : EUpdateOutcome::CHANGE;
+                value.GoingToAssimilate = false;
+                outcome = EUpdateOutcome::CHANGE;
             }
+            return outcome;
         });
     }
 
@@ -297,33 +318,14 @@ namespace NKikimr::NBlobDepot {
         return it->second;
     }
 
-    void TData::AddLoadSkip(TKey key) {
-        Y_VERIFY(!Loaded);
-        if (!LastLoadedKey || *LastLoadedKey < key) {
-            LoadSkip.insert(std::move(key));
-        }
-    }
-
-    void TData::AddDataOnLoad(TKey key, TString value, bool uncertainWrite, bool skip) {
-        if (skip) {
-            Y_VERIFY_DEBUG(!LastLoadedKey || *LastLoadedKey < key);
-            AddLoadSkip(key);
-        } else {
-            // delete keys that might have been loaded and deleted while we were still loading data
-            LoadSkip.erase(LoadSkip.begin(), LoadSkip.lower_bound(key));
-
-            // check if we have to skip currently loaded key
-            if (LoadSkip.erase(key)) {
-                return;
-            }
-        }
+    void TData::AddDataOnLoad(TKey key, TString value, bool uncertainWrite) {
+        Y_VERIFY_S(!IsKeyLoaded(key), "Id# " << Self->GetLogId() << " Key# " << key.ToString());
 
         NKikimrBlobDepot::TValue proto;
         const bool success = proto.ParseFromString(value);
         Y_VERIFY(success);
 
-        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT79, "AddDataOnLoad", (Id, Self->GetLogId()), (Key, key), (Value, proto),
-            (Skip, skip));
+        STLOG(PRI_DEBUG, BLOB_DEPOT, BDT79, "AddDataOnLoad", (Id, Self->GetLogId()), (Key, key), (Value, proto));
 
         // we can only add key that is not loaded before; if key exists, it MUST have been loaded from the dataset
         const auto [it, inserted] = Data.try_emplace(std::move(key), std::move(proto), uncertainWrite);
@@ -333,13 +335,16 @@ namespace NKikimr::NBlobDepot {
                 AddFirstMentionedBlob(id);
             }
         });
+        if (it->second.GoingToAssimilate) {
+            Self->TabletCounters->Simple()[NKikimrBlobDepot::COUNTER_BYTES_TO_DECOMMIT] += it->first.GetBlobId().BlobSize();
+        }
 
         ValidateRecords();
     }
 
     bool TData::AddDataOnDecommit(const TEvBlobStorage::TEvAssimilateResult::TBlob& blob,
             NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
-        Y_VERIFY(Loaded || IsKeyLoaded(TKey(blob.Id)));
+        Y_VERIFY_S(IsKeyLoaded(TKey(blob.Id)), "Id# " << Self->GetLogId() << " Blob# " << blob.ToString());
 
         return UpdateKey(TKey(blob.Id), txc, cookie, "AddDataOnDecommit", [&](TValue& value, bool inserted) {
             bool change = inserted;
@@ -350,6 +355,11 @@ namespace NKikimr::NBlobDepot {
                 change = true;
             } else if (blob.Keep && value.KeepState < EKeepState::Keep) {
                 value.KeepState = EKeepState::Keep;
+                change = true;
+            }
+
+            if (value.ValueChain.empty() && !value.GoingToAssimilate) {
+                value.GoingToAssimilate = true;
                 change = true;
             }
 
@@ -374,7 +384,7 @@ namespace NKikimr::NBlobDepot {
     }
 
     bool TData::UpdateKeepState(TKey key, EKeepState keepState, NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
-        Y_VERIFY(Loaded || IsKeyLoaded(key));
+        Y_VERIFY(IsKeyLoaded(key));
         return UpdateKey(std::move(key), txc, cookie, "UpdateKeepState", [&](TValue& value, bool inserted) {
              STLOG(PRI_DEBUG, BLOB_DEPOT, BDT51, "UpdateKeepState", (Id, Self->GetLogId()), (Key, key),
                 (KeepState, keepState), (Value, value));
@@ -464,8 +474,7 @@ namespace NKikimr::NBlobDepot {
         STLOG(PRI_DEBUG, BLOB_DEPOT, BDT18, "OnBarrierShift", (Id, Self->GetLogId()), (TabletId, tabletId),
             (Channel, int(channel)), (Hard, hard), (Previous, previous), (Current, current), (MaxItems, maxItems));
 
-        Y_VERIFY(Loaded || (LastLoadedKey && *LastLoadedKey > TKey(TLogoBlobID(tabletId, current.Generation(), current.Step(),
-            channel, TLogoBlobID::MaxBlobSize, TLogoBlobID::MaxCookie, TLogoBlobID::MaxPartId, TLogoBlobID::MaxCrcMode))));
+        Y_VERIFY(Loaded);
 
         const TData::TKey first(TLogoBlobID(tabletId, previous.Generation(), previous.Step(), channel, 0, 0));
         const TData::TKey last(TLogoBlobID(tabletId, current.Generation(), current.Step(), channel,

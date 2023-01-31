@@ -1,7 +1,6 @@
 #include "config.h"
 #include "kikimr_services_initializers.h"
 #include "service_initializer.h"
-#include "version.h"
 
 #include <ydb/core/actorlib_impl/destruct_actor.h>
 #include <ydb/core/actorlib_impl/load_network.h>
@@ -44,6 +43,8 @@
 #include <ydb/core/cms/http.h>
 
 #include <ydb/core/control/immediate_control_board_actor.h>
+
+#include <ydb/core/driver_lib/version/version.h>
 
 #include <ydb/core/grpc_services/grpc_mon.h>
 #include <ydb/core/grpc_services/grpc_request_proxy.h>
@@ -555,6 +556,9 @@ static TInterconnectSettings GetInterconnectSettings(const NKikimrConfig::TInter
     if (config.HasNumPreallocatedBuffers()) {
         result.NumPreallocatedBuffers = config.GetNumPreallocatedBuffers();
     }
+    if (config.HasEnableExternalDataChannel()) {
+        result.EnableExternalDataChannel = config.GetEnableExternalDataChannel();
+    }
 
     return result;
 }
@@ -755,6 +759,17 @@ void TBasicServicesInitializer::InitializeServices(NActors::TActorSystemSetup* s
             if (!nsConfig.GetSuppressVersionCheck()) {
                 icCommon->VersionInfo = VERSION;
                 CheckVersionTag();
+
+                icCommon->CompatibilityInfo = TString();
+                Y_VERIFY(TCompatibilityInfo::MakeStored(NKikimrConfig::TCompatibilityRule::Interconnect).SerializeToString(&*icCommon->CompatibilityInfo));
+                icCommon->ValidateCompatibilityInfo = [&](const TString& peer, TString& errorReason) {
+                    NKikimrConfig::TStoredCompatibilityInfo peerPB;
+                    if (!peerPB.ParseFromString(peer)) {
+                        errorReason = "Cannot parse given CompatibilityInfo";
+                        return false;
+                    }
+                    return TCompatibilityInfo::CheckCompatibility(&peerPB, (ui32)NKikimrConfig::TCompatibilityRule::Interconnect, errorReason);
+                };
             }
 
             setup->LocalServices.emplace_back(GetDestructActorID(), TActorSetupCmd(new TDestructActor,
@@ -2227,11 +2242,12 @@ void THttpProxyServiceInitializer::InitializeServices(NActors::TActorSystemSetup
 
 TConfigsDispatcherInitializer::TConfigsDispatcherInitializer(const TKikimrRunConfig& runConfig)
    : IKikimrServicesInitializer(runConfig)
+   , Labels(runConfig.Labels)
 {
 }
 
 void TConfigsDispatcherInitializer::InitializeServices(NActors::TActorSystemSetup* setup, const NKikimr::TAppData* appData) {
-    IActor* actor = NConsole::CreateConfigsDispatcher(Config);
+    IActor* actor = NConsole::CreateConfigsDispatcher(Config, Labels);
     setup->LocalServices.push_back(std::pair<TActorId, TActorSetupCmd>(
             NConsole::MakeConfigsDispatcherID(NodeId),
             TActorSetupCmd(actor, TMailboxType::HTSwap, appData->UserPoolId)));

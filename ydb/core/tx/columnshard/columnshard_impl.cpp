@@ -247,6 +247,14 @@ bool TColumnShard::HaveOutdatedTxs() const {
     return it->MaxStep <= step;
 }
 
+TWriteId TColumnShard::HasLongTxWrite(const NLongTxService::TLongTxId& longTxId) {
+    auto it = LongTxWritesByUniqueId.find(longTxId.UniqueId);
+    if (it != LongTxWritesByUniqueId.end()) {
+        return (TWriteId)it->second->WriteId;
+    }
+    return (TWriteId)0;
+}
+
 TWriteId TColumnShard::GetLongTxWrite(NIceDb::TNiceDb& db, const NLongTxService::TLongTxId& longTxId) {
     auto it = LongTxWritesByUniqueId.find(longTxId.UniqueId);
     if (it != LongTxWritesByUniqueId.end()) {
@@ -894,7 +902,7 @@ std::unique_ptr<TEvPrivate::TEvEviction> TColumnShard::SetupTtl(const THashMap<u
     actualIndexInfo.SetPathTiering(std::move(eviction));
 
     if (!indexChanges) {
-        LOG_S_NOTICE("Cannot prepare TTL at tablet " << TabletID());
+        LOG_S_DEBUG("Cannot prepare TTL at tablet " << TabletID());
         return {};
     }
     if (indexChanges->NeedRepeat) {

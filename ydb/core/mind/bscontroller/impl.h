@@ -508,7 +508,6 @@ public:
         TMaybe<Table::ErrorReason::Type> ErrorReason;
         TMaybe<Table::NeedAlter::Type> NeedAlter;
         std::optional<NKikimrBlobStorage::TGroupMetrics> GroupMetrics;
-        bool CommitInProgress = false;
 
         bool Down = false; // is group are down right now (not selectable)
         TVector<TIndirectReferable<TVSlotInfo>::TPtr> VDisksInGroup;
@@ -529,7 +528,7 @@ public:
         const ui32 NumVDisksPerFailDomain = 0;
 
         // topology according to the geometry
-        const std::shared_ptr<TBlobStorageGroupInfo::TTopology> Topology;
+        std::shared_ptr<TBlobStorageGroupInfo::TTopology> Topology;
 
         struct TGroupStatus {
             // status derived from the actual state of VDisks (IsReady() to be exact)
@@ -802,6 +801,10 @@ public:
 
         bool IsPhysicalGroup() const {
             return !BlobDepotId && DecommitStatus == NKikimrBlobStorage::TGroupDecommitStatus::NONE;
+        }
+
+        bool IsDecommitted() const {
+            return DecommitStatus != NKikimrBlobStorage::TGroupDecommitStatus::NONE;
         }
 
         void OnCommit();
@@ -1642,6 +1645,7 @@ private:
     void RenderFooter(IOutputStream& out);
     void RenderMonPage(IOutputStream& out);
     void RenderInternalTables(IOutputStream& out, const TString& table);
+    void RenderVirtualGroups(IOutputStream& out);
     void RenderGroupDetail(IOutputStream &out, TGroupId groupId);
     void RenderGroupsInStoragePool(IOutputStream &out, const TBoxStoragePoolId& id);
     void RenderVSlotTable(IOutputStream& out, std::function<void()> callback);

@@ -4,8 +4,6 @@
 #include "schemeshard_path_element.h"
 #include "schemeshard_info_types.h"
 
-#include <ydb/core/tablet_flat/tablet_flat_executor.h>
-
 #include <util/generic/ptr.h>
 #include <util/generic/stack.h>
 
@@ -61,9 +59,12 @@ public:
     void GrabIndex(TSchemeShard* ss, const TPathId& pathId);
 
     void GrabNewCdcStream(TSchemeShard* ss, const TPathId& pathId);
+    void GrabCdcStream(TSchemeShard* ss, const TPathId& pathId);
 
     void GrabNewTableSnapshot(TSchemeShard* ss, const TPathId& pathId, TTxId snapshotTxId);
-    void GrabNewLongLock(TSchemeShard* ss, const TPathId& pathId, TTxId lockTxId);
+
+    void GrabNewLongLock(TSchemeShard* ss, const TPathId& pathId);
+    void GrabLongLock(TSchemeShard* ss, const TPathId& pathId, TTxId lockTxId);
 
     void UnDo(TSchemeShard* ss);
 };

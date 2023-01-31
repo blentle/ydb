@@ -48,6 +48,7 @@ public:
     void Download(
             TString url,
             THeaders headers,
+            std::size_t offset,
             std::size_t sizeLimit,
             TOnResult callback,
             TString data,
@@ -55,6 +56,7 @@ public:
     {
 
         Y_UNUSED(sizeLimit);
+        Y_UNUSED(offset);
         Y_UNUSED(retryPolicy);
 
         auto key = TKeyType(url, headers, data);
@@ -69,15 +71,20 @@ public:
         }
     }
 
-     TCancelHook Download(
-            TString ,
-            THeaders ,
-            std::size_t ,
-            std::size_t ,
-            TOnDownloadStart ,
-            TOnNewDataPart ,
-            TOnDownloadFinish ) final {
+    TCancelHook Download(
+            TString,
+            THeaders,
+            std::size_t,
+            std::size_t,
+            TOnDownloadStart,
+            TOnNewDataPart,
+            TOnDownloadFinish,
+            const ::NMonitoring::TDynamicCounters::TCounterPtr&) final {
         return {};
+    }
+
+    ui64 GetBuffersSizePerStream() final {
+        return 0;
     }
 
     void AddDefaultResponse(TDataDefaultResponse response) {

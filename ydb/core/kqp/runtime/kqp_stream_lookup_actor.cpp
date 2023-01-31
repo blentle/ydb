@@ -10,6 +10,7 @@
 #include <ydb/core/protos/kqp.pb.h>
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
 #include <ydb/core/tx/datashard/datashard.h>
+#include <ydb/core/kqp/common/kqp_event_ids.h>
 
 namespace NKikimr {
 namespace NKqp {
@@ -176,6 +177,21 @@ private:
         return totalDataSize;
     }
 
+    TMaybe<google::protobuf::Any> ExtraData() override {
+        google::protobuf::Any result;
+        NKikimrTxDataShard::TEvKqpInputActorResultInfo resultInfo;
+        for (auto& lock : Locks) {
+            resultInfo.AddLocks()->CopyFrom(lock);
+        }
+
+        for (auto& lock : BrokenLocks) {
+            resultInfo.AddLocks()->CopyFrom(lock);
+        }
+
+        result.PackFrom(resultInfo);
+        return result;
+    }
+
     STFUNC(StateFunc) {
         Y_UNUSED(ctx);
 
@@ -235,16 +251,17 @@ private:
             return;
         }
 
-        if (record.BrokenTxLocksSize()) {
-            return RuntimeError("Transaction locks invalidated.", NYql::NDqProto::StatusIds::ABORTED);
+        for (auto& lock : record.GetBrokenTxLocks()) {
+            BrokenLocks.push_back(lock);
+        }
+
+        for (auto& lock : record.GetTxLocks()) {
+            Locks.push_back(lock);
         }
 
         if (!Snapshot.IsValid() && !record.GetFinished()) {
             // HEAD read was converted to repeatable read
             Snapshot = IKqpGateway::TKqpSnapshot(record.GetSnapshot().GetStep(), record.GetSnapshot().GetTxId());
-        } else if (Snapshot.IsValid()) {
-            YQL_ENSURE(record.GetSnapshot().GetStep() == Snapshot.Step && record.GetSnapshot().GetTxId() == Snapshot.TxId,
-                "Snapshot version mismatch");
         }
 
         // TODO: refactor after KIKIMR-15102
@@ -374,12 +391,21 @@ private:
         YQL_ENSURE(TableScheme);
         YQL_ENSURE(KeyPrefixColumns.size() <= TableScheme->KeyColumnTypes.size());
 
+        TVector<i32> keyColumnOrder;
+        keyColumnOrder.reserve(KeyPrefixColumns.size());
+        for (const auto& keyColumn : KeyPrefixColumns) {
+            auto it = TableScheme->ColumnsByName.find(keyColumn);
+            YQL_ENSURE(it != TableScheme->ColumnsByName.end());
+            keyColumnOrder.push_back(it->second.KeyOrder);
+        }
+
         NUdf::EFetchStatus status;
         NUdf::TUnboxedValue key;
         while ((status = Input.Fetch(key)) == NUdf::EFetchStatus::Ok) {
             std::vector<TCell> keyCells(KeyPrefixColumns.size());
             for (ui32 colId = 0; colId < KeyPrefixColumns.size(); ++colId) {
-                keyCells[colId] = MakeCell(TableScheme->KeyColumnTypes[colId], key.GetElement(colId), TypeEnv, /* copy */ true);
+                keyCells[keyColumnOrder[colId]] = MakeCell(TableScheme->KeyColumnTypes[keyColumnOrder[colId]],
+                    key.GetElement(colId), TypeEnv, /* copy */ true);
             }
 
             UnprocessedKeys.emplace_back(std::move(keyCells));
@@ -473,7 +499,7 @@ private:
             YQL_ENSURE(ImmediateTx, "HEAD reading is only available for immediate txs");
         }
 
-        if (LockTxId) {
+        if (LockTxId && BrokenLocks.empty()) {
             record.SetLockTxId(*LockTxId);
         }
 
@@ -509,7 +535,8 @@ private:
 
     void RetryTableRead(TReadState& failedRead, NKikimrTxDataShard::TReadContinuationToken& token) {
         YQL_ENSURE(token.GetFirstUnprocessedQuery() <= failedRead.Keys.size());
-        std::vector<TOwnedTableRange> unprocessedKeys(failedRead.Keys.size() - token.GetFirstUnprocessedQuery());
+        std::vector<TOwnedTableRange> unprocessedKeys;
+        unprocessedKeys.reserve(failedRead.Keys.size() - token.GetFirstUnprocessedQuery());
         for (ui64 idx = token.GetFirstUnprocessedQuery(); idx < failedRead.Keys.size(); ++idx) {
             unprocessedKeys.emplace_back(std::move(failedRead.Keys[idx]));
         }
@@ -612,6 +639,8 @@ private:
     const TDuration SchemeCacheRequestTimeout;
     NActors::TActorId SchemeCacheRequestTimeoutTimer;
     const TDuration RetryReadTimeout;
+    TVector<NKikimrTxDataShard::TLock> Locks;
+    TVector<NKikimrTxDataShard::TLock> BrokenLocks;
 };
 
 } // namespace

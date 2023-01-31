@@ -10,6 +10,7 @@ namespace NKikimr::NBlobDepot {
         struct TEvPrivate {
             enum {
                 EvResume = EventSpaceBegin(TEvents::ES_PRIVATE),
+                EvResumeScanDataForCopying,
                 EvTxComplete,
             };
         };
@@ -24,16 +25,22 @@ namespace NKikimr::NBlobDepot {
         std::optional<TLogoBlobID> LastScannedKey;
         bool EntriesToProcess = false;
 
-        static constexpr ui32 MaxSizeToQuery = 10'000'000;
+        static constexpr ui32 MaxSizeToQuery = 16'000'000;
 
-        ui32 NumPutsInFlight = 0;
+        static constexpr ui32 MaxGetsUnprocessed = 5;
+        ui64 NextGetId = 1;
+        std::unordered_map<ui64, ui32> GetIdToUnprocessedPuts;
+
+        std::deque<TLogoBlobID> ScanQ;
+        ui32 TotalSize = 0;
 
         TActorId PipeId;
 
         ui64 NextPutId = 1;
-        THashMap<ui64, TData::TKey> PutIdToKey;
+        THashMap<ui64, std::tuple<TData::TKey, ui64>> PutIdToKey;
 
-        class TTxCommitAssimilatedBlob;
+        bool ActionInProgress = false;
+        bool ResumeScanDataForCopyingInFlight = false;
 
     public:
         static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
@@ -54,11 +61,11 @@ namespace NKikimr::NBlobDepot {
     private:
         void Action();
         void SendAssimilateRequest();
-        void Handle(TEvents::TEvUndelivered::TPtr ev);
         void Handle(TEvBlobStorage::TEvAssimilateResult::TPtr ev);
         void ScanDataForCopying();
+        void HandleResumeScanDataForCopying();
         void Handle(TEvBlobStorage::TEvGetResult::TPtr ev);
-        void HandleTxComplete();
+        void HandleTxComplete(TAutoPtr<IEventHandle> ev);
         void Handle(TEvBlobStorage::TEvPutResult::TPtr ev);
         void OnCopyDone();
         void CreatePipe();

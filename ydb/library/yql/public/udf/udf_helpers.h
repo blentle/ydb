@@ -177,6 +177,9 @@ namespace NUdf {
 #define SIMPLE_UDF(udfName, signature) \
     UDF(udfName, builder.SimpleSignature<signature>();)
 
+#define SIMPLE_STRICT_UDF(udfName, signature) \
+    UDF(udfName, builder.SimpleSignature<signature>().IsStrict();)
+
 #define SIMPLE_UDF_WITH_IR(udfName, signature, irResourceId, irFunctionName) \
     UDF_IMPL(udfName, builder.SimpleSignature<signature>();, ;, ;, irResourceId, irFunctionName)
 
@@ -185,6 +188,9 @@ namespace NUdf {
 
 #define SIMPLE_UDF_OPTIONS(udfName, signature, options) \
     UDF(udfName, builder.SimpleSignature<signature>(); options;)
+
+#define SIMPLE_STRICT_UDF_OPTIONS(udfName, signature, options) \
+    UDF(udfName, builder.SimpleSignature<signature>().IsStrict(); options;)
 
 #define SIMPLE_UDF_RUN_OPTIONS(udfName, signature, options) \
     UDF_RUN(udfName, builder.SimpleSignature<signature>(); options;)
@@ -303,6 +309,12 @@ public:
     }
 };
 
+template <typename TUdf>
+struct TUdfTraits {
+    static constexpr bool SupportsBlocks = false;
+    using TBlockUdf = void;
+};
+
 template<typename... TUdfs>
 class TSimpleUdfModuleHelper : public IUdfModule
 {
@@ -317,6 +329,11 @@ public:
         auto r = names.Add(TUdfType::Name());
         if (THasTTypeAwareMarker<TUdfType>::value) {
             r->SetTypeAwareness();
+        }
+
+        if constexpr (TUdfTraits<TUdfType>::SupportsBlocks) {
+            auto rBlocks = names.Add(TUdfTraits<TUdfType>::TBlockUdf::Name());
+            rBlocks->SetTypeAwareness();
         }
     }
 
@@ -336,7 +353,14 @@ public:
     {
         Y_UNUSED(typeConfig);
         bool typesOnly = (flags & TFlags::TypesOnly);
-        return TUdfType::DeclareSignature(name, userType, builder, typesOnly);
+        bool found = TUdfType::DeclareSignature(name, userType, builder, typesOnly);
+        if (!found) {
+           if constexpr (TUdfTraits<TUdfType>::SupportsBlocks) {
+               found = TUdfTraits<TUdfType>::TBlockUdf::DeclareSignature(name, userType, builder, typesOnly);
+           }
+        }
+
+        return found;
     }
 
     template<typename THead1, typename THead2, typename... TTail>

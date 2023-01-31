@@ -85,18 +85,18 @@ public:
         , RuntimeData(runtimeData)
         , TraceId(traceId)
     {
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         YQL_CLOG(DEBUG, ProviderDq) << "TDqWorker created ";
     }
 
     ~TDqWorker()
     {
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         YQL_CLOG(DEBUG, ProviderDq) << "TDqWorker destroyed ";
     }
 
     void DoPassAway() override {
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         for (const auto& inputs : InputMap) {
             Send(inputs.first, new NActors::TEvents::TEvPoison());
         }
@@ -133,7 +133,7 @@ private:
         // between worker_actor <-> executer_actor, cause it transmits statistics in 'Metric' field
         HFunc(NDq::TEvDq::TEvAbortExecution, OnErrorFromPipe);  // received from task_runner_actor
         HFunc(TEvDqFailure, OnError); // received from this actor itself
-        HFunc(TEvContinueRun, OnContinueRun);
+        HFunc(TEvPushFinished, OnPushFinished);
         cFunc(TEvents::TEvWakeup::EventType, OnWakeup);
 
         hFunc(IDqComputeActorAsyncInput::TEvNewAsyncInputDataArrived, OnNewAsyncInputDataArrived);
@@ -205,13 +205,13 @@ private:
         Send(Executer, std::move(ev));
     }
 
-    void OnContinueRun(TEvContinueRun::TPtr&, const TActorContext& ctx) {
+    void OnPushFinished(TEvPushFinished::TPtr&, const TActorContext& ctx) {
         Run(ctx);
     }
 
     void OnDqTask(TEvDqTask::TPtr& ev, const NActors::TActorContext& ctx) {
         Y_UNUSED(ctx);
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         YQL_CLOG(DEBUG, ProviderDq) << "TDqWorker::OnDqTask";
 
         TFailureInjector::Reach("dq_task_failure", [] {::_exit(1); });
@@ -331,7 +331,7 @@ private:
 
     void OnPullRequest(TEvPullDataRequest::TPtr& ev, const NActors::TActorContext& ctx) {
         Y_UNUSED(ctx);
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         YQL_CLOG(TRACE, ProviderDq) << "TDqWorker::OnPullRequest " << ev->Sender;
 
         if (!TaskRunnerActor || !TaskRunnerPrepared) {
@@ -385,7 +385,7 @@ private:
 
     void OnPullResponse(TEvPullDataResponse::TPtr& ev, const NActors::TActorContext& ctx) {
         Y_UNUSED(ctx);
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         YQL_CLOG(TRACE, ProviderDq) << "TDqWorker::OnPullResponse";
 
         Stat.AddCounters(ev->Get()->Record);

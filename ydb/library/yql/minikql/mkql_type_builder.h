@@ -5,10 +5,22 @@
 #include <ydb/library/yql/public/udf/udf_type_builder.h>
 #include <ydb/library/yql/parser/pg_wrapper/interface/compare.h>
 
+#include <util/generic/size_literals.h>
+
 #include <arrow/datum.h>
 
 namespace NKikimr {
 namespace NMiniKQL {
+
+constexpr size_t MaxBlockSizeInBytes = 1_MB;
+static_assert(MaxBlockSizeInBytes < (size_t)std::numeric_limits<i32>::max());
+
+// maximum size of block item in bytes
+size_t CalcMaxBlockItemSize(const TType* type);
+
+inline size_t CalcBlockLen(size_t maxBlockItemSize) {
+    return MaxBlockSizeInBytes / std::max<size_t>(maxBlockItemSize, 1);
+}
 
 bool ConvertArrowType(TType* itemType, std::shared_ptr<arrow::DataType>& type);
 bool ConvertArrowType(NUdf::EDataSlot slot, std::shared_ptr<arrow::DataType>& type);
@@ -38,11 +50,12 @@ struct TFunctionTypeInfo
     const TType* RunConfigType = nullptr;
     const TType* UserType = nullptr;
     NUdf::TUniquePtr<NUdf::IBoxedValue> Implementation;
-    NUdf::TUniquePtr<NUdf::IBoxedValue> BlockImplementation;
     TString ModuleIR;
     TString ModuleIRUniqID;
     TString IRFunctionName;
     bool Deterministic = true;
+    bool SupportsBlocks = false;
+    bool IsStrict = false;
 };
 
 //////////////////////////////////////////////////////////////////////////////
@@ -133,23 +146,23 @@ public:
     NUdf::TType* EmptyList() const override;
     NUdf::TType* EmptyDict() const override;
 
-    NUdf::IFunctionTypeInfoBuilder9& BlockImplementationImpl(
-        NUdf::TUniquePtr<NUdf::IBoxedValue> impl) override;
-
+    void Unused1() override;
     NUdf::ISetTypeBuilder::TPtr Set() const override;
     NUdf::IEnumTypeBuilder::TPtr Enum(ui32 expectedItems = 10) const override;
     NUdf::TType* Tagged(const NUdf::TType* baseType, const NUdf::TStringRef& tag) const override;
     NUdf::TType* Pg(ui32 typeId) const override;
     NUdf::IBlockTypeBuilder::TPtr Block(bool isScalar) const override;
-    void Unused1() override;
     void Unused2() override;
+    void Unused3() override;
+
+    NUdf::IFunctionTypeInfoBuilder15& SupportsBlocks() override;
+    NUdf::IFunctionTypeInfoBuilder15& IsStrict() override;
 
     bool GetSecureParam(NUdf::TStringRef key, NUdf::TStringRef& value) const override;
 
 private:
     const TTypeEnvironment& Env_;
     NUdf::TUniquePtr<NUdf::IBoxedValue> Implementation_;
-    NUdf::TUniquePtr<NUdf::IBoxedValue> BlockImplementation_;
     const TType* ReturnType_;
     const TType* RunConfigType_;
     const TType* UserType_;
@@ -165,6 +178,8 @@ private:
     TString ModuleIR_;
     TString ModuleIRUniqID_;
     TString IRFunctionName_;
+    bool SupportsBlocks_ = false;
+    bool IsStrict_ = false;
 };
 
 class TTypeInfoHelper : public NUdf::ITypeInfoHelper
@@ -176,6 +191,8 @@ public:
     const NYql::NUdf::TPgTypeDescription* FindPgTypeDescription(ui32 typeId) const override;
     NUdf::IArrowType::TPtr MakeArrowType(const NUdf::TType* type) const override;
     NUdf::IArrowType::TPtr ImportArrowType(ArrowSchema* schema) const override;
+    ui64 GetMaxBlockLength(const NUdf::TType* type) const override;
+    ui64 GetMaxBlockBytes() const override;
 
 private:
     static void DoData(const NMiniKQL::TDataType* dt, NUdf::ITypeVisitor* v);

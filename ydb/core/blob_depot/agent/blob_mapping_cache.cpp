@@ -12,7 +12,7 @@ namespace NKikimr::NBlobDepot {
 
     void TBlobDepotAgent::TBlobMappingCache::HandleResolveResult(ui64 tag, const NKikimrBlobDepot::TEvResolveResult& msg,
             TRequestContext::TPtr context) {
-        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA28, "HandleResolveResult", (VirtualGroupId, Agent.VirtualGroupId),
+        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA28, "HandleResolveResult", (AgentId, Agent.LogId),
             (Cookie, tag), (Msg, msg));
 
         auto process = [&](TString key, const NKikimrBlobDepot::TEvResolveResult::TResolvedKey *item) {
@@ -46,10 +46,10 @@ namespace NKikimr::NBlobDepot {
     }
 
     const TResolvedValueChain *TBlobDepotAgent::TBlobMappingCache::ResolveKey(TString key, TQuery *query,
-            TRequestContext::TPtr context) {
+            TRequestContext::TPtr context, bool force) {
         const TStringBuf keyBuf = key;
         auto& entry = Cache.try_emplace(std::move(key), keyBuf).first->second;
-        if (!entry.Values.empty()) {
+        if (!entry.Values.empty() && !force) {
             return &entry.Values;
         }
         if (!entry.ResolveInFlight) {
@@ -84,7 +84,7 @@ namespace NKikimr::NBlobDepot {
             HandleResolveResult(tag, (*p)->Record, std::move(context));
         } else if (std::holds_alternative<TTabletDisconnected>(response)) {
             STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA38, "TBlobMappingCache::TTabletDisconnected",
-                (VirtualGroupId, Agent.VirtualGroupId), (Cookie, tag));
+                (AgentId, Agent.LogId), (Cookie, tag));
             if (auto resolveContext = std::dynamic_pointer_cast<TResolveContext>(context)) {
                 if (const auto it = Cache.find(resolveContext->Key); it != Cache.end() && it->second.ResolveInFlight) {
                     for (const ui64 id : std::exchange(it->second.PendingQueries, {})) {

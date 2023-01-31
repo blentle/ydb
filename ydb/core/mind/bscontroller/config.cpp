@@ -295,7 +295,7 @@ namespace NKikimr::NBsController {
                         continue;
                     }
                     auto& group = overlay->second;
-                    if (base->second->Generation != group->Generation || group->MoodChanged) {
+                    if ((base->second->Generation != group->Generation || group->MoodChanged) && group->VDisksInGroup) {
                         // process only groups with changed content; create topology for group
                         auto& topology = *group->Topology;
                         // fill in vector of failed disks (that are not fully operational)
@@ -823,6 +823,8 @@ namespace NKikimr::NBsController {
             pb->SetDecommitStatus(pdisk.DecommitStatus);
             pb->MutablePDiskMetrics()->CopyFrom(pdisk.Metrics);
             pb->MutablePDiskMetrics()->ClearPDiskId();
+            pb->SetExpectedSerial(pdisk.ExpectedSerial);
+            pb->SetLastSeenSerial(pdisk.LastSeenSerial);
         }
 
         void TBlobStorageController::Serialize(NKikimrBlobStorage::TVSlotId *pb, TVSlotId id) {

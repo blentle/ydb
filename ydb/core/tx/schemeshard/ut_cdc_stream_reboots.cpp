@@ -12,6 +12,8 @@ Y_UNIT_TEST_SUITE(TCdcStreamWithRebootsTests) {
         t.Run([&](TTestActorRuntime& runtime, bool& activeZone) {
             {
                 TInactiveZone inactive(activeZone);
+                runtime.GetAppData().DisableCdcAutoSwitchingToReadyStateForTests = true;
+
                 TestCreateTable(runtime, ++t.TxId, "/MyRoot", R"(
                     Name: "Table"
                     Columns { Name: "key" Type: "Uint64" }
@@ -43,7 +45,6 @@ Y_UNIT_TEST_SUITE(TCdcStreamWithRebootsTests) {
 
             TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Table/Stream"), {
                 NLs::PathExist,
-                NLs::StreamState(state.GetOrElse(NKikimrSchemeOp::ECdcStreamStateReady)),
                 NLs::StreamVirtualTimestamps(vt),
             });
         });
@@ -65,7 +66,7 @@ Y_UNIT_TEST_SUITE(TCdcStreamWithRebootsTests) {
         CreateStream({}, true);
     }
 
-    Y_UNIT_TEST(AlterStream) {
+    Y_UNIT_TEST(DisableStream) {
         TTestWithReboots t;
         t.Run([&](TTestActorRuntime& runtime, bool& activeZone) {
             {
@@ -116,11 +117,15 @@ Y_UNIT_TEST_SUITE(TCdcStreamWithRebootsTests) {
         });
     }
 
-    Y_UNIT_TEST(DropStream) {
+    Y_UNIT_TEST(GetReadyStream) {
         TTestWithReboots t;
+        t.GetTestEnvOptions().EnableChangefeedInitialScan(true);
+
         t.Run([&](TTestActorRuntime& runtime, bool& activeZone) {
             {
                 TInactiveZone inactive(activeZone);
+                runtime.GetAppData().DisableCdcAutoSwitchingToReadyStateForTests = true;
+
                 TestCreateTable(runtime, ++t.TxId, "/MyRoot", R"(
                     Name: "Table"
                     Columns { Name: "key" Type: "Uint64" }
@@ -135,8 +140,78 @@ Y_UNIT_TEST_SUITE(TCdcStreamWithRebootsTests) {
                       Name: "Stream"
                       Mode: ECdcStreamModeKeysOnly
                       Format: ECdcStreamFormatProto
+                      State: ECdcStreamStateScan
                     }
                 )");
+                t.TestEnv->TestWaitNotification(runtime, t.TxId);
+
+                TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Table/Stream"), {
+                    NLs::PathExist,
+                    NLs::StreamMode(NKikimrSchemeOp::ECdcStreamModeKeysOnly),
+                    NLs::StreamFormat(NKikimrSchemeOp::ECdcStreamFormatProto),
+                    NLs::StreamState(NKikimrSchemeOp::ECdcStreamStateScan),
+                });
+            }
+
+            const auto lockTxId = t.TxId;
+            auto request = AlterCdcStreamRequest(++t.TxId, "/MyRoot", Sprintf(R"(
+                TableName: "Table"
+                StreamName: "Stream"
+                GetReady {
+                  LockTxId: %lu
+                }
+            )", lockTxId));
+            request->Record.MutableTransaction(0)->MutableLockGuard()->SetOwnerTxId(lockTxId);
+
+            t.TestEnv->ReliablePropose(runtime, request, {
+                NKikimrScheme::StatusAccepted,
+                NKikimrScheme::StatusMultipleModifications,
+            });
+            t.TestEnv->TestWaitNotification(runtime, t.TxId);
+
+            TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Table/Stream"), {
+                NLs::PathExist,
+                NLs::StreamMode(NKikimrSchemeOp::ECdcStreamModeKeysOnly),
+                NLs::StreamFormat(NKikimrSchemeOp::ECdcStreamFormatProto),
+                NLs::StreamState(NKikimrSchemeOp::ECdcStreamStateReady),
+            });
+        });
+    }
+
+    void DropStream(const TMaybe<NKikimrSchemeOp::ECdcStreamState>& state = Nothing()) {
+        TTestWithReboots t;
+        t.GetTestEnvOptions().EnableChangefeedInitialScan(true);
+
+        t.Run([&](TTestActorRuntime& runtime, bool& activeZone) {
+            {
+                TInactiveZone inactive(activeZone);
+                runtime.GetAppData().DisableCdcAutoSwitchingToReadyStateForTests = true;
+
+                TestCreateTable(runtime, ++t.TxId, "/MyRoot", R"(
+                    Name: "Table"
+                    Columns { Name: "key" Type: "Uint64" }
+                    Columns { Name: "value" Type: "Uint64" }
+                    KeyColumnNames: ["key"]
+                )");
+                t.TestEnv->TestWaitNotification(runtime, t.TxId);
+
+                NKikimrSchemeOp::TCdcStreamDescription streamDesc;
+                streamDesc.SetName("Stream");
+                streamDesc.SetMode(NKikimrSchemeOp::ECdcStreamModeKeysOnly);
+                streamDesc.SetFormat(NKikimrSchemeOp::ECdcStreamFormatProto);
+
+                if (state) {
+                    streamDesc.SetState(*state);
+                }
+
+                TString strDesc;
+                const bool ok = google::protobuf::TextFormat::PrintToString(streamDesc, &strDesc);
+                UNIT_ASSERT_C(ok, "protobuf serialization failed");
+
+                TestCreateCdcStream(runtime, ++t.TxId, "/MyRoot", Sprintf(R"(
+                    TableName: "Table"
+                    StreamDescription { %s }
+                )", strDesc.c_str()));
                 t.TestEnv->TestWaitNotification(runtime, t.TxId);
             }
 
@@ -148,6 +223,18 @@ Y_UNIT_TEST_SUITE(TCdcStreamWithRebootsTests) {
 
             TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Table/Stream"), {NLs::PathNotExist});
         });
+    }
+
+    Y_UNIT_TEST(DropStream) {
+        DropStream();
+    }
+
+    Y_UNIT_TEST(DropStreamExplicitReady) {
+        DropStream(NKikimrSchemeOp::ECdcStreamStateReady);
+    }
+
+    Y_UNIT_TEST(DropStreamCreatedWithInitialScan) {
+        DropStream(NKikimrSchemeOp::ECdcStreamStateScan);
     }
 
     Y_UNIT_TEST(CreateDropRecreate) {

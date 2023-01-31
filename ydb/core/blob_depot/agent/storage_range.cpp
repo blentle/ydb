@@ -5,11 +5,17 @@ namespace NKikimr::NBlobDepot {
     template<>
     TBlobDepotAgent::TQuery *TBlobDepotAgent::CreateQuery<TEvBlobStorage::EvRange>(std::unique_ptr<IEventHandle> ev) {
         class TRangeQuery : public TBlobStorageQuery<TEvBlobStorage::TEvRange> {
+            struct TRead {
+                TLogoBlobID Id;
+                TString ValueChain;
+            };
+
             std::unique_ptr<TEvBlobStorage::TEvRangeResult> Response;
             ui32 ReadsInFlight = 0;
             ui32 ResolvesInFlight = 0;
             std::map<TLogoBlobID, TString> FoundBlobs;
-            std::vector<TLogoBlobID> Reads;
+            std::vector<TRead> Reads;
+            std::unordered_set<std::tuple<ui64, TString>> ValueChainsWithNodata; // processed value chains with this status
             bool Reverse = false;
             bool Finished = false;
 
@@ -17,16 +23,6 @@ namespace NKikimr::NBlobDepot {
             using TBlobStorageQuery::TBlobStorageQuery;
 
             void Initiate() override {
-                if (Request.Decommission) {
-                    Y_VERIFY(Agent.ProxyId);
-                    STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA26, "forwarding TEvRange", (VirtualGroupId, Agent.VirtualGroupId),
-                        (TabletId, Agent.TabletId), (Msg, Request), (ProxyId, Agent.ProxyId));
-                    const bool sent = TActivationContext::Send(Event->Forward(Agent.ProxyId));
-                    Y_VERIFY(sent);
-                    delete this;
-                    return;
-                }
-
                 BDEV_QUERY(BDEV21, "TEvRange_new", (U.TabletId, Request.TabletId), (U.From, Request.From), (U.To, Request.To),
                     (U.MustRestoreFirst, Request.MustRestoreFirst), (U.IndexOnly, Request.IsIndexOnly));
 
@@ -59,12 +55,13 @@ namespace NKikimr::NBlobDepot {
                 ++ResolvesInFlight;
             }
 
-            void IssueResolve(TLogoBlobID id) {
+            void IssueResolve(ui64 tag) {
                 NKikimrBlobDepot::TEvResolve resolve;
                 auto *item = resolve.AddItems();
-                item->SetExactKey(id.AsBinaryString());
+                item->SetExactKey(Reads[tag].Id.AsBinaryString());
                 item->SetTabletId(Request.TabletId);
                 item->SetMustRestoreFirst(Request.MustRestoreFirst);
+                item->SetCookie(tag);
 
                 Agent.Issue(std::move(resolve), this, nullptr);
                 ++ResolvesInFlight;
@@ -96,7 +93,17 @@ namespace NKikimr::NBlobDepot {
                     if (key.HasErrorReason()) {
                         return EndWithError(NKikimrProto::ERROR, TStringBuilder() << "failed to resolve blob# " << id
                             << ": " << key.GetErrorReason());
-                    } else if (!Request.IsIndexOnly) {
+                    } else if (Request.IsIndexOnly) {
+                        FoundBlobs.try_emplace(id);
+                    } else if (key.ValueChainSize()) {
+                        const ui64 tag = key.HasCookie() ? key.GetCookie() : Reads.size();
+                        TString valueChain = GetValueChainId(key.GetValueChain());
+                        if (tag == Reads.size()) {
+                            Reads.push_back(TRead{id, std::move(valueChain)});
+                        } else {
+                            Y_VERIFY(Reads[tag].Id == id);
+                            Reads[tag].ValueChain = std::move(valueChain);
+                        }
                         TReadArg arg{
                             key.GetValueChain(),
                             NKikimrBlobStorage::EGetHandleClass::FastRead,
@@ -104,19 +111,14 @@ namespace NKikimr::NBlobDepot {
                             this,
                             0,
                             0,
-                            Reads.size(),
+                            tag,
                             {}};
-                        Reads.push_back(id);
                         ++ReadsInFlight;
                         TString error;
                         if (!Agent.IssueRead(arg, error)) {
                             return EndWithError(NKikimrProto::ERROR, TStringBuilder() << "failed to read discovered blob: "
                                 << error);
                         }
-                    } else if (Request.MustRestoreFirst) {
-                        Y_FAIL("not implemented yet");
-                    } else {
-                        FoundBlobs.try_emplace(id);
                     }
                 }
 
@@ -130,20 +132,33 @@ namespace NKikimr::NBlobDepot {
             void OnRead(ui64 tag, NKikimrProto::EReplyStatus status, TString dataOrErrorReason) override {
                 --ReadsInFlight;
 
+                Y_VERIFY(tag < Reads.size());
+                TRead& read = Reads[tag];
+                Y_VERIFY(read.ValueChain);
+
                 switch (status) {
                     case NKikimrProto::OK: {
-                        const bool inserted = FoundBlobs.try_emplace(Reads[tag], std::move(dataOrErrorReason)).second;
+                        Y_VERIFY(dataOrErrorReason.size() == read.Id.BlobSize());
+                        const bool inserted = FoundBlobs.try_emplace(read.Id, std::move(dataOrErrorReason)).second;
                         Y_VERIFY(inserted);
                         break;
                     }
 
                     case NKikimrProto::NODATA:
-                        IssueResolve(Reads[tag]);
+                        if (ValueChainsWithNodata.emplace(tag, std::exchange(read.ValueChain, {})).second) { // real race
+                            IssueResolve(tag);
+                        } else {
+                            Y_VERIFY_DEBUG_S(false, "data is lost AgentId# " << Agent.LogId << " BlobId# " << read.Id);
+                            STLOG(PRI_CRIT, BLOB_DEPOT_AGENT, BDA40, "failed to ReadRange blob -- data is lost",
+                                (AgentId, Agent.LogId), (BlobId, read.Id));
+                            return EndWithError(status, TStringBuilder() << "failed to retrieve BlobId# "
+                                << read.Id << " data is lost");
+                        }
                         break;
 
                     default:
                         return EndWithError(status, TStringBuilder() << "failed to retrieve BlobId# "
-                            << Reads[tag] << " Error# " << dataOrErrorReason);
+                            << read.Id << " Error# " << dataOrErrorReason);
                 }
 
                 CheckAndFinish();
@@ -152,12 +167,8 @@ namespace NKikimr::NBlobDepot {
             void CheckAndFinish() {
                 if (!ReadsInFlight && !ResolvesInFlight && !Finished) {
                     for (auto& [id, buffer] : FoundBlobs) {
-                        if (!Request.IsIndexOnly) {
-                            Y_VERIFY_S(buffer.size() == id.BlobSize(), "Id# " << id << " Buffer.size# " << buffer.size());
-                        }
-                        if (buffer || Request.IsIndexOnly) {
-                            Response->Responses.emplace_back(id, std::move(buffer));
-                        }
+                        Y_VERIFY_S(buffer.size() == Request.IsIndexOnly ? 0 : id.BlobSize(), "Id# " << id << " Buffer.size# " << buffer.size());
+                        Response->Responses.emplace_back(id, std::move(buffer));
                     }
                     if (Reverse) {
                         std::reverse(Response->Responses.begin(), Response->Responses.end());

@@ -1659,6 +1659,61 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         CreateTableWithPartitionAtKeysSimple(true);
     }
 
+    Y_UNIT_TEST(CreateTableWithPartitionAtKeysSigned) {
+        TKikimrRunner kikimr;
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+        TString tableName = "/Root/TableWithPartitionAtKeysSigned";
+        auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            CREATE TABLE `)" << tableName << R"(` (
+                Key1 Int64,
+                Key2 String,
+                Value String,
+                PRIMARY KEY (Key1, Key2)
+            )
+            WITH (
+                PARTITION_AT_KEYS = ( 0, 10, 10000 )
+            );)";
+        auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        auto describeResult = session.DescribeTable(tableName,
+            TDescribeTableSettings().WithTableStatistics(true).WithKeyShardBoundary(true)).GetValueSync();
+        UNIT_ASSERT_C(describeResult.IsSuccess(), result.GetIssues().ToString());
+        UNIT_ASSERT_VALUES_EQUAL(describeResult.GetTableDescription().GetPartitionsCount(), 4);
+
+        auto extractValue = [](const TValue& val) {
+            auto parser = TValueParser(val);
+            parser.OpenTuple();
+            UNIT_ASSERT(parser.TryNextElement());
+            return parser.GetOptionalInt64().GetRef();
+        };
+
+        const TVector<TKeyRange>& keyRanges = describeResult.GetTableDescription().GetKeyRanges();
+
+        size_t n = 0;
+        const TVector<i64> expectedRanges = { 0l, 10l, 10000l };
+
+        for (const auto& range : keyRanges) {
+            if (n == 0) {
+                UNIT_ASSERT(!range.From());
+            } else {
+                UNIT_ASSERT(range.From()->IsInclusive());
+                auto left = extractValue(range.From()->GetValue());
+                UNIT_ASSERT_VALUES_EQUAL(left, expectedRanges[n - 1]);
+            }
+            if (n == expectedRanges.size()) {
+                UNIT_ASSERT(!range.To());
+            } else {
+                UNIT_ASSERT(!range.To()->IsInclusive());
+                auto right = extractValue(range.To()->GetValue());
+                UNIT_ASSERT_VALUES_EQUAL(right, expectedRanges[n]);
+            }
+            ++n;
+        }
+    }
+
     Y_UNIT_TEST(CreateTableWithPartitionAtKeysComplex) {
         TKikimrRunner kikimr;
         auto db = kikimr.GetTableClient();
@@ -3284,9 +3339,9 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         auto query = TStringBuilder() << R"(
             --!syntax_v1
             CREATE TABLE `)" << tableName << R"(` (
-                Key Uint64 NOT NULL,
-                Value1 String,
-                Value2 Int64 NOT NULL,
+                Key Timestamp NOT NULL,
+                Value1 Date,
+                Value2 Datetime NOT NULL,
                 PRIMARY KEY (Key)
             )
             PARTITION BY HASH(Value1, Value2)
@@ -3311,8 +3366,70 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
 
         auto query4 = TStringBuilder() << R"(
             --!syntax_v1
-            DROP TABLE `)" << tableName << R"(`;)";
+            ALTER TABLE `)" << tableName << R"(` SET(TTL = Interval("P1D") ON Value1);)";
         result = session.ExecuteSchemeQuery(query4).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        auto query5 = TStringBuilder() << R"(
+            --!syntax_v1
+            ALTER TABLE `)" << tableName << R"(` SET(TTL = Interval("P1D") ON Value2);)";
+        result = session.ExecuteSchemeQuery(query5).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        auto query6 = TStringBuilder() << R"(
+            --!syntax_v1
+            DROP TABLE `)" << tableName << R"(`;)";
+        result = session.ExecuteSchemeQuery(query6).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+    }
+
+    Y_UNIT_TEST(AlterColumnTableTiering) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        TKikimrRunner kikimr(runnerSettings);
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+        TString tableName = "/Root/ColumnTableTest";
+
+        auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            CREATE TABLE `)" << tableName << R"(` (
+                Key Uint64 NOT NULL,
+                Value1 String,
+                Value2 Int64 NOT NULL,
+                PRIMARY KEY (Key)
+            )
+            PARTITION BY HASH(Value1, Value2)
+            WITH (
+                STORE = COLUMN,
+                AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 10,
+                TIERING = 'tiering1'
+            );)";
+        auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        auto query2 = TStringBuilder() << R"(
+            --!syntax_v1
+            ALTER TABLE `)" << tableName << R"(` SET(TIERING = 'tiering2');)";
+        result = session.ExecuteSchemeQuery(query2).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        auto query3 = TStringBuilder() << R"(
+            --!syntax_v1
+            ALTER TABLE `)" << tableName << R"(` RESET (TIERING);)";
+        result = session.ExecuteSchemeQuery(query3).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        auto query4 = TStringBuilder() << R"(
+            --!syntax_v1
+            ALTER TABLE `)" << tableName << R"(` SET (TIERING = 'tiering1');)";
+        result = session.ExecuteSchemeQuery(query4).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        auto query5 = TStringBuilder() << R"(
+            --!syntax_v1
+            DROP TABLE `)" << tableName << R"(`;)";
+        result = session.ExecuteSchemeQuery(query5).GetValueSync();
         UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
     }
 
@@ -3459,19 +3576,19 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
             for (size_t i = 0; parser.TryNextRow(); ++i) {
                 {
                     auto& c = parser.ColumnParser("CUint8");
-                    UNIT_ASSERT_VALUES_EQUAL(i, *c.GetOptionalUint8().Get());
+                    UNIT_ASSERT_VALUES_EQUAL(i, c.GetUint8());
                 }
                 {
                     auto& c = parser.ColumnParser("CInt8");
-                    UNIT_ASSERT_VALUES_EQUAL(i, *c.GetOptionalInt8().Get());
+                    UNIT_ASSERT_VALUES_EQUAL(i, c.GetInt8());
                 }
                 {
                     auto& c = parser.ColumnParser("CUint16");
-                    UNIT_ASSERT_VALUES_EQUAL(i, *c.GetOptionalUint16().Get());
+                    UNIT_ASSERT_VALUES_EQUAL(i, c.GetUint16());
                 }
                 {
                     auto& c = parser.ColumnParser("CInt16");
-                    UNIT_ASSERT_VALUES_EQUAL(i, *c.GetOptionalInt16().Get());
+                    UNIT_ASSERT_VALUES_EQUAL(i, c.GetInt16());
                 }
             }
         }

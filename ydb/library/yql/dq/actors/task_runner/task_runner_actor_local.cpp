@@ -89,7 +89,14 @@ private:
         for (const auto sinkId : ev->Get()->SinkIds) {
             sinkStats[sinkId] = TaskRunner->GetSink(sinkId)->GetStats();
         }
-        ev->Get()->Stats = TDqTaskRunnerStatsView(TaskRunner->GetStats(), std::move(sinkStats));
+
+        THashMap<ui32, const TDqAsyncInputBufferStats*> inputTransformStats;
+        for (const auto inputTransformId : ev->Get()->InputTransformIds) {
+            inputTransformStats[inputTransformId] = TaskRunner->GetInputTransform(inputTransformId).second->GetStats();
+        }
+
+        ev->Get()->Stats = TDqTaskRunnerStatsView(TaskRunner->GetStats(), std::move(sinkStats),
+            std::move(inputTransformStats));
         Send(
             ev->Sender,
             ev->Release().Release(),
@@ -136,7 +143,7 @@ private:
         return true;
     }
 
-    void DoContinueRun(TEvContinueRun::TPtr& ev) {
+    void OnContinueRun(TEvContinueRun::TPtr& ev) {
         auto guard = TaskRunner->BindAllocator(MemoryQuota ? MemoryQuota->GetMkqlMemoryLimit() : ev->Get()->MemLimit);
         auto inputMap = ev->Get()->AskFreeSpace
             ? Inputs
@@ -144,8 +151,8 @@ private:
 
         const TInstant start = TInstant::Now();
         NYql::NDq::ERunStatus res = ERunStatus::Finished;
-        THashMap<ui32, ui64> inputChannelFreeSpace;
-        THashMap<ui32, ui64> sourcesFreeSpace;
+        THashMap<ui32, i64> inputChannelFreeSpace;
+        THashMap<ui32, i64> sourcesFreeSpace;
 
         const bool shouldHandleWatermark = ev->Get()->WatermarkRequest.Defined()
             && ev->Get()->WatermarkRequest->Watermark > TaskRunner->GetWatermark().WatermarkIn;
@@ -158,17 +165,14 @@ private:
             }
 
             res = TaskRunner->Run();
-            LOG_T("Resume execution, run status: " << res);
         }
 
-        if (res == ERunStatus::PendingInput) {
-            for (auto& channelId : inputMap) {
-                inputChannelFreeSpace[channelId] = TaskRunner->GetInputChannel(channelId)->GetFreeSpace();
-            }
+        for (auto& channelId : inputMap) {
+            inputChannelFreeSpace[channelId] = TaskRunner->GetInputChannel(channelId)->GetFreeSpace();
+        }
 
-            for (auto& index : Sources) {
-                sourcesFreeSpace[index] = TaskRunner->GetSource(index)->GetFreeSpace();
-            }
+        for (auto& index : Sources) {
+            sourcesFreeSpace[index] = TaskRunner->GetSource(index)->GetFreeSpace();
         }
 
         auto watermarkInjectedToOutputs = false;
@@ -215,14 +219,20 @@ private:
         }
 
         {
-            auto st = MakeHolder<TEvStatistics>(std::move(ev->Get()->SinkIds));
+            auto st = MakeHolder<TEvStatistics>(std::move(ev->Get()->SinkIds), std::move(ev->Get()->InputTransformIds));
 
             TaskRunner->UpdateStats();
             THashMap<ui32, const TDqAsyncOutputBufferStats*> sinkStats;
             for (const auto sinkId : st->SinkIds) {
                 sinkStats[sinkId] = TaskRunner->GetSink(sinkId)->GetStats();
             }
-            st->Stats = TDqTaskRunnerStatsView(TaskRunner->GetStats(), std::move(sinkStats));
+
+            THashMap<ui32, const TDqAsyncInputBufferStats*> inputTransformStats;
+            for (const auto inputTransformId : st->InputTransformIds) { // TODO
+                inputTransformStats[inputTransformId] = TaskRunner->GetInputTransform(inputTransformId).second->GetStats();
+            }
+
+            st->Stats = TDqTaskRunnerStatsView(TaskRunner->GetStats(), std::move(sinkStats), std::move(inputTransformStats));
             Send(ev->Sender, st.Release());
         }
 
@@ -243,15 +253,10 @@ private:
             ev->Cookie);
     }
 
-    void OnContinueRun(TEvContinueRun::TPtr& ev) {
-        DoContinueRun(ev);
-    }
-
     void OnChannelPush(TEvPush::TPtr& ev) {
         auto guard = TaskRunner->BindAllocator();
         auto hasData = ev->Get()->HasData;
         auto finish = ev->Get()->Finish;
-        auto askFreeSpace = ev->Get()->AskFreeSpace;
         auto channelId = ev->Get()->ChannelId;
         auto data = ev->Get()->Data;
         if (ev->Get()->IsOut) {
@@ -259,24 +264,22 @@ private:
             TaskRunner->GetOutputChannel(channelId)->Finish();
             return;
         }
-        ui64 freeSpace = 0;
+        auto inputChannel = TaskRunner->GetInputChannel(channelId);
         if (hasData) {
-            TaskRunner->GetInputChannel(channelId)->Push(std::move(data));
-            if (askFreeSpace) {
-                freeSpace = TaskRunner->GetInputChannel(channelId)->GetFreeSpace();
-            }
+            inputChannel->Push(std::move(data));
         }
+        const ui64 freeSpace = inputChannel->GetFreeSpace();
         if (finish) {
-            TaskRunner->GetInputChannel(channelId)->Finish();
+            inputChannel->Finish();
         }
         if (ev->Get()->PauseAfterPush) {
-            TaskRunner->GetInputChannel(channelId)->Pause();
+            inputChannel->Pause();
         }
 
         // run
         Send(
             ev->Sender,
-            new TEvContinueRun(channelId, freeSpace),
+            new TEvPushFinished(channelId, freeSpace),
             /*flags=*/0,
             ev->Cookie);
     }
@@ -295,7 +298,7 @@ private:
         }
         Send(
             ParentId,
-            new TEvAsyncInputPushFinished(index),
+            new TEvAsyncInputPushFinished(index, source->GetFreeSpace()),
             /*flags=*/0,
             cookie);
     }

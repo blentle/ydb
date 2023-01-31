@@ -361,7 +361,7 @@ namespace NActors {
         }
 
         // for actorsystem
-        bool SendWithContinuousExecution(TAutoPtr<IEventHandle>& ev) override {
+        bool SpecificSend(TAutoPtr<IEventHandle>& ev) override {
             return Send(ev);
         }
 
@@ -416,6 +416,10 @@ namespace NActors {
         }
 
         void ScheduleActivation(ui32 activation) override {
+            Y_UNUSED(activation);
+        }
+
+        void SpecificScheduleActivation(ui32 activation) override {
             Y_UNUSED(activation);
         }
 
@@ -1700,6 +1704,10 @@ namespace NActors {
 
         common->ClusterUUID = ClusterUUID;
         common->AcceptUUID = {ClusterUUID};
+
+        if (ICCommonSetupper) {
+            ICCommonSetupper(nodeIndex, common);
+        }
 
         for (ui32 proxyNodeIndex = 0; proxyNodeIndex < NodeCount; ++proxyNodeIndex) {
             if (proxyNodeIndex == nodeIndex)

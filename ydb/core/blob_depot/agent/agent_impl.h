@@ -13,7 +13,6 @@ namespace NKikimr::NBlobDepot {
         XX(EvCollectGarbage) \
         XX(EvStatus) \
         XX(EvPatch) \
-        XX(EvAssimilate) \
         // END
 
     class TBlobDepotAgent;
@@ -132,6 +131,9 @@ namespace NKikimr::NBlobDepot {
         };
 
     public:
+        TString LogId;
+
+    public:
         static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
             return NKikimrServices::TActivity::BLOB_DEPOT_AGENT_ACTOR;
         }
@@ -164,8 +166,9 @@ namespace NKikimr::NBlobDepot {
                 hFunc(TEvBlobStorage::TEvPutResult, HandleOtherResponse);
 
                 ENUMERATE_INCOMING_EVENTS(FORWARD_STORAGE_PROXY)
+                fFunc(TEvBlobStorage::EvAssimilate, HandleAssimilate);
                 hFunc(TEvBlobStorage::TEvBunchOfEvents, Handle);
-                cFunc(TEvPrivate::EvProcessPendingEvent, HandlePendingEvent);
+                cFunc(TEvPrivate::EvProcessPendingEvent, HandleProcessPendingEvent);
                 cFunc(TEvPrivate::EvPendingEventQueueWatchdog, HandlePendingEventQueueWatchdog);
 
                 cFunc(TEvPrivate::EvQueryWatchdog, HandleQueryWatchdog);
@@ -185,6 +188,7 @@ namespace NKikimr::NBlobDepot {
                 Y_VERIFY(info->BlobDepotId);
                 if (TabletId != *info->BlobDepotId) {
                     TabletId = *info->BlobDepotId;
+                    LogId = TStringBuilder() << '{' << TabletId << '@' << VirtualGroupId << '}';
                     if (TabletId && TabletId != Max<ui64>()) {
                         ConnectToBlobDepot();
                     }
@@ -323,14 +327,18 @@ namespace NKikimr::NBlobDepot {
         std::deque<TPendingEvent> PendingEventQ;
         size_t PendingEventBytes = 0;
         static constexpr size_t MaxPendingEventBytes = 32'000'000; // ~32 MB
-        static constexpr TDuration EventExpirationTime = TDuration::Seconds(5);
+        static constexpr TDuration EventExpirationTime = TDuration::Seconds(60);
         TIntrusiveListWithAutoDelete<TQuery, TQuery::TDeleter, TExecutingQueries> ExecutingQueries;
         TIntrusiveListWithAutoDelete<TQuery, TQuery::TDeleter, TExecutingQueries> DeletePendingQueries;
         std::multimap<TMonotonic, TQuery*> QueryWatchdogMap;
+        bool ProcessPendingEventInFlight = false;
 
         template<ui32 EventType> TQuery *CreateQuery(std::unique_ptr<IEventHandle> ev);
         void HandleStorageProxy(TAutoPtr<IEventHandle> ev);
+        void HandleAssimilate(TAutoPtr<IEventHandle> ev);
         void HandlePendingEvent();
+        void HandleProcessPendingEvent();
+        void ClearPendingEventQueue(const TString& reason);
         void ProcessStorageEvent(std::unique_ptr<IEventHandle> ev);
         void HandlePendingEventQueueWatchdog();
         void Handle(TEvBlobStorage::TEvBunchOfEvents::TPtr ev);
@@ -390,7 +398,7 @@ namespace NKikimr::NBlobDepot {
 
         struct TReadContext;
         struct TReadArg {
-            const NProtoBuf::RepeatedPtrField<NKikimrBlobDepot::TResolvedValueChain>& Values;
+            const TResolvedValueChain& Values;
             NKikimrBlobStorage::EGetHandleClass GetHandleClass;
             bool MustRestoreFirst = false;
             TQuery *Query = nullptr;
@@ -401,6 +409,7 @@ namespace NKikimr::NBlobDepot {
         };
 
         bool IssueRead(const TReadArg& arg, TString& error);
+        static TString GetValueChainId(const TResolvedValueChain& valueChain);
 
         void HandleGetResult(const TRequestContext::TPtr& context, TEvBlobStorage::TEvGetResult& msg);
 

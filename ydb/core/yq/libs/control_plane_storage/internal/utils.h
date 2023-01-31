@@ -8,6 +8,7 @@
 
 #include <ydb/core/yq/libs/config/protos/issue_id.pb.h>
 #include <ydb/core/yq/libs/control_plane_storage/ydb_control_plane_storage_impl.h>
+#include <ydb/core/yq/libs/exceptions/exceptions.h>
 
 namespace NYq {
 
@@ -32,5 +33,6 @@ NYql::TIssues ValidateNodesHealthCheck(
 NYql::TIssues ValidateCreateOrDeleteRateLimiterResource(const TString& queryId, const TString& scope, const TString& tenant, const TString& owner);
 
 std::vector<TString> GetMeteringRecords(const TString& statistics, const TString& queryId, const TString& scope, const TString& sourceId);
+TString GetPrettyStatistics(const TString& statistics);
 
 };

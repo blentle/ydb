@@ -14,12 +14,13 @@
 #include <ydb/library/yql/parser/pg_catalog/catalog.h>
 
 #include <util/generic/map.h>
-#include <util/generic/bitmap.h>
 #include <util/string/cast.h>
 #include <util/generic/xrange.h>
 
 #include <algorithm>
 #include <iterator>
+#include <map>
+#include <vector>
 
 namespace NYql {
 
@@ -119,10 +120,15 @@ TExprNode::TPtr KeepSortedConstraint(TExprNode::TPtr node, const TSortedConstrai
                     .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
                         size_t index = 0;
                         for (auto c : constent) {
-                            parent.Callable(index++, "Member")
-                                .Arg(0, "item")
-                                .Atom(1, c.first.front())
-                            .Seal();
+                            if (c.first.front().empty())
+                                parent.Arg(index++, "item");
+                            else {
+                                YQL_ENSURE(c.first.front().size() == 1U, "Just column expected.");
+                                parent.Callable(index++, "Member")
+                                    .Arg(0, "item")
+                                    .Atom(1, c.first.front().front())
+                                .Seal();
+                            }
                         }
                         return parent;
                     })
@@ -606,7 +612,7 @@ TExprNode::TPtr OptimizeInsert(const TExprNode::TPtr& node, TExprContext& ctx, T
 template <bool Ordered>
 TExprNode::TPtr ExpandExtract(const TExprNode::TPtr& node, TExprContext& ctx) {
     YQL_CLOG(DEBUG, Core) << "Expand " << node->Content();
-    const bool isStruct = ETypeAnnotationKind::Struct == GetSeqItemType(node->Head().GetTypeAnn())->GetKind();
+    const bool isStruct = ETypeAnnotationKind::Struct == GetSeqItemType(*node->Head().GetTypeAnn()).GetKind();
     return ctx.Builder(node->Pos())
         .Callable(Ordered ? "OrderedMap" : "Map")
             .Add(0, node->HeadPtr())
@@ -2236,19 +2242,19 @@ TExprNode::TPtr SimpleFlatMap(const TExprNode::TPtr& node, TExprContext& ctx, TO
         return expr;
     }
 
-    if (auto just = self.Lambda().Body().Maybe<TCoJust>()) {
-        if (auto tuple = just.Cast().Input().Maybe<TExprList>()) {
+    if (const auto just = self.Lambda().Body().Maybe<TCoJust>()) {
+        if (const auto tuple = just.Cast().Input().Maybe<TExprList>()) {
             if (tuple.Cast().Size() > 0) {
                 TExprNode::TPtr inner;
                 for (ui32 i = 0; i < tuple.Cast().Size(); ++i) {
                     auto x = tuple.Cast().Item(i).Raw();
-                    if (!x->IsCallable("Nth") || x->Child(1)->Content() != ToString(i)) {
+                    if (!(x->IsCallable("Nth") && x->Tail().IsAtom(ctx.GetIndexAsString(i)))) {
                         inner = nullptr;
                         break;
                     }
 
-                    auto current = x->ChildPtr(0);
-                    if (current != self.Lambda().Args().Arg(0).Raw()) {
+                    const auto& current = x->HeadPtr();
+                    if (current != self.Lambda().Args().Arg(0).Ptr()) {
                         inner = nullptr;
                         break;
                     }
@@ -2726,10 +2732,15 @@ void FixSortness(const TExprNode& origNode, TExprNode::TPtr& node, TExprContext&
                         .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
                             size_t index = 0;
                             for (auto c : content) {
-                                parent.Callable(index++, "Member")
-                                        .Arg(0, "item")
-                                        .Atom(1, c.first.front())
-                                        .Seal();
+                                if (c.first.empty())
+                                    parent.Arg(0, "item");
+                                else {
+                                    YQL_ENSURE(c.first.front().size() == 1U, "Just column expected.");
+                                    parent.Callable(index++, "Member")
+                                            .Arg(0, "item")
+                                            .Atom(1, c.first.front().front())
+                                            .Seal();
+                                }
                             }
                             return parent;
                         })
@@ -3986,6 +3997,15 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
         return node;
     };
 
+    map["CombineCore"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext& /*optCtx*/) {
+        if (node->Head().IsCallable("FromFlow")) {
+            YQL_CLOG(DEBUG, Core) << "Swap " << node->Content() << " with " << node->Head().Content();
+            return ctx.SwapWithHead(*node);
+        }
+
+        return node;
+    };
+
     map["Length"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext& /*optCtx*/) {
         const auto& nodeToCheck = SkipCallables(node->Head(), SkippableCallables);
         if (nodeToCheck.IsCallable("AsList")) {
@@ -4799,6 +4819,23 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                 YQL_CLOG(DEBUG, Core) << node->Content() << " - convert to Guess";
                 return ctx.NewCallable(node->Pos(), "Guess", { node->HeadPtr(), node->ChildPtr(1) });
             }
+            if (defaultValue->IsCallable("List")) {
+                YQL_CLOG(DEBUG, Core) << node->Content() << " - convert to OrderedFlatMap over Guess";
+                return ctx.Builder(node->Pos())
+                    .Callable("OrderedFlatMap")
+                        .Callable(0, "Guess")
+                            .Add(0, node->HeadPtr())
+                            .Add(1, node->ChildPtr(1))
+                        .Seal()
+                        .Lambda(1)
+                            .Param("item")
+                            .Apply(node->ChildPtr(2))
+                                .With(0, "item")
+                            .Seal()
+                        .Seal()
+                    .Seal()
+                    .Build();
+            }
 
             auto varType = node->Head().GetTypeAnn()->Cast<TVariantExprType>();
             bool removeDefaultValue;
@@ -4953,10 +4990,9 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
         const auto inputItemType = GetSeqItemType(node->Head().GetTypeAnn());
         const bool singleInput = inputItemType->GetKind() != ETypeAnnotationKind::Variant;
 
-        TDynBitMap usedIndicies;
         TExprNode::TListType lambdas;
         TExprNode::TListType switchLambdaArgs;
-        TExprNode::TListType indicies;
+        std::map<ui32, std::vector<size_t>> indicies;
         TExprNode::TListType castStructs;
         ETypeAnnotationKind targetType = singleInput ? ETypeAnnotationKind::List : ETypeAnnotationKind::Optional;
         const bool singleHandler = node->ChildrenSize() == 4;
@@ -4977,11 +5013,10 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
             }
             if (!singleInput) {
                 ui32 index = FromString<ui32>(node->Child(i)->Head().Content());
-                if (usedIndicies.Test(index)) {
-                    return node;
+                indicies[index].push_back(switchLambdaArgs.size());
+                if (targetType == ETypeAnnotationKind::Optional && indicies[index].size() > 1) {
+                    targetType = ETypeAnnotationKind::List;
                 }
-                usedIndicies.Set(index);
-                indicies.push_back(node->Child(i)->HeadPtr());
             }
 
             auto lambda = node->Child(i + 1);
@@ -4997,7 +5032,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                 auto flatMapInput = lambda->Child(1)->Child(0);
                 const TTypeAnnotationNode* castType = nullptr;
                 if (TCoExtractMembers::Match(flatMapInput)) {
-                    castType = GetSeqItemType(flatMapInput->GetTypeAnn());
+                    castType = &GetSeqItemType(*flatMapInput->GetTypeAnn());
                     flatMapInput = flatMapInput->Child(0);
                 }
 
@@ -5016,7 +5051,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                     if (!singleHandler && flatMapLambda->GetTypeAnn()->Cast<TListExprType>()->GetItemType()->GetKind() == ETypeAnnotationKind::Variant) {
                         return node;
                     }
-                    if (targetType != ETypeAnnotationKind::Stream) {
+                    if (targetType == ETypeAnnotationKind::Optional) {
                         targetType = ETypeAnnotationKind::List;
                     }
                     break;
@@ -5045,21 +5080,26 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
 
         const auto flatMapName = ordered ? TCoOrderedFlatMap::CallableName() : TCoFlatMap::CallableName();
         const auto mapName = ordered ? TCoOrderedMap::CallableName() : TCoMap::CallableName();
-        if (indicies.size() == 1) {
+        if (switchLambdaArgs.size() == 1) {
             YQL_CLOG(DEBUG, Core) << node->Content() << " with single trivial or FlatMap lambda";
-            if (lambdas.front()) {
-                return ctx.Builder(node->Pos())
-                    .Callable(flatMapName)
-                        .Callable(0, flatMapName)
-                            .Add(0, node->HeadPtr())
-                            .Lambda(1)
-                                .Param("item")
-                                .Callable("Guess")
-                                    .Arg(0, "item")
-                                    .Add(1, indicies.front())
-                                .Seal()
-                            .Seal()
+            YQL_ENSURE(!indicies.empty());
+            auto res = ctx.Builder(node->Pos())
+                .Callable(flatMapName)
+                    .Add(0, node->HeadPtr())
+                    .Lambda(1)
+                        .Param("item")
+                        .Callable("Guess")
+                            .Arg(0, "item")
+                            .Add(1, ctx.NewAtom(node->Pos(), indicies.begin()->first))
                         .Seal()
+                    .Seal()
+                .Seal()
+                .Build();
+
+            if (lambdas.front()) {
+                res = ctx.Builder(node->Pos())
+                    .Callable(flatMapName)
+                        .Add(0, res)
                         .Lambda(1)
                             .Param("varItem")
                             .Apply(lambdas.front())
@@ -5082,23 +5122,10 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                     .Seal()
                     .Build();
             }
-            else {
-                return ctx.Builder(node->Pos())
-                    .Callable(flatMapName)
-                        .Add(0, node->HeadPtr())
-                        .Lambda(1)
-                            .Param("item")
-                            .Callable("Guess")
-                                .Arg(0, "item")
-                                .Add(1, indicies.front())
-                            .Seal()
-                        .Seal()
-                    .Seal()
-                    .Build();
-            }
+            return res;
         }
 
-        const auto outVarType = ExpandType(node->Pos(), *GetSeqItemType(node->GetTypeAnn()), ctx);
+        const auto outVarType = ExpandType(node->Pos(), GetSeqItemType(*node->GetTypeAnn()), ctx);
 
         TExprNode::TListType updatedLambdas;
         for (size_t i = 0; i < lambdas.size(); ++i) {
@@ -5127,7 +5154,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                             .Param("mapItem")
                             .Callable("Variant")
                                 .Arg(0, "mapItem")
-                                .Atom(1, ToString(i), TNodeFlags::Default)
+                                .Add(1, ctx.NewAtom(node->Pos(), i))
                                 .Add(2, outVarType)
                             .Seal()
                         .Seal()
@@ -5153,7 +5180,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                 body = ctx.Builder(node->Pos())
                     .Callable("Variant")
                         .Add(0, arg)
-                        .Atom(1, ToString(i), TNodeFlags::Default)
+                        .Add(1, ctx.NewAtom(node->Pos(), i))
                         .Add(2, outVarType)
                     .Seal()
                     .Build();
@@ -5206,13 +5233,33 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                     .Callable("Visit")
                         .Arg(0, "item")
                         .Do([&](TExprNodeBuilder& builder) -> TExprNodeBuilder& {
-                            for (size_t i = 0; i < indicies.size(); ++i) {
-                                builder.Add(i * 2 + 1, indicies[i]);
-                                builder.Add(i * 2 + 2, updatedLambdas[i]);
+                            ui32 i = 1;
+                            for (auto& item: indicies) {
+                                builder.Add(i++, ctx.NewAtom(node->Pos(), item.first));
+                                if (item.second.size() > 1) {
+                                    builder.Lambda(i++)
+                                        .Param("subItem")
+                                        .Callable(ordered ? TCoOrderedExtend::CallableName() : TCoExtend::CallableName())
+                                            .Do([&](TExprNodeBuilder& builder) -> TExprNodeBuilder& {
+                                                ui32 j = 0;
+                                                for (auto ndx: item.second) {
+                                                    YQL_ENSURE(ndx < updatedLambdas.size());
+                                                    builder.Apply(j++, *updatedLambdas[ndx])
+                                                        .With(0, "subItem")
+                                                    .Seal();
+                                                }
+                                                return builder;
+                                            })
+                                        .Seal()
+                                    .Seal();
+                                } else {
+                                    YQL_ENSURE(item.second.size() == 1 && item.second.front() < updatedLambdas.size());
+                                    builder.Add(i++, updatedLambdas[item.second.front()]);
+                                }
                             }
                             if (indicies.size() < inputVarTupleType->GetSize()) {
-                                builder.Callable(indicies.size() * 2 + 1, GetEmptyCollectionName(targetType))
-                                    .Add(0, ExpandType(node->Pos(), *MakeSequenceType(targetType, *GetSeqItemType(node->GetTypeAnn()), ctx), ctx))
+                                builder.Callable(i++, GetEmptyCollectionName(targetType))
+                                    .Add(0, ExpandType(node->Pos(), *MakeSequenceType(targetType, GetSeqItemType(*node->GetTypeAnn()), ctx), ctx))
                                 .Seal();
                             }
                             return builder;
@@ -5264,7 +5311,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                 .Callable(ETypeAnnotationKind::Flow == node->GetTypeAnn()->GetKind() ? "ToFlow" : "ToStream")
                     .Callable(0, "Just")
                         .Callable(0, "Dict")
-                            .Add(0, ExpandType(node->Pos(), *GetSeqItemType(node->GetTypeAnn()), ctx))
+                            .Add(0, ExpandType(node->Pos(), GetSeqItemType(*node->GetTypeAnn()), ctx))
                         .Seal()
                     .Seal()
                 .Seal().Build();
@@ -6333,8 +6380,8 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
 
     map["CountedAggregateAll"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext& optCtx) {
         YQL_CLOG(DEBUG, Core) << "Expand " << node->Content();
-        auto itemType = GetItemType(*node->Head().GetTypeAnn());
-        auto inputTypeNode = ExpandType(node->Pos(), *itemType, ctx);
+        const auto& itemType = GetSeqItemType(*node->Head().GetTypeAnn());
+        auto inputTypeNode = ExpandType(node->Pos(), itemType, ctx);
         THashSet<TStringBuf> countedColumns;
         for (const auto& child : node->Tail().Children()) {
             countedColumns.insert(child->Content());
@@ -6342,7 +6389,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
 
         TExprNode::TListType keys;
         TExprNode::TListType payloads;
-        for (auto i : itemType->Cast<TStructExprType>()->GetItems()) {
+        for (auto i : itemType.Cast<TStructExprType>()->GetItems()) {
             if (!countedColumns.contains(i->GetName())) {
                 keys.push_back(ctx.NewAtom(node->Pos(), i->GetName()));
             } else {
@@ -6425,9 +6472,9 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
             if (const auto& joinKind = mapJoin.JoinKind().Value(); joinKind == "Inner" || joinKind == "LeftSemi")
                 return ctx.NewCallable(mapJoin.Pos(), "EmptyIterator", {ExpandType(mapJoin.Pos(), *node->GetTypeAnn(), ctx)});
             else if (joinKind == "Left" || joinKind == "LeftOnly") {
-                switch (const auto itemType = GetSeqItemType(node->GetTypeAnn()); itemType->GetKind()) {
+                switch (const auto& itemType = GetSeqItemType(*node->GetTypeAnn()); itemType.GetKind()) {
                     case ETypeAnnotationKind::Tuple: {
-                        const auto& items = itemType->Cast<TTupleExprType>()->GetItems();
+                        const auto& items = itemType.Cast<TTupleExprType>()->GetItems();
                         auto row = ctx.NewArgument(mapJoin.Pos(), "row");
                         TExprNode::TListType fields(items.size());
                         for (auto i = 1U; i < mapJoin.LeftRenames().Size(); ++++i) {
@@ -6449,7 +6496,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                         return ctx.NewCallable(mapJoin.Pos(), "Map", {mapJoin.LeftInput().Ptr(), std::move(lambda)});
                     }
                     case ETypeAnnotationKind::Struct: {
-                        const auto structType = itemType->Cast<TStructExprType>();
+                        const auto structType = itemType.Cast<TStructExprType>();
                         const auto& items = structType->GetItems();
                         auto row = ctx.NewArgument(mapJoin.Pos(), "row");
                         TExprNode::TListType fields(items.size());
@@ -6634,15 +6681,14 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
             // push over sequence-of-structs or tuple(world, sequence-of-structs)
             if (type->GetKind() == ETypeAnnotationKind::Tuple) {
                 auto tupleType = type->Cast<TTupleExprType>();
-                if (tupleType->GetSize() == 2 && tupleType->GetItems()[0]->GetKind() == ETypeAnnotationKind::World) {
-                    type = tupleType->GetItems()[1];
+                if (tupleType->GetSize() == 2 && tupleType->GetItems().front()->GetKind() == ETypeAnnotationKind::World) {
+                    type = tupleType->GetItems().back();
                 }
             }
 
             if (type->GetKind() != ETypeAnnotationKind::Struct) {
-                type = GetItemType(*type);
+                type = GetSeqItemType(type);
             }
-
 
             auto newChildren = node->ChildrenList();
             for (auto& child : newChildren) {

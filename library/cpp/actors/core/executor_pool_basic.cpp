@@ -1,4 +1,5 @@
 #include "executor_pool_basic.h"
+#include "actor.h"
 #include "probes.h"
 #include "mailbox.h"
 #include <library/cpp/actors/util/affinity.h>
@@ -219,12 +220,6 @@ namespace NActors {
         TThreadCtx& threadCtx = Threads[workerId];
         AtomicSet(threadCtx.WaitingFlag, TThreadCtx::WS_NONE);
 
-        if (Y_UNLIKELY(AtomicGet(threadCtx.BlockedFlag) != TThreadCtx::BS_NONE)) {
-            if (GoToBeBlocked(threadCtx, timers)) { // interrupted
-                return 0;
-            }
-        }
-
         bool needToWait = false;
         bool needToBlock = false;
 
@@ -234,6 +229,12 @@ namespace NActors {
             TSemaphore semaphore = TSemaphore::GetSemaphore(x);
             needToBlock = semaphore.CurrentSleepThreadCount < 0;
             needToWait = needToBlock || semaphore.OldSemaphore <= -semaphore.CurrentSleepThreadCount;
+
+            if (needToWait && wctx.HasCapturedMessageBox) {
+                timers.HPNow = GetCycleCountFast();
+                wctx.AddElapsedCycles(IActor::ACTOR_SYSTEM, timers.HPNow - timers.HPStart);
+                return 0;
+            }
 
             semaphore.OldSemaphore--;
             if (needToWait) {

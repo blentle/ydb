@@ -526,6 +526,7 @@ private:
             for(auto& tx : txResults) {
                 result.Results.emplace_back(std::move(tx.GetMkql()));
             }
+            Parameters->AddTxHolders(std::move(ev->GetTxHolders()));
             Parameters->AddTxResults(std::move(txResults));
         }
         Promise.SetValue(std::move(result));
@@ -1668,7 +1669,7 @@ public:
 
     TFuture<TExecPhysicalResult> ExecutePure(TExecPhysicalRequest&& request, TQueryData::TPtr params) override {
         YQL_ENSURE(!request.Transactions.empty());
-        YQL_ENSURE(request.Locks.empty());
+        YQL_ENSURE(request.DataShardLocks.empty());
         YQL_ENSURE(!request.NeedTxId);
 
         auto containOnlyPureStages = [](const auto& request) {
@@ -2095,76 +2096,6 @@ private:
         schema.SetEngine(NKikimrSchemeOp::EColumnTableEngine::COLUMN_ENGINE_REPLACING_TIMESERIES);
     }
 
-    static bool CheckLoadTableMetadataStatus(ui32 status, const TString& reason,
-        IKikimrGateway::TTableMetadataResult& error)
-    {
-        using TResult = IKikimrGateway::TTableMetadataResult;
-
-        switch (status) {
-            case NKikimrScheme::EStatus::StatusSuccess:
-            case NKikimrScheme::EStatus::StatusPathDoesNotExist:
-                return true;
-            case NKikimrScheme::EStatus::StatusSchemeError:
-                error = ResultFromError<TResult>(YqlIssue({}, TIssuesIds::KIKIMR_SCHEME_ERROR, reason));
-                return false;
-            case NKikimrScheme::EStatus::StatusAccessDenied:
-                error = ResultFromError<TResult>(YqlIssue({}, TIssuesIds::KIKIMR_ACCESS_DENIED, reason));
-                return false;
-            case NKikimrScheme::EStatus::StatusNotAvailable:
-                error = ResultFromError<TResult>(YqlIssue({}, TIssuesIds::KIKIMR_TEMPORARILY_UNAVAILABLE, reason));
-                return false;
-            default:
-                error = ResultFromError<TResult>(TStringBuilder() << status << ": " <<  reason);
-                return false;
-        }
-    }
-
-    static NYql::EYqlIssueCode KikimrProxyErrorStatus(ui32 proxyStatus) {
-        NYql::EYqlIssueCode status = TIssuesIds::DEFAULT_ERROR;
-
-        switch (proxyStatus) {
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ResolveError:
-                status = TIssuesIds::KIKIMR_SCHEME_MISMATCH;
-                break;
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ProxyNotReady:
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ProxyShardNotAvailable:
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ProxyShardTryLater:
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::CoordinatorDeclined:
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::CoordinatorOutdated:
-                status = TIssuesIds::KIKIMR_TEMPORARILY_UNAVAILABLE;
-                break;
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ProxyShardOverloaded:
-                status = TIssuesIds::KIKIMR_OVERLOADED;
-                break;
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ExecResultUnavailable:
-                status = TIssuesIds::KIKIMR_RESULT_UNAVAILABLE;
-                break;
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::AccessDenied:
-                status = TIssuesIds::KIKIMR_ACCESS_DENIED;
-                break;
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ExecTimeout:
-                status = TIssuesIds::KIKIMR_TIMEOUT;
-                break;
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ExecCancelled:
-                status = TIssuesIds::KIKIMR_OPERATION_CANCELLED;
-                break;
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::WrongRequest:
-                status = TIssuesIds::KIKIMR_BAD_REQUEST;
-                break;
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ProxyShardUnknown:
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::CoordinatorUnknown:
-                status = TIssuesIds::KIKIMR_OPERATION_STATE_UNKNOWN;
-                break;
-            case TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ExecAborted:
-                status = TIssuesIds::KIKIMR_OPERATION_ABORTED;
-                break;
-            default:
-                break;
-        }
-
-        return status;
-    }
-
     static void FillParameters(TQueryData::TPtr params, NKikimrMiniKQL::TParams& output) {
         if (!params) {
             return;
@@ -2218,6 +2149,10 @@ private:
             toType->set_type_id(Ydb::Type::UINT32);
             toValue->set_uint32_value(FromString<ui32>(fromValue));
             break;
+        case NYql::EDataSlot::Int64:
+            toType->set_type_id(Ydb::Type::INT64);
+            toValue->set_int64_value(FromString<i64>(fromValue));
+            break;
         case NYql::EDataSlot::Uint64:
             toType->set_type_id(Ydb::Type::UINT64);
             toValue->set_uint64_value(FromString<ui64>(fromValue));
@@ -2263,7 +2198,6 @@ private:
         }
         return true;
     }
-
 
     // Convert TKikimrTableMetadata struct to public API proto
     static bool ConvertCreateTableSettingsToProto(NYql::TKikimrTableMetadataPtr metadata,
@@ -2415,6 +2349,16 @@ private:
             } else {
                 code = Ydb::StatusIds::BAD_REQUEST;
                 error = "Can't reset TTL settings";
+                return false;
+            }
+        }
+
+        if (const auto& tiering = metadata->TableSettings.Tiering) {
+            if (tiering.IsSet()) {
+                proto.set_tiering(tiering.GetValueSet());
+            } else {
+                code = Ydb::StatusIds::BAD_REQUEST;
+                error = "Can't reset TIERING";
                 return false;
             }
         }

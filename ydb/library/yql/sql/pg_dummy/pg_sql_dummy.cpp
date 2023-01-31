@@ -130,6 +130,12 @@ void PgReleaseThreadContext(void* ctx) {
     Y_UNUSED(ctx);
 }
 
+ui64 PgValueSize(ui32 type, const NUdf::TUnboxedValuePod& value) {
+    Y_UNUSED(type);
+    Y_UNUSED(value);
+    throw yexception() << "PG types are not supported";
+}
+
 ui64 PgValueSize(const TPgType* type, const NUdf::TUnboxedValuePod& value) {
     Y_UNUSED(type);
     Y_UNUSED(value);
@@ -312,6 +318,18 @@ ui64 PgNativeBinaryHash(const char* data, size_t size, void* typeDesc) {
     Y_UNUSED(data);
     Y_UNUSED(size);
     Y_UNUSED(typeDesc);
+    throw yexception() << "PG types are not supported";
+}
+
+TConvertResult PgNativeBinaryFromNativeText(const TString& str, ui32 pgTypeId) {
+    Y_UNUSED(str);
+    Y_UNUSED(pgTypeId);
+    throw yexception() << "PG types are not supported";
+}
+
+TConvertResult PgNativeTextFromNativeBinary(const TString& binary, ui32 pgTypeId) {
+    Y_UNUSED(binary);
+    Y_UNUSED(pgTypeId);
     throw yexception() << "PG types are not supported";
 }
 

@@ -17,6 +17,32 @@ namespace {
 
 constexpr ui64 MinRowsPerCheck = 1000;
 
+class TRowCountBlockBuilder : public IBlockBuilder {
+public:
+    bool Start(const TVector<std::pair<TString, NScheme::TTypeInfo>>&, ui64, ui64, TString&) override
+    {
+        return true;
+    }
+
+    void AddRow(const TDbTupleRef&, const TDbTupleRef&) override {
+        ++RowCount;
+    }
+
+    TString Finish() override {
+        return TString();
+    }
+
+    size_t Bytes() const override { return 0; }
+
+private:
+    ui64 RowCount = 0;
+
+    std::unique_ptr<IBlockBuilder> Clone() const override {
+        return nullptr;
+    }
+};
+
+
 class TCellBlockBuilder : public IBlockBuilder {
 public:
     bool Start(
@@ -152,6 +178,11 @@ std::pair<std::unique_ptr<IBlockBuilder>, TString> CreateBlockBuilder(
     std::unique_ptr<IBlockBuilder> blockBuilder;
     TString error;
 
+    if (state.Columns.empty()) {
+        blockBuilder.reset(new TRowCountBlockBuilder());
+        return std::make_pair(std::move(blockBuilder), error);
+    }
+
     auto nameTypeCols = GetNameTypeColumns(state.Columns, tableInfo);
     if (nameTypeCols.empty()) {
         error = "Wrong columns requested";
@@ -159,10 +190,10 @@ std::pair<std::unique_ptr<IBlockBuilder>, TString> CreateBlockBuilder(
     }
 
     switch (state.Format) {
-    case NKikimrTxDataShard::EScanDataFormat::ARROW:
+    case NKikimrTxDataShard::ARROW:
         blockBuilder.reset(new NArrow::TArrowBatchBuilder());
         break;
-    case NKikimrTxDataShard::EScanDataFormat::CELLVEC:
+    case NKikimrTxDataShard::CELLVEC:
         blockBuilder.reset(new TCellBlockBuilder());
         break;
     default:
@@ -249,6 +280,8 @@ class TReader {
 
     NTable::ITransactionMapPtr TxMap;
     NTable::ITransactionObserverPtr TxObserver;
+    absl::flat_hash_set<ui64> VolatileReadDependencies;
+    bool VolatileWaitForCommit = false;
 
     enum class EReadStatus {
         Done = 0,
@@ -493,27 +526,34 @@ public:
             }
         }
 
-        if (!isKeysRequest)
+        Self->IncCounter(COUNTER_READ_ITERATOR_ROWS_READ, RowsRead);
+        if (!isKeysRequest) {
             Self->IncCounter(COUNTER_ENGINE_HOST_SELECT_RANGE_ROW_SKIPS, InvisibleRowSkips);
+            Self->IncCounter(COUNTER_ENGINE_HOST_SELECT_RANGE_ROWS, RowsRead);
+            Self->IncCounter(COUNTER_RANGE_READ_ROWS_PER_REQUEST, RowsRead);
+        }
 
+        if (RowsRead) {
+            record.SetRowCount(RowsRead);
+        }
+
+        // not that in case of empty columns set, here we have 0 bytes
+        // and if is false
         BytesInResult = BlockBuilder.Bytes();
         if (BytesInResult) {
-            Self->IncCounter(COUNTER_READ_ITERATOR_ROWS_READ, RowsRead);
             Self->IncCounter(COUNTER_READ_ITERATOR_BYTES_READ, BytesInResult);
             if (isKeysRequest) {
                 // backward compatibility
                 Self->IncCounter(COUNTER_ENGINE_HOST_SELECT_ROW_BYTES, BytesInResult);
             } else {
                 // backward compatibility
-                Self->IncCounter(COUNTER_ENGINE_HOST_SELECT_RANGE_ROWS, RowsRead);
-                Self->IncCounter(COUNTER_RANGE_READ_ROWS_PER_REQUEST, RowsRead);
                 Self->IncCounter(COUNTER_ENGINE_HOST_SELECT_RANGE_BYTES, BytesInResult);
             }
 
             switch (State.Format) {
             case NKikimrTxDataShard::ARROW: {
                 auto& arrowBuilder = static_cast<NArrow::TArrowBatchBuilder&>(BlockBuilder);
-                result.ArrowBatch = arrowBuilder.FlushBatch(false);
+                result.SetArrowBatch(arrowBuilder.FlushBatch(false));
                 break;
             }
             case NKikimrTxDataShard::CELLVEC: {
@@ -558,6 +598,9 @@ public:
     ui64 GetRowsRead() const { return RowsRead; }
     bool HadInvisibleRowSkips() const { return InvisibleRowSkips > 0; }
     bool HadInconsistentResult() const { return HadInconsistentResult_; }
+
+    const absl::flat_hash_set<ui64>& GetVolatileReadDependencies() const { return VolatileReadDependencies; }
+    bool NeedVolatileWaitForCommit() const { return VolatileWaitForCommit; }
 
 private:
     bool OutOfQuota() const {
@@ -621,8 +664,8 @@ private:
         }
 
         // last iteration to Page or Gone also might have deleted or invisible rows
-        RowsSinceLastCheck += ResetRowStats(iter->Stats);
         InvisibleRowSkips += iter->Stats.InvisibleRowSkips;
+        RowsSinceLastCheck += ResetRowStats(iter->Stats);
 
         // TODO: consider restart when Page and too few data read
         // (how much is too few, less than user's limit?)
@@ -638,32 +681,52 @@ private:
     }
 
     const NTable::ITransactionMapPtr& GetReadTxMap() {
-        if (!TxMap &&
-            State.LockId &&
-            !TSysTables::IsSystemTable(State.PathId) &&
-            Self->SysLocksTable().HasCurrentWriteLock(State.PathId))
-        {
-            TxMap = new NTable::TSingleTransactionMap(State.LockId, TRowVersion::Min());
+        if (!TxMap && Self->IsUserTable(State.PathId)) {
+            auto baseTxMap = Self->GetVolatileTxManager().GetTxMap();
+
+            bool needTxMap = (
+                // We need tx map when there are waiting volatile transactions
+                baseTxMap ||
+                // We need tx map when current lock has uncommitted changes
+                State.LockId && Self->SysLocksTable().HasCurrentWriteLock(State.PathId));
+
+            if (needTxMap) {
+                auto ptr = MakeIntrusive<NTable::TDynamicTransactionMap>(baseTxMap);
+                if (State.LockId) {
+                    ptr->Add(State.LockId, TRowVersion::Min());
+                }
+                TxMap = ptr;
+            }
         }
 
         return TxMap;
     }
 
     const NTable::ITransactionObserverPtr& GetReadTxObserver() {
-        if (!TxObserver &&
-            State.LockId &&
-            !TSysTables::IsSystemTable(State.PathId) &&
-            Self->SysLocksTable().HasWriteLocks(State.PathId))
-        {
-            TxObserver = new TReadTxObserver(this);
+        if (!TxObserver && Self->IsUserTable(State.PathId)) {
+            auto baseTxMap = Self->GetVolatileTxManager().GetTxMap();
+
+            bool needTxObserver = (
+                // We need tx observer when there are waiting volatile transactions
+                baseTxMap ||
+                // We need tx observer when current lock has uncommitted changes
+                State.LockId && Self->SysLocksTable().HasCurrentWriteLock(State.PathId));
+
+            if (needTxObserver) {
+                if (State.LockId) {
+                    TxObserver = new TLockedReadTxObserver(this);
+                } else {
+                    TxObserver = new TReadTxObserver(this);
+                }
+            }
         }
 
         return TxObserver;
     }
 
-    class TReadTxObserver : public NTable::ITransactionObserver {
+    class TLockedReadTxObserver : public NTable::ITransactionObserver {
     public:
-        TReadTxObserver(TReader* reader)
+        TLockedReadTxObserver(TReader* reader)
             : Reader(reader)
         {
         }
@@ -684,8 +747,40 @@ private:
             Reader->CheckReadConflict(rowVersion);
         }
 
-        void OnApplyCommitted(const TRowVersion& rowVersion, ui64) override {
+        void OnApplyCommitted(const TRowVersion& rowVersion, ui64 txId) override {
             Reader->CheckReadConflict(rowVersion);
+            Reader->CheckReadDependency(txId);
+        }
+
+    private:
+        TReader* const Reader;
+    };
+
+    class TReadTxObserver : public NTable::ITransactionObserver {
+    public:
+        TReadTxObserver(TReader* reader)
+            : Reader(reader)
+        {
+        }
+
+        void OnSkipUncommitted(ui64) override {
+            // We don't care about uncommitted changes
+        }
+
+        void OnSkipCommitted(const TRowVersion&) override {
+            // We already use InvisibleRowSkips for these
+        }
+
+        void OnSkipCommitted(const TRowVersion&, ui64) override {
+            // We already use InvisibleRowSkips for these
+        }
+
+        void OnApplyCommitted(const TRowVersion&) override {
+            // Not needed
+        }
+
+        void OnApplyCommitted(const TRowVersion&, ui64 txId) override {
+            Reader->CheckReadDependency(txId);
         }
 
     private:
@@ -709,6 +804,28 @@ private:
             // code path. We have to break our own lock and make sure we won't
             // reply with inconsistent results.
             HadInconsistentResult_ = true;
+        }
+    }
+
+    void CheckReadDependency(ui64 txId) {
+        if (auto* info = Self->GetVolatileTxManager().FindByCommitTxId(txId)) {
+            switch (info->State) {
+                case EVolatileTxState::Waiting:
+                    // We are reading undecided changes and need to wait until they are resolved
+                    VolatileReadDependencies.insert(info->TxId);
+                    break;
+                case EVolatileTxState::Committed:
+                    // Committed changes are immediately visible and don't need a dependency
+                    if (!info->AddCommitted) {
+                        // However we may need to wait until they are persistent
+                        VolatileWaitForCommit = true;
+                    }
+                    break;
+                case EVolatileTxState::Aborting:
+                    // We just read something that we know is aborting, we would have to retry later
+                    VolatileReadDependencies.insert(info->TxId);
+                    break;
+            }
         }
     }
 };
@@ -866,7 +983,7 @@ public:
             if (!snapshotFound) {
                 SetStatusError(
                     Result->Record,
-                    Ydb::StatusIds::NOT_FOUND,
+                    Ydb::StatusIds::PRECONDITION_FAILED,
                     TStringBuilder() << "Table id " << tableId << " lost snapshot at "
                          << state.ReadVersion << " shard " << Self->TabletID()
                          << " with lowWatermark " << Self->GetSnapshotManager().GetLowWatermark()
@@ -918,6 +1035,18 @@ public:
 
         if (!Read(txc, ctx, state))
             return EExecutionStatus::Restart;
+
+        // Check if successful result depends on unresolved volatile transactions
+        if (Result && !Result->Record.HasStatus() && !Reader->GetVolatileReadDependencies().empty()) {
+            for (ui64 txId : Reader->GetVolatileReadDependencies()) {
+                AddVolatileDependency(txId);
+                bool ok = Self->GetVolatileTxManager().AttachBlockedOperation(txId, GetTxId());
+                Y_VERIFY(ok, "Unexpected failure to attach a blocked operation");
+            }
+            Reader.reset();
+            Result.reset(new TEvDataShard::TEvReadResult());
+            return EExecutionStatus::Continue;
+        }
 
         TDataShard::EPromotePostExecuteEdges readType = TDataShard::EPromotePostExecuteEdges::RepeatableRead;
 
@@ -973,7 +1102,7 @@ public:
         if (hadWrites)
             return EExecutionStatus::DelayCompleteNoMoreRestarts;
 
-        if (Self->Pipeline.HasCommittingOpsBelow(state.ReadVersion))
+        if (Self->Pipeline.HasCommittingOpsBelow(state.ReadVersion) || Reader && Reader->NeedVolatileWaitForCommit())
             return EExecutionStatus::DelayComplete;
 
         Complete(ctx);
@@ -1078,7 +1207,7 @@ public:
             if (!snapshotFound) {
                 SetStatusError(
                     Result->Record,
-                    Ydb::StatusIds::NOT_FOUND,
+                    Ydb::StatusIds::PRECONDITION_FAILED,
                     TStringBuilder() << "Table id " << tableId << " has no snapshot at "
                          << state.ReadVersion << " shard " << Self->TabletID()
                          << " with lowWatermark " << Self->GetSnapshotManager().GetLowWatermark()
@@ -1316,7 +1445,7 @@ private:
         if (!Self->GetSnapshotManager().FindAvailable(snapshotKey) && !allowMvcc) {
             SetStatusError(
                 Result->Record,
-                Ydb::StatusIds::ABORTED,
+                Ydb::StatusIds::PRECONDITION_FAILED,
                 TStringBuilder() << "Table id " << tableId << " lost snapshot at "
                      << state.ReadVersion << " shard " << Self->TabletID()
                      << " with lowWatermark " << Self->GetSnapshotManager().GetLowWatermark()
@@ -1624,6 +1753,7 @@ class TDataShard::TTxReadContinue : public NTabletFlatExecutor::TTransactionBase
     std::unique_ptr<IBlockBuilder> BlockBuilder;
     TShortTableInfo TableInfo;
     std::unique_ptr<TReader> Reader;
+    bool DelayedResult = false;
 
 public:
     TTxReadContinue(TDataShard* ds, TEvDataShard::TEvReadContinue::TPtr ev)
@@ -1665,7 +1795,7 @@ public:
                     Result->Record,
                     Ydb::StatusIds::NOT_FOUND,
                     TStringBuilder() << "Unknown table id: " << state.PathId.LocalPathId);
-                SendResult(txc, ctx);
+                SendResult(ctx);
                 return true;
             }
             auto userTableInfo = it->second;
@@ -1677,7 +1807,7 @@ public:
                     Ydb::StatusIds::SCHEME_ERROR,
                     TStringBuilder() << "Schema changed, current " << currentSchemaVersion
                         << ", requested table schemaversion " << state.SchemaVersion);
-                SendResult(txc, ctx);
+                SendResult(ctx);
                 return true;
             }
 
@@ -1690,7 +1820,7 @@ public:
                     Ydb::StatusIds::NOT_FOUND,
                     TStringBuilder() << "Failed to get scheme for table local id: "
                         << state.PathId.LocalPathId);
-                SendResult(txc, ctx);
+                SendResult(ctx);
                 return true;
             }
             TableInfo = TShortTableInfo(state.PathId.LocalPathId, *schema);
@@ -1708,12 +1838,12 @@ public:
         if (!Self->GetSnapshotManager().FindAvailable(snapshotKey) && !allowMvcc) {
             SetStatusError(
                 Result->Record,
-                Ydb::StatusIds::ABORTED,
+                Ydb::StatusIds::PRECONDITION_FAILED,
                 TStringBuilder() << "Table id " << tableId << " lost snapshot at "
                      << state.ReadVersion << " shard " << Self->TabletID()
                      << " with lowWatermark " << Self->GetSnapshotManager().GetLowWatermark()
                      << (Self->IsFollower() ? " RO replica" : ""));
-            SendResult(txc, ctx);
+            SendResult(ctx);
             return true;
         }
 
@@ -1724,7 +1854,7 @@ public:
                     Result->Record,
                     Ydb::StatusIds::BAD_REQUEST,
                     p.second);
-                SendResult(txc, ctx);
+                SendResult(ctx);
                 return true;
             }
             std::swap(BlockBuilder, p.first);
@@ -1747,19 +1877,91 @@ public:
             Self));
 
         if (Reader->Read(txc, ctx)) {
-            SendResult(txc, ctx);
+            // Retry later when dependencies are resolved
+            if (!Reader->GetVolatileReadDependencies().empty()) {
+                Self->WaitVolatileDependenciesThenSend(
+                    Reader->GetVolatileReadDependencies(),
+                    Self->SelfId(),
+                    std::make_unique<TEvDataShard::TEvReadContinue>(Ev->Get()->Reader, Ev->Get()->ReadId));
+                return true;
+            }
+
+            ApplyLocks(ctx);
+
+            if (!Reader->NeedVolatileWaitForCommit()) {
+                SendResult(ctx);
+            } else {
+                DelayedResult = true;
+            }
             return true;
         }
         return false;
     }
 
-    void Complete(const TActorContext&) override {
-        // nothing to do
+    void Complete(const TActorContext& ctx) override {
+        if (DelayedResult) {
+            SendResult(ctx);
+        }
     }
 
-    void SendResult(TTransactionContext& txc, const TActorContext& ctx) {
-        Y_UNUSED(txc);
+    void ApplyLocks(const TActorContext& ctx) {
+        const auto* request = Ev->Get();
+        TReadIteratorId readId(request->Reader, request->ReadId);
+        auto it = Self->ReadIterators.find(readId);
+        Y_VERIFY(it != Self->ReadIterators.end());
+        Y_VERIFY(it->second);
+        auto& state = *it->second;
 
+        if (!Result) {
+            return;
+        }
+
+        auto& record = Result->Record;
+        if (record.HasStatus()) {
+            return;
+        }
+
+        Y_ASSERT(Reader);
+
+        if (state.Lock) {
+            auto& sysLocks = Self->SysLocksTable();
+
+            bool isBroken = state.Lock->IsBroken();
+            if (!isBroken && (Reader->HadInvisibleRowSkips() || Reader->HadInconsistentResult())) {
+                sysLocks.BreakLock(state.Lock->GetLockId());
+                sysLocks.ApplyLocks();
+                Y_VERIFY(state.Lock->IsBroken());
+                isBroken = true;
+            }
+
+            if (isBroken) {
+                NKikimrTxDataShard::TLock *addLock = record.AddBrokenTxLocks();
+                addLock->SetLockId(state.Lock->GetLockId());
+                addLock->SetDataShard(Self->TabletID());
+                addLock->SetGeneration(state.Lock->GetGeneration());
+                addLock->SetCounter(state.Lock->GetCounter(state.ReadVersion));
+                addLock->SetSchemeShard(state.PathId.OwnerId);
+                addLock->SetPathId(state.PathId.LocalPathId);
+
+                LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, Self->TabletID() << " read iterator# " << readId
+                    << " TTxReadContinue::Execute() found broken lock# " << state.Lock->GetLockId());
+
+                // A broken write lock means we are reading inconsistent results and must abort
+                if (state.Lock->IsWriteLock()) {
+                    SetStatusError(record, Ydb::StatusIds::ABORTED, "Read conflict with concurrent transaction");
+                    return;
+                }
+
+                state.Lock = nullptr;
+            } else {
+                // Lock valid, apply conflict changes
+                auto locks = sysLocks.ApplyLocks();
+                Y_VERIFY(locks.empty(), "ApplyLocks acquired unexpected locks");
+            }
+        }
+    }
+
+    void SendResult(const TActorContext& ctx) {
         const auto* request = Ev->Get();
         TReadIteratorId readId(request->Reader, request->ReadId);
         auto it = Self->ReadIterators.find(readId);
@@ -1793,47 +1995,6 @@ public:
 
         Y_ASSERT(Reader);
         Y_ASSERT(BlockBuilder);
-
-        if (state.Lock) {
-            auto& sysLocks = Self->SysLocksTable();
-
-            bool isBroken = state.Lock->IsBroken();
-            if (!isBroken && (Reader->HadInvisibleRowSkips() || Reader->HadInconsistentResult())) {
-                sysLocks.BreakLock(state.Lock->GetLockId());
-                sysLocks.ApplyLocks();
-                Y_VERIFY(state.Lock->IsBroken());
-                isBroken = true;
-            }
-
-            if (isBroken) {
-                NKikimrTxDataShard::TLock *addLock = record.AddBrokenTxLocks();
-                addLock->SetLockId(state.Lock->GetLockId());
-                addLock->SetDataShard(Self->TabletID());
-                addLock->SetGeneration(state.Lock->GetGeneration());
-                addLock->SetCounter(state.Lock->GetCounter(state.ReadVersion));
-                addLock->SetSchemeShard(state.PathId.OwnerId);
-                addLock->SetPathId(state.PathId.LocalPathId);
-
-                LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, Self->TabletID() << " read iterator# " << readId
-                    << " TTxReadContinue::Execute() found broken lock# " << state.Lock->GetLockId());
-
-                // A broken write lock means we are reading inconsistent results and must abort
-                if (state.Lock->IsWriteLock()) {
-                    SetStatusError(record, Ydb::StatusIds::ABORTED, "Read conflict with concurrent transaction");
-                    record.SetSeqNo(state.SeqNo + 1);
-                    record.SetReadId(readId.ReadId);
-                    Self->SendImmediateReadResult(request->Reader, Result.release(), 0, state.SessionId);
-                    Self->DeleteReadIterator(it);
-                    return;
-                }
-
-                state.Lock = nullptr;
-            } else {
-                // Lock valid, apply conflict changes
-                auto locks = sysLocks.ApplyLocks();
-                Y_VERIFY(locks.empty(), "ApplyLocks acquired unexpected locks");
-            }
-        }
 
         LOG_TRACE_S(ctx, NKikimrServices::TX_DATASHARD, Self->TabletID() << " readContinue iterator# " << readId
             << " sends rowCount# " << Reader->GetRowsRead() << ", hasUnreadQueries# " << Reader->HasUnreadQueries()
@@ -1930,11 +2091,6 @@ void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ct
         return;
     }
 
-    if (record.ColumnsSize() == 0) {
-        replyWithError(Ydb::StatusIds::BAD_REQUEST, "Missing Columns");
-        return;
-    }
-
     TRowVersion readVersion = TRowVersion::Max();
     bool isHeadRead = false;
     if (record.HasSnapshot()) {
@@ -1974,7 +2130,7 @@ void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ct
                 // check if there is MVCC version and maybe wait
                 if (readVersion < GetSnapshotManager().GetLowWatermark()) {
                     replyWithError(
-                        Ydb::StatusIds::NOT_FOUND,
+                        Ydb::StatusIds::PRECONDITION_FAILED,
                         TStringBuilder() << "MVCC read " << readVersion
                             << " bellow low watermark " << GetSnapshotManager().GetLowWatermark());
                     return;

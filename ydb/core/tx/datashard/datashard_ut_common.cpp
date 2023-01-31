@@ -1462,6 +1462,19 @@ TRowVersion CommitWrites(
     return { step, txId };
 }
 
+ui64 AsyncDropTable(
+        Tests::TServer::TPtr server,
+        TActorId sender,
+        const TString& workingDir,
+        const TString& name)
+{
+    auto request = SchemeTxTemplate(NKikimrSchemeOp::ESchemeOpDropTable, workingDir);
+    auto& desc = *request->Record.MutableTransaction()->MutableModifyScheme()->MutableDrop();
+    desc.SetName(name);
+
+    return RunSchemeTx(*server->GetRuntime(), std::move(request), sender, true);
+}
+
 ui64 AsyncSplitTable(
         Tests::TServer::TPtr server,
         TActorId sender,
@@ -1640,6 +1653,9 @@ ui64 AsyncAlterAddStream(
     desc.MutableStreamDescription()->SetMode(streamDesc.Mode);
     desc.MutableStreamDescription()->SetFormat(streamDesc.Format);
     desc.MutableStreamDescription()->SetVirtualTimestamps(streamDesc.VirtualTimestamps);
+    if (streamDesc.InitialState) {
+        desc.MutableStreamDescription()->SetState(*streamDesc.InitialState);
+    }
 
     return RunSchemeTx(*server->GetRuntime(), std::move(request));
 }

@@ -364,6 +364,26 @@ THolder<NKqp::TEvKqp::TEvQueryRequest> MakeSQLRequest(const TString &sql,
 void InitRoot(Tests::TServer::TPtr server,
               TActorId sender);
 
+class TLambdaActor : public IActorCallback {
+public:
+    using TCallback = std::function<void(TAutoPtr<IEventHandle>&)>;
+
+public:
+    TLambdaActor(TCallback&& callback)
+        : IActorCallback(static_cast<TReceiveFunc>(&TLambdaActor::StateWork))
+        , Callback(std::move(callback))
+    { }
+
+private:
+    STFUNC(StateWork) {
+        Y_UNUSED(ctx);
+        Callback(ev);
+    }
+
+private:
+    TCallback Callback;
+};
+
 enum class EShadowDataMode {
     Default,
     Enabled,
@@ -397,10 +417,12 @@ struct TShardedTableOptions {
     struct TCdcStream {
         using EMode = NKikimrSchemeOp::ECdcStreamMode;
         using EFormat = NKikimrSchemeOp::ECdcStreamFormat;
+        using EState = NKikimrSchemeOp::ECdcStreamState;
 
         TString Name;
         EMode Mode;
         EFormat Format;
+        TMaybe<EState> InitialState;
         bool VirtualTimestamps = false;
     };
 
@@ -544,6 +566,12 @@ TRowVersion CommitWrites(
         Tests::TServer::TPtr server,
         const TVector<TString>& tables,
         ui64 writeTxId);
+
+ui64 AsyncDropTable(
+        Tests::TServer::TPtr server,
+        TActorId sender,
+        const TString& workingDir,
+        const TString& name);
 
 ui64 AsyncSplitTable(
         Tests::TServer::TPtr server,
@@ -693,5 +721,21 @@ public:
 private:
     const bool PrevValue;
 };
+
+template<class TCondition>
+void WaitFor(TTestActorRuntime& runtime, TCondition&& condition, const TString& description = "condition", size_t maxAttempts = 1) {
+    for (size_t attempt = 0; attempt < maxAttempts; ++attempt) {
+        if (condition()) {
+            return;
+        }
+        Cerr << "... waiting for " << description << Endl;
+        TDispatchOptions options;
+        options.CustomFinalCondition = [&]() {
+            return condition();
+        };
+        runtime.DispatchEvents(options);
+    }
+    UNIT_ASSERT_C(condition(), "... failed to wait for " << description);
+}
 
 }

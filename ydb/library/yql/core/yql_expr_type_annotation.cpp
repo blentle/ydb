@@ -388,16 +388,11 @@ IGraphTransformer::TStatus TryConvertToImpl(TExprContext& ctx, TExprNode::TPtr& 
             if (!pos) {
                 switch (newField->GetItemType()->GetKind()) {
                 case ETypeAnnotationKind::Null:
-                case ETypeAnnotationKind::EmptyList:
-                case ETypeAnnotationKind::EmptyDict:
-                case ETypeAnnotationKind::Void:
                     field = ctx.Builder(node->Pos())
                         .Callable(ToString(newField->GetItemType()->GetKind())).Seal()
                         .Build();
                     break;
                 case ETypeAnnotationKind::Optional:
-                case ETypeAnnotationKind::List:
-                case ETypeAnnotationKind::Dict:
                 case ETypeAnnotationKind::Pg:
                     field = ctx.Builder(node->Pos())
                         .Callable(GetEmptyCollectionName(newField->GetItemType()->GetKind()))
@@ -4770,6 +4765,15 @@ bool IsEmptyList(const TTypeAnnotationNode& type) {
     return type.GetKind() == ETypeAnnotationKind::EmptyList;
 }
 
+bool IsFlowOrStream(const TTypeAnnotationNode& type) {
+    const auto kind = type.GetKind();
+    return kind == ETypeAnnotationKind::Stream || kind == ETypeAnnotationKind::Flow;
+}
+
+bool IsFlowOrStream(const TExprNode& node) {
+    return IsFlowOrStream(*node.GetTypeAnn());
+}
+
 namespace {
 
 using TIndentPrinter = std::function<void(TStringBuilder& res, size_t)>;
@@ -4857,7 +4861,7 @@ static void PrintTypeDiff(TStringBuilder& res, size_t level, const TIndentPrinte
         case ETypeAnnotationKind::Flow:
             res << left.GetKind() << '<';
             indent(res, level + 1);
-            PrintTypeDiff(res, level + 1, indent, *GetItemType(left), *GetItemType(right));
+            PrintTypeDiff(res, level + 1, indent, GetSeqItemType(left), GetSeqItemType(right));
             indent(res, level);
             res << '>';
             break;
@@ -5254,27 +5258,6 @@ std::optional<ui32> GetFieldPosition(const TStructExprType& structType, const TS
     return std::nullopt;
 }
 
-bool IsCallableTypeHasStreams(const TCallableExprType* callableType) {
-    for (;;) {
-        if (callableType->GetReturnType()->GetKind() == ETypeAnnotationKind::Stream) {
-            return true;
-        }
-        else {
-            for (auto& arg: callableType->GetArguments()) {
-                if (arg.Type->GetKind() == ETypeAnnotationKind::Stream) {
-                    return true;
-                }
-            }
-        }
-        if (callableType->GetReturnType()->GetKind() == ETypeAnnotationKind::Callable) {
-            callableType = callableType->GetReturnType()->Cast<TCallableExprType>();
-        } else {
-            break;
-        }
-    }
-    return false;
-}
-
 bool ExtractPgType(const TTypeAnnotationNode* type, ui32& pgType, bool& convertToPg, TPositionHandle pos, TExprContext& ctx) {
     pgType = 0;
     convertToPg = false;
@@ -5365,7 +5348,7 @@ const TTypeAnnotationNode* GetBlockItemType(const TTypeAnnotationNode& type, boo
 
 const TTypeAnnotationNode* AggApplySerializedStateType(const TExprNode::TPtr& input, TExprContext& ctx) {
     auto name = input->Child(0)->Content();
-    if (name == "count" || name == "count_all" || name == "sum" || name == "min" || name == "max") {
+    if (name == "count" || name == "count_all" || name == "sum" || name == "min" || name == "max" || name == "some") {
         return input->GetTypeAnn();
     } else if (name == "avg") {
         auto itemType = input->Content().StartsWith("AggBlock") ?

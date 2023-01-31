@@ -570,17 +570,6 @@ namespace {
                         return nullptr;
 
                     return Expr.MakeType<TBlockExprType>(r);
-                } else if (content == TStringBuf("ChunkedBlock")) {
-                    if (node.GetChildrenCount() != 2) {
-                        AddError(node, "Bad chunked block type annotation");
-                        return nullptr;
-                    }
-
-                    auto r = CompileTypeAnnotationNode(*node.GetChild(1));
-                    if (!r)
-                        return nullptr;
-
-                    return Expr.MakeType<TChunkedBlockExprType>(r);
                 } else if (content == TStringBuf("Scalar")) {
                     if (node.GetChildrenCount() != 2) {
                         AddError(node, "Bad scalar type annotation");
@@ -844,14 +833,6 @@ namespace {
         {
             auto type = annotation.Cast<TBlockExprType>();
             auto self = TAstNode::NewLiteralAtom(TPosition(), TStringBuf("Block"), pool);
-            auto itemType = ConvertTypeAnnotationToAst(*type->GetItemType(), pool, refAtoms);
-            return TAstNode::NewList(TPosition(), pool, self, itemType);
-        }
-
-        case ETypeAnnotationKind::ChunkedBlock:
-        {
-            auto type = annotation.Cast<TChunkedBlockExprType>();
-            auto self = TAstNode::NewLiteralAtom(TPosition(), TStringBuf("ChunkedBlock"), pool);
             auto itemType = ConvertTypeAnnotationToAst(*type->GetItemType(), pool, refAtoms);
             return TAstNode::NewList(TPosition(), pool, self, itemType);
         }
@@ -3392,15 +3373,6 @@ const TBlockExprType* TMakeTypeImpl<TBlockExprType>::Make(TExprContext& ctx, con
     return AddType<TBlockExprType>(ctx, hash, itemType);
 }
 
-const TChunkedBlockExprType* TMakeTypeImpl<TChunkedBlockExprType>::Make(TExprContext& ctx, const TTypeAnnotationNode* itemType) {
-    const auto hash = TChunkedBlockExprType::MakeHash(itemType);
-    TChunkedBlockExprType sample(hash, itemType);
-    if (const auto found = FindType(sample, ctx))
-        return found;
-
-    return AddType<TChunkedBlockExprType>(ctx, hash, itemType);
-}
-
 const TScalarExprType* TMakeTypeImpl<TScalarExprType>::Make(TExprContext& ctx, const TTypeAnnotationNode* itemType) {
     const auto hash = TScalarExprType::MakeHash(itemType);
     TScalarExprType sample(hash, itemType);
@@ -3514,6 +3486,9 @@ TString SubstParameters(const TString& str, const TMaybe<NYT::TNode>& params, TS
 }
 
 const TTypeAnnotationNode* GetSeqItemType(const TTypeAnnotationNode* type) {
+    if (!type)
+        return nullptr;
+
     switch (type->GetKind()) {
         case ETypeAnnotationKind::List: return type->Cast<TListExprType>()->GetItemType();
         case ETypeAnnotationKind::Flow: return type->Cast<TFlowExprType>()->GetItemType();
@@ -3521,7 +3496,13 @@ const TTypeAnnotationNode* GetSeqItemType(const TTypeAnnotationNode* type) {
         case ETypeAnnotationKind::Optional: return type->Cast<TOptionalExprType>()->GetItemType();
         default: break;
     }
-    throw yexception() << "Impossible to get item type from " << *type;
+    return nullptr;
+}
+
+const TTypeAnnotationNode& GetSeqItemType(const TTypeAnnotationNode& type) {
+    if (const auto itemType = GetSeqItemType(&type))
+        return *itemType;
+    throw yexception() << "Impossible to get item type from " << type;
 }
 
 } // namespace NYql

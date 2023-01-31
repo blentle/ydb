@@ -596,6 +596,8 @@ message TEvVAssimilate {
     optional fixed64 SkipBlocksUpTo = 10; // return keys strictly greater than this; if not set, return since the first one
     optional TBarrierKey SkipBarriersUpTo = 11; // the same behaviour
     optional NKikimrProto.TLogoBlobID SkipBlobsUpTo = 12; // the same behaviour
+
+    optional bool IgnoreDecommitState = 13 [default = false]; // do not check if VDisk belongs to a being-decommitted group
 }
 
 message TEvVAssimilateResult {
@@ -1285,6 +1287,7 @@ message TEvControllerSelectGroupsResult {
         optional uint32 GroupID = 2;
         optional string StoragePoolName = 3; // if it was selected from the storage pool
         optional bool PhysicalGroup = 12; // related to TChannelBind.PhysicalGroupsOnly
+        optional bool Decommitted = 13;
 
         reserved 4;
 

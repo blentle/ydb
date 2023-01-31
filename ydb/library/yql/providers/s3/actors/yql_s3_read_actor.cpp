@@ -174,14 +174,11 @@ struct TEvPrivate {
     };
 
     struct TEvFileFinished : public TEventLocal<TEvFileFinished, EvFileFinished> {
-        TEvFileFinished(size_t pathIndex, ui64 ingressBytes, ui64 expectedDataSize, ui64 actualDataSize)
-            : PathIndex(pathIndex), IngressBytes(ingressBytes), 
-              ExpectedDataSize(expectedDataSize), ActualDataSize(actualDataSize) {
+        TEvFileFinished(size_t pathIndex, ui64 ingressBytes)
+            : PathIndex(pathIndex), IngressBytes(ingressBytes) {
         }
         const size_t PathIndex;
         ui64 IngressBytes;
-        ui64 ExpectedDataSize;
-        ui64 ActualDataSize;
     };
 
     struct TEvReadError : public TEventLocal<TEvReadError, EvReadError> {
@@ -244,8 +241,12 @@ public:
         ui64 startPathIndex,
         const NActors::TActorId& computeActorId,
         ui64 sizeLimit,
-        const IRetryPolicy<long>::TPtr& retryPolicy
-    )   : Gateway(std::move(gateway))
+        const IRetryPolicy<long>::TPtr& retryPolicy,
+        const TS3ReadActorFactoryConfig& readActorFactoryCfg,
+        ::NMonitoring::TDynamicCounterPtr counters,
+        ::NMonitoring::TDynamicCounterPtr taskCounters
+    )   : ReadActorFactoryCfg(readActorFactoryCfg)
+        , Gateway(std::move(gateway))
         , HolderFactory(holderFactory)
         , InputIndex(inputIndex)
         , TxId(txId)
@@ -258,20 +259,57 @@ public:
         , AddPathIndex(addPathIndex)
         , StartPathIndex(startPathIndex)
         , SizeLimit(sizeLimit)
-    {}
+        , Counters(counters)
+        , TaskCounters(taskCounters)
+    {
+        if (Counters) {
+            QueueDataSize = Counters->GetCounter("QueueDataSize");
+            QueueDataLimit = Counters->GetCounter("QueueDataLimit");
+            QueueBlockCount = Counters->GetCounter("QueueBlockCount");
+            QueueDataLimit->Add(ReadActorFactoryCfg.DataInflight);
+        }
+        if (TaskCounters) {
+            TaskQueueDataSize = TaskCounters->GetCounter("QueueDataSize");
+            TaskQueueDataLimit = TaskCounters->GetCounter("QueueDataLimit");
+            TaskQueueDataLimit->Add(ReadActorFactoryCfg.DataInflight);
+        }
+    }
 
     void Bootstrap() {
         LOG_D("TS3ReadActor", "Bootstrap" << ", InputIndex: " << InputIndex);
         Become(&TS3ReadActor::StateFunc);
-        for (size_t pathInd = 0; pathInd < Paths.size(); ++pathInd) {
-            const TPath& path = Paths[pathInd];
-            auto url = Url + std::get<TString>(path);
-            auto id = pathInd + StartPathIndex;
-            const TString requestId = CreateGuidAsString();
-            LOG_D("TS3ReadActor", "Download: " << url << ", ID: " << id << ", request id: [" << requestId << "]");
-            Gateway->Download(url, MakeHeaders(Token, requestId), std::min(std::get<size_t>(path), SizeLimit),
-                std::bind(&TS3ReadActor::OnDownloadFinished, ActorSystem, SelfId(), requestId, std::placeholders::_1, id), {}, RetryPolicy);
-        };
+        while (TryStartDownload()) {
+
+        }
+    }
+
+    bool TryStartDownload() {
+        if (CurrentPathIndex >= Paths.size()) {
+            // no path is pending
+            return false;
+        }
+        if (QueueTotalDataSize > ReadActorFactoryCfg.DataInflight) {
+            // too large data inflight
+            return false;
+        }
+        if (DownloadInflight >= ReadActorFactoryCfg.MaxInflight) {
+            // too large download inflight
+            return false;
+        }
+
+        StartDownload(CurrentPathIndex++);
+        return true;
+    }
+
+    void StartDownload(size_t index) {
+        DownloadInflight++;
+        const TPath& path = Paths[index];
+        auto url = Url + std::get<TString>(path);
+        auto id = index + StartPathIndex;
+        const TString requestId = CreateGuidAsString();
+        LOG_D("TS3ReadActor", "Download: " << url << ", ID: " << id << ", request id: [" << requestId << "]");
+        Gateway->Download(url, MakeHeaders(Token, requestId), 0U, std::min(std::get<size_t>(path), SizeLimit),
+            std::bind(&TS3ReadActor::OnDownloadFinished, ActorSystem, SelfId(), requestId, std::placeholders::_1, id), {}, RetryPolicy);
     }
 
     static constexpr char ActorName[] = "S3_READ_ACTOR";
@@ -324,6 +362,16 @@ private:
                 Blocks.pop();
                 total += size;
                 freeSpace -= size;
+
+                QueueTotalDataSize -= size;
+                if (Counters) {
+                    QueueDataSize->Sub(size);
+                    QueueBlockCount->Dec();
+                }
+                if (TaskCounters) {
+                    TaskQueueDataSize->Sub(size);
+                }
+                TryStartDownload();
             } while (!Blocks.empty() && freeSpace > 0LL);
         }
 
@@ -344,7 +392,18 @@ private:
         IngressBytes += result->Get()->Result.size();
         LOG_D("TS3ReadActor", "ID: " << id << ", Path: " << path << ", read size: " << result->Get()->Result.size() << ", HTTP response code: " << httpCode << ", request id: [" << requestId << "]");
         if (200 == httpCode || 206 == httpCode) {
+            auto size = result->Get()->Result.size();
+            QueueTotalDataSize += size;
+            if (Counters) {
+                QueueBlockCount->Inc();
+                QueueDataSize->Add(size);
+            }
+            if (TaskCounters) {
+                TaskQueueDataSize->Add(size);
+            }
             Blocks.emplace(std::make_tuple(std::move(result->Get()->Result), id));
+            DownloadInflight--;
+            TryStartDownload();
             Send(ComputeActorId, new TEvNewAsyncInputDataArrived(InputIndex));
         } else {
             TString errorText = result->Get()->Result.Extract();
@@ -371,6 +430,18 @@ private:
     // IActor & IDqComputeActorAsyncInput
     void PassAway() override { // Is called from Compute Actor
         LOG_D("TS3ReadActor", "PassAway");
+
+        if (Counters) {
+            QueueDataSize->Sub(QueueTotalDataSize);
+            QueueBlockCount->Sub(Blocks.size());
+            QueueDataLimit->Sub(ReadActorFactoryCfg.DataInflight);
+        }
+        if (TaskCounters) {
+            TaskQueueDataSize->Sub(QueueTotalDataSize);
+            TaskQueueDataLimit->Sub(ReadActorFactoryCfg.DataInflight);
+        }
+        QueueTotalDataSize = 0;
+
         ContainerCache.Clear();
         TActorBootstrapped<TS3ReadActor>::PassAway();
     }
@@ -386,6 +457,7 @@ private:
 private:
     size_t IsDoneCounter = 0U;
 
+    const TS3ReadActorFactoryConfig ReadActorFactoryCfg;
     const IHTTPGateway::TPtr Gateway;
     const THolderFactory& HolderFactory;
     TPlainContainerCache ContainerCache;
@@ -406,6 +478,20 @@ private:
     ui64 IngressBytes = 0;
 
     std::queue<std::tuple<IHTTPGateway::TContent, ui64>> Blocks;
+
+    ::NMonitoring::TDynamicCounters::TCounterPtr QueueDataSize;
+    ::NMonitoring::TDynamicCounters::TCounterPtr QueueDataLimit;
+    ::NMonitoring::TDynamicCounters::TCounterPtr QueueBlockCount;
+    ::NMonitoring::TDynamicCounters::TCounterPtr DownloadPaused;
+    ::NMonitoring::TDynamicCounters::TCounterPtr DeferredQueueSize;
+    ::NMonitoring::TDynamicCounters::TCounterPtr TaskDownloadPaused;
+    ::NMonitoring::TDynamicCounters::TCounterPtr TaskQueueDataSize;
+    ::NMonitoring::TDynamicCounters::TCounterPtr TaskQueueDataLimit;
+    ::NMonitoring::TDynamicCounterPtr Counters;
+    ::NMonitoring::TDynamicCounterPtr TaskCounters;
+    ui64 CurrentPathIndex = 0;
+    ui64 QueueTotalDataSize = 0;
+    ui64 DownloadInflight = 0;
 };
 
 struct TReadSpec {
@@ -439,7 +525,7 @@ struct TRetryStuff {
       , SizeLimit(sizeLimit)
       , TxId(txId)
       , RequestId(requestId)
-      , RetryState(retryPolicy->CreateRetryState())
+      , RetryPolicy(retryPolicy)
       , Cancelled(false)
     {}
 
@@ -449,10 +535,18 @@ struct TRetryStuff {
     std::size_t Offset, SizeLimit;
     const TTxId TxId;
     const TString RequestId;
-    const IRetryPolicy<long>::IRetryState::TPtr RetryState;
+    const IRetryPolicy<long>::TPtr RetryPolicy;
+    IRetryPolicy<long>::IRetryState::TPtr RetryState;
     IHTTPGateway::TCancelHook CancelHook;
     TMaybe<TDuration> NextRetryDelay;
     std::atomic_bool Cancelled;
+
+    const IRetryPolicy<long>::IRetryState::TPtr& GetRetryState() {
+        if (!RetryState) {
+            RetryState = RetryPolicy->CreateRetryState();
+        }
+        return RetryState;
+    }
 
     void Cancel() {
         Cancelled.store(true);
@@ -479,12 +573,13 @@ void OnDownloadFinished(TActorSystem* actorSystem, const TActorId& self, const T
     actorSystem->Send(new IEventHandle(self, parent, new TEvPrivate::TEvReadFinished(pathIndex, std::move(issues))));
 }
 
-void DownloadStart(const TRetryStuff::TPtr& retryStuff, TActorSystem* actorSystem, const TActorId& self, const TActorId& parent, size_t pathIndex) {
+void DownloadStart(const TRetryStuff::TPtr& retryStuff, TActorSystem* actorSystem, const TActorId& self, const TActorId& parent, size_t pathIndex, const ::NMonitoring::TDynamicCounters::TCounterPtr& inflightCounter) {
     retryStuff->CancelHook = retryStuff->Gateway->Download(retryStuff->Url,
         retryStuff->Headers, retryStuff->Offset, retryStuff->SizeLimit,
         std::bind(&OnDownloadStart, actorSystem, self, parent, std::placeholders::_1),
         std::bind(&OnNewData, actorSystem, self, parent, std::placeholders::_1),
-        std::bind(&OnDownloadFinished, actorSystem, self, parent, pathIndex, std::placeholders::_1));
+        std::bind(&OnDownloadFinished, actorSystem, self, parent, pathIndex, std::placeholders::_1),
+        inflightCounter);
 }
 
 template <typename T>
@@ -592,6 +687,7 @@ ui64 GetSizeOfBatch(const arrow::RecordBatch& batch) {
 }
 
 class TS3ReadCoroImpl : public TActorCoroImpl {
+    friend class TS3StreamReadActor;
 private:
     class TReadBufferFromStream : public NDB::ReadBuffer {
     public:
@@ -615,14 +711,24 @@ private:
 
     static constexpr std::string_view TruncatedSuffix = "... [truncated]"sv;
 public:
-    TS3ReadCoroImpl(ui64 inputIndex, const TTxId& txId, const NActors::TActorId& computeActorId, 
-        const TRetryStuff::TPtr& retryStuff, const TReadSpec::TPtr& readSpec, size_t pathIndex, 
-        const TString& path, const TString& url, const std::size_t maxBlocksInFly, 
-        const TS3ReadActorFactoryConfig& readActorFactoryCfg, ui64 expectedDataSize)
-        : TActorCoroImpl(256_KB), ReadActorFactoryCfg(readActorFactoryCfg), InputIndex(inputIndex), 
-        TxId(txId), RetryStuff(retryStuff), ReadSpec(readSpec), ComputeActorId(computeActorId), 
-        PathIndex(pathIndex), Path(path), Url(url), MaxBlocksInFly(maxBlocksInFly), ExpectedDataSize(expectedDataSize)
+    TS3ReadCoroImpl(ui64 inputIndex, const TTxId& txId, const NActors::TActorId& computeActorId,
+        const TRetryStuff::TPtr& retryStuff, const TReadSpec::TPtr& readSpec, size_t pathIndex,
+        const TString& path, const TString& url, const std::size_t maxBlocksInFly,
+        const TS3ReadActorFactoryConfig& readActorFactoryCfg,
+        const ::NMonitoring::TDynamicCounters::TCounterPtr& deferredQueueSize,
+        const ::NMonitoring::TDynamicCounters::TCounterPtr& httpInflightSize,
+        const ::NMonitoring::TDynamicCounters::TCounterPtr& httpDataRps)
+        : TActorCoroImpl(256_KB), ReadActorFactoryCfg(readActorFactoryCfg), InputIndex(inputIndex),
+        TxId(txId), RetryStuff(retryStuff), ReadSpec(readSpec), ComputeActorId(computeActorId),
+        PathIndex(pathIndex), Path(path), Url(url), MaxBlocksInFly(maxBlocksInFly),
+        DeferredQueueSize(deferredQueueSize), HttpInflightSize(httpInflightSize), HttpDataRps(httpDataRps)
     {}
+
+    ~TS3ReadCoroImpl() override {
+        if (DeferredEvents.size() && DeferredQueueSize) {
+            DeferredQueueSize->Sub(DeferredEvents.size());
+        }
+    }
 
     bool Next(TString& value) {
         if (InputFinished)
@@ -648,6 +754,9 @@ public:
                     throw TS3ReadAbort();
                 default:
                     DeferredEvents.push(std::move(ev));
+                    if (DeferredQueueSize) {
+                        DeferredQueueSize->Inc();
+                    }
                     break;
             }
         }
@@ -660,19 +769,26 @@ public:
         THolder<IEventHandle> ev;
         ev.Swap(DeferredEvents.front());
         DeferredEvents.pop();
+        if (DeferredQueueSize) {
+            DeferredQueueSize->Dec();
+        }
 
         switch (const auto etype = ev->GetTypeRewrite()) {
             case TEvPrivate::TEvReadStarted::EventType:
                 ErrorText.clear();
                 Issues.Clear();
                 value.clear();
-                RetryStuff->NextRetryDelay = RetryStuff->RetryState->GetNextRetryDelay(HttpResponseCode = ev->Get<TEvPrivate::TEvReadStarted>()->HttpResponseCode);
+                RetryStuff->NextRetryDelay = RetryStuff->GetRetryState()->GetNextRetryDelay(HttpResponseCode = ev->Get<TEvPrivate::TEvReadStarted>()->HttpResponseCode);
                 LOG_CORO_D("TS3ReadCoroImpl", "TEvReadStarted, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", Http code: " << HttpResponseCode << ", retry after: " << RetryStuff->NextRetryDelay << ", request id: [" << RetryStuff->RequestId << "]");
+                if (!RetryStuff->NextRetryDelay) { // Success or not retryable
+                    RetryStuff->RetryState = nullptr;
+                }
                 return true;
             case TEvPrivate::TEvReadFinished::EventType:
                 Issues = std::move(ev->Get<TEvPrivate::TEvReadFinished>()->Issues);
                 if (Issues) {
-                    if (RetryStuff->NextRetryDelay = RetryStuff->RetryState->GetNextRetryDelay(0L); !RetryStuff->NextRetryDelay) {
+                    LOG_CORO_D("TS3ReadCoroImpl", "TEvReadFinished. Url: " << RetryStuff->Url << ". Issues: " << Issues.ToOneLineString());
+                    if (RetryStuff->NextRetryDelay = RetryStuff->GetRetryState()->GetNextRetryDelay(0L); !RetryStuff->NextRetryDelay) {
                         InputFinished = true;
                         LOG_CORO_W("TS3ReadCoroImpl", "ReadError: " << Issues.ToOneLineString() << ", Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", LastOffset: " << LastOffset << ", LastData: " << GetLastDataAsText() << ", request id: [" << RetryStuff->RequestId << "]");
                         throw TS3ReadError(); // Don't pass control to data parsing, because it may validate eof and show wrong issues about incorrect data format
@@ -681,10 +797,10 @@ public:
 
                 if (!RetryStuff->IsCancelled() && RetryStuff->NextRetryDelay && RetryStuff->SizeLimit > 0ULL) {
                     LOG_CORO_D("TS3ReadCoroImpl", "Retry Download in " << RetryStuff->NextRetryDelay << ", Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", request id: [" << RetryStuff->RequestId << "], Issues: " << Issues.ToOneLineString());
-                    GetActorSystem()->Schedule(*RetryStuff->NextRetryDelay, new IEventHandle(ParentActorId, SelfActorId, new TEvPrivate::TEvRetryEventFunc(std::bind(&DownloadStart, RetryStuff, GetActorSystem(), SelfActorId, ParentActorId, PathIndex))));
+                    GetActorSystem()->Schedule(*RetryStuff->NextRetryDelay, new IEventHandle(ParentActorId, SelfActorId, new TEvPrivate::TEvRetryEventFunc(std::bind(&DownloadStart, RetryStuff, GetActorSystem(), SelfActorId, ParentActorId, PathIndex, HttpInflightSize))));
                     value.clear();
                 } else {
-                    LOG_CORO_D("TS3ReadCoroImpl", "TEvReadFinished, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", LastOffset: " << LastOffset << ", Error: " << ServerReturnedError << ", LastData: " << GetLastDataAsText() << ", request id: [" << RetryStuff->RequestId << "]");
+                    LOG_CORO_D("TS3ReadCoroImpl", "TEvReadFinished, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", LastOffset: " << LastOffset << ", Error: " << ServerReturnedError << ", request id: [" << RetryStuff->RequestId << "]");
                     InputFinished = true;
                     if (ServerReturnedError) {
                         throw TS3ReadError(); // Don't pass control to data parsing, because it may validate eof and show wrong issues about incorrect data format
@@ -693,6 +809,9 @@ public:
                 }
                 return true;
             case TEvPrivate::TEvDataPart::EventType:
+                if (HttpDataRps) {
+                    HttpDataRps->Inc();
+                }
                 if (200L == HttpResponseCode || 206L == HttpResponseCode) {
                     value = ev->Get<TEvPrivate::TEvDataPart>()->Result.Extract();
                     IngressBytes += value.size();
@@ -800,17 +919,26 @@ private:
                 }
 
                 TArrowParquetBatchReader reader(std::move(fileReader), std::move(columnIndices), std::move(columnConverters));
-                ActualDataSize += ProcessBatches<std::shared_ptr<arrow::RecordBatch>, TEvPrivate::TEvNextRecordBatch>(reader, isLocal);
+                ProcessBatches<std::shared_ptr<arrow::RecordBatch>, TEvPrivate::TEvNextRecordBatch>(reader, isLocal);
             } else {
                 auto stream = std::make_unique<NDB::InputStreamFromInputFormat>(NDB::FormatFactory::instance().getInputFormat(ReadSpec->Format, decompress ? *decompress : *buffer, NDB::Block(ReadSpec->CHColumns), nullptr, ReadActorFactoryCfg.RowsInBatch, ReadSpec->Settings));
                 TBlockReader reader(std::move(stream));
-                ActualDataSize += ProcessBatches<NDB::Block, TEvPrivate::TEvNextBlock>(reader, isLocal);
+                ProcessBatches<NDB::Block, TEvPrivate::TEvNextBlock>(reader, isLocal);
             }
         } catch (const TS3ReadError&) {
             // Finish reading. Add error from server to issues
             LOG_CORO_D("TS3ReadCoroImpl", "S3 read error. Path: " << Path);
         } catch (const TDtorException&) {
             throw;
+        } catch (const NDB::Exception& err) {
+            TStringBuilder msgBuilder;
+            msgBuilder << err.message();
+            if (err.code()) {
+                msgBuilder << " (code: " << err.code() << ")";
+            }
+            exceptIssue.SetMessage(msgBuilder);
+            fatalCode = NYql::NDqProto::StatusIds::BAD_REQUEST;
+            RetryStuff->Cancel();
         } catch (const std::exception& err) {
             exceptIssue.SetMessage(err.what());
             fatalCode = NYql::NDqProto::StatusIds::INTERNAL_ERROR;
@@ -838,7 +966,7 @@ private:
         if (issues)
             Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, std::move(issues), fatalCode));
         else
-            Send(ParentActorId, new TEvPrivate::TEvFileFinished(PathIndex, IngressBytes, ExpectedDataSize, ActualDataSize));
+            Send(ParentActorId, new TEvPrivate::TEvFileFinished(PathIndex, IngressBytes));
     } catch (const TS3ReadAbort&) {
         LOG_CORO_D("TS3ReadCoroImpl", "S3 read abort. Path: " << Path);
     } catch (const TDtorException&) {
@@ -848,36 +976,17 @@ private:
         return;
     }
 
-    template <typename T>
-    ui64 SizeOfBatch(const T&) {
-        return 0;
-    }
-
-    template <>
-    ui64 SizeOfBatch(const std::shared_ptr<arrow::RecordBatch>& batch) {
-        return GetSizeOfBatch(*batch);
-    }
-    
-    template <>
-    ui64 SizeOfBatch(const NDB::Block& batch) {
-        return batch.bytes();
-    }
-
     template <typename T, typename TEv>
-    ui64 ProcessBatches(IBatchReader<T>& reader, bool isLocal) {
+    void ProcessBatches(IBatchReader<T>& reader, bool isLocal) {
         auto actorSystem = GetActorSystem();
         auto selfActorId = SelfActorId;
         size_t cntBlocksInFly = 0;
-        ui64 result = 0;
         if (isLocal) {
             for (;;) {
                 T batch;
                 if (!reader.Next(batch)) {
                     break;
                 }
-
-                result += SizeOfBatch<T>(batch);
-
                 if (++cntBlocksInFly > MaxBlocksInFly) {
                     WaitForSpecificEvent<TEvPrivate::TEvBlockProcessed>();
                     --cntBlocksInFly;
@@ -895,11 +1004,9 @@ private:
                 if (!reader.Next(batch)) {
                     break;
                 }
-                result += SizeOfBatch<T>(batch);
                 Send(ParentActorId, new TEv(batch, PathIndex));
             }
         }
-        return result;
     }
 
     void ProcessUnexpectedEvent(TAutoPtr<IEventHandle> ev) final {
@@ -966,54 +1073,34 @@ private:
     TString LastData;
     std::size_t MaxBlocksInFly = 2;
     ui64 IngressBytes = 0;
-    ui64 ExpectedDataSize;
-    ui64 ActualDataSize = 0;
     bool Paused = false;
     std::queue<THolder<IEventHandle>> DeferredEvents;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr DeferredQueueSize;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr HttpInflightSize;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr HttpDataRps;
 };
 
 class TS3ReadCoroActor : public TActorCoro {
 public:
-    TS3ReadCoroActor(THolder<TS3ReadCoroImpl> impl, TRetryStuff::TPtr retryStuff, size_t pathIndex)
+    TS3ReadCoroActor(THolder<TS3ReadCoroImpl> impl, TRetryStuff::TPtr retryStuff, size_t pathIndex, const ::NMonitoring::TDynamicCounters::TCounterPtr& httpInflightSize)
         : TActorCoro(THolder<TActorCoroImpl>(impl.Release()))
         , RetryStuff(std::move(retryStuff))
         , PathIndex(pathIndex)
+        , HttpInflightSize(httpInflightSize)
     {}
 private:
     void Registered(TActorSystem* actorSystem, const TActorId& parent) override {
         TActorCoro::Registered(actorSystem, parent); // Calls TActorCoro::OnRegister and sends bootstrap event to ourself.
         if (RetryStuff->Url.substr(0, 6) != "file://") {
             LOG_DEBUG_S(*actorSystem, NKikimrServices::KQP_COMPUTE, "TS3ReadCoroActor" << ": " << SelfId() << ", TxId: " << RetryStuff->TxId << ". " << "Start Download, Url: " << RetryStuff->Url << ", Offset: " << RetryStuff->Offset << ", request id: [" << RetryStuff->RequestId << "]");
-            DownloadStart(RetryStuff, actorSystem, SelfId(), parent, PathIndex);
+            DownloadStart(RetryStuff, actorSystem, SelfId(), parent, PathIndex, HttpInflightSize);
         }
     }
 
     const TRetryStuff::TPtr RetryStuff;
     const size_t PathIndex;
+    const ::NMonitoring::TDynamicCounters::TCounterPtr HttpInflightSize;
 };
-
-double FormatRatio(const TString& formatName) {
-    Y_UNUSED(formatName);
-    return 1.0;
-}
-
-double CompressionRatio(const TString& compressionName) {
-    if (compressionName == "gzip") {
-        return 15.0;
-    }
-    if (compressionName == "lz4") {
-        return 20.0;
-    }
-    if (compressionName) {
-        // "brotli"
-        // "zstd"
-        // "bzip2"
-        // "xz"
-        return 10.0;
-    }
-    // no compression
-    return 1.0;
-}
 
 class TS3StreamReadActor : public TActorBootstrapped<TS3StreamReadActor>, public IDqComputeActorAsyncInput {
 public:
@@ -1054,15 +1141,21 @@ public:
     {
         if (Counters) {
             QueueDataSize = Counters->GetCounter("QueueDataSize");
+            QueueDataLimit = Counters->GetCounter("QueueDataLimit");
             QueueBlockCount = Counters->GetCounter("QueueBlockCount");
-            BufferDataSize = Counters->GetCounter("BufferDataSize");
             DownloadPaused = Counters->GetCounter("DownloadPaused");
+            QueueDataLimit->Add(ReadActorFactoryCfg.DataInflight);
         }
         if (TaskCounters) {
-            ExpectedDataSize = TaskCounters->GetCounter("ExpectedDataSize");
-            ActualDataSize = TaskCounters->GetCounter("ActualDataSize");
+            TaskQueueDataSize = TaskCounters->GetCounter("QueueDataSize");
+            TaskQueueDataLimit = TaskCounters->GetCounter("QueueDataLimit");
+            TaskDownloadPaused = TaskCounters->GetCounter("DownloadPaused");
+            DeferredQueueSize = TaskCounters->GetCounter("DeferredQueueSize");
+            HttpInflightSize = TaskCounters->GetCounter("HttpInflightSize");
+            HttpInflightLimit = TaskCounters->GetCounter("HttpInflightLimit");
+            HttpDataRps = TaskCounters->GetCounter("HttpDataRps", true);
+            TaskQueueDataLimit->Add(ReadActorFactoryCfg.DataInflight);
         }
-        Ratio = FormatRatio(ReadSpec->Compression) * CompressionRatio(ReadSpec->Format);
     }
 
     void Bootstrap() {
@@ -1078,12 +1171,10 @@ public:
             // no path is pending
             return false;
         }
-        /*
-        if (BufferTotalDataSize > static_cast<i64>(ReadActorFactoryCfg.DataInflight)) {
+        if (QueueTotalDataSize > ReadActorFactoryCfg.DataInflight) {
             // too large data inflight
             return false;
         }
-        */
         if (DownloadInflight >= ReadActorFactoryCfg.MaxInflight) {
             // too large download inflight
             return false;
@@ -1097,16 +1188,15 @@ public:
         const TPath& path = Paths[index];
         const TString requestId = CreateGuidAsString();
         ui64 fileSize = std::get<std::size_t>(path);
-        ui64 expectedDataSize = (ui64) fileSize * Ratio;
         auto stuff = std::make_shared<TRetryStuff>(Gateway, Url + std::get<TString>(path), MakeHeaders(Token, requestId), fileSize, TxId, requestId, RetryPolicy);
         auto pathIndex = index + StartPathIndex;
         RetryStuffForFile.emplace(pathIndex, stuff);
-        BufferTotalDataSize += expectedDataSize;
-        if (Counters) {
-            BufferDataSize->Add(expectedDataSize);
+        if (TaskCounters) {
+            HttpInflightLimit->Add(Gateway->GetBuffersSizePerStream());
         }
-        auto impl = MakeHolder<TS3ReadCoroImpl>(InputIndex, TxId, ComputeActorId, stuff, ReadSpec, pathIndex, std::get<TString>(path), Url, MaxBlocksInFly, ReadActorFactoryCfg, expectedDataSize);
-        CoroActors.insert(RegisterWithSameMailbox(std::make_unique<TS3ReadCoroActor>(std::move(impl), std::move(stuff), pathIndex).release()));
+        ::NMonitoring::TDynamicCounters::TCounterPtr inflightCounter;
+        auto impl = MakeHolder<TS3ReadCoroImpl>(InputIndex, TxId, ComputeActorId, stuff, ReadSpec, pathIndex, std::get<TString>(path), Url, MaxBlocksInFly, ReadActorFactoryCfg, DeferredQueueSize, HttpInflightSize, HttpDataRps);
+        CoroActors.insert(RegisterWithSameMailbox(std::make_unique<TS3ReadCoroActor>(std::move(impl), std::move(stuff), pathIndex, impl->HttpInflightSize).release()));
     }
 
     static constexpr char ActorName[] = "S3_STREAM_READ_ACTOR";
@@ -1204,12 +1294,13 @@ private:
             total += s;
             output.emplace_back(std::move(value));
             Blocks.pop_front();
-            BufferTotalDataSize -= s;
             QueueTotalDataSize -= s;
             if (Counters) {
-                BufferDataSize->Sub(s);
                 QueueDataSize->Sub(s);
                 QueueBlockCount->Dec();
+            }
+            if (TaskCounters) {
+                TaskQueueDataSize->Sub(s);
             }
             TryRegisterCoro();
         } while (!Blocks.empty() && free > 0LL && GetBlockSize(Blocks.front()) <= size_t(free));
@@ -1229,14 +1320,23 @@ private:
     void PassAway() override { // Is called from Compute Actor
         LOG_D("TS3StreamReadActor", "PassAway");
         if (Counters) {
-            BufferDataSize->Sub(BufferTotalDataSize);
             QueueDataSize->Sub(QueueTotalDataSize);
             QueueBlockCount->Sub(Blocks.size());
-            if (Paused) {
+            QueueDataLimit->Sub(ReadActorFactoryCfg.DataInflight);
+        }
+        if (TaskCounters) {
+            TaskQueueDataSize->Sub(QueueTotalDataSize);
+            TaskQueueDataLimit->Sub(ReadActorFactoryCfg.DataInflight);
+            HttpInflightLimit->Sub(Gateway->GetBuffersSizePerStream() * CoroActors.size());
+        }
+        if (Paused) {
+            if (Counters) {
                 DownloadPaused->Dec();
             }
+            if (TaskCounters) {
+                TaskDownloadPaused->Dec();
+            }
         }
-        BufferTotalDataSize = 0;
         QueueTotalDataSize = 0;
 
         for (const auto actorId : CoroActors) {
@@ -1264,17 +1364,24 @@ private:
             if (Counters) {
                 DownloadPaused->Inc();
             }
+            if (TaskCounters) {
+                TaskDownloadPaused->Inc();
+            }
         }
     }
 
     void MaybeContinue() {
-        if (Paused && QueueTotalDataSize < ReadActorFactoryCfg.DataInflight) {
+        // resume download on 3/4 == 75% to avoid oscillation (hysteresis)
+        if (Paused && QueueTotalDataSize * 4 < ReadActorFactoryCfg.DataInflight * 3) {
             for (const auto actorId : CoroActors) {
                 Send(actorId, new TEvPrivate::TEvContinue());
             }
             Paused = false;
             if (Counters) {
                 DownloadPaused->Dec();
+            }
+            if (TaskCounters) {
+                TaskDownloadPaused->Dec();
             }
         }
     }
@@ -1299,6 +1406,9 @@ private:
             QueueBlockCount->Inc();
             QueueDataSize->Add(size);
         }
+        if (TaskCounters) {
+            TaskQueueDataSize->Add(size);
+        }
         MaybePause();
         Blocks.emplace_back(next);
         Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvNewAsyncInputDataArrived(InputIndex));
@@ -1314,6 +1424,9 @@ private:
             QueueBlockCount->Inc();
             QueueDataSize->Add(size);
         }
+        if (TaskCounters) {
+            TaskQueueDataSize->Add(size);
+        }
         MaybePause();
         Blocks.emplace_back(next);
         Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvNewAsyncInputDataArrived(InputIndex));
@@ -1327,16 +1440,8 @@ private:
         Y_VERIFY(Count);
         --Count;
 
-        // final netto of expected vs actual
-        BufferTotalDataSize += ev->Get()->ActualDataSize;
-        BufferTotalDataSize -= ev->Get()->ExpectedDataSize;
-        if (Counters) {
-            BufferDataSize->Add(ev->Get()->ActualDataSize);
-            BufferDataSize->Sub(ev->Get()->ExpectedDataSize);
-        }
         if (TaskCounters) {
-            ExpectedDataSize->Add(ev->Get()->ExpectedDataSize);
-            ActualDataSize->Add(ev->Get()->ActualDataSize);
+            HttpInflightLimit->Sub(Gateway->GetBuffersSizePerStream());
         }
         DownloadInflight--;
         if (CurrentPathIndex < Paths.size()) {
@@ -1379,16 +1484,19 @@ private:
     size_t CurrentPathIndex = 0;
     mutable TInstant LastMemoryReport = TInstant::Now();
     ui64 QueueTotalDataSize = 0;
-    i64 BufferTotalDataSize = 0;
     ::NMonitoring::TDynamicCounters::TCounterPtr QueueDataSize;
+    ::NMonitoring::TDynamicCounters::TCounterPtr QueueDataLimit;
     ::NMonitoring::TDynamicCounters::TCounterPtr QueueBlockCount;
-    ::NMonitoring::TDynamicCounters::TCounterPtr ExpectedDataSize;
-    ::NMonitoring::TDynamicCounters::TCounterPtr ActualDataSize;
-    ::NMonitoring::TDynamicCounters::TCounterPtr BufferDataSize;
     ::NMonitoring::TDynamicCounters::TCounterPtr DownloadPaused;
+    ::NMonitoring::TDynamicCounters::TCounterPtr DeferredQueueSize;
+    ::NMonitoring::TDynamicCounters::TCounterPtr TaskDownloadPaused;
+    ::NMonitoring::TDynamicCounters::TCounterPtr TaskQueueDataSize;
+    ::NMonitoring::TDynamicCounters::TCounterPtr TaskQueueDataLimit;
+    ::NMonitoring::TDynamicCounters::TCounterPtr HttpInflightSize;
+    ::NMonitoring::TDynamicCounters::TCounterPtr HttpInflightLimit;
+    ::NMonitoring::TDynamicCounters::TCounterPtr HttpDataRps;
     ::NMonitoring::TDynamicCounterPtr Counters;
     ::NMonitoring::TDynamicCounterPtr TaskCounters;
-    double Ratio = 0.0;
     ui64 DownloadInflight = 0;
     std::set<NActors::TActorId> CoroActors;
     bool Paused = false;
@@ -1566,7 +1674,7 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
 
     if (params.HasFormat() && params.HasRowType()) {
         const auto pb = std::make_unique<TProgramBuilder>(typeEnv, functionRegistry);
-        const auto outputItemType = NCommon::ParseTypeFromYson(TStringBuf(params.GetRowType()), *pb,  Cerr);
+        const auto outputItemType = NCommon::ParseTypeFromYson(TStringBuf(params.GetRowType()), *pb, Cerr);
         const auto structType = static_cast<TStructType*>(outputItemType);
 
         const auto readSpec = std::make_shared<TReadSpec>();
@@ -1664,7 +1772,8 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
             sizeLimit = FromString<ui64>(it->second);
 
         const auto actor = new TS3ReadActor(inputIndex, txId, std::move(gateway), holderFactory, params.GetUrl(), authToken,
-                                            std::move(paths), addPathIndex, startPathIndex, computeActorId, sizeLimit, retryPolicy);
+                                            std::move(paths), addPathIndex, startPathIndex, computeActorId, sizeLimit, retryPolicy,
+                                            cfg, counters, taskCounters);
         return {actor, actor};
     }
 }

@@ -1,3 +1,5 @@
+#include "actorsystem.h"
+#include "actor.h"
 #include "executor_pool_base.h"
 #include "executor_thread.h"
 #include "mailbox.h"
@@ -57,28 +59,29 @@ namespace NActors {
         return MailboxTable->SendTo(ev, this);
     }
 
-    bool TExecutorPoolBaseMailboxed::SendWithContinuousExecution(TAutoPtr<IEventHandle>& ev) {
+    bool TExecutorPoolBaseMailboxed::SpecificSend(TAutoPtr<IEventHandle>& ev) {
         Y_VERIFY_DEBUG(ev->GetRecipientRewrite().PoolID() == PoolId);
 #ifdef ACTORSLIB_COLLECT_EXEC_STATS
         RelaxedStore(&ev->SendTime, (::NHPTimer::STime)GetCycleCountFast());
 #endif
-        if (TlsThreadContext) {
-            bool prevValue = std::exchange(TlsThreadContext->IsSendingWithContinuousExecution, true);
-            bool res = MailboxTable->SendTo(ev, this);
-            TlsThreadContext->IsSendingWithContinuousExecution = prevValue;
-            return res;
-        } else {
-            return MailboxTable->SendTo(ev, this);;
-        }
-    }
-
-    Y_FORCE_INLINE bool IsSendingWithContinuousExecution(IExecutorPool *self) {
-        return TlsThreadContext && TlsThreadContext->Pool == self && TlsThreadContext->IsSendingWithContinuousExecution;
+        return MailboxTable->SpecificSendTo(ev, this);
     }
 
     void TExecutorPoolBase::ScheduleActivation(ui32 activation) {
-        if (IsSendingWithContinuousExecution(this)) {
-            std::swap(TlsThreadContext->WaitedActivation, activation);
+        ScheduleActivationEx(activation, AtomicIncrement(ActivationsRevolvingCounter));
+    }
+
+    Y_FORCE_INLINE bool IsAllowedToCapture(IExecutorPool *self) {
+        if (TlsThreadContext->Pool != self || TlsThreadContext->CapturedType == ESendingType::Tail) {
+            return false;
+        }
+        return TlsThreadContext->SendingType != ESendingType::Common;
+    }
+
+    void TExecutorPoolBase::SpecificScheduleActivation(ui32 activation) {
+        if (IsAllowedToCapture(this)) {
+            std::swap(TlsThreadContext->CapturedActivation, activation);
+            TlsThreadContext->CapturedType = TlsThreadContext->SendingType;
         }
         if (activation) {
             ScheduleActivationEx(activation, AtomicIncrement(ActivationsRevolvingCounter));

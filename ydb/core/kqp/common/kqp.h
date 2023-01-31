@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kqp_event_ids.h"
+#include "kqp_prepared_query.h"
 
 #include <library/cpp/lwtrace/shuttle.h>
 #include <ydb/core/kqp/counters/kqp_counters.h>
@@ -8,6 +9,7 @@
 
 #include <ydb/core/grpc_services/base/base.h>
 #include <ydb/core/grpc_services/cancelation/cancelation.h>
+#include <ydb/core/grpc_services/cancelation/cancelation_event.h>
 
 #include <ydb/library/yql/dq/actors/dq.h>
 #include <ydb/library/yql/public/issue/yql_issue.h>
@@ -205,8 +207,6 @@ public:
     }
 };
 
-using TPreparedQueryConstPtr = std::shared_ptr<const NKikimrKqp::TPreparedQuery>;
-
 struct TKqpCompileResult {
     using TConstPtr = std::shared_ptr<const TKqpCompileResult>;
 
@@ -245,7 +245,7 @@ struct TKqpCompileResult {
 
     ETableReadType MaxReadType;
 
-    TPreparedQueryConstPtr PreparedQuery;
+    TPreparedQueryHolder::TConstPtr PreparedQuery;
 };
 
 struct TEvKqp {
@@ -269,9 +269,29 @@ struct TEvKqp {
             return true;
         }
 
-        // Same as TEventPBBase but without Rope
-        bool IsExtendedFormat() const override {
-            return false;
+        // Same as TEventPBBase but without Rope (but can contain Payload and will lose some data after all)
+        TEventSerializationInfo CreateSerializationInfo() const override { return {}; }
+
+        ui64 GetRequestSize() const {
+            return Record.GetRequest().ByteSizeLong();
+        }
+
+        ui64 GetQuerySize() const {
+            return Record.GetRequest().GetQuery().size();
+        }
+
+        ui64 GetParametersSize() const {
+            if (ParametersSize > 0) {
+                return ParametersSize;
+            }
+
+            ParametersSize += Record.GetRequest().GetParameters().ByteSizeLong();
+            for(const auto& [name, param]: Record.GetRequest().GetYdbParameters()) {
+                ParametersSize += name.size();
+                ParametersSize += param.ByteSizeLong();
+            }
+
+            return ParametersSize;
         }
 
         ui32 CalculateSerializedSize() const override {
@@ -291,14 +311,14 @@ struct TEvKqp {
             return req;
         }
 
-        void SetClientLostAction(TActorId actorId, ui64 wakeupTag, NActors::TActorSystem* as) {
+        void SetClientLostAction(TActorId actorId, NActors::TActorSystem* as) {
             if (RequestCtx) {
-                RequestCtx->SetClientLostAction([actorId, wakeupTag, as]() {
-                    as->Send(actorId, new TEvents::TEvWakeup(wakeupTag));
+                RequestCtx->SetClientLostAction([actorId, as]() {
+                    as->Send(actorId, new NGRpcService::TEvClientLost());
                 });
             } else if (Record.HasCancelationActor()) {
                 auto cancelationActor = ActorIdFromProto(Record.GetCancelationActor());
-                NGRpcService::SubscribeRemoteCancel(cancelationActor, actorId, wakeupTag, as);
+                NGRpcService::SubscribeRemoteCancel(cancelationActor, actorId, as);
             }
         }
 
@@ -309,6 +329,7 @@ struct TEvKqp {
                 RequestCtx.reset();
             }
         }
+        mutable ui64 ParametersSize = 0;
         mutable NKikimrKqp::TEvQueryRequest Record;
     private:
         mutable std::shared_ptr<NGRpcService::IRequestCtxMtSafe> RequestCtx;

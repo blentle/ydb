@@ -94,7 +94,7 @@ TExprBase DqBuildPartitionsStageStub(TExprBase node, TExprContext& ctx, const TP
     // dq splits this type of lambda output into separate stage outputs
     // thus it's impossible to maintain 'node' typing (muxing them ain't an option,
     // cause the only purpose of this optimizer is to push original Mux to the stage)
-    if (const auto listItemType = GetItemType(*node.Ref().GetTypeAnn());
+    if (const auto listItemType = GetSeqItemType(node.Ref().GetTypeAnn());
         !listItemType || listItemType->GetKind() == ETypeAnnotationKind::Variant) {
         return node;
     }
@@ -220,15 +220,11 @@ TExprBase DqBuildPartitionsStageStub(TExprBase node, TExprContext& ctx, const TP
         if (ETypeAnnotationKind::List == partition.Input().Ref().GetTypeAnn()->GetKind()) {
             handler = Build<TCoLambda>(ctx, handler.Pos())
                 .Args({"flow"})
-                .template Body<TCoFlatMap>()
-                    .template Input<TCoSqueezeToList>()
-                        .Stream("flow")
-                    .Build()
-                    .Lambda()
-                        .Args({"list"})
-                        .template Body<TExprApplier>()
-                            .Apply(handler)
-                            .With(0, "list")
+                .template Body<TCoToFlow>()
+                    .template Input<TExprApplier>()
+                        .Apply(handler)
+                        .template With<TCoForwardList>(0)
+                            .Stream("flow")
                         .Build()
                     .Build()
                 .Build().Done();
@@ -700,10 +696,10 @@ TExprBase DqPushBaseLMapToStage(TExprBase node, TExprContext& ctx, IOptimization
         return node;
     }
 
-    const TTypeAnnotationNode* lmapItemTy = GetSeqItemType(lmap.Ref().GetTypeAnn());
-    if (lmapItemTy->GetKind() == ETypeAnnotationKind::Variant) {
+    const auto& lmapItemTy = GetSeqItemType(*lmap.Ref().GetTypeAnn());
+    if (lmapItemTy.GetKind() == ETypeAnnotationKind::Variant) {
         // preserve typing by Mux'ing several stage outputs into one
-        const auto variantItemTy = lmapItemTy->template Cast<TVariantExprType>();
+        const auto variantItemTy = lmapItemTy.template Cast<TVariantExprType>();
         const auto stageOutputNum = variantItemTy->GetUnderlyingType()->template Cast<TTupleExprType>()->GetSize();
         TVector<TExprBase> muxParts;
         muxParts.reserve(stageOutputNum);
@@ -752,7 +748,7 @@ TExprBase DqBuildLMapOverMuxStageStub(TExprBase node, TExprContext& ctx, NYql::I
         return node;
     }
     auto mux = maybeMux.Cast();
-    const TTypeAnnotationNode* listItemType = GetItemType(*node.Ref().GetTypeAnn());
+    const TTypeAnnotationNode* listItemType = GetSeqItemType(node.Ref().GetTypeAnn());
     if (!listItemType) {
         return node;
     }
@@ -1019,6 +1015,50 @@ TExprBase DqBuildShuffleStage(TExprBase node, TExprContext& ctx, const TParentsM
             .Index().Build("0")
             .Build()
         .Done();
+}
+
+NNodes::TExprBase DqBuildHashShuffleByKeyStage(NNodes::TExprBase node, TExprContext& ctx, const TParentsMap& /*parentsMap*/) {
+    if (!node.Maybe<TDqCnHashShuffle>()) {
+        return node;
+    }
+    auto cnHash = node.Cast<TDqCnHashShuffle>();
+    auto stage = cnHash.Output().Stage();
+    if (!stage.Program().Body().Maybe<TCoExtend>()) {
+        return node;
+    }
+    auto extend = stage.Program().Body().Cast<TCoExtend>();
+    TNodeSet nodes;
+    for (auto&& i : stage.Program().Args()) {
+        nodes.emplace(i.Raw());
+    }
+    for (auto&& i : extend) {
+        if (nodes.erase(i.Raw()) != 1) {
+            return node;
+        }
+    }
+    if (!nodes.empty()) {
+        return node;
+    }
+    TExprNode::TListType nodesTuple;
+    for (auto&& i : stage.Inputs()) {
+        if (!i.Maybe<TDqCnUnionAll>()) {
+            return node;
+        }
+        auto uAll = i.Cast<TDqCnUnionAll>();
+        nodesTuple.emplace_back(ctx.ChangeChild(node.Ref(), 0, uAll.Output().Ptr()));
+    }
+    auto stageCopy = ctx.ChangeChild(stage.Ref(), 0, ctx.NewList(node.Pos(), std::move(nodesTuple)));
+    auto output =
+        Build<TDqOutput>(ctx, node.Pos())
+            .Stage(stageCopy)
+            .Index().Build("0")
+        .Done();
+    auto outputCnMap =
+        Build<TDqCnMap>(ctx, node.Pos())
+            .Output(output)
+        .Done();
+
+    return TExprBase(outputCnMap);
 }
 
 TExprBase DqBuildFinalizeByKeyStage(TExprBase node, TExprContext& ctx, const TParentsMap& parentsMap) {
@@ -1822,7 +1862,7 @@ TExprBase DqRewriteLengthOfStageOutputLegacy(TExprBase node, TExprContext& ctx, 
                     .Name<TCoAtom>()
                         .Value("count_all")
                     .Build()
-                    .InputType(ExpandType(node.Pos(), *GetSeqItemType(dqUnion.Raw()->GetTypeAnn()), ctx))
+                    .InputType(ExpandType(node.Pos(), GetSeqItemType(*dqUnion.Raw()->GetTypeAnn()), ctx))
                     .Extractor<TCoLambda>()
                         .Args({ "row" })
                         .Body<TCoVoid>()

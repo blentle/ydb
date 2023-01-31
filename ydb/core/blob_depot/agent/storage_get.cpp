@@ -9,6 +9,8 @@ namespace NKikimr::NBlobDepot {
         class TGetQuery : public TBlobStorageQuery<TEvBlobStorage::TEvGet> {
             std::unique_ptr<TEvBlobStorage::TEvGetResult> Response;
             ui32 AnswersRemain;
+            std::vector<TString> ValueChainsInFlight;
+            std::unordered_set<std::tuple<ui64, TString>> ValueChainsWithNodata;
 
             struct TResolveKeyContext : TRequestContext {
                 ui32 QueryIdx;
@@ -22,15 +24,6 @@ namespace NKikimr::NBlobDepot {
             using TBlobStorageQuery::TBlobStorageQuery;
 
             void Initiate() override {
-                if (Request.Decommission) {
-                    // just forward this message to underlying proxy
-                    Y_VERIFY(Agent.ProxyId);
-                    const bool sent = TActivationContext::Send(Event->Forward(Agent.ProxyId));
-                    Y_VERIFY(sent);
-                    delete this;
-                    return;
-                }
-
                 if (IS_LOG_PRIORITY_ENABLED(*TlsActivationContext, NLog::PRI_TRACE, NKikimrServices::BLOB_DEPOT_EVENTS)) {
                     for (ui32 i = 0; i < Request.QuerySize; ++i) {
                         const auto& q = Request.Queries[i];
@@ -42,6 +35,7 @@ namespace NKikimr::NBlobDepot {
                 Response = std::make_unique<TEvBlobStorage::TEvGetResult>(NKikimrProto::OK, Request.QuerySize,
                     Agent.VirtualGroupId);
                 AnswersRemain = Request.QuerySize;
+                ValueChainsInFlight.resize(Request.QuerySize);
 
                 if (Request.ReaderTabletData) {
                     auto status = Agent.BlocksManager.CheckBlockForTablet(Request.ReaderTabletData->Id, Request.ReaderTabletData->Generation, this, nullptr);
@@ -63,10 +57,10 @@ namespace NKikimr::NBlobDepot {
                     if (const TResolvedValueChain *value = Agent.BlobMappingCache.ResolveKey(blobId, this,
                             std::make_shared<TResolveKeyContext>(i))) {
                         if (!ProcessSingleResult(i, value, std::nullopt)) {
-                            return;
+                            return; // error occured
                         }
                     } else {
-                        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA29, "resolve pending", (VirtualGroupId, Agent.VirtualGroupId),
+                        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA29, "resolve pending", (AgentId, Agent.LogId),
                             (QueryId, GetQueryId()), (QueryIdx, i), (BlobId, query.Id));
                     }
                 }
@@ -75,7 +69,7 @@ namespace NKikimr::NBlobDepot {
             }
 
             bool ProcessSingleResult(ui32 queryIdx, const TResolvedValueChain *value, const std::optional<TString>& errorReason) {
-                STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA27, "ProcessSingleResult", (VirtualGroupId, Agent.VirtualGroupId),
+                STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA27, "ProcessSingleResult", (AgentId, Agent.LogId),
                     (QueryId, GetQueryId()), (QueryIdx, queryIdx), (Value, value), (ErrorReason, errorReason));
 
                 auto& r = Response->Responses[queryIdx];
@@ -83,13 +77,14 @@ namespace NKikimr::NBlobDepot {
                 if (errorReason) {
                     r.Status = NKikimrProto::ERROR;
                     --AnswersRemain;
-                } else if (!value) {
+                } else if (!value || value->empty()) {
                     r.Status = NKikimrProto::NODATA;
                     --AnswersRemain;
                 } else if (Request.IsIndexOnly) {
                     r.Status = NKikimrProto::OK;
                     --AnswersRemain;
                 } else {
+                    ValueChainsInFlight[queryIdx] = GetValueChainId(*value);
                     TReadArg arg{
                         *value,
                         Request.GetHandleClass,
@@ -116,7 +111,7 @@ namespace NKikimr::NBlobDepot {
                         str << ']';
                         return str.Str();
                     };
-                    STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA34, "IssueRead", (VirtualGroupId, Agent.VirtualGroupId),
+                    STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA34, "IssueRead", (AgentId, Agent.LogId),
                         (Offset, arg.Offset), (Size, arg.Size), (ValueChain, makeValueChain()), (Tag, arg.Tag));
                     const bool success = Agent.IssueRead(arg, error);
                     if (!success) {
@@ -128,9 +123,28 @@ namespace NKikimr::NBlobDepot {
             }
 
             void OnRead(ui64 tag, NKikimrProto::EReplyStatus status, TString buffer) override {
-                STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA35, "OnRead", (VirtualGroupId, Agent.VirtualGroupId),
+                STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA35, "OnRead", (AgentId, Agent.LogId),
                     (Tag, tag), (Status, status), (Buffer.size, status == NKikimrProto::OK ? buffer.size() : 0),
                     (ErrorReason, status != NKikimrProto::OK ? buffer : ""));
+
+                if (status == NKikimrProto::NODATA) { // we have to retry this read, this may be a race between blob movement
+                    const auto& q = Request.Queries[tag];
+                    if (ValueChainsWithNodata.emplace(tag, std::exchange(ValueChainsInFlight[tag], {})).second) { // real race
+                        const TResolvedValueChain *value = Agent.BlobMappingCache.ResolveKey(
+                            q.Id.AsBinaryString(),
+                            this,
+                            std::make_shared<TResolveKeyContext>(tag),
+                            true);
+                        Y_VERIFY(!value);
+                        return;
+                    } else {
+                        Y_VERIFY_DEBUG_S(false, "data is lost AgentId# " << Agent.LogId << " BlobId# " << q.Id);
+                        STLOG(PRI_CRIT, BLOB_DEPOT_AGENT, BDA41, "failed to Get blob -- data is lost",
+                            (AgentId, Agent.LogId), (BlobId, q.Id));
+                        status = NKikimrProto::ERROR;
+                    }
+                }
+
                 auto& resp = Response->Responses[tag];
                 Y_VERIFY(resp.Status == NKikimrProto::UNKNOWN);
                 resp.Status = status;
@@ -187,6 +201,8 @@ namespace NKikimr::NBlobDepot {
                     Agent.HandleGetResult(context, **p);
                 } else if (std::holds_alternative<TTabletDisconnected>(response)) {
                     if (auto *resolveContext = dynamic_cast<TResolveKeyContext*>(context.get())) {
+                        STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA26, "TTabletDisconnected", (AgentId, Agent.LogId),
+                            (QueryId, GetQueryId()), (QueryIdx, resolveContext->QueryIdx));
                         Response->Responses[resolveContext->QueryIdx].Status = NKikimrProto::ERROR;
                         --AnswersRemain;
                         CheckAndFinish();

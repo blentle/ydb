@@ -700,6 +700,68 @@ IGraphTransformer::TStatus WideSkipTakeBlocksWrapper(const TExprNode::TPtr& inpu
     return IGraphTransformer::TStatus::Ok;
 }
 
+IGraphTransformer::TStatus WideTopWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+    if (!EnsureArgsCount(*input, 3U, ctx.Expr)) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    if (!EnsureWideFlowType(input->Head(), ctx.Expr)) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    if (!EnsureSpecificDataType(*input->Child(1U), EDataSlot::Uint64, ctx.Expr)) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    const auto& types = input->Head().GetTypeAnn()->Cast<TFlowExprType>()->GetItemType()->Cast<TMultiExprType>()->GetItems();
+    if (!(EnsureTupleMinSize(input->Tail(), 1U, ctx.Expr) && EnsureTupleMaxSize(input->Tail(), types.size(), ctx.Expr))) {
+        return IGraphTransformer::TStatus::Error;
+    }
+
+    std::unordered_set<ui32> indexes(input->Tail().ChildrenSize());
+    for (const auto& item : input->Tail().Children()) {
+        if (!EnsureTupleSize(*item, 2U, ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (!EnsureAtom(item->Head(), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (ui32 index; TryFromString(item->Head().Content(), index)) {
+            if (index >= types.size()) {
+                ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(item->Head().Pos()),
+                    TStringBuilder() << "Index too large: " << index));
+                return IGraphTransformer::TStatus::Error;
+            } else if (!indexes.emplace(index).second) {
+                ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(item->Head().Pos()),
+                    TStringBuilder() << "Duplicate index: " << index));
+                return IGraphTransformer::TStatus::Error;
+            }
+
+            const TDataExprType* type = nullptr;
+            if (bool opt; !EnsureDataOrOptionalOfData( item->Head().Pos(), types[index], opt, type, ctx.Expr)) {
+                return IGraphTransformer::TStatus::Error;
+            }
+
+            if (!EnsureComparableType(input->Pos(), *type, ctx.Expr)) {
+                return IGraphTransformer::TStatus::Error;
+            }
+        } else {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(item->Head().Pos()),
+                TStringBuilder() << "Invalid index value: " << item->Head().Content()));
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (!EnsureSpecificDataType(item->Tail(), EDataSlot::Bool, ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+    }
+
+    output = input;
+    input->SetTypeAnn(input->Head().GetTypeAnn());
+    return IGraphTransformer::TStatus::Ok;
+}
 
 } // namespace NTypeAnnImpl
 }

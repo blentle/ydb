@@ -313,6 +313,9 @@ struct TEvDataShard {
         EvGetOpenTxs, /* for tests */
         EvGetOpenTxsResult, /* for tests */
 
+        EvCdcStreamScanRequest,
+        EvCdcStreamScanResponse,
+
         EvEnd
     };
 
@@ -924,20 +927,24 @@ struct TEvDataShard {
 
         static NActors::IEventBase* Load(TEventSerializedData* data);
 
+        size_t GetRowsCount() const {
+            return Record.GetRowCount();
+        }
+
     private:
         void FillRecord();
 
     public:
         // CellVec (TODO: add schema?)
 
-        size_t GetRowsCount() const {
-            return Rows.size() + RowsSerialized.size();
-        }
-
         TConstArrayRef<TCell> GetCells(size_t row) const {
+            if (Rows.empty() && RowsSerialized.empty() && Record.GetRowCount())
+                return {};
+
             if (!Rows.empty()) {
                 return Rows[row];
             }
+
             return RowsSerialized[row].GetCells();
         }
 
@@ -947,7 +954,12 @@ struct TEvDataShard {
 
         // Arrow
 
-        std::shared_ptr<arrow::RecordBatch> ArrowBatch;
+        void SetArrowBatch(std::shared_ptr<arrow::RecordBatch>&& batch) {
+            ArrowBatch = std::move(batch);
+        }
+
+        std::shared_ptr<arrow::RecordBatch> GetArrowBatch();
+        std::shared_ptr<arrow::RecordBatch> GetArrowBatch() const;
 
     private:
         // for local events
@@ -955,6 +967,8 @@ struct TEvDataShard {
 
         // for remote events to avoid extra copying
         TVector<TSerializedCellVec> RowsSerialized;
+
+        std::shared_ptr<arrow::RecordBatch> ArrowBatch;
     };
 
     struct TEvReadContinue : public TEventLocal<TEvReadContinue, TEvDataShard::EvReadContinue> {
@@ -1582,6 +1596,31 @@ struct TEvDataShard {
         { }
     };
 
+    struct TEvCdcStreamScanRequest
+        : public TEventPB<TEvCdcStreamScanRequest,
+                          NKikimrTxDataShard::TEvCdcStreamScanRequest,
+                          EvCdcStreamScanRequest>
+    {
+    };
+
+    struct TEvCdcStreamScanResponse
+        : public TEventPB<TEvCdcStreamScanResponse,
+                          NKikimrTxDataShard::TEvCdcStreamScanResponse,
+                          EvCdcStreamScanResponse>
+    {
+        TEvCdcStreamScanResponse() = default;
+
+        explicit TEvCdcStreamScanResponse(
+                const NKikimrTxDataShard::TEvCdcStreamScanRequest& request, ui64 tabletId,
+                NKikimrTxDataShard::TEvCdcStreamScanResponse::EStatus status, const TString& error = {})
+        {
+            Record.SetTabletId(tabletId);
+            Record.MutableTablePathId()->CopyFrom(request.GetTablePathId());
+            Record.MutableStreamPathId()->CopyFrom(request.GetStreamPathId());
+            Record.SetStatus(status);
+            Record.SetErrorDescription(error);
+        }
+    };
 };
 
 IActor* CreateDataShard(const TActorId &tablet, TTabletStorageInfo *info);

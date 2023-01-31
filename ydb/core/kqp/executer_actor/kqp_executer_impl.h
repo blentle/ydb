@@ -181,7 +181,8 @@ protected:
         auto& state = ev->Get()->Record;
         ui64 taskId = state.GetTaskId();
 
-        LOG_D("Got execution state from compute actor: " << computeActor
+        LOG_D("ActorState: " << CurrentStateFuncName()
+            << ", got execution state from compute actor: " << computeActor
             << ", task: " << taskId
             << ", state: " << NYql::NDqProto::EComputeState_Name((NYql::NDqProto::EComputeState) state.GetState())
             << ", stats: " << state.GetStats());
@@ -229,6 +230,7 @@ protected:
                 if (Stats) {
                     Stats->AddComputeActorStats(computeActor.NodeId(), std::move(*state.MutableStats()));
                 }
+                ExtraData[computeActor].Swap(state.MutableExtraData());
 
                 LastTaskId = taskId;
                 LastComputeActorId = computeActor.ToString();
@@ -409,19 +411,19 @@ protected:
             switch (reason) {
                 case NKikimrKqp::TEvStartKqpTasksResponse::NOT_ENOUGH_MEMORY: {
                     ReplyErrorAndDie(Ydb::StatusIds::OVERLOADED,
-                        YqlIssue({}, NYql::TIssuesIds::KIKIMR_OVERLOADED, "Not enough memory to execute query"));
+                        YqlIssue({}, NYql::TIssuesIds::KIKIMR_OVERLOADED, message));
                     break;
                 }
 
                 case NKikimrKqp::TEvStartKqpTasksResponse::NOT_ENOUGH_EXECUTION_UNITS: {
                     ReplyErrorAndDie(Ydb::StatusIds::OVERLOADED,
-                        YqlIssue({}, NYql::TIssuesIds::KIKIMR_OVERLOADED, "Not enough computation units to execute query"));
+                        YqlIssue({}, NYql::TIssuesIds::KIKIMR_OVERLOADED, message));
                     break;
                 }
 
                 case NKikimrKqp::TEvStartKqpTasksResponse::QUERY_MEMORY_LIMIT_EXCEEDED: {
                     ReplyErrorAndDie(Ydb::StatusIds::PRECONDITION_FAILED,
-                        YqlIssue({}, NYql::TIssuesIds::KIKIMR_PRECONDITION_FAILED, "Memory limit exceeded"));
+                        YqlIssue({}, NYql::TIssuesIds::KIKIMR_PRECONDITION_FAILED, message));
                     break;
                 }
 
@@ -649,7 +651,7 @@ protected:
         }
     }
 
-    void BuildScanTasksFromSource(TStageInfo& stageInfo) {
+    size_t BuildScanTasksFromSource(TStageInfo& stageInfo, IKqpGateway::TKqpSnapshot snapshot, const TMaybe<ui64> lockTxId = {}) {
         THashMap<ui64, std::vector<ui64>> nodeTasks;
         THashMap<ui64, ui64> assignedShardsCount;
 
@@ -668,14 +670,11 @@ protected:
         auto columns = BuildKqpColumns(source, table);
         auto partitions = PrunePartitions(TableKeys, source, stageInfo, HolderFactory(), TypeEnv());
 
-        bool reverse = false;
         ui64 itemsLimit = 0;
 
         TString itemsLimitParamName;
         NYql::NDqProto::TData itemsLimitBytes;
         NKikimr::NMiniKQL::TType* itemsLimitType = nullptr;
-
-        YQL_ENSURE(!source.GetReverse(), "reverse not supported yet");
 
         for (auto& [shardId, shardInfo] : partitions) {
             YQL_ENSURE(!shardInfo.KeyWriteRanges);
@@ -694,11 +693,14 @@ protected:
 
             NKikimrTxDataShard::TKqpReadRangesSourceSettings settings;
             FillTableMeta(stageInfo, settings.MutableTable());
-            for (auto& key : source.GetSkipNullKeys()) {
-                settings.AddSkipNullKeys(key);
-            }
 
             for (auto& keyColumn : keyTypes) {
+                auto columnType = NScheme::ProtoColumnTypeFromTypeInfo(keyColumn);
+                if (columnType.TypeInfo) {
+                    *settings.AddKeyColumnTypeInfos() = *columnType.TypeInfo;
+                } else {
+                    *settings.AddKeyColumnTypeInfos() = NKikimrProto::TTypeInfo();
+                }
                 settings.AddKeyColumnTypes(static_cast<ui32>(keyColumn.GetTypeId()));
             }
 
@@ -719,18 +721,29 @@ protected:
                 settings.SetDataFormat(NKikimrTxDataShard::EScanDataFormat::CELLVEC);
             }
 
-            settings.MutableSnapshot()->SetStep(Request.Snapshot.Step);
-            settings.MutableSnapshot()->SetTxId(Request.Snapshot.TxId);
+            if (snapshot.IsValid()) {
+                settings.MutableSnapshot()->SetStep(snapshot.Step);
+                settings.MutableSnapshot()->SetTxId(snapshot.TxId);
+            }
 
             shardInfo.KeyReadRanges->SerializeTo(&settings);
-            settings.SetReverse(reverse);
+            settings.SetReverse(source.GetReverse());
             settings.SetSorted(source.GetSorted());
 
             settings.SetShardIdHint(shardId);
+            if (Stats) {
+                Stats->AffectedShards.insert(shardId);
+            }
 
             ExtractItemsLimit(stageInfo, source.GetItemsLimit(), Request.TxAlloc->HolderFactory,
                 Request.TxAlloc->TypeEnv, itemsLimit, itemsLimitParamName, itemsLimitBytes, itemsLimitType);
             settings.SetItemsLimit(itemsLimit);
+
+            auto self = static_cast<TDerived*>(this)->SelfId();
+            if (lockTxId) {
+                settings.SetLockTxId(*lockTxId);
+                settings.SetLockNodeId(self.NodeId());
+            }
 
             const auto& stageSource = stage.GetSources(0);
             auto& input = task.Inputs[stageSource.GetInputIndex()];
@@ -740,6 +753,7 @@ protected:
             taskSourceSettings->PackFrom(settings);
             input.SourceType = NYql::KqpReadRangesSourceName;
         }
+        return partitions.size();
     }
 
 protected:
@@ -1015,6 +1029,17 @@ protected:
     }
 
 protected:
+    virtual TString CurrentStateFuncName() const {
+        const auto& func = this->CurrentStateFunc();
+        if (func == &TKqpExecuterBase::ZombieState) {
+            return "ZombieState";
+        } else if (func == &TKqpExecuterBase::ReadyState) {
+            return "ReadyState";
+        } else {
+            return "unknown state";
+        }
+    }
+
     TString DebugString() const {
         TStringBuilder sb;
         sb << "[KqpExecuter], type: " << (ExecType == EExecType::Data ? "Data" : "Scan")
@@ -1046,6 +1071,8 @@ protected:
     TActorId KqpTableResolverId;
     TActorId KqpShardsResolverId;
     THashMap<TActorId, TProgressStat> PendingComputeActors; // Running compute actors (pure and DS)
+    THashMap<TActorId, NYql::NDqProto::TComputeActorExtraData> ExtraData;
+
     TVector<TProgressStat> LastStats;
 
     TInstant StartResolveTime;
@@ -1074,7 +1101,7 @@ IActor* CreateKqpDataExecuter(IKqpGateway::TExecPhysicalRequest&& request, const
     const TMaybe<TString>& userToken, TKqpRequestCounters::TPtr counters);
 
 IActor* CreateKqpScanExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
-    const TMaybe<TString>& userToken, TKqpRequestCounters::TPtr counters);
+    const TMaybe<TString>& userToken, TKqpRequestCounters::TPtr counters, const NKikimrConfig::TTableServiceConfig::TAggregationConfig& aggregation);
 
 } // namespace NKqp
 } // namespace NKikimr

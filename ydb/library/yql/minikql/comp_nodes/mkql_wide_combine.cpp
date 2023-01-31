@@ -1,4 +1,6 @@
 #include "mkql_wide_combine.h"
+#include "mkql_rh_hash.h"
+#include "mkql_llvm_base.h"
 
 #include <ydb/library/yql/minikql/computation/mkql_computation_node_codegen.h>
 #include <ydb/library/yql/minikql/mkql_node_builder.h>
@@ -150,45 +152,122 @@ struct TCombinerNodes {
 class TState : public TComputationValue<TState> {
     typedef TComputationValue<TState> TBase;
 public:
+    using TLLVMBase = TLLVMFieldsStructure<TComputationValue<TState>>;
+private:
+    using TStates = TRobinHoodHashSet<NUdf::TUnboxedValuePod*, TEqualsFunc, THashFunc, TMKQLAllocator<char, EMemorySubPool::Temporary>>;
+    using TRow = std::vector<NUdf::TUnboxedValuePod, TMKQLAllocator<NUdf::TUnboxedValuePod>>;
+    using TStorage = std::deque<TRow, TMKQLAllocator<TRow>>;
+
+    class TStorageIterator {
+    private:
+        TStorage& Storage;
+        const ui32 RowSize = 0;
+        const ui64 Count = 0;
+        ui64 Ready = 0;
+        TStorage::iterator ItStorage;
+        TRow::iterator ItRow;
+    public:
+        TStorageIterator(TStorage& storage, const ui32 rowSize, const ui64 count)
+            : Storage(storage)
+            , RowSize(rowSize)
+            , Count(count)
+        {
+            ItStorage = Storage.begin();
+            if (ItStorage != Storage.end()) {
+                ItRow = ItStorage->begin();
+            }
+        }
+
+        bool IsValid() {
+            return Ready < Count;
+        }
+
+        bool Next() {
+            if (++Ready >= Count) {
+                return false;
+            }
+            ItRow += RowSize;
+            if (ItRow == ItStorage->end()) {
+                ++ItStorage;
+                ItRow = ItStorage->begin();
+            }
+
+            return true;
+        }
+
+        NUdf::TUnboxedValuePod* GetValuePtr() const {
+            return &*ItRow;
+        }
+    };
+
+    static constexpr ui32 CountRowsOnPage = 128;
+
+    ui32 RowSize() const {
+        return KeyWidth + StateWidth;
+    }
+public:
     TState(TMemoryUsageInfo* memInfo, ui32 keyWidth, ui32 stateWidth, const THashFunc& hash, const TEqualsFunc& equal)
-        : TBase(memInfo), KeyWidth(keyWidth), StateWidth(stateWidth), States(0, hash, equal) {
-        Storage.emplace_back(KeyWidth + StateWidth, NUdf::TUnboxedValuePod());
-        Tongue = Storage.back().data();
+        : TBase(memInfo), KeyWidth(keyWidth), StateWidth(stateWidth), States(hash, equal, CountRowsOnPage) {
+        CurrentPage = &Storage.emplace_back(RowSize() * CountRowsOnPage, NUdf::TUnboxedValuePod());
+        CurrentPosition = 0;
+        Tongue = CurrentPage->data();
     }
 
     bool TasteIt() {
-        const auto ins = States.emplace(Tongue);
-        if (ins.second) {
-            Storage.emplace_back(KeyWidth + StateWidth, NUdf::TUnboxedValuePod());
-            Tongue = Storage.back().data();
+        Y_VERIFY(!ExtractIt);
+        bool isNew = false;
+        auto itInsert = States.Insert(Tongue, isNew);
+        if (isNew) {
+            CurrentPosition += RowSize();
+            if (CurrentPosition == CurrentPage->size()) {
+                CurrentPage = &Storage.emplace_back(RowSize() * CountRowsOnPage, NUdf::TUnboxedValuePod());
+                CurrentPosition = 0;
+            }
+            Tongue = CurrentPage->data() + CurrentPosition;
         }
-        Throat = *ins.first + KeyWidth;
-        return ins.second;
+        Throat = States.GetKey(itInsert) + KeyWidth;
+        if (isNew) {
+            States.CheckGrow();
+        }
+        return isNew;
     }
 
     bool IsEmpty() {
-        if (!States.empty())
+        if (!States.Empty())
             return false;
 
-        if (Storage.size() > 1U) {
-            Storage.clear();
-            Storage.emplace_back(KeyWidth + StateWidth, NUdf::TUnboxedValuePod());
-            Tongue = Storage.back().data();
+        {
+            TStorage localStorage;
+            std::swap(localStorage, Storage);
         }
+        CurrentPage = &Storage.emplace_back(RowSize() * CountRowsOnPage, NUdf::TUnboxedValuePod());
+        CurrentPosition = 0;
+        Tongue = CurrentPage->data();
 
         CleanupCurrentContext();
         return true;
     }
 
     void PushStat(IStatsRegistry* stats) const {
-        if (!States.empty()) {
-            MKQL_SET_MAX_STAT(stats, Combine_MaxRowsCount, static_cast<i64>(States.size()));
+        if (!States.Empty()) {
+            MKQL_SET_MAX_STAT(stats, Combine_MaxRowsCount, static_cast<i64>(States.GetSize()));
             MKQL_INC_STAT(stats, Combine_FlushesCount);
         }
     }
 
     NUdf::TUnboxedValuePod* Extract() {
-        return States.empty() ? nullptr : States.extract(States.cbegin()).value();
+        if (!ExtractIt) {
+            ExtractIt.emplace(Storage, RowSize(), States.GetSize());
+        } else {
+            ExtractIt->Next();
+        }
+        if (!ExtractIt->IsValid()) {
+            ExtractIt.reset();
+            States.Clear();
+            return nullptr;
+        }
+        NUdf::TUnboxedValuePod* result = ExtractIt->GetValuePtr();
+        return result;
     }
 
     EFetchResult InputStatus = EFetchResult::One;
@@ -196,11 +275,55 @@ public:
     NUdf::TUnboxedValuePod* Throat = nullptr;
 
 private:
+    std::optional<TStorageIterator> ExtractIt;
     const ui32 KeyWidth, StateWidth;
-    using TRow = std::vector<NUdf::TUnboxedValuePod, TMKQLAllocator<NUdf::TUnboxedValuePod>>;
-    std::deque<TRow, TMKQLAllocator<TRow>> Storage;
-    std::unordered_set<NUdf::TUnboxedValuePod*, THashFunc, TEqualsFunc, TMKQLAllocator<NUdf::TUnboxedValuePod*>> States;
+    ui64 CurrentPosition = 0;
+    TRow* CurrentPage = nullptr;
+    TStorage Storage;
+    TStates States;
 };
+
+#ifndef MKQL_DISABLE_CODEGEN
+class TLLVMFieldsStructureState: public TState::TLLVMBase {
+private:
+    using TBase = TState::TLLVMBase;
+    llvm::IntegerType* ValueType;
+    llvm::PointerType* PtrValueType;
+    llvm::IntegerType* StatusType;
+protected:
+    using TBase::Context;
+public:
+    std::vector<llvm::Type*> GetFieldsArray() {
+        std::vector<llvm::Type*> result = TBase::GetFields();
+        result.emplace_back(StatusType); //status
+        result.emplace_back(PtrValueType); //tongue
+        result.emplace_back(PtrValueType); //throat
+        result.emplace_back(Type::getInt32Ty(Context)); //size
+        result.emplace_back(Type::getInt32Ty(Context)); //size
+        return result;
+    }
+
+    llvm::Constant* GetStatus() {
+        return ConstantInt::get(Type::getInt32Ty(Context), TBase::GetFieldsCount() + 0);
+    }
+
+    llvm::Constant* GetTongue() {
+        return ConstantInt::get(Type::getInt32Ty(Context), TBase::GetFieldsCount() + 1);
+    }
+
+    llvm::Constant* GetThroat() {
+        return ConstantInt::get(Type::getInt32Ty(Context), TBase::GetFieldsCount() + 2);
+    }
+
+    TLLVMFieldsStructureState(llvm::LLVMContext& context)
+        : TBase(context)
+        , ValueType(Type::getInt128Ty(Context))
+        , PtrValueType(PointerType::getUnqual(ValueType))
+        , StatusType(Type::getInt32Ty(Context)) {
+
+    }
+};
+#endif
 
 template <bool TrackRss>
 class TWideCombinerWrapper: public TStatefulWideFlowCodegeneratorNode<TWideCombinerWrapper<TrackRss>>
@@ -227,7 +350,8 @@ public:
         while (const auto ptr = static_cast<TState*>(state.AsBoxed().Get())) {
             if (ptr->IsEmpty()) {
                 switch (ptr->InputStatus) {
-                    case EFetchResult::One: break;
+                    case EFetchResult::One:
+                        break;
                     case EFetchResult::Yield:
                         ptr->InputStatus = EFetchResult::One;
                         return EFetchResult::Yield;
@@ -269,22 +393,10 @@ public:
 
         const auto valueType = Type::getInt128Ty(context);
         const auto ptrValueType = PointerType::getUnqual(valueType);
-        const auto structPtrType = PointerType::getUnqual(StructType::get(context));
-        const auto contextType = GetCompContextType(context);
         const auto statusType = Type::getInt32Ty(context);
 
-        const auto stateType = StructType::get(context, {
-            structPtrType,              // vtbl
-            Type::getInt32Ty(context),  // ref
-            Type::getInt16Ty(context),  // abi
-            Type::getInt16Ty(context),  // reserved
-            structPtrType,              // meminfo
-            statusType,                 // status
-            ptrValueType,               // tongue
-            ptrValueType,               // throat
-            Type::getInt32Ty(context),  // size
-            Type::getInt32Ty(context),  // size
-        });
+        TLLVMFieldsStructureState stateFields(context);
+        const auto stateType = StructType::get(context, stateFields.GetFieldsArray());
 
         const auto statePtrType = PointerType::getUnqual(stateType);
 
@@ -336,7 +448,7 @@ public:
             const auto good = BasicBlock::Create(context, "good", ctx.Func);
             const auto done = BasicBlock::Create(context, "done", ctx.Func);
 
-            const auto statusPtr = GetElementPtrInst::CreateInBounds(stateArg, {ConstantInt::get(Type::getInt32Ty(context), 0), ConstantInt::get(Type::getInt32Ty(context), 5)}, "last", block);
+            const auto statusPtr = GetElementPtrInst::CreateInBounds(stateArg, { stateFields.This(), stateFields.GetStatus() }, "last", block);
 
             const auto last = new LoadInst(statusPtr, "last", block);
 
@@ -377,7 +489,7 @@ public:
                     items[i] = getres.second[i](ctx, block);
             }
 
-            const auto tonguePtr = GetElementPtrInst::CreateInBounds(stateArg, {ConstantInt::get(Type::getInt32Ty(context), 0), ConstantInt::get(Type::getInt32Ty(context), 6)}, "tongue_ptr", block);
+            const auto tonguePtr = GetElementPtrInst::CreateInBounds(stateArg, { stateFields.This(), stateFields.GetTongue() }, "tongue_ptr", block);
             const auto tongue = new LoadInst(tonguePtr, "tongue", block);
 
             std::vector<Value*> keyPointers(Nodes.KeyResultNodes.size(), nullptr), keys(Nodes.KeyResultNodes.size(), nullptr);
@@ -408,7 +520,7 @@ public:
             const auto next = BasicBlock::Create(context, "next", ctx.Func);
             const auto test = BasicBlock::Create(context, "test", ctx.Func);
 
-            const auto throatPtr = GetElementPtrInst::CreateInBounds(stateArg, {ConstantInt::get(Type::getInt32Ty(context), 0), ConstantInt::get(Type::getInt32Ty(context), 7)}, "throat_ptr", block);
+            const auto throatPtr = GetElementPtrInst::CreateInBounds(stateArg, { stateFields.This(), stateFields.GetThroat() }, "throat_ptr", block);
             const auto throat = new LoadInst(throatPtr, "throat", block);
 
             std::vector<Value*> pointers;
@@ -656,23 +768,11 @@ public:
 
         const auto valueType = Type::getInt128Ty(context);
         const auto ptrValueType = PointerType::getUnqual(valueType);
-        const auto structPtrType = PointerType::getUnqual(StructType::get(context));
-        const auto contextType = GetCompContextType(context);
         const auto statusType = Type::getInt32Ty(context);
 
-        const auto stateType = StructType::get(context, {
-            structPtrType,              // vtbl
-            Type::getInt32Ty(context),  // ref
-            Type::getInt16Ty(context),  // abi
-            Type::getInt16Ty(context),  // reserved
-            structPtrType,              // meminfo
-            statusType,                 // status
-            ptrValueType,               // tongue
-            ptrValueType,               // throat
-            Type::getInt32Ty(context),  // size
-            Type::getInt32Ty(context),  // size
-        });
+        TLLVMFieldsStructureState stateFields(context);
 
+        const auto stateType = StructType::get(context, stateFields.GetFieldsArray());
         const auto statePtrType = PointerType::getUnqual(stateType);
 
         const auto keys = new AllocaInst(ArrayType::get(valueType, Nodes.KeyResultNodes.size()), 0U, "keys", &ctx.Func->getEntryBlock().back());
@@ -706,7 +806,7 @@ public:
         const auto over = BasicBlock::Create(context, "over", ctx.Func);
         const auto result = PHINode::Create(statusType, 3U, "result", over);
 
-        const auto statusPtr = GetElementPtrInst::CreateInBounds(stateArg, {ConstantInt::get(Type::getInt32Ty(context), 0), ConstantInt::get(Type::getInt32Ty(context), 5)}, "last", block);
+        const auto statusPtr = GetElementPtrInst::CreateInBounds(stateArg, { stateFields.This(), stateFields.GetStatus() }, "last", block);
         const auto last = new LoadInst(statusPtr, "last", block);
         const auto finish = CmpInst::Create(Instruction::ICmp, ICmpInst::ICMP_EQ, last, ConstantInt::get(last->getType(), static_cast<i32>(EFetchResult::Finish)), "finish", block);
 
@@ -741,7 +841,7 @@ public:
                     items[i] = getres.second[i](ctx, block);
             }
 
-            const auto tonguePtr = GetElementPtrInst::CreateInBounds(stateArg, {ConstantInt::get(Type::getInt32Ty(context), 0), ConstantInt::get(Type::getInt32Ty(context), 6)}, "tongue_ptr", block);
+            const auto tonguePtr = GetElementPtrInst::CreateInBounds(stateArg, { stateFields.This(), stateFields.GetTongue() }, "tongue_ptr", block);
             const auto tongue = new LoadInst(tonguePtr, "tongue", block);
 
             std::vector<Value*> keyPointers(Nodes.KeyResultNodes.size(), nullptr), keys(Nodes.KeyResultNodes.size(), nullptr);
@@ -771,7 +871,7 @@ public:
             const auto init = BasicBlock::Create(context, "init", ctx.Func);
             const auto next = BasicBlock::Create(context, "next", ctx.Func);
 
-            const auto throatPtr = GetElementPtrInst::CreateInBounds(stateArg, {ConstantInt::get(Type::getInt32Ty(context), 0), ConstantInt::get(Type::getInt32Ty(context), 7)}, "throat_ptr", block);
+            const auto throatPtr = GetElementPtrInst::CreateInBounds(stateArg, { stateFields.This(), stateFields.GetThroat() }, "throat_ptr", block);
             const auto throat = new LoadInst(throatPtr, "throat", block);
 
             std::vector<Value*> pointers;

@@ -1783,7 +1783,7 @@ namespace NTypeAnnImpl {
 
         const TTypeAnnotationNode* resultType = nullptr;
         bool isSequence = true;
-        const TTypeAnnotationNode* itemType = GetItemType(*firstChildType);
+        const TTypeAnnotationNode* itemType = GetSeqItemType(firstChildType);
         if (!itemType) {
             itemType = firstChildType;
             isSequence = false;
@@ -1871,7 +1871,7 @@ namespace NTypeAnnImpl {
             return IGraphTransformer::TStatus::Error;
         }
 
-        const TTypeAnnotationNode* itemType = GetItemType(*firstChildType);
+        const TTypeAnnotationNode* itemType = GetSeqItemType(firstChildType);
         if (!itemType) {
             itemType = firstChildType;
         }
@@ -6969,7 +6969,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
             return IGraphTransformer::TStatus::Error;
         }
 
-        if (!EnsureMaxArgsCount(*input, 7, ctx.Expr)) {
+        if (!EnsureMaxArgsCount(*input, 8, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
 
@@ -7052,13 +7052,41 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
             fileAlias = input->Child(6)->Content();
         }
 
-        if (input->ChildrenSize() != 7) {
+        // (7) settings
+        if (input->ChildrenSize() > 7) {
+            if (!EnsureTuple(*input->Child(7), ctx.Expr)) {
+                return IGraphTransformer::TStatus::Error;
+            }
+
+            for (const auto& child : input->Child(7)->Children()) {
+                if (!EnsureTupleMinSize(*child, 1, ctx.Expr)) {
+                    return IGraphTransformer::TStatus::Error;
+                }
+
+                if (!EnsureAtom(child->Head(), ctx.Expr)) {
+                    return IGraphTransformer::TStatus::Error;
+                }
+
+                auto settingName = child->Head().Content();
+                if (settingName == "strict") {
+                    if (!EnsureTupleSize(*child, 1, ctx.Expr)) {
+                        return IGraphTransformer::TStatus::Error;
+                    }
+                } else if (settingName == "blocks") {
+                    if (!EnsureTupleSize(*child, 1, ctx.Expr)) {
+                        return IGraphTransformer::TStatus::Error;
+                    }
+                } else {
+                    ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(child->Head().Pos()), TStringBuilder() << "Unknown setting: " << settingName));
+                    return IGraphTransformer::TStatus::Error;
+                }
+            }
+        }
+
+        if (input->ChildrenSize() != 8) {
             YQL_PROFILE_SCOPE(DEBUG, "ResolveUdfs");
-            auto& cacheItem = ctx.Types.UdfTypeCache[std::make_tuple(TString(name), TString(typeConfig), userType)];
-            auto& cachedFuncType = std::get<0>(cacheItem);
-            auto& cachedRunConfigType = std::get<1>(cacheItem);
-            auto& cachedNormalizedUserType = std::get<2>(cacheItem);
-            if (!cachedFuncType) {
+            auto& cached = ctx.Types.UdfTypeCache[std::make_tuple(TString(name), TString(typeConfig), userType)];
+            if (!cached.FunctionType) {
                 IUdfResolver::TFunction description;
                 description.Pos = ctx.Expr.GetPosition(input->Pos());
                 description.Name = TString(name);
@@ -7099,9 +7127,11 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                     return IGraphTransformer::TStatus::Error;
                 }
 
-                cachedFuncType = description.CallableType;
-                cachedRunConfigType = description.RunConfigType ? description.RunConfigType : ctx.Expr.MakeType<TVoidExprType>();
-                cachedNormalizedUserType = description.UserType ? description.NormalizedUserType : ctx.Expr.MakeType<TVoidExprType>();
+                cached.FunctionType = description.CallableType;
+                cached.RunConfigType = description.RunConfigType ? description.RunConfigType : ctx.Expr.MakeType<TVoidExprType>();
+                cached.NormalizedUserType = description.UserType ? description.NormalizedUserType : ctx.Expr.MakeType<TVoidExprType>();
+                cached.SupportsBlocks = description.SupportsBlocks;
+                cached.IsStrict = description.IsStrict;
             }
 
             TStringBuf typeConfig = "";
@@ -7109,19 +7139,19 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                 typeConfig = input->Child(3)->Content();
             }
 
-            const auto callableTypeNode = ExpandType(input->Pos(), *cachedFuncType, ctx.Expr);
-            const auto runConfigTypeNode = ExpandType(input->Pos(), *cachedRunConfigType, ctx.Expr);
+            const auto callableTypeNode = ExpandType(input->Pos(), *cached.FunctionType, ctx.Expr);
+            const auto runConfigTypeNode = ExpandType(input->Pos(), *cached.RunConfigType, ctx.Expr);
             TExprNode::TPtr runConfigValue;
             if (input->ChildrenSize() > 1 && !input->Child(1)->IsCallable("Void")) {
                 runConfigValue = input->ChildPtr(1);
             } else {
-                if (cachedRunConfigType->GetKind() == ETypeAnnotationKind::Void) {
+                if (cached.RunConfigType->GetKind() == ETypeAnnotationKind::Void) {
                     runConfigValue = ctx.Expr.NewCallable(input->Pos(), "Void", {});
-                } else if (cachedRunConfigType->GetKind() == ETypeAnnotationKind::Optional) {
+                } else if (cached.RunConfigType->GetKind() == ETypeAnnotationKind::Optional) {
                     runConfigValue = ctx.Expr.NewCallable(input->Pos(), "Nothing", { runConfigTypeNode });
                 } else {
                     ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()), TStringBuilder() << "Missing run config value for type: "
-                        << *cachedRunConfigType << " in function " << name));
+                        << *cached.RunConfigType << " in function " << name));
                     return IGraphTransformer::TStatus::Error;
                 }
             }
@@ -7132,11 +7162,29 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                 .Callable("Udf")
                     .Add(0, input->HeadPtr())
                     .Add(1, runConfigValue)
-                    .Add(2, ExpandType(input->Pos(), *cachedNormalizedUserType, ctx.Expr))
+                    .Add(2, ExpandType(input->Pos(), *cached.NormalizedUserType, ctx.Expr))
                     .Atom(3, typeConfig)
                     .Add(4, callableTypeNode)
                     .Add(5, runConfigTypeNode)
                     .Atom(6, fileAlias)
+                    .List(7)
+                        .Do([&](TExprNodeBuilder& parent) -> TExprNodeBuilder& {
+                            ui32 settingIndex = 0;
+                            if (cached.SupportsBlocks) {
+                                parent.List(settingIndex++)
+                                    .Atom(0, "blocks")
+                                    .Seal();
+                            }
+
+                            if (cached.IsStrict) {
+                                parent.List(settingIndex++)
+                                    .Atom(0, "strict")
+                                    .Seal();
+                            }
+
+                            return parent;
+                        })
+                    .Seal()
                 .Seal()
                 .Build();
 
@@ -7752,7 +7800,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                 return IGraphTransformer::TStatus::Error;
             }
         }
-        
+
         TExprNode::TPtr runConfig;
         if (input->ChildrenSize() > 4) {
             runConfig = input->Child(4);
@@ -11497,7 +11545,6 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["StreamType"] = &TypeWrapper<ETypeAnnotationKind::Stream>;
         Functions["FlowType"] = &TypeWrapper<ETypeAnnotationKind::Flow>;
         Functions["BlockType"] = &TypeWrapper<ETypeAnnotationKind::Block>;
-        Functions["ChunkedBlockType"] = &TypeWrapper<ETypeAnnotationKind::ChunkedBlock>;
         Functions["ScalarType"] = &TypeWrapper<ETypeAnnotationKind::Scalar>;
         Functions["Nothing"] = &NothingWrapper;
         Functions["AsOptionalType"] = &AsOptionalTypeWrapper;
@@ -11790,6 +11837,8 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["WideCombiner"] = &WideCombinerWrapper;
         Functions["WideChopper"] = &WideChopperWrapper;
         Functions["WideChain1Map"] = &WideChain1MapWrapper;
+        Functions["WideTop"] = &WideTopWrapper;
+        Functions["WideTopSort"] = &WideTopWrapper;
         Functions["NarrowMap"] = &NarrowMapWrapper;
         Functions["NarrowFlatMap"] = &NarrowFlatMapWrapper;
         Functions["NarrowMultiMap"] = &NarrowMultiMapWrapper;
@@ -11807,6 +11856,8 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["BlockOr"] = &BlockLogicalWrapper;
         Functions["BlockXor"] = &BlockLogicalWrapper;
         Functions["BlockNot"] = &BlockLogicalWrapper;
+        Functions["BlockIf"] = &BlockIfWrapper;
+        Functions["BlockJust"] = &BlockJustWrapper;
         ExtFunctions["BlockFunc"] = &BlockFuncWrapper;
         ExtFunctions["BlockBitCast"] = &BlockBitCastWrapper;
 

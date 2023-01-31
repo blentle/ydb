@@ -29,9 +29,9 @@ void TConstraintNode::Out(IOutputStream& out) const {
     out.Write(Name_);
 }
 
-bool TConstraintNode::PathExistsInType(const TPathType& path, const TTypeAnnotationNode& type) {
+const TTypeAnnotationNode* TConstraintNode::GetSubTypeByPath(const TPathType& path, const TTypeAnnotationNode& type) {
     if (path.empty())
-        return true;
+        return &type;
 
     const auto tail = [](const TPathType& path) {
         auto p(path);
@@ -40,25 +40,25 @@ bool TConstraintNode::PathExistsInType(const TPathType& path, const TTypeAnnotat
     };
     switch (type.GetKind()) {
         case ETypeAnnotationKind::Optional:
-            return PathExistsInType(path, *type.Cast<TOptionalExprType>()->GetItemType());
+            return GetSubTypeByPath(path, *type.Cast<TOptionalExprType>()->GetItemType());
         case ETypeAnnotationKind::Struct:
             if (const auto itemType = type.Cast<TStructExprType>()->FindItemType(path.front()))
-                return PathExistsInType(tail(path), *itemType);
+                return GetSubTypeByPath(tail(path), *itemType);
             break;
         case ETypeAnnotationKind::Tuple:
             if (const auto index = TryFromString<ui64>(TStringBuf(path.front())))
                 if (const auto typleType = type.Cast<TTupleExprType>(); typleType->GetSize() > *index)
-                    return PathExistsInType(tail(path), *typleType->GetItems()[*index]);
+                    return GetSubTypeByPath(tail(path), *typleType->GetItems()[*index]);
             break;
         case ETypeAnnotationKind::Multi:
             if (const auto index = TryFromString<ui64>(TStringBuf(path.front())))
                 if (const auto multiType = type.Cast<TMultiExprType>(); multiType->GetSize() > *index)
-                    return PathExistsInType(tail(path), *multiType->GetItems()[*index]);
+                    return GetSubTypeByPath(tail(path), *multiType->GetItems()[*index]);
             break;
         default:
             break;
     }
-    return false;
+    return nullptr;
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -209,7 +209,8 @@ TSortedConstraintNode::TSortedConstraintNode(TExprContext& ctx, TContainerType&&
     YQL_ENSURE(!Content_.empty());
     for (const auto& c : Content_) {
         YQL_ENSURE(!c.first.empty());
-        Hash_ = std::accumulate(c.first.cbegin(), c.first.cend(), c.second ? Hash_ : ~Hash_, [](ui64 hash, const std::string_view& field) { return MurmurHash<ui64>(field.data(), field.size(), hash); });
+        for (const auto& path : c.first)
+            Hash_ = std::accumulate(path.cbegin(), path.cend(), c.second ? Hash_ : ~Hash_, [](ui64 hash, const std::string_view& field) { return MurmurHash<ui64>(field.data(), field.size(), hash); });
     }
 }
 
@@ -249,13 +250,16 @@ bool TSortedConstraintNode::Includes(const TConstraintNode& node) const {
 void TSortedConstraintNode::Out(IOutputStream& out) const {
     TConstraintNode::Out(out);
     out.Write('(');
-    for (size_t i = 0; i < Content_.size(); ++i) {
-        if (i > 0) {
+    bool first = true;
+    for (const auto& c : Content_) {
+        if (first)
+            first = false;
+        else
             out.Write(';');
-        }
-        out.Write(JoinSeq(',', Content_[i].first));
+
+        out.Write(JoinSeq(',', c.first));
         out.Write('[');
-        out.Write(Content_[i].second ? "asc" : "desc");
+        out.Write(c.second ? "asc" : "desc");
         out.Write(']');
     }
     out.Write(')');
@@ -263,10 +267,10 @@ void TSortedConstraintNode::Out(IOutputStream& out) const {
 
 void TSortedConstraintNode::ToJson(NJson::TJsonWriter& out) const {
     out.OpenArray();
-    for (size_t i = 0; i < Content_.size(); ++i) {
+    for (const auto& c : Content_) {
         out.OpenArray();
-        out.Write(JoinSeq(';', Content_[i].first));
-        out.Write(Content_[i].second);
+        out.Write(JoinSeq(';', c.first));
+        out.Write(c.second);
         out.CloseArray();
     }
     out.CloseArray();
@@ -276,19 +280,22 @@ bool TSortedConstraintNode::IsPrefixOf(const TSortedConstraintNode& node) const 
     return node.Includes(*this);
 }
 
-bool TSortedConstraintNode::IsOrderBy(const TUniqueConstraintNode& unique) const {
-    NSorted::TSimpleSet<TColumnsSet> columns;
+const TSortedConstraintNode::TFullSetType TSortedConstraintNode::GetAllSets() const {
+    TFullSetType sets;
     for (const auto& key : Content_)
-        if (!key.first.empty())
-            columns.insert_unique(key.first);
+        sets.insert_unique(key.first);
+    return sets;
+}
 
+bool TSortedConstraintNode::IsOrderBy(const TUniqueConstraintNode& unique) const {
+    auto columns = GetAllSets();
     const auto ordered = columns;
     for (const auto& set : unique.GetAllSets()) {
         if (std::all_of(set.cbegin(), set.cend(), [&ordered](const TPathType& path) {
-            return !path.empty() && std::any_of(ordered.cbegin(), ordered.cend(), [&path](const TColumnsSet& s) { return s.contains(path.front()); });
+            return !path.empty() && std::any_of(ordered.cbegin(), ordered.cend(), [&path](const TSetType& s) { return s.contains(path); });
         })) {
             std::for_each(set.cbegin(), set.cend(), [&columns](const TPathType& path) {
-                if (const auto it = std::find_if(columns.cbegin(), columns.cend(), [&path](const TColumnsSet& s) { return s.contains(path.front()); }); columns.cend() != it)
+                if (const auto it = std::find_if(columns.cbegin(), columns.cend(), [&path](const TSetType& s) { return s.contains(path); }); columns.cend() != it)
                     columns.erase(it);
             });
             if (columns.empty())
@@ -319,7 +326,7 @@ const TSortedConstraintNode* TSortedConstraintNode::MakeCommon(const std::vector
                     for (auto j = 0U; j < size; ++j) {
                         auto& one = (*content)[j];
                         auto& two = nextContent[j];
-                        TColumnsSet common;
+                        TSetType common;
                         common.reserve(std::min(one.first.size(), two.first.size()));
                         std::set_intersection(one.first.cbegin(), one.first.cend(), two.first.cbegin(), two.first.cend(), std::back_inserter(common));
                         if (common.empty() || one.second != two.second) {
@@ -354,7 +361,7 @@ const TSortedConstraintNode* TSortedConstraintNode::MakeCommon(const TSortedCons
     for (auto j = 0U; j < size; ++j) {
         auto& one = content[j];
         auto& two = Content_[j];
-        TColumnsSet common;
+        TSetType common;
         common.reserve(std::min(one.first.size(), two.first.size()));
         std::set_intersection(one.first.cbegin(), one.first.cend(), two.first.cbegin(), two.first.cend(), std::back_inserter(common));
         if (common.empty() || one.second != two.second) {
@@ -372,7 +379,7 @@ const TSortedConstraintNode* TSortedConstraintNode::FilterByType(const TSortedCo
         auto content = sorted->GetContent();
         for (size_t i = 0; i < content.size(); ++i) {
             for (auto it = content[i].first.cbegin(); content[i].first.cend() != it;) {
-                if (outItemType->FindItem(*it))
+                if (GetSubTypeByPath(*it, *outItemType))
                     ++it;
                 else
                     it = content[i].first.erase(it);
@@ -401,6 +408,33 @@ const TSortedConstraintNode* TSortedConstraintNode::CutPrefix(size_t newPrefixLe
     auto content = Content_;
     content.resize(newPrefixLength);
     return ctx.MakeConstraint<TSortedConstraintNode>(std::move(content));
+}
+
+const TSortedConstraintNode* TSortedConstraintNode::RenameFields(TExprContext& ctx, const TPathReduce& reduce) const {
+    TContainerType sorted;
+    sorted.reserve(Content_.size());
+    for (const auto& item : Content_) {
+        TSetType newSet;
+        newSet.reserve(item.first.size());
+        for (const auto& path : item.first) {
+            auto newPaths = reduce(path);
+            if (!newPaths.empty())
+                newSet.insert_unique(newPaths.cbegin(), newPaths.cend());
+        }
+
+        if (newSet.empty())
+            break;
+        else
+            sorted.emplace_back(std::move(newSet), item.second);
+    }
+    return sorted.empty() ? nullptr : ctx.MakeConstraint<TSortedConstraintNode>(std::move(sorted));
+}
+
+bool TSortedConstraintNode::IsApplicableToType(const TTypeAnnotationNode& type) const {
+    const auto& itemType = GetSeqItemType(type);
+    return std::all_of(Content_.cbegin(), Content_.cend(), [&itemType](const std::pair<TSetType, bool>& pair) {
+        return std::all_of(pair.first.cbegin(), pair.first.cend(), std::bind(&GetSubTypeByPath, std::placeholders::_1, std::cref(itemType)));
+    });
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -546,19 +580,11 @@ void TUniqueConstraintNode::Out(IOutputStream& out) const {
         out.Write('(');
         bool first = true;
         for (const auto& path : set) {
-            if (!first) {
+            if (first)
+                first = false;
+            else
                 out.Write(',');
-            }
-            if (!path.empty()) {
-                auto it = path.cbegin();
-                out.Write(*it);
-                while (path.cend() > ++it) {
-                    out.Write('#');
-                    out.Write(*it);
-                }
-            }
-
-            first = false;
+            out << path;
         }
         out.Write(')');
     }
@@ -627,7 +653,7 @@ bool TUniqueConstraintNode::HasEqualColumns(const std::vector<std::string_view>&
     return false;
 }
 
-const TUniqueConstraintNode* TUniqueConstraintNode::FilterFields(TExprContext& ctx, const std::function<bool(const TPathType&)>& predicate) const {
+const TUniqueConstraintNode* TUniqueConstraintNode::FilterFields(TExprContext& ctx, const TPathFilter& predicate) const {
     auto sets = Sets_;
     for (auto it = sets.cbegin(); sets.cend() != it;) {
         if (std::all_of(it->cbegin(), it->cend(), predicate))
@@ -638,23 +664,21 @@ const TUniqueConstraintNode* TUniqueConstraintNode::FilterFields(TExprContext& c
     return sets.empty() ? nullptr : ctx.MakeConstraint<TUniqueConstraintNode>(std::move(sets));
 }
 
-const TUniqueConstraintNode* TUniqueConstraintNode::RenameFields(TExprContext& ctx, const std::function<std::vector<std::string_view>(const std::string_view&)>& reduce) const {
+const TUniqueConstraintNode* TUniqueConstraintNode::RenameFields(TExprContext& ctx, const TPathReduce& reduce) const {
     TFullSetType sets;
     sets.reserve(Sets_.size());
     for (const auto& set : Sets_) {
         std::vector<TSetType> newSets(1U);
         newSets.front().reserve(set.size());
         for (const auto& path : set) {
-            auto newNames = reduce(path.front());
-            if (newNames.empty())
+            auto newPaths = reduce(path);
+            if (newPaths.empty())
                 break;
             auto tmpSets(std::move(newSets));
-            for (const auto& newName : newNames) {
+            for (const auto& newPath : newPaths) {
                 for (const auto& oldSet : tmpSets) {
                     newSets.emplace_back(oldSet);
-                    auto newPath = path;
-                    newPath.front() = newName;
-                    newSets.back().insert_unique(std::move(newPath));
+                    newSets.back().insert_unique(newPath);
                 }
             }
         }
@@ -664,16 +688,17 @@ const TUniqueConstraintNode* TUniqueConstraintNode::RenameFields(TExprContext& c
     return sets.empty() ? nullptr : ctx.MakeConstraint<TUniqueConstraintNode>(std::move(sets));
 }
 
-bool TUniqueConstraintNode::IsAppliesToType(const TTypeAnnotationNode& type) const {
-    const auto itemType = GetSeqItemType(&type);
-    return std::all_of(Sets_.cbegin(), Sets_.cend(), [itemType](const TSetType& set) {
-        return std::all_of(set.cbegin(), set.cend(), std::bind(&PathExistsInType, std::placeholders::_1, std::cref(*itemType)));
+bool TUniqueConstraintNode::IsApplicableToType(const TTypeAnnotationNode& type) const {
+    const auto& itemType = GetSeqItemType(type);
+    return std::all_of(Sets_.cbegin(), Sets_.cend(), [&itemType](const TSetType& set) {
+        return std::all_of(set.cbegin(), set.cend(), std::bind(&GetSubTypeByPath, std::placeholders::_1, std::cref(itemType)));
     });
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-TPartOfUniqueConstraintNode::TPartOfUniqueConstraintNode(TExprContext& ctx, TMapType&& mapping)
+template<class TOriginalConstraintNode>
+TPartOfConstraintNode<TOriginalConstraintNode>::TPartOfConstraintNode(TExprContext& ctx, TMapType&& mapping)
     : TConstraintNode(ctx, Name()), Mapping_(std::move(mapping))
 {
     YQL_ENSURE(!Mapping_.empty());
@@ -688,26 +713,29 @@ TPartOfUniqueConstraintNode::TPartOfUniqueConstraintNode(TExprContext& ctx, TMap
     }
 }
 
-TPartOfUniqueConstraintNode::TPartOfUniqueConstraintNode(TPartOfUniqueConstraintNode&& constr) = default;
+template<class TOriginalConstraintNode>
+TPartOfConstraintNode<TOriginalConstraintNode>::TPartOfConstraintNode(TPartOfConstraintNode&& constr) = default;
 
-bool TPartOfUniqueConstraintNode::Equals(const TConstraintNode& node) const {
+template<class TOriginalConstraintNode>
+bool TPartOfConstraintNode<TOriginalConstraintNode>::Equals(const TConstraintNode& node) const {
     if (this == &node) {
         return true;
     }
     if (GetHash() != node.GetHash()) {
         return false;
     }
-    if (const auto c = dynamic_cast<const TPartOfUniqueConstraintNode*>(&node)) {
+    if (const auto c = dynamic_cast<const TPartOfConstraintNode*>(&node)) {
         return Mapping_ == c->Mapping_;
     }
     return false;
 }
 
-bool TPartOfUniqueConstraintNode::Includes(const TConstraintNode& node) const {
+template<class TOriginalConstraintNode>
+bool TPartOfConstraintNode<TOriginalConstraintNode>::Includes(const TConstraintNode& node) const {
     if (this == &node) {
         return true;
     }
-    if (const auto c = dynamic_cast<const TPartOfUniqueConstraintNode*>(&node)) {
+    if (const auto c = dynamic_cast<const TPartOfConstraintNode*>(&node)) {
         for (const auto& part : c->Mapping_) {
             if (const auto it = Mapping_.find(part.first); Mapping_.cend() != it) {
                 for (const auto& pair : part.second) {
@@ -723,41 +751,28 @@ bool TPartOfUniqueConstraintNode::Includes(const TConstraintNode& node) const {
     return false;
 }
 
-void TPartOfUniqueConstraintNode::Out(IOutputStream& out) const {
+template<class TOriginalConstraintNode>
+void TPartOfConstraintNode<TOriginalConstraintNode>::Out(IOutputStream& out) const {
     TConstraintNode::Out(out);
     out.Write('(');
-
     bool first = true;
     for (const auto& part : Mapping_) {
         for (const auto& item : part.second) {
-            if (!first) {
+            if (first)
+                first = false;
+            else
                 out.Write(',');
-            }
-            if (!item.first.empty()) {
-                auto it = item.first.cbegin();
-                out.Write(*it);
-                while (item.first.cend() > ++it) {
-                    out.Write('#');
-                    out.Write(*it);
-                }
-            }
-            out.Write(':');
-            if (!item.second.empty()) {
-                auto it = item.second.cbegin();
-                out.Write(*it);
-                while (item.second.cend() > ++it) {
-                    out.Write('#');
-                    out.Write(*it);
-                }
-            }
 
-            first = false;
+            out << item.first;
+            out.Write(':');
+            out << item.second;
         }
     }
     out.Write(')');
 }
 
-void TPartOfUniqueConstraintNode::ToJson(NJson::TJsonWriter& out) const {
+template<class TOriginalConstraintNode>
+void TPartOfConstraintNode<TOriginalConstraintNode>::ToJson(NJson::TJsonWriter& out) const {
     out.OpenMap();
     for (const auto& part : Mapping_) {
         for (const auto& [resultColumn, originalColumn] : part.second) {
@@ -767,7 +782,9 @@ void TPartOfUniqueConstraintNode::ToJson(NJson::TJsonWriter& out) const {
     out.CloseMap();
 }
 
-const TPartOfUniqueConstraintNode* TPartOfUniqueConstraintNode::ExtractField(TExprContext& ctx, const std::string_view& field) const {
+template<class TOriginalConstraintNode>
+const TPartOfConstraintNode<TOriginalConstraintNode>*
+TPartOfConstraintNode<TOriginalConstraintNode>::ExtractField(TExprContext& ctx, const std::string_view& field) const {
     TMapType passtrought;
     for (const auto& part : Mapping_) {
         auto it = part.second.lower_bound(TPathType(1U, field));
@@ -786,10 +803,12 @@ const TPartOfUniqueConstraintNode* TPartOfUniqueConstraintNode::ExtractField(TEx
             passtrought.emplace(part.first, std::move(mapping));
         }
     }
-    return passtrought.empty() ? nullptr : ctx.MakeConstraint<TPartOfUniqueConstraintNode>(std::move(passtrought));
+    return passtrought.empty() ? nullptr : ctx.MakeConstraint<TPartOfConstraintNode>(std::move(passtrought));
 }
 
-const TPartOfUniqueConstraintNode* TPartOfUniqueConstraintNode::FilterFields(TExprContext& ctx, const std::function<bool(const TPathType& front)>& predicate) const {
+template<class TOriginalConstraintNode>
+const TPartOfConstraintNode<TOriginalConstraintNode>*
+TPartOfConstraintNode<TOriginalConstraintNode>::FilterFields(TExprContext& ctx, const TPathFilter& predicate) const {
     auto mapping = Mapping_;
     for (auto part = mapping.begin(); mapping.end() != part;) {
         for (auto it = part->second.cbegin(); part->second.cend() != it;) {
@@ -804,10 +823,33 @@ const TPartOfUniqueConstraintNode* TPartOfUniqueConstraintNode::FilterFields(TEx
         else
             ++part;
     }
-    return mapping.empty() ? nullptr : ctx.MakeConstraint<TPartOfUniqueConstraintNode>(std::move(mapping));
+    return mapping.empty() ? nullptr : ctx.MakeConstraint<TPartOfConstraintNode>(std::move(mapping));
 }
 
-TPartOfUniqueConstraintNode::TMapType TPartOfUniqueConstraintNode::GetColumnMapping(const std::string_view& asField) const {
+template<class TOriginalConstraintNode>
+const TPartOfConstraintNode<TOriginalConstraintNode>*
+TPartOfConstraintNode<TOriginalConstraintNode>::RenameFields(TExprContext& ctx, const TPathReduce& rename) const {
+    auto mapping = Mapping_;
+    for (auto part = mapping.begin(); mapping.end() != part;) {
+        TPartType old;
+        part->second.swap(old);
+        for (auto& item : std::move(old)) {
+            for (auto& path : rename(item.first)) {
+                part->second.insert_unique(std::make_pair(std::move(path), std::move(item.second)));
+            }
+        }
+
+        if (part->second.empty())
+            part = mapping.erase(part);
+        else
+            ++part;
+    }
+    return mapping.empty() ? nullptr : ctx.MakeConstraint<TPartOfConstraintNode>(std::move(mapping));
+}
+
+template<class TOriginalConstraintNode>
+typename TPartOfConstraintNode<TOriginalConstraintNode>::TMapType
+TPartOfConstraintNode<TOriginalConstraintNode>::GetColumnMapping(const std::string_view& asField) const {
     auto mapping = Mapping_;
     if (!asField.empty()) {
         for (auto& item : mapping) {
@@ -819,19 +861,21 @@ TPartOfUniqueConstraintNode::TMapType TPartOfUniqueConstraintNode::GetColumnMapp
     return mapping;
 }
 
-const TPartOfUniqueConstraintNode* TPartOfUniqueConstraintNode::MakeCommon(const std::vector<const TConstraintSet*>& constraints, TExprContext& ctx) {
+template<class TOriginalConstraintNode>
+const TPartOfConstraintNode<TOriginalConstraintNode>*
+TPartOfConstraintNode<TOriginalConstraintNode>::MakeCommon(const std::vector<const TConstraintSet*>& constraints, TExprContext& ctx) {
     if (constraints.empty()) {
         return nullptr;
     }
 
     if (constraints.size() == 1) {
-        return constraints.front()->GetConstraint<TPartOfUniqueConstraintNode>();
+        return constraints.front()->GetConstraint<TPartOfConstraintNode>();
     }
 
     bool first = true;
-    TPartOfUniqueConstraintNode::TMapType mapping;
+    TMapType mapping;
     for (size_t i = 0; i < constraints.size(); ++i) {
-        auto part = constraints[i]->GetConstraint<TPartOfUniqueConstraintNode>();
+        auto part = constraints[i]->GetConstraint<TPartOfConstraintNode>();
         if (!part) {
             if (constraints[i]->GetConstraint<TEmptyConstraintNode>()) {
                 continue;
@@ -844,12 +888,12 @@ const TPartOfUniqueConstraintNode* TPartOfUniqueConstraintNode::MakeCommon(const
         } else {
             for (const auto& nextMapping : part->GetColumnMapping()) {
                 if (const auto it = mapping.find(nextMapping.first); mapping.cend() != it) {
-                    TPartOfUniqueConstraintNode::TPartType result;
+                    TPartType result;
                     std::set_intersection(
                         it->second.cbegin(), it->second.cend(),
                         nextMapping.second.cbegin(), nextMapping.second.cend(),
                         std::back_inserter(result),
-                        [] (const TPartOfUniqueConstraintNode::TPartType::value_type& c1, const TPartOfUniqueConstraintNode::TPartType::value_type& c2) {
+                        [] (const TPartOfConstraintNode<TOriginalConstraintNode>::TPartType::value_type& c1, const TPartOfConstraintNode<TOriginalConstraintNode>::TPartType::value_type& c2) {
                             return c1 < c2;
                         }
                     );
@@ -865,15 +909,18 @@ const TPartOfUniqueConstraintNode* TPartOfUniqueConstraintNode::MakeCommon(const
         }
     }
 
-    return mapping.empty() ? nullptr : ctx.MakeConstraint<TPartOfUniqueConstraintNode>(std::move(mapping));
+    return mapping.empty() ? nullptr : ctx.MakeConstraint<TPartOfConstraintNode>(std::move(mapping));
 }
 
-const TPartOfUniqueConstraintNode::TMapType& TPartOfUniqueConstraintNode::GetColumnMapping() const {
+template<class TOriginalConstraintNode>
+const typename TPartOfConstraintNode<TOriginalConstraintNode>::TMapType&
+TPartOfConstraintNode<TOriginalConstraintNode>::GetColumnMapping() const {
     return Mapping_;
 }
 
-TPartOfUniqueConstraintNode::TMapType
-TPartOfUniqueConstraintNode::GetCommonMapping(const TUniqueConstraintNode* complete, const TPartOfUniqueConstraintNode* incomplete, const std::string_view& field) {
+template<class TOriginalConstraintNode>
+typename TPartOfConstraintNode<TOriginalConstraintNode>::TMapType
+TPartOfConstraintNode<TOriginalConstraintNode>::GetCommonMapping(const TOriginalConstraintNode* complete, const TPartOfConstraintNode* incomplete, const std::string_view& field) {
     TMapType mapping;
     if (incomplete) {
         mapping = incomplete->GetColumnMapping();
@@ -900,7 +947,8 @@ TPartOfUniqueConstraintNode::GetCommonMapping(const TUniqueConstraintNode* compl
     return mapping;
 }
 
-void TPartOfUniqueConstraintNode::UniqueMerge(TMapType& output, TMapType&& input) {
+template<class TOriginalConstraintNode>
+void TPartOfConstraintNode<TOriginalConstraintNode>::UniqueMerge(TMapType& output, TMapType&& input) {
     output.merge(std::move(input));
     while (!input.empty()) {
         const auto exists = input.extract(input.cbegin());
@@ -911,24 +959,9 @@ void TPartOfUniqueConstraintNode::UniqueMerge(TMapType& output, TMapType&& input
     }
 }
 
-void TPartOfUniqueConstraintNode::FilterFields(TMapType& mapping, const std::function<bool(const std::string_view& front)>& predicate) {
-    for (auto part = mapping.begin(); mapping.end() != part;) {
-        for (auto it = part->second.cbegin(); part->second.cend() != it;) {
-            if (it->first.empty() || !predicate(it->first.front()))
-                it = part->second.erase(it);
-            else
-                ++it;
-        }
-
-        if (part->second.empty())
-            part = mapping.erase(part);
-        else
-            ++part;
-    }
-}
-
-TPartOfUniqueConstraintNode::TMapType
-TPartOfUniqueConstraintNode::ExtractField(const TMapType& mapping, const std::string_view& field) {
+template<class TOriginalConstraintNode>
+typename TPartOfConstraintNode<TOriginalConstraintNode>::TMapType
+TPartOfConstraintNode<TOriginalConstraintNode>::ExtractField(const TMapType& mapping, const std::string_view& field) {
     TMapType parts;
     for (const auto& part : mapping) {
         auto it = part.second.lower_bound(TPathType(1U, field));
@@ -950,39 +983,27 @@ TPartOfUniqueConstraintNode::ExtractField(const TMapType& mapping, const std::st
     return parts;
 }
 
-const TUniqueConstraintNode* TPartOfUniqueConstraintNode::MakeComplete(TExprContext& ctx, const TMapType& mapping, const TUniqueConstraintNode* original) {
+template<class TOriginalConstraintNode>
+const TOriginalConstraintNode*
+TPartOfConstraintNode<TOriginalConstraintNode>::MakeComplete(TExprContext& ctx, const TMapType& mapping, const TOriginalConstraintNode* original) {
     if (const auto it = mapping.find(original); mapping.cend() != it) {
-        TUniqueConstraintNode::TFullSetType newSets;
-        for (const auto& set : it->first->GetAllSets()) {
-            TReversePartType reverseMap;
-            reverseMap.reserve(it->second.size());
-            for (const auto& map : it->second)
-                reverseMap[map.second].insert_unique(map.first);
+        TReversePartType reverseMap;
+        reverseMap.reserve(it->second.size());
+        for (const auto& map : it->second)
+            reverseMap[map.second].insert_unique(map.first);
 
-            if (std::all_of(set.cbegin(), set.cend(), [reverseMap] (const TPathType& path) { return reverseMap.contains(path); })) {
-                TUniqueConstraintNode::TFullSetType addSets = {TUniqueConstraintNode::TSetType()};
-                for (const auto& old : set) {
-                    const auto& renamed = reverseMap[old];
-                    TUniqueConstraintNode::TFullSetType incSets;
-                    for (auto s = addSets.begin(); addSets.end() != s; s = addSets.erase(s)) {
-                        for (const auto& item : renamed) {
-                            auto newSet = std::move(*s);
-                            newSet.insert_unique(item);
-                            incSets.insert_unique(std::move(newSet));
-                        }
-                    }
-                    incSets.swap(addSets);
-                }
-                newSets.insert(addSets.cbegin(), addSets.cend());
-            }
-        }
+        const auto rename = [&](const TPathType& path) {
+            const auto& set = reverseMap[path];
+            return std::vector<TPathType>(set.cbegin(), set.cend());
+        };
 
-        if (!newSets.empty())
-            return ctx.MakeConstraint<TUniqueConstraintNode>(std::move(newSets));
+        return it->first->RenameFields(ctx, rename);
     }
 
     return nullptr;
 }
+
+template class TPartOfConstraintNode<TUniqueConstraintNode>;
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1594,6 +1615,22 @@ const TMultiConstraintNode* TMultiConstraintNode::MakeCommon(const std::vector<c
 } // namespace NYql
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<>
+void Out<NYql::TConstraintNode::TPathType>(IOutputStream& out, const NYql::TConstraintNode::TPathType& path) {
+    if (path.empty())
+        out.Write('/');
+    else {
+        bool first = true;
+        for (const auto& c : path) {
+            if (first)
+                first = false;
+            else
+                out.Write('/');
+            out.Write(c);
+        }
+    }
+}
 
 template<>
 void Out<NYql::TConstraintNode>(IOutputStream& out, const NYql::TConstraintNode& c) {

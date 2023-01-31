@@ -20,7 +20,7 @@ struct TEvKqpExecuter {
         NKikimrKqp::TEvExecuterTxResponse Record;
         TTxAllocatorState::TPtr AllocState;
         NLongTxService::TLockHandle LockHandle;
-        TVector<NKikimrMiniKQL::TResult> MkqlResults_;
+        TVector<TKqpPhyTxHolder::TConstPtr> TxHolders;
         TVector<TKqpExecuterTxResult> TxResults;
 
         NLWTrace::TOrbit Orbit;
@@ -33,8 +33,9 @@ struct TEvKqpExecuter {
 
         ~TEvTxResponse();
 
+        TVector<TKqpPhyTxHolder::TConstPtr>& GetTxHolders() { return TxHolders; }
         TVector<TKqpExecuterTxResult>& GetTxResults() { return TxResults; }
-        void InitTxResult(const NKqpProto::TKqpPhyTx& tx);
+        void InitTxResult(const TKqpPhyTxHolder::TConstPtr& tx);
         void TakeResult(ui32 idx, NKikimr::NMiniKQL::TUnboxedValueVector& rows);
         void TakeResult(ui32 idx, const NYql::NDqProto::TData& rows);
 
@@ -83,7 +84,7 @@ struct TEvKqpExecuter {
 };
 
 IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
-    const TMaybe<TString>& userToken, TKqpRequestCounters::TPtr counters);
+    const TMaybe<TString>& userToken, TKqpRequestCounters::TPtr counters, const NKikimrConfig::TTableServiceConfig::TAggregationConfig& aggregation);
 
 std::unique_ptr<TEvKqpExecuter::TEvTxResponse> ExecutePure(
     IKqpGateway::TExecPhysicalRequest&& request, TKqpRequestCounters::TPtr counters, TActorId owner);

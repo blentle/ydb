@@ -133,6 +133,8 @@ class TUpsertActor : public TActorBootstrapped<TUpsertActor> {
     TString ConfingString;
 
     TActorId Pipe;
+    bool WasConnected = false;
+    ui64 ReconnectLimit = 10;
 
     TRequestsVector Requests;
     size_t CurrentRequest = 0;
@@ -185,6 +187,12 @@ public:
 private:
     void Connect(const TActorContext &ctx) {
         LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Id# " << Id << " TUpsertActor Connect called");
+        --ReconnectLimit;
+        if (ReconnectLimit == 0) {
+            TStringStream ss;
+            ss << "Failed to set pipe to " << Target.GetTabletId();
+            return StopWithError(ctx, ss.Str());
+        }
         Pipe = Register(NTabletPipe::CreateClient(SelfId(), Target.GetTabletId()));
     }
 
@@ -195,34 +203,63 @@ private:
             << " TUpsertActor Handle TEvClientConnected called, Status# " << msg->Status);
 
         if (msg->Status != NKikimrProto::OK) {
-            TStringStream ss;
-            ss << "Failed to connect to " << Target.GetTabletId() << ", status: " << msg->Status;
-            StopWithError(ctx, ss.Str());
-            return;
+            Pipe = {};
+            return Connect(ctx);
         }
 
         StartTs = TInstant::Now();
+        WasConnected = true;
         SendRows(ctx);
     }
 
     void Handle(TEvTabletPipe::TEvClientDestroyed::TPtr, const TActorContext& ctx) {
         LOG_DEBUG_S(ctx, NKikimrServices::DS_LOAD_TEST, "Id# " << Id
             << " TUpsertActor Handle TEvClientDestroyed called");
-        StopWithError(ctx, "broken pipe");
+
+        // sanity check
+        if (!WasConnected) {
+            return Connect(ctx);
+        }
+
+        return StopWithError(ctx, "broken pipe");
     }
 
     void SendRows(const TActorContext &ctx) {
         while (Inflight < Config.GetInflight() && CurrentRequest < Requests.size()) {
             const auto* request = Requests[CurrentRequest].get();
-            LOG_TRACE_S(ctx, NKikimrServices::DS_LOAD_TEST, "Id# " << Id
-                << "TUpsertActor# " << Id << " send request# " << CurrentRequest << ": " << request->ToString());
-            NTabletPipe::SendData(ctx, Pipe, Requests[CurrentRequest].release());
+            LOG_TRACE_S(ctx, NKikimrServices::DS_LOAD_TEST, "TUpsertActor# " << Id
+                << " send request# " << CurrentRequest << ": " << request->ToString());
+
+            if (!Config.GetInfinite()) {
+                NTabletPipe::SendData(ctx, Pipe, Requests[CurrentRequest].release());
+            } else {
+                switch (RequestType) {
+                case ERequestType::UpsertBulk: {
+                    const auto& casted = static_cast<const TEvDataShard::TEvUploadRowsRequest*>(request);
+                    auto requestCopy = std::make_unique<TEvDataShard::TEvUploadRowsRequest>();
+                    requestCopy->Record = casted->Record;
+                    NTabletPipe::SendData(ctx, Pipe, requestCopy.release());
+                    break;
+                } case ERequestType::UpsertLocalMkql: {
+                    const auto& casted = static_cast<const TEvTablet::TEvLocalMKQL*>(request);
+                    auto requestCopy = std::make_unique<TEvTablet::TEvLocalMKQL>();
+                    requestCopy->Record = casted->Record;
+                    NTabletPipe::SendData(ctx, Pipe, requestCopy.release());
+                    break;
+                }
+                }
+            }
+
             ++CurrentRequest;
             ++Inflight;
         }
     }
 
     void OnRequestDone(const TActorContext& ctx) {
+        if (Config.GetInfinite() && CurrentRequest >= Requests.size()) {
+            CurrentRequest = 0;
+        }
+
         if (CurrentRequest < Requests.size()) {
             SendRows(ctx);
         } else if (Inflight == 0) {

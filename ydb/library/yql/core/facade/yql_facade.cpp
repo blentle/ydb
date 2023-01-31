@@ -553,7 +553,7 @@ TProgram::TFutureStatus TProgram::DiscoverAsync(const TString& username) {
     }
 
     return openSession.Apply([this](const TFuture<void>& f) {
-        YQL_LOG_CTX_ROOT_SCOPE(GetSessionId());
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(GetSessionId());
         try {
             f.GetValue();
         } catch (const std::exception& e) {
@@ -608,7 +608,7 @@ TProgram::TFutureStatus TProgram::ValidateAsync(const TString& username, IOutput
     SavedExprRoot_ = ExprRoot_;
 
     return openSession.Apply([this](const TFuture<void>& f) {
-        YQL_LOG_CTX_ROOT_SCOPE(GetSessionId());
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(GetSessionId());
         try {
             f.GetValue();
         } catch (const std::exception& e) {
@@ -680,7 +680,7 @@ TProgram::TFutureStatus TProgram::OptimizeAsync(
         return NThreading::MakeFuture<TStatus>(IGraphTransformer::TStatus::Error);
 
     return openSession.Apply([this](const TFuture<void>& f) {
-        YQL_LOG_CTX_ROOT_SCOPE(GetSessionId());
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(GetSessionId());
         try {
             f.GetValue();
         } catch (const std::exception& e) {
@@ -751,7 +751,7 @@ TProgram::TFutureStatus TProgram::OptimizeAsyncWithConfig(
     SavedExprRoot_ = ExprRoot_;
 
     return openSession.Apply([this](const TFuture<void>& f) {
-        YQL_LOG_CTX_ROOT_SCOPE(GetSessionId());
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(GetSessionId());
         try {
             f.GetValue();
         } catch (const std::exception& e) {
@@ -833,7 +833,7 @@ TProgram::TFutureStatus TProgram::RunAsync(
     SavedExprRoot_ = ExprRoot_;
 
     return openSession.Apply([this](const TFuture<void>& f) {
-        YQL_LOG_CTX_ROOT_SCOPE(GetSessionId());
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(GetSessionId());
         try {
             f.GetValue();
         } catch (const std::exception& e) {
@@ -905,7 +905,7 @@ TProgram::TFutureStatus TProgram::RunAsyncWithConfig(
     SavedExprRoot_ = ExprRoot_;
 
     return openSession.Apply([this](const TFuture<void>& f) {
-        YQL_LOG_CTX_ROOT_SCOPE(GetSessionId());
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(GetSessionId());
         try {
             f.GetValue();
         } catch (const std::exception& e) {
@@ -933,6 +933,7 @@ TFuture<IGraphTransformer::TStatus> TProgram::AsyncTransformWithFallback(bool ap
             auto issues = ExprCtx_->IssueManager.GetIssues();
             bool hasDqGatewayError = false;
             bool hasDqGatewayFallbackError = false;
+            bool hasDqOptimizeError = false;
 
             auto checkIssue = [&](const TIssue& issue) {
                 if (issue.GetCode() == TIssuesIds::DQ_GATEWAY_ERROR) {
@@ -942,6 +943,9 @@ TFuture<IGraphTransformer::TStatus> TProgram::AsyncTransformWithFallback(bool ap
                     YQL_LOG(DEBUG) << "Gateway Fallback Error " << issue;
                     hasDqGatewayError = true;
                     hasDqGatewayFallbackError = true;
+                } else if (issue.GetCode() == TIssuesIds::DQ_OPTIMIZE_ERROR) {
+                    YQL_LOG(DEBUG) << "Optimize Error " << issue;
+                    hasDqOptimizeError = true;
                 }
             };
 
@@ -952,7 +956,7 @@ TFuture<IGraphTransformer::TStatus> TProgram::AsyncTransformWithFallback(bool ap
                 }
             };
 
-            std::function<void(const TIssuePtr& issue)> toWarning = [&](const TIssuePtr& issue) {
+            std::function<void(const TIssuePtr& issue)> toInfo = [&](const TIssuePtr& issue) {
                 if (issue->Severity == TSeverityIds::S_ERROR
                     || issue->Severity == TSeverityIds::S_FATAL
                     || issue->Severity == TSeverityIds::S_WARNING)
@@ -960,7 +964,7 @@ TFuture<IGraphTransformer::TStatus> TProgram::AsyncTransformWithFallback(bool ap
                     issue->Severity = TSeverityIds::S_INFO;
                 }
                 for (const auto& subissue : issue->GetSubIssues()) {
-                    toWarning(subissue);
+                    toInfo(subissue);
                 }
             };
 
@@ -993,9 +997,9 @@ TFuture<IGraphTransformer::TStatus> TProgram::AsyncTransformWithFallback(bool ap
             }
             CleanupLastSession();
 
-            if (hasDqGatewayError) {
-                TIssue warning("DQ cannot execute the query");
-                warning.Severity = TSeverityIds::S_INFO;
+            if (hasDqGatewayError || hasDqOptimizeError) {
+                TIssue info("DQ cannot execute the query");
+                info.Severity = TSeverityIds::S_INFO;
 
                 for (auto& issue : issues) {
                     TIssuePtr newIssue = new TIssue(issue);
@@ -1006,12 +1010,12 @@ TFuture<IGraphTransformer::TStatus> TProgram::AsyncTransformWithFallback(bool ap
                         newIssue->Severity = TSeverityIds::S_INFO;
                     }
                     for (auto& subissue : newIssue->GetSubIssues()) {
-                        toWarning(subissue);
+                        toInfo(subissue);
                     }
-                    warning.AddSubIssue(newIssue);
+                    info.AddSubIssue(newIssue);
                 }
 
-                ExprCtx_->IssueManager.AddIssues({warning});
+                ExprCtx_->IssueManager.AddIssues({info});
             }
 
             FallbackCounter ++;
@@ -1236,7 +1240,7 @@ TMaybe<TString> TProgram::GetDiscoveredData() {
 }
 
 TProgram::TFutureStatus TProgram::ContinueAsync() {
-    YQL_LOG_CTX_ROOT_SCOPE(GetSessionId());
+    YQL_LOG_CTX_ROOT_SESSION_SCOPE(GetSessionId());
     return AsyncTransformWithFallback(true);
 }
 
@@ -1246,7 +1250,7 @@ void TProgram::Abort()
 }
 
 void TProgram::CleanupLastSession() {
-    YQL_LOG_CTX_ROOT_SCOPE(GetSessionId());
+    YQL_LOG_CTX_ROOT_SESSION_SCOPE(GetSessionId());
 
     TString sessionId = GetSessionId();
     if (sessionId.empty()) {
@@ -1261,7 +1265,7 @@ void TProgram::CleanupLastSession() {
 }
 
 void TProgram::CloseLastSession() {
-    YQL_LOG_CTX_ROOT_SCOPE(GetSessionId());
+    YQL_LOG_CTX_ROOT_SESSION_SCOPE(GetSessionId());
 
     TString sessionId = TakeSessionId();
     if (sessionId.empty()) {

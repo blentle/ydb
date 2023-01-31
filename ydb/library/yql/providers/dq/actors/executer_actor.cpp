@@ -82,7 +82,7 @@ private:
         HFunc(TEvQueryResponse, OnQueryResponse);
         // execution timeout
         cFunc(TEvents::TEvBootstrap::EventType, [this]() {
-            YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+            YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
             YQL_CLOG(DEBUG, ProviderDq) << "Execution timeout";
             auto issue = TIssue("Execution timeout");
             issue.SetCode(TIssuesIds::DQ_GATEWAY_NEED_FALLBACK_ERROR, TSeverityIds::S_ERROR);
@@ -129,7 +129,7 @@ private:
     }
 
     void OnGraph(TEvGraphRequest::TPtr& ev, const NActors::TActorContext&) {
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         Y_VERIFY(!ControlId);
         Y_VERIFY(!ResultId);
         YQL_CLOG(DEBUG, ProviderDq) << "TDqExecuter::OnGraph";
@@ -140,11 +140,9 @@ private:
         });
         ControlId = NActors::ActorIdFromProto(ev->Get()->Record.GetControlId());
         ResultId = NActors::ActorIdFromProto(ev->Get()->Record.GetResultId());
-        CheckPointCoordinatorId = NActors::ActorIdFromProto(ev->Get()->Record.GetCheckPointCoordinatorId());
         // These actors will be killed at exit.
         AddChild(ControlId);
         AddChild(ResultId);
-        AddChild(CheckPointCoordinatorId);
 
         int workerCount = ev->Get()->Record.GetRequest().GetTask().size();
         const bool enableComputeActor = Settings->EnableComputeActor.Get().GetOrElse(false);
@@ -264,7 +262,7 @@ private:
 
     void OnFailure(TEvDqFailure::TPtr& ev, const NActors::TActorContext&) {
         if (!Finished) {
-            YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+            YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
             YQL_CLOG(DEBUG, ProviderDq) << __FUNCTION__
                             << ", status=" << static_cast<int>(ev->Get()->Record.GetStatusCode())
                             << ", issues size=" << ev->Get()->Record.IssuesSize()
@@ -282,7 +280,7 @@ private:
     }
 
     void OnGraphFinished(TEvGraphFinished::TPtr&, const NActors::TActorContext&) {
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         YQL_CLOG(DEBUG, ProviderDq) << __FUNCTION__;
         if (!Finished) {
             try {
@@ -299,14 +297,14 @@ private:
     // TBD: wait for PoisonTaken from CheckPointCoordinator before send TEvQueryResponse to PrinterId
 
     void OnQueryResponse(TEvQueryResponse::TPtr& ev, const TActorContext&) {
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         YQL_CLOG(DEBUG, ProviderDq) << __FUNCTION__ << " status=" << static_cast<int>(ev->Get()->Record.GetStatusCode()) << " issuses_size=" << ev->Get()->Record.IssuesSize();
         Send(PrinterId, ev->Release().Release());
         PassAway();
     }
 
     void OnDqStats(TEvDqStats::TPtr& ev) {
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         YQL_CLOG(DEBUG, ProviderDq) << __FUNCTION__;
         Send(PrinterId, ev->Release().Release());
     }
@@ -316,7 +314,7 @@ private:
     }
 
     void OnAllocateWorkersResponse(TEvAllocateWorkersResponse::TPtr& ev, const NActors::TActorContext&) {
-        YQL_LOG_CTX_ROOT_SCOPE(TraceId);
+        YQL_LOG_CTX_ROOT_SESSION_SCOPE(TraceId);
         YQL_CLOG(DEBUG, ProviderDq) << "TDqExecuter::TEvAllocateWorkersResponse";
 
         AddCounters(ev->Get()->Record);
@@ -404,13 +402,9 @@ private:
         AllocationHistogram->Collect((ExecutionStart-StartTime).Seconds());
 
         auto readyState1 = res->Record;
-        auto readyState2 = res->Record;
         Send(ControlId, res.Release());
         if (ResultId != SelfId() && ResultId != ControlId) {
             Send(ResultId, new TEvReadyState(std::move(readyState1)));
-        }
-        if (CheckPointCoordinatorId) {
-            Send(CheckPointCoordinatorId, new TEvReadyState(std::move(readyState2)));
         }
 
         if (Timeout) {
@@ -466,7 +460,6 @@ private:
 
     NActors::TActorId ControlId;
     NActors::TActorId ResultId;
-    NActors::TActorId CheckPointCoordinatorId;
     TExprNode::TPtr ExprRoot;
     THolder<IDqsExecutionPlanner> ExecutionPlanner;
     ui64 ResourceId = 0;

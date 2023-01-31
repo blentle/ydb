@@ -76,12 +76,12 @@ public:
 
     STRICT_STFUNC(Handler, {
         cFunc(NActors::TEvents::TEvPoison::EventType, TTaskRunnerActor::PassAway);
-        HFunc(TEvTaskRunnerCreate, OnDqTask);
-        HFunc(TEvContinueRun, OnContinueRun);
-        HFunc(TEvPop, OnChannelPop);
-        HFunc(TEvPush, OnChannelPush);
-        HFunc(TEvSinkPop, OnSinkPop);
-        HFunc(TEvSinkPopFinished, OnSinkPopFinished);
+        hFunc(TEvTaskRunnerCreate, OnDqTask);
+        hFunc(TEvContinueRun, OnContinueRun);
+        hFunc(TEvPop, OnChannelPop);
+        hFunc(TEvPush, OnChannelPush);
+        hFunc(TEvSinkPop, OnSinkPop);
+        hFunc(TEvSinkPopFinished, OnSinkPopFinished);
     })
 
 private:
@@ -191,30 +191,27 @@ private:
         TActor<TTaskRunnerActor>::PassAway();
     }
 
-    void OnContinueRun(TEvContinueRun::TPtr& ev, const TActorContext& ctx) {
-        Run(ev, ctx);
+    void OnContinueRun(TEvContinueRun::TPtr& ev) {
+        Run(ev);
     }
 
-    void OnChannelPush(TEvPush::TPtr& ev, const NActors::TActorContext& ctx) {
-        auto* actorSystem = ctx.ExecutorThread.ActorSystem;
+    void OnChannelPush(TEvPush::TPtr& ev) {
+        auto* actorSystem = TActivationContext::ActorSystem();
         auto replyTo = ev->Sender;
         auto selfId = SelfId();
         auto hasData = ev->Get()->HasData;
         auto finish = ev->Get()->Finish;
-        auto askFreeSpace = ev->Get()->AskFreeSpace;
         auto channelId = ev->Get()->ChannelId;
         auto cookie = ev->Cookie;
         auto data = ev->Get()->Data;
-        Invoker->Invoke([hasData, selfId, cookie, askFreeSpace, finish, channelId, taskRunner=TaskRunner, data, actorSystem, replyTo, settings=Settings, stageId=StageId] () mutable {
+        Invoker->Invoke([hasData, selfId, cookie, finish, channelId, taskRunner=TaskRunner, data, actorSystem, replyTo, settings=Settings, stageId=StageId] () mutable {
             try {
                 // todo:(whcrc) finish output channel?
                 ui64 freeSpace = 0;
                 if (hasData) {
                     // auto guard = taskRunner->BindAllocator(); // only for local mode
                     taskRunner->GetInputChannel(channelId)->Push(std::move(data));
-                    if (askFreeSpace) {
-                        freeSpace = taskRunner->GetInputChannel(channelId)->GetFreeSpace();
-                    }
+                    freeSpace = taskRunner->GetInputChannel(channelId)->GetFreeSpace();
                 }
                 if (finish) {
                     taskRunner->GetInputChannel(channelId)->Finish();
@@ -225,7 +222,7 @@ private:
                     new IEventHandle(
                         replyTo,
                         selfId,
-                        new TEvContinueRun(channelId, freeSpace),
+                        new TEvPushFinished(channelId, freeSpace),
                         /*flags=*/0,
                         cookie));
             } catch (...) {
@@ -270,7 +267,7 @@ private:
                     new IEventHandle(
                         parentId,
                         selfId,
-                        new TEvAsyncInputPushFinished(index),
+                        new TEvAsyncInputPushFinished(index, source->GetFreeSpace()),
                         /*flags=*/0,
                         cookie));
             } catch (...) {
@@ -286,8 +283,8 @@ private:
         });
     }
 
-    void OnChannelPop(TEvPop::TPtr& ev, const NActors::TActorContext& ctx) {
-        auto* actorSystem = ctx.ExecutorThread.ActorSystem;
+    void OnChannelPop(TEvPop::TPtr& ev) {
+        auto* actorSystem = TActivationContext::ActorSystem();
         auto replyTo = ev->Sender;
         auto selfId = SelfId();
         auto cookie = ev->Cookie;
@@ -358,8 +355,7 @@ private:
         });
     }
 
-    void OnSinkPopFinished(TEvSinkPopFinished::TPtr& ev, const NActors::TActorContext& ctx) {
-        Y_UNUSED(ctx);
+    void OnSinkPopFinished(TEvSinkPopFinished::TPtr& ev) {
         auto guard = TaskRunner->BindAllocator();
         NKikimr::NMiniKQL::TUnboxedValueVector batch;
         for (auto& row: ev->Get()->Strings) {
@@ -375,9 +371,9 @@ private:
             ev->Get()->Changed);
     }
 
-    void OnSinkPop(TEvSinkPop::TPtr& ev, const NActors::TActorContext& ctx) {
+    void OnSinkPop(TEvSinkPop::TPtr& ev) {
         auto selfId = SelfId();
-        auto* actorSystem = ctx.ExecutorThread.ActorSystem;
+        auto* actorSystem = TActivationContext::ActorSystem();
 
         Invoker->Invoke([taskRunner=TaskRunner, selfId, actorSystem, ev=std::move(ev), settings=Settings, stageId=StageId] {
             auto cookie = ev->Cookie;
@@ -426,7 +422,7 @@ private:
         });
     }
 
-    void OnDqTask(TEvTaskRunnerCreate::TPtr& ev, const NActors::TActorContext& ctx) {
+    void OnDqTask(TEvTaskRunnerCreate::TPtr& ev) {
         auto replyTo = ev->Sender;
         auto selfId = SelfId();
         auto cookie = ev->Cookie;
@@ -454,7 +450,7 @@ private:
             return;
         }
 
-        auto* actorSystem = ctx.ExecutorThread.ActorSystem;
+        auto* actorSystem = TActivationContext::ActorSystem();
         {
             Yql::DqsProto::TTaskMeta taskMeta;
             ev->Get()->Task.GetMeta().UnpackTo(&taskMeta);
@@ -496,8 +492,8 @@ private:
         });
     }
 
-    void Run(TEvContinueRun::TPtr& ev, const TActorContext& ctx) {
-        auto* actorSystem = ctx.ExecutorThread.ActorSystem;
+    void Run(TEvContinueRun::TPtr& ev) {
+        auto* actorSystem = TActivationContext::ActorSystem();
         auto replyTo = ev->Sender;
         auto selfId = SelfId();
         auto cookie = ev->Cookie;
@@ -514,8 +510,8 @@ private:
                 auto response = taskRunner->Run();
                 auto res = static_cast<NDq::ERunStatus>(response.GetResult());
 
-                THashMap<ui32, ui64> inputChannelFreeSpace;
-                THashMap<ui32, ui64> sourcesFreeSpace;
+                THashMap<ui32, i64> inputChannelFreeSpace;
+                THashMap<ui32, i64> sourcesFreeSpace;
                 if (res == ERunStatus::PendingInput) {
                     for (auto& channelId : inputMap) {
                         inputChannelFreeSpace[channelId] = taskRunner->GetInputChannel(channelId)->GetFreeSpace();

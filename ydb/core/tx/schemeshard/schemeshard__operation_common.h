@@ -416,7 +416,7 @@ public:
 
 
 class TDone: public TSubOperationState {
-private:
+protected:
     TOperationId OperationId;
 
     TString DebugHint() const override {
@@ -1048,9 +1048,11 @@ class TConfigurePartsAtTable: public TSubOperationState {
     static bool IsExpectedTxType(TTxState::ETxType txType) {
         switch (txType) {
         case TTxState::TxCreateCdcStreamAtTable:
-        case TTxState::TxCreateCdcStreamAtTableWithSnapshot:
+        case TTxState::TxCreateCdcStreamAtTableWithInitialScan:
         case TTxState::TxAlterCdcStreamAtTable:
+        case TTxState::TxAlterCdcStreamAtTableDropSnapshot:
         case TTxState::TxDropCdcStreamAtTable:
+        case TTxState::TxDropCdcStreamAtTableDropSnapshot:
             return true;
         default:
             return false;
@@ -1085,22 +1087,13 @@ public:
         context.SS->FillSeqNo(tx, context.SS->StartRound(*txState));
         FillNotice(pathId, tx, context);
 
-        TString txBody;
-        Y_PROTOBUF_SUPPRESS_NODISCARD tx.SerializeToString(&txBody);
-
         txState->ClearShardsInProgress();
         Y_VERIFY(txState->Shards.size());
 
         for (ui32 i = 0; i < txState->Shards.size(); ++i) {
             const auto& idx = txState->Shards[i].Idx;
             const auto datashardId = context.SS->ShardInfos[idx].TabletID;
-
-            auto ev = MakeHolder<TEvDataShard::TEvProposeTransaction>(
-                NKikimrTxDataShard::TX_KIND_SCHEME, context.SS->TabletID(), context.Ctx.SelfID,
-                ui64(OperationId.GetTxId()), txBody,
-                context.SS->SelectProcessingParams(pathId)
-            );
-
+            auto ev = context.SS->MakeDataShardProposal(pathId, OperationId, tx.SerializeAsString(), context.Ctx);
             context.OnComplete.BindMsgToPipe(OperationId, datashardId, idx, ev.Release());
         }
 
@@ -1135,9 +1128,11 @@ class TProposeAtTable: public TSubOperationState {
     static bool IsExpectedTxType(TTxState::ETxType txType) {
         switch (txType) {
         case TTxState::TxCreateCdcStreamAtTable:
-        case TTxState::TxCreateCdcStreamAtTableWithSnapshot:
+        case TTxState::TxCreateCdcStreamAtTableWithInitialScan:
         case TTxState::TxAlterCdcStreamAtTable:
+        case TTxState::TxAlterCdcStreamAtTableDropSnapshot:
         case TTxState::TxDropCdcStreamAtTable:
+        case TTxState::TxDropCdcStreamAtTableDropSnapshot:
             return true;
         default:
             return false;
@@ -1213,6 +1208,40 @@ protected:
     const TOperationId OperationId;
 
 }; // TProposeAtTable
+
+class TProposeAtTableDropSnapshot: public TProposeAtTable {
+public:
+    using TProposeAtTable::TProposeAtTable;
+
+    bool HandleReply(TEvPrivate::TEvOperationPlan::TPtr& ev, TOperationContext& context) override {
+        TProposeAtTable::HandleReply(ev, context);
+
+        const auto* txState = context.SS->FindTx(OperationId);
+        Y_VERIFY(txState);
+        const auto& pathId = txState->TargetPathId;
+
+        Y_VERIFY(context.SS->TablesWithSnapshots.contains(pathId));
+        const auto snapshotTxId = context.SS->TablesWithSnapshots.at(pathId);
+
+        auto it = context.SS->SnapshotTables.find(snapshotTxId);
+        if (it != context.SS->SnapshotTables.end()) {
+            it->second.erase(pathId);
+            if (it->second.empty()) {
+                context.SS->SnapshotTables.erase(it);
+            }
+        }
+
+        context.SS->SnapshotsStepIds.erase(snapshotTxId);
+        context.SS->TablesWithSnapshots.erase(pathId);
+
+        NIceDb::TNiceDb db(context.GetDB());
+        context.SS->PersistDropSnapshot(db, snapshotTxId, pathId);
+
+        context.SS->TabletCounters->Simple()[COUNTER_SNAPSHOTS_COUNT].Sub(1);
+        return true;
+    }
+
+}; // TProposeAtTableDropSnapshot
 
 } // NCdcStreamState
 

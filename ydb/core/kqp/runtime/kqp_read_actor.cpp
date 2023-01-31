@@ -31,6 +31,7 @@ bool IsDebugLogEnabled(const NActors::TActorSystem* actorSystem, NActors::NLog::
 
 }
 
+
 namespace NKikimr {
 namespace NKqp {
 
@@ -43,12 +44,25 @@ using namespace NKikimr::NDataShard;
 class TKqpReadActor : public TActorBootstrapped<TKqpReadActor>, public NYql::NDq::IDqComputeActorAsyncInput {
     using TBase = TActorBootstrapped<TKqpReadActor>;
 public:
+    struct TResult {
+        ui64 ShardId;
+        THolder<TEventHandle<TEvDataShard::TEvReadResult>> ReadResult;
+        TMaybe<NKikimr::NMiniKQL::TUnboxedValueVector> Batch;
+        size_t ProcessedRows = 0;
+
+        TResult(ui64 shardId, THolder<TEventHandle<TEvDataShard::TEvReadResult>> readResult)
+            : ShardId(shardId)
+            , ReadResult(std::move(readResult))
+        {
+        }
+    };
+
     struct TShardState : public TIntrusiveListItem<TShardState> {
         TSmallVec<TSerializedTableRange> Ranges;
         TSmallVec<TSerializedCellVec> Points;
 
         TOwnedCellVec LastKey;
-        ui32 FirstUnprocessedRequest = 0;
+        TMaybe<ui32> FirstUnprocessedRequest;
         TMaybe<ui32> ReadId;
         ui64 TabletId;
 
@@ -57,9 +71,9 @@ public:
 
         bool NeedResolve = false;
 
-        void CopyContinuationToken(TShardState* state) {
+        void AssignContinuationToken(TShardState* state) {
             if (state->LastKey.DataSize() != 0) {
-                LastKey = state->LastKey;
+                LastKey = std::move(state->LastKey);
             }
             FirstUnprocessedRequest = state->FirstUnprocessedRequest;
         }
@@ -97,35 +111,37 @@ public:
 
             // Absent cells mean infinity. So in prefix notation `From` should be exclusive.
             // For example x >= (Key1, Key2, +infinity) is equivalent to x > (Key1, Key2) where x is arbitrary tuple
-            if (range.From.GetCells().size() < keyColumns) {
-                fromInclusive = false;
+            if (from.size() < keyColumns) {
                 noop = range.FromInclusive;
-            } else if (range.FromInclusive) {
+                fromInclusive = false;
+            } else if (fromInclusive) {
                 // Nulls are minimum values so we should remove null padding.
                 // x >= (Key1, Key2, null) is equivalent to x >= (Key1, Key2)
-                ssize_t i = range.From.GetCells().size();
-                while (i > 0 && range.From.GetCells()[i - 1].IsNull()) {
+                ssize_t i = from.size();
+                while (i > 0 && from[i - 1].IsNull()) {
                     --i;
                     noop = false;
                 }
-                from = range.From.GetCells().subspan(0, i);
+                from = from.subspan(0, i);
             }
 
             // Absent cells mean infinity. So in prefix notation `To` should be inclusive.
             // For example x < (Key1, Key2, +infinity) is equivalent to x <= (Key1, Key2) where x is arbitrary tuple
-            if (range.To.GetCells().size() < keyColumns) {
+            if (to.size() < keyColumns) {
                 toInclusive = true;
+                noop = noop && range.ToInclusive;
+            } else if (!range.ToInclusive) {
                 // Nulls are minimum values so we should remove null padding.
                 // For example x < (Key1, Key2, null) is equivalent to x < (Key1, Key2)
-                ssize_t i = range.To.GetCells().size();
-                while (i > 0 && range.To.GetCells()[i - 1].IsNull()) {
+                ssize_t i = to.size();
+                while (i > 0 && to[i - 1].IsNull()) {
                     --i;
                     noop = false;
                 }
-                to = range.To.GetCells().subspan(0, i);
+                to = to.subspan(0, i);
             }
 
-            if (!noop) {
+            if (noop) {
                 return;
             }
 
@@ -134,7 +150,8 @@ public:
 
         void FillUnprocessedRanges(
             TVector<TSerializedTableRange>& result,
-            TConstArrayRef<NScheme::TTypeInfo> keyTypes) const
+            TConstArrayRef<NScheme::TTypeInfo> keyTypes,
+            bool reverse) const
         {
             // Form new vector. Skip ranges already read.
             bool lastKeyEmpty = LastKey.DataSize() == 0;
@@ -143,32 +160,50 @@ public:
                 YQL_ENSURE(keyTypes.size() == LastKey.size(), "Key columns size != last key");
             }
 
-            auto rangeIt = Ranges.begin() + FirstUnprocessedRequest;
+            if (reverse) {
+                auto rangeIt = Ranges.begin() + FirstUnprocessedRequest.GetOrElse(Ranges.size());
 
-            if (!lastKeyEmpty) {
-                // It is range, where read was interrupted. Restart operation from last read key.
-                result.emplace_back(std::move(TSerializedTableRange(
-                    TSerializedCellVec::Serialize(LastKey), rangeIt->To.GetBuffer(), false, rangeIt->ToInclusive
-                    )));
-                ++rangeIt;
+                if (!lastKeyEmpty) {
+                    // It is range, where read was interrupted. Restart operation from last read key.
+                    result.emplace_back(std::move(TSerializedTableRange(
+                        rangeIt->From.GetBuffer(), TSerializedCellVec::Serialize(LastKey), rangeIt->ToInclusive, false
+                        )));
+                }
+                result.insert(result.begin(), Ranges.begin(), rangeIt);
+            } else {
+                auto rangeIt = Ranges.begin() + FirstUnprocessedRequest.GetOrElse(0);
+
+                if (!lastKeyEmpty) {
+                    // It is range, where read was interrupted. Restart operation from last read key.
+                    result.emplace_back(std::move(TSerializedTableRange(
+                        TSerializedCellVec::Serialize(LastKey), rangeIt->To.GetBuffer(), false, rangeIt->ToInclusive
+                        )));
+                    ++rangeIt;
+                }
+
+                // And push all others
+                result.insert(result.end(), rangeIt, Ranges.end());
             }
-
-            // And push all others
-            result.insert(result.end(), rangeIt, Ranges.end());
             for (auto& range : result) {
                 MakePrefixRange(range, keyTypes.size());
             }
         }
 
-        void FillUnprocessedPoints(TVector<TSerializedCellVec>& result) const {
-            result.insert(result.begin(), Points.begin() + FirstUnprocessedRequest, Points.end());
+        void FillUnprocessedPoints(TVector<TSerializedCellVec>& result, bool reverse) const {
+            if (reverse) {
+                auto it = FirstUnprocessedRequest ? Points.begin() + *FirstUnprocessedRequest + 1 : Points.end();
+                result.insert(result.begin(), Points.begin(), it);
+            } else {
+                auto it = FirstUnprocessedRequest ? Points.begin() + *FirstUnprocessedRequest : Points.begin();
+                result.insert(result.begin(), it, Points.end());
+            }
         }
 
-        void FillEvRead(TEvDataShard::TEvRead& ev, TConstArrayRef<NScheme::TTypeInfo> keyTypes) {
+        void FillEvRead(TEvDataShard::TEvRead& ev, TConstArrayRef<NScheme::TTypeInfo> keyTypes, bool reversed) {
             if (Ranges.empty()) {
-                FillUnprocessedPoints(ev.Keys);
+                FillUnprocessedPoints(ev.Keys, reversed);
             } else {
-                FillUnprocessedRanges(ev.Ranges, keyTypes);
+                FillUnprocessedRanges(ev.Ranges, keyTypes, reversed);
             }
         }
 
@@ -240,8 +275,15 @@ public:
         );
 
         KeyColumnTypes.reserve(Settings.GetKeyColumnTypes().size());
-        for (auto typeId : Settings.GetKeyColumnTypes()) {
-            KeyColumnTypes.push_back(NScheme::TTypeInfo((NScheme::TTypeId)typeId));
+        for (size_t i = 0; i < Settings.KeyColumnTypesSize(); ++i) {
+            auto typeId = Settings.GetKeyColumnTypes(i);
+            KeyColumnTypes.push_back(
+                NScheme::TTypeInfo(
+                    (NScheme::TTypeId)typeId,
+                    (typeId == NScheme::NTypeIds::Pg) ?
+                        NPg::TypeDescFromPgTypeId(
+                            Settings.GetKeyColumnTypeInfos(i).GetPgTypeId()
+                        ) : nullptr));
         }
     }
 
@@ -298,9 +340,15 @@ public:
                 CA_LOG_D("BEFORE: " << PendingShards.Size() << "." << RunningReads());
                 isFirst = false;
             }
-            auto state = THolder<TShardState>(PendingShards.PopFront());
-            InFlightShards.PushFront(state.Get());
-            StartRead(state.Release());
+            if (Settings.GetReverse()) {
+                auto state = THolder<TShardState>(PendingShards.PopBack());
+                InFlightShards.PushBack(state.Get());
+                StartRead(state.Release());
+            } else {
+                auto state = THolder<TShardState>(PendingShards.PopFront());
+                InFlightShards.PushFront(state.Get());
+                StartRead(state.Release());
+            }
         }
         if (!isFirst) {
             CA_LOG_D("AFTER: " << PendingShards.Size() << "." << RunningReads());
@@ -328,7 +376,7 @@ public:
             TKeyDesc::TColumnOp op;
             op.Column = column.GetId();
             op.Operation = TKeyDesc::EColumnOperation::Read;
-            op.ExpectedType = NScheme::TTypeInfo((NScheme::TTypeId)column.GetType());
+            op.ExpectedType = MakeTypeInfo(column);
             columns.emplace_back(std::move(op));
         }
 
@@ -432,8 +480,8 @@ public:
 
             auto newShard = MakeHolder<TShardState>(partition.ShardId);
 
-            if (idx == 0 && state) {
-                newShard->CopyContinuationToken(state.Get());
+            if (((!Settings.GetReverse() && idx == 0) || (Settings.GetReverse() && idx + 1 == keyDesc->GetPartitions().size())) && state) {
+                newShard->AssignContinuationToken(state.Get());
             }
 
             for (ui64 j = i; j < state->Ranges.size(); ++j) {
@@ -462,12 +510,14 @@ public:
         }
 
         YQL_ENSURE(!newShards.empty());
-        for (int i = newShards.ysize() - 1; i >= 0; --i) {
-            PendingShards.PushFront(newShards[i].Release());
-        }
-
-        if (!state->LastKey.empty()) {
-            PendingShards.Front()->LastKey = std::move(state->LastKey);
+        if (Settings.GetReverse()) {
+            for (size_t i = 0; i < newShards.size(); ++i) {
+                PendingShards.PushBack(newShards[i].Release());
+            }
+        } else {
+            for (int i = newShards.ysize() - 1; i >= 0; --i) {
+                PendingShards.PushFront(newShards[i].Release());
+            }
         }
 
         if (IsDebugLogEnabled(TlsActivationContext->ActorSystem(), NKikimrServices::KQP_COMPUTE)
@@ -532,19 +582,20 @@ public:
             limit = EVREAD_MAX_ROWS;
         }
         if (limit == 0) {
-            delete state;
             return;
         }
 
         THolder<TEvDataShard::TEvRead> ev(new TEvDataShard::TEvRead());
         auto& record = ev->Record;
 
-        state->FillEvRead(*ev, KeyColumnTypes);
+        state->FillEvRead(*ev, KeyColumnTypes, Settings.GetReverse());
         for (const auto& column : Settings.GetColumns()) {
-            record.AddColumns(column.GetId());
+            if (!IsSystemColumn(column.GetId())) {
+                record.AddColumns(column.GetId());
+            }
         }
 
-        if (record.HasSnapshot()) {
+        if (Settings.HasSnapshot()) {
             record.MutableSnapshot()->SetTxId(Settings.GetSnapshot().GetTxId());
             record.MutableSnapshot()->SetStep(Settings.GetSnapshot().GetStep());
         }
@@ -572,9 +623,20 @@ public:
 
         record.SetResultFormat(Settings.GetDataFormat());
 
+        if (Settings.HasLockTxId() && BrokenLocks.empty()) {
+            record.SetLockTxId(Settings.GetLockTxId());
+        }
+
+        if (Settings.HasLockNodeId()) {
+            record.SetLockNodeId(Settings.GetLockNodeId());
+        }
+
         CA_LOG_D(TStringBuilder() << "Send EvRead to shardId: " << state->TabletId << ", tablePath: " << Settings.GetTable().GetTablePath()
             << ", ranges: " << DebugPrintRanges(KeyColumnTypes, ev->Ranges, *AppData()->TypeRegistry)
-            << ", readId = " << id);
+            << ", limit: " << limit
+            << ", readId = " << id
+            << " snapshot = (txid=" << Settings.GetSnapshot().GetTxId() << ",step=" << Settings.GetSnapshot().GetStep() << ")"
+            << " lockTxId = " << Settings.GetLockTxId());
 
         ReadIdByTabletId[state->TabletId].push_back(id);
         Send(MakePipePeNodeCacheID(false), new TEvPipeCache::TEvForward(ev.Release(), state->TabletId, true),
@@ -584,7 +646,6 @@ public:
     void HandleRead(TEvDataShard::TEvReadResult::TPtr ev) {
         const auto& record = ev->Get()->Record;
         auto id = record.GetReadId();
-        Y_VERIFY(id < ReadId);
         if (!Reads[id] || Reads[id].Finished) {
             // dropped read
             return;
@@ -596,11 +657,19 @@ public:
             }
             return RetryRead(id);
         }
+        for (auto& lock : record.GetTxLocks()) {
+            Locks.push_back(lock);
+        }
+
+        for (auto& lock : record.GetBrokenTxLocks()) {
+            BrokenLocks.push_back(lock);
+        }
+
+        CA_LOG_D("Taken " << Locks.size() << " locks");
         Reads[id].SerializedContinuationToken = record.GetContinuationToken();
 
         Reads[id].RegisterMessage(*ev->Get());
 
-        YQL_ENSURE(record.GetResultFormat() == NKikimrTxDataShard::EScanDataFormat::CELLVEC);
 
         RecievedRowCount += ev->Get()->GetRowsCount();
         Results.push({Reads[id].Shard->TabletId, THolder<TEventHandle<TEvDataShard::TEvReadResult>>(ev.Release())});
@@ -627,11 +696,13 @@ public:
 
     NMiniKQL::TBytesStatistics GetRowSize(const NUdf::TUnboxedValue* row) {
         NMiniKQL::TBytesStatistics rowStats{0, 0};
-        for (size_t i = 0; i < Settings.ColumnsSize(); ++i) {
-            if (IsSystemColumn(Settings.GetColumns(i).GetId())) {
+        size_t columnIndex = 0;
+        for (size_t resultColumnIndex = 0; resultColumnIndex < Settings.ColumnsSize(); ++resultColumnIndex) {
+            if (IsSystemColumn(Settings.GetColumns(resultColumnIndex).GetId())) {
                 rowStats.AllocatedBytes += sizeof(NUdf::TUnboxedValue);
             } else {
-                rowStats.AddStatistics(NMiniKQL::GetUnboxedValueSize(row[i], NScheme::TTypeInfo((NScheme::TTypeId)Settings.GetColumns(i).GetType())));
+                rowStats.AddStatistics(NMiniKQL::GetUnboxedValueSize(row[columnIndex], MakeTypeInfo(Settings.GetColumns(resultColumnIndex))));
+                columnIndex += 1;
             }
         }
         if (Settings.ColumnsSize() == 0) {
@@ -644,39 +715,41 @@ public:
         return TypeEnv.BindAllocator();
     }
 
-    NMiniKQL::TBytesStatistics PackArrow(
-        THolder<TEventHandle<TEvDataShard::TEvReadResult>>& result,
-        ui64 shardId,
-        NKikimr::NMiniKQL::TUnboxedValueVector& batch)
-    {
+    NMiniKQL::TBytesStatistics PackArrow(TResult& handle) {
+        auto& [shardId, result, batch, _] = handle;
         NMiniKQL::TBytesStatistics stats;
         bool hasResultColumns = false;
+        if (result->Get()->GetRowsCount() == 0) {
+            return {};
+        }
         if (Settings.ColumnsSize() == 0) {
-            batch.resize(result->Get()->GetRowsCount(), HolderFactory.GetEmptyContainer());
+            batch->resize(result->Get()->GetRowsCount(), HolderFactory.GetEmptyContainer());
         } else {
             TVector<NUdf::TUnboxedValue*> editAccessors(result->Get()->GetRowsCount());
-            batch.reserve(result->Get()->GetRowsCount());
+            batch->reserve(result->Get()->GetRowsCount());
 
             for (ui64 rowIndex = 0; rowIndex < result->Get()->GetRowsCount(); ++rowIndex) {
-                batch.emplace_back(HolderFactory.CreateDirectArrayHolder(
+                batch->emplace_back(HolderFactory.CreateDirectArrayHolder(
                     Settings.columns_size(),
                     editAccessors[rowIndex])
                 );
             }
 
-            for (size_t columnIndex = 0; columnIndex < Settings.ColumnsSize(); ++columnIndex) {
-                auto tag = Settings.GetColumns(columnIndex).GetId();
-                auto type = NScheme::TTypeInfo((NScheme::TTypeId)Settings.GetColumns(columnIndex).GetType());
+            size_t columnIndex = 0;
+            for (size_t resultColumnIndex = 0; resultColumnIndex < Settings.ColumnsSize(); ++resultColumnIndex) {
+                auto tag = Settings.GetColumns(resultColumnIndex).GetId();
+                auto type = NScheme::TTypeInfo((NScheme::TTypeId)Settings.GetColumns(resultColumnIndex).GetType());
                 if (IsSystemColumn(tag)) {
                     for (ui64 rowIndex = 0; rowIndex < result->Get()->GetRowsCount(); ++rowIndex) {
-                        NMiniKQL::FillSystemColumn(editAccessors[rowIndex][columnIndex], shardId, tag, type);
+                        NMiniKQL::FillSystemColumn(editAccessors[rowIndex][resultColumnIndex], shardId, tag, type);
                         stats.AllocatedBytes += sizeof(NUdf::TUnboxedValue);
                     }
                 } else {
                     hasResultColumns = true;
                     stats.AddStatistics(
-                        NMiniKQL::WriteColumnValuesFromArrow(editAccessors, *result->Get()->ArrowBatch, columnIndex, type)
+                        NMiniKQL::WriteColumnValuesFromArrow(editAccessors, *result->Get()->GetArrowBatch(), columnIndex, resultColumnIndex, type)
                     );
+                    columnIndex += 1;
                 }
             }
         }
@@ -688,27 +761,29 @@ public:
         return stats;
     }
 
-    NMiniKQL::TBytesStatistics PackCells(
-        THolder<TEventHandle<TEvDataShard::TEvReadResult>>& result,
-        ui64 shardId,
-        NKikimr::NMiniKQL::TUnboxedValueVector& batch)
-    {
+    NMiniKQL::TBytesStatistics PackCells(TResult& handle) {
+        auto& [shardId, result, batch, _] = handle;
         NMiniKQL::TBytesStatistics stats;
-        batch.reserve(batch.size());
+        batch->reserve(batch->size());
         for (size_t rowIndex = 0; rowIndex < result->Get()->GetRowsCount(); ++rowIndex) {
             const auto& row = result->Get()->GetCells(rowIndex);
             NUdf::TUnboxedValue* rowItems = nullptr;
-            batch.emplace_back(HolderFactory.CreateDirectArrayHolder(Settings.ColumnsSize(), rowItems));
-            for (size_t i = 0; i < Settings.ColumnsSize(); ++i) {
-                auto tag = Settings.GetColumns(i).GetId();
-                auto type = NScheme::TTypeInfo((NScheme::TTypeId)Settings.GetColumns(i).GetType());
+            batch->emplace_back(HolderFactory.CreateDirectArrayHolder(Settings.ColumnsSize(), rowItems));
+            size_t rowSize = 0;
+            size_t columnIndex = 0;
+            for (size_t resultColumnIndex = 0; resultColumnIndex < Settings.ColumnsSize(); ++resultColumnIndex) {
+                auto tag = Settings.GetColumns(resultColumnIndex).GetId();
+                auto type = MakeTypeInfo(Settings.GetColumns(resultColumnIndex));
                 if (IsSystemColumn(tag)) {
-                    NMiniKQL::FillSystemColumn(rowItems[i], shardId, tag, type);
+                    NMiniKQL::FillSystemColumn(rowItems[resultColumnIndex], shardId, tag, type);
                 } else {
-                    rowItems[i] = NMiniKQL::GetCellValue(row[i], type);
+                    rowItems[resultColumnIndex] = NMiniKQL::GetCellValue(row[columnIndex], type);
+                    rowSize += row[columnIndex].Size(); 
+                    columnIndex += 1;
                 }
             }
-            stats.AddStatistics(GetRowSize(rowItems));
+            stats.DataBytes += std::max(rowSize, (size_t)8);
+            stats.AllocatedBytes += GetRowSize(rowItems).AllocatedBytes;
         }
         return stats;
     }
@@ -721,39 +796,40 @@ public:
     {
         ui64 bytes = 0;
         while (!Results.empty()) {
-            auto& [shardId, result, batch, processedRows] = Results.front();
-            auto& msg = *result->Get();
+            auto& result = Results.front();
+            auto& batch = result.Batch;
+            auto& msg = *result.ReadResult->Get();
             if (!batch.Defined()) {
                 batch.ConstructInPlace();
                 switch (msg.Record.GetResultFormat()) {
                     case NKikimrTxDataShard::EScanDataFormat::ARROW:
-                        PackArrow(result, shardId, *batch);
+                        BytesStats.AddStatistics(PackArrow(result));
                         break;
                     case NKikimrTxDataShard::EScanDataFormat::UNSPECIFIED:
                     case NKikimrTxDataShard::EScanDataFormat::CELLVEC:
-                        PackCells(result, shardId, *batch);
+                        BytesStats.AddStatistics(PackCells(result));
                 }
             }
 
-            auto id = result->Get()->Record.GetReadId();
+            auto id = result.ReadResult->Get()->Record.GetReadId();
             if (!Reads[id]) {
                 Results.pop();
                 continue;
             }
             auto* state = Reads[id].Shard;
 
-            for (; processedRows < batch->size(); ++processedRows) {
-                NMiniKQL::TBytesStatistics rowSize = GetRowSize((*batch)[processedRows].GetElements());
+            for (; result.ProcessedRows < batch->size(); ++result.ProcessedRows) {
+                NMiniKQL::TBytesStatistics rowSize = GetRowSize((*batch)[result.ProcessedRows].GetElements());
                 if (static_cast<ui64>(freeSpace) < bytes + rowSize.AllocatedBytes) {
                     break;
                 }
-                resultVector.push_back(std::move((*batch)[processedRows]));
+                resultVector.push_back(std::move((*batch)[result.ProcessedRows]));
                 ProcessedRowCount += 1;
                 bytes += rowSize.AllocatedBytes;
             }
             CA_LOG_D(TStringBuilder() << "returned " << resultVector.size() << " rows");
 
-            if (batch->size() == processedRows) {
+            if (batch->size() == result.ProcessedRows) {
                 auto& record = msg.Record;
                 if (Reads[id].IsLastMessage(msg)) {
                     Reads[id].Reset();
@@ -778,7 +854,6 @@ public:
                         auto cancel = MakeHolder<TEvDataShard::TEvReadCancel>();
                         cancel->Record.SetReadId(id);
                         Send(MakePipePeNodeCacheID(false), new TEvPipeCache::TEvForward(cancel.Release(), state->TabletId), IEventHandle::FlagTrackDelivery);
-                        delete state;
                         Reads[id].Reset();
                         ResetReads++;
                     }
@@ -804,6 +879,29 @@ public:
         return bytes;
     }
 
+    void FillExtraStats(NDqProto::TDqTaskStats* stats, bool last) override {
+        if (last) {
+            NDqProto::TDqTableStats* tableStats = nullptr;
+            for (size_t i = 0; i < stats->TablesSize(); ++i) {
+                auto* table = stats->MutableTables(i);
+                if (table->GetTablePath() == Settings.GetTable().GetTablePath()) {
+                    tableStats = table;
+                }
+            }
+            if (!tableStats) {
+                tableStats = stats->AddTables();
+                tableStats->SetTablePath(Settings.GetTable().GetTablePath());
+
+            }
+
+            //FIXME: use evread statistics after KIKIMR-16924
+            tableStats->SetReadRows(tableStats->GetReadRows() + RecievedRowCount);
+            tableStats->SetReadBytes(tableStats->GetReadBytes() + BytesStats.DataBytes);
+            tableStats->SetAffectedPartitions(tableStats->GetAffectedPartitions() + InFlightShards.Size());
+        }
+    }
+
+
     void SaveState(const NYql::NDqProto::TCheckpoint&, NYql::NDqProto::TSourceState&) override {}
     void CommitState(const NYql::NDqProto::TCheckpoint&) override {}
     void LoadState(const NYql::NDqProto::TSourceState&) override {}
@@ -827,13 +925,38 @@ public:
         Send(ComputeActorId, new TEvAsyncInputError(InputIndex, std::move(issues), statusCode));
     }
 
+    TMaybe<google::protobuf::Any> ExtraData() override {
+        google::protobuf::Any result;
+        NKikimrTxDataShard::TEvKqpInputActorResultInfo resultInfo;
+        for (auto& lock : Locks) {
+            resultInfo.AddLocks()->CopyFrom(lock);
+        }
+        for (auto& lock : BrokenLocks) {
+            resultInfo.AddLocks()->CopyFrom(lock);
+        }
+        result.PackFrom(resultInfo);
+        return result;
+    }
+
+
+    NScheme::TTypeInfo MakeTypeInfo(const NKikimrTxDataShard::TKqpTransaction_TColumnMeta& info) {
+        auto typeId = info.GetType();
+        return NScheme::TTypeInfo(
+            (NScheme::TTypeId)typeId,
+            (typeId == NScheme::NTypeIds::Pg) ?
+                NPg::TypeDescFromPgTypeId(
+                    info.GetTypeInfo().GetPgTypeId()
+                ) : nullptr);
+    }
+
 private:
     NKikimrTxDataShard::TKqpReadRangesSourceSettings Settings;
 
     TVector<NScheme::TTypeInfo> KeyColumnTypes;
 
-    size_t RecievedRowCount = 0;
-    size_t ProcessedRowCount = 0;
+    NMiniKQL::TBytesStatistics BytesStats;
+    ui64 RecievedRowCount = 0;
+    ui64 ProcessedRowCount = 0;
     ui64 ResetReads = 0;
     ui64 ReadId = 0;
     TVector<TReadState> Reads;
@@ -845,19 +968,10 @@ private:
     TShardQueue InFlightShards;
     TShardQueue PendingShards;
 
-    struct TResult {
-        ui64 ShardId;
-        THolder<TEventHandle<TEvDataShard::TEvReadResult>> ReadResult;
-        TMaybe<NKikimr::NMiniKQL::TUnboxedValueVector> Batch;
-        size_t ProcessedRows = 0;
-
-        TResult(ui64 shardId, THolder<TEventHandle<TEvDataShard::TEvReadResult>> readResult)
-            : ShardId(shardId)
-            , ReadResult(std::move(readResult))
-        {
-        }
-    };
     TQueue<TResult> Results;
+
+    TVector<NKikimrTxDataShard::TLock> Locks;
+    TVector<NKikimrTxDataShard::TLock> BrokenLocks;
 
     ui32 MaxInFlight = 1024;
     const TString LogPrefix;

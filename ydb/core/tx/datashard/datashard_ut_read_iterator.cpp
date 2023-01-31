@@ -79,14 +79,14 @@ std::vector<TOwnedCellVec> GetRows(
     const TVector<std::pair<TString, NScheme::TTypeInfo>>& batchSchema,
     const TEvDataShard::TEvReadResult& result)
 {
-    UNIT_ASSERT(result.ArrowBatch);
+    UNIT_ASSERT(result.GetArrowBatch());
 
     // TODO: use schema from ArrowBatch
     TRowWriter writer;
     NArrow::TArrowToYdbConverter converter(batchSchema, writer);
 
     TString error;
-    UNIT_ASSERT(converter.Process(*result.ArrowBatch, error));
+    UNIT_ASSERT(converter.Process(*result.GetArrowBatch(), error));
 
     return std::move(writer.Rows);
 }
@@ -146,7 +146,7 @@ void CheckResultArrow(
     std::vector<NTable::TTag> columns = {})
 {
     UNIT_ASSERT(!gold.empty());
-    UNIT_ASSERT(result.ArrowBatch);
+    UNIT_ASSERT(result.GetArrowBatch());
 
     TVector<std::pair<TString, NScheme::TTypeInfo>> batchSchema;
     const auto& description = userTable.GetDescription();
@@ -201,7 +201,7 @@ void CheckResult(
             UNIT_ASSERT(false);
         }
     } else {
-        UNIT_ASSERT(!result.ArrowBatch && result.GetRowsCount() == 0);
+        UNIT_ASSERT(!result.GetArrowBatch() && result.GetRowsCount() == 0);
     }
 }
 
@@ -911,6 +911,54 @@ Y_UNIT_TEST_SUITE(DataShardReadIterator) {
             auto readResult = helper.SendRead("table-1", request.release());
             CheckResult(helper.Tables["table-1"].UserTable, *readResult, {{k * 100, k}}, columns);
         }
+    }
+
+    Y_UNIT_TEST(ShouldReadNoColumnsCellVec) {
+        // KIKIMR-16897: no columns mean we want to calc row count
+        TTestHelper helper;
+
+        auto request = helper.GetBaseReadRequest("table-1", 1, NKikimrTxDataShard::CELLVEC);
+        request->Record.ClearColumns();
+        AddRangeQuery<ui32>(
+            *request,
+            {1, 1, 1},
+            true,
+            {5, 5, 5},
+            true
+        );
+
+        auto readResult = helper.SendRead("table-1", request.release());
+        UNIT_ASSERT(readResult);
+        CheckResult(helper.Tables["table-1"].UserTable, *readResult, {
+            std::vector<ui32>(),
+            std::vector<ui32>(),
+            std::vector<ui32>(),
+        });
+        UNIT_ASSERT_VALUES_EQUAL(readResult->GetRowsCount(), 3UL);
+    }
+
+    Y_UNIT_TEST(ShouldReadNoColumnsArrow) {
+        // KIKIMR-16897: no columns mean we want to calc row count
+        TTestHelper helper;
+
+        auto request = helper.GetBaseReadRequest("table-1", 1, NKikimrTxDataShard::ARROW);
+        request->Record.ClearColumns();
+        AddRangeQuery<ui32>(
+            *request,
+            {1, 1, 1},
+            true,
+            {5, 5, 5},
+            true
+        );
+
+        auto readResult = helper.SendRead("table-1", request.release());
+        UNIT_ASSERT(readResult);
+        UNIT_ASSERT_VALUES_EQUAL(readResult->Record.GetStatus().GetCode(), Ydb::StatusIds::SUCCESS);
+        UNIT_ASSERT_VALUES_EQUAL(readResult->GetRowsCount(), 3UL);
+        UNIT_ASSERT(readResult->GetArrowBatch());
+
+        auto batch = readResult->GetArrowBatch();
+        UNIT_ASSERT_VALUES_EQUAL(batch->num_rows(), 3UL);
     }
 
     Y_UNIT_TEST(ShouldReadNonExistingKey) {
@@ -1800,7 +1848,7 @@ Y_UNIT_TEST_SUITE(DataShardReadIterator) {
         AddKeyQuery(*request, {3, 3, 3});
         auto readResult = helper.SendRead("table-1", request.release());
         const auto& record = readResult->Record;
-        UNIT_ASSERT_VALUES_EQUAL(record.GetStatus().GetCode(), Ydb::StatusIds::NOT_FOUND);
+        UNIT_ASSERT_VALUES_EQUAL(record.GetStatus().GetCode(), Ydb::StatusIds::PRECONDITION_FAILED);
     }
 
     Y_UNIT_TEST(ShouldNotReadHeadFromFollower) {
@@ -2459,6 +2507,61 @@ Y_UNIT_TEST_SUITE(DataShardReadIterator) {
         UNIT_ASSERT_VALUES_EQUAL(readResult1->Record.BrokenTxLocksSize(), 1);
 
         helper.CheckLockBroken("table-1", 10, {11, 11, 11}, lockTxId, *readResult1);
+    }
+
+    Y_UNIT_TEST(ShouldReturnBrokenLockWhenReadRangeInvisibleRowSkips2) {
+        // Almost the same as ShouldReturnBrokenLockWhenReadRangeInvisibleRowSkips:
+        // 1. tx1: read some **non-existing** range1
+        // 2. tx2: upsert into range2 > range1 range and commit.
+        // 3. tx1: read range2 -> lock should be broken
+
+        TTestHelper helper;
+
+        auto readVersion = CreateVolatileSnapshot(
+            helper.Server,
+            {"/Root/movies", "/Root/table-1"},
+            TDuration::Hours(1));
+
+        const ui64 lockTxId = 1011121314;
+
+        auto request1 = helper.GetBaseReadRequest("table-1", 1, NKikimrTxDataShard::ARROW, readVersion);
+        request1->Record.SetLockTxId(lockTxId);
+        AddRangeQuery<ui32>(
+            *request1,
+            {100, 0, 0},
+            true,
+            {200, 0, 0},
+            true
+        );
+
+        auto readResult1 = helper.SendRead("table-1", request1.release());
+        CheckResult(helper.Tables["table-1"].UserTable, *readResult1, {});
+        UNIT_ASSERT_VALUES_EQUAL(readResult1->Record.TxLocksSize(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(readResult1->Record.BrokenTxLocksSize(), 0);
+
+        // write new data above snapshot
+        ExecSQL(helper.Server, helper.Sender, R"(
+            SELECT * FROM `/Root/table-1` WHERE key1 == 300;
+            UPSERT INTO `/Root/table-1`
+            (key1, key2, key3, value)
+            VALUES
+            (300, 0, 0, 3000);
+        )");
+
+        auto request2 = helper.GetBaseReadRequest("table-1", 2, NKikimrTxDataShard::ARROW, readVersion);
+        request2->Record.SetLockTxId(lockTxId);
+        AddRangeQuery<ui32>(
+            *request2,
+            {300, 0, 0},
+            true,
+            {300, 0, 0},
+            true
+        );
+
+        auto readResult2 = helper.SendRead("table-1", request2.release());
+        UNIT_ASSERT_VALUES_EQUAL(readResult2->Record.TxLocksSize(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(readResult2->Record.BrokenTxLocksSize(), 1);
+        helper.CheckLockBroken("table-1", 10, {300, 0, 0}, lockTxId, *readResult2);
     }
 
     Y_UNIT_TEST(ShouldReturnBrokenLockWhenReadRangeLeftBorder) {

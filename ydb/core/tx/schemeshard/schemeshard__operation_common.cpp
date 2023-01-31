@@ -283,8 +283,7 @@ void NTableState::AckAllSchemaChanges(const TOperationId &operationId, TTxState 
                         << ", datashard: " << tabletId
                         << ", at schemeshard: " << ssId);
 
-        THolder<TEvDataShard::TEvSchemaChangedResult> event =
-                THolder(new TEvDataShard::TEvSchemaChangedResult());
+        auto event = MakeHolder<TEvDataShard::TEvSchemaChangedResult>();
         event->Record.SetTxId(ui64(operationId.GetTxId()));
 
         context.OnComplete.Send(ackTo, std::move(event), ui64(shardIdx.GetLocalId()));
@@ -352,11 +351,15 @@ void NTableState::UpdatePartitioningForTableModification(TOperationId operationI
         commonShardOp = TTxState::ConfigureParts;
     } else if (txState.TxType == TTxState::TxCreateCdcStreamAtTable) {
         commonShardOp = TTxState::ConfigureParts;
-    } else if (txState.TxType == TTxState::TxCreateCdcStreamAtTableWithSnapshot) {
+    } else if (txState.TxType == TTxState::TxCreateCdcStreamAtTableWithInitialScan) {
         commonShardOp = TTxState::ConfigureParts;
     } else if (txState.TxType == TTxState::TxAlterCdcStreamAtTable) {
         commonShardOp = TTxState::ConfigureParts;
+    } else if (txState.TxType == TTxState::TxAlterCdcStreamAtTableDropSnapshot) {
+        commonShardOp = TTxState::ConfigureParts;
     } else if (txState.TxType == TTxState::TxDropCdcStreamAtTable) {
+        commonShardOp = TTxState::ConfigureParts;
+    } else if (txState.TxType == TTxState::TxDropCdcStreamAtTableDropSnapshot) {
         commonShardOp = TTxState::ConfigureParts;
     } else {
         Y_FAIL("UNREACHABLE");

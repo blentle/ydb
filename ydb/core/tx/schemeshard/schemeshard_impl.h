@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dedicated_pipe_pool.h"
+#include "operation_queue_timer.h"
 #include "schemeshard.h"
 #include "schemeshard_export.h"
 #include "schemeshard_import.h"
@@ -14,10 +16,7 @@
 #include "schemeshard_tx_infly.h"
 #include "schemeshard_utils.h"
 #include "schemeshard_schema.h"
-
 #include "schemeshard__operation.h"
-
-#include "operation_queue_timer.h"
 
 #include <ydb/core/base/hive.h>
 #include <ydb/core/base/storage_pools.h>
@@ -83,7 +82,8 @@ private:
         TShardCompactionInfo,
         TCompactionQueueImpl,
         TEvPrivate::EvRunBackgroundCompaction,
-        NKikimrServices::FLAT_TX_SCHEMESHARD>;
+        NKikimrServices::FLAT_TX_SCHEMESHARD,
+        NKikimrServices::TActivity::SCHEMESHARD_BACKGROUND_COMPACTION>;
 
     class TCompactionStarter : public TCompactionQueue::IStarter {
     public:
@@ -107,7 +107,8 @@ private:
         TShardIdx,
         TFifoQueue<TShardIdx>,
         TEvPrivate::EvRunBorrowedCompaction,
-        NKikimrServices::FLAT_TX_SCHEMESHARD>;
+        NKikimrServices::FLAT_TX_SCHEMESHARD,
+        NKikimrServices::TActivity::SCHEMESHARD_BORROWED_COMPACTION>;
 
     class TBorrowedCompactionStarter : public TBorrowedCompactionQueue::IStarter {
     public:
@@ -269,6 +270,7 @@ public:
     TActorId SysPartitionStatsCollector;
 
     TActorId SVPMigrator;
+    TActorId CdcStreamScanFinalizer;
 
     TDuration StatsMaxExecuteTime;
     TDuration StatsBatchTimeout;
@@ -328,6 +330,8 @@ public:
     TAutoPtr<TEvSchemeShard::TEvInitTenantSchemeShardResult> DelayedInitTenantReply;
 
     THolder<TProposeResponse> IgniteOperation(TProposeRequest& request, TOperationContext& context);
+    THolder<TEvDataShard::TEvProposeTransaction> MakeDataShardProposal(const TPathId& pathId, const TOperationId& opId,
+        const TString& body, const TActorContext& ctx) const;
 
     TPathId RootPathId() const {
         return MakeLocalId(TPathElement::RootPathId);
@@ -337,9 +341,13 @@ public:
         return pId == RootPathId();
     }
 
-    bool IsServerlessDomain(const TPath& domain) const {
-        const auto& resourcesDomainId = domain.DomainInfo()->GetResourcesDomainId();
+    bool IsServerlessDomain(TSubDomainInfo::TPtr domainInfo) const {
+        const auto& resourcesDomainId = domainInfo->GetResourcesDomainId();
         return !IsDomainSchemeShard && resourcesDomainId && resourcesDomainId != ParentDomainId;
+    }
+
+    bool IsServerlessDomain(const TPath& domain) const {
+        return IsServerlessDomain(domain.DomainInfo());
     }
 
     TPathId MakeLocalId(const TLocalPathId& localPathId) const {
@@ -722,6 +730,13 @@ public:
     void PersistStorageBillingTime(NIceDb::TNiceDb& db);
 
     TTabletId GetGlobalHive(const TActorContext& ctx) const;
+
+    enum class EHiveSelection : uint8_t {
+        ANY,
+        IGNORE_TENANT,
+    };
+
+    TTabletId ResolveHive(TPathId pathId, const TActorContext& ctx, EHiveSelection selection) const;
     TTabletId ResolveHive(TPathId pathId, const TActorContext& ctx) const;
     TTabletId ResolveHive(TShardIdx shardIdx, const TActorContext& ctx) const;
     TShardIdx GetShardIdx(TTabletId tabletId) const;
@@ -743,13 +758,15 @@ public:
     struct TTxInitTenantSchemeShard;
     NTabletFlatExecutor::ITransaction* CreateTxInitTenantSchemeShard(TEvSchemeShard::TEvInitTenantSchemeShard::TPtr &ev);
 
-    void ActivateAfterInitialization(const TActorContext &ctx,
-                                     TSideEffects::TPublications&& delayPublications = {},
-                                     const TVector<ui64>& exportIds = {},
-                                     const TVector<ui64>& importsIds = {},
-                                     TVector<TPathId>&& tablesToClean = {},
-                                     TDeque<TPathId>&& blockStoreVolumesToClean = {}
-                                     );
+    struct TActivationOpts {
+        TSideEffects::TPublications DelayPublications;
+        TVector<ui64> ExportIds;
+        TVector<ui64> ImportsIds;
+        TVector<TPathId> CdcStreamScans;
+        TVector<TPathId> TablesToClean;
+        TDeque<TPathId> BlockStoreVolumesToClean;
+    };
+    void ActivateAfterInitialization(const TActorContext& ctx, TActivationOpts&& opts);
 
     struct TTxInitPopulator;
     NTabletFlatExecutor::ITransaction* CreateTxInitPopulator(TSideEffects::TPublications&& publications);
@@ -1127,25 +1144,7 @@ public:
 
     // do not share pipes with operations
     // also do not share pipes between IndexBuilds
-    struct TDedicatedPipePool {
-        using TMessage = std::pair<ui32, TIntrusivePtr<TEventSerializedData>>;
-        using TOwnerRec = std::pair<TIndexBuildId, TTabletId>;
-        NTabletPipe::TClientConfig PipeCfg;
-
-        TMap<TIndexBuildId, TMap<TTabletId, TActorId>> Pipes;
-        TMap<TActorId, TOwnerRec> Owners;
-
-        TDedicatedPipePool();
-
-        void Create(TIndexBuildId ownerTxId, TTabletId dst, THolder<IEventBase> message, const TActorContext& ctx);
-        void Close(TIndexBuildId ownerTxId, TTabletId dst, const TActorContext& ctx);
-        ui64 CloseAll(TIndexBuildId ownerTxId, const TActorContext& ctx);
-
-        bool Has(TActorId actorId) const;
-        TTabletId GetTabletId(TActorId actorId) const;
-        TIndexBuildId GetOwnerId(TActorId actorId) const;
-    };
-    TDedicatedPipePool IndexBuildPipes;
+    TDedicatedPipePool<TIndexBuildId> IndexBuildPipes;
 
     void PersistCreateBuildIndex(NIceDb::TNiceDb& db, const TIndexBuildInfo::TPtr indexInfo);
     void PersistBuildIndexState(NIceDb::TNiceDb& db, const TIndexBuildInfo::TPtr indexInfo);
@@ -1203,7 +1202,6 @@ public:
     NTabletFlatExecutor::ITransaction* CreatePipeRetry(TIndexBuildId indexBuildId, TTabletId tabletId);
     NTabletFlatExecutor::ITransaction* CreateTxBilling(TEvPrivate::TEvIndexBuildingMakeABill::TPtr& ev);
 
-
     void Handle(TEvIndexBuilder::TEvCreateRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvIndexBuilder::TEvGetRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvIndexBuilder::TEvCancelRequest::TPtr& ev, const TActorContext& ctx);
@@ -1218,6 +1216,27 @@ public:
     void SetupRouting(const TDeque<TIndexBuildId>& indexIds, const TActorContext& ctx);
 
     // } //NIndexBuilder
+
+    // namespace NCdcStreamScan {
+    struct TCdcStreamScan {
+        struct TTxProgress;
+    };
+
+    TDedicatedPipePool<TPathId> CdcStreamScanPipes;
+
+    NTabletFlatExecutor::ITransaction* CreateTxProgressCdcStreamScan(TEvPrivate::TEvRunCdcStreamScan::TPtr& ev);
+    NTabletFlatExecutor::ITransaction* CreateTxProgressCdcStreamScan(TEvDataShard::TEvCdcStreamScanResponse::TPtr& ev);
+    NTabletFlatExecutor::ITransaction* CreatePipeRetry(const TPathId& streamPathId, TTabletId tabletId);
+
+    void Handle(TEvPrivate::TEvRunCdcStreamScan::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvDataShard::TEvCdcStreamScanResponse::TPtr& ev, const TActorContext& ctx);
+
+    void ResumeCdcStreamScans(const TVector<TPathId>& ids, const TActorContext& ctx);
+
+    void PersistCdcStreamScanShardStatus(NIceDb::TNiceDb& db, const TPathId& streamPathId, const TShardIdx& shardIdx,
+        const TCdcStreamInfo::TShardStatus& status);
+    void RemoveCdcStreamScanShardStatus(NIceDb::TNiceDb& db, const TPathId& streamPathId, const TShardIdx& shardIdx);
+    // } // NCdcStreamScan
 
 public:
     void ChangeStreamShardsCount(i64 delta) override;

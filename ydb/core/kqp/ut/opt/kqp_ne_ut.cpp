@@ -3297,7 +3297,7 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         }
 
         TExecDataQuerySettings querySettings;
-        querySettings.CollectQueryStats(ECollectQueryStatsMode::Full);
+        querySettings.CollectQueryStats(ECollectQueryStatsMode::Profile);
 
         {
             auto result = session.ExecuteDataQuery(R"(
@@ -3314,6 +3314,13 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
             NJson::ReadJsonTree(result.GetQueryPlan(), &plan, true);
             auto streamLookup = FindPlanNodeByKv(plan, "Node Type", "TableLookup");
             UNIT_ASSERT(streamLookup.IsDefined());
+
+            auto stats = NYdb::TProtoAccessor::GetProto(*result.GetStats());
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases().size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access().size(), 2);
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access(0).name(), "/Root/EightShard");
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access(1).name(), "/Root/KeyValue");
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access(1).reads().rows(), 2);
         }
 
         {
@@ -3341,6 +3348,12 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
             NJson::ReadJsonTree(result.GetQueryPlan(), &plan, true);
             auto streamLookup = FindPlanNodeByKv(plan, "Node Type", "TableLookup");
             UNIT_ASSERT(streamLookup.IsDefined());
+
+            auto stats = NYdb::TProtoAccessor::GetProto(*result.GetStats());
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases().size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access().size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access(0).name(), "/Root/KeyValue");
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access(0).reads().rows(), 2);
         }
 
         {
@@ -3357,6 +3370,12 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
             NJson::ReadJsonTree(result.GetQueryPlan(), &plan, true);
             auto streamLookup = FindPlanNodeByKv(plan, "Node Type", "TableLookup");
             UNIT_ASSERT(streamLookup.IsDefined());
+
+            auto stats = NYdb::TProtoAccessor::GetProto(*result.GetStats());
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases().size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access().size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access(0).name(), "/Root/KeyValue");
+            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access(0).reads().rows(), 1);
         }
     }
 
@@ -3481,6 +3500,51 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
             UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
             CompareYson(R"([[[101u];[1]];[[102u];[3]]])", FormatResultSetYson(result.GetResultSet(0)));
         }
+    }
+
+    Y_UNIT_TEST(DqSourceLocksEffects) {
+        TKikimrSettings settings;
+        NKikimrConfig::TAppConfig appConfig;
+        appConfig.MutableTableServiceConfig()->SetEnableKqpDataQuerySourceRead(true);
+        settings.SetDomainRoot(KikimrDefaultUtDomainRoot);
+        TFeatureFlags flags;
+        flags.SetEnablePredicateExtractForDataQueries(true);
+        settings.SetFeatureFlags(flags);
+        settings.SetAppConfig(appConfig);
+
+        TKikimrRunner kikimr(settings);
+        auto db = kikimr.GetTableClient();
+        auto session1 = db.CreateSession().GetValueSync().GetSession();
+        auto session3 = db.CreateSession().GetValueSync().GetSession();
+
+        auto result = session1.ExecuteDataQuery(R"(
+            SELECT * FROM `/Root/TwoShard` WHERE Key <= 1;
+        )", TTxControl::BeginTx(TTxSettings::SerializableRW())).GetValueSync();
+        AssertSuccessResult(result);
+
+        auto tx = result.GetTransaction();
+
+        auto session2 = db.CreateSession().GetValueSync().GetSession();
+        result = session2.ExecuteDataQuery(R"(
+            UPSERT INTO `/Root/TwoShard` (Key, Value1) VALUES(1, "NewValue2");
+        )", TTxControl::BeginTx(TTxSettings::SerializableRW()).CommitTx()).GetValueSync();
+        AssertSuccessResult(result);
+
+        result = session1.ExecuteDataQuery(R"(
+            UPSERT INTO `/Root/TwoShard` (Key,Value1) VALUES(1, "NewValue");
+        )", TTxControl::Tx(*tx).CommitTx()).GetValueSync();
+        UNIT_ASSERT(!result.IsSuccess());
+        result.GetIssues().PrintTo(Cerr);
+        UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), EStatus::ABORTED);
+        UNIT_ASSERT(HasIssue(result.GetIssues(), NYql::TIssuesIds::KIKIMR_LOCKS_INVALIDATED));
+
+        result = session2.ExecuteDataQuery(R"(
+            SELECT Key, Value1 FROM `/Root/TwoShard` WHERE Key <= 1;
+        )", TTxControl::BeginTx(TTxSettings::SerializableRW()).CommitTx()).GetValueSync();
+        AssertSuccessResult(result);
+
+        CompareYson(R"([[[1u];["NewValue2"]]])",
+            FormatResultSetYson(result.GetResultSet(0)));
     }
 }
 

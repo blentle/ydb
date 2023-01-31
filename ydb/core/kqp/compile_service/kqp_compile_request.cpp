@@ -80,7 +80,7 @@ public:
             return;
         }
 
-        if (!NavigateTables(*compileResult->PreparedQuery, compileResult->Query->Database, ctx)) {
+        if (!NavigateTables(compileResult->PreparedQuery, compileResult->Query->Database, ctx)) {
 
             if (CompileRequestSpan) {
                 CompileRequestSpan.End();
@@ -153,24 +153,38 @@ private:
 private:
     void FillTables(const NKqpProto::TKqpPhyTx& phyTx) {
         for (const auto& stage : phyTx.GetStages()) {
-            for (const auto& tableOp : stage.GetTableOps()) {
-                TTableId tableId(tableOp.GetTable().GetOwnerId(), tableOp.GetTable().GetTableId());
+            auto addTable = [&](const NKqpProto::TKqpPhyTableId& table) {
+                TTableId tableId(table.GetOwnerId(), table.GetTableId());
                 auto it = TableVersions.find(tableId);
                 if (it != TableVersions.end()) {
-                    Y_ENSURE(it->second == tableOp.GetTable().GetVersion());
+                    Y_ENSURE(it->second == table.GetVersion());
                 } else {
-                    TableVersions.emplace(tableId, tableOp.GetTable().GetVersion());
+                    TableVersions.emplace(tableId, table.GetVersion());
+                }
+            };
+            for (const auto& tableOp : stage.GetTableOps()) {
+                addTable(tableOp.GetTable());
+            }
+            for (const auto& input : stage.GetInputs()) {
+                if (input.GetTypeCase() == NKqpProto::TKqpPhyConnection::kStreamLookup) {
+                    addTable(input.GetStreamLookup().GetTable());
+                }
+            }
+
+            for (const auto& source : stage.GetSources()) {
+                if (source.GetTypeCase() == NKqpProto::TKqpSource::kReadRangesSource) {
+                    addTable(source.GetReadRangesSource().GetTable());
                 }
             }
         }
     }
 
-    bool NavigateTables(const NKikimrKqp::TPreparedQuery& query, const TString& database, const TActorContext& ctx) {
+    bool NavigateTables(const TPreparedQueryHolder::TConstPtr& query, const TString& database, const TActorContext& ctx) {
         TableVersions.clear();
 
-        switch (query.GetVersion()) {
+        switch (query->GetVersion()) {
             case NKikimrKqp::TPreparedQuery::VERSION_PHYSICAL_V1:
-                for (const auto& tx : query.GetPhysicalQuery().GetTransactions()) {
+                for (const auto& tx : query->GetPhysicalQuery().GetTransactions()) {
                     FillTables(tx);
                 }
                 break;
@@ -179,7 +193,7 @@ private:
                 LOG_ERROR_S(ctx, NKikimrServices::KQP_COMPILE_REQUEST,
                     "Unexpected prepared query version"
                     << ", self: " << ctx.SelfID
-                    << ", version: " << (ui32)query.GetVersion());
+                    << ", version: " << (ui32)query->GetVersion());
                 return false;
         }
 

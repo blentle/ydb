@@ -1038,10 +1038,9 @@ TTableBuilder& TTableBuilder::AddNullableColumn(const TString& name, const TDeci
 
 TTableBuilder& TTableBuilder::AddNullableColumn(const TString& name, const TPgType& type, const TString& family) {
     auto columnType = TTypeBuilder()
-        .BeginOptional()
-            .Pg(type)
-        .EndOptional()
+        .Pg(type)
         .Build();
+
     TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family);
     return *this;
 }
@@ -1065,11 +1064,10 @@ TTableBuilder& TTableBuilder::AddNonNullableColumn(const TString& name, const TD
 }
 
 TTableBuilder& TTableBuilder::AddNonNullableColumn(const TString& name, const TPgType& type, const TString& family) {
-    auto columnType = TTypeBuilder()
-        .Pg(type)
-        .Build();
-
-    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family);
+    throw yexception() << "It is not allowed to create NOT NULL column with pg type";
+    Y_UNUSED(name);
+    Y_UNUSED(type);
+    Y_UNUSED(family);
     return *this;
 }
 
@@ -3158,7 +3156,7 @@ TTableBuilder TTableClient::GetTableBuilder() {
     return TTableBuilder();
 }
 
-TParamsBuilder TTableClient::GetParamsBuilder() {
+TParamsBuilder TTableClient::GetParamsBuilder() const {
     return TParamsBuilder();
 }
 
@@ -4409,6 +4407,11 @@ TChangefeedDescription& TChangefeedDescription::WithRetentionPeriod(const TDurat
     return *this;
 }
 
+TChangefeedDescription& TChangefeedDescription::WithInitialScan() {
+    InitialScan_ = true;
+    return *this;
+}
+
 const TString& TChangefeedDescription::GetName() const {
     return Name_;
 }
@@ -4421,8 +4424,16 @@ EChangefeedFormat TChangefeedDescription::GetFormat() const {
     return Format_;
 }
 
+EChangefeedState TChangefeedDescription::GetState() const {
+    return State_;
+}
+
 bool TChangefeedDescription::GetVirtualTimestamps() const {
     return VirtualTimestamps_;
+}
+
+bool TChangefeedDescription::GetInitialScan() const {
+    return InitialScan_;
 }
 
 template <typename TProto>
@@ -4464,12 +4475,30 @@ TChangefeedDescription TChangefeedDescription::FromProto(const TProto& proto) {
         ret.WithVirtualTimestamps();
     }
 
+    if constexpr (std::is_same_v<TProto, Ydb::Table::ChangefeedDescription>) {
+        switch (proto.state()) {
+        case Ydb::Table::ChangefeedDescription::STATE_ENABLED:
+            ret.State_= EChangefeedState::Enabled;
+            break;
+        case Ydb::Table::ChangefeedDescription::STATE_DISABLED:
+            ret.State_ = EChangefeedState::Disabled;
+            break;
+        case Ydb::Table::ChangefeedDescription::STATE_INITIAL_SCAN:
+            ret.State_ = EChangefeedState::InitialScan;
+            break;
+        default:
+            ret.State_ = EChangefeedState::Unknown;
+            break;
+        }
+    }
+
     return ret;
 }
 
 void TChangefeedDescription::SerializeTo(Ydb::Table::Changefeed& proto) const {
     proto.set_name(Name_);
     proto.set_virtual_timestamps(VirtualTimestamps_);
+    proto.set_initial_scan(InitialScan_);
 
     switch (Mode_) {
     case EChangefeedMode::KeysOnly:

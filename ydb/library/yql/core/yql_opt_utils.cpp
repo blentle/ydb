@@ -628,7 +628,7 @@ TExprNode::TPtr ExpandRemoveMembers(const TExprNode::TPtr& node, TExprContext& c
 TExprNode::TPtr ExpandRemovePrefixMembers(const TExprNode::TPtr& node, TExprContext& ctx) {
     YQL_CLOG(DEBUG, Core) << "Expand " << node->Content();
 
-    const TTypeAnnotationNode* targetItemType = GetItemType(*node->GetTypeAnn());
+    const TTypeAnnotationNode* targetItemType = GetSeqItemType(node->GetTypeAnn());
     bool isSequence = true;
     if (!targetItemType) {
         targetItemType = node->GetTypeAnn();
@@ -1001,53 +1001,6 @@ void ExtractSimpleKeys(const TExprNode* keySelectorBody, const TExprNode* keySel
     } else if (keySelectorBody->IsCallable("Member") && keySelectorBody->Child(0) == keySelectorArg) {
         columns.push_back(keySelectorBody->Child(1)->Content());
     }
-}
-
-std::vector<std::pair<std::string_view, bool>> ExtractSimpleSortTraits(const TExprNode& sortDirections, const TExprNode& keySelectorLambda) {
-    const auto& keySelectorBody = keySelectorLambda.Tail();
-    const auto& keySelectorArg = keySelectorLambda.Head().Head();
-    std::vector<std::pair<std::string_view, bool>> columns;
-    if (sortDirections.IsCallable("Bool"))
-        columns.emplace_back(std::string_view(), IsTrue(sortDirections.Tail().Content()));
-    else if (sortDirections.IsList())
-        if (const auto size = keySelectorBody.ChildrenSize()) {
-            columns.reserve(size);
-            for (auto i = 0U; i < size; ++i)
-                if (const auto child = sortDirections.Child(i); child->IsCallable("Bool"))
-                    columns.emplace_back(std::string_view(), IsTrue(child->Tail().Content()));
-                else
-                    return {};
-        } else
-            return {};
-    else
-        return  {};
-
-    if (keySelectorBody.IsCallable("Member") && &keySelectorBody.Head() == &keySelectorArg)
-        if (columns.size() == 1U)
-            columns.front().first = keySelectorBody.Tail().Content();
-        else
-            return {};
-    else if (keySelectorBody.IsList())
-        if (const auto size = keySelectorBody.ChildrenSize()) {
-            std::unordered_set<std::string_view> set(size);
-            columns.resize(size, std::make_pair(std::string_view(), columns.back().second));
-            auto it = columns.begin();
-            for (auto i = 0U; i < columns.size(); ++i) {
-                if (const auto child = keySelectorBody.Child(i); child->IsCallable("Member") && &child->Head() == &keySelectorArg) {
-                    if (set.emplace(child->Tail().Content()).second)
-                        it++->first = child->Tail().Content();
-                    else if (columns.cend() != it)
-                        it = columns.erase(it);
-                } else {
-                    columns.resize(i);
-                }
-            }
-        } else
-            return {};
-    else
-        return {};
-
-    return columns;
 }
 
 const TExprNode& SkipCallables(const TExprNode& node, const std::initializer_list<std::string_view>& skipCallables) {
@@ -1575,7 +1528,7 @@ TVector<TStringBuf> GetCommonKeysFromVariantSelector(const NNodes::TCoLambda& la
 }
 
 bool IsIdentityLambda(const TExprNode& lambda) {
-    return lambda.IsLambda() && &lambda.Head().Head() == &lambda.Tail();
+    return lambda.IsLambda() && lambda.Head().ChildrenSize() == 1 && &lambda.Head().Head() == &lambda.Tail();
 }
 
 TExprNode::TPtr MakeExpandMap(TPositionHandle pos, const TVector<TString>& columns, const TExprNode::TPtr& input, TExprContext& ctx) {
@@ -1621,6 +1574,116 @@ TExprNode::TPtr MakeNarrowMap(TPositionHandle pos, const TVector<TString>& colum
             .Seal()
         .Seal()
         .Build();
+}
+
+TExprNode::TPtr FindNonYieldTransparentNodeImpl(const TExprNode::TPtr& root, const bool udfSupportsYield, const TNodeSet& flowSources) {
+    auto depensOnFlow = [&flowSources](const TExprNode::TPtr& node) {
+        return !!FindNode(node,
+            [](const TExprNode::TPtr& n) {
+                return !TCoDependsOn::Match(n.Get());
+            },
+            [&flowSources](const TExprNode::TPtr& n) {
+                return flowSources.contains(n.Get());
+            }
+        );
+    };
+
+    auto candidates = FindNodes(root,
+        [&flowSources](const TExprNode::TPtr& node) {
+            if (flowSources.contains(node.Get()) || TCoDependsOn::Match(node.Get())) {
+                return false;
+            }
+            if (node->ChildrenSize() > 0 && node->Head().GetTypeAnn()->GetKind() == ETypeAnnotationKind::World) {
+                return false;
+            }
+            return true;
+        },
+        [](const TExprNode::TPtr& node) {
+            return TCoCollect::Match(node.Get())
+                || TCoForwardList::Match(node.Get())
+                || TCoApply::Match(node.Get())
+                || TCoSwitch::Match(node.Get())
+                || node->IsCallable("DqReplicate");
+        }
+    );
+
+    for (auto candidate: candidates) {
+        if (TCoCollect::Match(candidate.Get()) || TCoForwardList::Match(candidate.Get())) {
+            if (depensOnFlow(candidate->HeadPtr())) {
+                return candidate;
+            }
+        } else if (TCoApply::Match(candidate.Get())) {
+            if (AnyOf(candidate->Children().begin() + 1, candidate->Children().end(), depensOnFlow)) {
+                if (!IsFlowOrStream(*candidate)) {
+                    while (TCoApply::Match(candidate.Get())) {
+                        candidate = candidate->HeadPtr();
+                    }
+                    return candidate;
+                }
+                if (!udfSupportsYield) {
+                    while (TCoApply::Match(candidate.Get())) {
+                        candidate = candidate->HeadPtr();
+                    }
+                    if (TCoScriptUdf::Match(candidate.Get())) {
+                        return candidate;
+                    }
+                }
+            }
+        } else if (TCoSwitch::Match(candidate.Get())) {
+            for (size_t i = 3; i < candidate->ChildrenSize(); i += 2) {
+                if (auto node = FindNonYieldTransparentNodeImpl(candidate->Child(i)->TailPtr(), udfSupportsYield, TNodeSet{&candidate->Child(i)->Head().Head()})) {
+                    return node;
+                }
+            }
+        } else if (candidate->IsCallable("DqReplicate")) {
+            for (size_t i = 1; i < candidate->ChildrenSize(); ++i) {
+                if (auto node = FindNonYieldTransparentNodeImpl(candidate->Child(i)->TailPtr(), udfSupportsYield, TNodeSet{&candidate->Child(i)->Head().Head()})) {
+                    return node;
+                }
+            }
+        }
+    }
+    return {};
+}
+
+TExprNode::TPtr FindNonYieldTransparentNode(const TExprNode::TPtr& root, const TTypeAnnotationContext& typeCtx) {
+    TNodeSet flowSources;
+    TExprNode::TPtr from = root;
+    if (root->IsLambda()) {
+        if (IsIdentityLambda(*root)) {
+            return {};
+        }
+        from = root->TailPtr();
+
+        // Add all flow lambda args
+        root->Head().ForEachChild([&flowSources](const TExprNode& arg) {
+            if (IsFlowOrStream(arg)) {
+                flowSources.insert(&arg);
+            }
+        });
+    }
+
+    static const THashSet<TStringBuf> WHITE_LIST = {"EmptyIterator"sv, TCoToStream::CallableName(), TCoIterator::CallableName(),
+        TCoToFlow::CallableName(), TCoApply::CallableName(), TCoNth::CallableName(), TCoMux::CallableName()};
+    // Find all other flow sources (readers)
+    auto sources = FindNodes(from,
+        [](const TExprNode::TPtr& node) {
+            return !node->IsCallable(WHITE_LIST)
+                && node->IsCallable()
+                && IsFlowOrStream(*node)
+                && (node->ChildrenSize() == 0 || !IsFlowOrStream(node->Head()));
+        }
+    );
+    std::for_each(sources.cbegin(), sources.cend(), [&flowSources](const TExprNode::TPtr& node) { flowSources.insert(node.Get()); });
+
+    if (flowSources.empty()) {
+        return {};
+    }
+    return FindNonYieldTransparentNodeImpl(from, typeCtx.UdfSupportsYield, flowSources);
+}
+
+bool IsYieldTransparent(const TExprNode::TPtr& root, const TTypeAnnotationContext& typeCtx) {
+    return !FindNonYieldTransparentNode(root, typeCtx);
 }
 
 }

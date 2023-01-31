@@ -958,16 +958,20 @@ ISubOperationBase::TPtr TOperation::RestorePart(TTxState::ETxType txType, TTxSta
         return CreateNewCdcStreamImpl(NextPartId(), txState);
     case TTxState::ETxType::TxCreateCdcStreamAtTable:
         return CreateNewCdcStreamAtTable(NextPartId(), txState, false);
-    case TTxState::ETxType::TxCreateCdcStreamAtTableWithSnapshot:
+    case TTxState::ETxType::TxCreateCdcStreamAtTableWithInitialScan:
         return CreateNewCdcStreamAtTable(NextPartId(), txState, true);
     case TTxState::ETxType::TxAlterCdcStream:
         return CreateAlterCdcStreamImpl(NextPartId(), txState);
     case TTxState::ETxType::TxAlterCdcStreamAtTable:
-        return CreateAlterCdcStreamAtTable(NextPartId(), txState);
+        return CreateAlterCdcStreamAtTable(NextPartId(), txState, false);
+    case TTxState::ETxType::TxAlterCdcStreamAtTableDropSnapshot:
+        return CreateAlterCdcStreamAtTable(NextPartId(), txState, true);
     case TTxState::ETxType::TxDropCdcStream:
         return CreateDropCdcStreamImpl(NextPartId(), txState);
     case TTxState::ETxType::TxDropCdcStreamAtTable:
-        return CreateDropCdcStreamAtTable(NextPartId(), txState);
+        return CreateDropCdcStreamAtTable(NextPartId(), txState, false);
+    case TTxState::ETxType::TxDropCdcStreamAtTableDropSnapshot:
+        return CreateDropCdcStreamAtTable(NextPartId(), txState, true);
 
     // Sequences
     case TTxState::ETxType::TxCreateSequence:

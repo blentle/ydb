@@ -203,7 +203,6 @@ protected:
         config.Opts->AddLongOption("cms-file", "CMS config file").OptionalArgument("PATH");
         config.Opts->AddLongOption("alloc-file", "Allocator config file").OptionalArgument("PATH");
         config.Opts->AddLongOption("yql-file", "Yql Analytics config file").OptionalArgument("PATH");
-        config.Opts->AddLongOption("yq-file", "Yandex Query config file (deprecated)").OptionalArgument("PATH");
         config.Opts->AddLongOption("fq-file", "Federated Query config file").OptionalArgument("PATH");
         config.Opts->AddLongOption("feature-flags-file", "File with feature flags to turn new features on/off").OptionalArgument("PATH");
         config.Opts->AddLongOption("rb-file", "File with resource broker customizations").OptionalArgument("PATH");
@@ -253,6 +252,12 @@ protected:
 
         config.Opts->AddLongOption("hierarchic-cfg", "Use hierarchical approach for configuration parts overriding")
         .NoArgument().SetFlag(&HierarchicalCfg);
+
+        config.Opts->AddLongOption("label", "labels for this node")
+            .Optional().RequiredArgument("KEY=VALUE")
+            .KVHandler([&](TString key, TString val) {
+                RunConfig.Labels[key] = val;
+            });
 
         config.SetFreeArgsMin(0);
         config.Opts->SetFreeArgDefaultTitle("PATH", "path to protobuf file; files are merged in order in which they are enlisted");
@@ -442,7 +447,6 @@ protected:
         OPTION("kqp-file", KQPConfig);
         OPTION("incrhuge-file", IncrHugeConfig);
         OPTION("alloc-file", AllocatorConfig);
-        OPTION("yq-file", FederatedQueryConfig); // TODO: remove after migration (YQ-1467)
         OPTION("fq-file", FederatedQueryConfig);
         OPTION(nullptr, TracingConfig);
         OPTION(nullptr, FailureInjectionConfig);
@@ -681,6 +685,13 @@ protected:
             messageBusConfig->SetStartTracingBusProxy(!!TracePath);
             messageBusConfig->SetTracePath(TracePath);
         }
+
+        RunConfig.Labels["node_id"] = ToString(NodeId);
+        RunConfig.Labels["node_host"] = FQDNHostName();
+        RunConfig.Labels["tenant"] = RunConfig.TenantName;
+        // will be replaced with proper version info
+        RunConfig.Labels["branch"] = GetBranch();
+        RunConfig.Labels["rev"] = ToString(GetProgramSvnRevision());
     }
 
     inline bool LoadConfigFromCMS() {

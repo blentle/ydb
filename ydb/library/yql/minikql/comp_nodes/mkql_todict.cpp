@@ -1,4 +1,5 @@
 #include "mkql_todict.h"
+#include "mkql_llvm_base.h"
 
 #include <ydb/library/yql/minikql/computation/mkql_computation_list_adapter.h>
 #include <ydb/library/yql/minikql/computation/mkql_computation_node_codegen.h>
@@ -24,12 +25,7 @@ using NYql::EnsureDynamicCast;
 namespace {
 
 class THashedMultiMapAccumulator {
-    using TMapType = std::unordered_map<
-        NUdf::TUnboxedValue,
-        TUnboxedValueVector,
-        NYql::TVaryingHash<NUdf::TUnboxedValue, TValueHasher>,
-        TValueEqual,
-        TMKQLAllocator<std::pair<const NUdf::TUnboxedValue, TUnboxedValueVector>>>;
+    using TMapType = TValuesDictHashMap;
 
     TComputationContext& Ctx;
     TType* KeyType;
@@ -62,30 +58,17 @@ public:
             key = MakeString(Packer->Pack(key));
         }
 
-        const auto ins = Map.emplace(std::move(key), 1U);
-        if (ins.second)
-            ins.first->second.front() = std::move(payload);
-        else
-            ins.first->second.emplace_back(std::move(payload));
+        auto it = Map.find(key);
+        if (it == Map.end()) {
+            it = Map.emplace(std::move(key), Ctx.HolderFactory.NewVectorHolder()).first;
+        }
+        it->second.Push(std::move(payload));
     }
 
     NUdf::TUnboxedValue Build()
     {
         const auto filler = [this](TValuesDictHashMap& targetMap) {
-            targetMap.reserve(Map.size());
-
-            for (auto& pair : Map) {
-                auto itemFactory = [](const NUdf::TUnboxedValuePod& value) {
-                    return value;
-                };
-
-                ui64 start = 0;
-                ui64 finish = pair.second.size();
-                auto payloadList = CreateOwningVectorListAdapter(std::move(pair.second), itemFactory,
-                    start, finish, false, Ctx.HolderFactory.GetMemInfo());
-
-                targetMap.emplace(pair.first, std::move(payloadList));
-            }
+            targetMap = std::move(Map);
         };
 
         return Ctx.HolderFactory.CreateDirectHashedDictHolder(filler, KeyTypes, IsTuple, true, Packer ? KeyType : nullptr, Hash, Equate);
@@ -141,23 +124,17 @@ public:
 
 template<typename T, bool OptionalKey>
 class THashedSingleFixedMultiMapAccumulator {
-    using TMapType = std::unordered_map<
-        T,
-        TUnboxedValueVector,
-        NYql::TVaryingHash<T, TMyHash<T>>,
-        TMyEquals<T>,
-        TMKQLAllocator<std::pair<const T, TUnboxedValueVector>>>;
+    using TMapType = TValuesDictHashSingleFixedMap<T>;
 
     TComputationContext& Ctx;
     const TKeyTypes& KeyTypes;
     TMapType Map;
     TUnboxedValueVector NullPayloads;
-
+    NUdf::TUnboxedValue CurrentEmptyVectorForInsert;
 public:
     THashedSingleFixedMultiMapAccumulator(TType* keyType, TType* payloadType, const TKeyTypes& keyTypes, bool isTuple, bool encoded,
         NUdf::ICompare::TPtr compare, NUdf::IEquate::TPtr equate, NUdf::IHash::TPtr hash, TComputationContext& ctx, ui64 itemsCountHint)
-        : Ctx(ctx), KeyTypes(keyTypes), Map(0, TMyHash<T>(), TMyEquals<T>())
-    {
+        : Ctx(ctx), KeyTypes(keyTypes), Map(0, TMyHash<T>(), TMyEquals<T>()) {
         Y_UNUSED(keyType);
         Y_UNUSED(payloadType);
         Y_UNUSED(isTuple);
@@ -166,52 +143,29 @@ public:
         Y_UNUSED(equate);
         Y_UNUSED(hash);
         Map.reserve(itemsCountHint);
+        CurrentEmptyVectorForInsert = Ctx.HolderFactory.NewVectorHolder();
     }
 
-    void Add(NUdf::TUnboxedValue&& key, NUdf::TUnboxedValue&& payload)
-    {
+    void Add(NUdf::TUnboxedValue&& key, NUdf::TUnboxedValue&& payload) {
         if constexpr (OptionalKey) {
             if (!key) {
                 NullPayloads.emplace_back(std::move(payload));
                 return;
             }
         }
-        const auto ins = Map.emplace(key.Get<T>(), 1U);
-        if (ins.second)
-            ins.first->second.front() = std::move(payload);
-        else
-            ins.first->second.emplace_back(std::move(payload));
+        auto insertInfo = Map.emplace(key.Get<T>(), CurrentEmptyVectorForInsert);
+        if (insertInfo.second) {
+            CurrentEmptyVectorForInsert = Ctx.HolderFactory.NewVectorHolder();
+        }
+        insertInfo.first->second.Push(payload.Release());
     }
 
-    NUdf::TUnboxedValue Build()
-    {
-        const auto filler = [this](TValuesDictHashMap& targetMap) {
-            targetMap.reserve(Map.size());
-
-            auto itemFactory = [](const NUdf::TUnboxedValuePod& value) {
-                return value;
-            };
-            for (auto& pair : Map) {
-                ui64 start = 0;
-                ui64 finish = pair.second.size();
-                auto payloadList = CreateOwningVectorListAdapter(std::move(pair.second), itemFactory,
-                    start, finish, false,
-                    Ctx.HolderFactory.GetMemInfo());
-
-                targetMap.emplace(NUdf::TUnboxedValuePod(pair.first), std::move(payloadList));
-            }
-            if constexpr (OptionalKey) {
-                if (!NullPayloads.empty()) {
-                    auto payloadList = CreateOwningVectorListAdapter(std::move(NullPayloads), itemFactory,
-                        /*start*/ 0, /*finish*/ NullPayloads.size(), /*reversed*/ false,
-                        Ctx.HolderFactory.GetMemInfo());
-
-                    targetMap.emplace(NUdf::TUnboxedValuePod(), std::move(payloadList));
-                }
-            }
-        };
-
-        return Ctx.HolderFactory.CreateDirectHashedDictHolder(filler, KeyTypes, false, true, nullptr, nullptr, nullptr);
+    NUdf::TUnboxedValue Build() {
+        std::optional<NUdf::TUnboxedValue> nullPayload;
+        if (NullPayloads.size()) {
+            nullPayload = Ctx.HolderFactory.VectorAsVectorHolder(std::move(NullPayloads));
+        }
+        return Ctx.HolderFactory.CreateDirectHashedSingleFixedMapHolder<T, OptionalKey>(std::move(Map), std::move(nullPayload));
     }
 };
 
@@ -861,6 +815,32 @@ private:
     bool UseIHash;
 };
 
+#ifndef MKQL_DISABLE_CODEGEN
+template <class TLLVMBase>
+class TLLVMFieldsStructureStateWithAccum: public TLLVMBase {
+private:
+    using TBase = TLLVMBase;
+    llvm::PointerType* StructPtrType;
+protected:
+    using TBase::Context;
+public:
+    std::vector<llvm::Type*> GetFieldsArray() {
+        std::vector<llvm::Type*> result = TBase::GetFields();
+        result.emplace_back(StructPtrType); //accumulator
+        return result;
+    }
+
+    llvm::Constant* GetAccumulator() {
+        return ConstantInt::get(Type::getInt32Ty(Context), TBase::GetFieldsCount() + 0);
+    }
+
+    TLLVMFieldsStructureStateWithAccum(llvm::LLVMContext& context)
+        : TBase(context)
+        , StructPtrType(PointerType::getUnqual(StructType::get(context))) {
+    }
+};
+#endif
+
 template <typename TSetAccumulator>
 class TSqueezeSetFlowWrapper : public TStatefulFlowCodegeneratorNode<TSqueezeSetFlowWrapper<TSetAccumulator>> {
     using TBase = TStatefulFlowCodegeneratorNode<TSqueezeSetFlowWrapper<TSetAccumulator>>;
@@ -868,6 +848,7 @@ public:
     class TState : public TComputationValue<TState> {
         using TBase = TComputationValue<TState>;
     public:
+        using TLLVMBase = TLLVMFieldsStructure<TBase>;
         TState(TMemoryUsageInfo* memInfo, TSetAccumulator&& setAccum)
             : TBase(memInfo), SetAccum(std::move(setAccum)) {}
 
@@ -926,14 +907,8 @@ public:
         const auto valueType = Type::getInt128Ty(context);
         const auto structPtrType = PointerType::getUnqual(StructType::get(context));
 
-        const auto stateType = StructType::get(context, {
-            structPtrType,              // vtbl
-            Type::getInt32Ty(context),  // ref
-            Type::getInt16Ty(context),  // abi
-            Type::getInt16Ty(context),  // reserved
-            structPtrType,              // meminfo
-            structPtrType               // accumulator
-        });
+        TLLVMFieldsStructureStateWithAccum<typename TState::TLLVMBase> fieldsStruct(context);
+        const auto stateType = StructType::get(context, fieldsStruct.GetFieldsArray());
 
         const auto statePtrType = PointerType::getUnqual(stateType);
 
@@ -1053,6 +1028,7 @@ public:
     class TState : public TComputationValue<TState> {
         using TBase = TComputationValue<TState>;
     public:
+        using TLLVMBase = TLLVMFieldsStructure<TBase>;
         TState(TMemoryUsageInfo* memInfo, TSetAccumulator&& setAccum)
             : TBase(memInfo), SetAccum(std::move(setAccum)) {}
 
@@ -1117,14 +1093,8 @@ public:
         const auto valueType = Type::getInt128Ty(context);
         const auto structPtrType = PointerType::getUnqual(StructType::get(context));
 
-        const auto stateType = StructType::get(context, {
-            structPtrType,              // vtbl
-            Type::getInt32Ty(context),  // ref
-            Type::getInt16Ty(context),  // abi
-            Type::getInt16Ty(context),  // reserved
-            structPtrType,              // meminfo
-            structPtrType               // accumulator
-        });
+        TLLVMFieldsStructureStateWithAccum<typename TState::TLLVMBase> fieldsStruct(context);
+        const auto stateType = StructType::get(context, fieldsStruct.GetFieldsArray());
 
         const auto statePtrType = PointerType::getUnqual(stateType);
 
@@ -1376,6 +1346,7 @@ public:
     class TState : public TComputationValue<TState> {
         using TBase = TComputationValue<TState>;
     public:
+        using TLLVMBase = TLLVMFieldsStructure<TBase>;
         TState(TMemoryUsageInfo* memInfo, TMapAccumulator&& mapAccum)
             : TBase(memInfo), MapAccum(std::move(mapAccum)) {}
 
@@ -1436,15 +1407,8 @@ public:
 
         const auto valueType = Type::getInt128Ty(context);
         const auto structPtrType = PointerType::getUnqual(StructType::get(context));
-
-        const auto stateType = StructType::get(context, {
-            structPtrType,              // vtbl
-            Type::getInt32Ty(context),  // ref
-            Type::getInt16Ty(context),  // abi
-            Type::getInt16Ty(context),  // reserved
-            structPtrType,              // meminfo
-            structPtrType               // accumulator
-        });
+        TLLVMFieldsStructureStateWithAccum<typename TState::TLLVMBase> fieldsStruct(context);
+        const auto stateType = StructType::get(context, fieldsStruct.GetFieldsArray());
 
         const auto statePtrType = PointerType::getUnqual(stateType);
 
@@ -1569,6 +1533,7 @@ public:
     class TState : public TComputationValue<TState> {
         using TBase = TComputationValue<TState>;
     public:
+        using TLLVMBase = TLLVMFieldsStructure<TBase>;
         TState(TMemoryUsageInfo* memInfo, TMapAccumulator&& mapAccum)
             : TBase(memInfo), MapAccum(std::move(mapAccum)) {}
 
@@ -1637,14 +1602,8 @@ public:
         const auto valueType = Type::getInt128Ty(context);
         const auto structPtrType = PointerType::getUnqual(StructType::get(context));
 
-        const auto stateType = StructType::get(context, {
-            structPtrType,              // vtbl
-            Type::getInt32Ty(context),  // ref
-            Type::getInt16Ty(context),  // abi
-            Type::getInt16Ty(context),  // reserved
-            structPtrType,              // meminfo
-            structPtrType               // accumulator
-        });
+        TLLVMFieldsStructureStateWithAccum<typename TState::TLLVMBase> fieldsStruct(context);
+        const auto stateType = StructType::get(context, fieldsStruct.GetFieldsArray());
 
         const auto statePtrType = PointerType::getUnqual(stateType);
 

@@ -20,12 +20,29 @@ void TDSAccessorBase::Handle(TEvYQLResponse::TPtr& ev) {
     auto& currentFullReply = ev->Get()->GetResponse();
     Ydb::Table::ExecuteQueryResult qResult;
     currentFullReply.operation().result().UnpackTo(&qResult);
-    Y_VERIFY((size_t)qResult.result_sets().size() == SnapshotConstructor->GetManagers().size());
-    auto parsedSnapshot = SnapshotConstructor->ParseSnapshot(qResult, RequestedActuality);
+
+    auto& managers = SnapshotConstructor->GetManagers();
+    Y_VERIFY(managers.size());
+    Ydb::Table::ExecuteQueryResult qResultFull;
+    ui32 replyIdx = 0;
+    for (auto&& i : managers) {
+        auto it = CurrentExistence.find(i->GetStorageTablePath());
+        Y_VERIFY(it != CurrentExistence.end());
+        Y_VERIFY(it->second);
+        if (it->second == 1) {
+            *qResultFull.add_result_sets() = std::move(qResult.result_sets()[replyIdx]);
+            ++replyIdx;
+        } else {
+            qResultFull.add_result_sets();
+        }
+    }
+    Y_VERIFY((int)replyIdx == qResult.result_sets().size());
+    Y_VERIFY((size_t)qResultFull.result_sets().size() == SnapshotConstructor->GetManagers().size());
+    auto parsedSnapshot = SnapshotConstructor->ParseSnapshot(qResultFull, RequestedActuality);
     if (!parsedSnapshot) {
         OnIncorrectSnapshotFromYQL("snapshot is null after parsing");
     } else {
-        OnNewParsedSnapshot(std::move(qResult), parsedSnapshot);
+        OnNewParsedSnapshot(std::move(qResultFull), parsedSnapshot);
     }
 }
 
@@ -43,13 +60,72 @@ void TDSAccessorBase::Handle(TEvEnrichSnapshotProblem::TPtr& ev) {
     OnSnapshotEnrichingError(ev->Get()->GetErrorText());
 }
 
+void TDSAccessorBase::Handle(TEvRecheckExistence::TPtr& ev) {
+    Register(new TTableExistsActor(InternalController, ev->Get()->GetPath(), TDuration::Seconds(5)));
+}
+
+void TDSAccessorBase::Handle(TTableExistsActor::TEvController::TEvError::TPtr& ev) {
+    ALS_ERROR(NKikimrServices::METADATA_PROVIDER) << "cannot detect path existence: " << ev->Get()->GetPath() << "/" << ev->Get()->GetErrorMessage();
+    Schedule(TDuration::Seconds(1), new TEvRecheckExistence(ev->Get()->GetPath()));
+}
+
+void TDSAccessorBase::Handle(TTableExistsActor::TEvController::TEvResult::TPtr& ev) {
+    auto it = ExistenceChecks.find(ev->Get()->GetTablePath());
+    Y_VERIFY(it != ExistenceChecks.end());
+    if (ev->Get()->IsTableExists()) {
+        it->second = 1;
+    } else {
+        it->second = -1;
+    }
+    bool hasExists = false;
+    for (auto&& i : ExistenceChecks) {
+        if (i.second == 0) {
+            return;
+        }
+        if (i.second == 1) {
+            hasExists = true;
+        }
+    }
+    if (!hasExists) {
+        OnNewEnrichedSnapshot(SnapshotConstructor->CreateEmpty(RequestedActuality));
+    } else {
+        StartSnapshotsFetchingImpl();
+    }
+}
+
 void TDSAccessorBase::StartSnapshotsFetching() {
+    RequestedActuality = TInstant::Now();
+    auto& managers = SnapshotConstructor->GetManagers();
+    Y_VERIFY(managers.size());
+    bool hasExistsCheckers = false;
+    for (auto&& i : managers) {
+        auto it = ExistenceChecks.find(i->GetStorageTablePath());
+        if (it == ExistenceChecks.end() || it->second == -1) {
+            Register(new TTableExistsActor(InternalController, i->GetStorageTablePath(), TDuration::Seconds(5)));
+            hasExistsCheckers = true;
+            ExistenceChecks[i->GetStorageTablePath()] = 0;
+        } else if (it->second == 0) {
+            hasExistsCheckers = true;
+        }
+    }
+    if (!hasExistsCheckers) {
+        StartSnapshotsFetchingImpl();
+    }
+}
+
+void TDSAccessorBase::StartSnapshotsFetchingImpl() {
     TStringBuilder sb;
     RequestedActuality = TInstant::Now();
     auto& managers = SnapshotConstructor->GetManagers();
     Y_VERIFY(managers.size());
+    CurrentExistence = ExistenceChecks;
     for (auto&& i : managers) {
-        sb << "SELECT * FROM `" + EscapeC(i->GetStorageTablePath()) + "`;";
+        auto it = CurrentExistence.find(i->GetStorageTablePath());
+        Y_VERIFY(it != CurrentExistence.end());
+        Y_VERIFY(it->second);
+        if (it->second == 1) {
+            sb << "SELECT * FROM `" + EscapeC(i->GetStorageTablePath()) + "`;" << Endl;
+        }
     }
     Register(new NRequest::TYQLQuerySessionedActor(sb, NACLib::TSystemUsers::Metadata(), Config, InternalController));
 }

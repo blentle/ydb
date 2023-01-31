@@ -48,6 +48,7 @@ namespace NActors {
         ui32 MaxSerializedEventSize = NActors::EventMaxByteSize;
         ui32 PreallocatedBufferSize = 8 << 10; // 8 KB
         ui32 NumPreallocatedBuffers = 16;
+        bool EnableExternalDataChannel = false;
 
         ui32 GetSendBufferSize() const {
             ui32 res = 512 * 1024; // 512 kb is the default value for send buffer
@@ -100,7 +101,11 @@ namespace NActors {
             TSet<TString> AcceptedTags; // we accept all enlisted version tags of peer nodes, but no others; empty = accept all
         };
 
+        // obsolete compatibility control
         TMaybe<TVersionInfo> VersionInfo;
+
+        std::optional<TString> CompatibilityInfo;
+        std::function<bool(const TString&, TString&)> ValidateCompatibilityInfo;
 
         using TPtr = TIntrusivePtr<TInterconnectProxyCommon>;
     };

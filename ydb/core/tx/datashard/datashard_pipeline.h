@@ -230,6 +230,7 @@ public:
     TOperation::TPtr FindOp(ui64 txId);
 
     TOperation::TPtr GetActiveOp(ui64 txId);
+    TOperation::TPtr GetVolatileOp(ui64 txId);
     const TMap<TStepOrder, TOperation::TPtr> &GetActiveOps() const { return ActiveOps; }
 
     void AddActiveOp(TOperation::TPtr op);
@@ -298,7 +299,7 @@ public:
     }
 
     ui64 GetDataTxCacheSize() const { return DataTxCache.size(); }
-    const TMap<TStepOrder, THolder<IEventHandle>> &GetDelayedAcks() const
+    const TMap<TStepOrder, TStackVec<THolder<IEventHandle>, 1>> &GetDelayedAcks() const
     {
         return DelayedAcks;
     }
@@ -453,7 +454,7 @@ private:
     TSortedOps::iterator ActivePlannedOpsLogicallyCompleteEnd;
     TSortedOps::iterator ActivePlannedOpsLogicallyIncompleteEnd;
     THashMap<ui64, TValidatedDataTx::TPtr> DataTxCache;
-    TMap<TStepOrder, THolder<IEventHandle>> DelayedAcks;
+    TMap<TStepOrder, TStackVec<THolder<IEventHandle>, 1>> DelayedAcks;
     TStepOrder LastPlannedTx;
     TStepOrder LastCompleteTx;
     TStepOrder UtmostCompleteTx;

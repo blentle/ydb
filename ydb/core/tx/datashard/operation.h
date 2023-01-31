@@ -445,11 +445,13 @@ struct TOutputOpData {
     using TDelayedAcks = TVector<THolder<IEventHandle>>;
     using TOutReadSets = TMap<std::pair<ui64, ui64>, TString>; // source:target -> body
     using TChangeRecord = NMiniKQL::IChangeCollector::TChange;
+    using TExpectedReadSets = TMap<std::pair<ui64, ui64>, TStackVec<TActorId, 1>>;
 
     TResultPtr Result;
     // ACKs to send on successful operation completion.
     TDelayedAcks DelayedAcks;
     TOutReadSets OutReadSets;
+    TExpectedReadSets ExpectedReadSets;
     TVector<THolder<TEvTxProcessing::TEvReadSet>> PreparedOutReadSets;
     // Access log of checked locks
     TLocksCache LocksAccessLog;
@@ -598,6 +600,7 @@ public:
     ////////////////////////////////////////
     //            OUTPUT DATA             //
     ////////////////////////////////////////
+    bool HasOutputData() { return bool(OutputData); }
     TOutputOpData::TResultPtr &Result() { return OutputDataRef().Result; }
 
     TOutputOpData::TDelayedAcks &DelayedAcks() { return OutputDataRef().DelayedAcks; }
@@ -607,6 +610,7 @@ public:
     }
 
     TOutputOpData::TOutReadSets &OutReadSets() { return OutputDataRef().OutReadSets; }
+    TOutputOpData::TExpectedReadSets &ExpectedReadSets() { return OutputDataRef().ExpectedReadSets; }
     TVector<THolder<TEvTxProcessing::TEvReadSet>> &PreparedOutReadSets()
     {
         return OutputDataRef().PreparedOutReadSets;
@@ -647,6 +651,9 @@ public:
     const NFH::TFlatHashSet<TOperation::TPtr> &GetSpecialDependencies() const { return SpecialDependencies; }
     const NFH::TFlatHashSet<TOperation::TPtr> &GetPlannedConflicts() const { return PlannedConflicts; }
     const NFH::TFlatHashSet<TOperation::TPtr> &GetImmediateConflicts() const { return ImmediateConflicts; }
+    const absl::flat_hash_set<ui64> &GetVolatileDependencies() const { return VolatileDependencies; }
+    bool HasVolatileDependencies() const { return !VolatileDependencies.empty(); }
+    bool GetVolatileDependenciesAborted() const { return VolatileDependenciesAborted; }
 
     void AddDependency(const TOperation::TPtr &op);
     void AddSpecialDependency(const TOperation::TPtr &op);
@@ -660,6 +667,10 @@ public:
     void ClearImmediateConflicts();
     void ClearSpecialDependents();
     void ClearSpecialDependencies();
+
+    void AddVolatileDependency(ui64 txId);
+    void RemoveVolatileDependency(ui64 txId, bool success);
+    void ClearVolatileDependenciesAborted() { VolatileDependenciesAborted = false; }
 
     TString DumpDependencies() const;
 
@@ -798,7 +809,6 @@ protected:
             OutputData = MakeHolder<TOutputOpData>();
         return *OutputData;
     }
-    void ClearOutputData() { OutputData = nullptr; }
 
     TInputOpData &InputDataRef()
     {
@@ -828,6 +838,8 @@ private:
     NFH::TFlatHashSet<TOperation::TPtr> SpecialDependencies;
     NFH::TFlatHashSet<TOperation::TPtr> PlannedConflicts;
     NFH::TFlatHashSet<TOperation::TPtr> ImmediateConflicts;
+    absl::flat_hash_set<ui64> VolatileDependencies;
+    bool VolatileDependenciesAborted = false;
     TVector<EExecutionUnitKind> ExecutionPlan;
     // Index of current execution unit.
     size_t CurrentUnit;

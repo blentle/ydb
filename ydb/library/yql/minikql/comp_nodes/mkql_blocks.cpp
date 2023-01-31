@@ -30,7 +30,7 @@ public:
 
     NUdf::TUnboxedValuePod DoCalculate(TComputationContext& ctx) const {
         const auto maxLen = CalcBlockLen(CalcMaxBlockItemSize(ItemType_));
-        auto builder = MakeBlockBuilder(ItemType_, ctx.ArrowMemoryPool, maxLen);
+        auto builder = MakeArrayBuilder(TTypeInfoHelper(), ItemType_, ctx.ArrowMemoryPool, maxLen);
 
         for (size_t i = 0; i < builder->MaxLength(); ++i) {
             auto result = Flow_->GetValue(ctx);
@@ -43,7 +43,7 @@ public:
             builder->Add(result);
         }
 
-        return builder->Build(ctx, true);
+        return ctx.HolderFactory.CreateArrowBlock(builder->Build(true));
     }
 
 private:
@@ -98,7 +98,7 @@ public:
 
         for (size_t i = 0; i < Width_; ++i) {
             if (auto* out = output[i]; out != nullptr) {
-                *out = s.Builders_[i]->Build(ctx, s.IsFinished_);
+                *out = ctx.HolderFactory.CreateArrowBlock(s.Builders_[i]->Build(s.IsFinished_));
             }
         }
 
@@ -114,7 +114,7 @@ private:
     struct TState : public TComputationValue<TState> {
         std::vector<NUdf::TUnboxedValue> Values_;
         std::vector<NUdf::TUnboxedValue*> ValuePointers_;
-        std::vector<std::unique_ptr<IBlockBuilder>> Builders_;
+        std::vector<std::unique_ptr<IArrayBuilder>> Builders_;
         size_t MaxLength_;
         size_t Rows_ = 0;
         bool IsFinished_ = false;
@@ -132,7 +132,7 @@ private:
 
             for (size_t i = 0; i < types.size(); ++i) {
                 ValuePointers_[i] = &Values_[i];
-                Builders_.push_back(MakeBlockBuilder(types[i], ctx.ArrowMemoryPool, MaxLength_));
+                Builders_.push_back(MakeArrayBuilder(TTypeInfoHelper(), types[i], ctx.ArrowMemoryPool, MaxLength_));
             }
         }
     };
@@ -169,7 +169,7 @@ public:
         auto& state = GetState(ctx);
 
         for (;;) {
-            auto item = state.GetValue();
+            auto item = state.GetValue(ctx);
             if (item) {
                 return *item;
             }
@@ -190,23 +190,45 @@ private:
     struct TState : public TComputationValue<TState> {
         using TComputationValue::TComputationValue;
 
-        TState(TMemoryUsageInfo* memInfo, TType* itemType, TComputationContext& ctx)
+        TState(TMemoryUsageInfo* memInfo, TType* itemType)
             : TComputationValue(memInfo)
-            , Reader_(MakeBlockReader(itemType, ctx.HolderFactory))
+            , Reader_(MakeBlockReader(TTypeInfoHelper(), itemType))
+            , Converter_(MakeBlockItemConverter(TTypeInfoHelper(), itemType))
         {
         }
 
-        TMaybe<NUdf::TUnboxedValuePod> GetValue() const {
-            return Reader_->GetNextValue();
+        TMaybe<NUdf::TUnboxedValuePod> GetValue(TComputationContext& ctx) {
+            for (;;) {
+                if (Arrays_.empty()) {
+                    return {};
+                }
+                if (Index_ < Arrays_.front()->length) {
+                    break;
+                }
+                Index_ = 0;
+                Arrays_.pop_front();
+            }
+            return Converter_->MakeValue(Reader_->GetItem(*Arrays_.front(), Index_++), ctx.HolderFactory);
         }
 
-        void Reset(const arrow::Datum& datum) const {
+        void Reset(const arrow::Datum& datum) {
             MKQL_ENSURE(datum.is_arraylike(), "Expecting array as FromBlocks argument");
-            Reader_->Reset(datum);
+            MKQL_ENSURE(Arrays_.empty(), "Not all input is processed");
+            if (datum.is_array()) {
+                Arrays_.push_back(datum.array());
+            } else {
+                for (auto& chunk : datum.chunks()) {
+                    Arrays_.push_back(chunk->data());
+                }
+            }
+            Index_ = 0;
         }
 
     private:
         const std::unique_ptr<IBlockReader> Reader_;
+        const std::unique_ptr<IBlockItemConverter> Converter_;
+        TDeque<std::shared_ptr<arrow::ArrayData>> Arrays_;
+        size_t Index_ = 0;
     };
 
 private:
@@ -217,7 +239,7 @@ private:
     TState& GetState(TComputationContext& ctx) const {
         auto& result = ctx.MutableValues[StateIndex_];
         if (!result.HasValue()) {
-            result = ctx.HolderFactory.Create<TState>(ItemType_, ctx);
+            result = ctx.HolderFactory.Create<TState>(ItemType_);
         }
         return *static_cast<TState*>(result.AsBoxed().Get());
     }
@@ -252,11 +274,6 @@ public:
             }
 
             s.Index_ = 0;
-            for (size_t i = 0; i < Width_; ++i) {
-                const auto& datum = TArrowBlock::From(s.Values_[i]).GetDatum();
-                s.Readers_[i]->Reset(datum);
-            }
-
             s.Count_ = TArrowBlock::From(s.Values_[Width_]).GetDatum().scalar_as<arrow::UInt64Scalar>().value;
         }
 
@@ -265,9 +282,16 @@ public:
                 continue;
             }
 
-            auto result = s.Readers_[i]->GetNextValue();
-            Y_VERIFY(result);
-            *(output[i]) = *result;
+            const auto& datum = TArrowBlock::From(s.Values_[i]).GetDatum();
+            TBlockItem item;
+            if (datum.is_scalar()) {
+                item = s.Readers_[i]->GetScalarItem(*datum.scalar());
+            } else {
+                MKQL_ENSURE(datum.is_array(), "Expecting array");
+                item = s.Readers_[i]->GetItem(*datum.array(), s.Index_);
+            }
+
+            *(output[i]) = s.Converters_[i]->MakeValue(item, ctx.HolderFactory);
         }
 
         ++s.Index_;
@@ -279,10 +303,11 @@ private:
         TVector<NUdf::TUnboxedValue> Values_;
         TVector<NUdf::TUnboxedValue*> ValuePointers_;
         TVector<std::unique_ptr<IBlockReader>> Readers_;
+        TVector<std::unique_ptr<IBlockItemConverter>> Converters_;
         size_t Count_ = 0;
         size_t Index_ = 0;
 
-        TState(TMemoryUsageInfo* memInfo, const TVector<TType*>& types, TComputationContext& ctx)
+        TState(TMemoryUsageInfo* memInfo, const TVector<TType*>& types)
             : TComputationValue(memInfo)
             , Values_(types.size() + 1)
             , ValuePointers_(types.size() + 1)
@@ -292,7 +317,8 @@ private:
             }
 
             for (size_t i = 0; i < types.size(); ++i) {
-                Readers_.push_back(MakeBlockReader(types[i], ctx.HolderFactory));
+                Readers_.push_back(MakeBlockReader(TTypeInfoHelper(), types[i]));
+                Converters_.push_back(MakeBlockItemConverter(TTypeInfoHelper(), types[i]));
             }
         }
     };
@@ -304,7 +330,7 @@ private:
 
     TState& GetState(NUdf::TUnboxedValue& state, TComputationContext& ctx) const {
         if (!state.HasValue()) {
-            state = ctx.HolderFactory.Create<TState>(Types_, ctx);
+            state = ctx.HolderFactory.Create<TState>(Types_);
         }
         return *static_cast<TState*>(state.AsBoxed().Get());
     }

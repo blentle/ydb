@@ -116,8 +116,10 @@ struct TTxState {
         item(TxDropBlobDepot, 70) \
         item(TxUpdateMainTableOnIndexMove, 71) \
         item(TxAllocatePQ, 72) \
-        item(TxCreateCdcStreamAtTableWithSnapshot, 73) \
+        item(TxCreateCdcStreamAtTableWithInitialScan, 73) \
         item(TxAlterExtSubDomainCreateHive, 74) \
+        item(TxAlterCdcStreamAtTableDropSnapshot, 75) \
+        item(TxDropCdcStreamAtTableDropSnapshot, 76) \
 
     // TX_STATE_TYPE_ENUM
 
@@ -328,7 +330,7 @@ struct TTxState {
             return true;
         case TxInitializeBuildIndex: //this is more like alter
         case TxCreateCdcStreamAtTable:
-        case TxCreateCdcStreamAtTableWithSnapshot:
+        case TxCreateCdcStreamAtTableWithInitialScan:
             return false;
         case TxCreateLock: //this is more like alter
         case TxDropLock: //this is more like alter
@@ -350,6 +352,7 @@ struct TTxState {
         case TxDropTableIndexAtMainTable:
         case TxDropCdcStream:
         case TxDropCdcStreamAtTable:
+        case TxDropCdcStreamAtTableDropSnapshot:
         case TxDropSequence:
         case TxDropReplication:
         case TxDropBlobDepot:
@@ -378,6 +381,7 @@ struct TTxState {
         case TxAlterSolomonVolume:
         case TxAlterCdcStream:
         case TxAlterCdcStreamAtTable:
+        case TxAlterCdcStreamAtTableDropSnapshot:
         case TxAlterSequence:
         case TxAlterReplication:
         case TxAlterBlobDepot:
@@ -429,7 +433,7 @@ struct TTxState {
         case TxFillIndex:
         case TxCreateCdcStream:
         case TxCreateCdcStreamAtTable:
-        case TxCreateCdcStreamAtTableWithSnapshot:
+        case TxCreateCdcStreamAtTableWithInitialScan:
         case TxCreateSequence:
         case TxCreateReplication:
         case TxCreateBlobDepot:
@@ -439,6 +443,7 @@ struct TTxState {
         case TxFinalizeBuildIndex:
         case TxDropTableIndexAtMainTable: // just increments schemaversion at main table
         case TxDropCdcStreamAtTable:
+        case TxDropCdcStreamAtTableDropSnapshot:
         case TxUpdateMainTableOnIndexMove:
             return false;
         case TxAlterPQGroup:
@@ -464,6 +469,7 @@ struct TTxState {
         case TxAlterSolomonVolume:
         case TxAlterCdcStream:
         case TxAlterCdcStreamAtTable:
+        case TxAlterCdcStreamAtTableDropSnapshot:
         case TxAlterSequence:
         case TxAlterReplication:
         case TxAlterBlobDepot:
@@ -518,7 +524,7 @@ struct TTxState {
         case TxCreateTableIndex:
         case TxCreateCdcStream:
         case TxCreateCdcStreamAtTable:
-        case TxCreateCdcStreamAtTableWithSnapshot:
+        case TxCreateCdcStreamAtTableWithInitialScan:
         case TxCreateSequence:
         case TxCreateReplication:
         case TxCreateBlobDepot:
@@ -527,6 +533,7 @@ struct TTxState {
         case TxDropLock:
         case TxDropTableIndexAtMainTable:
         case TxDropCdcStreamAtTable:
+        case TxDropCdcStreamAtTableDropSnapshot:
         case TxUpdateMainTableOnIndexMove:
             return false;
         case TxAlterPQGroup:
@@ -551,6 +558,7 @@ struct TTxState {
         case TxAlterSolomonVolume:
         case TxAlterCdcStream:
         case TxAlterCdcStreamAtTable:
+        case TxAlterCdcStreamAtTableDropSnapshot:
         case TxMoveTable:
         case TxMoveTableIndex:
         case TxAlterSequence:

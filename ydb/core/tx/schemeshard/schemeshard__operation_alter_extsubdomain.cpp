@@ -515,11 +515,11 @@ class TAlterExtSubDomainCreateHive: public TSubOperation {
         switch(state) {
         case TTxState::Waiting:
         case TTxState::CreateParts:
-            return THolder(new TCreateHive(OperationId));
+            return MakeHolder<TCreateHive>(OperationId);
         case TTxState::Propose:
-            return THolder(new TEmptyPropose(OperationId));
+            return MakeHolder<TEmptyPropose>(OperationId);
         case TTxState::Done:
-            return THolder(new TDone(OperationId));
+            return MakeHolder<TDone>(OperationId);
         default:
             return nullptr;
         }
@@ -570,7 +570,7 @@ public:
         TTxState& txState = context.SS->CreateTx(OperationId, TTxState::TxAlterExtSubDomainCreateHive, basenameId);
 
         // Create subdomain alter
-        TSubDomainInfo::TPtr alter = new TSubDomainInfo(*subdomainInfo, 0, 0);
+        TSubDomainInfo::TPtr alter = new TSubDomainInfo(*subdomainInfo, 0, 0, delta.StoragePoolsAdded);
 
         LOG_D("TAlterExtSubDomainCreateHive Propose"
             << ", opId: " << OperationId
@@ -583,7 +583,7 @@ public:
         // Create shard for the hive to-be.
         {
             TChannelsBindings channelsBinding;
-            if (!context.SS->ResolveSubdomainsChannels(delta.StoragePoolsAdded, channelsBinding)) {
+            if (!context.SS->ResolveSubdomainsChannels(alter->GetStoragePools(), channelsBinding)) {
                 result->SetError(NKikimrScheme::StatusInvalidParameter, "failed to construct channels binding");
                 return result;
             }
@@ -692,15 +692,15 @@ class TAlterExtSubDomain: public TSubOperation {
     TSubOperationState::TPtr SelectStateFunc(TTxState::ETxState state) override {
         switch(state) {
         case TTxState::Waiting:
-            return THolder(new TWaitHiveCreated(OperationId));
+            return MakeHolder<TWaitHiveCreated>(OperationId);
         case TTxState::CreateParts:
-            return THolder(new TCreateParts(OperationId));
+            return MakeHolder<TCreateParts>(OperationId);
         case TTxState::ConfigureParts:
-            return THolder(new NSubDomainState::TConfigureParts(OperationId));
+            return MakeHolder<NSubDomainState::TConfigureParts>(OperationId);
         case TTxState::Propose:
-            return THolder(new NSubDomainState::TPropose(OperationId));
+            return MakeHolder<NSubDomainState::TPropose>(OperationId);
         case TTxState::Done:
-            return THolder(new TDone(OperationId));
+            return MakeHolder<TDone>(OperationId);
         default:
             return nullptr;
         }
@@ -950,9 +950,6 @@ TVector<ISubOperationBase::TPtr> CreateCompatibleAlterExtSubDomain(TOperationId 
         TString explain;
         if (!context.SS->CheckApplyIf(tx, explain)) {
             return errorResult(NKikimrScheme::StatusPreconditionFailed, explain);
-        }
-        if (!context.SS->CheckInFlightLimit(TTxState::TxAlterExtSubDomain, explain)) {
-            return errorResult(NKikimrScheme::StatusResourceExhausted, explain);
         }
     }
 

@@ -431,6 +431,23 @@ namespace NKikimr::NBsController {
         }
     }
 
+    void TBlobStorageController::TConfigState::ExecuteStep(const NKikimrBlobStorage::TReadSettings& /*cmd*/, TStatus& status) {
+        auto settings = status.MutableSettings();
+
+        settings->AddDefaultMaxSlots(Self.DefaultMaxSlots);
+        settings->AddEnableSelfHeal(Self.SelfHealEnable);
+        settings->AddEnableDonorMode(Self.DonorMode);
+        settings->AddScrubPeriodicitySeconds(Self.ScrubPeriodicity.Seconds());
+        settings->AddPDiskSpaceMarginPromille(Self.PDiskSpaceMarginPromille);
+        settings->AddGroupReserveMin(Self.GroupReserveMin);
+        settings->AddGroupReservePartPPM(Self.GroupReservePart);
+        settings->AddMaxScrubbedDisksAtOnce(Self.MaxScrubbedDisksAtOnce);
+        settings->AddPDiskSpaceColorBorder(Self.PDiskSpaceColorBorder);
+        settings->AddEnableGroupLayoutSanitizer(Self.GroupLayoutSanitizer);
+        // TODO:
+        // settings->AddSerialManagementStage(Self.SerialManagementStage);
+    }
+
     void TBlobStorageController::TConfigState::ExecuteStep(const NKikimrBlobStorage::TQueryBaseConfig& /*cmd*/, TStatus& status) {
         NKikimrBlobStorage::TBaseConfig *pb = status.MutableBaseConfig();
         PDisks.ForEach([&](const TPDiskId& pdiskId, const TPDiskInfo& pdiskInfo) {
@@ -520,6 +537,14 @@ namespace NKikimr::NBsController {
 
             auto& node = nodes[record.NodeId];
             node.SetNodeId(record.NodeId);
+            auto config = AppData()->DynamicNameserviceConfig;
+            if (config && record.NodeId <= config->MaxStaticNodeId) {
+                node.SetType(NKikimrBlobStorage::NT_STATIC);
+            } else if (config && record.NodeId <= config->MaxDynamicNodeId) {
+                node.SetType(NKikimrBlobStorage::NT_DYNAMIC);
+            } else {
+                node.SetType(NKikimrBlobStorage::NT_UNKNOWN);
+            }
             node.SetPhysicalLocation(s.Str());
             record.Location.Serialize(node.MutableLocation(), false); // this field has been introduced recently, so it doesn't have compatibility format
             const auto& nodes = Nodes.Get();

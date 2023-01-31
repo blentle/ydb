@@ -4,6 +4,8 @@
 #include <ydb/core/kqp/gateway/kqp_gateway.h>
 #include <ydb/core/kqp/provider/yql_kikimr_provider.h>
 
+#include <ydb/core/util/ulid.h>
+
 #include <ydb/library/mkql_proto/protos/minikql.pb.h>
 
 #include <library/cpp/actors/core/actorid.h>
@@ -68,11 +70,11 @@ struct TKqpTxLocks {
 };
 
 struct TDeferredEffect {
-    std::shared_ptr<const NKqpProto::TKqpPhyTx> PhysicalTx;
+    TKqpPhyTxHolder::TConstPtr PhysicalTx;
     TQueryData::TPtr Params;
 
-    explicit TDeferredEffect(std::shared_ptr<const NKqpProto::TKqpPhyTx>&& physicalTx)
-        : PhysicalTx(std::move(physicalTx)) {}
+    explicit TDeferredEffect(const TKqpPhyTxHolder::TConstPtr& physicalTx)
+        : PhysicalTx(physicalTx) {}
 };
 
 
@@ -98,9 +100,9 @@ public:
 
 private:
     [[nodiscard]]
-    bool Add(std::shared_ptr<const NKqpProto::TKqpPhyTx>&& physicalTx, TQueryData::TPtr params) {
-        DeferredEffects.emplace_back(std::move(physicalTx));
-        DeferredEffects.back().Params = std::move(params);
+    bool Add(const TKqpPhyTxHolder::TConstPtr& physicalTx, const TQueryData::TPtr& params) {
+        DeferredEffects.emplace_back(physicalTx);
+        DeferredEffects.back().Params = params;
         return true;
     }
 
@@ -135,8 +137,8 @@ public:
     }
 
     [[nodiscard]]
-    bool AddDeferredEffect(std::shared_ptr<const NKqpProto::TKqpPhyTx> physicalTx, TQueryData::TPtr params) {
-        return DeferredEffects.Add(std::move(physicalTx), std::move(params));
+    bool AddDeferredEffect(const TKqpPhyTxHolder::TConstPtr& physicalTx, const TQueryData::TPtr& params) {
+        return DeferredEffects.Add(physicalTx, params);
     }
 
     bool TxHasEffects() const {
@@ -241,10 +243,134 @@ public:
     IKqpGateway::TKqpSnapshotHandle SnapshotHandle;
 };
 
+struct TTxId {
+    TULID Id;
+    TString HumanStr;
+
+    TTxId()
+        : Id(TULID::Min())
+    {}
+
+    TTxId(const TULID& other)
+        : Id(other)
+        , HumanStr(Id.ToString())
+    {}
+
+    static TTxId FromString(const TString& str) {
+        TTxId res;
+        if (res.Id.ParseString(str)) {
+            res.HumanStr = str;
+        }
+        return res;
+    }
+
+    friend bool operator==(const TTxId& lhs, const TTxId& rhs) {
+        return lhs.Id == rhs.Id;
+    }
+
+    TString GetHumanStr() {
+        return HumanStr;
+    }
+};
+
+class TTransactionsCache {
+    TLRUCache<TTxId, TIntrusivePtr<TKqpTransactionContext>> Active;
+    std::deque<TIntrusivePtr<TKqpTransactionContext>> ToBeAborted;
+public:
+    ui64 EvictedTx = 0;
+    TDuration IdleTimeout;
+
+    TTransactionsCache(size_t size, TDuration idleTimeout)
+        : Active(size)
+        , IdleTimeout(idleTimeout)
+    {}
+
+    size_t Size() {
+        return Active.Size();
+    }
+
+    size_t MaxSize() {
+        return Active.GetMaxSize();
+    }
+
+    TIntrusivePtr<TKqpTransactionContext> Find(const TTxId& id) {
+        if (auto it = Active.Find(id); it != Active.End()) {
+            it.Value()->Touch();
+            return *it;
+        } else {
+            return {};
+        }
+    }
+
+    TIntrusivePtr<TKqpTransactionContext> ReleaseTransaction(const TTxId& txId) {
+        if (auto it = Active.FindWithoutPromote(txId); it != Active.End()) {
+            auto ret = std::move(it.Value());
+            Active.Erase(it);
+            return ret;
+        }
+        return {};
+    }
+
+    void AddToBeAborted(TIntrusivePtr<TKqpTransactionContext> ctx) {
+        ToBeAborted.emplace_back(std::move(ctx));
+    }
+
+    bool RemoveOldTransactions() {
+        if (Active.Size() < Active.GetMaxSize()) {
+            return true;
+        } else {
+            auto it = Active.FindOldest();
+            auto currentIdle = TInstant::Now() - it.Value()->LastAccessTime;
+            if (currentIdle >= IdleTimeout) {
+                it.Value()->Invalidate();
+                ToBeAborted.emplace_back(std::move(it.Value()));
+                Active.Erase(it);
+                ++EvictedTx;
+                return true;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    bool CreateNew(const TTxId& txId, TIntrusivePtr<TKqpTransactionContext> txCtx) {
+        if (!RemoveOldTransactions()) {
+            return false;
+        }
+        return Active.Insert(std::make_pair(txId, txCtx));
+    }
+
+    void FinalCleanup() {
+        for (auto it = Active.Begin(); it != Active.End(); ++it) {
+            it.Value()->Invalidate();
+            ToBeAborted.emplace_back(std::move(it.Value()));
+        }
+        Active.Clear();
+    }
+
+    size_t ToBeAbortedSize() {
+        return ToBeAborted.size();
+    }
+
+    std::deque<TIntrusivePtr<TKqpTransactionContext>> ReleaseToBeAborted() {
+        return std::exchange(ToBeAborted, {});
+    }
+};
+
 bool MergeLocks(const NKikimrMiniKQL::TType& type, const NKikimrMiniKQL::TValue& value, TKqpTransactionContext& txCtx,
     NYql::TExprContext& ctx);
 
 std::pair<bool, std::vector<NYql::TIssue>> MergeLocks(const NKikimrMiniKQL::TType& type,
     const NKikimrMiniKQL::TValue& value, TKqpTransactionContext& txCtx);
 
+bool NeedSnapshot(const TKqpTransactionContext& txCtx, const NYql::TKikimrConfiguration& config, bool rollbackTx,
+    bool commitTx, const NKqpProto::TKqpPhyQuery& physicalQuery);
+
 }  // namespace NKikimr::NKqp
+
+template<>
+struct THash<NKikimr::NKqp::TTxId> {
+    inline size_t operator()(const NKikimr::NKqp::TTxId& id) const noexcept {
+        return THash<NKikimr::TULID>()(id.Id);
+    }
+};

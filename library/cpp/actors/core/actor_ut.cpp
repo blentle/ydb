@@ -54,11 +54,6 @@ Y_UNIT_TEST_SUITE(ActorBenchmark) {
         Follower
     };
 
-    enum class ESendingType {
-        Default,
-        ContinuousExecution,
-    };
-
     class TSendReceiveActor : public TActorBootstrapped<TSendReceiveActor> {
     public:
         static constexpr auto ActorActivityType() {
@@ -93,17 +88,20 @@ Y_UNIT_TEST_SUITE(ActorBenchmark) {
         }
 
         void SpecialSend(TAutoPtr<IEventHandle> ev, const TActorContext &ctx) {
-            if (SendingType == ESendingType::ContinuousExecution) {
-                ctx.SendWithContinuousExecution(ev);
+            if (SendingType == ESendingType::Lazy) {
+                ctx.Send<ESendingType::Lazy>(ev);
+            } else if (SendingType == ESendingType::Tail) {
+                ctx.Send<ESendingType::Tail>(ev);
             } else {
                 ctx.Send(ev);
             }
         }
 
         STFUNC(StateFunc) {
-            if (EventsCounter == 0 && ElapsedTime != nullptr) {
+            if (--EventsCounter == 0 && ElapsedTime != nullptr) {
                 *ElapsedTime = Timer.Passed() / TotalEventsAmount;
                 PassAway();
+                return;
             }
 
             if (AllocatesMemory) {
@@ -113,7 +111,6 @@ Y_UNIT_TEST_SUITE(ActorBenchmark) {
                 ev->DropRewrite();
                 SpecialSend(ev, ctx);
             }
-            EventsCounter--;
         }
 
     private:
@@ -229,7 +226,7 @@ Y_UNIT_TEST_SUITE(ActorBenchmark) {
 
         ui32 leaderPoolId = poolsCount == 1 ? 0 : 1;
         TActorId followerId = actorSystem.Register(
-            new TSendReceiveActor(nullptr, {}, allocation, ERole::Follower, ESendingType::Default), TMailboxType::HTSwap, followerPoolId);
+            new TSendReceiveActor(nullptr, {}, allocation, ERole::Follower, ESendingType::Common), TMailboxType::HTSwap, followerPoolId);
         THolder<IActor> leader{
             new TTestEndDecorator(THolder(
                 new TSendReceiveActor(&elapsedTime, followerId, allocation, ERole::Leader, sendingType)), &pad, &actorsAlive)};
@@ -251,7 +248,7 @@ Y_UNIT_TEST_SUITE(ActorBenchmark) {
         double elapsedTime = 0;
 
         TActorId followerId = actorSystem.Register(
-            new TSendReceiveActor(nullptr, {}, false, ERole::Follower, ESendingType::Default, MailboxNeighbourActors), TMailboxType::HTSwap);
+            new TSendReceiveActor(nullptr, {}, false, ERole::Follower, ESendingType::Common, MailboxNeighbourActors), TMailboxType::HTSwap);
         THolder<IActor> leader{
             new TTestEndDecorator(THolder(
                 new TSendReceiveActor(&elapsedTime, followerId, false, ERole::Leader, sendingType, MailboxNeighbourActors)), &pad, &actorsAlive)};
@@ -278,7 +275,7 @@ Y_UNIT_TEST_SUITE(ActorBenchmark) {
             ui32 followerPoolId = 0;
             ui32 leaderPoolId = 0;
             TActorId followerId = actorSystem.Register(
-                new TSendReceiveActor(nullptr, {}, true, ERole::Follower, ESendingType::Default), TMailboxType::HTSwap, followerPoolId);
+                new TSendReceiveActor(nullptr, {}, true, ERole::Follower, ESendingType::Common), TMailboxType::HTSwap, followerPoolId);
             THolder<IActor> leader{
                 new TTestEndDecorator(THolder(
                     new TSendReceiveActor(&dummy[i], followerId, true, ERole::Leader, sendingType)), &pad, &actorsAlive)};
@@ -334,64 +331,84 @@ Y_UNIT_TEST_SUITE(ActorBenchmark) {
     Y_UNIT_TEST(SendReceive1Pool1ThreadAlloc) {
         for (const auto& mType : MailboxTypes) {
             auto stats = CountStats([mType] {
-                return BenchSendReceive(true, mType, EPoolType::Basic, ESendingType::Default);
+                return BenchSendReceive(true, mType, EPoolType::Basic, ESendingType::Common);
             });
             Cerr << stats.ToString() << " " << mType << Endl;
             stats = CountStats([mType] {
-                return BenchSendReceive(true, mType, EPoolType::Basic, ESendingType::ContinuousExecution);
+                return BenchSendReceive(true, mType, EPoolType::Basic, ESendingType::Lazy);
             });
-            Cerr << stats.ToString() << " " << mType << " ContinuousExecution" << Endl;
+            Cerr << stats.ToString() << " " << mType << " Lazy" << Endl;
+            stats = CountStats([mType] {
+                return BenchSendReceive(true, mType, EPoolType::Basic, ESendingType::Tail);
+            });
+            Cerr << stats.ToString() << " " << mType << " Tail" << Endl;
         }
     }
 
     Y_UNIT_TEST(SendReceive1Pool1ThreadAllocUnited) {
         for (const auto& mType : MailboxTypes) {
             auto stats = CountStats([mType] {
-                return BenchSendReceive(true, mType, EPoolType::United, ESendingType::Default);
+                return BenchSendReceive(true, mType, EPoolType::United, ESendingType::Common);
             });
             Cerr << stats.ToString() << " " << mType << Endl;
             stats = CountStats([mType] {
-                return BenchSendReceive(true, mType, EPoolType::United, ESendingType::ContinuousExecution);
+                return BenchSendReceive(true, mType, EPoolType::United, ESendingType::Lazy);
             });
-            Cerr << stats.ToString() << " " << mType << " ContinuousExecution" << Endl;
+            Cerr << stats.ToString() << " " << mType << " Lazy" << Endl;
+            stats = CountStats([mType] {
+                return BenchSendReceive(true, mType, EPoolType::United, ESendingType::Tail);
+            });
+            Cerr << stats.ToString() << " " << mType << " Tail" << Endl;
         }
     }
 
     Y_UNIT_TEST(SendReceive1Pool1ThreadNoAlloc) {
         for (const auto& mType : MailboxTypes) {
             auto stats = CountStats([mType] {
-                return BenchSendReceive(false, mType, EPoolType::Basic, ESendingType::Default);
+                return BenchSendReceive(false, mType, EPoolType::Basic, ESendingType::Common);
             });
             Cerr << stats.ToString() << " " << mType << Endl;
             stats = CountStats([mType] {
-                return BenchSendReceive(false, mType, EPoolType::Basic, ESendingType::ContinuousExecution);
+                return BenchSendReceive(false, mType, EPoolType::Basic, ESendingType::Lazy);
             });
-            Cerr << stats.ToString() << " " << mType << " ContinuousExecution" << Endl;
+            Cerr << stats.ToString() << " " << mType << " Lazy" << Endl;
+            stats = CountStats([mType] {
+                return BenchSendReceive(false, mType, EPoolType::Basic, ESendingType::Tail);
+            });
+            Cerr << stats.ToString() << " " << mType << " Tail" << Endl;
         }
     }
 
     Y_UNIT_TEST(SendReceive1Pool1ThreadNoAllocUnited) {
         for (const auto& mType : MailboxTypes) {
             auto stats = CountStats([mType] {
-                return BenchSendReceive(false, mType, EPoolType::United, ESendingType::Default);
+                return BenchSendReceive(false, mType, EPoolType::United, ESendingType::Common);
             });
             Cerr << stats.ToString() << " " << mType << Endl;
             stats = CountStats([mType] {
-                return BenchSendReceive(false, mType, EPoolType::United, ESendingType::ContinuousExecution);
+                return BenchSendReceive(false, mType, EPoolType::United, ESendingType::Lazy);
             });
-            Cerr << stats.ToString() << " " << mType << " ContinuousExecution" << Endl;
+            Cerr << stats.ToString() << " " << mType << " Lazy" << Endl;
+            stats = CountStats([mType] {
+                return BenchSendReceive(false, mType, EPoolType::United, ESendingType::Tail);
+            });
+            Cerr << stats.ToString() << " " << mType << " Tail" << Endl;
         }
     }
 
     void RunBenchSendActivateReceive(ui32 poolsCount, ui32 threads, bool allocation, EPoolType poolType) {
         auto stats = CountStats([=] {
-            return BenchSendActivateReceive(poolsCount, threads, allocation, poolType, ESendingType::Default);
+            return BenchSendActivateReceive(poolsCount, threads, allocation, poolType, ESendingType::Common);
         });
         Cerr << stats.ToString() << Endl;
         stats = CountStats([=] {
-            return BenchSendActivateReceive(poolsCount, threads, allocation, poolType, ESendingType::ContinuousExecution);
+            return BenchSendActivateReceive(poolsCount, threads, allocation, poolType, ESendingType::Lazy);
         });
-        Cerr << stats.ToString() << " ContinuousExecution" << Endl;
+        Cerr << stats.ToString() << " Lazy" << Endl;
+        stats = CountStats([=] {
+            return BenchSendActivateReceive(poolsCount, threads, allocation, poolType, ESendingType::Tail);
+        });
+        Cerr << stats.ToString() << " Tail" << Endl;
     }
 
     Y_UNIT_TEST(SendActivateReceive1Pool1ThreadAlloc) {
@@ -445,13 +462,17 @@ Y_UNIT_TEST_SUITE(ActorBenchmark) {
     void RunBenchContentedThreads(ui32 threads, EPoolType poolType) {
         for (ui32 actorPairs = 1; actorPairs <= 2 * threads; actorPairs++) {
             auto stats = CountStats([threads, actorPairs, poolType] {
-                return BenchContentedThreads(threads, actorPairs, poolType, ESendingType::Default);
+                return BenchContentedThreads(threads, actorPairs, poolType, ESendingType::Common);
             });
             Cerr << stats.ToString() << " actorPairs: " << actorPairs << Endl;
             stats = CountStats([threads, actorPairs, poolType] {
-                return BenchContentedThreads(threads, actorPairs, poolType, ESendingType::ContinuousExecution);
+                return BenchContentedThreads(threads, actorPairs, poolType, ESendingType::Lazy);
             });
-            Cerr << stats.ToString() << " actorPairs: " << actorPairs << " ContinuousExecution"<< Endl;
+            Cerr << stats.ToString() << " actorPairs: " << actorPairs << " Lazy"<< Endl;
+            stats = CountStats([threads, actorPairs, poolType] {
+                return BenchContentedThreads(threads, actorPairs, poolType, ESendingType::Tail);
+            });
+            Cerr << stats.ToString() << " actorPairs: " << actorPairs << " Tail"<< Endl;
         }
     }
 
@@ -476,13 +497,17 @@ Y_UNIT_TEST_SUITE(ActorBenchmark) {
         TVector<ui32> NeighbourActors = {0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 256};
         for (const auto& neighbour : NeighbourActors) {
             auto stats = CountStats([neighbour] {
-                return BenchSendActivateReceiveWithMailboxNeighbours(neighbour, EPoolType::Basic, ESendingType::Default);
+                return BenchSendActivateReceiveWithMailboxNeighbours(neighbour, EPoolType::Basic, ESendingType::Common);
             });
             Cerr << stats.ToString() << " neighbourActors: " << neighbour << Endl;
             stats = CountStats([neighbour] {
-                return BenchSendActivateReceiveWithMailboxNeighbours(neighbour, EPoolType::Basic, ESendingType::ContinuousExecution);
+                return BenchSendActivateReceiveWithMailboxNeighbours(neighbour, EPoolType::Basic, ESendingType::Lazy);
             });
-            Cerr << stats.ToString() << " neighbourActors: " << neighbour << " ContinuousExecution" << Endl;
+            Cerr << stats.ToString() << " neighbourActors: " << neighbour << " Lazy" << Endl;
+            stats = CountStats([neighbour] {
+                return BenchSendActivateReceiveWithMailboxNeighbours(neighbour, EPoolType::Basic, ESendingType::Tail);
+            });
+            Cerr << stats.ToString() << " neighbourActors: " << neighbour << " Tail" << Endl;
         }
     }
 
@@ -490,13 +515,17 @@ Y_UNIT_TEST_SUITE(ActorBenchmark) {
         TVector<ui32> NeighbourActors = {0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 256};
         for (const auto& neighbour : NeighbourActors) {
             auto stats = CountStats([neighbour] {
-                return BenchSendActivateReceiveWithMailboxNeighbours(neighbour, EPoolType::United, ESendingType::Default);
+                return BenchSendActivateReceiveWithMailboxNeighbours(neighbour, EPoolType::United, ESendingType::Common);
             });
             Cerr << stats.ToString() << " neighbourActors: " << neighbour << Endl;
             stats = CountStats([neighbour] {
-                return BenchSendActivateReceiveWithMailboxNeighbours(neighbour, EPoolType::United, ESendingType::ContinuousExecution);
+                return BenchSendActivateReceiveWithMailboxNeighbours(neighbour, EPoolType::United, ESendingType::Lazy);
             });
-            Cerr << stats.ToString() << " neighbourActors: " << neighbour << " ContinuousExecution" << Endl;
+            Cerr << stats.ToString() << " neighbourActors: " << neighbour << " Lazy" << Endl;
+            stats = CountStats([neighbour] {
+                return BenchSendActivateReceiveWithMailboxNeighbours(neighbour, EPoolType::United, ESendingType::Tail);
+            });
+            Cerr << stats.ToString() << " neighbourActors: " << neighbour << " Tail" << Endl;
         }
     }
 }

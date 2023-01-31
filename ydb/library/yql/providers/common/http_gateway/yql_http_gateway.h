@@ -76,6 +76,7 @@ public:
     virtual void Download(
         TString url,
         THeaders headers,
+        std::size_t offset,
         std::size_t sizeLimit,
         TOnResult callback,
         TString data = {},
@@ -84,7 +85,7 @@ public:
 
     class TCountedContent : public TContentBase {
     public:
-        TCountedContent(TString&& data, const std::shared_ptr<std::atomic_size_t>& counter);
+        TCountedContent(TString&& data, const std::shared_ptr<std::atomic_size_t>& counter, const ::NMonitoring::TDynamicCounters::TCounterPtr& inflightCounter);
         ~TCountedContent();
 
         TCountedContent(TCountedContent&&) = default;
@@ -93,6 +94,7 @@ public:
         TString Extract();
     private:
         const std::shared_ptr<std::atomic_size_t> Counter;
+        const ::NMonitoring::TDynamicCounters::TCounterPtr InflightCounter;
     };
 
     using TOnDownloadStart = std::function<void(long)>; // http code.
@@ -107,7 +109,10 @@ public:
         std::size_t sizeLimit,
         TOnDownloadStart onStart,
         TOnNewDataPart onNewData,
-        TOnDownloadFinish onFinish) = 0;
+        TOnDownloadFinish onFinish,
+        const ::NMonitoring::TDynamicCounters::TCounterPtr& inflightCounter) = 0;
+        
+    virtual ui64 GetBuffersSizePerStream() = 0;
 };
 
 }

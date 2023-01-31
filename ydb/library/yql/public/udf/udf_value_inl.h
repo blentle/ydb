@@ -384,6 +384,13 @@ inline bool TUnboxedValuePod::HasFastListLength() const {
     return TBoxedValueAccessor::HasFastListLength(*Raw.Boxed.Value);
 }
 
+#if UDF_ABI_COMPATIBILITY_VERSION_CURRENT >= UDF_ABI_COMPATIBILITY_VERSION(2, 11)
+inline void TUnboxedValuePod::Push(const TUnboxedValuePod& value) const {
+    UDF_VERIFY(IsBoxed(), "Value is not a list");
+    return TBoxedValueAccessor::Push(*Raw.Boxed.Value, value);
+}
+#endif
+
 inline ui64 TUnboxedValuePod::GetListLength() const
 {
     UDF_VERIFY(IsBoxed(), "Value is not a list");
@@ -674,6 +681,10 @@ Y_FORCE_INLINE void TUnboxedValuePod::UnlockRef(i32 prev) const noexcept
 PRIMITIVE_VALUE_TYPES(VALUE_GET)
 PRIMITIVE_VALUE_TYPES(VALUE_GET_DEF)
 PRIMITIVE_VALUE_TYPES(VALUE_CONSTR)
+
+#undef VALUE_GET
+#undef VALUE_GET_DEF
+#undef VALUE_CONSTR
 
 template <>
 inline bool TUnboxedValuePod::Get<bool>() const

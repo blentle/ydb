@@ -4,6 +4,7 @@
 
 #include <ydb/core/protos/kqp_physical.pb.h>
 #include <ydb/core/protos/tx_proxy.pb.h>
+#include <ydb/core/protos/tx_datashard.pb.h>
 
 #include <ydb/library/yql/ast/yql_expr.h>
 #include <ydb/library/yql/dq/common/dq_value.h>
@@ -57,12 +58,12 @@ void ApplyServiceConfig(NYql::TKikimrConfiguration& kqpConfig, const NKikimrConf
 class IKqpGateway : public NYql::IKikimrGateway {
 public:
     struct TPhysicalTxData : private TMoveOnly {
-        std::shared_ptr<const NKqpProto::TKqpPhyTx> Body;
+        TKqpPhyTxHolder::TConstPtr Body;
         NKikimr::NKqp::TQueryData::TPtr Params;
 
-        TPhysicalTxData(std::shared_ptr<const NKqpProto::TKqpPhyTx> body, TQueryData::TPtr params)
-            : Body(std::move(body))
-            , Params(std::move(params)) {}
+        TPhysicalTxData(const TKqpPhyTxHolder::TConstPtr& body, const TQueryData::TPtr& params)
+            : Body(body)
+            , Params(params) {}
     };
 
     struct TKqpSnapshot {
@@ -108,7 +109,7 @@ public:
         {}
 
         TVector<TPhysicalTxData> Transactions;
-        TVector<NYql::NDq::TMkqlValueRef> Locks;
+        TMap<ui64, TVector<NKikimrTxDataShard::TLock>> DataShardLocks;
         NKikimr::NKqp::TTxAllocatorState::TPtr TxAlloc;
         bool ValidateLocks = false;
         bool EraseLocks = false;
