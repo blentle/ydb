@@ -171,8 +171,7 @@ struct TKqpQueryState {
         auto type = GetType();
         return (
             type == NKikimrKqp::QUERY_TYPE_SQL_SCAN ||
-            type == NKikimrKqp::QUERY_TYPE_AST_SCAN ||
-            type == NKikimrKqp::QUERY_TYPE_SQL_QUERY // TODO: Switch to MVCC snapshots after moving to separate executer.
+            type == NKikimrKqp::QUERY_TYPE_AST_SCAN
         );
     }
 
@@ -694,7 +693,6 @@ public:
 
         QueryState->TxCtx->OnBeginQuery();
 
-
         if (QueryState->NeedPersistentSnapshot()) {
             return AcquirePersistentSnapshot();
         } else if (NeedSnapshot(*QueryState->TxCtx, *Config, /*rollback*/ false, QueryState->Commit,
@@ -793,6 +791,7 @@ public:
         QueryState->TxCtx = MakeIntrusive<TKqpTransactionContext>(false, AppData()->FunctionRegistry, AppData()->TimeProvider, AppData()->RandomProvider);
         QueryState->QueryData = std::make_shared<TQueryData>(QueryState->TxCtx->TxAlloc);
         QueryState->TxCtx->SetIsolationLevel(settings);
+        QueryState->TxCtx->OnBeginQuery();
 
         if (!Transactions.CreateNew(QueryState->TxId, QueryState->TxCtx)) {
             std::vector<TIssue> issues{
@@ -999,8 +998,12 @@ public:
     IKqpGateway::TExecPhysicalRequest PrepareGenericRequest(TKqpQueryState *queryState) {
         auto request = PrepareBaseRequest(queryState, queryState->TxCtx->TxAlloc);
 
-        YQL_ENSURE(queryState);
-        request.Snapshot = queryState->TxCtx->GetSnapshot();
+        if (queryState) {
+            request.Snapshot = queryState->TxCtx->GetSnapshot();
+            request.IsolationLevel = *queryState->TxCtx->EffectiveIsolationLevel;
+        } else {
+            request.IsolationLevel = NKikimrKqp::ISOLATION_LEVEL_SERIALIZABLE;
+        }
 
         return request;
     }
@@ -1967,8 +1970,14 @@ public:
             PassAway();
         } else {
             CleanupCtx.reset();
+            bool doNotKeepSession = QueryState && !QueryState->KeepSession;
             QueryState.reset();
-            Become(&TKqpSessionActor::ReadyState);
+            if (doNotKeepSession) {
+                // TEvCloseSessionRequest was received in final=false CleanupState, so actor should rerun Cleanup with final=true
+                CleanupAndPassAway();
+            } else {
+                Become(&TKqpSessionActor::ReadyState);
+            }
         }
         ExecuterId = TActorId{};
     }

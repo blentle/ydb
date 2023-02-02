@@ -20,6 +20,7 @@ namespace NKikimr {
 namespace NGRpcService {
 
 using namespace Ydb;
+using NPerms = NKikimr::TEvTicketParser::TEvAuthorizeTicket;
 
 template <typename RpcRequestType, typename EvRequestType, typename EvResponseType, typename CastRequest, typename CastResult>
 class TFederatedQueryRequestRPC : public TRpcOperationRequestActor<
@@ -177,6 +178,7 @@ protected:
 
         NYq::TEvAuditService::TExtraInfo extraInfo{
             .Token = Token,
+            .CloudId = response.AuditDetails.CloudId,
             .FolderId = FolderId,
             .User = User,
             .PeerName = PeerName,
@@ -293,7 +295,7 @@ using TFederatedQueryGetResultDataRPC = TFederatedQueryRequestRPC<
     YandexQuery::GetResultDataRequest,
     FederatedQuery::GetResultDataResult>;
 
-void DoGetResultDataRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryGetResultDataRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryGetResultDataRPC(p.release()));
 }
 
@@ -304,7 +306,7 @@ using TFederatedQueryListJobsRPC = TFederatedQueryRequestRPC<
     YandexQuery::ListJobsRequest,
     FederatedQuery::ListJobsResult>;
 
-void DoListJobsRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryListJobsRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryListJobsRPC(p.release()));
 }
 
@@ -315,7 +317,7 @@ using TFederatedQueryDescribeJobRPC = TFederatedQueryRequestRPC<
     YandexQuery::DescribeJobRequest,
     FederatedQuery::DescribeJobResult>;
 
-void DoDescribeJobRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryDescribeJobRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryDescribeJobRPC(p.release()));
 }
 
@@ -326,7 +328,7 @@ using TFederatedQueryCreateConnectionRPC = TFederatedQueryRequestRPC<
     YandexQuery::CreateConnectionRequest,
     FederatedQuery::CreateConnectionResult>;
 
-void DoCreateConnectionRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryCreateConnectionRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryCreateConnectionRPC(p.release()));
 }
 
@@ -337,7 +339,7 @@ using TFederatedQueryListConnectionsRPC = TFederatedQueryRequestRPC<
     YandexQuery::ListConnectionsRequest,
     FederatedQuery::ListConnectionsResult>;
 
-void DoListConnectionsRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryListConnectionsRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryListConnectionsRPC(p.release()));
 }
 
@@ -348,7 +350,7 @@ using TFederatedQueryDescribeConnectionRPC = TFederatedQueryRequestRPC<
     YandexQuery::DescribeConnectionRequest,
     FederatedQuery::DescribeConnectionResult>;
 
-void DoDescribeConnectionRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryDescribeConnectionRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryDescribeConnectionRPC(p.release()));
 }
 
@@ -359,7 +361,7 @@ using TFederatedQueryModifyConnectionRPC = TFederatedQueryRequestRPC<
     YandexQuery::ModifyConnectionRequest,
     FederatedQuery::ModifyConnectionResult>;
 
-void DoModifyConnectionRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryModifyConnectionRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryModifyConnectionRPC(p.release()));
 }
 
@@ -370,7 +372,7 @@ using TFederatedQueryDeleteConnectionRPC = TFederatedQueryRequestRPC<
     YandexQuery::DeleteConnectionRequest,
     FederatedQuery::DeleteConnectionResult>;
 
-void DoDeleteConnectionRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryDeleteConnectionRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryDeleteConnectionRPC(p.release()));
 }
 
@@ -381,7 +383,7 @@ using TFederatedQueryTestConnectionRPC = TFederatedQueryRequestRPC<
     YandexQuery::TestConnectionRequest,
     FederatedQuery::TestConnectionResult>;
 
-void DoTestConnectionRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryTestConnectionRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryTestConnectionRPC(p.release()));
 }
 
@@ -392,7 +394,7 @@ using TFederatedQueryCreateBindingRPC = TFederatedQueryRequestRPC<
     YandexQuery::CreateBindingRequest,
     FederatedQuery::CreateBindingResult>;
 
-void DoCreateBindingRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider& ) {
+void DoFederatedQueryCreateBindingRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider& ) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryCreateBindingRPC(p.release()));
 }
 
@@ -403,7 +405,7 @@ using TFederatedQueryListBindingsRPC = TFederatedQueryRequestRPC<
     YandexQuery::ListBindingsRequest,
     FederatedQuery::ListBindingsResult>;
 
-void DoListBindingsRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryListBindingsRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryListBindingsRPC(p.release()));
 }
 
@@ -414,7 +416,7 @@ using TFederatedQueryDescribeBindingRPC = TFederatedQueryRequestRPC<
     YandexQuery::DescribeBindingRequest,
     FederatedQuery::DescribeBindingResult>;
 
-void DoDescribeBindingRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryDescribeBindingRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryDescribeBindingRPC(p.release()));
 }
 
@@ -425,7 +427,7 @@ using TFederatedQueryModifyBindingRPC = TFederatedQueryRequestRPC<
     YandexQuery::ModifyBindingRequest,
     FederatedQuery::ModifyBindingResult>;
 
-void DoModifyBindingRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryModifyBindingRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryModifyBindingRPC(p.release()));
 }
 
@@ -436,8 +438,292 @@ using TFederatedQueryDeleteBindingRPC = TFederatedQueryRequestRPC<
     YandexQuery::DeleteBindingRequest,
     FederatedQuery::DeleteBindingResult>;
 
-void DoDeleteBindingRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
+void DoFederatedQueryDeleteBindingRequest(std::unique_ptr<IRequestOpCtx> p, const IFacilityProvider&) {
     TActivationContext::AsActorContext().Register(new TFederatedQueryDeleteBindingRPC(p.release()));
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryCreateQueryRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{[](const FederatedQuery::CreateQueryRequest& request) {
+        TVector<NPerms::TPermission> basePermissions{
+            NPerms::Required("yq.queries.create"),
+            NPerms::Optional("yq.connections.use"),
+            NPerms::Optional("yq.bindings.use")
+        };
+        if (request.execute_mode() != FederatedQuery::SAVE) {
+            basePermissions.push_back(NPerms::Required("yq.queries.invoke"));
+        }
+        if (request.content().acl().visibility() == FederatedQuery::Acl::SCOPE) {
+            basePermissions.push_back(NPerms::Required("yq.resources.managePublic"));
+        }
+        return basePermissions;
+    }};
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::CreateQueryRequest, FederatedQuery::CreateQueryResponse>>(ctx.Release(), &DoFederatedQueryCreateQueryRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryListQueriesRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{[](const FederatedQuery::ListQueriesRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.queries.get"),
+            NPerms::Optional("yq.resources.viewPublic"),
+            NPerms::Optional("yq.resources.viewPrivate")
+        };
+    }};
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::ListQueriesRequest, FederatedQuery::ListQueriesResponse>>(ctx.Release(), &DoFederatedQueryListQueriesRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryDescribeQueryRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{[](const FederatedQuery::DescribeQueryRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.queries.get"),
+            NPerms::Optional("yq.queries.viewAst"),
+            NPerms::Optional("yq.resources.viewPublic"),
+            NPerms::Optional("yq.resources.viewPrivate")
+        };
+    }};
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::DescribeQueryRequest, FederatedQuery::DescribeQueryResponse>>(ctx.Release(), &DoFederatedQueryDescribeQueryRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryGetQueryStatusRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{[](const FederatedQuery::GetQueryStatusRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.queries.getStatus"),
+            NPerms::Optional("yq.resources.viewPublic"),
+            NPerms::Optional("yq.resources.viewPrivate")
+        };
+    }};
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::GetQueryStatusRequest, FederatedQuery::GetQueryStatusResponse>>(ctx.Release(), &DoFederatedQueryGetQueryStatusRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryModifyQueryRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{[](const FederatedQuery::ModifyQueryRequest& request) {
+        TVector<NPerms::TPermission> basePermissions{
+            NPerms::Required("yq.queries.update"),
+            NPerms::Optional("yq.connections.use"),
+            NPerms::Optional("yq.bindings.use"),
+            NPerms::Optional("yq.resources.managePrivate")
+        };
+        if (request.execute_mode() != FederatedQuery::SAVE) {
+            basePermissions.push_back(NPerms::Required("yq.queries.invoke"));
+        }
+        if (request.content().acl().visibility() == FederatedQuery::Acl::SCOPE) {
+            basePermissions.push_back(NPerms::Required("yq.resources.managePublic"));
+        }
+        return basePermissions;
+    }};
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::ModifyQueryRequest, FederatedQuery::ModifyQueryResponse>>(ctx.Release(), &DoFederatedQueryModifyQueryRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryDeleteQueryRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{[](const FederatedQuery::DeleteQueryRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.queries.delete"),
+            NPerms::Optional("yq.resources.managePublic"),
+            NPerms::Optional("yq.resources.managePrivate")
+        };
+    }};
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::DeleteQueryRequest, FederatedQuery::DeleteQueryResponse>>(ctx.Release(), &DoFederatedQueryDeleteQueryRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryControlQueryRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{[](const FederatedQuery::ControlQueryRequest& request) -> TVector<NPerms::TPermission> {
+        TVector<NPerms::TPermission> basePermissions{
+            NPerms::Required("yq.queries.control"),
+            NPerms::Optional("yq.resources.managePublic"),
+            NPerms::Optional("yq.resources.managePrivate")
+        };
+        if (request.action() == FederatedQuery::RESUME) {
+            basePermissions.push_back(NPerms::Required("yq.queries.start"));
+        } else if (request.action() != FederatedQuery::QUERY_ACTION_UNSPECIFIED) {
+            basePermissions.push_back(NPerms::Required("yq.queries.abort"));
+        }
+        return basePermissions;
+    }};
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::ControlQueryRequest, FederatedQuery::ControlQueryResponse>>(ctx.Release(), &DoFederatedQueryControlQueryRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryGetResultDataRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::GetResultDataRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.queries.getData"),
+            NPerms::Optional("yq.resources.viewPublic"),
+            NPerms::Optional("yq.resources.viewPrivate")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::GetResultDataRequest, FederatedQuery::GetResultDataResponse>>(ctx.Release(), &DoFederatedQueryGetResultDataRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryListJobsRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::ListJobsRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.jobs.get"),
+            NPerms::Optional("yq.resources.viewPublic"),
+            NPerms::Optional("yq.resources.viewPrivate")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::ListJobsRequest, FederatedQuery::ListJobsResponse>>(ctx.Release(), &DoFederatedQueryListJobsRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryDescribeJobRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::DescribeJobRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.jobs.get"),
+            NPerms::Optional("yq.resources.viewPublic"),
+            NPerms::Optional("yq.resources.viewPrivate")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::DescribeJobRequest, FederatedQuery::DescribeJobResponse>>(ctx.Release(), &DoFederatedQueryDescribeJobRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryCreateConnectionRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::CreateConnectionRequest& request) -> TVector<NPerms::TPermission> {
+        TVector<NPerms::TPermission> basePermissions{
+            NPerms::Required("yq.connections.create"),
+        };
+        if (request.content().acl().visibility() == FederatedQuery::Acl::SCOPE) {
+            basePermissions.push_back(NPerms::Required("yq.resources.managePublic"));
+        }
+        return basePermissions;
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::CreateConnectionRequest, FederatedQuery::CreateConnectionResponse>>(ctx.Release(), &DoFederatedQueryCreateConnectionRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryListConnectionsRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::ListConnectionsRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.connections.get"),
+            NPerms::Optional("yq.resources.viewPublic"),
+            NPerms::Optional("yq.resources.viewPrivate")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::ListConnectionsRequest, FederatedQuery::ListConnectionsResponse>>(ctx.Release(), &DoFederatedQueryListConnectionsRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryDescribeConnectionRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::DescribeConnectionRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.connections.get"),
+            NPerms::Optional("yq.resources.viewPublic"),
+            NPerms::Optional("yq.resources.viewPrivate")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::DescribeConnectionRequest, FederatedQuery::DescribeConnectionResponse>>(ctx.Release(), &DoFederatedQueryDescribeConnectionRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryModifyConnectionRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::ModifyConnectionRequest& request) -> TVector<NPerms::TPermission> {
+        TVector<NPerms::TPermission> basePermissions{
+            NPerms::Required("yq.connections.update"),
+            NPerms::Optional("yq.resources.managePrivate")
+        };
+        if (request.content().acl().visibility() == FederatedQuery::Acl::SCOPE) {
+            basePermissions.push_back(NPerms::Required("yq.resources.managePublic"));
+        }
+        return basePermissions;
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::ModifyConnectionRequest, FederatedQuery::ModifyConnectionResponse>>(ctx.Release(), &DoFederatedQueryModifyConnectionRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryDeleteConnectionRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::DeleteConnectionRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.connections.delete"),
+            NPerms::Optional("yq.resources.managePublic"),
+            NPerms::Optional("yq.resources.managePrivate")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::DeleteConnectionRequest, FederatedQuery::DeleteConnectionResponse>>(ctx.Release(), &DoFederatedQueryDeleteConnectionRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryTestConnectionRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::TestConnectionRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.connections.create")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::TestConnectionRequest, FederatedQuery::TestConnectionResponse>>(ctx.Release(), &DoFederatedQueryTestConnectionRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryCreateBindingRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::CreateBindingRequest&) -> TVector<NPerms::TPermission> {
+        // For use in binding links on connection with visibility SCOPE,
+        // the yq.resources.managePublic permission is required. But there
+        // is no information about connection visibility in this place,
+        // so yq.resources.managePublic is always requested as optional
+        return {
+            NPerms::Required("yq.bindings.create"),
+            NPerms::Optional("yq.resources.managePublic")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::CreateBindingRequest, FederatedQuery::CreateBindingResponse>>(ctx.Release(), &DoFederatedQueryCreateBindingRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryListBindingsRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::ListBindingsRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.bindings.get"),
+            NPerms::Optional("yq.resources.viewPublic"),
+            NPerms::Optional("yq.resources.viewPrivate")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::ListBindingsRequest, FederatedQuery::ListBindingsResponse>>(ctx.Release(), &DoFederatedQueryListBindingsRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryDescribeBindingRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::DescribeBindingRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.bindings.get"),
+            NPerms::Optional("yq.resources.viewPublic"),
+            NPerms::Optional("yq.resources.viewPrivate")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::DescribeBindingRequest, FederatedQuery::DescribeBindingResponse>>(ctx.Release(), &DoFederatedQueryDescribeBindingRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryModifyBindingRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::ModifyBindingRequest&) -> TVector<NPerms::TPermission> {
+        // For use in binding links on connection with visibility SCOPE,
+        // the yq.resources.managePublic permission is required. But there
+        // is no information about connection visibility in this place,
+        // so yq.resources.managePublic is always requested as optional
+        return {
+            NPerms::Required("yq.bindings.update"),
+            NPerms::Optional("yq.resources.managePrivate"),
+            NPerms::Optional("yq.resources.managePublic")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::ModifyBindingRequest, FederatedQuery::ModifyBindingResponse>>(ctx.Release(), &DoFederatedQueryModifyBindingRequest, permissions);
+}
+
+std::unique_ptr<TEvProxyRuntimeEvent> CreateFederatedQueryDeleteBindingRequestOperationCall(TIntrusivePtr<NGrpc::IRequestContextBase> ctx) {
+    static const std::function permissions{ [](const FederatedQuery::DeleteBindingRequest&) -> TVector<NPerms::TPermission> {
+        return {
+            NPerms::Required("yq.bindings.delete"),
+            NPerms::Optional("yq.resources.managePublic"),
+            NPerms::Optional("yq.resources.managePrivate")
+        };
+    } };
+
+    return std::make_unique<TGrpcFqRequestOperationCall<FederatedQuery::DeleteBindingRequest, FederatedQuery::DeleteBindingResponse>>(ctx.Release(), &DoFederatedQueryDeleteBindingRequest, permissions);
 }
 
 } // namespace NGRpcService

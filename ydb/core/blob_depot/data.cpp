@@ -92,6 +92,10 @@ namespace NKikimr::NBlobDepot {
             const bool wasUncertain = value.IsWrittenUncertainly();
             const bool wasGoingToAssimilate = value.GoingToAssimilate;
 
+#ifndef NDEBUG
+            TValue originalValue(value);
+#endif
+
             if (!inserted) {
                 EnumerateBlobsForValueChain(value.ValueChain, Self->TabletID(), [&](TLogoBlobID id, ui32, ui32) {
                     const auto it = RefCount.find(id);
@@ -103,6 +107,11 @@ namespace NKikimr::NBlobDepot {
             }
 
             EUpdateOutcome outcome = callback(value, inserted);
+
+#ifndef NDEBUG
+            Y_VERIFY(outcome != EUpdateOutcome::NO_CHANGE || !value.Changed(originalValue));
+            Y_VERIFY(inserted || value.ValueVersion == originalValue.ValueVersion + 1 || IsSameValueChain(value.ValueChain, originalValue.ValueChain));
+#endif
 
             if ((underSoft && value.KeepState != EKeepState::Keep) || underHard) {
                 outcome = EUpdateOutcome::DROP;
@@ -215,6 +224,7 @@ namespace NKikimr::NBlobDepot {
                 auto *chain = value.ValueChain.Add();
                 auto *locator = chain->MutableLocator();
                 locator->CopyFrom(item.GetBlobLocator());
+                ++value.ValueVersion;
 
                 // clear assimilation flag -- we have blob overwritten with fresh copy (of the same data)
                 value.GoingToAssimilate = false;
@@ -245,6 +255,7 @@ namespace NKikimr::NBlobDepot {
                 locator->SetTotalDataLen(key.GetBlobId().BlobSize());
                 locator->SetFooterLen(0);
                 value.GoingToAssimilate = false;
+                ++value.ValueVersion;
                 outcome = EUpdateOutcome::CHANGE;
             }
             return outcome;
@@ -318,7 +329,7 @@ namespace NKikimr::NBlobDepot {
         return it->second;
     }
 
-    void TData::AddDataOnLoad(TKey key, TString value, bool uncertainWrite) {
+    TData::TValue *TData::AddDataOnLoad(TKey key, TString value, bool uncertainWrite) {
         Y_VERIFY_S(!IsKeyLoaded(key), "Id# " << Self->GetLogId() << " Key# " << key.ToString());
 
         NKikimrBlobDepot::TValue proto;
@@ -340,6 +351,8 @@ namespace NKikimr::NBlobDepot {
         }
 
         ValidateRecords();
+
+        return &it->second;
     }
 
     bool TData::AddDataOnDecommit(const TEvBlobStorage::TEvAssimilateResult::TBlob& blob,
@@ -480,11 +493,14 @@ namespace NKikimr::NBlobDepot {
         const TData::TKey last(TLogoBlobID(tabletId, current.Generation(), current.Step(), channel,
             TLogoBlobID::MaxBlobSize, TLogoBlobID::MaxCookie, TLogoBlobID::MaxPartId, TLogoBlobID::MaxCrcMode));
 
+        // find keys we have to delete
         bool finished = true;
-        Self->Data->ScanRange(&first, &last, TData::EScanFlags::INCLUDE_END, [&](auto& key, auto& value) {
+        TScanRange r{first, last, TData::EScanFlags::INCLUDE_END};
+        std::vector<TKey> keysToDelete;
+        Self->Data->ScanRange(r, nullptr, nullptr, [&](auto& key, auto& value) {
             if (value.KeepState != EKeepState::Keep || hard) {
                 if (maxItems) {
-                    Self->Data->DeleteKey(key, txc, cookie);
+                    keysToDelete.push_back(key);
                     --maxItems;
                 } else {
                     finished = false;
@@ -493,6 +509,11 @@ namespace NKikimr::NBlobDepot {
             }
             return true;
         });
+
+        // delete selected keys
+        for (const TKey& key : keysToDelete) {
+            DeleteKey(key, txc, cookie);
+        }
 
         return finished;
     }
@@ -653,3 +674,8 @@ namespace NKikimr::NBlobDepot {
     }
 
 } // NKikimr::NBlobDepot
+
+template<>
+void Out<NKikimr::NBlobDepot::TBlobDepot::TData::TKey>(IOutputStream& s, const NKikimr::NBlobDepot::TBlobDepot::TData::TKey& x) {
+    x.Output(s);
+}

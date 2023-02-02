@@ -4003,6 +4003,47 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
             return ctx.SwapWithHead(*node);
         }
 
+        if (const auto selector = node->Child(1); selector != selector->Tail().GetDependencyScope()->second) {
+            YQL_CLOG(DEBUG, Core) << node->Content() << " by constant key.";
+            return ctx.Builder(node->Pos())
+                .Callable("FlatMap")
+                    .Callable(0, "Condense1")
+                        .Add(0, node->HeadPtr())
+                        .Lambda(1)
+                            .Param("item")
+                            .Apply(*node->Child(2))
+                                .With(0, selector->TailPtr())
+                                .With(1, "item")
+                            .Seal()
+                        .Seal()
+                        .Lambda(2)
+                            .Param("item")
+                            .Param("state")
+                            .Callable("Bool")
+                                .Atom(0, "false", TNodeFlags::Default)
+                            .Seal()
+                        .Seal()
+                        .Lambda(3)
+                            .Param("item")
+                            .Param("state")
+                            .Apply(*node->Child(3))
+                                .With(0, selector->TailPtr())
+                                .With(1, "item")
+                                .With(2, "state")
+                            .Seal()
+                        .Seal()
+                    .Seal()
+                    .Lambda(1)
+                        .Param("state")
+                        .Apply(*node->Child(4))
+                            .With(0, selector->TailPtr())
+                            .With(1, "state")
+                        .Seal()
+                    .Seal()
+                .Seal()
+            .Build();
+        }
+
         return node;
     };
 
@@ -5090,7 +5131,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                         .Param("item")
                         .Callable("Guess")
                             .Arg(0, "item")
-                            .Add(1, ctx.NewAtom(node->Pos(), indicies.begin()->first))
+                            .Atom(1, indicies.begin()->first)
                         .Seal()
                     .Seal()
                 .Seal()
@@ -5154,7 +5195,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                             .Param("mapItem")
                             .Callable("Variant")
                                 .Arg(0, "mapItem")
-                                .Add(1, ctx.NewAtom(node->Pos(), i))
+                                .Atom(1,  i)
                                 .Add(2, outVarType)
                             .Seal()
                         .Seal()
@@ -5180,7 +5221,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                 body = ctx.Builder(node->Pos())
                     .Callable("Variant")
                         .Add(0, arg)
-                        .Add(1, ctx.NewAtom(node->Pos(), i))
+                        .Atom(1, i)
                         .Add(2, outVarType)
                     .Seal()
                     .Build();
@@ -5235,7 +5276,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                         .Do([&](TExprNodeBuilder& builder) -> TExprNodeBuilder& {
                             ui32 i = 1;
                             for (auto& item: indicies) {
-                                builder.Add(i++, ctx.NewAtom(node->Pos(), item.first));
+                                builder.Atom(i++, item.first);
                                 if (item.second.size() > 1) {
                                     builder.Lambda(i++)
                                         .Param("subItem")
