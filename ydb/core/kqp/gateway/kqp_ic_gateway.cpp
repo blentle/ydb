@@ -178,6 +178,7 @@ public:
     }
 
     void Handle(NKqp::TEvKqpExecuter::TEvStreamData::TPtr& ev, const TActorContext& ctx) {
+        ExecuterActorId = ev->Sender;
         auto& record = ev->Get()->Record;
 
         if (!HasMeta) {
@@ -213,12 +214,6 @@ public:
     void Handle(NKqp::TEvKqpExecuter::TEvStreamProfile::TPtr& ev, const TActorContext& ctx) {
         Y_UNUSED(ctx);
         Executions.push_back(std::move(*ev->Get()->Record.MutableProfile()));
-    }
-
-    void Handle(NKqp::TEvKqpExecuter::TEvExecuterProgress::TPtr& ev, const TActorContext& ctx) {
-        ExecuterActorId = ActorIdFromProto(ev->Get()->Record.GetExecuterActorId());
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_GATEWAY, SelfId()
-            << "Received executer progress for scan query, id: " << ExecuterActorId);
     }
 
     void Handle(NKqp::TEvKqp::TEvProcessResponse::TPtr& ev, const TActorContext& ctx) {
@@ -257,7 +252,6 @@ public:
             HFunc(NKqp::TEvKqp::TEvAbortExecution, Handle);
             HFunc(NKqp::TEvKqpExecuter::TEvStreamData, Handle);
             HFunc(NKqp::TEvKqpExecuter::TEvStreamProfile, Handle);
-            HFunc(NKqp::TEvKqpExecuter::TEvExecuterProgress, Handle);
             HFunc(TResponse, HandleResponse);
 
         default:
@@ -403,20 +397,13 @@ public:
 
     void Handle(NKqp::TEvKqpExecuter::TEvStreamData::TPtr& ev, const TActorContext& ctx) {
         Y_UNUSED(ctx);
+        ExecuterActorId = ev->Sender;
         TlsActivationContext->Send(ev->Forward(TargetActorId));
     }
 
     void Handle(NKqp::TEvKqpExecuter::TEvStreamDataAck::TPtr& ev, const TActorContext& ctx) {
         Y_UNUSED(ctx);
         TlsActivationContext->Send(ev->Forward(ExecuterActorId));
-    }
-
-    void Handle(NKqp::TEvKqpExecuter::TEvExecuterProgress::TPtr& ev, const TActorContext& ctx) {
-        ExecuterActorId = ActorIdFromProto(ev->Get()->Record.GetExecuterActorId());
-        ActorIdToProto(SelfId(), ev->Get()->Record.MutableExecuterActorId());
-        LOG_DEBUG_S(ctx, NKikimrServices::KQP_GATEWAY, SelfId()
-            << "Received executer progress for scan query, id: " << ExecuterActorId);
-        TlsActivationContext->Send(ev->Forward(TargetActorId));
     }
 
     void Handle(NKqp::TEvKqpExecuter::TEvStreamProfile::TPtr& ev, const TActorContext& ctx) {
@@ -461,7 +448,6 @@ public:
             HFunc(NKqp::TEvKqp::TEvAbortExecution, Handle);
             HFunc(NKqp::TEvKqpExecuter::TEvStreamData, Handle);
             HFunc(NKqp::TEvKqpExecuter::TEvStreamProfile, Handle);
-            HFunc(NKqp::TEvKqpExecuter::TEvExecuterProgress, Handle);
             HFunc(TResponse, HandleResponse);
 
         default:
@@ -553,8 +539,11 @@ public:
     using TResponse = TEvTxUserProxy::TEvProposeTransactionStatus;
     using TResult = IKqpGateway::TGenericResult;
 
-    TSchemeOpRequestHandler(TRequest* request, TPromise<TResult> promise)
-        : TBase(request, promise, {}) {}
+    TSchemeOpRequestHandler(TRequest* request, TPromise<TResult> promise, bool failedOnAlreadyExists)
+        : TBase(request, promise, {})
+        , FailedOnAlreadyExists(failedOnAlreadyExists)
+        {}
+
 
     void Bootstrap(const TActorContext& ctx) {
         TActorId txproxy = MakeTxProxyID();
@@ -604,7 +593,7 @@ public:
 
             case TEvTxUserProxy::TResultStatus::ExecComplete: {
                 if (response.GetSchemeShardStatus() == NKikimrScheme::EStatus::StatusSuccess ||
-                    response.GetSchemeShardStatus() == NKikimrScheme::EStatus::StatusAlreadyExists)
+                    (!FailedOnAlreadyExists && response.GetSchemeShardStatus() == NKikimrScheme::EStatus::StatusAlreadyExists))
                 {
                     LOG_DEBUG_S(ctx, NKikimrServices::KQP_GATEWAY, "Successful completion of scheme request"
                     << ", TxId: " << response.GetTxId());
@@ -704,6 +693,7 @@ public:
 
 private:
     TActorId ShemePipeActorId;
+    bool FailedOnAlreadyExists = false;
 };
 
 template<typename TResult>
@@ -744,14 +734,6 @@ namespace {
 
 class TKikimrIcGateway : public IKqpGateway {
 private:
-    struct TUserTokenData {
-        TString Serialized;
-        NACLib::TUserToken Data;
-
-        TUserTokenData(const TString& serialized)
-            : Serialized(serialized)
-            , Data(serialized) {}
-    };
     using TNavigate = NSchemeCache::TSchemeCacheNavigate;
 
 public:
@@ -782,11 +764,9 @@ public:
         return {};
     }
 
-    void SetToken(const TString& cluster, const TString& token) override {
+    void SetToken(const TString& cluster, const TIntrusiveConstPtr<NACLib::TUserToken>& token) override {
         YQL_ENSURE(cluster == Cluster);
-        if (!token.empty()) {
-            UserToken = TUserTokenData(token);
-        }
+        UserToken = token;
     }
 
     TVector<TString> GetCollectedSchemeData() override {
@@ -794,7 +774,7 @@ public:
     }
 
     TString GetTokenCompat() const {
-        return UserToken ? UserToken->Serialized : TString();
+        return UserToken ? UserToken->GetSerializedToken() : TString();
     }
 
     TFuture<TListPathResult> ListPath(const TString& cluster, const TString &path) override {
@@ -808,7 +788,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(Database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& describePath = *ev->Record.MutableDescribePath();
             describePath.SetPath(CanonizePath(path));
@@ -843,11 +823,8 @@ public:
             if (!CheckCluster(cluster)) {
                 return InvalidCluster<TTableMetadataResult>(cluster);
             }
-            if (UserToken) {
-                return MetadataLoader->LoadTableMetadata(cluster, table, settings, Database, UserToken->Data);
-            } else {
-                return MetadataLoader->LoadTableMetadata(cluster, table, settings, Database, Nothing());
-            }
+
+            return MetadataLoader->LoadTableMetadata(cluster, table, settings, Database, UserToken);
 
         } catch (yexception& e) {
             return MakeFuture(ResultFromException<TTableMetadataResult>(e));
@@ -903,7 +880,7 @@ public:
                     auto ev = MakeHolder<TRequest>();
                     ev->Record.SetDatabaseName(Database);
                     if (UserToken) {
-                        ev->Record.SetUserToken(UserToken->Serialized);
+                        ev->Record.SetUserToken(UserToken->GetSerializedToken());
                     }
                     auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
                     schemeTx.SetWorkingDir(pathPair.first);
@@ -993,7 +970,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(Database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetWorkingDir(pathPair.first);
@@ -1050,7 +1027,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(Database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpMoveTable);
@@ -1114,7 +1091,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(Database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetWorkingDir(pathPair.first);
@@ -1150,7 +1127,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(Database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetWorkingDir(pathPair.first);
@@ -1191,7 +1168,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(Database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetWorkingDir(pathPair.first);
@@ -1227,7 +1204,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(Database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetWorkingDir(pathPair.first);
@@ -1235,6 +1212,84 @@ public:
             schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpDropColumnStore);
             NKikimrSchemeOp::TDrop* drop = schemeTx.MutableDrop();
             drop->SetName(pathPair.second);
+            return SendSchemeRequest(ev.Release());
+        }
+        catch (yexception& e) {
+            return MakeFuture(ResultFromException<TGenericResult>(e));
+        }
+    }
+
+    TFuture<TGenericResult> CreateExternalTable(const TString& cluster,
+                                                const NYql::TCreateExternalTableSettings& settings,
+                                                bool createDir) override {
+        using TRequest = TEvTxUserProxy::TEvProposeTransaction;
+
+        try {
+            if (!CheckCluster(cluster)) {
+                return InvalidCluster<TGenericResult>(cluster);
+            }
+
+            std::pair<TString, TString> pathPair;
+            {
+                TString error;
+                if (!GetPathPair(settings.ExternalTable, pathPair, error, createDir)) {
+                    return MakeFuture(ResultFromError<TGenericResult>(error));
+                }
+            }
+
+            auto ev = MakeHolder<TRequest>();
+            ev->Record.SetDatabaseName(Database);
+            if (UserToken) {
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
+            }
+            auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
+            schemeTx.SetWorkingDir(pathPair.first);
+            schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpCreateExternalTable);
+
+            NKikimrSchemeOp::TExternalTableDescription& externalTableDesc = *schemeTx.MutableCreateExternalTable();
+            FillCreateExternalTableColumnDesc(externalTableDesc, pathPair.second, settings);
+            return SendSchemeRequest(ev.Release());
+        }
+        catch (yexception& e) {
+            return MakeFuture(ResultFromException<TGenericResult>(e));
+        }
+    }
+
+    TFuture<TGenericResult> AlterExternalTable(const TString& cluster,
+                                               const NYql::TAlterExternalTableSettings& settings) override {
+        Y_UNUSED(cluster, settings);
+        return MakeErrorFuture<TGenericResult>(std::make_exception_ptr(yexception() << "The alter is not supported for the external table"));
+    }
+
+    TFuture<TGenericResult> DropExternalTable(const TString& cluster,
+                                              const NYql::TDropExternalTableSettings& settings) override {
+        using TRequest = TEvTxUserProxy::TEvProposeTransaction;
+
+        try {
+            if (!CheckCluster(cluster)) {
+                return InvalidCluster<TGenericResult>(cluster);
+            }
+
+            std::pair<TString, TString> pathPair;
+            {
+                TString error;
+                if (!GetPathPair(settings.ExternalTable, pathPair, error, false)) {
+                    return MakeFuture(ResultFromError<TGenericResult>(error));
+                }
+            }
+
+            auto ev = MakeHolder<TRequest>();
+            ev->Record.SetDatabaseName(Database);
+            if (UserToken) {
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
+            }
+
+            auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
+            schemeTx.SetWorkingDir(pathPair.first);
+            schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpDropExternalTable);
+
+            NKikimrSchemeOp::TDrop& drop = *schemeTx.MutableDrop();
+            drop.SetName(pathPair.second);
             return SendSchemeRequest(ev.Release());
         }
         catch (yexception& e) {
@@ -1260,7 +1315,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetWorkingDir(database);
@@ -1285,6 +1340,84 @@ public:
         }
     }
 
+    TFuture<TGenericResult> CreateExternalDataSource(const TString& cluster,
+                                                     const NYql::TCreateExternalDataSourceSettings& settings,
+                                                     bool createDir) override {
+        using TRequest = TEvTxUserProxy::TEvProposeTransaction;
+
+        try {
+            if (!CheckCluster(cluster)) {
+                return InvalidCluster<TGenericResult>(cluster);
+            }
+
+            std::pair<TString, TString> pathPair;
+            {
+                TString error;
+                if (!GetPathPair(settings.ExternalDataSource, pathPair, error, createDir)) {
+                    return MakeFuture(ResultFromError<TGenericResult>(error));
+                }
+            }
+
+            auto ev = MakeHolder<TRequest>();
+            ev->Record.SetDatabaseName(Database);
+            if (UserToken) {
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
+            }
+            auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
+            schemeTx.SetWorkingDir(pathPair.first);
+            schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpCreateExternalDataSource);
+
+            NKikimrSchemeOp::TExternalDataSourceDescription& dataSourceDesc = *schemeTx.MutableCreateExternalDataSource();
+            FillCreateExternalDataSourceDesc(dataSourceDesc, pathPair.second, settings);
+            return SendSchemeRequest(ev.Release(), true);
+        }
+        catch (yexception& e) {
+            return MakeFuture(ResultFromException<TGenericResult>(e));
+        }
+    }
+
+    TFuture<TGenericResult> AlterExternalDataSource(const TString& cluster,
+                                                    const NYql::TAlterExternalDataSourceSettings& settings) override {
+        Y_UNUSED(cluster, settings);
+        return MakeErrorFuture<TGenericResult>(std::make_exception_ptr(yexception() << "The alter is not supported for the external data source"));
+    }
+
+    TFuture<TGenericResult> DropExternalDataSource(const TString& cluster,
+                                                   const NYql::TDropExternalDataSourceSettings& settings) override {
+        using TRequest = TEvTxUserProxy::TEvProposeTransaction;
+
+        try {
+            if (!CheckCluster(cluster)) {
+                return InvalidCluster<TGenericResult>(cluster);
+            }
+
+            std::pair<TString, TString> pathPair;
+            {
+                TString error;
+                if (!GetPathPair(settings.ExternalDataSource, pathPair, error, false)) {
+                    return MakeFuture(ResultFromError<TGenericResult>(error));
+                }
+            }
+
+            auto ev = MakeHolder<TRequest>();
+            ev->Record.SetDatabaseName(Database);
+            if (UserToken) {
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
+            }
+
+            auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
+            schemeTx.SetWorkingDir(pathPair.first);
+            schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpDropExternalDataSource);
+
+            NKikimrSchemeOp::TDrop& drop = *schemeTx.MutableDrop();
+            drop.SetName(pathPair.second);
+            return SendSchemeRequest(ev.Release());
+        }
+        catch (yexception& e) {
+            return MakeFuture(ResultFromException<TGenericResult>(e));
+        }
+    }
+
     TFuture<TGenericResult> AlterUser(const TString& cluster, const NYql::TAlterUserSettings& settings) override {
         using TRequest = TEvTxUserProxy::TEvProposeTransaction;
 
@@ -1303,7 +1436,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetWorkingDir(database);
@@ -1346,7 +1479,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetWorkingDir(database);
@@ -1386,12 +1519,8 @@ public:
         ui32 GetNodeId() const {
             return Owner.NodeId;
         }
-        TMaybe<NACLib::TUserToken> GetUserToken() const {
-            if (Owner.UserToken) {
-                return Owner.UserToken->Data;
-            } else {
-                return {};
-            }
+        TIntrusiveConstPtr<NACLib::TUserToken> GetUserToken() const {
+            return Owner.UserToken;
         }
     public:
         IObjectModifier(TKikimrIcGateway& owner)
@@ -1506,7 +1635,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetWorkingDir(database);
@@ -1556,7 +1685,7 @@ public:
                 auto ev = MakeHolder<TRequest>();
                 ev->Record.SetDatabaseName(database);
                 if (UserToken) {
-                    ev->Record.SetUserToken(UserToken->Serialized);
+                    ev->Record.SetUserToken(UserToken->GetSerializedToken());
                 }
                 auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
                 schemeTx.SetWorkingDir(database);
@@ -1638,7 +1767,7 @@ public:
             auto ev = MakeHolder<TRequest>();
             ev->Record.SetDatabaseName(database);
             if (UserToken) {
-                ev->Record.SetUserToken(UserToken->Serialized);
+                ev->Record.SetUserToken(UserToken->GetSerializedToken());
             }
             auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
             schemeTx.SetWorkingDir(database);
@@ -1705,7 +1834,7 @@ public:
 
         auto ev = MakeHolder<TRequest>();
         if (UserToken) {
-            ev->Record.SetUserToken(UserToken->Serialized);
+            ev->Record.SetUserToken(UserToken->GetSerializedToken());
         }
 
         ev->Record.MutableRequest()->SetDatabase(Database);
@@ -1737,7 +1866,7 @@ public:
 
         auto ev = MakeHolder<TRequest>();
         if (UserToken) {
-            ev->Record.SetUserToken(UserToken->Serialized);
+            ev->Record.SetUserToken(UserToken->GetSerializedToken());
         }
 
         ev->Record.MutableRequest()->SetDatabase(Database);
@@ -1772,7 +1901,7 @@ public:
 
         auto ev = MakeHolder<TRequest>();
         if (UserToken) {
-            ev->Record.SetUserToken(UserToken->Serialized);
+            ev->Record.SetUserToken(UserToken->GetSerializedToken());
         }
 
         ev->Record.MutableRequest()->SetDatabase(Database);
@@ -1802,7 +1931,7 @@ public:
 
         auto ev = MakeHolder<TRequest>();
         if (UserToken) {
-            ev->Record.SetUserToken(UserToken->Serialized);
+            ev->Record.SetUserToken(UserToken->GetSerializedToken());
         }
 
         ev->Record.MutableRequest()->SetDatabase(Database);
@@ -1830,7 +1959,7 @@ public:
 
         auto ev = MakeHolder<TRequest>();
         if (UserToken) {
-            ev->Record.SetUserToken(UserToken->Serialized);
+            ev->Record.SetUserToken(UserToken->GetSerializedToken());
         }
 
         ev->Record.MutableRequest()->SetDatabase(Database);
@@ -1863,7 +1992,7 @@ public:
 
         auto ev = MakeHolder<TRequest>();
         if (UserToken) {
-            ev->Record.SetUserToken(UserToken->Serialized);
+            ev->Record.SetUserToken(UserToken->GetSerializedToken());
         }
 
         ev->Record.MutableRequest()->SetDatabase(Database);
@@ -1972,10 +2101,10 @@ private:
         return promise.GetFuture();
     }
 
-    TFuture<TGenericResult> SendSchemeRequest(TEvTxUserProxy::TEvProposeTransaction* request)
+    TFuture<TGenericResult> SendSchemeRequest(TEvTxUserProxy::TEvProposeTransaction* request, bool failedOnAlreadyExists = false)
     {
         auto promise = NewPromise<TGenericResult>();
-        IActor* requestHandler = new TSchemeOpRequestHandler(request, promise);
+        IActor* requestHandler = new TSchemeOpRequestHandler(request, promise, failedOnAlreadyExists);
         RegisterActor(requestHandler);
 
         return promise.GetFuture();
@@ -2052,7 +2181,7 @@ private:
     }
 
     static void FillCreateTableColumnDesc(NKikimrSchemeOp::TTableDescription& tableDesc,
-        const TString& name, NYql::TKikimrTableMetadataPtr metadata)
+                                          const TString& name, NYql::TKikimrTableMetadataPtr metadata)
     {
         tableDesc.SetName(name);
 
@@ -2094,6 +2223,40 @@ private:
         }
 
         schema.SetEngine(NKikimrSchemeOp::EColumnTableEngine::COLUMN_ENGINE_REPLACING_TIMESERIES);
+    }
+
+    static void FillCreateExternalTableColumnDesc(NKikimrSchemeOp::TExternalTableDescription& externalTableDesc,
+                                                  const TString& name,
+                                                  const NYql::TCreateExternalTableSettings& settings)
+    {
+        externalTableDesc.SetName(name);
+        externalTableDesc.SetDataSourcePath(settings.DataSourcePath);
+        externalTableDesc.SetLocation(settings.Location);
+
+        Y_ENSURE(settings.ColumnOrder.size() == settings.Columns.size());
+        for (const auto& name : settings.ColumnOrder) {
+            auto columnIt = settings.Columns.find(name);
+            Y_ENSURE(columnIt != settings.Columns.end());
+
+            TColumnDescription& columnDesc = *externalTableDesc.AddColumns();
+            columnDesc.SetName(columnIt->second.Name);
+            columnDesc.SetType(columnIt->second.Type);
+            columnDesc.SetNotNull(columnIt->second.NotNull);
+        }
+    }
+
+    static void FillCreateExternalDataSourceDesc(NKikimrSchemeOp::TExternalDataSourceDescription& externaDataSourceDesc,
+                                                 const TString& name,
+                                                 const NYql::TCreateExternalDataSourceSettings& settings)
+    {
+        externaDataSourceDesc.SetName(name);
+        externaDataSourceDesc.SetSourceType(settings.SourceType);
+        externaDataSourceDesc.SetLocation(settings.Location);
+        externaDataSourceDesc.SetInstallation(settings.Installation);
+
+        if (settings.AuthMethod == "NONE") {
+            externaDataSourceDesc.MutableAuth()->MutableNone();
+        }
     }
 
     static void FillParameters(TQueryData::TPtr params, NKikimrMiniKQL::TParams& output) {
@@ -2440,7 +2603,7 @@ private:
     ui32 NodeId;
     TKqpRequestCounters::TPtr Counters;
     TAlignedPagePoolCounters AllocCounters;
-    TMaybe<TUserTokenData> UserToken;
+    TIntrusiveConstPtr<NACLib::TUserToken> UserToken;
     std::shared_ptr<IKqpTableMetadataLoader> MetadataLoader;
 };
 

@@ -21,7 +21,8 @@ TExprBase KqpRemoveRedundantSortByPkBase(
     TExprContext& ctx,
     const TKqpOptimizeContext& kqpCtx,
     std::function<TMaybe<TTableData>(TExprBase)> tableAccessor,
-    std::function<TExprBase(TExprBase, NYql::TKqpReadTableSettings)> rebuildInput)
+    std::function<TExprBase(TExprBase, NYql::TKqpReadTableSettings)> rebuildInput,
+    bool allowSortForAllTables = false)
 {
     auto maybeSort = node.Maybe<TCoSort>();
     auto maybeTopSort = node.Maybe<TCoTopSort>();
@@ -128,7 +129,7 @@ TExprBase KqpRemoveRedundantSortByPkBase(
 
     bool olapTable = tableDesc.Metadata->Kind == EKikimrTableKind::Olap;
     if (direction == SortDirectionReverse) {
-        if (!olapTable && kqpCtx.IsScanQuery()) {
+        if (!allowSortForAllTables && !olapTable && kqpCtx.IsScanQuery()) {
             return node;
         }
 
@@ -141,7 +142,7 @@ TExprBase KqpRemoveRedundantSortByPkBase(
 
         input = rebuildInput(input, settings);
     } else if (direction == SortDirectionForward) {
-        if (olapTable) {
+        if (olapTable || allowSortForAllTables) {
             settings.SetSorted();
             input = rebuildInput(input, settings);
         }
@@ -204,8 +205,7 @@ NYql::NNodes::TExprBase KqpRemoveRedundantSortByPkOverSource(
     auto& tableDesc = kqpCtx.Tables->ExistingTable(kqpCtx.Cluster, readRangesSource.Table().Path());
 
     TVector<NYql::TKqpReadTableSettings> newSettings;
-    NYql::TNodeOnNodeOwnedMap replaces;
-    auto sourceArg = stage.Program().Args().Arg(*tableSourceIndex);
+    NYql::TNodeOnNodeOwnedMap bodyReplaces;
     VisitExpr(stage.Program().Body().Ptr(),
         [&](const TExprNode::TPtr& exprPtr) -> bool {
             TExprBase expr(exprPtr);
@@ -223,9 +223,10 @@ NYql::NNodes::TExprBase KqpRemoveRedundantSortByPkOverSource(
                     [&](TExprBase input, NYql::TKqpReadTableSettings settings) {
                         newSettings.push_back(settings);
                         return input;
-                    });
+                    },
+                    /* allowSortForAllTables */ true);
                 if (newExpr.Ptr() != expr.Ptr()) {
-                    replaces[expr.Raw()] = newExpr.Ptr();
+                    bodyReplaces[expr.Raw()] = newExpr.Ptr();
                 }
             }
             return true;
@@ -238,17 +239,28 @@ NYql::NNodes::TExprBase KqpRemoveRedundantSortByPkOverSource(
             }
         }
 
-        auto newSource = Build<TKqpReadRangesSourceSettings>(exprCtx, source.Pos())
-            .Table(readRangesSource.Table())
-            .Columns(readRangesSource.Columns())
-            .Settings(newSettings[0].BuildNode(exprCtx, source.Settings().Pos()))
-            .RangesExpr(readRangesSource.RangesExpr())
-            .ExplainPrompt(readRangesSource.ExplainPrompt())
-            .Done();
-        replaces[readRangesSource.Raw()] = newSource.Ptr();
+        if (settings != newSettings[0]) {
+            auto newSource = Build<TKqpReadRangesSourceSettings>(exprCtx, source.Pos())
+                .Table(readRangesSource.Table())
+                .Columns(readRangesSource.Columns())
+                .Settings(newSettings[0].BuildNode(exprCtx, source.Settings().Pos()))
+                .RangesExpr(readRangesSource.RangesExpr())
+                .ExplainPrompt(readRangesSource.ExplainPrompt())
+                .Done();
+            stage = ReplaceTableSourceSettings(stage, *tableSourceIndex, newSource, exprCtx);
+        }
     }
 
-    return TExprBase(exprCtx.ReplaceNodes(node.Ptr(), replaces));
+    if (bodyReplaces.empty()) {
+        return stage;
+    }
+
+    return Build<TDqStage>(exprCtx, stage.Pos())
+        .Inputs(stage.Inputs())
+        .Outputs(stage.Outputs())
+        .Settings(stage.Settings())
+        .Program(TCoLambda(exprCtx.ReplaceNodes(stage.Program().Ptr(), bodyReplaces)))
+        .Done();
 }
 
 } // namespace NKikimr::NKqp::NOpt

@@ -405,7 +405,13 @@ TExprNode::TPtr RemoveSetting(const TExprNode& settings, const TStringBuf& name,
 }
 
 TExprNode::TPtr ReplaceSetting(const TExprNode& settings, TPositionHandle pos, const TString& name, const TExprNode::TPtr& value, TExprContext& ctx) {
+    auto newSetting = value ? ctx.NewList(pos, { ctx.NewAtom(pos, name), value }) : ctx.NewList(pos, { ctx.NewAtom(pos, name) });
+    return ReplaceSetting(settings, newSetting, ctx);
+}
+
+TExprNode::TPtr ReplaceSetting(const TExprNode& settings, const TExprNode::TPtr& newSetting, TExprContext& ctx) {
     TExprNode::TListType newChildren;
+    const TStringBuf name = newSetting->Head().Content();
     for (auto setting : settings.Children()) {
         if (setting->ChildrenSize() != 0 && setting->Head().Content() == name) {
             continue;
@@ -414,20 +420,24 @@ TExprNode::TPtr ReplaceSetting(const TExprNode& settings, TPositionHandle pos, c
         newChildren.push_back(setting);
     }
 
-    newChildren.push_back(value ? ctx.NewList(pos, { ctx.NewAtom(pos, name), value }) : ctx.NewList(pos, { ctx.NewAtom(pos, name) }));
+    newChildren.push_back(newSetting);
 
     auto ret = ctx.NewList(settings.Pos(), std::move(newChildren));
     return ret;
 }
 
 TExprNode::TPtr AddSetting(const TExprNode& settings, TPositionHandle pos, const TString& name, const TExprNode::TPtr& value, TExprContext& ctx) {
+    auto newSetting = value ? ctx.NewList(pos, { ctx.NewAtom(pos, name), value }) : ctx.NewList(pos, { ctx.NewAtom(pos, name) });
+    return AddSetting(settings, newSetting, ctx);
+}
+
+TExprNode::TPtr AddSetting(const TExprNode& settings, const TExprNode::TPtr& newSetting, TExprContext& ctx) {
     auto newChildren = settings.ChildrenList();
-    newChildren.push_back(value ? ctx.NewList(pos, { ctx.NewAtom(pos, name), value }) : ctx.NewList(pos, { ctx.NewAtom(pos, name) }));
+    newChildren.push_back(newSetting);
 
     auto ret = ctx.NewList(settings.Pos(), std::move(newChildren));
     return ret;
 }
-
 
 TExprNode::TPtr MergeSettings(const TExprNode& settings1, const TExprNode& settings2, TExprContext& ctx) {
     auto newChildren = settings1.ChildrenList();
@@ -1214,6 +1224,12 @@ TExprNode::TPtr OptimizeIfPresent(const TExprNode::TPtr& node, TExprContext& ctx
                 .Seal().Build();
         }
 
+        if (lambda.Tail().IsCallable({"SafeCast", "StrictCast"}) && node->Tail().IsCallable("Nothing") && &lambda.Tail().Head() == &lambda.Head().Head() &&
+            ETypeAnnotationKind::Optional != node->Head().GetTypeAnn()->Cast<TOptionalExprType>()->GetItemType()->GetKind()) {
+            YQL_CLOG(DEBUG, Core) << "Drop " << node->Content() << " with " << lambda.Tail().Content() << " and " << node->Tail().Content();
+            return ctx.ChangeChild(lambda.Tail(), 0U, node->HeadPtr());
+        }
+
         if constexpr (Cannonize) {
             if (node->Tail().IsCallable("Nothing") && node->Tail().GetTypeAnn()->GetKind() != ETypeAnnotationKind::Pg) {
                 YQL_CLOG(DEBUG, Core) << node->Content() << " with else " << node->Tail().Content();
@@ -1341,7 +1357,8 @@ IGraphTransformer::TStatus LocalUnorderedOptimize(TExprNode::TPtr input, TExprNo
     TOptimizeExprSettings settings(typeCtx);
     settings.ProcessedNodes = &processedNodes; // Prevent optimizer to go deeper
 
-    static THashSet<TStringBuf> CALLABLE = {"AssumeUnique",
+    static THashSet<TStringBuf> CALLABLE = {
+        "AssumeUnique", "AssumeDistinct",
         "Map", "OrderedMap",
         "Filter", "OrderedFilter",
         "FlatMap", "OrderedFlatMap",
@@ -1684,6 +1701,53 @@ TExprNode::TPtr FindNonYieldTransparentNode(const TExprNode::TPtr& root, const T
 
 bool IsYieldTransparent(const TExprNode::TPtr& root, const TTypeAnnotationContext& typeCtx) {
     return !FindNonYieldTransparentNode(root, typeCtx);
+}
+
+bool IsStrict(const TExprNode::TPtr& root) {
+    // TODO: add TExprNode::IsStrict() method (with corresponding flag). Fill it as part of type annotation pass
+    bool isStrict = true;
+    size_t insideAssumeStrict = 0;
+
+    VisitExpr(root, [&](const TExprNode::TPtr& node) {
+        if (node->IsCallable("AssumeStrict")) {
+            ++insideAssumeStrict;
+        } else if (isStrict && !insideAssumeStrict && node->IsCallable({"Udf", "ScriptUdf", "Unwrap", "Ensure"})) {
+            if (!node->IsCallable("Udf") || !HasSetting(*node->Child(TCoUdf::idx_Settings), "strict")) {
+                isStrict = false;
+            }
+        }
+        return isStrict;
+    }, [&](const TExprNode::TPtr& node) {
+        if (node->IsCallable("AssumeStrict")) {
+            YQL_ENSURE(insideAssumeStrict > 0);
+            --insideAssumeStrict;
+        }
+        return true;
+    });
+
+    return isStrict;
+}
+
+bool HasDependsOn(const TExprNode::TPtr& root, const TExprNode::TPtr& arg) {
+    bool withDependsOn = false;
+    size_t insideDependsOn = 0;
+
+    VisitExpr(root, [&](const TExprNode::TPtr& node) {
+        if (node->IsCallable("DependsOn")) {
+            ++insideDependsOn;
+        } else if (insideDependsOn && node == arg) {
+            withDependsOn = true;
+        }
+        return !withDependsOn;
+    }, [&](const TExprNode::TPtr& node) {
+        if (node->IsCallable("DependsOn")) {
+            YQL_ENSURE(insideDependsOn > 0);
+            --insideDependsOn;
+        }
+        return true;
+    });
+
+    return withDependsOn;
 }
 
 }

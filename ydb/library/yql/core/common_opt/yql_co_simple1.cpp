@@ -138,25 +138,33 @@ TExprNode::TPtr KeepSortedConstraint(TExprNode::TPtr node, const TSortedConstrai
         .Build();
 }
 
-TExprNode::TPtr KeepConstraints(TExprNode::TPtr node, const TExprNode& src, TExprContext& ctx) {
-    auto res = KeepSortedConstraint(node, src.GetConstraint<TSortedConstraintNode>(), ctx);
-    if (const auto uniq = src.GetConstraint<TUniqueConstraintNode>()) {
+template<bool Distinct>
+TExprNode::TPtr KeepUniqueConstraint(TExprNode::TPtr node, const TExprNode& src, TExprContext& ctx) {
+    if (const auto uniq = src.GetConstraint<TUniqueConstraintNodeBase<Distinct>>()) {
         TExprNode::TListType columns;
         for (const auto& set : uniq->GetAllSets())
             for (const auto& path : set)
                 if (!path.empty())
                     columns.emplace_back(ctx.NewAtom(node->Pos(), path.front()));
-        res = columns.empty() ?
-            ctx.NewCallable(node->Pos(), "AssumeUnique", {std::move(res)}):
+        const auto& name = std::conditional_t<Distinct, TCoAssumeDistinct, TCoAssumeUnique>::CallableName();
+        return columns.empty() ?
+            ctx.NewCallable(node->Pos(), name, {std::move(node)}):
             ctx.Builder(node->Pos())
-                .Callable("AssumeUnique")
-                    .Add(0, std::move(res))
+                .Callable(name)
+                    .Add(0, std::move(node))
                     .List(1)
                         .Add(std::move(columns))
                     .Seal()
                 .Seal()
                 .Build();
     }
+    return node;
+}
+
+TExprNode::TPtr KeepConstraints(TExprNode::TPtr node, const TExprNode& src, TExprContext& ctx) {
+    auto res = KeepSortedConstraint(node, src.GetConstraint<TSortedConstraintNode>(), ctx);
+    res = KeepUniqueConstraint<true>(std::move(res), src, ctx);
+    res = KeepUniqueConstraint<false>(std::move(res), src, ctx);
     return res;
 }
 
@@ -471,7 +479,7 @@ TExprNode::TPtr HandleEmptyListInJoin(const TExprNode::TPtr& node, TExprContext&
     return node;
 }
 
-TExprNode::TPtr UpdateJoinTreeUniqueRecursive(const TExprNode::TPtr& joinTree, const TJoinLabels& labels, const TVector<const TUniqueConstraintNode*>& unique, TExprContext& ctx) {
+TExprNode::TPtr UpdateJoinTreeUniqueRecursive(const TExprNode::TPtr& joinTree, const TJoinLabels& labels, const TVector<const TDistinctConstraintNode*>& unique, TExprContext& ctx) {
     TExprNode::TPtr res = joinTree;
 
     TEquiJoinLinkSettings linkSettings = GetEquiJoinLinkSettings(*joinTree->Child(5));
@@ -537,12 +545,12 @@ TExprNode::TPtr UpdateJoinTreeUniqueRecursive(const TExprNode::TPtr& joinTree, c
 
 
 TExprNode::TPtr HandleUniqueListInJoin(const TExprNode::TPtr& node, TExprContext& ctx, const TTypeAnnotationContext& typeCtx) {
-    if (!typeCtx.IsConstraintCheckEnabled<TUniqueConstraintNode>()) {
+    if (!typeCtx.IsConstraintCheckEnabled<TDistinctConstraintNode>()) {
         return node;
     }
 
     TJoinLabels labels;
-    TVector<const TUniqueConstraintNode*> unique;
+    TVector<const TDistinctConstraintNode*> unique;
     unique.reserve(node->ChildrenSize() - 2);
     for (ui32 i = 0; i < node->ChildrenSize() - 2; ++i) {
         auto err = labels.Add(ctx, *node->Child(i)->Child(1),
@@ -551,7 +559,7 @@ TExprNode::TPtr HandleUniqueListInJoin(const TExprNode::TPtr& node, TExprContext
             ctx.AddError(*err);
             return nullptr;
         }
-        unique.push_back(node->Child(i)->Head().GetConstraint<TUniqueConstraintNode>());
+        unique.push_back(node->Child(i)->Head().GetConstraint<TDistinctConstraintNode>());
     }
 
     auto joinTree = UpdateJoinTreeUniqueRecursive(node->ChildPtr(node->ChildrenSize() - 2), labels, unique, ctx);
@@ -1446,35 +1454,33 @@ bool ShouldConvertSqlInToJoin(const TCoSqlIn& sqlIn, bool /* negated */) {
 }
 
 bool CanConvertSqlInToJoin(const TCoSqlIn& sqlIn) {
-    auto leftArg = sqlIn.Lookup();
-    auto leftColumnType = leftArg.Ref().GetTypeAnn();
+    const auto leftArg = sqlIn.Lookup();
+    const auto leftColumnType = leftArg.Ref().GetTypeAnn();
 
-    auto rightArg = sqlIn.Collection();
-    auto rightArgType = rightArg.Ref().GetTypeAnn();
+    const auto rightArg = sqlIn.Collection();
+    const auto rightArgType = rightArg.Ref().GetTypeAnn();
 
     if (rightArgType->GetKind() == ETypeAnnotationKind::List) {
-        auto rightListItemType = rightArgType->Cast<TListExprType>()->GetItemType();
+        const auto rightListItemType = rightArgType->Cast<TListExprType>()->GetItemType();
 
-        auto isDataOrTupleOfData = [](const TTypeAnnotationNode* type) {
-            if (IsDataOrOptionalOfData(type)) {
+        const auto isDataOrTupleOfDataOrPg = [](const TTypeAnnotationNode* type) {
+            if (IsDataOrOptionalOfDataOrPg(type)) {
                 return true;
             }
             if (type->GetKind() == ETypeAnnotationKind::Tuple) {
-                return AllOf(type->Cast<TTupleExprType>()->GetItems(), [](const auto& item) {
-                    return IsDataOrOptionalOfData(item);
-                });
+                return AllOf(type->Cast<TTupleExprType>()->GetItems(), &IsDataOrOptionalOfDataOrPg);
             }
             return false;
         };
 
         if (rightListItemType->GetKind() == ETypeAnnotationKind::Struct) {
-            auto rightStructType = rightListItemType->Cast<TStructExprType>();
+            const auto rightStructType = rightListItemType->Cast<TStructExprType>();
             YQL_ENSURE(rightStructType->GetSize() == 1);
-            auto rightColumnType = rightStructType->GetItems()[0]->GetItemType();
-            return isDataOrTupleOfData(rightColumnType);
+            const auto rightColumnType = rightStructType->GetItems().front()->GetItemType();
+            return isDataOrTupleOfDataOrPg(rightColumnType);
         }
 
-        return isDataOrTupleOfData(rightListItemType);
+        return isDataOrTupleOfDataOrPg(rightListItemType);
     }
 
     /**
@@ -1487,8 +1493,8 @@ bool CanConvertSqlInToJoin(const TCoSqlIn& sqlIn) {
      */
 
     if (rightArgType->GetKind() == ETypeAnnotationKind::Dict) {
-        auto rightDictType = rightArgType->Cast<TDictExprType>()->GetKeyType();
-        return IsDataOrOptionalOfData(leftColumnType) && IsDataOrOptionalOfData(rightDictType);
+        const auto rightDictType = rightArgType->Cast<TDictExprType>()->GetKeyType();
+        return IsDataOrOptionalOfDataOrPg(leftColumnType) && IsDataOrOptionalOfDataOrPg(rightDictType);
     }
 
     return false;
@@ -1590,7 +1596,7 @@ TExprNode::TPtr BuildCollectionEmptyPred(TPositionHandle pos, const TExprNode::T
                 .Callable(0, "Take")
                     .Add(0, collectionAsList)
                     .Callable(1, "Uint64")
-                        .Atom(0, "1", TNodeFlags::Default)
+                        .Atom(0, 1)
                     .Seal()
                 .Seal()
             .Seal()
@@ -1752,7 +1758,7 @@ TPredicateChainNode ParsePredicateChainNode(const TExprNode::TPtr& predicate, co
             YQL_ENSURE(rightStructType->GetSize() == 1);
 
             const TItemExprType* itemType = rightStructType->GetItems()[0];
-            if (IsDataOrOptionalOfData(itemType->GetItemType())) {
+            if (IsDataOrOptionalOfDataOrPg(itemType->GetItemType())) {
                 result.Right = rightArg;
                 result.RightArgColumns = { ToString(itemType->GetName()) };
                 return result;
@@ -1785,7 +1791,7 @@ TPredicateChainNode ParsePredicateChainNode(const TExprNode::TPtr& predicate, co
                             .Name().Build(columnName)
                             .Value<TCoNth>()
                                 .Tuple(rowArg)
-                                .Index(ctx.NewAtom(sqlIn.Pos(), ToString(i)))
+                                .Index(ctx.NewAtom(sqlIn.Pos(), i))
                                 .Build()
                             .Build();
                     result.RightArgColumns.emplace_back(columnName);
@@ -1817,7 +1823,7 @@ TPredicateChainNode ParsePredicateChainNode(const TExprNode::TPtr& predicate, co
                             .Name().Build(columnName)
                             .Value<TCoNth>()
                                 .Tuple(rowArg)
-                                .Index(ctx.NewAtom(sqlIn.Pos(), ToString(i)))
+                                .Index(ctx.NewAtom(sqlIn.Pos(), i))
                                 .Build()
                             .Build();
                     result.RightArgColumns.emplace_back(columnName);
@@ -1835,7 +1841,7 @@ TPredicateChainNode ParsePredicateChainNode(const TExprNode::TPtr& predicate, co
 
             // fallthrough to default join by the whole tuple
         } else {
-            YQL_ENSURE(IsDataOrOptionalOfData(rightArgItemType), "" << FormatType(rightArgItemType));
+            YQL_ENSURE(IsDataOrOptionalOfDataOrPg(rightArgItemType), "" << FormatType(rightArgItemType));
         }
 
         // rewrite List<DataType|Tuple> to List<Struct<key: DataType|Tuple>>
@@ -1860,7 +1866,7 @@ TPredicateChainNode ParsePredicateChainNode(const TExprNode::TPtr& predicate, co
     YQL_ENSURE(rightArgType->GetKind() == ETypeAnnotationKind::Dict, "" << FormatType(rightArgType));
 
     auto rightDictType = rightArgType->Cast<TDictExprType>()->GetKeyType();
-    YQL_ENSURE(IsDataOrOptionalOfData(rightDictType));
+    YQL_ENSURE(IsDataOrOptionalOfDataOrPg(rightDictType));
 
     auto dictKeys = ctx.Builder(sqlIn.Pos())
         .Callable("DictKeys")
@@ -1967,7 +1973,7 @@ TExprNode::TPtr BuildEquiJoinForSqlInChain(const TExprNode::TPtr& flatMapNode, c
     YQL_ENSURE(inputRowType->GetKind() == ETypeAnnotationKind::Struct);
 
     static const TStringBuf inputTable = "_yql_injoin_input";
-    auto inputTableAtom = ctx.NewAtom(input->Pos(), inputTable);
+    auto inputTableAtom = ctx.NewAtom(input->Pos(), inputTable, TNodeFlags::Default);
 
     size_t startColumnIndex = 0;
     for (;;) {
@@ -1987,7 +1993,7 @@ TExprNode::TPtr BuildEquiJoinForSqlInChain(const TExprNode::TPtr& flatMapNode, c
         auto equiJoinArg = ctx.Builder(pos)
             .List()
                 .Add(0, chain[i].Right)
-                .Atom(1, tableName)
+                .Atom(1, tableName, TNodeFlags::Default)
             .Seal()
             .Build();
 
@@ -1996,7 +2002,7 @@ TExprNode::TPtr BuildEquiJoinForSqlInChain(const TExprNode::TPtr& flatMapNode, c
         TExprNodeList leftKeys;
         if (chain[i].LeftArgColumns.empty()) {
             leftKeys.push_back(inputTableAtom);
-            leftKeys.push_back(ctx.NewAtom(pos, columnName));
+            leftKeys.push_back(ctx.NewAtom(pos, columnName, TNodeFlags::Default));
         } else {
             for (TStringBuf leftKey : chain[i].LeftArgColumns) {
                 leftKeys.push_back(inputTableAtom);
@@ -2006,15 +2012,15 @@ TExprNode::TPtr BuildEquiJoinForSqlInChain(const TExprNode::TPtr& flatMapNode, c
 
         TExprNodeList rightKeys;
         for (const TString& rightKey : chain[i].RightArgColumns) {
-            rightKeys.push_back(ctx.NewAtom(pos, tableName));
+            rightKeys.push_back(ctx.NewAtom(pos, tableName, TNodeFlags::Default));
             rightKeys.push_back(ctx.NewAtom(pos, rightKey));
         }
 
         joinChain = ctx.Builder(pos)
             .List()
-                .Atom(0, chain[i].Negated ? "LeftOnly" : "LeftSemi")
+                .Atom(0, chain[i].Negated ? "LeftOnly" : "LeftSemi", TNodeFlags::Default)
                 .Add(1, joinChain ? joinChain : inputTableAtom)
-                .Atom(2, tableName)
+                .Atom(2, tableName, TNodeFlags::Default)
                 .List(3)
                     .Add(std::move(leftKeys))
                 .Seal()
@@ -2029,7 +2035,7 @@ TExprNode::TPtr BuildEquiJoinForSqlInChain(const TExprNode::TPtr& flatMapNode, c
         if (chain[i].LeftArgColumns.empty()) {
             auto rename = ctx.Builder(pos)
                 .List()
-                    .Atom(0, "rename")
+                    .Atom(0, "rename", TNodeFlags::Default)
                     .Atom(1, FullColumnName(inputTable, columnName))
                     .Atom(2, "")
                 .Seal()
@@ -2039,7 +2045,7 @@ TExprNode::TPtr BuildEquiJoinForSqlInChain(const TExprNode::TPtr& flatMapNode, c
             addMemberChain = ctx.Builder(chain[i].SqlInPos)
                 .Callable("AddMember")
                     .Add(0, addMemberChain ? addMemberChain : origLambdaArgs->HeadPtr())
-                    .Atom(1, columnName)
+                    .Atom(1, columnName, TNodeFlags::Default)
                     .Add(2, chain[i].Left)
                 .Seal()
                 .Build();
@@ -2049,18 +2055,13 @@ TExprNode::TPtr BuildEquiJoinForSqlInChain(const TExprNode::TPtr& flatMapNode, c
     for (const auto& i : inputRowType->Cast<TStructExprType>()->GetItems()) {
         auto rename = ctx.Builder(input->Pos())
             .List()
-                .Atom(0, "rename")
+                .Atom(0, "rename", TNodeFlags::Default)
                 .Atom(1, FullColumnName(inputTable, i->GetName()))
                 .Atom(2, i->GetName())
             .Seal()
             .Build();
         renames.push_back(rename);
     }
-    renames.push_back(ctx.Builder(input->Pos())
-        .List()
-            .Atom(0, "keep_sys")
-        .Seal()
-        .Build());
 
     equiJoinArgs.push_back(joinChain);
     equiJoinArgs.push_back(ctx.NewList(input->Pos(), std::move(renames)));

@@ -21,6 +21,7 @@
 #include <ydb/public/api/protos/yq.pb.h>
 #include <ydb/public/sdk/cpp/client/ydb_scheme/scheme.h>
 
+#include <ydb/library/db_pool/db_pool.h>
 #include <ydb/library/security/util.h>
 
 #include <ydb/core/base/appdata.h>
@@ -45,6 +46,7 @@ namespace NYq {
 
 using namespace NActors;
 using namespace NConfig;
+using namespace NDbPool;
 using namespace NKikimr;
 using namespace NThreading;
 using namespace NYdb;
@@ -563,6 +565,8 @@ class TYdbControlPlaneStorageActor : public NActors::TActorBootstrapped<TYdbCont
     TInstant QuotasUpdatedAt = TInstant::Zero();
     bool QuotasUpdating = false;
 
+    TString TablePathPrefix;
+
 public:
     TYdbControlPlaneStorageActor(
         const NConfig::TControlPlaneStorageConfig& config,
@@ -744,7 +748,7 @@ private:
                 auto event = std::make_unique<ResponseEvent>(issues);
                 event->DebugInfo = debugInfo;
                 responseByteSize = event->GetByteSize();
-                actorSystem->Send(new IEventHandle(ev->Sender, self, event.release(), 0, ev->Cookie));
+                actorSystem->Send(new IEventHandleFat(ev->Sender, self, event.release(), 0, ev->Cookie));
                 requestCounters.IncError();
                 for (const auto& issue : issues) {
                     NYql::WalkThroughIssues(issue, true, [&requestCounters](const NYql::TIssue& err, ui16 level) {
@@ -762,7 +766,7 @@ private:
                 }
                 event->DebugInfo = debugInfo;
                 responseByteSize = event->GetByteSize();
-                actorSystem->Send(new IEventHandle(ev->Sender, self, event.release(), 0, ev->Cookie));
+                actorSystem->Send(new IEventHandleFat(ev->Sender, self, event.release(), 0, ev->Cookie));
                 requestCounters.IncOk();
             }
             requestCounters.DecInFly();
@@ -819,7 +823,7 @@ private:
                 std::unique_ptr<ResponseEvent> event(new ResponseEvent(issues));
                 event->DebugInfo = debugInfo;
                 responseByteSize = event->GetByteSize();
-                actorSystem->Send(new IEventHandle(ev->Sender, self, event.release(), 0, ev->Cookie));
+                actorSystem->Send(new IEventHandleFat(ev->Sender, self, event.release(), 0, ev->Cookie));
                 requestCounters.IncError();
                 for (const auto& issue : issues) {
                     NYql::WalkThroughIssues(issue, true, [&requestCounters](const NYql::TIssue& err, ui16 level) {
@@ -832,7 +836,7 @@ private:
                 std::unique_ptr<ResponseEvent> event(new ResponseEvent(std::make_from_tuple<ResponseEvent>(result)));
                 event->DebugInfo = debugInfo;
                 responseByteSize = event->GetByteSize();
-                actorSystem->Send(new IEventHandle(ev->Sender, self, event.release(), 0, ev->Cookie));
+                actorSystem->Send(new IEventHandleFat(ev->Sender, self, event.release(), 0, ev->Cookie));
                 requestCounters.IncOk();
             }
             requestCounters.IncInFly();

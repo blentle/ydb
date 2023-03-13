@@ -48,8 +48,10 @@ bool HasSetting(const TExprNode& settings, const TStringBuf& name);
 bool HasAnySetting(const TExprNode& settings, const THashSet<TString>& names);
 TExprNode::TPtr RemoveSetting(const TExprNode& settings, const TStringBuf& name, TExprContext& ctx);
 TExprNode::TPtr AddSetting(const TExprNode& settings, TPositionHandle pos, const TString& name, const TExprNode::TPtr& value, TExprContext& ctx);
+TExprNode::TPtr AddSetting(const TExprNode& settings, const TExprNode::TPtr& newSetting, TExprContext& ctx);
 TExprNode::TPtr MergeSettings(const TExprNode& settings1, const TExprNode& settings2, TExprContext& ctx);
 TExprNode::TPtr ReplaceSetting(const TExprNode& settings, TPositionHandle pos, const TString& name, const TExprNode::TPtr& value, TExprContext& ctx);
+TExprNode::TPtr ReplaceSetting(const TExprNode& settings, const TExprNode::TPtr& newSetting, TExprContext& ctx);
 
 TMaybe<TIssue> ParseToDictSettings(const TExprNode& node, TExprContext& ctx, TMaybe<bool>& isMany, TMaybe<bool>& isHashed, TMaybe<ui64>& itemsCount, bool& isCompact);
 
@@ -83,7 +85,7 @@ template <bool Bool>
 TExprNode::TPtr MakeBool(TPositionHandle position, TExprContext& ctx);
 TExprNode::TPtr MakeIdentityLambda(TPositionHandle position, TExprContext& ctx);
 
-constexpr std::initializer_list<std::string_view> SkippableCallables = {"Unordered", "AssumeSorted", "AssumeUnique", "AssumeColumnOrder", "AssumeAllMembersNullableAtOnce"};
+constexpr std::initializer_list<std::string_view> SkippableCallables = {"Unordered", "AssumeSorted", "AssumeUnique", "AssumeDistinct", "AssumeColumnOrder", "AssumeAllMembersNullableAtOnce"};
 
 const TExprNode& SkipCallables(const TExprNode& node, const std::initializer_list<std::string_view>& skipCallables);
 
@@ -124,5 +126,8 @@ TExprNode::TPtr MakeNarrowMap(TPositionHandle pos, const TVector<TString>& colum
 
 TExprNode::TPtr FindNonYieldTransparentNode(const TExprNode::TPtr& root, const TTypeAnnotationContext& typeCtx);
 bool IsYieldTransparent(const TExprNode::TPtr& root, const TTypeAnnotationContext& typeCtx);
+
+bool IsStrict(const TExprNode::TPtr& node);
+bool HasDependsOn(const TExprNode::TPtr& node, const TExprNode::TPtr& arg);
 
 }

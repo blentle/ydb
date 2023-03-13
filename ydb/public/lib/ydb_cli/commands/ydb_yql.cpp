@@ -4,6 +4,8 @@
 #include <ydb/public/lib/ydb_cli/common/pretty_table.h>
 #include <ydb/public/lib/ydb_cli/common/print_operation.h>
 #include <ydb/public/lib/ydb_cli/common/query_stats.h>
+#include <ydb/public/lib/ydb_cli/commands/interactive/interactive_cli.h>
+#include <util/generic/queue.h>
 
 namespace NYdb {
 namespace NConsoleClient {
@@ -18,14 +20,9 @@ void TCommandYql::Config(TConfig& config) {
     config.Opts->AddLongOption("stats", "Collect statistics mode [none, basic, full]")
         .RequiredArgument("[String]").StoreResult(&CollectStatsMode);
     config.Opts->AddLongOption('s', "script", "Text of script to execute").RequiredArgument("[String]").StoreResult(&Script);
-    config.Opts->AddLongOption('f', "file", "[Required] Script file").RequiredArgument("PATH").StoreResult(&ScriptFile);
-
-    AddParametersOption(config);
-
-    AddInputFormats(config, {
-        EOutputFormat::JsonUnicode,
-        EOutputFormat::JsonBase64
-        });
+    config.Opts->AddLongOption('f', "file", "Script file").RequiredArgument("PATH").StoreResult(&ScriptFile);
+  
+    AddParametersOption(config, "script");
 
     AddFormats(config, {
         EOutputFormat::Pretty,
@@ -35,7 +32,21 @@ void TCommandYql::Config(TConfig& config) {
         EOutputFormat::JsonBase64Array,
         EOutputFormat::Csv,
         EOutputFormat::Tsv
-        });
+    });
+
+    AddInputFormats(config, {
+        EOutputFormat::JsonUnicode,
+        EOutputFormat::JsonBase64
+    });
+
+    AddStdinFormats(config, {
+        EOutputFormat::JsonUnicode,
+        EOutputFormat::JsonBase64,
+        EOutputFormat::Raw,
+    }, {
+        EOutputFormat::NoFraming,
+        EOutputFormat::NewlineDelimited
+    });
 
     CheckExamples(config);
 
@@ -46,8 +57,13 @@ void TCommandYql::Parse(TConfig& config) {
     TClientCommand::Parse(config);
     ParseFormats();
     if (!Script && !ScriptFile) {
+#ifdef _win32_
         throw TMisuseException() << "Neither \"Text of script\" (\"--script\", \"-s\") "
-            << "nor \"Path to file with script text\" (\"--file\", \"-f\") were provided.";
+            << "nor \"Path to file with script text\" (\"--file\", \"-f\") were provided. "
+            << "Interactive CLI is not supported on Windows.";
+#else
+        Interactive = true;
+#endif
     }
     if (Script && ScriptFile) {
         throw TMisuseException() << "Both mutually exclusive options \"Text of script\" (\"--script\", \"-s\") "
@@ -56,40 +72,107 @@ void TCommandYql::Parse(TConfig& config) {
     if (ScriptFile) {
         Script = ReadFromFile(ScriptFile, "script");
     }
-    ParseParameters();
+    if (!Interactive) {
+        ValidateResult = MakeHolder<NScripting::TExplainYqlResult>(
+            ExplainQuery(config, Script, NScripting::ExplainYqlRequestMode::Validate));
+    }
+    ParseParameters(config);
 }
 
 int TCommandYql::Run(TConfig& config) {
+    if (Interactive) {
+        // run interactive cli
+
+        class TLogic : public TInteractiveCli::ILogic {
+        public:
+            TLogic(TCommandYql *base, TConfig& config)
+                : Base(base)
+                , Config(config)
+            {}
+
+            virtual bool Ready(const std::string &text) override {
+                bool done = text.find(';') != std::string::npos;
+                return done;
+            }
+
+            virtual void Run(const std::string &text, const std::string &stat) override {
+                Y_UNUSED(stat);
+                try {
+                    Base->RunCommand(Config, TString(text.c_str()));
+                } catch (TYdbErrorException &error) {
+                    Cerr << error;
+                }
+                TTerminalOutput::Print("\n");
+            }
+
+        private:
+            TCommandYql* Base;
+            TConfig& Config;
+        };
+
+    
+        TTerminalOutput::Print("\033[32mYDB Interactive CLI \033[0m");
+        TTerminalOutput::Print("\033[31m(experimental, no compatibility guarantees)\033[0m\n\n");
+        TInteractiveCli::TConfig interactiveCfg;
+        interactiveCfg.Prompt = "\033[32m=> \033[0m";
+        TInteractiveCli cli(std::make_shared<TLogic>(this, config), std::move(interactiveCfg));
+        cli.Run();
+        while(true) {
+            // blocking until input
+            auto action = GetKeyboardAction();
+            cli.HandleInput(action);
+        }
+
+        return EXIT_SUCCESS;
+    } else {
+        return RunCommand(config, Script);    
+    }
+}
+
+int TCommandYql::RunCommand(TConfig& config, const TString &script) {
     TDriver driver = CreateDriver(config);
     NScripting::TScriptingClient client(driver);
-    NTable::TTableClient tableClient(driver);
 
     NScripting::TExecuteYqlRequestSettings settings;
     settings.CollectQueryStats(ParseQueryStatsMode(CollectStatsMode, NTable::ECollectQueryStatsMode::None));
 
-    NScripting::TAsyncYqlResultPartIterator asyncResult;
-    if (Parameters.size()) {
-        auto validateResult = ExplainQuery(config, Script, NScripting::ExplainYqlRequestMode::Validate);
-        asyncResult = client.StreamExecuteYqlScript(
-            Script,
-            BuildParams(validateResult.GetParameterTypes(), InputFormat),
-            FillSettings(settings)
-        );
-    } else {
-        asyncResult = client.StreamExecuteYqlScript(
-            Script,
-            FillSettings(settings)
-        );
+    if (!Interactive) {
+        SetInterruptHandlers();
     }
-    NScripting::TYqlResultPartIterator result = asyncResult.GetValueSync();
 
-    ThrowOnError(result);
-    PrintResponse(result);
+    if (!Parameters.empty() || !IsStdinInteractive()) {
+        THolder<TParamsBuilder> paramBuilder;
+        while (!IsInterrupted() && 
+            GetNextParams(ValidateResult->GetParameterTypes(), InputFormat, StdinFormat, FramingFormat, paramBuilder)) {
+            
+            auto asyncResult = client.StreamExecuteYqlScript(
+                    script,
+                    paramBuilder->Build(),
+                    FillSettings(settings)
+            );
+            
+            auto result = asyncResult.GetValueSync();
+            ThrowOnError(result);
+            if (!PrintResponse(result)) {
+                return EXIT_FAILURE;
+            }
+        }
+    } else {
+        auto asyncResult = client.StreamExecuteYqlScript(
+            script,
+            FillSettings(settings)
+        );
+
+        auto result = asyncResult.GetValueSync();
+        ThrowOnError(result);
+        if (!PrintResponse(result)) {
+            return EXIT_FAILURE;
+        }
+    }
     return EXIT_SUCCESS;
 }
 
-void TCommandYql::PrintResponse(NScripting::TYqlResultPartIterator& result) {
-    SetInterruptHandlers();
+bool TCommandYql::PrintResponse(NScripting::TYqlResultPartIterator& result) {
     TStringStream statsStr;
     {
         ui32 currentIndex = 0;
@@ -129,7 +212,9 @@ void TCommandYql::PrintResponse(NScripting::TYqlResultPartIterator& result) {
 
     if (IsInterrupted()) {
         Cerr << "<INTERRUPTED>" << Endl;
+        return false;
     }
+    return true;
 }
 
 }

@@ -103,6 +103,12 @@ public:
         return *this;
     }
 
+    TNodeBuilder<TParent, TCoAtom>& Value(i64 value) {
+        return value >= 0 && value <= i64(std::numeric_limits<ui32>::max()) ?
+            Value(this->Ctx.GetIndexAsString(ui32(value)), TNodeFlags::Default) :
+            Value(ToString(value), TNodeFlags::Default);
+    }
+
     TCoAtom DoBuild() {
         auto node = this->Ctx.NewAtom(this->Pos, ValueHolder, this->Flags);
         return TCoAtom(node);
@@ -119,9 +125,10 @@ public:
     }
 
     TParent& Build(i64 value) {
-        return Build(ToString(value), TNodeFlags::Default);
+        return value >= 0 && value <= i64(std::numeric_limits<ui32>::max()) ?
+            Build(this->Ctx.GetIndexAsString(ui32(value)), TNodeFlags::Default) :
+            Build(ToString(value), TNodeFlags::Default);
     }
-
 private:
     TStringBuf ValueHolder;
     ui32 Flags = TNodeFlags::ArbitraryContent;

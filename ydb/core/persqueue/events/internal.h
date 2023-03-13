@@ -120,10 +120,13 @@ struct TEvPQ {
         EvMetering,
         EvTxCalcPredicate,
         EvTxCalcPredicateResult,
+        EvProposePartitionConfig,
+        EvProposePartitionConfigResult,
         EvTxCommit,
         EvTxCommitDone,
         EvTxRollback,
         EvPartitionConfigChanged,
+        EvSubDomainStatus,
         EvEnd
     };
 
@@ -253,7 +256,8 @@ struct TEvPQ {
         };
 
         TEvSetClientInfo(const ui64 cookie, const TString& clientId, const ui64 offset, const TString& sessionId,
-                            const ui32 generation, const ui32 step, ESetClientInfoType type = ESCI_OFFSET, ui64 readRuleGeneration = 0)
+                            const ui32 generation, const ui32 step, ESetClientInfoType type = ESCI_OFFSET,
+                            ui64 readRuleGeneration = 0, bool strict = false)
         : Cookie(cookie)
         , ClientId(clientId)
         , Offset(offset)
@@ -262,6 +266,7 @@ struct TEvPQ {
         , Step(step)
         , Type(type)
         , ReadRuleGeneration(readRuleGeneration)
+        , Strict(strict)
         {
         }
 
@@ -273,6 +278,7 @@ struct TEvPQ {
         ui32 Step;
         ESetClientInfoType Type;
         ui64 ReadRuleGeneration;
+        bool Strict;
     };
 
     struct TEvGetClientOffset : public TEventLocal<TEvGetClientOffset, EvGetClientOffset> {
@@ -630,12 +636,12 @@ struct TEvPQ {
         TEvInitCredentials()
         {}
     };
-    
+
     struct TEvCredentialsCreated : public TEventLocal<TEvCredentialsCreated, EvCredentialsCreated> {
         TEvCredentialsCreated(const TString& error)
             : Error(error)
         {}
-        
+
         TEvCredentialsCreated(std::shared_ptr<NYdb::ICredentialsProviderFactory> credentials)
             : Credentials(credentials)
         {}
@@ -707,6 +713,32 @@ struct TEvPQ {
         bool Predicate = false;
     };
 
+    struct TEvProposePartitionConfig : public TEventLocal<TEvProposePartitionConfig, EvProposePartitionConfig> {
+        TEvProposePartitionConfig(ui64 step, ui64 txId) :
+            Step(step),
+            TxId(txId)
+        {
+        }
+
+        ui64 Step;
+        ui64 TxId;
+        NPersQueue::TTopicConverterPtr TopicConverter;
+        NKikimrPQ::TPQTabletConfig Config;
+    };
+
+    struct TEvProposePartitionConfigResult : public TEventLocal<TEvProposePartitionConfigResult, EvProposePartitionConfigResult> {
+        TEvProposePartitionConfigResult(ui64 step, ui64 txId, ui32 partition) :
+            Step(step),
+            TxId(txId),
+            Partition(partition)
+        {
+        }
+
+        ui64 Step;
+        ui64 TxId;
+        ui32 Partition;
+    };
+
     struct TEvTxCommit : public TEventLocal<TEvTxCommit, EvTxCommit> {
         TEvTxCommit(ui64 step, ui64 txId) :
             Step(step),
@@ -740,6 +772,18 @@ struct TEvPQ {
 
         ui64 Step;
         ui64 TxId;
+    };
+
+    struct TEvSubDomainStatus : public TEventPB<TEvSubDomainStatus, NKikimrPQ::TEvSubDomainStatus, EvSubDomainStatus> {
+        TEvSubDomainStatus() {
+        }
+
+        explicit TEvSubDomainStatus(bool subDomainOutOfSpace)
+        {
+            Record.SetSubDomainOutOfSpace(subDomainOutOfSpace);
+        }
+
+        bool SubDomainOutOfSpace() const { return Record.GetSubDomainOutOfSpace(); }
     };
 };
 

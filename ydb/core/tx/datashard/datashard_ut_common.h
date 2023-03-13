@@ -366,7 +366,8 @@ void InitRoot(Tests::TServer::TPtr server,
 
 class TLambdaActor : public IActorCallback {
 public:
-    using TCallback = std::function<void(TAutoPtr<IEventHandle>&)>;
+    using TCallback = std::function<void(TAutoPtr<IEventHandle>&, const TActorContext&)>;
+    using TNoCtxCallback = std::function<void(TAutoPtr<IEventHandle>&)>;
 
 public:
     TLambdaActor(TCallback&& callback)
@@ -374,10 +375,15 @@ public:
         , Callback(std::move(callback))
     { }
 
+    TLambdaActor(TNoCtxCallback&& callback)
+        : TLambdaActor([callback = std::move(callback)](auto& ev, auto&) {
+            callback(ev);
+        })
+    { }
+
 private:
     STFUNC(StateWork) {
-        Y_UNUSED(ctx);
-        Callback(ev);
+        Callback(ev, ctx);
     }
 
 private:
@@ -449,21 +455,6 @@ struct TShardedTableOptions {
 #undef TABLE_OPTION
 #undef TABLE_OPTION_IMPL
 };
-
-#define Y_UNIT_TEST_WITH_MVCC_IMPL(N, OPT)                                                                         \
-    template<bool OPT> void N(NUnitTest::TTestContext&);                                                           \
-    struct TTestRegistration##N {                                                                                  \
-        TTestRegistration##N() {                                                                                   \
-            TCurrentTest::AddTest(#N, static_cast<void (*)(NUnitTest::TTestContext&)>(&N<false>), false);          \
-            TCurrentTest::AddTest("Mvcc" #N, static_cast<void (*)(NUnitTest::TTestContext&)>(&N<true>), false);    \
-        }                                                                                                          \
-    };                                                                                                             \
-    static TTestRegistration##N testRegistration##N;                                                               \
-    template<bool OPT>                                                                                             \
-    void N(NUnitTest::TTestContext&)
-
-#define Y_UNIT_TEST_WITH_MVCC(N) Y_UNIT_TEST_WITH_MVCC_IMPL(N, UseMvcc)
-#define WithMvcc UseMvcc
 
 #define Y_UNIT_TEST_QUAD(N, OPT1, OPT2)                                                                                              \
     template<bool OPT1, bool OPT2> void N(NUnitTest::TTestContext&);                                                                 \

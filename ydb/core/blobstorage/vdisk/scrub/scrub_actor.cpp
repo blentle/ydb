@@ -7,7 +7,7 @@ namespace NKikimr {
 
     TScrubCoroImpl::TScrubCoroImpl(TScrubContext::TPtr scrubCtx, NKikimrVDiskData::TScrubEntrypoint scrubEntrypoint,
             ui64 scrubEntrypointLsn)
-        : TActorCoroImpl(65536)
+        : TActorCoroImpl(64_KB)
         , ScrubCtx(std::move(scrubCtx))
         , VCtx(ScrubCtx->VCtx)
         , Info(ScrubCtx->Info)
@@ -39,6 +39,9 @@ namespace NKikimr {
             hFunc(NPDisk::TEvLogResult, Handle);
             hFunc(NPDisk::TEvCutLog, Handle);
 
+            case TEvents::TSystem::Poison:
+                throw TExPoison();
+
             default:
                 Y_FAIL("unexpected event Type# 0x%08" PRIx32, type);
         }
@@ -49,7 +52,8 @@ namespace NKikimr {
     }
 
     void TScrubCoroImpl::ForwardToBlobRecoveryActor(TAutoPtr<IEventHandle> ev) {
-        Send(ev->Forward(BlobRecoveryActorId));
+        IEventHandle::Forward(ev, BlobRecoveryActorId);
+        Send(ev);
     }
 
     void TScrubCoroImpl::Run() {
@@ -82,10 +86,10 @@ namespace NKikimr {
             STLOGX(GetActorContext(), PRI_DEBUG, BS_VDISK_SCRUB, VDS23, VDISKP(LogPrefix, "catched TExDie"));
         } catch (const TDtorException&) {
             return; // actor system is stopping, no actor activities allowed
-        } catch (const TPoisonPillException&) { // poison pill from the skeleton
-            STLOGX(GetActorContext(), PRI_DEBUG, BS_VDISK_SCRUB, VDS25, VDISKP(LogPrefix, "catched TPoisonPillException"));
+        } catch (const TExPoison&) { // poison pill from the skeleton
+            STLOGX(GetActorContext(), PRI_DEBUG, BS_VDISK_SCRUB, VDS25, VDISKP(LogPrefix, "caught TExPoison"));
         }
-        Send(new IEventHandle(TEvents::TSystem::Poison, 0, std::exchange(BlobRecoveryActorId, {}), {}, nullptr, 0));
+        Send(new IEventHandleFat(TEvents::TSystem::Poison, 0, std::exchange(BlobRecoveryActorId, {}), {}, nullptr, 0));
     }
 
     void TScrubCoroImpl::RequestState() {
@@ -93,7 +97,7 @@ namespace NKikimr {
         Send(MakeBlobStorageNodeWardenID(SelfActorId.NodeId()), new TEvBlobStorage::TEvControllerScrubQueryStartQuantum(
             ScrubCtx->NodeId, ScrubCtx->PDiskId, ScrubCtx->VSlotId), 0, ScrubCtx->ScrubCookie);
         CurrentState = TStringBuilder() << "in queue for scrub state";
-        auto res = WaitForSpecificEvent<TEvBlobStorage::TEvControllerScrubStartQuantum>();
+        auto res = WaitForSpecificEvent<TEvBlobStorage::TEvControllerScrubStartQuantum>(&TScrubCoroImpl::ProcessUnexpectedEvent);
         const auto& r = res->Get()->Record;
         if (r.HasState()) {
             State.emplace();

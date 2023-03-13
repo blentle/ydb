@@ -28,7 +28,11 @@ namespace NKikimr::NBlobDepot {
         }
 
         if (doForward) {
-            TActivationContext::Send(ev->Forward(ProxyId));
+            if (ProxyId) {
+                TActivationContext::Forward(ev, ProxyId);
+            } else {
+                CreateQuery<0>(std::unique_ptr<IEventHandle>(ev.Release()))->EndWithError(NKikimrProto::ERROR, "proxy has vanished");
+            }
             return;
         }
 
@@ -58,7 +62,7 @@ namespace NKikimr::NBlobDepot {
     }
 
     void TBlobDepotAgent::HandleAssimilate(TAutoPtr<IEventHandle> ev) {
-        TActivationContext::Send(ev->Forward(ProxyId));
+        TActivationContext::Forward(ev, ProxyId);
     }
 
     void TBlobDepotAgent::HandlePendingEvent() {
@@ -70,7 +74,7 @@ namespace NKikimr::NBlobDepot {
             PendingEventQ.pop_front();
             if (!PendingEventQ.empty() && TDuration::Seconds(timer.Passed()) >= TDuration::MilliSeconds(1)) {
                 if (!ProcessPendingEventInFlight) {
-                    TActivationContext::Send(new IEventHandle(TEvPrivate::EvProcessPendingEvent, 0, SelfId(), {}, nullptr, 0));
+                    TActivationContext::Send(new IEventHandleFat(TEvPrivate::EvProcessPendingEvent, 0, SelfId(), {}, nullptr, 0));
                     ProcessPendingEventInFlight = true;
                 }
                 break;
@@ -114,7 +118,7 @@ namespace NKikimr::NBlobDepot {
             PendingEventQ.erase(PendingEventQ.begin(), it);
         }
 
-        TActivationContext::Schedule(TDuration::Seconds(1), new IEventHandle(TEvPrivate::EvPendingEventQueueWatchdog, 0,
+        TActivationContext::Schedule(TDuration::Seconds(1), new IEventHandleFat(TEvPrivate::EvPendingEventQueueWatchdog, 0,
             SelfId(), {}, nullptr, 0));
     }
 
@@ -132,7 +136,7 @@ namespace NKikimr::NBlobDepot {
                 break;
             }
         }
-        TActivationContext::Schedule(TDuration::Seconds(1), new IEventHandle(TEvPrivate::EvQueryWatchdog, 0, SelfId(),
+        TActivationContext::Schedule(TDuration::Seconds(1), new IEventHandleFat(TEvPrivate::EvQueryWatchdog, 0, SelfId(),
             {}, nullptr, 0));
     }
 
@@ -159,6 +163,10 @@ namespace NKikimr::NBlobDepot {
         auto nh = Agent.QueryWatchdogMap.extract(QueryWatchdogMapIter);
         nh.key() = now + WatchdogDuration;
         QueryWatchdogMapIter = Agent.QueryWatchdogMap.insert(std::move(nh));
+        for (const auto& cookie : SubrequestRelays) {
+            Y_VERIFY_S(!cookie.expired(), "AgentId# " << Agent.LogId << " QueryId# " << GetQueryId()
+                << " subrequest got stuck");
+        }
     }
 
     void TBlobDepotAgent::TQuery::EndWithError(NKikimrProto::EReplyStatus status, const TString& errorReason) {
@@ -171,7 +179,9 @@ namespace NKikimr::NBlobDepot {
 #define XX(TYPE) \
             case TEvBlobStorage::TYPE: \
                 response = Event->Get<TEvBlobStorage::T##TYPE>()->MakeErrorResponse(status, errorReason, Agent.VirtualGroupId); \
-                break;
+                static_cast<TEvBlobStorage::T##TYPE##Result&>(*response).ExecutionRelay = std::move(ExecutionRelay); \
+                break; \
+            //
 
             ENUMERATE_INCOMING_EVENTS(XX)
 #undef XX
@@ -185,6 +195,16 @@ namespace NKikimr::NBlobDepot {
     void TBlobDepotAgent::TQuery::EndWithSuccess(std::unique_ptr<IEventBase> response) {
         STLOG(PRI_DEBUG, BLOB_DEPOT_AGENT, BDA15, "query ends with success", (AgentId, Agent.LogId),
             (QueryId, GetQueryId()), (Response, response->ToString()), (Duration, TActivationContext::Monotonic() - StartTime));
+        switch (response->Type()) {
+#define XX(TYPE) \
+            case TEvBlobStorage::TYPE##Result: \
+                static_cast<TEvBlobStorage::T##TYPE##Result&>(*response).ExecutionRelay = std::move(ExecutionRelay); \
+                break; \
+            //
+
+            ENUMERATE_INCOMING_EVENTS(XX)
+#undef XX
+        }
         Agent.SelfId().Send(Event->Sender, response.release(), 0, Event->Cookie);
         OnDestroy(true);
         DoDestroy();

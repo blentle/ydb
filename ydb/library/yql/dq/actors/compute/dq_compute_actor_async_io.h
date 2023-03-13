@@ -55,7 +55,7 @@ struct IDqComputeActorAsyncInput {
     };
 
     struct TEvAsyncInputError : public NActors::TEventLocal<TEvAsyncInputError, TDqComputeEvents::EvAsyncInputError> {
-        TEvAsyncInputError(ui64 inputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode = NYql::NDqProto::StatusIds::UNSPECIFIED)
+        TEvAsyncInputError(ui64 inputIndex, const TIssues& issues, NYql::NDqProto::StatusIds::StatusCode fatalCode)
             : InputIndex(inputIndex)
             , Issues(issues)
             , FatalCode(fatalCode)
@@ -85,6 +85,10 @@ struct IDqComputeActorAsyncInput {
 
     virtual ui64 GetIngressBytes() {
         return 0;
+    }
+
+    virtual TDuration GetCpuTime() {
+        return TDuration::Zero();
     }
 
     virtual TMaybe<google::protobuf::Any> ExtraData() { return {}; }
@@ -174,6 +178,7 @@ public:
         const NKikimr::NMiniKQL::TTypeEnvironment& TypeEnv;
         const NKikimr::NMiniKQL::THolderFactory& HolderFactory;
         ::NMonitoring::TDynamicCounterPtr TaskCounters;
+        std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> Alloc;
     };
 
     struct TSinkArguments {
@@ -201,6 +206,7 @@ public:
         const NKikimr::NMiniKQL::TTypeEnvironment& TypeEnv;
         const NKikimr::NMiniKQL::THolderFactory& HolderFactory;
         NKikimr::NMiniKQL::TProgramBuilder& ProgramBuilder;
+        std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> Alloc;
     };
 
     struct TOutputTransformArguments {

@@ -105,7 +105,6 @@ namespace NKikimr {
             // static pdisk/vdisk states
             std::map<TVSlotId, TStaticVSlotInfo>& StaticVSlots;
             std::map<TPDiskId, TStaticPDiskInfo>& StaticPDisks;
-            const std::map<TString, TNodeId>& NodeForSerial;
 
             TCowHolder<Schema::State::SerialManagementStage::Type> SerialManagementStage;
 
@@ -135,7 +134,6 @@ namespace NKikimr {
                 , DefaultMaxSlots(controller.DefaultMaxSlots)
                 , StaticVSlots(controller.StaticVSlots)
                 , StaticPDisks(controller.StaticPDisks)
-                , NodeForSerial(controller.NodeForSerial)
                 , SerialManagementStage(&controller.SerialManagementStage)
                 , StoragePoolStat(*controller.StoragePoolStat)
             {

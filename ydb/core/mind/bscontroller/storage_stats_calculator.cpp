@@ -28,13 +28,15 @@ private:
         EvResume = EventSpaceBegin(TEvents::ES_PRIVATE)
     };
 
+    struct TExPoison {};
+
 public:
     TStorageStatsCoroCalculatorImpl(
         const TControllerSystemViewsState& systemViewsState,
         const TBlobStorageController::THostRecordMap& hostRecordMap,
         ui32 groupReserveMin,
         ui32 groupReservePart)
-        : TActorCoroImpl(/* stackSize */ 64 * 1024, /* allowUnhandledPoisonPill */ true, /* allowUnhandledDtor */ true)
+        : TActorCoroImpl(/* stackSize */ 640_KB, /* allowUnhandledDtor */ true) // 640 KiB should be enough for anything!
         , SystemViewsState(systemViewsState)
         , HostRecordMap(hostRecordMap)
         , GroupReserveMin(groupReserveMin)
@@ -42,11 +44,24 @@ public:
     {
     }
 
-    void ProcessUnexpectedEvent(TAutoPtr<IEventHandle> ev) override {
+    void ProcessUnexpectedEvent(TAutoPtr<IEventHandle> ev) {
+        switch (ev->GetTypeRewrite()) {
+            case TEvents::TSystem::Poison:
+                throw TExPoison();
+        }
+
         Y_FAIL("unexpected event Type# 0x%08" PRIx32, ev->GetTypeRewrite());
     }
 
     void Run() override {
+        try {
+            RunImpl();
+        } catch (const TExPoison&) {
+            return;
+        }
+    }
+
+    void RunImpl() {
         std::vector<NKikimrSysView::TStorageStatsEntry> storageStats;
 
         using TEntityKey = std::tuple<TString, TString>; // PDiskFilter, ErasureSpecies
@@ -208,8 +223,8 @@ public:
 
 private:
     void Yield() {
-        Send(new IEventHandle(EvResume, 0, SelfActorId, {}, nullptr, 0));
-        WaitForSpecificEvent([](IEventHandle& ev) { return ev.Type == EvResume; });
+        Send(new IEventHandleFat(EvResume, 0, SelfActorId, {}, nullptr, 0));
+        WaitForSpecificEvent([](IEventHandle& ev) { return ev.Type == EvResume; }, &TStorageStatsCoroCalculatorImpl::ProcessUnexpectedEvent);
     }
 
 private:

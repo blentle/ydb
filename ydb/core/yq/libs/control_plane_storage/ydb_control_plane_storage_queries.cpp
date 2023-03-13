@@ -523,7 +523,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvDescribeQue
     const TString token = event.Token;
     TPermissions permissions = Config->Proto.GetEnablePermissions()
         ? event.Permissions
-        : TPermissions{TPermissions::VIEW_PUBLIC | TPermissions::VIEW_AST};
+        : TPermissions{TPermissions::VIEW_PUBLIC | TPermissions::VIEW_AST | TPermissions::VIEW_QUERY_TEXT};
     if (IsSuperUser(user)) {
         permissions.SetAll();
     }
@@ -609,6 +609,9 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvDescribeQue
                 }
             }
         }
+        if (!permissions.Check(TPermissions::VIEW_QUERY_TEXT)) {
+            result.mutable_query()->mutable_content()->clear_text();
+        }
 
         if (result.query().ByteSizeLong() > GRPC_MESSAGE_SIZE_LIMIT) {
             ythrow TCodeLineException(TIssuesIds::INTERNAL_ERROR) << "Resulting query of size " << result.query().ByteSizeLong() << " bytes is too big";
@@ -646,7 +649,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetQuerySta
     const TString token = event.Token;
     TPermissions permissions = Config->Proto.GetEnablePermissions()
         ? event.Permissions
-        : TPermissions{TPermissions::VIEW_PUBLIC | TPermissions::VIEW_AST};
+        : TPermissions{TPermissions::VIEW_PUBLIC | TPermissions::VIEW_AST | TPermissions::VIEW_QUERY_TEXT};
     if (IsSuperUser(user)) {
         permissions.SetAll();
     }
@@ -1738,7 +1741,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvDescribeJob
     const TString token = event.Token;
     TPermissions permissions = Config->Proto.GetEnablePermissions()
         ? event.Permissions
-        : TPermissions{TPermissions::VIEW_PUBLIC};
+        : TPermissions{TPermissions::VIEW_PUBLIC | TPermissions::VIEW_AST | TPermissions::VIEW_QUERY_TEXT};
     if (IsSuperUser(user)) {
         permissions.SetAll();
     }
@@ -1788,6 +1791,12 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvDescribeJob
         bool hasViewAccces = HasViewAccess(permissions, visibility, result.job().meta().created_by(), user);
         if (!hasViewAccces) {
             ythrow TCodeLineException(TIssuesIds::ACCESS_DENIED) << "Job does not exist or permission denied. Please check the job id or your access rights";
+        }
+        if (!permissions.Check(TPermissions::VIEW_AST)) {
+            result.mutable_job()->clear_ast();
+        }
+        if (!permissions.Check(TPermissions::VIEW_QUERY_TEXT)) {
+            result.mutable_job()->clear_text();
         }
         return result;
     };

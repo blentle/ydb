@@ -131,6 +131,33 @@ NActors::NLog::EPriority PriorityForStatusOutbound(NKikimrProto::EReplyStatus st
 NActors::NLog::EPriority PriorityForStatusResult(NKikimrProto::EReplyStatus status);
 NActors::NLog::EPriority PriorityForStatusInbound(NKikimrProto::EReplyStatus status);
 
+inline void SetExecutionRelay(IEventBase& ev, std::shared_ptr<TEvBlobStorage::TExecutionRelay> executionRelay) {
+    switch (const ui32 type = ev.Type()) {
+#define XX(T) \
+        case TEvBlobStorage::Ev##T: \
+            static_cast<TEvBlobStorage::TEv##T&>(ev).ExecutionRelay = std::move(executionRelay); \
+            break; \
+        case TEvBlobStorage::Ev##T##Result: \
+            static_cast<TEvBlobStorage::TEv##T##Result&>(ev).ExecutionRelay = std::move(executionRelay); \
+            break; \
+        //
+
+        XX(Put)
+        XX(Get)
+        XX(Block)
+        XX(Discover)
+        XX(Range)
+        XX(CollectGarbage)
+        XX(Status)
+        XX(Patch)
+        XX(Assimilate)
+#undef XX
+
+        default:
+            Y_FAIL("unexpected event Type# 0x%08" PRIx32, type);
+    }
+}
+
 template<typename TDerived>
 class TBlobStorageGroupRequestActor : public TActor<TBlobStorageGroupRequestActor<TDerived>> {
 public:
@@ -141,7 +168,8 @@ public:
     TBlobStorageGroupRequestActor(TIntrusivePtr<TBlobStorageGroupInfo> info, TIntrusivePtr<TGroupQueues> groupQueues,
             TIntrusivePtr<TBlobStorageGroupProxyMon> mon, const TActorId& source, ui64 cookie, NWilson::TTraceId traceId,
             NKikimrServices::EServiceKikimr logComponent, bool logAccEnabled, TMaybe<TGroupStat::EKind> latencyQueueKind,
-            TInstant now, TIntrusivePtr<TStoragePoolCounters> &storagePoolCounters, ui32 restartCounter, TString name)
+            TInstant now, TIntrusivePtr<TStoragePoolCounters> &storagePoolCounters, ui32 restartCounter, TString name,
+            std::shared_ptr<TEvBlobStorage::TExecutionRelay> executionRelay)
         : TActor<TBlobStorageGroupRequestActor<TDerived>>(&TThis::InitialStateFunc, TDerived::ActorActivityType())
         , Info(std::move(info))
         , GroupQueues(std::move(groupQueues))
@@ -155,6 +183,7 @@ public:
         , LatencyQueueKind(latencyQueueKind)
         , RequestStartTime(now)
         , RacingDomains(&Info->GetTopology())
+        , ExecutionRelay(std::move(executionRelay))
     {
         TDerived::ActiveCounter(Mon)->Inc();
         Span
@@ -164,7 +193,7 @@ public:
 
     void Registered(TActorSystem *as, const TActorId& parentId) override {
         ProxyActorId = parentId;
-        as->Send(new IEventHandle(TEvents::TSystem::Bootstrap, 0,
+        as->Send(new IEventHandleFat(TEvents::TSystem::Bootstrap, 0,
             TActor<TBlobStorageGroupRequestActor<TDerived>>::SelfId(), parentId, nullptr, 0));
         TActor<TBlobStorageGroupRequestActor<TDerived>>::Registered(as, parentId);
     }
@@ -184,7 +213,7 @@ public:
     }
 
     template<typename TEvent>
-    bool CheckForTermErrors(TAutoPtr<TEventHandle<TEvent>>& ev) {
+    bool CheckForTermErrors(TAutoPtr<TEventHandleFat<TEvent>>& ev) {
         auto& record = ev->Get()->Record;
         auto& self = Derived();
 
@@ -221,7 +250,7 @@ public:
 
         // sanity check for correct VDisk generation ??? possible race
         Y_VERIFY_S(status == NKikimrProto::RACE || vdiskId.GroupGeneration <= Info->GroupGeneration ||
-            TEvent::EventType == TEvBlobStorage::EvVStatusResult,
+            TEvent::EventType == TEvBlobStorage::EvVStatusResult || TEvent::EventType == TEvBlobStorage::EvVAssimilateResult,
             "status# " << NKikimrProto::EReplyStatus_Name(status) << " vdiskId.GroupGeneration# " << vdiskId.GroupGeneration
             << " Info->GroupGeneration# " << Info->GroupGeneration << " Response# " << ev->Get()->ToString());
 
@@ -272,9 +301,12 @@ public:
         // make NodeWarden restart the query just after proxy reconfiguration
         Y_VERIFY_DEBUG(RestartCounter < 100);
         auto q = self.RestartQuery(RestartCounter + 1);
+        if (q->Type() != TEvBlobStorage::EvBunchOfEvents) {
+            SetExecutionRelay(*q, std::exchange(ExecutionRelay, {}));
+        }
         ++*Mon->NodeMon->RestartHisto[Min<size_t>(Mon->NodeMon->RestartHisto.size() - 1, RestartCounter)];
         const TActorId& proxyId = MakeBlobStorageProxyID(Info->GroupID);
-        TActivationContext::Send(new IEventHandle(nodeWardenId, Source, q.release(), 0, Cookie, &proxyId, Span.GetTraceId()));
+        TActivationContext::Send(new IEventHandleFat(nodeWardenId, Source, q.release(), 0, Cookie, &proxyId, Span.GetTraceId()));
         PassAway();
         return true;
     }
@@ -294,7 +326,7 @@ public:
 #undef CHECK
 
             case TEvBlobStorage::EvProxySessionsState: {
-                GroupQueues = static_cast<TEvProxySessionsState*>(ev->GetBase())->GroupQueues;
+                GroupQueues = ev->Get<TEvProxySessionsState>()->GroupQueues;
                 return true;
             }
 
@@ -414,6 +446,9 @@ public:
     }
 
     void PassAway() override {
+        // ensure we didn't keep execution relay on occasion
+        Y_VERIFY_DEBUG_S(!ExecutionRelay, LogCtx.RequestPrefix << " actor died without properly sending response");
+
         // ensure that we are dying for the first time
         Y_VERIFY(!std::exchange(Dead, true));
         TDerived::ActiveCounter(Mon)->Dec();
@@ -450,6 +485,13 @@ public:
             default:
                 Y_FAIL();
 #undef XX
+        }
+
+        if (ExecutionRelay) {
+            SetExecutionRelay(*ev, std::exchange(ExecutionRelay, {}));
+            ExecutionRelayUsed = true;
+        } else {
+            Y_VERIFY(!ExecutionRelayUsed);
         }
 
         // ensure that we are dying for the first time
@@ -543,6 +585,8 @@ private:
     std::deque<std::unique_ptr<IEventHandle>> PostponedQ;
     TBlobStorageGroupInfo::TGroupFailDomains RacingDomains; // a set of domains we've received RACE from
     TActorId ProxyActorId;
+    std::shared_ptr<TEvBlobStorage::TExecutionRelay> ExecutionRelay;
+    bool ExecutionRelayUsed = false;
 };
 
 void Encrypt(char *destination, const char *source, size_t shift, size_t sizeBytes, const TLogoBlobID &id,

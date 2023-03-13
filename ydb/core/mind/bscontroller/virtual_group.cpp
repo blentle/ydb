@@ -107,7 +107,13 @@ namespace NKikimr::NBsController {
             if (!group) {
                 throw TExError() << "group not found" << TErrorParams::GroupId(groupId);
             } else if (group->DecommitStatus != NKikimrBlobStorage::TGroupDecommitStatus::NONE) {
-                throw TExError() << "group is already being decommitted" << TErrorParams::GroupId(groupId);
+                if (group->HiveId != cmd.GetHiveId()) {
+                    throw TExError() << "different hive specified for decommitting group" << TErrorParams::GroupId(groupId);
+                }
+                // group is already being decommitted -- make this operation idempotent
+                continue;
+            } else if (group->VirtualGroupState) {
+                throw TExError() << "group is already virtual" << TErrorParams::GroupId(groupId);
             }
 
             group->DecommitStatus = NKikimrBlobStorage::TGroupDecommitStatus::PENDING;
@@ -166,7 +172,7 @@ namespace NKikimr::NBsController {
                 auto *data = profiles->Add();
                 data->SetStoragePoolName(storagePoolName);
                 data->SetChannelKind(NKikimrBlobDepot::TChannelKind::Data);
-                data->SetCount(numPhysicalGroups);
+                data->SetCount(Min<ui32>(250, numPhysicalGroups));
             }
 
             const bool success = config.SerializeToString(&group->BlobDepotConfig.ConstructInPlace());
@@ -217,7 +223,7 @@ namespace NKikimr::NBsController {
                 if (State) {
                     State->ApplyConfigUpdates();
                 }
-                TActivationContext::Send(new IEventHandle(TEvents::TSystem::Bootstrap, 0, Machine->SelfId(), {}, nullptr, 0));
+                TActivationContext::Send(new IEventHandleFat(TEvents::TSystem::Bootstrap, 0, Machine->SelfId(), {}, nullptr, 0));
             }
         };
 
@@ -338,8 +344,10 @@ namespace NKikimr::NBsController {
         void OnPipeError(TActorId clientId) {
             if (clientId == HivePipeId) {
                 HivePipeId = {};
+                Bootstrap();
             } else if (clientId == BlobDepotPipeId) {
                 BlobDepotPipeId = {};
+                Bootstrap();
             }
         }
 
@@ -371,13 +379,12 @@ namespace NKikimr::NBsController {
             }
 
             NTabletPipe::CloseAndForgetClient(SelfId(), HivePipeId);
+            ConfigureBlobDepot();
         }
 
         void Handle(TEvHive::TEvTabletCreationResult::TPtr ev) {
             STLOG(PRI_INFO, BS_CONTROLLER, BSCVG05, "received TEvTabletCreationResult", (TabletId, Self->TabletID()),
                 (Msg, ev->Get()->Record));
-
-            ConfigureBlobDepot();
         }
 
         void ConfigureBlobDepot() {
@@ -543,7 +550,7 @@ namespace NKikimr::NBsController {
                 if (ErrorReason) {
                     ev->Record.SetErrorReason(ErrorReason);
                 }
-                auto reply = std::make_unique<IEventHandle>(Ev->Sender, Self->SelfId(), ev.release(), 0, Ev->Cookie);
+                auto reply = std::make_unique<IEventHandleFat>(Ev->Sender, Self->SelfId(), ev.release(), 0, Ev->Cookie);
                 if (Ev->InterconnectSession) {
                     reply->Rewrite(TEvInterconnect::EvForward, Ev->InterconnectSession);
                 }

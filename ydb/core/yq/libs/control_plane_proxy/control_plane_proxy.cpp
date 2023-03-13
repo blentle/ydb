@@ -316,7 +316,7 @@ public:
             if (delay) {
                 Counters->Retry->Inc();
                 CPP_LOG_E("Folder resolve error. Retry with delay " << *delay << ", " << errorMessage);
-                TActivationContext::Schedule(*delay, new IEventHandle(NKikimr::NFolderService::FolderServiceActorId(), static_cast<const TActorId&>(SelfId()), CreateRequest().release()));
+                TActivationContext::Schedule(*delay, new IEventHandleFat(NKikimr::NFolderService::FolderServiceActorId(), static_cast<const TActorId&>(SelfId()), CreateRequest().release()));
                 return;
             }
             Counters->Error->Inc();
@@ -802,6 +802,7 @@ private:
         {"yq.connections.use@as", TPermissions::CONNECTIONS_USE},
         {"yq.bindings.use@as", TPermissions::BINDINGS_USE},
         {"yq.queries.invoke@as", TPermissions::QUERY_INVOKE},
+        {"yq.queries.viewQueryText@as", TPermissions::VIEW_QUERY_TEXT},
     };
 
     template<typename T>
@@ -985,6 +986,7 @@ private:
             TPermissions::TPermission::VIEW_AST
             | TPermissions::TPermission::VIEW_PUBLIC
             | TPermissions::TPermission::VIEW_PRIVATE
+            | TPermissions::VIEW_QUERY_TEXT
         };
 
         Register(new TRequestActor<YandexQuery::DescribeQueryRequest,
@@ -1383,6 +1385,8 @@ private:
         static const TPermissions availablePermissions {
             TPermissions::TPermission::VIEW_PUBLIC
             | TPermissions::TPermission::VIEW_PRIVATE
+            | TPermissions::TPermission::VIEW_AST
+            | TPermissions::VIEW_QUERY_TEXT
         };
 
         Register(new TRequestActor<YandexQuery::DescribeJobRequest,

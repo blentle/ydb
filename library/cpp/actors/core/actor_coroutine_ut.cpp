@@ -67,6 +67,8 @@ Y_UNIT_TEST_SUITE(ActorCoro) {
         TAtomic& ItemsProcessed;
         bool Finish;
 
+        struct TPoisonPillException {};
+
     public:
         TCoroActor(TManualEvent& doneEvent, TAtomic& itemsProcessed)
             : TActorCoroImpl(1 << 20)
@@ -82,7 +84,7 @@ Y_UNIT_TEST_SUITE(ActorCoro) {
             try {
                 while (!Finish) {
                     GetActorContext().Send(child, new TEvRequest());
-                    THolder<IEventHandle> resp = WaitForSpecificEvent<TEvResponse>();
+                    THolder<IEventHandle> resp = WaitForSpecificEvent<TEvResponse>(&TCoroActor::ProcessUnexpectedEvent);
                     UNIT_ASSERT_EQUAL(resp->GetTypeRewrite(), TEvResponse::EventType);
                     ++itemsProcessed;
                 }
@@ -94,9 +96,11 @@ Y_UNIT_TEST_SUITE(ActorCoro) {
             DoneEvent.Signal();
         }
 
-        void ProcessUnexpectedEvent(TAutoPtr<IEventHandle> event) override {
+        void ProcessUnexpectedEvent(TAutoPtr<IEventHandle> event) {
             if (event->GetTypeRewrite() == Enough) {
                 Finish = true;
+            } else if (event->GetTypeRewrite() == TEvents::TSystem::Poison) {
+                throw TPoisonPillException();
             }
         }
     };

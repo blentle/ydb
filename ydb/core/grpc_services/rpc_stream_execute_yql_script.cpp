@@ -129,7 +129,6 @@ private:
             HFunc(NKqp::TEvKqp::TEvDataQueryStreamPart, Handle);
             HFunc(TRpcServices::TEvGrpcNextReply, Handle);
             HFunc(NKqp::TEvKqp::TEvQueryResponse, Handle);
-            HFunc(NKqp::TEvKqpExecuter::TEvExecuterProgress, Handle);
             HFunc(NKqp::TEvKqpExecuter::TEvStreamData, Handle);
             default: {
                 return ReplyFinishStream(TStringBuilder()
@@ -227,22 +226,11 @@ private:
     }
 
     // From TKqpScanQueryStreamRequestHandler
-    void Handle(NKqp::TEvKqpExecuter::TEvExecuterProgress::TPtr& ev, const TActorContext& ctx) {
-        GatewayRequestHandlerActorId_ = ActorIdFromProto(ev->Get()->Record.GetExecuterActorId());
-        ProcessingScanQuery_ = false;
-        LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, this->SelfId() << " GatewayRequestHandlerActorId_: " << GatewayRequestHandlerActorId_);
-    }
-
-    // From TKqpScanQueryStreamRequestHandler
     void Handle(NKqp::TEvKqpExecuter::TEvStreamData::TPtr& ev, const TActorContext& ctx) {
-        if (!GatewayRequestHandlerActorId_) {
-            return ReplyFinishStream("Received StreamData event from unknown executer", ctx);
-        }
-        if (!ProcessingScanQuery_) {
-            // First data part from this scan query
+        if (GatewayRequestHandlerActorId_ != ev->Sender) {
             ++ResultsReceived_;
+            GatewayRequestHandlerActorId_ = ev->Sender;
         }
-        ProcessingScanQuery_ = true;
 
         Ydb::Scripting::ExecuteYqlPartialResponse response;
         response.set_status(StatusIds::SUCCESS);
@@ -358,7 +346,7 @@ private:
     void SetClientTimeoutTimer(TDuration timeout, const TActorContext& ctx) {
         LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, this->SelfId() << " Set stream timeout timer for " << timeout);
 
-        auto *ev = new IEventHandle(this->SelfId(), this->SelfId(), new TEvents::TEvWakeup(EStreamRpcWakeupTag::ClientTimeoutTag));
+        auto *ev = new IEventHandleFat(this->SelfId(), this->SelfId(), new TEvents::TEvWakeup(EStreamRpcWakeupTag::ClientTimeoutTag));
         ClientTimeoutTimerCookieHolder_.Reset(ISchedulerCookie::Make2Way());
         CreateLongTimer(ctx, timeout, ev, 0, ClientTimeoutTimerCookieHolder_.Get());
     }
@@ -481,17 +469,15 @@ private:
 
     TActorId GatewayRequestHandlerActorId_;
     ui64 ResultsReceived_ = 0;
-    bool ProcessingScanQuery_ = false;
-
     // DataQuery
     THolder<TDataQueryStreamContext> DataQueryStreamContext;
 };
 
 } // namespace
 
-void DoStreamExecuteYqlScript(std::unique_ptr<IRequestNoOpCtx> p, const IFacilityProvider& facility) {
-    ui64 rpcBufferSize = facility.GetAppConfig().GetTableServiceConfig().GetResourceManager().GetChannelBufferSize();
-    TActivationContext::AsActorContext().Register(new TStreamExecuteYqlScriptRPC(p.release(), rpcBufferSize));
+void DoStreamExecuteYqlScript(std::unique_ptr<IRequestNoOpCtx> p, const IFacilityProvider& f) {
+    ui64 rpcBufferSize = f.GetAppConfig()->GetTableServiceConfig().GetResourceManager().GetChannelBufferSize();
+    f.RegisterActor(new TStreamExecuteYqlScriptRPC(p.release(), rpcBufferSize));
 }
 
 } // namespace NGRpcService

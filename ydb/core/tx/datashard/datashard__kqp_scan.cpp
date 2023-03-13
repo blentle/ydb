@@ -199,7 +199,7 @@ private:
         startConfig.Conf.ReadAheadHi = READAHEAD_HI;
 
         TimeoutActorId = CreateLongTimer(TlsActivationContext->AsActorContext(), Deadline - TInstant::Now(),
-            new IEventHandle(SelfId(), SelfId(), new TEvents::TEvWakeup));
+            new IEventHandleFat(SelfId(), SelfId(), new TEvents::TEvWakeup));
 
         if (Y_UNLIKELY(IsProfile())) {
             StartWaitTime = TInstant::Now();
@@ -542,6 +542,13 @@ void TDataShard::Handle(TEvDataShard::TEvKqpScan::TPtr& ev, const TActorContext&
     auto& request = ev->Get()->Record;
     auto scanComputeActor = ev->Sender;
     auto generation = request.GetGeneration();
+
+    if (VolatileTxManager.HasVolatileTxsAtSnapshot(TRowVersion(request.GetSnapshot().GetStep(), request.GetSnapshot().GetTxId()))) {
+        VolatileTxManager.AttachWaitingSnapshotEvent(
+            TRowVersion(request.GetSnapshot().GetStep(), request.GetSnapshot().GetTxId()),
+            std::unique_ptr<IEventHandle>(ev.Release()));
+        return;
+    }
 
     auto infoIt = TableInfos.find(request.GetLocalPathId());
 

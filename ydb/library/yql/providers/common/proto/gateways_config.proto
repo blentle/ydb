@@ -82,6 +82,7 @@ message THttpGatewayConfig {
     optional uint64 LowSpeedTimeSeconds = 8;
     optional uint64 LowSpeedBytesLimit = 9;
     optional TDnsResolverConfig DnsResolverConfig = 10;
+    optional uint64 MaxRetries = 11;
 }
 
 /////////////////////////////// YT ///////////////////////////////
@@ -120,9 +121,10 @@ message TYtGatewayConfig {
 /////////////////////////////// Grut ///////////////////////////////
 
 message TYtOrmClusterConfig {
-    optional string Name = 1;
-    optional string Cluster = 2; // Real cluster server name with port
+    optional string Name = 1; // Examples: grut_testing, grut_stable, grut_dev
+    optional string Cluster = 2; // Examples: sas, vla, etc
     optional bool Enabled = 3 [default = true]; // Allow to handle YTORM queries
+    optional string EndpointSetId = 4; // Examples: grut-stable.object_api, grut-testing.object_api, etc
 }
 
 message TYtOrmGatewayConfig {
@@ -380,6 +382,8 @@ message TS3GatewayConfig {
     optional uint64 MaxReadSizePerQuery = 4;
     optional uint64 MaxDiscoveryFilesPerQuery = 5;
     optional uint64 MaxInflightListsPerQuery = 7;
+    optional uint64 MaxDirectoriesAndFilesPerQuery = 8;
+    optional uint64 MinDesiredDirectoriesOfFilesPerQuery = 9;
 
     repeated TAttr DefaultSettings = 100;
 }

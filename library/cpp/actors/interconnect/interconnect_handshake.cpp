@@ -19,6 +19,7 @@ namespace NActors {
        , public TInterconnectLoggingBase
     {
         struct TExHandshakeFailed : yexception {};
+        struct TExPoison {};
 
         static constexpr TDuration ResolveTimeout = TDuration::Seconds(1);
 
@@ -96,17 +97,14 @@ namespace NActors {
         bool ResolveTimedOut = false;
         THashMap<ui32, TInstant> LastLogNotice;
         const TDuration MuteDuration = TDuration::Seconds(15);
-        TInstant Deadline;
+        TMonotonic Deadline;
         TActorId HandshakeBroker;
+        std::optional<TBrokerLeaseHolder> BrokerLeaseHolder;
 
     public:
-        static constexpr IActor::EActivityType ActorActivityType() {
-            return IActor::INTERCONNECT_HANDSHAKE;
-        }
-
         THandshakeActor(TInterconnectProxyCommon::TPtr common, const TActorId& self, const TActorId& peer,
                         ui32 nodeId, ui64 nextPacket, TString peerHostName, TSessionParams params)
-            : TActorCoroImpl(StackSize, true, true) // allow unhandled poison pills and dtors
+            : TActorCoroImpl(StackSize, true)
             , Common(std::move(common))
             , SelfVirtualId(self)
             , PeerVirtualId(peer)
@@ -123,7 +121,7 @@ namespace NActors {
         }
 
         THandshakeActor(TInterconnectProxyCommon::TPtr common, TSocketPtr socket)
-            : TActorCoroImpl(StackSize, true, true) // allow unhandled poison pills and dtors
+            : TActorCoroImpl(StackSize, true)
             , Common(std::move(common))
             , Socket(std::move(socket))
             , HandshakeKind("incoming handshake")
@@ -135,7 +133,6 @@ namespace NActors {
             } else {
                 PeerAddr.clear();
             }
-            HandshakeBroker = MakeHandshakeBrokerInId();
         }
 
         void UpdatePrefix() {
@@ -145,21 +142,29 @@ namespace NActors {
         void Run() override {
             UpdatePrefix();
 
-            bool isBrokerActive = false;
-
-            if (Send(HandshakeBroker, new TEvHandshakeBrokerTake())) {
-                isBrokerActive = true;
-                WaitForSpecificEvent<TEvHandshakeBrokerPermit>("HandshakeBrokerPermit");
+            if (!Socket && Common->OutgoingHandshakeInflightLimit) {
+                // Create holder, which sends request to broker and automatically frees the place when destroyed
+                BrokerLeaseHolder.emplace(SelfActorId, HandshakeBroker);
             }
 
             try {
+                if (BrokerLeaseHolder && BrokerLeaseHolder->IsLeaseRequested()) {
+                    WaitForSpecificEvent<TEvHandshakeBrokerPermit>("HandshakeBrokerPermit");
+                }
+
                 // set up overall handshake process timer
                 TDuration timeout = Common->Settings.Handshake;
                 if (timeout == TDuration::Zero()) {
                     timeout = DEFAULT_HANDSHAKE_TIMEOUT;
                 }
                 timeout += ResolveTimeout * 2;
-                Deadline = Now() + timeout;
+
+                if (Socket) {
+                    // Incoming handshakes have shorter timeout than outgoing
+                    timeout *= 0.9;
+                }
+
+                Deadline = TActivationContext::Monotonic() + timeout;
                 Schedule(Deadline, new TEvents::TEvWakeup);
 
                 try {
@@ -192,17 +197,16 @@ namespace NActors {
                         *NextPacketFromPeer, ProgramInfo->Release(), std::move(Params)));
                 }
             } catch (const TDtorException&) {
-                throw; // we can't use actor system when handling this exception
-            } catch (...) {
-                if (isBrokerActive) {
-                    Send(HandshakeBroker, new TEvHandshakeBrokerFree());
+                if (BrokerLeaseHolder) {
+                    BrokerLeaseHolder->ForgetLease();
                 }
+                throw;
+            } catch (const TExPoison&) {
+                return; // just stop execution
+            } catch (...) {
                 throw;
             }
 
-            if (isBrokerActive) {
-                Send(HandshakeBroker, new TEvHandshakeBrokerFree());
-            }
             Socket.Reset();
         }
 
@@ -243,7 +247,7 @@ namespace NActors {
             }
         }
 
-        void ProcessUnexpectedEvent(TAutoPtr<IEventHandle> ev) override {
+        void ProcessUnexpectedEvent(TAutoPtr<IEventHandle> ev) {
             switch (const ui32 type = ev->GetTypeRewrite()) {
                 case TEvents::TSystem::Wakeup:
                     Fail(TEvHandshakeFail::HANDSHAKE_FAIL_TRANSIENT, Sprintf("Handshake timed out, State# %s", State.data()), true);
@@ -256,6 +260,9 @@ namespace NActors {
 
                 case TEvPollerReady::EventType:
                    break;
+
+                case TEvents::TSystem::Poison:
+                   throw TExPoison();
 
                 default:
                     Y_FAIL("unexpected event 0x%08" PRIx32, type);
@@ -829,15 +836,15 @@ namespace NActors {
         }
 
         template <typename TEvent>
-        THolder<typename TEvent::THandle> WaitForSpecificEvent(TString state, TInstant deadline = TInstant::Max()) {
+        THolder<typename TEvent::THandle> WaitForSpecificEvent(TString state, TMonotonic deadline = TMonotonic::Max()) {
             State = std::move(state);
-            return TActorCoroImpl::WaitForSpecificEvent<TEvent>(deadline);
+            return TActorCoroImpl::WaitForSpecificEvent<TEvent>(&THandshakeActor::ProcessUnexpectedEvent, deadline);
         }
 
         template <typename T1, typename T2, typename... TEvents>
-        THolder<IEventHandle> WaitForSpecificEvent(TString state, TInstant deadline = TInstant::Max()) {
+        THolder<IEventHandle> WaitForSpecificEvent(TString state, TMonotonic deadline = TMonotonic::Max()) {
             State = std::move(state);
-            return TActorCoroImpl::WaitForSpecificEvent<T1, T2, TEvents...>(deadline);
+            return TActorCoroImpl::WaitForSpecificEvent<T1, T2, TEvents...>(&THandshakeActor::ProcessUnexpectedEvent, deadline);
         }
 
         template <typename TEvent>
@@ -889,11 +896,12 @@ namespace NActors {
 
         void Connect(bool updatePeerAddr) {
             // issue request to a nameservice to resolve peer node address
-            Send(Common->NameserviceId, new TEvInterconnect::TEvResolveNode(PeerNodeId, Deadline));
+            const auto mono = TActivationContext::Monotonic();
+            Send(Common->NameserviceId, new TEvInterconnect::TEvResolveNode(PeerNodeId, TActivationContext::Now() + (Deadline - mono)));
 
             // wait for the result
             auto ev = WaitForSpecificEvent<TEvResolveError, TEvLocalNodeInfo, TEvInterconnect::TEvNodeAddress>("ResolveNode",
-                Now() + ResolveTimeout);
+                mono + ResolveTimeout);
 
             // extract address from the result
             std::vector<NInterconnect::TAddress> addresses;
@@ -1043,7 +1051,8 @@ namespace NActors {
 
         THolder<TEvInterconnect::TNodeInfo> GetPeerNodeInfo() {
             Y_VERIFY(PeerNodeId);
-            Send(Common->NameserviceId, new TEvInterconnect::TEvGetNode(PeerNodeId, Deadline));
+            Send(Common->NameserviceId, new TEvInterconnect::TEvGetNode(PeerNodeId, TActivationContext::Now() +
+                (Deadline - TActivationContext::Monotonic())));
             auto response = WaitForSpecificEvent<TEvInterconnect::TEvNodeInfo>("GetPeerNodeInfo");
             return std::move(response->Get()->Node);
         }
@@ -1062,11 +1071,12 @@ namespace NActors {
                                          const TActorId& peer, ui32 nodeId, ui64 nextPacket, TString peerHostName,
                                          TSessionParams params) {
         return new TActorCoro(MakeHolder<THandshakeActor>(std::move(common), self, peer, nodeId, nextPacket,
-            std::move(peerHostName), std::move(params)));
+            std::move(peerHostName), std::move(params)), IActor::INTERCONNECT_HANDSHAKE);
     }
 
     IActor* CreateIncomingHandshakeActor(TInterconnectProxyCommon::TPtr common, TSocketPtr socket) {
-        return new TActorCoro(MakeHolder<THandshakeActor>(std::move(common), std::move(socket)));
+        return new TActorCoro(MakeHolder<THandshakeActor>(std::move(common), std::move(socket)),
+            IActor::INTERCONNECT_HANDSHAKE);
     }
 
 }

@@ -39,7 +39,9 @@ private:
         TReadItem(const TReadBlobRangeOptions& opts, const TBlobRange& blobRange)
             : TReadBlobRangeOptions(opts)
             , BlobRange(blobRange)
-        {}
+        {
+            Y_VERIFY(blobRange.BlobId.IsValid());
+        }
 
         bool PromoteInCache() const {
             return CacheAfterRead;
@@ -174,8 +176,8 @@ private:
             HFunc(TEvColumnShard::TEvReadBlobRangesResult, Handle);
         default:
             LOG_S_WARN("Unhandled event type: " << ev->GetTypeRewrite()
-                       << " event: " << (ev->HasEvent() ? ev->GetBase()->ToString().data() : "serialized?"));
-            ctx.Send(ev->ForwardOnNondelivery(TEvents::TEvUndelivered::ReasonActorUnknown));
+                       << " event: " << ev->ToString());
+            ctx.Send(IEventHandle::ForwardOnNondelivery(ev, TEvents::TEvUndelivered::ReasonActorUnknown));
             break;
         };
     }
@@ -550,7 +552,6 @@ private:
             CookieToRange.erase(readCookie);
 
             for (size_t i = 0; i < blobRanges.size(); ++i) {
-                Y_VERIFY(blobRanges[i].BlobId.IsSmallBlob());
                 Y_VERIFY(blobRanges[i].BlobId.GetTabletId() == tabletId);
                 ProcessSingleRangeResult(blobRanges[i], readCookie, NKikimrProto::EReplyStatus::NOTREADY, {}, ctx);
             }
@@ -633,7 +634,7 @@ private:
                 break;
             }
 
-            LOG_S_DEBUG("Evict: " << it.Key());
+            LOG_S_DEBUG("Evict: " << it.Key() << ";CacheDataSize:" << CacheDataSize << ";InFlightDataSize:" << (i64)InFlightDataSize << ";MaxCacheDataSize:" << (i64)MaxCacheDataSize);
 
             {
                 // Remove the range from list of ranges by blob id
@@ -664,12 +665,12 @@ NActors::IActor* CreateBlobCache(ui64 maxBytes, TIntrusivePtr<::NMonitoring::TDy
 
 void AddRangeToCache(const TBlobRange& blobRange, const TString& data) {
     TlsActivationContext->Send(
-        new IEventHandle(MakeBlobCacheServiceId(), TActorId(), new TEvBlobCache::TEvCacheBlobRange(blobRange, data)));
+        new IEventHandleFat(MakeBlobCacheServiceId(), TActorId(), new TEvBlobCache::TEvCacheBlobRange(blobRange, data)));
 }
 
 void ForgetBlob(const TUnifiedBlobId& blobId) {
     TlsActivationContext->Send(
-        new IEventHandle(MakeBlobCacheServiceId(), TActorId(), new TEvBlobCache::TEvForgetBlob(blobId)));
+        new IEventHandleFat(MakeBlobCacheServiceId(), TActorId(), new TEvBlobCache::TEvForgetBlob(blobId)));
 }
 
 }

@@ -13,15 +13,19 @@
 namespace NKikimr::NMiniKQL {
 
 using NYql::NUdf::IBlockReader;
+using NYql::NUdf::TOutputBuffer;
 
 class IBlockItemConverter {
 public:
     virtual ~IBlockItemConverter() = default;
 
     virtual NUdf::TUnboxedValuePod MakeValue(TBlockItem item, const THolderFactory& holderFactory) const = 0;
+    virtual TBlockItem MakeItem(NUdf::TUnboxedValuePod value) const = 0;
 };
 
 using NYql::NUdf::MakeBlockReader;
+using NYql::NUdf::TBlockItemSerializeProps;
+using NYql::NUdf::UpdateBlockItemSerializeProps;
 
 std::unique_ptr<IBlockItemConverter> MakeBlockItemConverter(const NYql::NUdf::ITypeInfoHelper& typeInfoHelper, const NYql::NUdf::TType* type);
 

@@ -269,7 +269,7 @@ namespace NKikimr::NBlobDepot {
         value.UncertainWrite = false;
         KeysMadeCertain.push_back(key);
         if (!CommitCertainKeysScheduled) {
-            TActivationContext::Schedule(TDuration::Seconds(1), new IEventHandle(TEvPrivate::EvCommitCertainKeys, 0,
+            TActivationContext::Schedule(TDuration::Seconds(1), new IEventHandleFat(TEvPrivate::EvCommitCertainKeys, 0,
                 Self->SelfId(), {}, nullptr, 0));
             CommitCertainKeysScheduled = true;
         }
@@ -304,7 +304,7 @@ namespace NKikimr::NBlobDepot {
                 if (Self->Data->KeysMadeCertain.empty()) {
                     Self->Data->CommitCertainKeysScheduled = false;
                 } else {
-                    TActivationContext::Schedule(TDuration::Seconds(1), new IEventHandle(TEvPrivate::EvCommitCertainKeys,
+                    TActivationContext::Schedule(TDuration::Seconds(1), new IEventHandleFat(TEvPrivate::EvCommitCertainKeys,
                         0, Self->SelfId(), {}, nullptr, 0));
                 }
             }
@@ -454,7 +454,7 @@ namespace NKikimr::NBlobDepot {
             };
 
             STLOG(PRI_DEBUG, BLOB_DEPOT, BDT13, "Trim", (Id, Self->GetLogId()), (AgentId, agent.Connection->NodeId),
-                (Id, ev->Cookie), (Channel, channelIndex), (InvalidatedStep, invalidatedStep),
+                (Id, ev->Cookie), (Channel, int(channelIndex)), (InvalidatedStep, invalidatedStep),
                 (GivenIdRanges, channel.GivenIdRanges),
                 (Agent.GivenIdRanges, agent.GivenIdRanges[channelIndex]),
                 (WritesInFlight, makeWritesInFlight()));

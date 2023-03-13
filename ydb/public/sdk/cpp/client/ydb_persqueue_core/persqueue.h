@@ -349,7 +349,7 @@ enum class EClusterDiscoveryMode {
 };
 
 class TContinuationToken : public TMoveOnly {
-    friend class TWriteSession;
+    friend class TWriteSessionImpl;
 private:
     TContinuationToken() = default;
 };
@@ -717,7 +717,7 @@ struct TReadSessionEvent {
 
     //! Server request for creating partition stream.
     struct TCreatePartitionStreamEvent {
-        explicit TCreatePartitionStreamEvent(TPartitionStream::TPtr, ui64 committedOffset, ui64 endOffset);
+        TCreatePartitionStreamEvent(TPartitionStream::TPtr, ui64 committedOffset, ui64 endOffset);
 
         const TPartitionStream::TPtr& GetPartitionStream() const {
             return PartitionStream;
@@ -1105,8 +1105,8 @@ struct TWriteSessionSettings : public TRequestSettings<TWriteSessionSettings> {
         //! Function to handle all event types.
         //! If event with current type has no handler for this type of event,
         //! this handler (if specified) will be used.
-        //! If this handler is not specified, event can be received with TReadSession::GetEvent() method.
-        FLUENT_SETTING(std::function<void(TReadSessionEvent::TEvent&)>, CommonHandler);
+        //! If this handler is not specified, event can be received with TWriteSession::GetEvent() method.
+        FLUENT_SETTING(std::function<void(TWriteSessionEvent::TEvent&)>, CommonHandler);
 
         //! Executor for handlers.
         //! If not set, default single threaded executor will be used.

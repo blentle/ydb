@@ -13,6 +13,11 @@ namespace NOperationId {
 
 using namespace NUri;
 
+TString FormatPreparedQueryIdCompat(const TString& in) {
+    static const TString prefix = "ydb://preparedqueryid/4?id=";
+    return prefix + in;
+}
+
 TString ProtoToString(const Ydb::TOperationId& proto) {
     using namespace ::google::protobuf;
     const Reflection& reflection = *proto.GetReflection();
@@ -41,6 +46,9 @@ TString ProtoToString(const Ydb::TOperationId& proto) {
             break;
         case Ydb::TOperationId::BUILD_INDEX:
             res << "ydb://buildindex";
+            break;
+        case Ydb::TOperationId::SCRIPT:
+            res << "ydb://script";
             break;
         default:
             Y_VERIFY(false, "unexpected kind");
@@ -166,6 +174,10 @@ Ydb::TOperationId::EKind ParseKind(const TStringBuf value) {
 
     if (value.StartsWith("buildindex")) {
         return Ydb::TOperationId::BUILD_INDEX;
+    }
+
+    if (value.StartsWith("script")) {
+        return Ydb::TOperationId::SCRIPT;
     }
 
     return Ydb::TOperationId::UNUSED;

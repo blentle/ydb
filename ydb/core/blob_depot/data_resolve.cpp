@@ -7,7 +7,7 @@ namespace NKikimr::NBlobDepot {
 
     using TData = TBlobDepot::TData;
 
-    TData::TResolveResultAccumulator::TResolveResultAccumulator(TEventHandle<TEvBlobDepot::TEvResolve>& ev)
+    TData::TResolveResultAccumulator::TResolveResultAccumulator(TEventHandleFat<TEvBlobDepot::TEvResolve>& ev)
         : Sender(ev.Sender)
         , Recipient(ev.Recipient)
         , Cookie(ev.Cookie)
@@ -23,7 +23,7 @@ namespace NKikimr::NBlobDepot {
 
     void TData::TResolveResultAccumulator::Send(NKikimrProto::EReplyStatus status, std::optional<TString> errorReason) {
         auto sendResult = [&](std::unique_ptr<TEvBlobDepot::TEvResolveResult> ev) {
-            auto handle = std::make_unique<IEventHandle>(Sender, Recipient, ev.release(), 0, Cookie);
+            auto handle = std::make_unique<IEventHandleFat>(Sender, Recipient, ev.release(), 0, Cookie);
             if (InterconnectSession) {
                 handle->Rewrite(TEvInterconnect::EvForward, InterconnectSession);
             }
@@ -237,9 +237,14 @@ namespace NKikimr::NBlobDepot {
             if (!ResolutionErrors.empty() && ResolutionErrors.contains(key.GetBlobId())) {
                 item.SetErrorReason("item resolution error");
                 item.ClearValueChain();
-            } else if (!item.ValueChainSize()) {
-                STLOG(PRI_WARN, BLOB_DEPOT, BDT48, "empty ValueChain on Resolve", (Id, Self->GetLogId()),
-                    (Key, key), (Value, value), (Item, item), (Sender, Request->Sender), (Cookie, Request->Cookie));
+            } else {
+                if (!item.ValueChainSize()) {
+                    STLOG(PRI_WARN, BLOB_DEPOT, BDT48, "empty ValueChain on Resolve", (Id, Self->GetLogId()),
+                        (Key, key), (Value, value), (Item, item), (Sender, Request->Sender), (Cookie, Request->Cookie));
+                }
+                if (item.GetValueVersion() != value.ValueVersion) {
+                    item.SetValueVersion(value.ValueVersion);
+                }
             }
 
             Result.AddItem(std::move(item), Self->Config);

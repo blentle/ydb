@@ -6,7 +6,6 @@
 #include <ydb/core/yq/libs/config/protos/pinger.pb.h>
 #include <ydb/core/yq/libs/events/events.h>
 #include <ydb/core/yq/libs/private_client/private_client.h>
-#include <ydb/core/yq/libs/shared_resources/db_pool.h>
 #include <ydb/core/yq/libs/shared_resources/shared_resources.h>
 #include <ydb/core/yq/libs/signer/signer.h>
 
@@ -40,12 +39,7 @@ NActors::TActorId MakePendingFetcherId(ui32 nodeId);
 NActors::IActor* CreatePendingFetcher(
     const NYq::TYqSharedResources::TPtr& yqSharedResources,
     const NKikimr::TYdbCredentialsProviderFactory& credentialsProviderFactory,
-    const ::NYq::NConfig::TCommonConfig& commonConfig,
-    const ::NYq::NConfig::TCheckpointCoordinatorConfig& checkpointCoordinatorConfig,
-    const ::NYq::NConfig::TPrivateApiConfig& privateApiConfig,
-    const ::NYq::NConfig::TGatewaysConfig& gatewaysConfig,
-    const ::NYq::NConfig::TPingerConfig& pingerConfig,
-    const ::NYq::NConfig::TRateLimiterConfig& rateLimiterConfig,
+    const ::NYq::NConfig::TConfig& config,
     const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
     TIntrusivePtr<ITimeProvider> timeProvider,
     TIntrusivePtr<IRandomProvider> randomProvider,

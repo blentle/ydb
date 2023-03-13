@@ -16,6 +16,7 @@
 #include <ydb/library/yql/public/issue/yql_issue.h>
 #include <ydb/library/yql/public/issue/yql_issue_message.h>
 #include <ydb/library/yql/public/issue/yql_issue_manager.h>
+#include <ydb/library/aclib/aclib.h>
 
 #include <ydb/core/grpc_services/counters/proxy_counters.h>
 #include <ydb/core/grpc_streaming/grpc_streaming.h>
@@ -24,11 +25,9 @@
 
 #include <util/stream/str.h>
 
-namespace NKikimrConfig {
-    class TAppConfig;
-}
-
 namespace NKikimr {
+
+struct TAppConfig;
 
 namespace NSchemeCache {
     struct TSchemeCacheNavigate;
@@ -105,6 +104,7 @@ struct TRpcServices {
         EvStreamTopicWrite,
         EvStreamTopicRead,
         EvPQReadInfo,
+        EvTopicCommitOffset,
         EvListOperations,
         EvExportToYt,
         EvDiscoverPQClusters,
@@ -251,7 +251,9 @@ public:
     // Returns client provided database name
     virtual const TMaybe<TString> GetDatabaseName() const = 0;
     // Returns "internal" token (result of ticket parser authentication)
-    virtual const TString& GetInternalToken() const = 0;
+    virtual const TIntrusiveConstPtr<NACLib::TUserToken>& GetInternalToken() const = 0;
+    // Returns internal token as a serialized message.
+    virtual const TString& GetSerializedToken() const = 0;
     virtual bool IsClientLost() const = 0;
 };
 
@@ -334,7 +336,9 @@ class ICheckerIface;
 // The way to pass some common data to request processing
 class IFacilityProvider {
 public:
-    virtual const NKikimrConfig::TAppConfig& GetAppConfig() const = 0;
+    virtual TIntrusiveConstPtr<TAppConfig> GetAppConfig() const = 0;
+    // Registers new actor using method chosen by grpc proxy
+    virtual TActorId RegisterActor(IActor* actor) const = 0;
 };
 
 struct TRequestAuxSettings {
@@ -351,7 +355,7 @@ public:
     // auth
     virtual const TMaybe<TString> GetYdbToken() const  = 0;
     virtual void UpdateAuthState(NGrpc::TAuthState::EAuthState state) = 0;
-    virtual void SetInternalToken(const TString& token) = 0;
+    virtual void SetInternalToken(const TIntrusiveConstPtr<NACLib::TUserToken>& token) = 0;
     virtual const NGrpc::TAuthState& GetAuthState() const = 0;
     virtual void ReplyUnauthenticated(const TString& msg = "") = 0;
     virtual void ReplyUnavaliable() = 0;
@@ -478,7 +482,7 @@ public:
         State_.State = state;
     }
 
-    void SetInternalToken(const TString& token) override {
+    void SetInternalToken(const TIntrusiveConstPtr<NACLib::TUserToken>& token) override {
         InternalToken_ = token;
     }
 
@@ -494,8 +498,16 @@ public:
         return State_;
     }
 
-    const TString& GetInternalToken() const override {
+    const TIntrusiveConstPtr<NACLib::TUserToken>& GetInternalToken() const override {
         return InternalToken_;
+    }
+
+    const TString& GetSerializedToken() const override {
+        if (InternalToken_) {
+            return InternalToken_->GetSerializedToken();
+        }
+
+        return EmptySerializedTokenMessage_;
     }
 
     TString GetPeerName() const override {
@@ -607,7 +619,8 @@ private:
     const TString Database_;
     const TActorId From_;
     NGrpc::TAuthState State_;
-    TString InternalToken_;
+    TIntrusiveConstPtr<NACLib::TUserToken> InternalToken_;
+    const TString EmptySerializedTokenMessage_;
     NYql::TIssueManager IssueManager_;
 };
 
@@ -725,7 +738,7 @@ public:
         IssueManager_.RaiseIssues(issues);
     }
 
-    void SetInternalToken(const TString& token) override {
+    void SetInternalToken(const TIntrusiveConstPtr<NACLib::TUserToken>& token) override {
         InternalToken_ = token;
     }
 
@@ -737,8 +750,16 @@ public:
         return RlPath_;
     }
 
-    const TString& GetInternalToken() const override {
+    const TIntrusiveConstPtr<NACLib::TUserToken>& GetInternalToken() const override {
         return InternalToken_;
+    }
+
+    const TString& GetSerializedToken() const override {
+        if (InternalToken_) {
+            return InternalToken_->GetSerializedToken();
+        }
+
+        return EmptySerializedTokenMessage_;
     }
 
     TString GetPeerName() const override {
@@ -820,7 +841,8 @@ public:
 
 private:
     TIntrusivePtr<IStreamCtx> Ctx_;
-    TString InternalToken_;
+    TIntrusiveConstPtr<NACLib::TUserToken> InternalToken_;
+    const TString EmptySerializedTokenMessage_;
     NYql::TIssueManager IssueManager_;
     TMaybe<NRpcService::TRlPath> RlPath_;
     bool RlAllowed_;
@@ -969,7 +991,7 @@ public:
         Ctx_->ReplyUnauthenticated(MakeAuthError(in, IssueManager));
     }
 
-    void SetInternalToken(const TString& token) override {
+    void SetInternalToken(const TIntrusiveConstPtr<NACLib::TUserToken>& token) override {
         InternalToken_ = token;
     }
 
@@ -982,8 +1004,16 @@ public:
         Ctx_->AddTrailingMetadata(NYdb::YDB_CONSUMED_UNITS_HEADER, IntToString<10>(ru));
     }
 
-    const TString& GetInternalToken() const override {
+    const TIntrusiveConstPtr<NACLib::TUserToken>& GetInternalToken() const override {
         return InternalToken_;
+    }
+
+    const TString& GetSerializedToken() const override {
+        if (InternalToken_) {
+            return InternalToken_->GetSerializedToken();
+        }
+
+        return EmptySerializedTokenMessage_;
     }
 
     const TMaybe<TString> GetPeerMetaValues(const TString& key) const override {
@@ -1188,7 +1218,8 @@ private:
 
 private:
     TIntrusivePtr<NGrpc::IRequestContextBase> Ctx_;
-    TString InternalToken_;
+    TIntrusiveConstPtr<NACLib::TUserToken> InternalToken_;
+    const TString EmptySerializedTokenMessage_;
     NYql::TIssueManager IssueManager;
     Ydb::CostInfo* CostInfo = nullptr;
     Ydb::QuotaExceeded* QuotaExceeded = nullptr;

@@ -55,6 +55,7 @@ TImportFileClient::TImportFileClient(const TDriver& driver, const TClientCommand
         .ClientTimeout(TDuration::Seconds(TImportFileSettings::ClientTimeoutSec));
     RetrySettings
         .MaxRetries(TImportFileSettings::MaxRetries)
+        .Idempotent(true)
         .Verbose(rootConfig.IsVerbose());
 }
 
@@ -111,15 +112,29 @@ TStatus TImportFileClient::Import(const TString& filePath, const TString& dbPath
 namespace {
 
 TStatus WaitForQueue(std::deque<TAsyncStatus>& inFlightRequests, size_t maxQueueSize) {
-    while (!inFlightRequests.empty() && inFlightRequests.size() > maxQueueSize) {
-        auto status = inFlightRequests.front().ExtractValueSync();
-        inFlightRequests.pop_front();
-        if (!status.IsSuccess()) {
-            return status;
+    std::vector<TStatus> problemResults;
+    while (!inFlightRequests.empty() && inFlightRequests.size() > maxQueueSize && problemResults.empty()) {
+        Y_UNUSED(NThreading::WaitAny(inFlightRequests));
+        ui32 delta = 0;
+        for (ui32 i = 0; i + delta < inFlightRequests.size();) {
+            if (inFlightRequests[i].HasValue() || inFlightRequests[i].HasException()) {
+                auto status = inFlightRequests[i].ExtractValueSync();
+                if (!status.IsSuccess()) {
+                    problemResults.emplace_back(status);
+                }
+                ++delta;
+                inFlightRequests[i] = inFlightRequests[inFlightRequests.size() - delta];
+            } else {
+                ++i;
+            }
         }
+        inFlightRequests.resize(inFlightRequests.size() - delta);
     }
-
-    return MakeStatus();
+    if (problemResults.size()) {
+        return problemResults.front();
+    } else {
+        return MakeStatus();
+    }
 }
 
 }
@@ -176,7 +191,7 @@ TStatus TImportFileClient::UpsertCsv(IInputStream& input, const TString& dbPath,
 
     std::deque<TAsyncStatus> inFlightRequests;
 
-    ui32 idx = 0;
+    ui32 idx = settings.SkipRows_;
     ui64 readSize = 0;
     const ui32 mb100 = 1 << 27;
     ui64 nextBorder = mb100;

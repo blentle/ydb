@@ -120,7 +120,7 @@ struct TEnvironmentSetup {
 
     TVector<std::tuple<TString, i32, ui32>> GetNodes() {
         const TActorId edge = Runtime->AllocateEdgeActor();
-        Runtime->Send(new IEventHandle(GetNameserviceActorId(), edge, new TEvInterconnect::TEvListNodes));
+        Runtime->Send(new IEventHandleFat(GetNameserviceActorId(), edge, new TEvInterconnect::TEvListNodes));
         auto response = Runtime->GrabEdgeEventRethrow<TEvInterconnect::TEvNodesInfo>(edge);
         TVector<std::tuple<TString, i32, ui32>> res;
         for (const auto& nodeInfo : response->Get()->Nodes) {
@@ -838,17 +838,10 @@ Y_UNIT_TEST_SUITE(BsControllerConfig) {
                 pb->SetSerial("SN_123");
                 pb->SetBoxId(1);
                 NKikimrBlobStorage::TConfigResponse response = env.Invoke(request);
-                if (i == 0) {
-                    UNIT_ASSERT(response.GetSuccess());
-                    UNIT_ASSERT(response.StatusSize() == 1);
-                    UNIT_ASSERT(response.GetStatus(0).GetSuccess());
-                } else {
-                    UNIT_ASSERT(!response.GetSuccess());
-                    UNIT_ASSERT(response.StatusSize() == 1);
-                    UNIT_ASSERT(!response.GetStatus(0).GetSuccess());
-                    UNIT_ASSERT(response.GetStatus(0).GetFailReason()
-                                    == NKikimrBlobStorage::TConfigResponse::TStatus::kAlready);
-                }
+                UNIT_ASSERT(!response.GetSuccess());
+                UNIT_ASSERT(response.StatusSize() == 1);
+                UNIT_ASSERT(!response.GetStatus(0).GetSuccess());
+                UNIT_ASSERT(response.GetStatus(0).GetErrorDescription());
             }
         };
         RunTestWithReboots(env.TabletIds, [&] { return env.PrepareInitialEventsFilter(); }, test);
@@ -867,18 +860,20 @@ Y_UNIT_TEST_SUITE(BsControllerConfig) {
                 pb->SetSerial(TStringBuilder() << "SN_" << i);
                 pb->SetBoxId(1);
                 NKikimrBlobStorage::TConfigResponse response = env.Invoke(request);
-                UNIT_ASSERT(response.GetSuccess());
+                UNIT_ASSERT(!response.GetSuccess());
                 UNIT_ASSERT(response.StatusSize() == 1);
-                UNIT_ASSERT(response.GetStatus(0).GetSuccess());
+                UNIT_ASSERT(!response.GetStatus(0).GetSuccess());
+                UNIT_ASSERT(response.GetStatus(0).GetErrorDescription());
             }
             for (size_t i = 0; i < disksCount; ++i) {
                 NKikimrBlobStorage::TConfigRequest request;
                 auto pb = request.AddCommand()->MutableRemoveDriveSerial();
                 pb->SetSerial(TStringBuilder() << "SN_" << i);
                 NKikimrBlobStorage::TConfigResponse response = env.Invoke(request);
-                UNIT_ASSERT(response.GetSuccess());
+                UNIT_ASSERT(!response.GetSuccess());
                 UNIT_ASSERT(response.StatusSize() == 1);
-                UNIT_ASSERT(response.GetStatus(0).GetSuccess());
+                UNIT_ASSERT(!response.GetStatus(0).GetSuccess());
+                UNIT_ASSERT(response.GetStatus(0).GetErrorDescription());
             }
         };
         RunTestWithReboots(env.TabletIds, [&] { return env.PrepareInitialEventsFilter(); }, test);

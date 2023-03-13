@@ -1,6 +1,8 @@
+#include "utils.h"
 #include <ydb/library/yql/sql/settings/partitioning.h>
 #include <ydb/library/yql/parser/pg_wrapper/interface/parser.h>
 #include <ydb/library/yql/parser/pg_wrapper/parser.h>
+#include <ydb/library/yql/parser/pg_catalog/catalog.h>
 #include <ydb/library/yql/providers/common/provider/yql_provider_names.h>
 #include <ydb/library/yql/core/yql_callable_names.h>
 #include <ydb/library/yql/parser/pg_catalog/catalog.h>
@@ -168,7 +170,7 @@ public:
         bool InjectRead = false;
     };
 
-    struct TInsertDesc {
+    struct TWriteRangeDesc {
         TAstNode* Sink = nullptr;
         TAstNode* Key = nullptr;
     };
@@ -205,6 +207,11 @@ public:
             } else if (flag == "DqEngineForce") {
                 DqEngineForce = true;
             }
+        }
+
+        for (const auto& [cluster, provider] : Settings.ClusterMapping) {
+            Provider = provider;
+            break;
         }
     }
 
@@ -261,10 +268,14 @@ public:
             return ParseInsertStmt(CAST_NODE(InsertStmt, node)) != nullptr;
         case T_ViewStmt:
             return ParseViewStmt(CAST_NODE(ViewStmt, node)) != nullptr;
+        case T_CreateStmt:
+            return ParseCreateStmt(CAST_NODE(CreateStmt, node)) != nullptr;
         case T_DropStmt:
             return ParseDropStmt(CAST_NODE(DropStmt, node)) != nullptr;
         case T_VariableSetStmt:
             return ParseVariableSetStmt(CAST_NODE(VariableSetStmt, node)) != nullptr;
+        case T_DeleteStmt:
+            return ParseDeleteStmt(CAST_NODE(DeleteStmt, node)) != nullptr;
         default:
             NodeNotImplemented(value, node);
             return false;
@@ -275,7 +286,7 @@ public:
     using TTraverseNodeStack = TStack<std::pair<const Node*, bool>>;
 
     [[nodiscard]]
-    TAstNode* ParseSelectStmt(const SelectStmt* value, bool inner) {
+    TAstNode* ParseSelectStmt(const SelectStmt* value, bool inner, TVector <TAstNode*> targetColumns = {}) {
         CTE.emplace_back();
         Y_DEFER {
             CTE.pop_back();
@@ -698,6 +709,9 @@ public:
             }
 
             TVector<TAstNode*> setItemOptions;
+            if (targetColumns) {
+                setItemOptions.push_back(QL(QA("target_columns"), QVL(targetColumns.data(), targetColumns.size())));
+            }
             if (ListLength(x->targetList) > 0) {
                 setItemOptions.push_back(QL(QA("result"), QVL(res.data(), res.size())));
             } else {
@@ -876,11 +890,6 @@ public:
 
     [[nodiscard]]
     TAstNode* ParseInsertStmt(const InsertStmt* value) {
-        if (ListLength(value->cols) > 0) {
-            AddError("InsertStmt: target columns are not supported");
-            return nullptr;
-        }
-
         if (!value->selectStmt) {
             AddError("InsertStmt: expected Select");
             return nullptr;
@@ -906,14 +915,45 @@ public:
             return nullptr;
         }
 
-        auto select = ParseSelectStmt(CAST_NODE(SelectStmt, value->selectStmt), true);
+        TVector <TAstNode*> targetColumns;
+        if (value->cols) {
+            for (size_t i = 0; i < ListLength(value->cols); i++) {
+                auto node = ListNodeNth(value->cols, i);
+                if (NodeTag(node) != T_ResTarget) {
+                    NodeNotImplemented(value, node);
+                    return nullptr;
+                }
+                auto r = CAST_NODE(ResTarget, node);
+                if (!r->name) {
+                    AddError("SelectStmt: expected name");
+                    return nullptr;
+                }
+                targetColumns.push_back(QA(r->name));
+            }
+        }
+
+        auto select = ParseSelectStmt(CAST_NODE(SelectStmt, value->selectStmt), true, targetColumns);
         if (!select) {
             return nullptr;
         }
 
-        auto writeOptions = QL(QL(QA("mode"), QA("append")));
-        Statements.push_back(L(A("let"), A("world"), L(A("Write!"),
-            A("world"), insertDesc.Sink, insertDesc.Key, select, writeOptions)));
+        auto insertMode = (ProviderToInsertModeMap.contains(Provider))
+            ? ProviderToInsertModeMap.at(Provider)
+            : "append";
+
+        auto writeOptions = QL(QL(QA("mode"), QA(insertMode)));
+        Statements.push_back(L(
+            A("let"),
+            A("world"),
+            L(
+                A("Write!"),
+                A("world"),
+                insertDesc.Sink,
+                insertDesc.Key,
+                select,
+                writeOptions
+            )
+        ));
 
         return Statements.back();
     }
@@ -982,6 +1022,262 @@ public:
         Views[view.Name] = view;
         return Statements.back();
     }
+
+#pragma region CreateTable
+private:
+    struct TCreateTableCtx {
+        std::vector<TAstNode*> Columns;
+        std::unordered_set<TString> ColumnsSet;
+        std::vector<TAstNode*> PrimaryKey;
+        std::vector<TAstNode*> NotNullColumns;
+        std::unordered_set<TString> NotNullColSet;
+    };
+
+    bool CheckConstraintSupported(const Constraint* pk) {
+        bool isSupported = true;
+
+        if (pk->deferrable) {
+            AddError("DEFERRABLE constraints not supported");
+            isSupported = false;
+        }
+
+        if (pk->initdeferred) {
+            AddError("INITIALLY DEFERRED constraints not supported");
+            isSupported = false;
+        }
+
+        if (0 < ListLength(pk->including)) {
+            AddError("INCLUDING columns not supported");
+            isSupported = false;
+        }
+
+        if (0 < ListLength(pk->options)) {
+            AddError("WITH options not supported");
+            isSupported = false;
+        }
+
+        if (pk->indexname) {
+            AddError("INDEX name not supported");
+            isSupported = false;
+        }
+
+        if (pk->indexspace) {
+            AddError("USING INDEX TABLESPACE not supported");
+            isSupported = false;
+        }
+
+        return isSupported;
+    }
+
+    bool FillPrimaryKeyColumns(TCreateTableCtx& ctx, const Constraint* pk) {
+        if (!CheckConstraintSupported(pk))
+            return false;
+
+        for (auto i = 0; i < ListLength(pk->keys); ++i) {
+            auto node = ListNodeNth(pk->keys, i);
+
+            AddNonNullColumn(ctx, StrVal(node));
+            ctx.PrimaryKey.push_back(QA(StrVal(node)));
+        }
+
+        Y_ENSURE(0 < ctx.PrimaryKey.size());
+
+        return true;
+    }
+
+    bool AddNonNullColumn(TCreateTableCtx& ctx, const char* colName) {
+        auto [it, inserted] = ctx.NotNullColSet.insert(colName);
+        if (inserted)
+            ctx.NotNullColumns.push_back(QA(colName));
+
+        return inserted;
+    }
+
+    bool AddColumn(TCreateTableCtx& ctx, const ColumnDef* node) {
+        auto success = true;
+
+        if (node->constraints) {
+            for (ui32 i = 0; i < ListLength(node->constraints); ++i) {
+                auto constraintNode =
+                        CAST_NODE(Constraint, ListNodeNth(node->constraints, i));
+
+                switch (constraintNode->contype) {
+                    case CONSTR_NOTNULL:
+                        AddNonNullColumn(ctx, node->colname);
+                        break;
+
+                    case CONSTR_PRIMARY: {
+                        if (!ctx.PrimaryKey.empty()) {
+                            AddError("Only a single PK is allowed per table");
+                            success = false;
+                            break;
+                        }
+                        AddNonNullColumn(ctx, node->colname);
+                        ctx.PrimaryKey.push_back(QA(node->colname));
+                    } break;
+
+                    default:
+                        AddError("column constraint not supported");
+                        success = false;
+                }
+            }
+        }
+        auto [it, inserted] = ctx.ColumnsSet.insert(node->colname);
+        if (!inserted) {
+            AddError("duplicated column names found");
+            success = false;
+        }
+
+        if (!success)
+            return success;
+
+        // for now we pass just the last part of the type name
+        auto colType = StrVal( ListNodeNth(node->typeName->names,
+                                           ListLength(node->typeName->names) - 1));
+
+        ctx.Columns.push_back(
+                QL(QA(node->colname), L(A("PgType"), QA(colType)))
+                );
+
+        return success;
+    }
+
+    bool AddConstraint(TCreateTableCtx& ctx, const Constraint* node) {
+        auto success = true;
+
+        switch (node->contype) {
+            case CONSTR_PRIMARY: {
+                if (!ctx.PrimaryKey.empty()) {
+                    AddError("Only a single PK is allowed per table");
+                    success = false;
+                    break;
+                }
+                success &= FillPrimaryKeyColumns(ctx, node);
+            } break;
+
+            // TODO: support table-level not null constraints like:
+            // CHECK (col1 is not null [OR col2 is not null])
+
+            default:
+                AddError("table constraint not supported");
+                success = false;
+        }
+        return success;
+    }
+
+    TAstNode* BuildCreateTableOptions(TCreateTableCtx& ctx) {
+        return QL(
+                QL(QA("mode"), QA("create")),
+                QL(QA("columns"), QVL(ctx.Columns.data(), ctx.Columns.size())),
+                QL(QA("primarykey"), QVL(ctx.PrimaryKey.data(), ctx.PrimaryKey.size())),
+                QL(QA("notnull"), QVL(ctx.NotNullColumns.data(), ctx.NotNullColumns.size())));
+    }
+
+public:
+    [[nodiscard]]
+    TAstNode* ParseCreateStmt(const CreateStmt* value) {
+        auto success = true;
+
+        // See also transformCreateStmt() in parse_utilcmd.c
+        if (0 < ListLength(value->inhRelations)) {
+            AddError("table inheritance not supported");
+            success = false;
+        }
+
+        if (value->partspec) {
+            AddError("PARTITION BY clause not supported");
+            success = false;
+        }
+
+        if (value->partbound) {
+            AddError("FOR VALUES clause not supported");
+            success = false;
+        }
+
+        // if we ever support typed tables, check transformOfType() in parse_utilcmd.c
+        if (value->ofTypename) {
+            AddError("typed tables not supported");
+            success = false;
+        }
+
+        if (0 < ListLength(value->options)) {
+            AddError("table options not supported");
+            success = false;
+        }
+
+        if (value->oncommit != ONCOMMIT_NOOP && value->oncommit != ONCOMMIT_PRESERVE_ROWS) {
+            AddError("ON COMMIT actions not supported");
+            success = false;
+        }
+
+        if (value->tablespacename) {
+            AddError("TABLESPACE not supported");
+            success = false;
+        }
+
+        if (value->accessMethod) {
+            AddError("USING not supported");
+            success = false;
+        }
+
+        if (value->if_not_exists) {
+            AddError("IF NOT EXISTS not supported");
+            success = false;
+        }
+
+        { auto relPersistence = static_cast<NPg::ERelPersistence>(value->relation->relpersistence);
+        if (relPersistence != NPg::ERelPersistence::Permanent) {
+            switch (relPersistence) {
+                case NPg::ERelPersistence::Temp:
+                    AddError("CREATE TEMP TABLE not supported");
+                    break;
+
+                case NPg::ERelPersistence::Unlogged:
+                    AddError("UNLOGGED tables not supported");
+                    break;
+
+                default:
+                    Y_UNREACHABLE();
+            }
+            success = false;
+        }}
+
+        auto [sink, key] = ParseWriteRangeVar(value->relation, true);
+
+        if (!sink || !key)
+            success = false;
+
+        TCreateTableCtx ctx;
+
+        for (ui32 i = 0; i < ListLength(value->tableElts); ++i) {
+            auto rawNode = ListNodeNth(value->tableElts, i);
+
+            switch (NodeTag(rawNode)) {
+                case T_ColumnDef:
+                    success &= AddColumn(ctx, CAST_NODE(ColumnDef, rawNode));
+                    break;
+
+                case T_Constraint:
+                    success &= AddConstraint(ctx, CAST_NODE(Constraint, rawNode));
+                    break;
+
+                default:
+                    NodeNotImplemented(value, rawNode);
+                    success = false;
+            }
+        }
+
+        if (!success)
+            return nullptr;
+
+        Statements.push_back(
+                L(A("let"), A("world"),
+                  L(A("Write!"), A("world"), sink, key, L(A("Void")),
+                    BuildCreateTableOptions(ctx))));
+
+        return Statements.back();
+    }
+#pragma endregion CreateTable
 
     [[nodiscard]]
     TAstNode* ParseDropStmt(const DropStmt* value) {
@@ -1102,6 +1398,88 @@ public:
         return Statements.back();
     }
 
+    [[nodiscard]]
+    TAstNode* ParseDeleteStmt(const DeleteStmt* value) {
+        if (value->usingClause) {
+            AddError("using is not supported");
+            return nullptr;
+        }
+        if (value->returningList) {
+            AddError("returning is not supported");
+            return nullptr;
+        }
+        if (value->withClause) {
+            AddError("with is not supported");
+            return nullptr;
+        }
+
+        if (!value->relation) {
+            AddError("DeleteStmt: expected relation");
+            return nullptr;
+        }
+
+        TVector<TAstNode*> fromList;
+        auto p = ParseRangeVar(value->relation);
+        if (!p.Source) {
+            return nullptr;
+        }
+        AddFrom(p, fromList);
+
+        TAstNode* whereFilter = nullptr;
+        if (value->whereClause) {
+            TExprSettings settings;
+            settings.AllowColumns = true;
+            settings.AllowSubLinks = true;
+            settings.Scope = "WHERE";
+            whereFilter = ParseExpr(value->whereClause, settings);
+            if (!whereFilter) {
+                return nullptr;
+            }
+        }
+
+        TAstNode* starLambda = L(A("lambda"), QL(), L(A("PgStar")));
+        TAstNode* resultItem = L(A("PgResultItem"), QAX(""), L(A("Void")), starLambda);
+
+        TVector<TAstNode*> setItemOptions;
+
+        setItemOptions.push_back(QL(QA("result"), QVL(resultItem)));
+        setItemOptions.push_back(QL(QA("from"), QVL(fromList.data(), fromList.size())));
+        setItemOptions.push_back(QL(QA("join_ops"), QVL(QL())));
+
+        NYql::TAstNode* lambda = nullptr;
+        if (whereFilter) {
+            lambda = L(A("lambda"), QL(), whereFilter);
+            setItemOptions.push_back(QL(QA("where"), L(A("PgWhere"), L(A("Void")), lambda)));
+        }
+
+        auto setItemNode = L(A("PgSetItem"), QVL(setItemOptions.data(), setItemOptions.size()));
+
+        TVector<TAstNode*> selectOptions;
+        selectOptions.push_back(QL(QA("set_items"), QVL(setItemNode)));
+        selectOptions.push_back(QL(QA("set_ops"), QVL(QA("push"))));
+
+        auto select = L(A("PgSelect"), QVL(selectOptions.data(), selectOptions.size()));
+
+        auto [sink, key] = ParseWriteRangeVar(value->relation);
+
+        Statements.push_back(L(
+            A("let"),
+            A("world"),
+            L(
+                A("Write!"),
+                A("world"),
+                sink,
+                key,
+                L(A("Void")),
+                QL(
+                    QL(QA("pg_delete"), select),
+                    QL(QA("mode"), QA("delete"))
+                )
+            )
+        ));
+        return Statements.back();
+    }
+
     TFromDesc ParseFromClause(const Node* node) {
         switch (NodeTag(node)) {
         case T_RangeVar:
@@ -1150,15 +1528,10 @@ public:
         return true;
     }
 
-    TInsertDesc ParseWriteRangeVar(const RangeVar* value) {
+    TWriteRangeDesc ParseWriteRangeVar(const RangeVar* value, bool isScheme = false) {
         AT_LOCATION(value);
         if (StrLength(value->catalogname) > 0) {
             AddError("catalogname is not supported");
-            return {};
-        }
-
-        if (StrLength(value->schemaname) == 0) {
-            AddError("schemaname should be specified");
             return {};
         }
 
@@ -1180,7 +1553,7 @@ public:
         }
 
         auto sink = L(A("DataSink"), QAX(*p), QAX(schemaname));
-        auto key = L(A("Key"), QL(QA("table"), L(A("String"), QAX(value->relname))));
+        auto key = L(A("Key"), QL(QA(isScheme ? "tablescheme" : "table"), L(A("String"), QAX(TablePathPrefix + value->relname))));
         return { sink, key };
     }
 
@@ -1267,7 +1640,7 @@ public:
 
         for (auto& [key, value] : bindingInfo.Attributes) {
             TVector<TAstNode*> hintValues;
-            hintValues.push_back(QA(key));
+            hintValues.push_back(QA(NormalizeName(key)));
             for (auto& v : value) {
                 hintValues.push_back(QA(v));
             }
@@ -2644,6 +3017,10 @@ public:
         return Q(VL(nodes, size, pos), pos);
     }
 
+    TAstNode* QVL(TAstNode* node, TPosition pos = {}) {
+        return QVL(&node, 1, pos);
+    }
+
     TAstNode* A(const TString& str, TPosition pos = {}, ui32 flags = 0) {
         return TAstNode::NewAtom(pos.Row ? pos : Positions.back(), str, *AstParseResult.Pool, flags);
     }
@@ -2782,6 +3159,13 @@ private:
     TVector<NYql::TPosition> Positions;
     TVector<ui32> RowStarts;
     ui32 QuerySize;
+    TString Provider;
+    static const THashMap<TStringBuf, TString> ProviderToInsertModeMap;
+};
+
+const THashMap<TStringBuf, TString> TConverter::ProviderToInsertModeMap = {
+    {NYql::KikimrProviderName, "insert_abort"},
+    {NYql::YtProviderName, "append"}
 };
 
 NYql::TAstParseResult PGToYql(const TString& query, const NSQLTranslation::TTranslationSettings& settings) {

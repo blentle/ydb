@@ -7,6 +7,7 @@
 #include <ydb/library/yql/minikql/mkql_type_ops.h>
 #include <ydb/library/yql/parser/pg_catalog/catalog.h>
 #include <ydb/library/yql/parser/pg_wrapper/interface/codec.h>
+#include <ydb/library/yql/parser/pg_wrapper/interface/type_desc.h>
 #include <ydb/library/yql/public/decimal/yql_decimal.h>
 #include <ydb/library/yql/minikql/dom/json.h>
 #include <ydb/library/yql/utils/utf8.h>
@@ -278,12 +279,17 @@ void ExportTypeToProtoImpl(TType* type, Ydb::Type& res, const TVector<ui32>* col
         }
 
         case TType::EKind::Pg: {
-            auto pgType = static_cast<TPgType*>(type);
-            auto t = res.mutable_pg_type();
-            t->set_oid(pgType->GetTypeId());
-            t->set_typmod(-1);
+            auto* pgType = static_cast<TPgType*>(type);
+            auto typeId = pgType->GetTypeId();
+            auto* typeDesc = NKikimr::NPg::TypeDescFromPgTypeId(typeId);
+            MKQL_ENSURE(typeDesc, TStringBuilder() << "Unknown PG type id: " << typeId);
+
+            auto* pg = res.mutable_pg_type();
+            pg->set_type_name(NKikimr::NPg::PgTypeNameFromTypeDesc(typeDesc));
+            pg->set_oid(typeId);
+            pg->set_typmod(-1);
             const i32 typlen = NYql::NPg::LookupType(pgType->GetTypeId()).TypeLen;
-            t->set_typlen(typlen);
+            pg->set_typlen(typlen);
             break;
         }
 
@@ -1323,8 +1329,12 @@ TType* TProtoImporter::ImportTypeFromProto(const Ydb::Type& input) {
             return env.GetTypeOfEmptyList();
         case Ydb::Type::kEmptyDictType:
             return env.GetTypeOfEmptyDict();
-        case Ydb::Type::kPgType:
-            return TPgType::Create(input.pg_type().oid(), env);
+        case Ydb::Type::kPgType: {
+            const auto& typeName = input.pg_type().type_name();
+            auto* typeDesc = NKikimr::NPg::TypeDescFromPgTypeName(typeName);
+            MKQL_ENSURE(typeDesc, TStringBuilder() << "Unknown PG type name: " << typeName);
+            return TPgType::Create(NKikimr::NPg::PgTypeIdFromTypeDesc(typeDesc), env);
+        }
         case Ydb::Type::kTypeId: {
             MKQL_ENSURE(NUdf::FindDataSlot(input.type_id()), TStringBuilder() << "unknown type id: " << ui32(input.type_id()));
             return TDataType::Create(input.type_id(), env);
@@ -1375,7 +1385,8 @@ TType* TProtoImporter::ImportTypeFromProto(const Ydb::Type& input) {
 
 Y_FORCE_INLINE void CheckTypeId(i32 id, i32 expected, std::string_view typeName) {
     if (id != expected) {
-        throw yexception() << "Invalid value representation for type: " << typeName;
+        throw yexception() << "Invalid value representation for type: " << typeName
+            << ", expected value case: " << expected << ", but current: " << id;
     }
 }
 
@@ -1543,14 +1554,45 @@ NUdf::TUnboxedValue TProtoImporter::ImportValueFromProto(const TType* type, cons
         return KindDataImport(type, value);
 
     case TType::EKind::Optional: {
-        const TOptionalType* optionalType = static_cast<const TOptionalType*>(type);
-        switch (value.value_case()) {
-            case Ydb::Value::kNestedValue:
-                return ImportValueFromProto(optionalType->GetItemType(), value.nested_value(), factory).MakeOptional();
-            case Ydb::Value::kNullFlagValue:
-                return NUdf::TUnboxedValue();
-            default:
-                return ImportValueFromProto(optionalType->GetItemType(), value, factory).MakeOptional();
+        const TType* innerType = type;
+        const Ydb::Value* innerValue = &value;
+        ui32 level = 0;
+        ui32 nestLevel = 0;
+        while(innerType->GetKind() == TType::EKind::Optional) {
+            const TOptionalType* optionalType = static_cast<const TOptionalType*>(innerType);
+            innerType = optionalType->GetItemType();
+            ++level;
+            if (innerValue->value_case() == Ydb::Value::kNestedValue) {
+                innerValue = &(innerValue->nested_value());
+                ++nestLevel;
+            }
+        }
+
+        const Ydb::Value* tmpValue = innerValue;
+        while(tmpValue->value_case() == Ydb::Value::kNestedValue) {
+            tmpValue = &(tmpValue->nested_value());
+        }
+
+        if (innerType->GetKind() == TType::EKind::Variant) {
+            if (tmpValue->value_case() == Ydb::Value::kNullFlagValue) {
+                auto res = ImportValueFromProto(innerType, *innerValue, factory);
+                while (level-->0) { res = res.MakeOptional(); }
+                return res;
+            }
+            auto res = ImportValueFromProto(innerType, value, factory);
+            while (level-->0) { res = res.MakeOptional(); }
+            return res;
+        } else {
+            MKQL_ENSURE(innerValue->value_case() != Ydb::Value::kNestedValue, "unexpected nested value");
+            if (innerValue->value_case() != Ydb::Value::kNullFlagValue) {
+                auto res = ImportValueFromProto(innerType, *innerValue, factory);
+                while (level-->0) { res = res.MakeOptional(); }
+                return res;
+            } else {
+                auto res = NUdf::TUnboxedValue();
+                while (nestLevel-->0) { res = res.MakeOptional(); }
+                return res;
+            }
         }
     }
 
@@ -1564,7 +1606,7 @@ NUdf::TUnboxedValue TProtoImporter::ImportValueFromProto(const TType* type, cons
             *items++ = ImportValueFromProto(itemType, x, factory);
         }
 
-        return std::move(array);
+        return array;
     }
 
     case TType::EKind::Struct: {
@@ -1572,25 +1614,31 @@ NUdf::TUnboxedValue TProtoImporter::ImportValueFromProto(const TType* type, cons
         NUdf::TUnboxedValue* itemsPtr = nullptr;
         auto res = factory.CreateDirectArrayHolder(structType->GetMembersCount(), itemsPtr);
         TRemapArray remap = TRemapArray::FromCookie(structType->GetCookie());
+        MKQL_ENSURE((ui32)value.items_size() == structType->GetMembersCount(),
+            "Member size mismatch. members in value: " << value.items_size()
+            << ", members in type: " << structType->GetMembersCount());
         for (ui32 index = 0; index < structType->GetMembersCount(); ++index) {
             ui32 remapped = remap.empty() ? index : remap[index];
             auto memberType = structType->GetMemberType(index);
             itemsPtr[index] = ImportValueFromProto(memberType, value.items(remapped), factory);
         }
 
-        return std::move(res);
+        return res;
     }
 
     case TType::EKind::Tuple: {
         const TTupleType* tupleType = static_cast<const TTupleType*>(type);
         NUdf::TUnboxedValue* itemsPtr = nullptr;
         auto res = factory.CreateDirectArrayHolder(tupleType->GetElementsCount(), itemsPtr);
+        MKQL_ENSURE_S((ui32)value.items_size() == tupleType->GetElementsCount(),
+            "Elements size mismatch. Elements in value: " << value.items_size()
+            << ", elements in type: " << tupleType->GetElementsCount());
         for (ui32 index = 0; index < tupleType->GetElementsCount(); ++index) {
             auto elementType = tupleType->GetElementType(index);
             itemsPtr[index] = ImportValueFromProto(elementType, value.items(index), factory);
         }
 
-        return std::move(res);
+        return res;
     }
 
     case TType::EKind::Dict: {
@@ -1606,26 +1654,41 @@ NUdf::TUnboxedValue TProtoImporter::ImportValueFromProto(const TType* type, cons
             );
         }
 
-        return std::move(dictBuilder->Build());
+        return dictBuilder->Build();
     }
 
     case TType::EKind::Variant: {
         const TVariantType* variantType = static_cast<const TVariantType*>(type);
         auto index = value.variant_index();
-        auto unboxedValue = ImportValueFromProto(variantType->GetAlternativeType(index), value, factory);
-        auto res = factory.CreateVariantHolder(std::move(unboxedValue.Release()), index);
-        return std::move(res);
+        MKQL_ENSURE_S(index < variantType->GetAlternativesCount(), "type has " << variantType->GetAlternativesCount()
+            << " alternatives, but requested " << index);
+        auto alternative = variantType->GetAlternativeType(index);
+        if (value.value_case() == Ydb::Value::kNestedValue) {
+            auto unboxedValue = ImportValueFromProto(alternative, value.nested_value(), factory);
+            return factory.CreateVariantHolder(std::move(unboxedValue.Release()), index);
+        }
+        auto unboxedValue = ImportValueFromProto(alternative, value, factory);
+        return factory.CreateVariantHolder(std::move(unboxedValue.Release()), index);
     }
 
     case TType::EKind::Tagged: {
         const TTaggedType* taggedType = static_cast<const TTaggedType*>(type);
         auto unboxedValue = ImportValueFromProto(taggedType->GetBaseType(), value, factory);
-        return std::move(unboxedValue);
+        return unboxedValue;
     }
 
-    case TType::EKind::Pg:
-        // TODO: support pg types
-        MKQL_ENSURE(false, "pg types are not supported");
+    case TType::EKind::Pg: {
+        const TPgType* pgType = static_cast<const TPgType*>(type);
+        NYql::NUdf::TUnboxedValue unboxedValue;
+        if (value.Hastext_value()) {
+            unboxedValue = NYql::NCommon::PgValueFromNativeText(value.Gettext_value(), pgType->GetTypeId());
+        } else if (value.Hasbytes_value()) {
+            unboxedValue = NYql::NCommon::PgValueFromNativeBinary(value.Getbytes_value(), pgType->GetTypeId());
+        } else {
+            MKQL_ENSURE(false, "empty pg value proto");
+        }
+        return unboxedValue;
+    }
 
     default:
         MKQL_ENSURE(false, TStringBuilder() << "Unknown kind: " << type->GetKindAsStr());
@@ -1738,6 +1801,15 @@ std::pair<TType*, NUdf::TUnboxedValue> ImportValueFromProto(const Ydb::Type& typ
     TType* nodeType = importer.ImportTypeFromProto(type);
     auto unboxedValue = importer.ImportValueFromProto(nodeType, value, factory);
     return {nodeType, unboxedValue};
+}
+
+NUdf::TUnboxedValue ImportValueFromProto(TType* type,
+    const Ydb::Value& value, const TTypeEnvironment& env, const THolderFactory& factory)
+{
+    TProtoImporter importer(env);
+    auto unboxedValue = importer.ImportValueFromProto(type, value, factory);
+    return unboxedValue;
+
 }
 
 TType* ImportTypeFromProto(const NKikimrMiniKQL::TType& type, const TTypeEnvironment& env) {
