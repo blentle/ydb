@@ -46,8 +46,7 @@ ChannelTrace::TraceEvent::TraceEvent(Severity severity, const grpc_slice& data,
                                      RefCountedPtr<BaseNode> referenced_entity)
     : severity_(severity),
       data_(data),
-      timestamp_(
-          grpc_millis_to_timespec(ExecCtx::Get()->Now(), GPR_CLOCK_REALTIME)),
+      timestamp_(ExecCtx::Get()->Now().as_timespec(GPR_CLOCK_REALTIME)),
       next_(nullptr),
       referenced_entity_(std::move(referenced_entity)),
       memory_usage_(sizeof(TraceEvent) + grpc_slice_memory_usage(data)) {}
@@ -55,8 +54,7 @@ ChannelTrace::TraceEvent::TraceEvent(Severity severity, const grpc_slice& data,
 ChannelTrace::TraceEvent::TraceEvent(Severity severity, const grpc_slice& data)
     : severity_(severity),
       data_(data),
-      timestamp_(
-          grpc_millis_to_timespec(ExecCtx::Get()->Now(), GPR_CLOCK_REALTIME)),
+      timestamp_(ExecCtx::Get()->Now().as_timespec(GPR_CLOCK_REALTIME)),
       next_(nullptr),
       memory_usage_(sizeof(TraceEvent) + grpc_slice_memory_usage(data)) {}
 
@@ -72,8 +70,7 @@ ChannelTrace::ChannelTrace(size_t max_event_memory)
     return;  // tracing is disabled if max_event_memory_ == 0
   }
   gpr_mu_init(&tracer_mu_);
-  time_created_ =
-      grpc_millis_to_timespec(ExecCtx::Get()->Now(), GPR_CLOCK_REALTIME);
+  time_created_ = ExecCtx::Get()->Now().as_timespec(GPR_CLOCK_REALTIME);
 }
 
 ChannelTrace::~ChannelTrace() {
@@ -161,7 +158,7 @@ Json ChannelTrace::TraceEvent::RenderTraceEvent() const {
          referenced_entity_->type() == BaseNode::EntityType::kInternalChannel);
     object[is_channel ? "channelRef" : "subchannelRef"] = Json::Object{
         {(is_channel ? "channelId" : "subchannelId"),
-         ToString(referenced_entity_->uuid())},
+         ::ToString(referenced_entity_->uuid())},
     };
   }
   return object;
@@ -176,7 +173,7 @@ Json ChannelTrace::RenderJson() const {
       {"creationTimestamp", gpr_format_timespec(time_created_)},
   };
   if (num_events_logged_ > 0) {
-    object["numEventsLogged"] = ToString(num_events_logged_);
+    object["numEventsLogged"] = ::ToString(num_events_logged_);
   }
   // Only add in the event list if it is non-empty.
   if (head_trace_ != nullptr) {

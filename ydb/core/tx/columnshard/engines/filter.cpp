@@ -1,38 +1,46 @@
-#include "defs.h"
 #include "filter.h"
+#include "defs.h"
 #include "indexed_read_data.h"
+
 #include <ydb/core/formats/arrow_helpers.h>
+#include <ydb/core/formats/custom_registry.h>
 
 namespace NKikimr::NOlap {
 
-std::vector<bool> MakeSnapshotFilter(std::shared_ptr<arrow::Table> table,
-                                     std::shared_ptr<arrow::Schema> snapSchema,
+void TFilteredBatch::ApplyFilter() {
+    if (Filter.empty()) {
+        return;
+    }
+    auto res = arrow::compute::Filter(Batch, NArrow::MakeFilter(Filter));
+    Y_VERIFY_S(res.ok(), res.status().message());
+    Y_VERIFY((*res).kind() == arrow::Datum::RECORD_BATCH);
+    Batch = (*res).record_batch();
+    Filter.clear();
+}
+
+std::vector<bool> MakeSnapshotFilter(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                     const std::shared_ptr<arrow::Schema>& snapSchema,
                                      ui64 planStep, ui64 txId) {
-    Y_VERIFY(table);
+    Y_VERIFY(batch);
     Y_VERIFY(snapSchema);
     Y_VERIFY(snapSchema->num_fields() == 2);
 
-    std::vector<std::shared_ptr<arrow::ChunkedArray>> snapColumns;
-    snapColumns.reserve(snapSchema->num_fields());
-    for (auto& field : snapSchema->fields()) {
-        snapColumns.push_back(table->GetColumnByName(field->name()));
-        Y_VERIFY(snapColumns.back());
-    }
-
     bool alwaysTrue = true;
     std::vector<bool> bits;
-    bits.reserve(snapColumns[0]->length());
+    bits.reserve(batch->num_rows());
 
-    for (int ch = 0; ch < snapColumns[0]->num_chunks(); ++ch) {
-        auto steps = snapColumns[0]->chunk(ch);
-        auto ids = snapColumns[1]->chunk(ch);
+    {
+        auto steps = batch->GetColumnByName(snapSchema->fields()[0]->name());
+        auto ids = batch->GetColumnByName(snapSchema->fields()[1]->name());
+        Y_VERIFY(steps);
+        Y_VERIFY(ids);
         Y_VERIFY(steps->length() == ids->length());
 
         const auto* rawSteps = std::static_pointer_cast<arrow::UInt64Array>(steps)->raw_values();
         const auto* rawIds = std::static_pointer_cast<arrow::UInt64Array>(ids)->raw_values();
 
         for (int i = 0; i < steps->length(); ++i) {
-            bool value = snapLessOrEqual(rawSteps[i], rawIds[i], planStep, txId);
+            bool value = SnapLessOrEqual(rawSteps[i], rawIds[i], planStep, txId);
             alwaysTrue = alwaysTrue && value;
             bits.push_back(value);
         }
@@ -45,7 +53,7 @@ std::vector<bool> MakeSnapshotFilter(std::shared_ptr<arrow::Table> table,
     return bits;
 }
 
-std::vector<bool> MakeReplaceFilter(std::shared_ptr<arrow::RecordBatch> batch,
+std::vector<bool> MakeReplaceFilter(const std::shared_ptr<arrow::RecordBatch>& batch,
                                     THashSet<NArrow::TReplaceKey>& keys) {
     bool alwaysTrue = true;
     std::vector<bool> bits;
@@ -71,7 +79,7 @@ std::vector<bool> MakeReplaceFilter(std::shared_ptr<arrow::RecordBatch> batch,
     return bits;
 }
 
-std::vector<bool> MakeReplaceFilterLastWins(std::shared_ptr<arrow::RecordBatch> batch,
+std::vector<bool> MakeReplaceFilterLastWins(const std::shared_ptr<arrow::RecordBatch>& batch,
                                             THashSet<NArrow::TReplaceKey>& keys) {
     if (!batch->num_rows()) {
         return {};
@@ -101,8 +109,7 @@ std::vector<bool> MakeReplaceFilterLastWins(std::shared_ptr<arrow::RecordBatch> 
     return bits;
 }
 
-std::shared_ptr<arrow::RecordBatch> FilterPortion(std::shared_ptr<arrow::Table> portion,
-                                                  const TReadMetadata& readMetadata) {
+TFilteredBatch FilterPortion(const std::shared_ptr<arrow::RecordBatch>& portion, const TReadMetadata& readMetadata) {
     Y_VERIFY(portion);
     std::vector<bool> snapFilter;
     if (readMetadata.PlanStep) {
@@ -124,31 +131,47 @@ std::shared_ptr<arrow::RecordBatch> FilterPortion(std::shared_ptr<arrow::Table> 
         greater = NArrow::MakePredicateFilter(portion, readMetadata.GreaterPredicate->Batch, cmpType);
     }
 
-    std::vector<bool> bits = NArrow::CombineFilters(std::move(snapFilter),
-                                                    NArrow::CombineFilters(std::move(less), std::move(greater)));
-    if (bits.size()) {
-        auto res = arrow::compute::Filter(portion, NArrow::MakeFilter(bits));
-        Y_VERIFY_S(res.ok(), res.status().message());
-        Y_VERIFY((*res).kind() == arrow::Datum::TABLE);
-        portion = (*res).table();
+    size_t numRows = 0;
+    std::vector<bool> filter = NArrow::CombineFilters(
+        std::move(snapFilter), NArrow::CombineFilters(std::move(less), std::move(greater)), numRows);
+    if (filter.size() && !numRows) {
+        return {};
+    }
+    return TFilteredBatch{portion, std::move(filter)};
+}
+
+TFilteredBatch FilterNotIndexed(const std::shared_ptr<arrow::RecordBatch>& batch, const TReadMetadata& readMetadata) {
+    std::vector<bool> less;
+    if (readMetadata.LessPredicate) {
+        Y_VERIFY(NArrow::HasAllColumns(batch, readMetadata.LessPredicate->Batch->schema()));
+
+        auto cmpType = readMetadata.LessPredicate->Inclusive ?
+            NArrow::ECompareType::LESS_OR_EQUAL : NArrow::ECompareType::LESS;
+        less = NArrow::MakePredicateFilter(batch, readMetadata.LessPredicate->Batch, cmpType);
     }
 
-    Y_VERIFY(portion);
-    if (!portion->num_rows()) {
-        // TableBatchReader return nullptr in case of empty table. We need a valid batch with 0 rows.
-        return NArrow::MakeEmptyBatch(portion->schema());
+    std::vector<bool> greater;
+    if (readMetadata.GreaterPredicate) {
+        Y_VERIFY(NArrow::HasAllColumns(batch, readMetadata.GreaterPredicate->Batch->schema()));
+
+        auto cmpType = readMetadata.GreaterPredicate->Inclusive ?
+            NArrow::ECompareType::GREATER_OR_EQUAL : NArrow::ECompareType::GREATER;
+        greater = NArrow::MakePredicateFilter(batch, readMetadata.GreaterPredicate->Batch, cmpType);
     }
 
-    auto res = portion->CombineChunks();
-    Y_VERIFY(res.ok());
+    size_t numRows = 0;
+    std::vector<bool> filter = NArrow::CombineFilters(std::move(less), std::move(greater), numRows);
+    if (filter.size() && !numRows) {
+        return {};
+    }
+    return TFilteredBatch{batch, filter};
+}
 
-    arrow::TableBatchReader reader(*portion);
-    auto result = reader.Next();
-    Y_VERIFY(result.ok());
-    auto batch = *result;
-    result = reader.Next();
-    Y_VERIFY(result.ok() && !(*result));
-    return batch;
+TFilteredBatch EarlyFilter(const std::shared_ptr<arrow::RecordBatch>& batch, std::shared_ptr<NSsa::TProgram> ssa) {
+    return TFilteredBatch{
+        .Batch = batch,
+        .Filter = ssa->MakeEarlyFilter(batch, NArrow::GetCustomExecContext())
+    };
 }
 
 void ReplaceDupKeys(std::shared_ptr<arrow::RecordBatch>& batch,

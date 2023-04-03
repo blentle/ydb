@@ -379,9 +379,10 @@ static NKikimrConfig::TBootstrap GenerateBootstrapConfig(TTestActorRuntime &runt
     TVector<ui32> nodes;
     nodes.reserve(nodesCount);
     for (ui32 nodeIndex = 0; nodeIndex < nodesCount; ++nodeIndex) {
-        ui32 nodeId = runtime.GetNodeId(nodeIndex);
-        if (tenants.contains(nodeId))
+        if (tenants.contains(nodeIndex))
             continue;
+
+        ui32 nodeId = runtime.GetNodeId(nodeIndex);
         nodes.push_back(nodeId);
     }
 
@@ -549,7 +550,7 @@ TCmsTestEnv::TCmsTestEnv(const TTestEnvOpts &options)
             ) {
             auto fakeId = NNodeWhiteboard::MakeNodeWhiteboardServiceId(event->Recipient.NodeId());
             if (event->Recipient != fakeId)
-                IEventHandle::Forward(event, fakeId);
+                event = IEventHandle::Forward(event, fakeId);
         }
         return TTestActorRuntime::EEventAction::PROCESS;
     };
@@ -597,7 +598,7 @@ TCmsTestEnv::TCmsTestEnv(ui32 nodeCount,
 TIntrusiveConstPtr<NKikimr::TStateStorageInfo> TCmsTestEnv::GetStateStorageInfo() {
     ui32 StateStorageGroup = 0;
     const TActorId proxy = MakeStateStorageProxyID(StateStorageGroup);
-    Send(new IEventHandleFat(proxy, Sender, new TEvStateStorage::TEvListStateStorage()));
+    Send(new IEventHandle(proxy, Sender, new TEvStateStorage::TEvListStateStorage()));
 
     auto reply = GrabEdgeEventRethrow<TEvStateStorage::TEvListStateStorageResult>(Sender);
     const auto &rec = reply->Get()->Info;

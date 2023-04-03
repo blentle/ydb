@@ -7,6 +7,9 @@
 #include <ydb/library/yql/core/yql_opt_utils.h>
 #include <ydb/library/yql/parser/pg_wrapper/interface/type_desc.h>
 #include <ydb/library/yql/providers/common/provider/yql_provider.h>
+#include <ydb/library/yql/providers/dq/provider/yql_dq_datasource_type_ann.h>
+
+#include <util/generic/is_in.h>
 
 namespace NYql {
 namespace {
@@ -102,7 +105,19 @@ class TKiSourceTypeAnnotationTransformer : public TKiSourceVisitorTransformer {
 public:
     TKiSourceTypeAnnotationTransformer(TIntrusivePtr<TKikimrSessionContext> sessionCtx, TTypeAnnotationContext& types)
         : SessionCtx(sessionCtx)
-        , Types(types) {}
+        , Types(types)
+        , DqsTypeAnn(IsIn({EKikimrQueryType::Query, EKikimrQueryType::Script}, SessionCtx->Query().Type) ? CreateDqsDataSourceTypeAnnotationTransformer(false) : nullptr)
+    {}
+
+    TStatus DoTransform(TExprNode::TPtr input, TExprNode::TPtr& output, TExprContext& ctx) override {
+        if (DqsTypeAnn && DqsTypeAnn->CanParse(*input)) {
+            TStatus status = DqsTypeAnn->DoTransform(input, output, ctx);
+            if (input->GetTypeAnn()) {
+                return status;
+            }
+        }
+        return TKiSourceVisitorTransformer::DoTransform(input, output, ctx);
+    }
 
 private:
     TStatus HandleKiRead(TKiReadBase node, TExprContext& ctx) override {
@@ -216,6 +231,7 @@ private:
 private:
     TIntrusivePtr<TKikimrSessionContext> SessionCtx;
     TTypeAnnotationContext& Types;
+    THolder<TVisitorTransformerBase> DqsTypeAnn;
 };
 
 namespace {
@@ -532,7 +548,7 @@ private:
         return TStatus::Ok;
     }
 
-    virtual TStatus HandleCreateTable(TKiCreateTable create, TExprContext& ctx) override {
+virtual TStatus HandleCreateTable(TKiCreateTable create, TExprContext& ctx) override {
         TString cluster = TString(create.DataSink().Cluster());
         TString table = TString(create.Table());
         TString tableType = TString(create.TableType());
@@ -559,6 +575,11 @@ private:
             meta->TableSettings.PartitionBy.emplace_back(column.Value());
         }
 
+        THashSet<TString> notNullColumns;
+        for (const auto& column : create.NotNullColumns()) {
+            notNullColumns.emplace(column.Value());
+        }
+
         for (auto item : create.Columns()) {
             auto columnTuple = item.Cast<TExprList>();
             auto nameNode = columnTuple.Item(0).Cast<TCoAtom>();
@@ -569,10 +590,31 @@ private:
             YQL_ENSURE(columnType && columnType->GetKind() == ETypeAnnotationKind::Type);
 
             auto type = columnType->Cast<TTypeExprType>()->GetType();
-            auto notNull = type->GetKind() != ETypeAnnotationKind::Optional;
-            auto actualType = notNull ? type : type->Cast<TOptionalExprType>()->GetItemType();
-            if (
-                actualType->GetKind() != ETypeAnnotationKind::Data
+
+            auto isOptional = type->GetKind() == ETypeAnnotationKind::Optional;
+            auto actualType = !isOptional ? type : type->Cast<TOptionalExprType>()->GetItemType();
+
+            bool notNull;
+            if (actualType->GetKind() == ETypeAnnotationKind::Pg) {
+                if (notNullColumns.contains(columnName)) {
+                    if (std::find(meta->KeyColumnNames.begin(), meta->KeyColumnNames.end(), columnName) == meta->KeyColumnNames.end()) {
+                        ctx.AddError(TIssue(ctx.GetPosition(create.NotNullColumns().Pos()), TStringBuilder()
+                            << "notnull option for pg column " << columnName << " is forbidden"));
+                        return TStatus::Error;
+                    } else {
+                        //TODO: KIKIMR-17471
+                        //Right now YDB ignores the constraint native Postgres enforces
+                        //on primary key values; it should be used very carefully.
+                        ctx.AddWarning(TIssue(ctx.GetPosition(create.NotNullColumns().Pos()), TStringBuilder()
+                            << "notnull option for primary key column " << columnName << " will be ignored"));
+                    }
+                }
+                //TODO: set notnull for pg types
+                notNull = false;
+            } else {
+                notNull = !isOptional;
+            }
+            if (actualType->GetKind() != ETypeAnnotationKind::Data
                 && actualType->GetKind() != ETypeAnnotationKind::Pg
             ) {
                 columnTypeError(typeNode.Pos(), columnName, "Only YQL data types and PG types are currently supported");
@@ -596,7 +638,6 @@ private:
                     NKikimr::NScheme::NTypeIds::Pg,
                     NKikimr::NPg::TypeDescFromPgTypeId(pgTypeId)
                 );
-                YQL_ENSURE(!notNull, "notNull is forbidden for pg types");
             }
             columnMeta.NotNull = notNull;
 
@@ -696,6 +737,73 @@ private:
             }
         }
 
+        switch (meta->TableType) {
+            case ETableType::Unknown:
+            case ETableType::TableStore:
+            case ETableType::Table: {
+                auto status = FillTableSettings(create, ctx, meta);
+                if (status != TStatus::Ok) {
+                    return status;
+                }
+                break;
+            }
+            case ETableType::ExternalTable: {
+                auto status = FillExternalTableSettings(create, ctx, meta);
+                if (status != TStatus::Ok) {
+                    return status;
+                }
+                break;
+            }
+        };
+
+        if (meta->TableType == ETableType::TableStore && meta->StoreType != EStoreType::Column) {
+            ctx.AddError(TIssue(ctx.GetPosition(create.Pos()),
+                    TStringBuilder() << "TABLESTORE recuires STORE = COLUMN setting now"));
+            return TStatus::Error;
+        }
+
+        auto& tableDesc = SessionCtx->Tables().GetTable(cluster, table);
+        if (meta->TableType == ETableType::Table && tableDesc.DoesExist() && !tableDesc.Metadata->IsSameTable(*meta)) {
+            ctx.AddError(TIssue(ctx.GetPosition(create.Pos()), TStringBuilder()
+                << "Table name conflict: " << NCommon::FullTableName(cluster, table)
+                << " is used to reference multiple tables."));
+            return TStatus::Error;
+        }
+
+        tableDesc.Metadata = meta;
+        bool sysColumnsEnabled = SessionCtx->Config().SystemColumnsEnabled();
+        YQL_ENSURE(tableDesc.Load(ctx, sysColumnsEnabled));
+
+        create.Ptr()->SetTypeAnn(create.World().Ref().GetTypeAnn());
+        return TStatus::Ok;
+    }
+
+    TStatus FillExternalTableSettings(TKiCreateTable create, TExprContext& ctx, TKikimrTableMetadataPtr meta) {
+        for (const auto& setting : create.TableSettings()) {
+            auto name = setting.Name().Value();
+            if (name == "data_source_path") {
+                meta->TableSettings.DataSourcePath = TString(
+                    setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Value()
+                );
+            } else if (name == "location") {
+                meta->TableSettings.Location = TString(
+                    setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Value()
+                );
+            } else {
+                meta->TableSettings.ExternalSourceParameters.emplace_back(name, TString(
+                    setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Value()
+                ));
+            }
+        }
+        if (!meta->TableSettings.DataSourcePath) {
+            ctx.AddError(TIssue(ctx.GetPosition(create.Pos()),
+                "DATA_SOURCE parameter is required for external table"));
+            return TStatus::Error;
+        }
+        return TStatus::Ok;
+    }
+
+    TStatus FillTableSettings(TKiCreateTable create, TExprContext& ctx, TKikimrTableMetadataPtr meta) {
         for (const auto& setting : create.TableSettings()) {
             auto name = setting.Name().Value();
             if (name == "compactionPolicy") {
@@ -843,28 +951,10 @@ private:
                 return TStatus::Error;
             }
         }
-
-        if (meta->TableType == ETableType::TableStore && meta->StoreType != EStoreType::Column) {
-            ctx.AddError(TIssue(ctx.GetPosition(create.Pos()),
-                    TStringBuilder() << "TABLESTORE recuires STORE = COLUMN setting now"));
-            return TStatus::Error;
-        }
-
-        auto& tableDesc = SessionCtx->Tables().GetTable(cluster, table);
-        if (meta->TableType == ETableType::Table && tableDesc.DoesExist() && !tableDesc.Metadata->IsSameTable(*meta)) {
-            ctx.AddError(TIssue(ctx.GetPosition(create.Pos()), TStringBuilder()
-                << "Table name conflict: " << NCommon::FullTableName(cluster, table)
-                << " is used to reference multiple tables."));
-            return TStatus::Error;
-        }
-
-        tableDesc.Metadata = meta;
-        bool sysColumnsEnabled = SessionCtx->Config().SystemColumnsEnabled();
-        YQL_ENSURE(tableDesc.Load(ctx, sysColumnsEnabled));
-
-        create.Ptr()->SetTypeAnn(create.World().Ref().GetTypeAnn());
         return TStatus::Ok;
     }
+
+
 
     virtual TStatus HandleDropTable(TKiDropTable node, TExprContext& ctx) override {
         auto table = SessionCtx->Tables().EnsureTableExists(TString(node.DataSink().Cluster()), TString(node.Table().Value()), node.Pos(), ctx);

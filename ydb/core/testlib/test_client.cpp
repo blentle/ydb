@@ -7,7 +7,6 @@
 #include <ydb/public/lib/base/msgbus.h>
 #include <ydb/core/grpc_services/grpc_request_proxy.h>
 #include <ydb/services/auth/grpc_service.h>
-#include <ydb/services/yq/grpc_service.h>
 #include <ydb/services/fq/grpc_service.h>
 #include <ydb/services/fq/private_grpc.h>
 #include <ydb/services/cms/grpc_service.h>
@@ -32,9 +31,8 @@
 #include <ydb/services/persqueue_v1/topic.h>
 #include <ydb/services/persqueue_v1/grpc_pq_write.h>
 #include <ydb/services/monitoring/grpc_service.h>
-#include <ydb/services/yq/grpc_service.h>
-#include <ydb/core/yq/libs/control_plane_proxy/control_plane_proxy.h>
-#include <ydb/core/yq/libs/control_plane_storage/control_plane_storage.h>
+#include <ydb/core/fq/libs/control_plane_proxy/control_plane_proxy.h>
+#include <ydb/core/fq/libs/control_plane_storage/control_plane_storage.h>
 #include <ydb/core/client/metadata/types_metadata.h>
 #include <ydb/core/client/metadata/functions_metadata.h>
 #include <ydb/core/client/minikql_compile/mkql_compile_service.h>
@@ -88,12 +86,15 @@
 #include <ydb/core/persqueue/pq.h>
 #include <ydb/core/persqueue/cluster_tracker.h>
 #include <ydb/library/security/ydb_credentials_provider_factory.h>
-#include <ydb/core/yq/libs/init/init.h>
-#include <ydb/core/yq/libs/mock/yql_mock.h>
+#include <ydb/core/fq/libs/init/init.h>
+#include <ydb/core/fq/libs/mock/yql_mock.h>
 #include <ydb/services/metadata/ds_table/service.h>
 #include <ydb/services/metadata/service.h>
 #include <ydb/services/bg_tasks/ds_table/executor.h>
 #include <ydb/services/bg_tasks/service.h>
+#include <ydb/services/ext_index/common/config.h>
+#include <ydb/services/ext_index/common/service.h>
+#include <ydb/services/ext_index/service/executor.h>
 #include <ydb/library/folder_service/mock/mock_folder_service.h>
 
 #include <ydb/core/client/server/msgbus_server_tracer.h>
@@ -318,7 +319,7 @@ namespace Tests {
             }
             desc->ServedDatabases.insert(desc->ServedDatabases.end(), rootDomains.begin(), rootDomains.end());
 
-            TVector<TString> grpcServices = {"yql", "clickhouse_internal", "datastreams", "table_service", "scripting", "experimental", "discovery", "pqcd", "pq", "pqv1" };
+            TVector<TString> grpcServices = {"yql", "clickhouse_internal", "datastreams", "table_service", "scripting", "experimental", "discovery", "pqcd", "fds", "pq", "pqv1" };
             desc->ServedServices.insert(desc->ServedServices.end(), grpcServices.begin(), grpcServices.end());
 
             system->Register(NGRpcService::CreateGrpcEndpointPublishActor(desc.Get()), TMailboxType::ReadAsFilled, appData.UserPoolId);
@@ -368,7 +369,6 @@ namespace Tests {
         GRpcServer->AddService(new NGRpcService::TGRpcMonitoringService(system, counters, grpcRequestProxies[0], true));
         GRpcServer->AddService(new NGRpcService::TGRpcYdbQueryService(system, counters, grpcRequestProxies[0], true));
         if (Settings->EnableYq) {
-            GRpcServer->AddService(new NGRpcService::TGRpcYandexQueryService(system, counters, grpcRequestProxies[0]));
             GRpcServer->AddService(new NGRpcService::TGRpcFederatedQueryService(system, counters, grpcRequestProxies[0]));
             GRpcServer->AddService(new NGRpcService::TGRpcFqPrivateTaskService(system, counters, grpcRequestProxies[0]));
         }
@@ -527,7 +527,7 @@ namespace Tests {
         pipeConfig.RetryPolicy = NTabletPipe::TClientRetryPolicy::WithRetries();
 
         //get NodesInfo, nodes hostname and port are interested
-        Runtime->Send(new IEventHandleFat(GetNameserviceActorId(), sender, new TEvInterconnect::TEvListNodes));
+        Runtime->Send(new IEventHandle(GetNameserviceActorId(), sender, new TEvInterconnect::TEvListNodes));
         TAutoPtr<IEventHandle> handleNodesInfo;
         auto nodesInfo = Runtime->GrabEdgeEventRethrow<TEvInterconnect::TEvNodesInfo>(handleNodesInfo);
 
@@ -635,7 +635,7 @@ namespace Tests {
     void TServer::DestroyDynamicLocalService(ui32 nodeIdx) {
         Y_VERIFY(nodeIdx >= StaticNodes());
         TActorId local = MakeLocalID(Runtime->GetNodeId(nodeIdx)); // MakeTenantPoolRootID?
-        Runtime->Send(new IEventHandleFat(local, TActorId(), new TEvents::TEvPoisonPill()));
+        Runtime->Send(new IEventHandle(local, TActorId(), new TEvents::TEvPoisonPill()));
     }
 
     void TServer::SetupLocalConfig(TLocalConfig &localConfig, const NKikimr::TAppData &appData) {
@@ -723,6 +723,11 @@ namespace Tests {
             auto* actor = NBackgroundTasks::CreateService(NBackgroundTasks::TConfig());
             const auto aid = Runtime->Register(actor, nodeIdx, appData.SystemPoolId, TMailboxType::Revolving, 0);
             Runtime->RegisterService(NBackgroundTasks::MakeServiceId(Runtime->GetNodeId(nodeIdx)), aid);
+        }
+        if (Settings->IsEnableExternalIndex()) {
+            auto* actor = NCSIndex::CreateService(NCSIndex::TConfig());
+            const auto aid = Runtime->Register(actor, nodeIdx, appData.SystemPoolId, TMailboxType::Revolving, 0);
+            Runtime->RegisterService(NCSIndex::MakeServiceId(Runtime->GetNodeId(nodeIdx)), aid);
         }
         Runtime->Register(CreateLabelsMaintainer({}), nodeIdx, appData.SystemPoolId, TMailboxType::Revolving, 0);
 
@@ -863,7 +868,7 @@ namespace Tests {
         }
 
         if (Settings->EnableYq) {
-            NYq::NConfig::TConfig protoConfig;
+            NFq::NConfig::TConfig protoConfig;
             protoConfig.SetEnabled(true);
 
             protoConfig.MutableQuotasManager()->SetEnabled(true);
@@ -964,8 +969,8 @@ namespace Tests {
 
             const auto ydbCredFactory = NKikimr::CreateYdbCredentialsProviderFactory;
             auto counters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
-            YqSharedResources = NYq::CreateYqSharedResources(protoConfig, ydbCredFactory, counters);
-            NYq::Init(
+            YqSharedResources = NFq::CreateYqSharedResources(protoConfig, ydbCredFactory, counters);
+            NFq::Init(
                 protoConfig,
                 Runtime->GetNodeId(nodeIdx),
                 actorRegistrator,
@@ -977,7 +982,7 @@ namespace Tests {
                 /*IcPort = */0,
                 {}
                 );
-            NYq::InitTest(Runtime.Get(), port, Settings->GrpcPort, YqSharedResources);
+            NFq::InitTest(Runtime.Get(), port, Settings->GrpcPort, YqSharedResources);
         }
     }
 
@@ -1851,10 +1856,10 @@ namespace Tests {
         auto& entry = request->ResultSet.emplace_back();
         entry.Path = SplitPath(path);
         entry.Operation = NSchemeCache::TSchemeCacheNavigate::OpPath;
-        runtime->Send(
+        runtime->Send(new IEventHandle(
             MakeSchemeCacheID(),
             sender,
-            new TEvTxProxySchemeCache::TEvNavigateKeySet(request.Release()),
+            new TEvTxProxySchemeCache::TEvNavigateKeySet(request.Release())),
             nodeIdx);
         auto ev = runtime->GrabEdgeEvent<TEvTxProxySchemeCache::TEvNavigateKeySetResult>(sender);
         Y_VERIFY(ev);
@@ -2263,7 +2268,7 @@ namespace Tests {
             }
         } catch (TEmptyEventQueueException &) {}
 
-        runtime->Send(new IEventHandleFat(pipeClient, TActorId(), new TEvents::TEvPoisonPill()));
+        runtime->Send(new IEventHandle(pipeClient, TActorId(), new TEvents::TEvPoisonPill()));
         return res;
     }
 
@@ -2308,7 +2313,7 @@ namespace Tests {
             }
         } catch (TEmptyEventQueueException &) {}
 
-        runtime->Send(new IEventHandleFat(pipeClient, edge, new TEvents::TEvPoisonPill()));
+        runtime->Send(new IEventHandle(pipeClient, edge, new TEvents::TEvPoisonPill()));
         return res;
     }
 
@@ -2429,7 +2434,7 @@ namespace Tests {
 
         TAutoPtr<IEventHandle> handle;
         runtime->GrabEdgeEvent<NKesus::TEvKesus::TEvGetConfigResult>(handle);
-        return THolder<NKesus::TEvKesus::TEvGetConfigResult>(IEventHandle::Release<NKesus::TEvKesus::TEvGetConfigResult>(handle));
+        return THolder<NKesus::TEvKesus::TEvGetConfigResult>(handle->Release<NKesus::TEvKesus::TEvGetConfigResult>());
     }
 
     bool IsServerRedirected() {

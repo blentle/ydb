@@ -247,28 +247,37 @@ bool TColumnShard::HaveOutdatedTxs() const {
     return it->MaxStep <= step;
 }
 
-TWriteId TColumnShard::HasLongTxWrite(const NLongTxService::TLongTxId& longTxId) {
+TWriteId TColumnShard::HasLongTxWrite(const NLongTxService::TLongTxId& longTxId, const ui32 partId) {
     auto it = LongTxWritesByUniqueId.find(longTxId.UniqueId);
     if (it != LongTxWritesByUniqueId.end()) {
-        return (TWriteId)it->second->WriteId;
+        auto itPart = it->second.find(partId);
+        if (itPart != it->second.end()) {
+            return (TWriteId)itPart->second->WriteId;
+        }
     }
     return (TWriteId)0;
 }
 
-TWriteId TColumnShard::GetLongTxWrite(NIceDb::TNiceDb& db, const NLongTxService::TLongTxId& longTxId) {
+TWriteId TColumnShard::GetLongTxWrite(NIceDb::TNiceDb& db, const NLongTxService::TLongTxId& longTxId, const ui32 partId) {
     auto it = LongTxWritesByUniqueId.find(longTxId.UniqueId);
     if (it != LongTxWritesByUniqueId.end()) {
-        return (TWriteId)it->second->WriteId;
+        auto itPart = it->second.find(partId);
+        if (itPart != it->second.end()) {
+            return (TWriteId)itPart->second->WriteId;
+        }
+    } else {
+        it = LongTxWritesByUniqueId.emplace(longTxId.UniqueId, TPartsForLTXShard()).first;
     }
 
     TWriteId writeId = ++LastWriteId;
     auto& lw = LongTxWrites[writeId];
     lw.WriteId = (ui64)writeId;
+    lw.WritePartId = partId;
     lw.LongTxId = longTxId;
-    LongTxWritesByUniqueId[longTxId.UniqueId] = &lw;
+    it->second[partId] = &lw;
 
     Schema::SaveSpecialValue(db, Schema::EValueIds::LastWriteId, (ui64)writeId);
-    Schema::SaveLongTxWrite(db, writeId, longTxId);
+    Schema::SaveLongTxWrite(db, writeId, partId, longTxId);
 
     return writeId;
 }
@@ -278,11 +287,12 @@ void TColumnShard::AddLongTxWrite(TWriteId writeId, ui64 txId) {
     lw.PreparedTxId = txId;
 }
 
-void TColumnShard::LoadLongTxWrite(TWriteId writeId, const NLongTxService::TLongTxId& longTxId) {
+void TColumnShard::LoadLongTxWrite(TWriteId writeId, const ui32 writePartId, const NLongTxService::TLongTxId& longTxId) {
     auto& lw = LongTxWrites[writeId];
+    lw.WritePartId = writePartId;
     lw.WriteId = (ui64)writeId;
     lw.LongTxId = longTxId;
-    LongTxWritesByUniqueId[longTxId.UniqueId] = &lw;
+    LongTxWritesByUniqueId[longTxId.UniqueId][writePartId] = &lw;
 }
 
 bool TColumnShard::RemoveLongTxWrite(NIceDb::TNiceDb& db, TWriteId writeId, ui64 txId) {
@@ -290,7 +300,11 @@ bool TColumnShard::RemoveLongTxWrite(NIceDb::TNiceDb& db, TWriteId writeId, ui64
         ui64 prepared = lw->PreparedTxId;
         if (!prepared || txId == prepared) {
             Schema::EraseLongTxWrite(db, writeId);
-            LongTxWritesByUniqueId.erase(lw->LongTxId.UniqueId);
+            auto& ltxParts = LongTxWritesByUniqueId[lw->LongTxId.UniqueId];
+            ltxParts.erase(lw->WritePartId);
+            if (ltxParts.empty()) {
+                LongTxWritesByUniqueId.erase(lw->LongTxId.UniqueId);
+            }
             LongTxWrites.erase(writeId);
             return true;
         }
@@ -672,15 +686,18 @@ void TColumnShard::SetPrimaryIndex(TMap<NOlap::TSnapshot, NOlap::TIndexInfo>&& s
     }
 }
 
-void TColumnShard::EnqueueBackgroundActivities(bool periodic, bool insertOnly) {
-    if (periodic && LastBackActivation > TInstant::Now() - ActivationPeriod) {
-        return;
+void TColumnShard::EnqueueBackgroundActivities(bool periodic, TBackgroundActivity activity) {
+    if (periodic) {
+        if (LastPeriodicBackActivation > TInstant::Now() - ActivationPeriod) {
+            return;
+        }
+        LastPeriodicBackActivation = TInstant::Now();
     }
 
     const TActorContext& ctx = TActivationContext::ActorContextFor(SelfId());
     SendPeriodicStats();
 
-    if (insertOnly) {
+    if (activity.IndexationOnly()) {
         if (auto event = SetupIndexation()) {
             ctx.Send(IndexingActor, event.release());
         }
@@ -690,44 +707,56 @@ void TColumnShard::EnqueueBackgroundActivities(bool periodic, bool insertOnly) {
     // Preventing conflicts between indexing and compaction leads to election between them.
     // Indexing vs compaction probability depends on index and insert table overload status.
     // Prefer compaction: 25% by default; 50% if IndexOverloaded(); 6.25% if InsertTableOverloaded().
-    ui32 mask = IndexOverloaded() ? 0x1 : 0x3;
-    if (InsertTableOverloaded()) {
-        mask = 0x0F;
-    }
-    bool preferIndexing = (++BackgroundActivation) & mask;
+    if (activity.HasIndexation() && activity.HasCompaction()) {
+        ui32 mask = IndexOverloaded() ? 0x1 : 0x3;
+        if (InsertTableOverloaded()) {
+            mask = 0x0F;
+        }
+        bool preferIndexing = (++BackgroundActivation) & mask;
 
-    if (preferIndexing) {
+        if (preferIndexing) {
+            if (auto evIdx = SetupIndexation()) {
+                ctx.Send(IndexingActor, evIdx.release());
+            } else if (auto event = SetupCompaction()) {
+                ctx.Send(CompactionActor, event.release());
+            }
+        } else {
+            if (auto event = SetupCompaction()) {
+                ctx.Send(CompactionActor, event.release());
+            } else if (auto evIdx = SetupIndexation()) {
+                ctx.Send(IndexingActor, evIdx.release());
+            }
+        }
+    } else if (activity.HasIndexation()) {
         if (auto evIdx = SetupIndexation()) {
             ctx.Send(IndexingActor, evIdx.release());
-        } else if (auto event = SetupCompaction()) {
-            ctx.Send(CompactionActor, event.release());
         }
-    } else {
+    } else if (activity.HasCompaction()) {
         if (auto event = SetupCompaction()) {
             ctx.Send(CompactionActor, event.release());
-        } else if (auto evIdx = SetupIndexation()) {
-            ctx.Send(IndexingActor, evIdx.release());
         }
     }
 
-    if (auto event = SetupCleanup()) {
-        ctx.Send(SelfId(), event.release());
-    } else {
-        // Small cleanup (no index changes)
-        THashSet<NOlap::TEvictedBlob> blobsToForget;
-        BlobManager->GetCleanupBlobs(blobsToForget);
-        ForgetBlobs(ctx, blobsToForget);
-    }
-
-    if (auto event = SetupTtl()) {
-        if (event->NeedDataReadWrite()) {
-            ctx.Send(EvictionActor, event.release());
+    if (activity.HasCleanup()) {
+        if (auto event = SetupCleanup()) {
+            ctx.Send(SelfId(), event.release());
         } else {
-            ctx.Send(SelfId(), event->TxEvent.release());
+            // Small cleanup (no index changes)
+            THashSet<NOlap::TEvictedBlob> blobsToForget;
+            BlobManager->GetCleanupBlobs(blobsToForget);
+            ForgetBlobs(ctx, blobsToForget);
         }
     }
 
-    LastBackActivation = TInstant::Now();
+    if (activity.HasTtl()) {
+        if (auto event = SetupTtl()) {
+            if (event->NeedDataReadWrite()) {
+                ctx.Send(EvictionActor, event.release());
+            } else {
+                ctx.Send(SelfId(), event->TxEvent.release());
+            }
+        }
+    }
 }
 
 std::unique_ptr<TEvPrivate::TEvIndexing> TColumnShard::SetupIndexation() {
@@ -834,16 +863,12 @@ std::unique_ptr<TEvPrivate::TEvCompaction> TColumnShard::SetupCompaction() {
     }
 
     PrimaryIndex->UpdateCompactionLimits(CompactionLimits.Get());
-    auto compactionInfo = PrimaryIndex->Compact();
+    auto compactionInfo = PrimaryIndex->Compact(LastCompactedGranule);
     if (!compactionInfo || compactionInfo->Empty()) {
         LOG_S_DEBUG("Compaction not started: no portions to compact at tablet " << TabletID());
         return {};
     }
 
-    // TODO: Compact granules in parallel
-
-    // Rotate compaction granules: do not choose the same granule all the time.
-    LastCompactedGranule = compactionInfo->ChooseOneGranule(LastCompactedGranule);
     Y_VERIFY(compactionInfo->Good());
 
     LOG_S_DEBUG("Prepare " << *compactionInfo << " at tablet " << TabletID());
@@ -937,7 +962,7 @@ std::unique_ptr<TEvPrivate::TEvWriteIndex> TColumnShard::SetupCleanup() {
 
     NOlap::TSnapshot cleanupSnapshot{GetMinReadStep(), 0};
 
-    auto changes = PrimaryIndex->StartCleanup(cleanupSnapshot, PathsToDrop);
+    auto changes = PrimaryIndex->StartCleanup(cleanupSnapshot, PathsToDrop, TLimits::MAX_TX_RECORDS);
     if (!changes) {
         LOG_S_NOTICE("Cannot prepare cleanup at tablet " << TabletID());
         return {};
@@ -947,7 +972,6 @@ std::unique_ptr<TEvPrivate::TEvWriteIndex> TColumnShard::SetupCleanup() {
     Y_VERIFY(changes->DataToIndex.empty());
     Y_VERIFY(changes->AppendedPortions.empty());
 
-    // TODO: limit PortionsToDrop total size. Delete them in small portions.
     // Filter PortionsToDrop
     TVector<NOlap::TPortionInfo> portionsCanBedropped;
     THashSet<ui64> excludedPortions;
@@ -1077,6 +1101,12 @@ void TColumnShard::ForgetBlobs(const TActorContext& ctx, const THashSet<NOlap::T
 
     for (const auto& ev : evictedBlobs) {
         auto& blobId = ev.Blob;
+        if (BlobManager->BlobInUse(blobId)) {
+            LOG_S_DEBUG("Blob '" << blobId.ToStringNew() << "' in use at tablet " << TabletID());
+            strBlobsDelayed += "'" + blobId.ToStringNew() + "' ";
+            continue;
+        }
+
         TEvictMetadata meta;
         auto evict = BlobManager->GetDropped(blobId, meta);
 

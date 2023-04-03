@@ -299,6 +299,18 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
         setup.Run(cases);
     }
 
+    Y_UNIT_TEST(ExternalTableOperations) {
+        TCases cases = {
+            {"creAte exTernAl TabLe usEr (a int) With (a = \"b\")",
+             "CREATE EXTERNAL TABLE usEr (\n\ta int\n)\nWITH (a = \"b\");\n\n"},
+            {"dRop exTerNal taBlE usEr",
+             "DROP EXTERNAL TABLE usEr;\n"},
+        };
+
+        TSetup setup;
+        setup.Run(cases);
+    }
+
     Y_UNIT_TEST(TypeSelection) {
         TCases cases = {
             {"Select tYpe.* frOm Table tYpe",
@@ -1171,4 +1183,16 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
         TSetup setup;
         setup.Run(cases);
     }
+
+    Y_UNIT_TEST(UnaryOp) {
+        TCases cases = {
+            {"select -x,+x,~x,-1,-1.0,+1,+1.0,~1u",
+             "SELECT\n\t-x,\n\t+x,\n\t~x,\n\t-1,\n\t-1.0,\n\t+1,\n\t+1.0,\n\t~1u;\n\n"},
+        };
+
+        TSetup setup;
+        setup.Run(cases);
+    }
+
+    
 }

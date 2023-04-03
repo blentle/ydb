@@ -43,27 +43,12 @@ TExprNode::TPtr KiEmptyCommit(TExprBase node) {
 TAutoPtr<IGraphTransformer> CreateKiLogicalOptProposalTransformer(TIntrusivePtr<TKikimrSessionContext> sessionCtx,
     TTypeAnnotationContext& types)
 {
-    Y_UNUSED(sessionCtx);
-    Y_UNUSED(types);
-
-    return CreateFunctorTransformer([](const TExprNode::TPtr& input, TExprNode::TPtr& output,
+    return CreateFunctorTransformer([sessionCtx, &types](const TExprNode::TPtr& input, TExprNode::TPtr& output,
         TExprContext& ctx)
     {
-        Y_UNUSED(input);
-        Y_UNUSED(output);
-        Y_UNUSED(ctx);
+        using TStatus = IGraphTransformer::TStatus;
 
-        return IGraphTransformer::TStatus::Ok;
-    });
-}
-
-TAutoPtr<IGraphTransformer> CreateKiPhysicalOptProposalTransformer(TIntrusivePtr<TKikimrSessionContext> sessionCtx) {
-    return CreateFunctorTransformer([sessionCtx](const TExprNode::TPtr& input, TExprNode::TPtr& output,
-        TExprContext& ctx)
-    {
-        typedef IGraphTransformer::TStatus TStatus;
-
-        TStatus status = OptimizeExpr(input, output, [sessionCtx](const TExprNode::TPtr& inputNode, TExprContext& ctx) {
+        TStatus status = OptimizeExpr(input, output, [sessionCtx, &types](const TExprNode::TPtr& inputNode, TExprContext& ctx) {
             auto ret = inputNode;
             TExprBase node(inputNode);
 
@@ -75,7 +60,7 @@ TAutoPtr<IGraphTransformer> CreateKiPhysicalOptProposalTransformer(TIntrusivePtr
             if (auto maybeDatasink = node.Maybe<TCoCommit>().DataSink().Maybe<TKiDataSink>()) {
                 auto cluster = TString(maybeDatasink.Cast().Cluster());
 
-                ret = KiBuildQuery(node, ctx, sessionCtx->TablesPtr());
+                ret = KiBuildQuery(node, ctx, sessionCtx->TablesPtr(), types);
 
                 if (ret != inputNode) {
                     return ret;
@@ -93,11 +78,17 @@ TAutoPtr<IGraphTransformer> CreateKiPhysicalOptProposalTransformer(TIntrusivePtr
             return ret;
         }, ctx, TOptimizeExprSettings(nullptr));
 
-        if (status.Level != IGraphTransformer::TStatus::Ok) {
-            return status;
-        }
+        return status;
+    });
+}
 
-        status = OptimizeExpr(input, output, [sessionCtx](const TExprNode::TPtr& inputNode, TExprContext& ctx) {
+TAutoPtr<IGraphTransformer> CreateKiPhysicalOptProposalTransformer(TIntrusivePtr<TKikimrSessionContext> sessionCtx) {
+    return CreateFunctorTransformer([sessionCtx](const TExprNode::TPtr& input, TExprNode::TPtr& output,
+        TExprContext& ctx)
+    {
+        using TStatus = IGraphTransformer::TStatus;
+
+        TStatus status = OptimizeExpr(input, output, [sessionCtx](const TExprNode::TPtr& inputNode, TExprContext& ctx) {
             Y_UNUSED(ctx);
 
             auto ret = inputNode;

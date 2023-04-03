@@ -239,7 +239,7 @@ namespace NKikimr::NBlobDepot {
                 }
                 if (!info->GetTotalVDisksNum()) {
                     // proxy finishes serving user requests
-                    TActivationContext::Send(new IEventHandleFat(TEvents::TSystem::Poison, 0, ProxyId, {}, nullptr, 0));
+                    TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, ProxyId, {}, nullptr, 0));
                     ProxyId = {};
                 }
             }
@@ -263,10 +263,10 @@ namespace NKikimr::NBlobDepot {
             std::shared_ptr<TEvBlobStorage::TExecutionRelay> executionRelay = nullptr);
 
         template<typename TEvent>
-        void HandleTabletResponse(TAutoPtr<TEventHandleFat<TEvent>> ev);
+        void HandleTabletResponse(TAutoPtr<TEventHandle<TEvent>> ev);
 
         template<typename TEvent>
-        void HandleOtherResponse(TAutoPtr<TEventHandleFat<TEvent>> ev);
+        void HandleOtherResponse(TAutoPtr<TEventHandle<TEvent>> ev);
 
         void OnRequestComplete(ui64 id, TRequestSender::TResponse response, TRequestsInFlight& map,
             std::shared_ptr<TEvBlobStorage::TExecutionRelay> executionRelay = nullptr);
@@ -396,9 +396,9 @@ namespace NKikimr::NBlobDepot {
         size_t PendingEventBytes = 0;
         static constexpr size_t MaxPendingEventBytes = 32'000'000; // ~32 MB
         static constexpr TDuration EventExpirationTime = TDuration::Seconds(60);
+        std::multimap<TMonotonic, TQuery*> QueryWatchdogMap;
         TIntrusiveListWithAutoDelete<TQuery, TQuery::TDeleter, TExecutingQueries> ExecutingQueries;
         TIntrusiveListWithAutoDelete<TQuery, TQuery::TDeleter, TExecutingQueries> DeletePendingQueries;
-        std::multimap<TMonotonic, TQuery*> QueryWatchdogMap;
         bool ProcessPendingEventInFlight = false;
 
         template<ui32 EventType> TQuery *CreateQuery(std::unique_ptr<IEventHandle> ev);
@@ -465,7 +465,7 @@ namespace NKikimr::NBlobDepot {
         // Blob mapping cache
 
         class TBlobMappingCache;
-        std::unique_ptr<TBlobMappingCache> BlobMappingCachePtr;
+        std::shared_ptr<TBlobMappingCache> BlobMappingCachePtr;
         TBlobMappingCache& BlobMappingCache;
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////

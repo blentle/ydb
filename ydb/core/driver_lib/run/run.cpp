@@ -83,6 +83,7 @@
 
 #include <ydb/services/auth/grpc_service.h>
 #include <ydb/services/cms/grpc_service.h>
+#include <ydb/services/console/grpc_service.h>
 #include <ydb/services/datastreams/grpc_service.h>
 #include <ydb/services/discovery/grpc_service.h>
 #include <ydb/services/fq/grpc_service.h>
@@ -105,9 +106,8 @@
 #include <ydb/services/ydb/ydb_scheme.h>
 #include <ydb/services/ydb/ydb_scripting.h>
 #include <ydb/services/ydb/ydb_table.h>
-#include <ydb/services/yq/grpc_service.h>
 
-#include <ydb/core/yq/libs/init/init.h>
+#include <ydb/core/fq/libs/init/init.h>
 
 #include <library/cpp/logger/global/global.h>
 #include <library/cpp/monlib/messagebus/mon_messagebus.h>
@@ -810,6 +810,9 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
         if (hasCms) {
             server.AddService(new NGRpcService::TGRpcCmsService(ActorSystem.Get(), Counters,
                 grpcRequestProxies[0], hasCms.IsRlAllowed()));
+
+            server.AddService(new NGRpcService::TGRpcConsoleService(ActorSystem.Get(), Counters,
+                grpcRequestProxies[0], hasCms.IsRlAllowed()));
         }
 
         if (hasDiscovery) {
@@ -842,7 +845,6 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
         }
 
         if (hasYandexQuery) {
-            server.AddService(new NGRpcService::TGRpcYandexQueryService(ActorSystem.Get(), Counters, grpcRequestProxies[0]));
             server.AddService(new NGRpcService::TGRpcFederatedQueryService(ActorSystem.Get(), Counters, grpcRequestProxies[0]));
             server.AddService(new NGRpcService::TGRpcFqPrivateTaskService(ActorSystem.Get(), Counters, grpcRequestProxies[0]));
         }   /* REMOVE */ else /* THIS else as well and separate ifs */ if (hasYandexQueryPrivate) {
@@ -901,7 +903,7 @@ void TKikimrRunner::InitializeGRpc(const TKikimrRunConfig& runConfig) {
                 opts.SetKeepAliveEnable(false);
             }
         }
-        
+
         NConsole::SetGRpcLibraryFunction();
 
 #define GET_PATH_TO_FILE(GRPC_CONFIG, PRIMARY_FIELD, SECONDARY_FIELD) \
@@ -1485,6 +1487,14 @@ TIntrusivePtr<TServiceInitializersList> TKikimrRunner::CreateServiceInitializers
         sil->AddServiceInitializer(new TMetadataProviderInitializer(runConfig));
     }
 
+    if (serviceMask.ExternalIndex) {
+        sil->AddServiceInitializer(new TExternalIndexInitializer(runConfig));
+    }
+
+    if (serviceMask.EnableBackgroundTasks) {
+        sil->AddServiceInitializer(new TBackgroundTasksInitializer(runConfig));
+    }
+
     if (serviceMask.EnableCms) {
         sil->AddServiceInitializer(new TCmsServiceInitializer(runConfig));
     }
@@ -1537,7 +1547,7 @@ TIntrusivePtr<TServiceInitializersList> TKikimrRunner::CreateServiceInitializers
     }
 
     if (serviceMask.EnableYandexQuery && runConfig.AppConfig.GetFederatedQueryConfig().GetEnabled()) {
-        YqSharedResources = NYq::CreateYqSharedResources(
+        YqSharedResources = NFq::CreateYqSharedResources(
             runConfig.AppConfig.GetFederatedQueryConfig(),
             NKikimr::CreateYdbCredentialsProviderFactory,
             Counters->GetSubgroup("counters", "yq"));
@@ -1616,13 +1626,13 @@ void TKikimrRunner::KikimrStop(bool graceful) {
     Y_UNUSED(graceful);
 
     if (EnabledGrpcService) {
-        ActorSystem->Send(new IEventHandleFat(NGRpcService::CreateGrpcPublisherServiceActorId(), {}, new TEvents::TEvPoisonPill));
+        ActorSystem->Send(new IEventHandle(NGRpcService::CreateGrpcPublisherServiceActorId(), {}, new TEvents::TEvPoisonPill));
     }
 
     TIntrusivePtr<TDrainProgress> drainProgress(new TDrainProgress());
     if (AppData->FeatureFlags.GetEnableDrainOnShutdown() && GracefulShutdownSupported && ActorSystem) {
         drainProgress->OnSend();
-        ActorSystem->Send(new IEventHandleFat(MakeTenantPoolRootID(), {}, new TEvLocal::TEvLocalDrainNode(drainProgress)));
+        ActorSystem->Send(new IEventHandle(MakeTenantPoolRootID(), {}, new TEvLocal::TEvLocalDrainNode(drainProgress)));
     }
 
     if (KqpShutdownController) {
@@ -1654,10 +1664,10 @@ void TKikimrRunner::KikimrStop(bool graceful) {
 
     if (ActorSystem) {
         ActorSystem->BroadcastToProxies([](const TActorId& proxyId) {
-            return new IEventHandleFat(proxyId, {}, new TEvInterconnect::TEvTerminate);
+            return new IEventHandle(proxyId, {}, new TEvInterconnect::TEvTerminate);
         });
-        ActorSystem->Send(new IEventHandleFat(MakeInterconnectListenerActorId(false), {}, new TEvents::TEvPoisonPill));
-        ActorSystem->Send(new IEventHandleFat(MakeInterconnectListenerActorId(true), {}, new TEvents::TEvPoisonPill));
+        ActorSystem->Send(new IEventHandle(MakeInterconnectListenerActorId(false), {}, new TEvents::TEvPoisonPill));
+        ActorSystem->Send(new IEventHandle(MakeInterconnectListenerActorId(true), {}, new TEvents::TEvPoisonPill));
     }
 
     if (SqsHttp) {

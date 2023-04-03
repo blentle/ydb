@@ -194,6 +194,10 @@ public:
     TRuntimeNode NewEmptyTuple();
     TRuntimeNode NewTuple(TType* tupleType, const TArrayRef<const TRuntimeNode>& elements);
     TRuntimeNode NewTuple(const TArrayRef<const TRuntimeNode>& elements);
+
+    TType* NewEmptyMultiType();
+    TType* NewMultiType(const TArrayRef<TType* const>& elements);
+
     TType* NewResourceType(const std::string_view& tag);
     TType* NewVariantType(TType* underlyingType);
     TRuntimeNode NewVariant(TRuntimeNode item, ui32 tupleIndex, TType* variantType);
@@ -253,6 +257,8 @@ public:
     TRuntimeNode BlockCompress(TRuntimeNode flow, ui32 bitmapIndex);
     TRuntimeNode BlockExpandChunked(TRuntimeNode flow);
     TRuntimeNode BlockCoalesce(TRuntimeNode first, TRuntimeNode second);
+    TRuntimeNode BlockNth(TRuntimeNode tuple, ui32 index);
+    TRuntimeNode BlockAsTuple(const TArrayRef<const TRuntimeNode>& args);
 
     //-- logical functions
     TRuntimeNode BlockNot(TRuntimeNode data);

@@ -429,6 +429,18 @@ bool FillIndexDescription(NKikimrSchemeOp::TIndexedTableCreationConfig& out,
     return true;
 }
 
+template <typename TOutProto, typename TInProto>
+void FillAttributesImpl(TOutProto& out, const TInProto& in) {
+    if (!in.UserAttributesSize()) {
+        return;
+    }
+
+    auto& outAttrs = *out.mutable_attributes();
+    for (const auto& inAttr : in.GetUserAttributes()) {
+        outAttrs[inAttr.GetKey()] = inAttr.GetValue();
+    }
+}
+
 void FillChangefeedDescription(Ydb::Table::DescribeTableResult& out,
         const NKikimrSchemeOp::TTableDescription& in) {
 
@@ -460,14 +472,15 @@ void FillChangefeedDescription(Ydb::Table::DescribeTableResult& out,
 
         switch (stream.GetState()) {
         case NKikimrSchemeOp::ECdcStreamState::ECdcStreamStateReady:
-            changefeed->set_state(Ydb::Table::ChangefeedDescription::STATE_ENABLED);
         case NKikimrSchemeOp::ECdcStreamState::ECdcStreamStateDisabled:
-            changefeed->set_state(Ydb::Table::ChangefeedDescription::STATE_DISABLED);
         case NKikimrSchemeOp::ECdcStreamState::ECdcStreamStateScan:
-            changefeed->set_state(Ydb::Table::ChangefeedDescription::STATE_INITIAL_SCAN);
+            changefeed->set_state(static_cast<Ydb::Table::ChangefeedDescription::State>(stream.GetState()));
+            break;
         default:
             break;
         }
+
+        FillAttributesImpl(*changefeed, stream);
     }
 }
 
@@ -508,6 +521,12 @@ bool FillChangefeedDescription(NKikimrSchemeOp::TCdcStreamDescription& out,
             return false;
         }
         out.SetState(NKikimrSchemeOp::ECdcStreamState::ECdcStreamStateScan);
+    }
+
+    for (const auto& [key, value] : in.attributes()) {
+        auto& attr = *out.AddUserAttributes();
+        attr.SetKey(key);
+        attr.SetValue(value);
     }
 
     return true;
@@ -692,20 +711,6 @@ void FillColumnFamilies(Ydb::Table::DescribeTableResult& out,
 void FillColumnFamilies(Ydb::Table::CreateTableRequest& out,
         const NKikimrSchemeOp::TTableDescription& in) {
     FillColumnFamiliesImpl(out, in);
-}
-
-template <typename TYdbProto>
-void FillAttributesImpl(TYdbProto& out,
-        const NKikimrSchemeOp::TPathDescription& in) {
-
-    if (!in.UserAttributesSize()) {
-        return;
-    }
-
-    auto& outAttrs = *out.mutable_attributes();
-    for (const auto& inAttr : in.GetUserAttributes()) {
-        outAttrs[inAttr.GetKey()] = inAttr.GetValue();
-    }
 }
 
 void FillAttributes(Ydb::Table::DescribeTableResult& out,

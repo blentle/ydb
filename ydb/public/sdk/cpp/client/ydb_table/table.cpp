@@ -245,6 +245,12 @@ static TInstant ProtobufTimestampToTInstant(const NProtoBuf::Timestamp& timestam
     return TInstant::MicroSeconds(lastModificationUs);
 }
 
+static void SerializeTo(const TRenameIndex& rename, Ydb::Table::RenameIndexItem& proto) {
+    proto.set_source_name(rename.SourceName_);
+    proto.set_destination_name(rename.DestinationName_);
+    proto.set_replace_destination(rename.ReplaceDestination_);
+}
+
 class TTableDescription::TImpl {
     using EUnit = TValueSinceUnixEpochModeSettings::EUnit;
 
@@ -3521,6 +3527,10 @@ static Ydb::Table::AlterTableRequest MakeAlterTableProtoRequest(
         request.add_drop_indexes(name);
     }
 
+    for (const auto& rename : settings.RenameIndexes_) {
+        SerializeTo(rename, *request.add_rename_indexes());
+    }
+
     for (const auto& addChangefeed : settings.AddChangefeeds_) {
         addChangefeed.SerializeTo(*request.add_add_changefeeds());
     }
@@ -4252,6 +4262,21 @@ TChangefeedDescription& TChangefeedDescription::WithInitialScan() {
     return *this;
 }
 
+TChangefeedDescription& TChangefeedDescription::AddAttribute(const TString& key, const TString& value) {
+    Attributes_[key] = value;
+    return *this;
+}
+
+TChangefeedDescription& TChangefeedDescription::SetAttributes(const THashMap<TString, TString>& attrs) {
+    Attributes_ = attrs;
+    return *this;
+}
+
+TChangefeedDescription& TChangefeedDescription::SetAttributes(THashMap<TString, TString>&& attrs) {
+    Attributes_ = std::move(attrs);
+    return *this;
+}
+
 const TString& TChangefeedDescription::GetName() const {
     return Name_;
 }
@@ -4274,6 +4299,10 @@ bool TChangefeedDescription::GetVirtualTimestamps() const {
 
 bool TChangefeedDescription::GetInitialScan() const {
     return InitialScan_;
+}
+
+const THashMap<TString, TString>& TChangefeedDescription::GetAttributes() const {
+    return Attributes_;
 }
 
 template <typename TProto>
@@ -4332,6 +4361,10 @@ TChangefeedDescription TChangefeedDescription::FromProto(const TProto& proto) {
         }
     }
 
+    for (const auto& [key, value] : proto.attributes()) {
+        ret.Attributes_[key] = value;
+    }
+
     return ret;
 }
 
@@ -4372,6 +4405,10 @@ void TChangefeedDescription::SerializeTo(Ydb::Table::Changefeed& proto) const {
         auto& retention = *proto.mutable_retention_period();
         retention.set_seconds(RetentionPeriod_->Seconds());
         retention.set_nanos(RetentionPeriod_->NanoSecondsOfSecond());
+    }
+
+    for (const auto& [key, value] : Attributes_) {
+        (*proto.mutable_attributes())[key] = value;
     }
 }
 

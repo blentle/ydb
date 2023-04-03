@@ -23,6 +23,7 @@
 
 #include <map>
 #include <util/generic/string.h>
+#include <util/string/cast.h>
 #include <vector>
 
 #include "y_absl/status/statusor.h"
@@ -62,6 +63,7 @@ class URI {
   URI(URI&&) = default;
   URI& operator=(URI&&) = default;
 
+  static TString PercentEncodeAuthority(y_absl::string_view str);
   static TString PercentEncodePath(y_absl::string_view str);
 
   static TString PercentDecode(y_absl::string_view str);

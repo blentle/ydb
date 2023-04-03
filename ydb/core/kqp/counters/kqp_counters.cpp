@@ -774,9 +774,10 @@ TKqpCounters::TKqpCounters(const ::NMonitoring::TDynamicCounterPtr& counters, co
     CreatedIterators = KqpGroup->GetCounter("IteratorReads/Created", true);
     ReadActorsCount = KqpGroup->GetCounter("IteratorReads/ReadActorCount", false);
     StreamLookupActorsCount = KqpGroup->GetCounter("IteratorReads/StreamLookupActorCount", false);
-    ReadActorRetries = KqpGroup->GetCounter("IteratorReads/Retries", false);
+    ReadActorRetries = KqpGroup->GetCounter("IteratorReads/Retries", true);
     DataShardIteratorFails = KqpGroup->GetCounter("IteratorReads/DatashardFails", true);
     DataShardIteratorMessages = KqpGroup->GetCounter("IteratorReads/DatashardMessages", true);
+    IteratorDeliveryProblems = KqpGroup->GetCounter("IteratorReads/DeliveryProblems", true);
 
     LiteralTxTotalTimeHistogram = KqpGroup->GetHistogram(
         "PhyTx/LiteralTxTotalTimeMs", NMonitoring::ExponentialHistogram(10, 2, 1));

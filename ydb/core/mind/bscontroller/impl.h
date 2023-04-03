@@ -97,8 +97,7 @@ public:
         Table::VDiskIdx::Type VDiskIdx = 0;
         Table::Mood::Type Mood;
         TIndirectReferable<TGroupInfo>::TPtr Group; // group to which this VSlot belongs (or nullptr if it doesn't belong to any)
-        std::vector<std::pair<TVSlotId, TVDiskID>> Donors; // a set of alive donors for this disk
-        TVSlotId AcceptorVSlotId;
+        THashSet<TVSlotId> Donors; // a set of alive donors for this disk (which are not being deleted)
         TInstant LastSeenReady;
 
         // volatile state
@@ -137,6 +136,7 @@ public:
                 } else {
                     DropFromVSlotReadyTimestampQ();
                 }
+                const_cast<TGroupInfo&>(*Group).CalculateGroupStatus();
             }
         }
 
@@ -214,10 +214,13 @@ public:
         void MakeDonorFor(TVSlotInfo *newSlot) {
             Y_VERIFY(newSlot);
             Y_VERIFY(!IsBeingDeleted());
+            Y_VERIFY(GroupId == newSlot->GroupId);
+            Y_VERIFY(GetShortVDiskId() == newSlot->GetShortVDiskId());
             Mood = TMood::Donor;
             Group = nullptr; // we are not part of this group anymore
-            Donors.emplace_back(VSlotId, GetVDiskId());
-            newSlot->Donors = std::exchange(Donors, {});
+            Donors.insert(VSlotId);
+            Donors.swap(newSlot->Donors);
+            Y_VERIFY(Donors.empty());
         }
 
         TVDiskID GetVDiskId() const {
@@ -511,6 +514,7 @@ public:
 
         bool Down = false; // is group are down right now (not selectable)
         TVector<TIndirectReferable<TVSlotInfo>::TPtr> VDisksInGroup;
+        THashSet<TVSlotId> VSlotsBeingDeleted;
         TGroupLatencyStats LatencyStats;
         TBoxStoragePoolId StoragePoolId;
         mutable TStorageStatusFlags StatusFlags;
@@ -823,6 +827,7 @@ public:
         // in-mem only
         std::map<TString, NPDisk::TDriveData> KnownDrives;
         THashSet<TGroupId> WaitingForGroups;
+        THashSet<TGroupId> GroupsRequested;
 
         template<typename T>
         static void Apply(TBlobStorageController* /*controller*/, T&& callback) {
@@ -1424,6 +1429,7 @@ private:
     std::unique_ptr<TStoragePoolStat> StoragePoolStat;
     bool StopGivingGroups = false;
     bool GroupLayoutSanitizer = false;
+    std::set<std::tuple<TGroupId, TNodeId>> GroupToNode;
     NKikimrBlobStorage::TSerialManagementStage::E SerialManagementStage
             = NKikimrBlobStorage::TSerialManagementStage::DISCOVER_SERIAL;
 
@@ -1499,6 +1505,17 @@ private:
     void UpdateSelfHealCounters();
 
     void ValidateInternalState();
+
+    const TVSlotInfo* FindAcceptor(const TVSlotInfo& donor) {
+        Y_VERIFY(donor.Mood == TMood::Donor);
+        TGroupInfo *group = FindGroup(donor.GroupId);
+        Y_VERIFY(group);
+        const ui32 orderNumber = group->Topology->GetOrderNumber(donor.GetShortVDiskId());
+        const TVSlotInfo *acceptor = group->VDisksInGroup[orderNumber];
+        Y_VERIFY(donor.GroupId == acceptor->GroupId && donor.GroupGeneration < acceptor->GroupGeneration &&
+            donor.GetShortVDiskId() == acceptor->GetShortVDiskId());
+        return acceptor;
+    }
 
     TVSlotInfo* FindVSlot(TVSlotId id) {
         auto it = VSlots.find(id);
@@ -1611,12 +1628,12 @@ private:
         }
         for (TActorId *ptr : {&SelfHealId, &StatProcessorActorId, &SystemViewsCollectorId}) {
             if (const TActorId actorId = std::exchange(*ptr, {})) {
-                TActivationContext::Send(new IEventHandleFat(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
+                TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
             }
         }
         for (const auto& [id, info] : GroupMap) {
             if (const auto& actorId = info->VirtualGroupSetupMachineId) {
-                TActivationContext::Send(new IEventHandleFat(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
+                TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
             }
         }
         return TActor::PassAway();
@@ -1676,6 +1693,12 @@ public:
 
     bool IsGroupLayoutSanitizerEnabled() const {
         return GroupLayoutSanitizer;
+    }
+
+    // For test purposes, required for self heal actor
+    void CreateEmptyHostRecordsMap() {
+        TEvInterconnect::TEvNodesInfo nodes;
+        HostRecords = std::make_shared<THostRecordMapImpl>(&nodes);
     }
 
 private:
@@ -1830,7 +1853,7 @@ public:
     }
 
     void PushProcessIncomingEvent() {
-        TActivationContext::Send(new IEventHandleFat(TEvPrivate::EvProcessIncomingEvent, 0, SelfId(), {}, nullptr, 0));
+        TActivationContext::Send(new IEventHandle(TEvPrivate::EvProcessIncomingEvent, 0, SelfId(), {}, nullptr, 0));
     }
 
     void ProcessIncomingEvent() {
@@ -2127,7 +2150,7 @@ public:
     void OnWardenDisconnected(TNodeId nodeId);
     void EraseKnownDrivesOnDisconnected(TNodeInfo *nodeInfo);
 
-    using TVSlotFinder = std::function<void(const TVSlotId&, const std::function<void(const TVSlotInfo&)>&)>;
+    using TVSlotFinder = std::function<void(TVSlotId, const std::function<void(const TVSlotInfo&)>&)>;
 
     static void Serialize(NKikimrBlobStorage::TDefineHostConfig *pb, const THostConfigId &id, const THostConfigInfo &hostConfig);
     static void Serialize(NKikimrBlobStorage::TDefineBox *pb, const TBoxId &id, const TBoxInfo &box);
@@ -2140,7 +2163,7 @@ public:
     static void Serialize(NKikimrBlobStorage::TBaseConfig::TVSlot *pb, const TVSlotInfo &vslot, const TVSlotFinder& finder);
     static void Serialize(NKikimrBlobStorage::TBaseConfig::TGroup *pb, const TGroupInfo &group);
     static void SerializeDonors(NKikimrBlobStorage::TNodeWardenServiceSet::TVDisk *vdisk, const TVSlotInfo& vslot,
-        const TGroupInfo& group);
+        const TGroupInfo& group, const TVSlotFinder& finder);
     static void SerializeGroupInfo(NKikimrBlobStorage::TGroupInfo *group, const TGroupInfo& groupInfo,
         const TString& storagePoolName, const TMaybe<TKikimrScopeId>& scopeId);
 };

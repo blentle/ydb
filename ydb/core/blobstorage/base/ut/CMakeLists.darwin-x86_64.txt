@@ -22,8 +22,7 @@ target_link_libraries(ydb-core-blobstorage-base-ut PUBLIC
   ydb-core-protos
 )
 target_link_options(ydb-core-blobstorage-base-ut PRIVATE
-  -Wl,-no_deduplicate
-  -Wl,-sdk_version,10.15
+  -Wl,-platform_version,macos,11.0,11.0
   -fPIC
   -fPIC
   -framework
@@ -39,5 +38,19 @@ add_test(
   ydb-core-blobstorage-base-ut
   COMMAND
   ydb-core-blobstorage-base-ut
+)
+set_property(
+  TEST
+  ydb-core-blobstorage-base-ut
+  PROPERTY
+  LABELS
+  SMALL
+)
+set_property(
+  TEST
+  ydb-core-blobstorage-base-ut
+  PROPERTY
+  PROCESSORS
+  1
 )
 vcs_info(ydb-core-blobstorage-base-ut)

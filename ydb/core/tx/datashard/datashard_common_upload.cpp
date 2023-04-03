@@ -15,7 +15,8 @@ TCommonUploadOps<TEvRequest, TEvResponse>::TCommonUploadOps(typename TEvRequest:
 
 template <typename TEvRequest, typename TEvResponse>
 bool TCommonUploadOps<TEvRequest, TEvResponse>::Execute(TDataShard* self, TTransactionContext& txc,
-        const TRowVersion& readVersion, const TRowVersion& writeVersion)
+        const TRowVersion& readVersion, const TRowVersion& writeVersion, ui64 globalTxId,
+        absl::flat_hash_set<ui64>* volatileReadDependencies)
 {
     const auto& record = Ev->Get()->Record;
     Result = MakeHolder<TEvResponse>(self->TabletID());
@@ -58,7 +59,9 @@ bool TCommonUploadOps<TEvRequest, TEvResponse>::Execute(TDataShard* self, TTrans
     const bool readForTableShadow = writeToTableShadow && !shadowTableId;
     const ui32 writeTableId = writeToTableShadow && shadowTableId ? shadowTableId : localTableId;
 
-    const bool breakWriteConflicts = BreakLocks && self->SysLocksTable().HasWriteLocks(fullTableId);
+    const bool breakWriteConflicts = BreakLocks && (
+        self->SysLocksTable().HasWriteLocks(fullTableId) ||
+        self->GetVolatileTxManager().GetTxMap());
 
     TDataShardUserDb userDb(*self, txc.DB, readVersion);
     TDataShardChangeGroupProvider groupProvider(*self, txc.DB);
@@ -89,7 +92,10 @@ bool TCommonUploadOps<TEvRequest, TEvResponse>::Execute(TDataShard* self, TTrans
     TSerializedCellVec valueCells;
 
     bool pageFault = false;
+    bool commitAdded = false;
     NTable::TRowState rowState;
+
+    absl::flat_hash_set<ui64> volatileDependencies;
 
     ui64 bytes = 0;
     for (const auto& r : record.GetRows()) {
@@ -174,34 +180,60 @@ bool TCommonUploadOps<TEvRequest, TEvResponse>::Execute(TDataShard* self, TTrans
         }
 
         if (!writeToTableShadow) {
+            if (BreakLocks) {
+                if (breakWriteConflicts) {
+                    if (!self->BreakWriteConflicts(txc.DB, fullTableId, keyCells.GetCells(), volatileDependencies)) {
+                        pageFault = true;
+                    }
+                }
+
+                if (!pageFault) {
+                    self->SysLocksTable().BreakLocks(fullTableId, keyCells.GetCells());
+                }
+            }
+
             if (ChangeCollector) {
                 Y_VERIFY(CollectChanges);
 
-                if (!ChangeCollector->OnUpdate(fullTableId, writeTableId, NTable::ERowOp::Upsert, key, value, writeVersion)) {
-                    pageFault = true;
-                }
+                if (!volatileDependencies.empty()) {
+                    if (!globalTxId) {
+                        throw TNeedGlobalTxId();
+                    }
 
-                if (pageFault) {
-                    continue;
+                    if (!ChangeCollector->OnUpdateTx(fullTableId, writeTableId, NTable::ERowOp::Upsert, key, value, globalTxId)) {
+                        pageFault = true;
+                    }
+                } else {
+                    if (!ChangeCollector->OnUpdate(fullTableId, writeTableId, NTable::ERowOp::Upsert, key, value, writeVersion)) {
+                        pageFault = true;
+                    }
                 }
             }
 
-            if (BreakLocks) {
-                if (breakWriteConflicts) {
-                    if (!self->BreakWriteConflicts(txc.DB, fullTableId, keyCells.GetCells())) {
-                        pageFault = true;
-                    }
-
-                    if (pageFault) {
-                        continue;
-                    }
-                }
-
-                self->SysLocksTable().BreakLocks(fullTableId, keyCells.GetCells());
+            if (pageFault) {
+                continue;
             }
         }
 
-        txc.DB.Update(writeTableId, NTable::ERowOp::Upsert, key, value, writeVersion);
+        if (!volatileDependencies.empty()) {
+            if (!globalTxId) {
+                throw TNeedGlobalTxId();
+            }
+            txc.DB.UpdateTx(writeTableId, NTable::ERowOp::Upsert, key, value, globalTxId);
+            if (!commitAdded) {
+                // Make sure we see our own changes on further iterations
+                userDb.AddCommitTxId(globalTxId, writeVersion);
+                commitAdded = true;
+            }
+        } else {
+            txc.DB.Update(writeTableId, NTable::ERowOp::Upsert, key, value, writeVersion);
+        }
+    }
+
+    if (volatileReadDependencies && !userDb.GetVolatileReadDependencies().empty()) {
+        *volatileReadDependencies = std::move(userDb.GetVolatileReadDependencies());
+        txc.Reschedule();
+        pageFault = true;
     }
 
     if (pageFault) {
@@ -210,6 +242,19 @@ bool TCommonUploadOps<TEvRequest, TEvResponse>::Execute(TDataShard* self, TTrans
         }
 
         return false;
+    }
+
+    if (!volatileDependencies.empty()) {
+        self->GetVolatileTxManager().PersistAddVolatileTx(
+            globalTxId,
+            writeVersion,
+            /* commitTxIds */ { globalTxId },
+            volatileDependencies,
+            /* participants */ { },
+            groupProvider.GetCurrentChangeGroup(),
+            /* ordered */ false,
+            txc);
+        // Note: transaction is already committed, no additional waiting needed
     }
 
     self->IncCounter(COUNTER_UPLOAD_ROWS, record.GetRows().size());

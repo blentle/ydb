@@ -1652,7 +1652,7 @@ namespace NTypeAnnImpl {
         }
 
         input->SetTypeAnn(tupleType->GetItems()[index]);
-        if (isOptional && input->GetTypeAnn()->GetKind() != ETypeAnnotationKind::Optional && input->GetTypeAnn()->GetKind() != ETypeAnnotationKind::Null) {
+        if (isOptional && !input->GetTypeAnn()->IsOptionalOrNull()) {
             input->SetTypeAnn(ctx.Expr.MakeType<TOptionalExprType>(input->GetTypeAnn()));
         }
 
@@ -4689,6 +4689,11 @@ namespace NTypeAnnImpl {
         }
 
         if (!EnsureComputable(input->Head(), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (input->Head().GetTypeAnn()->GetKind() == ETypeAnnotationKind::Pg) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Head().Pos()), "Can't unwrap PostgreSQL type"));
             return IGraphTransformer::TStatus::Error;
         }
 
@@ -11806,6 +11811,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["BuildTablePath"] = &BuildTablePathWrapper;
         Functions["WithOptionalArgs"] = &WithOptionalArgsWrapper;
         Functions["WithContext"] = &WithContextWrapper;
+        Functions["EmptyFrom"] = &EmptyFromWrapper;
 
         Functions["DecimalDiv"] = &DecimalBinaryWrapper;
         Functions["DecimalMod"] = &DecimalBinaryWrapper;
@@ -11878,6 +11884,8 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["BlockNot"] = &BlockLogicalWrapper;
         Functions["BlockIf"] = &BlockIfWrapper;
         Functions["BlockJust"] = &BlockJustWrapper;
+        Functions["BlockAsTuple"] = &BlockAsTupleWrapper;
+        Functions["BlockNth"] = &BlockNthWrapper;
         ExtFunctions["BlockFunc"] = &BlockFuncWrapper;
         ExtFunctions["BlockBitCast"] = &BlockBitCastWrapper;
 

@@ -20,6 +20,7 @@
 
 #include <memory>
 #include <util/generic/string.h>
+#include <util/string/cast.h>
 #include <utility>
 
 #include "y_absl/memory/memory.h"
@@ -185,7 +186,7 @@ class BinderServerListener : public Server::ListenerInterface {
       // SETUP_TRANSPORT transaction and ghost the client. Check if we should
       // send back a SHUTDOWN_TRANSPORT in this case.
       return y_absl::PermissionDeniedError(
-          "UID " + ToString(uid) +
+          "UID " + ::ToString(uid) +
           " is not allowed to connect to this "
           "server according to security policy.");
     }

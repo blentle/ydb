@@ -81,12 +81,12 @@ class TKqpReadActor : public TActorBootstrapped<TKqpReadActor>, public NYql::NDq
 public:
     struct TResult {
         ui64 ShardId;
-        THolder<TEventHandleFat<TEvDataShard::TEvReadResult>> ReadResult;
+        THolder<TEventHandle<TEvDataShard::TEvReadResult>> ReadResult;
         TMaybe<NKikimr::NMiniKQL::TUnboxedValueVector> Batch;
         size_t ProcessedRows = 0;
         size_t PackedRows = 0;
 
-        TResult(ui64 shardId, THolder<TEventHandleFat<TEvDataShard::TEvReadResult>> readResult)
+        TResult(ui64 shardId, THolder<TEventHandle<TEvDataShard::TEvReadResult>> readResult)
             : ShardId(shardId)
             , ReadResult(std::move(readResult))
         {
@@ -721,7 +721,7 @@ public:
         }
 
         CA_LOG_D("schedule retry #" << id << " after " << delay);
-        TlsActivationContext->Schedule(delay, new IEventHandleFat(SelfId(), SelfId(), new TEvRetryShard(id, Reads[id].LastSeqNo)));
+        TlsActivationContext->Schedule(delay, new IEventHandle(SelfId(), SelfId(), new TEvRetryShard(id, Reads[id].LastSeqNo)));
     }
 
     void DoRetryRead(ui64 id) {
@@ -738,7 +738,6 @@ public:
         }
         CA_LOG_D("Retrying read #" << id);
 
-        SendCancel(id);
         ResetRead(id);
 
         if (Reads[id].SerializedContinuationToken) {
@@ -871,21 +870,17 @@ public:
             case Ydb::StatusIds::SUCCESS:
                 break;
             case Ydb::StatusIds::OVERLOADED: {
-                ++ErrorsCount;
                 return RetryRead(id, false);
             }
             case Ydb::StatusIds::INTERNAL_ERROR: {
-                ++ErrorsCount;
                 return RetryRead(id);
             }
             case Ydb::StatusIds::NOT_FOUND: {
-                ++ErrorsCount;
                 auto shard = Reads[id].Shard;
                 ResetRead(id);
                 return ResolveShard(shard);
             }
             default: {
-                ++ErrorsCount;
                 NYql::TIssues issues;
                 NYql::IssuesFromMessage(record.GetStatus().GetIssues(), issues);
                 return RuntimeError("Read request aborted", NYql::NDqProto::StatusIds::ABORTED, issues);
@@ -915,20 +910,21 @@ public:
             << " seqno = " << ev->Get()->Record.GetSeqNo()
             << " finished = " << ev->Get()->Record.GetFinished());
         CA_LOG_T(TStringBuilder() << "read #" << id << " pushed " << DebugPrintCells(ev->Get()) << " continuation token " << DebugPrintContionuationToken(record.GetContinuationToken()));
-        Results.push({Reads[id].Shard->TabletId, THolder<TEventHandleFat<TEvDataShard::TEvReadResult>>(ev.Release())});
+        Results.push({Reads[id].Shard->TabletId, THolder<TEventHandle<TEvDataShard::TEvReadResult>>(ev.Release())});
         NotifyCA();
     }
 
     void HandleError(TEvPipeCache::TEvDeliveryProblem::TPtr& ev) {
         auto& msg = *ev->Get();
 
-        ++ErrorsCount;
-
         TVector<ui32> reads;
-        reads.swap(ReadIdByTabletId[msg.TabletId]);
+        reads = ReadIdByTabletId[msg.TabletId];
+        CA_LOG_W("Got EvDeliveryProblem, TabletId: " << msg.TabletId << ", NotDelivered: " << msg.NotDelivered);
         for (auto read : reads) {
-            CA_LOG_W("Got EvDeliveryProblem, TabletId: " << msg.TabletId << ", NotDelivered: " << msg.NotDelivered);
-            RetryRead(read, false);
+            if (Reads[read]) {
+                Counters->IteratorDeliveryProblems->Inc();
+            }
+            RetryRead(read);
         }
     }
 
@@ -938,6 +934,12 @@ public:
 
     void ResetRead(size_t id) {
         if (Reads[id]) {
+            Counters->SentIteratorCancels->Inc();
+            auto* state = Reads[id].Shard;
+            auto cancel = MakeHolder<TEvDataShard::TEvReadCancel>();
+            cancel->Record.SetReadId(id);
+            Send(::PipeCacheId, new TEvPipeCache::TEvForward(cancel.Release(), state->TabletId, false));
+
             Reads[id].Reset();
             ResetReads++;
         }
@@ -1052,6 +1054,7 @@ public:
                     columnIndex += 1;
                 }
             }
+            // min row size according to datashard
             rowSize = std::max(rowSize, (i64)8);
 
             columnIndex = 0;
@@ -1155,9 +1158,6 @@ public:
                 }
 
                 if (Reads[id].IsLastMessage(msg)) {
-                    if (!record.GetFinished()) {
-                        SendCancel(id);
-                    }
                     ResetRead(id);
                 }
 
@@ -1195,10 +1195,8 @@ public:
         return bytes;
     }
 
-    void FillExtraStats(NDqProto::TDqTaskStats* stats, bool last) override {
+    void FillExtraStats(NDqProto::TDqTaskStats* stats, bool last, const NYql::NDq::TDqMeteringStats* mstats) override {
         if (last) {
-            stats->SetErrorsCount(ErrorsCount);
-
             NDqProto::TDqTableStats* tableStats = nullptr;
             for (size_t i = 0; i < stats->TablesSize(); ++i) {
                 auto* table = stats->MutableTables(i);
@@ -1212,10 +1210,17 @@ public:
 
             }
 
-            //FIXME: use evread statistics after KIKIMR-16924
-            tableStats->SetReadRows(tableStats->GetReadRows() + ReceivedRowCount);
-            tableStats->SetReadBytes(tableStats->GetReadBytes() + BytesStats.DataBytes);
+            auto consumedRows = mstats ? mstats->Inputs[InputIndex]->RowsConsumed : ReceivedRowCount;
+
+            //FIXME: use real rows count
+            tableStats->SetReadRows(tableStats->GetReadRows() + consumedRows);
+            tableStats->SetReadBytes(tableStats->GetReadBytes() + (mstats ? mstats->Inputs[InputIndex]->BytesConsumed : BytesStats.DataBytes));
             tableStats->SetAffectedPartitions(tableStats->GetAffectedPartitions() + InFlightShards.Size());
+
+            //FIXME: use evread statistics after KIKIMR-16924
+            //tableStats->SetReadRows(tableStats->GetReadRows() + ReceivedRowCount);
+            //tableStats->SetReadBytes(tableStats->GetReadBytes() + BytesStats.DataBytes);
+            //tableStats->SetAffectedPartitions(tableStats->GetAffectedPartitions() + InFlightShards.Size());
         }
     }
 
@@ -1224,26 +1229,15 @@ public:
     void CommitState(const NYql::NDqProto::TCheckpoint&) override {}
     void LoadState(const NYql::NDqProto::TSourceState&) override {}
 
-    void SendCancel(ui32 id) {
-        if (!Reads[id]) {
-            return;
-        }
-        Counters->SentIteratorCancels->Inc();
-        auto* state = Reads[id].Shard;
-        auto cancel = MakeHolder<TEvDataShard::TEvReadCancel>();
-        cancel->Record.SetReadId(id);
-        Send(::PipeCacheId, new TEvPipeCache::TEvForward(cancel.Release(), state->TabletId));
-    }
-
     void PassAway() override {
         Counters->ReadActorsCount->Dec();
         {
             auto guard = BindAllocator();
             Results.clear();
-            Send(PipeCacheId, new TEvPipeCache::TEvUnlink(0));
             for (size_t i = 0; i < Reads.size(); ++i) {
-                SendCancel(i);
+                ResetRead(i);
             }
+            Send(PipeCacheId, new TEvPipeCache::TEvUnlink(0));
         }
         TBase::PassAway();
     }
@@ -1315,8 +1309,6 @@ private:
 
     bool ScanStarted = false;
     size_t BufSize = 0;
-
-    ui32 ErrorsCount = 0;
 
     const TActorId ComputeActorId;
     const ui64 InputIndex;

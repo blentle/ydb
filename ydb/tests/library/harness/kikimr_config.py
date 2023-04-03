@@ -295,7 +295,7 @@ class KikimrConfigGenerator(object):
             self.yaml_config["auth_config"] = _load_yaml_config(auth_config_path)
 
         if fq_config_path:
-            self.yaml_config["yandex_query_config"] = _load_yaml_config(fq_config_path)  # TODO: rename to federated_query_config after migration
+            self.yaml_config["federated_query_config"] = _load_yaml_config(fq_config_path)
 
         if public_http_config:
             self.yaml_config["public_http_config"] = public_http_config
@@ -392,7 +392,11 @@ class KikimrConfigGenerator(object):
         audit_file_path = os.path.join(cwd, 'audit.txt')
         with open(audit_file_path, "w") as audit_file:
             audit_file.write('')
-        self.yaml_config['audit_config'] = {'audit_file_path': audit_file_path}
+        self.yaml_config['audit_config'] = dict(
+            file_backend=dict(
+                file_path=audit_file_path,
+            )
+        )
 
     @property
     def metering_file_path(self):

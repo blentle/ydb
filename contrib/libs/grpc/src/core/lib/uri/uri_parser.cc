@@ -22,6 +22,7 @@
 
 #include <map>
 #include <util/generic/string.h>
+#include <util/string/cast.h>
 
 #include "y_absl/strings/escaping.h"
 #include "y_absl/strings/str_format.h"
@@ -165,6 +166,10 @@ y_absl::Status MakeInvalidURIStatus(y_absl::string_view part_name,
 }
 
 }  // namespace
+
+TString URI::PercentEncodeAuthority(y_absl::string_view str) {
+  return PercentEncode(str, IsAuthorityChar);
+}
 
 TString URI::PercentEncodePath(y_absl::string_view str) {
   return PercentEncode(str, IsPathChar);

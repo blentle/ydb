@@ -62,7 +62,12 @@ public:
     };
 
     using THeaders = TSmallVec<TString>;
-    using TResult = std::variant<TContent, TIssues>;
+    struct TResult {
+        TResult(TContent&& content) : Content(std::move(content)) {}
+        TResult(const TIssues& issues) : Content(""), Issues(issues) {}
+        TContent Content;
+        TIssues Issues;
+    };
     using TOnResult = std::function<void(TResult&&)>;
 
     virtual void Upload(
@@ -71,7 +76,13 @@ public:
         TString body,
         TOnResult callback,
         bool put = false,
-        IRetryPolicy</*http response code*/long>::TPtr RetryPolicy = IRetryPolicy<long>::GetNoRetryPolicy()) = 0;
+        IRetryPolicy</*http response code*/long>::TPtr retryPolicy = IRetryPolicy<long>::GetNoRetryPolicy()) = 0;
+
+    virtual void Delete(
+        TString url,
+        THeaders headers,
+        TOnResult callback,
+        IRetryPolicy</*http response code*/long>::TPtr retryPolicy = IRetryPolicy<long>::GetNoRetryPolicy()) = 0;
 
     virtual void Download(
         TString url,
@@ -80,8 +91,7 @@ public:
         std::size_t sizeLimit,
         TOnResult callback,
         TString data = {},
-        IRetryPolicy</*http response code*/long>::TPtr RetryPolicy = IRetryPolicy<long>::GetNoRetryPolicy()
-    ) = 0;
+        IRetryPolicy</*http response code*/long>::TPtr retryPolicy = IRetryPolicy<long>::GetNoRetryPolicy()) = 0;
 
     class TCountedContent : public TContentBase {
     public:
@@ -113,6 +123,8 @@ public:
         const ::NMonitoring::TDynamicCounters::TCounterPtr& inflightCounter) = 0;
         
     virtual ui64 GetBuffersSizePerStream() = 0;
+
+    static THeaders MakeYcHeaders(const TString& requestId, const TString& token = "", const TString& contentType = "");
 };
 
 }

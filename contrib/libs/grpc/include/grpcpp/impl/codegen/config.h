@@ -22,6 +22,7 @@
 // IWYU pragma: private, include <grpcpp/support/config.h>
 
 #include <util/generic/string.h>
+#include <util/string/cast.h>
 
 /// The following macros are deprecated and appear only for users
 /// with PB files generated using gRPC 1.0.x plugins. They should
@@ -36,7 +37,7 @@
 namespace grpc {
 
 // Using grpc::string and grpc::to_string is discouraged in favor of
-// TString and ToString. This is only for legacy code using
+// TString and ::ToString. This is only for legacy code using
 // them explictly.
 typedef TString string;
 

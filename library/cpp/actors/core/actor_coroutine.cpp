@@ -28,7 +28,7 @@ namespace NActors {
 #endif
     }
 
-    TActorCoroImpl::~TActorCoroImpl() {
+    void TActorCoroImpl::Destroy() {
         if (!Finished && !NSan::TSanIsOn()) { // only resume when we have bootstrapped and Run() was entered and not yet finished; in other case simply terminate
             Y_VERIFY(!PendingEvent);
             InvokedFromDtor = true;
@@ -41,9 +41,9 @@ namespace NActors {
     }
 
     THolder<IEventHandle> TActorCoroImpl::WaitForEvent(TMonotonic deadline) {
-        IEventHandleFat *timeoutEv = nullptr;
+        IEventHandle *timeoutEv = nullptr;
         if (deadline != TMonotonic::Max()) {
-            TActivationContext::Schedule(deadline, timeoutEv = new IEventHandleFat(TEvents::TSystem::CoroTimeout, 0,
+            TActivationContext::Schedule(deadline, timeoutEv = new IEventHandle(TEvents::TSystem::CoroTimeout, 0,
                 SelfActorId, {}, nullptr, 0));
         }
 
@@ -120,12 +120,22 @@ namespace NActors {
     void TActorCoroImpl::ReturnToActorSystem() {
         TExceptionSafeContext* returnContext = std::exchange(ActorSystemContext, nullptr);
         Y_VERIFY(returnContext);
+        if (StoreTlsState) {
+            StoreTlsState(this);
+        }
         FiberContext.SwitchTo(returnContext);
+        if (RestoreTlsState) {
+            RestoreTlsState(this);
+        }
         if (!PendingEvent) {
             // we have returned from the actor system and it kindly asks us to terminate the coroutine as it is being
             // stopped
             throw TDtorException();
         }
+    }
+
+    TActorCoro::~TActorCoro() {
+        Impl->Destroy();
     }
 
     STATEFN(TActorCoro::StateFunc) {

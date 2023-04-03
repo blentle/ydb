@@ -108,6 +108,12 @@ private:
                     } else if (line.Contains("embedded:Len")) {
                         // YQL-14763
                         fallback = true;
+                    } else if (line.Contains("No such transaction")) {
+                        // YQL-15542
+                        fallback = true;
+                    } else if (line.Contains("Transaction") && line.Contains("aborted")) {
+                        // YQL-15542
+                        fallback = true;
                     } else if (line.Contains("Container killed by OOM")) {
                         // temporary workaround for YQL-12066
                         fallback = true;
@@ -219,7 +225,7 @@ private:
 
                 // run
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         replyTo,
                         selfId,
                         new TEvPushFinished(channelId, freeSpace),
@@ -228,7 +234,7 @@ private:
             } catch (...) {
                 auto status = taskRunner->GetStatus();
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         replyTo,
                         selfId,
                         MakeError({status.ExitCode, status.Stderr}, settings, stageId).Release(),
@@ -264,7 +270,7 @@ private:
                     source->Finish();
                 }
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         parentId,
                         selfId,
                         new TEvAsyncInputPushFinished(index, source->GetFreeSpace()),
@@ -273,7 +279,7 @@ private:
             } catch (...) {
                 auto status = taskRunner->GetStatus();
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         parentId,
                         selfId,
                         MakeError({status.ExitCode, status.Stderr}, settings, stageId).Release(),
@@ -329,7 +335,7 @@ private:
                 }
 
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         replyTo,
                         selfId,
                         new TEvChannelPopFinished(
@@ -345,7 +351,7 @@ private:
             } catch (...) {
                 auto status = taskRunner->GetStatus();
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         replyTo,
                         selfId,
                         MakeError({status.ExitCode, status.Stderr}, settings, stageId).Release(),
@@ -403,7 +409,7 @@ private:
                 event->Strings = std::move(batch);
                 // repack data and forward
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         selfId,
                         replyTo,
                         event.Release(),
@@ -412,7 +418,7 @@ private:
             } catch (...) {
                 auto status = taskRunner->GetStatus();
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         replyTo,
                         selfId,
                         MakeError({status.ExitCode, status.Stderr}, settings, stageId).Release(),
@@ -478,7 +484,7 @@ private:
                     sensors);
 
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         replyTo,
                         selfId,
                         event.Release(),
@@ -487,7 +493,7 @@ private:
             } catch (...) {
                 auto status = taskRunner->GetStatus();
                 actorSystem->Send(
-                    new IEventHandleFat(replyTo, selfId, MakeError({status.ExitCode, status.Stderr}, settings, stageId).Release(), 0, cookie));
+                    new IEventHandle(replyTo, selfId, MakeError({status.ExitCode, status.Stderr}, settings, stageId).Release(), 0, cookie));
             }
         });
     }
@@ -523,7 +529,7 @@ private:
                 }
 
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         replyTo,
                         selfId,
                         new TEvTaskRunFinished(
@@ -544,7 +550,7 @@ private:
             } catch (...) {
                 auto status = taskRunner->GetStatus();
                 actorSystem->Send(
-                    new IEventHandleFat(
+                    new IEventHandle(
                         replyTo,
                         selfId,
                         MakeError({status.ExitCode, status.Stderr}, settings, stageId).Release(),

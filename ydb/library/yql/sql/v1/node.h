@@ -75,7 +75,8 @@ namespace NSQLTranslationV1 {
 
     enum class ETableType {
         Table,
-        TableStore
+        TableStore,
+        ExternalTable
     };
 
     class TContext;
@@ -781,7 +782,7 @@ namespace NSQLTranslationV1 {
 
         virtual bool InitAggr(TContext& ctx, bool isFactory, ISource* src, TAstListNode& node, const TVector<TNodePtr>& exprs) = 0;
 
-        virtual std::pair<TNodePtr, bool> AggregationTraits(const TNodePtr& type, bool overState, bool many, TContext& ctx) const;
+        virtual std::pair<TNodePtr, bool> AggregationTraits(const TNodePtr& type, bool overState, bool many, bool allowAggApply, TContext& ctx) const;
 
         virtual TNodePtr AggregationTraitsFactory() const = 0;
 
@@ -799,7 +800,7 @@ namespace NSQLTranslationV1 {
         virtual void Join(IAggregation* aggr);
 
     private:
-        virtual TNodePtr GetApply(const TNodePtr& type, bool many, TContext& ctx) const = 0;
+        virtual TNodePtr GetApply(const TNodePtr& type, bool many, bool allowAggApply, TContext& ctx) const = 0;
 
     protected:
         IAggregation(TPosition pos, const TString& name, const TString& func, EAggregateMode mode);
@@ -1133,10 +1134,15 @@ namespace NSQLTranslationV1 {
         TMaybe<TIdentifier> StoreType;
         TNodePtr PartitionByHashFunction;
 
+        TNodePtr DataSourcePath;
+        TNodePtr Location;
+        TVector<std::pair<TIdentifier, TNodePtr>> ExternalSourceParameters;
+
         bool IsSet() const {
             return CompactionPolicy || AutoPartitioningBySize || PartitionSizeMb || AutoPartitioningByLoad
                 || MinPartitions || MaxPartitions || UniformPartitions || PartitionAtKeys || KeyBloomFilter
-                || ReadReplicasSettings || TtlSettings || Tiering || StoreType || PartitionByHashFunction;
+                || ReadReplicasSettings || TtlSettings || Tiering || StoreType || PartitionByHashFunction
+                || DataSourcePath || Location || ExternalSourceParameters;
         }
     };
 
@@ -1397,7 +1403,7 @@ namespace NSQLTranslationV1 {
     TNodePtr BuildInputTables(TPosition pos, const TTableList& tables, bool inSubquery, TScopedStatePtr scoped);
     TNodePtr BuildCreateTable(TPosition pos, const TTableRef& tr, const TCreateTableParameters& params, TScopedStatePtr scoped);
     TNodePtr BuildAlterTable(TPosition pos, const TTableRef& tr, const TAlterTableParameters& params, TScopedStatePtr scoped);
-    TNodePtr BuildDropTable(TPosition pos, const TTableRef& table, bool isTabletore, TScopedStatePtr scoped);
+    TNodePtr BuildDropTable(TPosition pos, const TTableRef& table, ETableType tableType, TScopedStatePtr scoped);
     TNodePtr BuildCreateUser(TPosition pos, const TString& service, const TDeferredAtom& cluster, const TDeferredAtom& name, const TMaybe<TRoleParameters>& params, TScopedStatePtr scoped);
     TNodePtr BuildCreateGroup(TPosition pos, const TString& service, const TDeferredAtom& cluster, const TDeferredAtom& name, TScopedStatePtr scoped);
     TNodePtr BuildAlterUser(TPosition pos, const TString& service, const TDeferredAtom& cluster, const TDeferredAtom& name, const TRoleParameters& params, TScopedStatePtr scoped);

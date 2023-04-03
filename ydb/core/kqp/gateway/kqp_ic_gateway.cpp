@@ -12,6 +12,7 @@
 #include <ydb/core/kqp/executer_actor/kqp_executer.h>
 #include <ydb/core/kqp/rm_service/kqp_snapshot_manager.h>
 #include <ydb/core/protos/console_config.pb.h>
+#include <ydb/core/protos/external_sources.pb.h>
 #include <ydb/core/tx/schemeshard/schemeshard.h>
 #include <ydb/core/tx/tx_proxy/proxy.h>
 #include <ydb/core/grpc_services/table_settings.h>
@@ -462,7 +463,7 @@ private:
 };
 
 
-class TKqpExecPureRequestHandler: public TActorBootstrapped<TKqpExecPureRequestHandler> {
+class TKqpExecLiteralRequestHandler: public TActorBootstrapped<TKqpExecLiteralRequestHandler> {
 public:
     using TResult = IKqpGateway::TExecPhysicalResult;
 
@@ -470,7 +471,7 @@ public:
         return NKikimrServices::TActivity::KQP_EXEC_PHYSICAL_REQUEST_HANDLER;
     }
 
-    TKqpExecPureRequestHandler(IKqpGateway::TExecPhysicalRequest&& request,
+    TKqpExecLiteralRequestHandler(IKqpGateway::TExecPhysicalRequest&& request,
         TKqpRequestCounters::TPtr counters, TPromise<TResult> promise, TQueryData::TPtr params)
         : Request(std::move(request))
         , Parameters(params)
@@ -479,7 +480,7 @@ public:
     {}
 
     void Bootstrap() {
-        auto result = ::NKikimr::NKqp::ExecutePure(std::move(Request), Counters, SelfId());
+        auto result = ::NKikimr::NKqp::ExecuteLiteral(std::move(Request), Counters, SelfId());
         ProcessPureExecution(result);
         Become(&TThis::DieState);
         Send(SelfId(), new TEvents::TEvPoisonPill());
@@ -510,7 +511,7 @@ private:
             auto& txResults = ev->GetTxResults();
             result.Results.reserve(txResults.size());
             for(auto& tx : txResults) {
-                result.Results.emplace_back(std::move(tx.GetMkql()));
+                result.Results.emplace_back(tx.GetMkql());
             }
             Parameters->AddTxHolders(std::move(ev->GetTxHolders()));
             Parameters->AddTxResults(std::move(txResults));
@@ -1248,7 +1249,7 @@ public:
 
             NKikimrSchemeOp::TExternalTableDescription& externalTableDesc = *schemeTx.MutableCreateExternalTable();
             FillCreateExternalTableColumnDesc(externalTableDesc, pathPair.second, settings);
-            return SendSchemeRequest(ev.Release());
+            return SendSchemeRequest(ev.Release(), true);
         }
         catch (yexception& e) {
             return MakeFuture(ResultFromException<TGenericResult>(e));
@@ -1515,7 +1516,7 @@ public:
     protected:
         virtual TFuture<NMetadata::NModifications::TObjectOperatorResult> DoExecute(
             NMetadata::IClassBehaviour::TPtr manager, const TSettings& settings,
-            const NMetadata::NModifications::IOperationsManager::TModificationContext& context) = 0;
+            const NMetadata::NModifications::IOperationsManager::TExternalModificationContext& context) = 0;
         ui32 GetNodeId() const {
             return Owner.NodeId;
         }
@@ -1544,7 +1545,7 @@ public:
                 if (!cBehaviour->GetOperationsManager()) {
                     return MakeFuture(ResultFromError<TGenericResult>("type has not manager for operations"));
                 }
-                NMetadata::NModifications::IOperationsManager::TModificationContext context;
+                NMetadata::NModifications::IOperationsManager::TExternalModificationContext context;
                 if (GetUserToken()) {
                     context.SetUserToken(*GetUserToken());
                 }
@@ -1571,7 +1572,7 @@ public:
     protected:
         virtual TFuture<NMetadata::NModifications::TObjectOperatorResult> DoExecute(
             NMetadata::IClassBehaviour::TPtr manager, const NYql::TCreateObjectSettings& settings,
-            const NMetadata::NModifications::IOperationsManager::TModificationContext& context) override
+            const NMetadata::NModifications::IOperationsManager::TExternalModificationContext& context) override
         {
             return manager->GetOperationsManager()->CreateObject(settings, TBase::GetNodeId(), manager, context);
         }
@@ -1585,7 +1586,7 @@ public:
     protected:
         virtual TFuture<NMetadata::NModifications::TObjectOperatorResult> DoExecute(
             NMetadata::IClassBehaviour::TPtr manager, const NYql::TAlterObjectSettings& settings,
-            const NMetadata::NModifications::IOperationsManager::TModificationContext& context) override {
+            const NMetadata::NModifications::IOperationsManager::TExternalModificationContext& context) override {
             return manager->GetOperationsManager()->AlterObject(settings, TBase::GetNodeId(), manager, context);
         }
     public:
@@ -1598,7 +1599,7 @@ public:
     protected:
         virtual TFuture<NMetadata::NModifications::TObjectOperatorResult> DoExecute(
             NMetadata::IClassBehaviour::TPtr manager, const NYql::TDropObjectSettings& settings,
-            const NMetadata::NModifications::IOperationsManager::TModificationContext& context) override {
+            const NMetadata::NModifications::IOperationsManager::TExternalModificationContext& context) override {
             return manager->GetOperationsManager()->DropObject(settings, TBase::GetNodeId(), manager, context);
         }
     public:
@@ -1796,12 +1797,12 @@ public:
         }
     }
 
-    TFuture<TExecPhysicalResult> ExecutePure(TExecPhysicalRequest&& request, TQueryData::TPtr params) override {
+    TFuture<TExecPhysicalResult> ExecuteLiteral(TExecPhysicalRequest&& request, TQueryData::TPtr params) override {
         YQL_ENSURE(!request.Transactions.empty());
         YQL_ENSURE(request.DataShardLocks.empty());
         YQL_ENSURE(!request.NeedTxId);
 
-        auto containOnlyPureStages = [](const auto& request) {
+        auto containOnlyLiteralStages = [](const auto& request) {
             for (const auto& tx : request.Transactions) {
                 if (tx.Body->GetType() != NKqpProto::TKqpPhyTx::TYPE_COMPUTE) {
                     return false;
@@ -1817,9 +1818,9 @@ public:
             return true;
         };
 
-        YQL_ENSURE(containOnlyPureStages(request));
+        YQL_ENSURE(containOnlyLiteralStages(request));
         auto promise = NewPromise<TExecPhysicalResult>();
-        IActor* requestHandler = new TKqpExecPureRequestHandler(std::move(request), Counters, promise, params);
+        IActor* requestHandler = new TKqpExecLiteralRequestHandler(std::move(request), Counters, promise, params);
         RegisterActor(requestHandler);
         return promise.GetFuture();
     }
@@ -2232,6 +2233,7 @@ private:
         externalTableDesc.SetName(name);
         externalTableDesc.SetDataSourcePath(settings.DataSourcePath);
         externalTableDesc.SetLocation(settings.Location);
+        externalTableDesc.SetSourceType("General");
 
         Y_ENSURE(settings.ColumnOrder.size() == settings.Columns.size());
         for (const auto& name : settings.ColumnOrder) {
@@ -2243,6 +2245,12 @@ private:
             columnDesc.SetType(columnIt->second.Type);
             columnDesc.SetNotNull(columnIt->second.NotNull);
         }
+        NKikimrExternalSources::TGeneral general;
+        auto& attributes = *general.mutable_attributes();
+        for (const auto& [key, value]: settings.SourceTypeParameters) {
+            attributes.insert({key, value});
+        }
+        externalTableDesc.SetContent(general.SerializeAsString());
     }
 
     static void FillCreateExternalDataSourceDesc(NKikimrSchemeOp::TExternalDataSourceDescription& externaDataSourceDesc,

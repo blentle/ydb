@@ -18,9 +18,10 @@ target_link_libraries(ydb-core-kqp-ut-federated_query PUBLIC
   contrib-libs-linux-headers
   contrib-libs-cxxsupp
   yutil
-  library-cpp-lfalloc
+  cpp-malloc-jemalloc
   cpp-testing-unittest_main
   ydb-core-kqp
+  libs-aws-sdk-cpp-aws-cpp-sdk-s3
   kqp-ut-common
   yql-sql-pg_dummy
 )

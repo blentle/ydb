@@ -431,14 +431,14 @@ void FillOlapProgram(const TCoLambda& process, const NKikimr::NMiniKQL::TType* m
 class TKqpQueryCompiler : public IKqpQueryCompiler {
 public:
     TKqpQueryCompiler(const TString& cluster, const TIntrusivePtr<TKikimrTablesData> tablesData,
-        const NMiniKQL::IFunctionRegistry& funcRegistry)
+        const NMiniKQL::IFunctionRegistry& funcRegistry, TTypeAnnotationContext& typesCtx)
         : Cluster(cluster)
         , TablesData(tablesData)
         , FuncRegistry(funcRegistry)
         , Alloc(__LOCATION__, TAlignedPagePoolCounters(), funcRegistry.SupportsSizedAllocators())
         , TypeEnv(Alloc)
         , KqlCtx(cluster, tablesData, TypeEnv, FuncRegistry)
-        , KqlCompiler(CreateKqlCompiler(KqlCtx))
+        , KqlCompiler(CreateKqlCompiler(KqlCtx, typesCtx))
     {
         Alloc.Release();
     }
@@ -692,7 +692,10 @@ private:
         }
 
         stageProto.SetProgramAst(KqpExprToPrettyString(stage.Program(), ctx));
-        stageProto.SetStageGuid(NDq::TDqStageSettings::Parse(stage).Id);
+
+        auto stageSettings = NDq::TDqStageSettings::Parse(stage);
+        stageProto.SetStageGuid(stageSettings.Id);
+        stageProto.SetIsSinglePartition(stageSettings.SinglePartition);
     }
 
     void CompileTransaction(const TKqpPhysicalTx& tx, NKqpProto::TKqpPhyTx& txProto, TExprContext& ctx) {
@@ -1001,9 +1004,10 @@ private:
 } // namespace
 
 TIntrusivePtr<IKqpQueryCompiler> CreateKqpQueryCompiler(const TString& cluster,
-    const TIntrusivePtr<TKikimrTablesData> tablesData, const IFunctionRegistry& funcRegistry)
+    const TIntrusivePtr<TKikimrTablesData> tablesData, const IFunctionRegistry& funcRegistry,
+    TTypeAnnotationContext& typesCtx)
 {
-    return MakeIntrusive<TKqpQueryCompiler>(cluster, tablesData, funcRegistry);
+    return MakeIntrusive<TKqpQueryCompiler>(cluster, tablesData, funcRegistry, typesCtx);
 }
 
 } // namespace NKqp

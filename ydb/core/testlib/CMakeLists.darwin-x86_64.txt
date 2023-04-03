@@ -38,6 +38,9 @@ target_link_libraries(ydb-core-testlib PUBLIC
   ydb-core-engine
   core-engine-minikql
   ydb-core-formats
+  fq-libs-init
+  fq-libs-mock
+  fq-libs-shared_resources
   ydb-core-grpc_services
   ydb-core-health_check
   core-kesus-proxy
@@ -66,9 +69,6 @@ target_link_libraries(ydb-core-testlib PUBLIC
   core-tx-sequenceproxy
   core-tx-sequenceshard
   core-tx-time_cast
-  yq-libs-init
-  yq-libs-mock
-  yq-libs-shared_resources
   ydb-library-aclib
   library-folder_service-mock
   library-mkql_proto-protos
@@ -85,6 +85,7 @@ target_link_libraries(ydb-core-testlib PUBLIC
   ydb-services-cms
   ydb-services-datastreams
   ydb-services-discovery
+  services-ext_index-service
   ydb-services-fq
   ydb-services-kesus
   ydb-services-persqueue_cluster_discovery
@@ -95,7 +96,6 @@ target_link_libraries(ydb-core-testlib PUBLIC
   services-bg_tasks-ds_table
   ydb-services-bg_tasks
   ydb-services-ydb
-  ydb-services-yq
   ydb-core-http_proxy
 )
 target_sources(ydb-core-testlib PRIVATE

@@ -1119,6 +1119,34 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         )", FormatResultSetYson(result.GetResultSet(0)));
     }
 
+    Y_UNIT_TEST(ReadAfterWrite) {
+        auto settings = TKikimrSettings();
+        auto kikimr = TKikimrRunner{settings};
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        auto result = session.ExecuteDataQuery(R"(
+            UPSERT INTO KeyValue (Key, Value) VALUES (3u, "Three")
+        )", TTxControl::BeginTx(TTxSettings::SerializableRW())).ExtractValueSync();
+        AssertSuccessResult(result);
+
+        auto tx = result.GetTransaction();
+
+        NYdb::NTable::TExecDataQuerySettings execSettings;
+        execSettings.CollectQueryStats(ECollectQueryStatsMode::Basic);
+
+        result = session.ExecuteDataQuery(R"(
+            SELECT Amount FROM Test WHERE Group = 1 ORDER BY Amount DESC;
+        )", TTxControl::Tx(*tx).CommitTx(), execSettings).ExtractValueSync();
+        AssertSuccessResult(result);
+
+        CompareYson(R"([[[3500u]];[[300u]]])", FormatResultSetYson(result.GetResultSet(0)));
+
+        auto& stats = NYdb::TProtoAccessor::GetProto(*result.GetStats());
+        // Commit cannot be merged with physical tx for read-write transactions
+        UNIT_ASSERT_VALUES_EQUAL(stats.query_phases().size(), 2);
+    }
+
     Y_UNIT_TEST(PrunePartitionsByLiteral) {
         TKikimrSettings settings;
         TKikimrRunner kikimr(settings);
@@ -1176,16 +1204,12 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         auto& stats = NYdb::TProtoAccessor::GetProto(*result.GetStats());
 
         ui32 index = 0;
-        if (settings.AppConfig.GetTableServiceConfig().GetEnableKqpDataQueryStreamLookup()) {
-            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases().size(), 1);
-        } else {
-            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases().size(), 2);
-            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access().size(), 0);
-            UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).affected_shards(), 0);
-            UNIT_ASSERT(stats.query_phases(0).table_access().size() == 0);
+        UNIT_ASSERT_VALUES_EQUAL(stats.query_phases().size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).table_access().size(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(0).affected_shards(), 0);
+        UNIT_ASSERT(stats.query_phases(0).table_access().size() == 0);
 
-            index = 1;
-        }
+        index = 1;
 
         UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(index).table_access().size(), 1);
         UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(index).table_access(0).name(), "/Root/EightShard");
@@ -1419,6 +1443,66 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(index).table_access().size(), 1);
         UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(index).table_access(0).name(), "/Root/Join2");
         UNIT_ASSERT_VALUES_EQUAL(stats.query_phases(index).table_access(0).reads().rows(), 4);
+    }
+
+    Y_UNIT_TEST(JoinIdxLookupWithPredicate) {
+        TKikimrRunner kikimr;
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        AssertSuccessResult(session.ExecuteSchemeQuery(R"(
+            CREATE TABLE `Left` (
+                Key Uint64,
+                Value1 Uint64,
+                Value2 String,
+                PRIMARY KEY (Key)
+            );
+        )").GetValueSync());
+
+        AssertSuccessResult(session.ExecuteSchemeQuery(R"(
+            CREATE TABLE `Right` (
+                Key Uint64,
+                Value String,
+                PRIMARY KEY (Key)
+            );
+        )").GetValueSync());
+
+        AssertSuccessResult(session.ExecuteDataQuery(R"(
+            REPLACE INTO `Left` (Key, Value1, Value2) VALUES
+                (1, 6, "Value1"),
+                (2, 2, "Value1"),
+                (3, 3, "Value2"),
+                (4, 4, "Value2"),
+                (5, 5, "Value3"),
+                (6, 6, "Value1");
+
+            REPLACE INTO `Right` (Key, Value) VALUES
+                (1, "One"),
+                (2, "Two"),
+                (3, "Three"),
+                (4, "Four"),
+                (5, "Five"),
+                (6, "Six");
+        )", TTxControl::BeginTx(TTxSettings::SerializableRW()).CommitTx()).GetValueSync());
+
+        auto result = session.ExecuteDataQuery(R"(
+            $input = (
+                SELECT Key, Value1
+                FROM `Left` WHERE Value2 == "Value1"
+            );
+
+            SELECT t1.Key AS Key, t2.Value AS Value
+            FROM $input AS t1
+            INNER JOIN `Right` AS t2
+            ON t1.Value1 = t2.Key AND t1.Key = t2.Key
+            ORDER BY Key, Value;
+        )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        CompareYson(R"([
+            [[2u];["Two"]];
+            [[6u];["Six"]]
+        ])", FormatResultSetYson(result.GetResultSet(0)));
     }
 
     Y_UNIT_TEST(LeftSemiJoin) {
@@ -2793,9 +2877,7 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
     }
 
     Y_UNIT_TEST(DeleteWithInputMultiConsumptionLimit) {
-        NKikimrConfig::TAppConfig app;
-        app.MutableTableServiceConfig()->SetEnableKqpDataQuerySourceRead(false);
-        TKikimrRunner kikimr(TKikimrSettings().SetAppConfig(app));
+        TKikimrRunner kikimr;
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
@@ -3191,8 +3273,10 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
     }
 
     Y_UNIT_TEST(PushFlatmapInnerConnectionsToStageInput) {
+        NKikimrConfig::TAppConfig app;
+        app.MutableTableServiceConfig()->SetEnablePredicateExtractForDataQueries(true);
         auto settings = TKikimrSettings()
-            .SetEnablePredicateExtractForDataQueries(false);
+            .SetAppConfig(app);
         TKikimrRunner kikimr{settings};
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
@@ -3294,8 +3378,10 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
     }
 
     Y_UNIT_TEST(MultiUsageInnerConnection) {
+        NKikimrConfig::TAppConfig app;
+        app.MutableTableServiceConfig()->SetEnablePredicateExtractForDataQueries(true);
         auto settings = TKikimrSettings()
-            .SetEnablePredicateExtractForDataQueries(false);
+            .SetAppConfig(app);
 
         TKikimrRunner kikimr{settings};
         auto db = kikimr.GetTableClient();
@@ -3398,8 +3484,10 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
     }
 
     Y_UNIT_TEST(FlatmapLambdaMutiusedConnections) {
+        NKikimrConfig::TAppConfig app;
+        app.MutableTableServiceConfig()->SetEnablePredicateExtractForDataQueries(true);
         auto settings = TKikimrSettings()
-            .SetEnablePredicateExtractForDataQueries(false);
+            .SetAppConfig(app);
         TKikimrRunner kikimr{settings};
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
@@ -3444,8 +3532,10 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
     }
 
     Y_UNIT_TEST(FlatMapLambdaInnerPrecompute) {
+        NKikimrConfig::TAppConfig app;
+        app.MutableTableServiceConfig()->SetEnablePredicateExtractForDataQueries(true);
         auto settings = TKikimrSettings()
-            .SetEnablePredicateExtractForDataQueries(false);
+            .SetAppConfig(app);
         TKikimrRunner kikimr{settings};
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
@@ -3467,10 +3557,8 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         TKikimrSettings settings;
         NKikimrConfig::TAppConfig appConfig;
         appConfig.MutableTableServiceConfig()->SetEnableKqpDataQuerySourceRead(true);
+        appConfig.MutableTableServiceConfig()->SetEnablePredicateExtractForDataQueries(true);
         settings.SetDomainRoot(KikimrDefaultUtDomainRoot);
-        TFeatureFlags flags;
-        flags.SetEnablePredicateExtractForDataQueries(true);
-        settings.SetFeatureFlags(flags);
         settings.SetAppConfig(appConfig);
 
         TKikimrRunner kikimr(settings);
@@ -3500,9 +3588,7 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         NKikimrConfig::TAppConfig appConfig;
         appConfig.MutableTableServiceConfig()->SetEnableKqpDataQuerySourceRead(true);
         settings.SetDomainRoot(KikimrDefaultUtDomainRoot);
-        TFeatureFlags flags;
-        flags.SetEnablePredicateExtractForDataQueries(true);
-        settings.SetFeatureFlags(flags);
+        appConfig.MutableTableServiceConfig()->SetEnablePredicateExtractForDataQueries(true);
         settings.SetAppConfig(appConfig);
 
         TKikimrRunner kikimr(settings);
@@ -3523,9 +3609,7 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         NKikimrConfig::TAppConfig appConfig;
         appConfig.MutableTableServiceConfig()->SetEnableKqpDataQuerySourceRead(true);
         settings.SetDomainRoot(KikimrDefaultUtDomainRoot);
-        TFeatureFlags flags;
-        flags.SetEnablePredicateExtractForDataQueries(true);
-        settings.SetFeatureFlags(flags);
+        appConfig.MutableTableServiceConfig()->SetEnablePredicateExtractForDataQueries(true);
         settings.SetAppConfig(appConfig);
 
         TKikimrRunner kikimr(settings);
@@ -3556,10 +3640,8 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         TKikimrSettings settings;
         NKikimrConfig::TAppConfig appConfig;
         appConfig.MutableTableServiceConfig()->SetEnableKqpDataQuerySourceRead(true);
+        appConfig.MutableTableServiceConfig()->SetEnablePredicateExtractForDataQueries(true);
         settings.SetDomainRoot(KikimrDefaultUtDomainRoot);
-        TFeatureFlags flags;
-        flags.SetEnablePredicateExtractForDataQueries(true);
-        settings.SetFeatureFlags(flags);
         settings.SetAppConfig(appConfig);
 
         TKikimrRunner kikimr(settings);
@@ -3586,10 +3668,8 @@ Y_UNIT_TEST_SUITE(KqpNewEngine) {
         TKikimrSettings settings;
         NKikimrConfig::TAppConfig appConfig;
         appConfig.MutableTableServiceConfig()->SetEnableKqpDataQuerySourceRead(true);
+        appConfig.MutableTableServiceConfig()->SetEnablePredicateExtractForDataQueries(true);
         settings.SetDomainRoot(KikimrDefaultUtDomainRoot);
-        TFeatureFlags flags;
-        flags.SetEnablePredicateExtractForDataQueries(true);
-        settings.SetFeatureFlags(flags);
         settings.SetAppConfig(appConfig);
 
         TKikimrRunner kikimr(settings);

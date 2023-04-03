@@ -20,6 +20,7 @@
 #define SRC_COMPILER_CONFIG_H
 
 #include <util/generic/string.h>
+#include <util/string/cast.h>
 
 #include "src/compiler/config_protobuf.h"
 
@@ -30,7 +31,7 @@
 namespace grpc {
 
 // Using grpc::string and grpc::to_string is discouraged in favor of
-// TString and ToString. This is only for legacy code using
+// TString and ::ToString. This is only for legacy code using
 // them explictly.
 typedef TString string;
 

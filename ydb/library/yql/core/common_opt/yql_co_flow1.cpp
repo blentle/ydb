@@ -1356,6 +1356,11 @@ TExprNode::TPtr OptimizeToFlow(const TExprNode::TPtr& node, TExprContext& ctx, T
         return node->Head().HeadPtr();
     }
 
+    if (node->Head().IsCallable("ForwardList")) {
+        YQL_CLOG(DEBUG, Core) << "Drop " << node->Head().Content() << " under " << node->Content();
+        return ctx.ChangeChild(*node, 0U,  node->Head().HeadPtr());
+    }
+
     if (node->Head().IsCallable("Chopper")) {
         YQL_CLOG(DEBUG, Core) << "Swap " << node->Head().Content() << " with " << node->Content();
         auto children = node->Head().ChildrenList();
@@ -1731,10 +1736,11 @@ void RegisterCoFlowCallables1(TCallableOptimizerMap& map) {
         }
 
         // Very special optimizer for hybrid reduce. Drops Chain1Map whose only purpose is make key switch column.
-        if (const TCoCondense1 self(node); self.Input().Ref().IsCallable("Chain1Map") && self.SwitchHandler().Body().Ref().IsCallable("Member")
+        const TCoCondense1 self(node);
+        if (const TMaybeNode<TCoChain1Map> maybeChain(&SkipCallables(self.Input().Ref(), {"ExtractMembers"})); maybeChain && self.SwitchHandler().Body().Ref().IsCallable("Member")
             && &self.SwitchHandler().Body().Ref().Head() == self.SwitchHandler().Args().Arg(0).Raw()) {
             const auto member = self.SwitchHandler().Body().Ref().Tail().Content();
-            const TCoChain1Map chain(self.Input().Ptr());
+            const auto& chain = maybeChain.Cast();
             if (const auto init = ExtractMemberFromLiteral(chain.InitHandler().Ref(), member), update = ExtractMemberFromLiteral(chain.UpdateHandler().Ref(), member);
                 init && update && init->IsCallable("Bool") && !FromString<bool>(init->Tail().Content())) {
                 if (std::map<std::string_view, TExprNode::TPtr> usedFields;

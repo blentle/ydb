@@ -1607,6 +1607,29 @@ public:
     void UpdateStats() override {
     }
 
+    const TDqMeteringStats* GetMeteringStats() const override {
+        try {
+            NDqProto::TCommandHeader header;
+            header.SetVersion(3);
+            header.SetCommand(NDqProto::TCommandHeader::GET_METERING_STATS);
+            header.SetTaskId(Task.GetId());
+            header.Save(&Delegate->GetOutput());
+
+            NDqProto::TMeteringStatsResponse response;
+            response.Load(&Delegate->GetInput());
+
+            MeteringStats.Inputs.clear();
+            for (auto input : response.GetInputs()) {
+                auto i = MeteringStats.AddInputs();
+                i.RowsConsumed = input.GetRowsConsumed();
+                i.BytesConsumed = input.GetBytesConsumed();
+            }
+            return &MeteringStats;
+        } catch (...) {
+            Delegate->RaiseException();
+        }
+    }
+
     const TDqTaskRunnerStats* GetStats() const override
     {
         try {
@@ -1648,6 +1671,7 @@ private:
     TIntrusivePtr<TTaskRunner> Delegate;
     NDqProto::TDqTask Task;
     mutable TDqTaskRunnerStats Stats;
+    mutable TDqMeteringStats MeteringStats;
 
     THashMap<ui64, IDqInputChannel::TPtr> InputChannels;
     THashMap<ui64, IDqAsyncInputBuffer::TPtr> Sources;

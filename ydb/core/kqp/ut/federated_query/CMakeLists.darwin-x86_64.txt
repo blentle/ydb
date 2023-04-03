@@ -21,12 +21,12 @@ target_link_libraries(ydb-core-kqp-ut-federated_query PUBLIC
   library-cpp-cpuid_check
   cpp-testing-unittest_main
   ydb-core-kqp
+  libs-aws-sdk-cpp-aws-cpp-sdk-s3
   kqp-ut-common
   yql-sql-pg_dummy
 )
 target_link_options(ydb-core-kqp-ut-federated_query PRIVATE
-  -Wl,-no_deduplicate
-  -Wl,-sdk_version,10.15
+  -Wl,-platform_version,macos,11.0,11.0
   -fPIC
   -fPIC
   -framework

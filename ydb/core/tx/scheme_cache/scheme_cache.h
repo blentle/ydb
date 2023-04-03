@@ -131,6 +131,8 @@ struct TSchemeCacheNavigate {
         KindBlobDepot = 16,
         KindExternalTable = 17,
         KindExternalDataSource = 18,
+        KindBlockStoreVolume = 19,
+        KindFileStore = 20,
     };
 
     struct TListNodeEntry : public TAtomicRefCount<TListNodeEntry> {
@@ -223,6 +225,16 @@ struct TSchemeCacheNavigate {
         NKikimrSchemeOp::TExternalDataSourceDescription Description;
     };
 
+    struct TBlockStoreVolumeInfo : public TAtomicRefCount<TBlockStoreVolumeInfo> {
+        EKind Kind = KindUnknown;
+        NKikimrSchemeOp::TBlockStoreVolumeDescription Description;
+    };
+
+    struct TFileStoreInfo : public TAtomicRefCount<TFileStoreInfo> {
+        EKind Kind = KindUnknown;
+        NKikimrSchemeOp::TFileStoreDescription Description;
+    };
+
     struct TEntry {
         enum class ERequestType : ui8 {
             ByPath,
@@ -270,6 +282,8 @@ struct TSchemeCacheNavigate {
         TIntrusiveConstPtr<TBlobDepotInfo> BlobDepotInfo;
         TIntrusiveConstPtr<TExternalTableInfo> ExternalTableInfo;
         TIntrusiveConstPtr<TExternalDataSourceInfo> ExternalDataSourceInfo;
+        TIntrusiveConstPtr<TBlockStoreVolumeInfo> BlockStoreVolumeInfo;
+        TIntrusiveConstPtr<TFileStoreInfo> FileStoreInfo;
 
         TString ToString() const;
         TString ToString(const NScheme::TTypeRegistry& typeRegistry) const;
@@ -282,6 +296,7 @@ struct TSchemeCacheNavigate {
     TString DatabaseName;
     ui64 DomainOwnerId = 0;
     ui64 ErrorCount = 0;
+    ui64 Cookie = 0;
     const ui64 Instant; // deprecated, used by pq
 
     TSchemeCacheNavigate()
@@ -448,7 +463,7 @@ struct TEvTxProxySchemeCache {
 
 private:
     template <typename TDerived, ui32 EventType, typename TRequest>
-    struct TEvBasic : public TEventLight<TDerived, EventType> {
+    struct TEvBasic : public TEventLocal<TDerived, EventType> {
         TAutoPtr<TRequest> Request;
 
         TEvBasic(TAutoPtr<TRequest> request)

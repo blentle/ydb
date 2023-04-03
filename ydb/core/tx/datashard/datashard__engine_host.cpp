@@ -275,8 +275,8 @@ public:
         IsRepeatableSnapshot = true;
     }
 
-    bool HasChangeGroup() const override {
-        return bool(ChangeGroup);
+    std::optional<ui64> GetCurrentChangeGroup() const override {
+        return ChangeGroup;
     }
 
     ui64 GetChangeGroup() override {
@@ -321,7 +321,7 @@ public:
             return;
         }
 
-        if (auto lock = Self->SysLocksTable().GetRawLock(lockId, TRowVersion::Min())) {
+        if (auto lock = Self->SysLocksTable().GetRawLock(lockId, TRowVersion::Min()); lock && !VolatileCommitOrdered) {
             lock->ForAllVolatileDependencies([this](ui64 txId) {
                 if (VolatileDependencies.insert(txId).second && !VolatileTxId) {
                     VolatileTxId = EngineBay.GetTxId();
@@ -390,21 +390,16 @@ public:
         return commitTxIds;
     }
 
-    TVector<ui64> GetVolatileDependencies() const {
-        TVector<ui64> dependencies;
-
-        if (!VolatileDependencies.empty()) {
-            dependencies.reserve(VolatileDependencies.size());
-            for (ui64 dependency : VolatileDependencies) {
-                dependencies.push_back(dependency);
-            }
-        }
-
-        return dependencies;
+    const absl::flat_hash_set<ui64>& GetVolatileDependencies() const {
+        return VolatileDependencies;
     }
 
     std::optional<ui64> GetVolatileChangeGroup() const {
         return ChangeGroup;
+    }
+
+    bool GetVolatileCommitOrdered() const {
+        return VolatileCommitOrdered;
     }
 
     bool IsValidKey(TKeyDesc& key, std::pair<ui64, ui64>& maxSnapshotTime) const override {
@@ -785,11 +780,17 @@ public:
     }
 
     void CheckWriteConflicts(const TTableId& tableId, TArrayRef<const TCell> row) {
-        if (!Self->GetVolatileTxManager().GetTxMap() &&
-            !Self->SysLocksTable().HasWriteLocks(tableId))
-        {
-            // We don't have any uncommitted changes, so there's nothing we
-            // could possibly conflict with.
+        // When there are uncommitted changes (write locks) we must find which
+        // locks would break upon commit.
+        bool mustFindConflicts = Self->SysLocksTable().HasWriteLocks(tableId);
+
+        // When there are volatile changes (tx map) we try to find precise
+        // dependencies, but we may switch to total order on page faults.
+        const bool tryFindConflicts = mustFindConflicts ||
+            (!VolatileCommitOrdered && Self->GetVolatileTxManager().GetTxMap());
+
+        if (!tryFindConflicts) {
+            // We don't need to find conflicts
             return;
         }
 
@@ -804,8 +805,14 @@ public:
         NTable::ITransactionObserverPtr txObserver;
         if (LockTxId) {
             txObserver = new TLockedWriteTxObserver(this, LockTxId, skipCount, localTid);
+            // Locked writes are immediate, increased latency is not critical
+            mustFindConflicts = true;
         } else {
             txObserver = new TWriteTxObserver(this);
+            // Prefer precise conflicts for non-distributed transactions
+            if (IsImmediateTx) {
+                mustFindConflicts = true;
+            }
         }
 
         // We are not actually interested in the row version, we only need to
@@ -815,7 +822,20 @@ public:
             nullptr, txObserver);
 
         if (res.Ready == NTable::EReady::Page) {
-            throw TNotReadyTabletException();
+            if (mustFindConflicts || LockTxId) {
+                // We must gather all conflicts
+                throw TNotReadyTabletException();
+            }
+
+            // Upgrade to volatile ordered commit and ignore the page fault
+            if (!VolatileCommitOrdered) {
+                if (!VolatileTxId) {
+                    VolatileTxId = EngineBay.GetTxId();
+                }
+                VolatileCommitOrdered = true;
+                VolatileDependencies.clear();
+            }
+            return;
         }
 
         if (LockTxId || VolatileTxId) {
@@ -928,7 +948,7 @@ public:
             // even though they may not be persistent yet, since this tx will
             // also perform writes, and either it fails, or future generation
             // could not have possibly committed it already.
-            if (info->State != EVolatileTxState::Aborting) {
+            if (info->State != EVolatileTxState::Aborting && !VolatileCommitOrdered) {
                 if (!VolatileTxId) {
                     // All further writes will use this VolatileTxId and will
                     // add it to VolatileCommitTxIds, forcing it to be committed
@@ -969,6 +989,7 @@ private:
     mutable absl::flat_hash_set<ui64> VolatileCommitTxIds;
     mutable absl::flat_hash_set<ui64> VolatileDependencies;
     std::optional<ui64> ChangeGroup = std::nullopt;
+    bool VolatileCommitOrdered = false;
 };
 
 //
@@ -1191,7 +1212,7 @@ TVector<ui64> TEngineBay::GetVolatileCommitTxIds() const {
     return host->GetVolatileCommitTxIds();
 }
 
-TVector<ui64> TEngineBay::GetVolatileDependencies() const {
+const absl::flat_hash_set<ui64>& TEngineBay::GetVolatileDependencies() const {
     Y_VERIFY(EngineHost);
 
     auto* host = static_cast<TDataShardEngineHost*>(EngineHost.Get());
@@ -1203,6 +1224,13 @@ std::optional<ui64> TEngineBay::GetVolatileChangeGroup() const {
 
     auto* host = static_cast<TDataShardEngineHost*>(EngineHost.Get());
     return host->GetVolatileChangeGroup();
+}
+
+bool TEngineBay::GetVolatileCommitOrdered() const {
+    Y_VERIFY(EngineHost);
+
+    auto* host = static_cast<TDataShardEngineHost*>(EngineHost.Get());
+    return host->GetVolatileCommitOrdered();
 }
 
 IEngineFlat * TEngineBay::GetEngine() {

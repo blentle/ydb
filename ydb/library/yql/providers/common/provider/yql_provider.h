@@ -36,6 +36,7 @@ struct TWriteTableSettings {
     NNodes::TMaybeNode<NNodes::TCoAtom> Mode;
     NNodes::TMaybeNode<NNodes::TExprList> Columns;
     NNodes::TMaybeNode<NNodes::TCoAtomList> PrimaryKey;
+    NNodes::TMaybeNode<NNodes::TCoAtomList> NotNullColumns;
     NNodes::TMaybeNode<NNodes::TCoAtomList> PartitionBy;
     NNodes::TMaybeNode<NNodes::TCoNameValueTupleList> OrderBy;
     NNodes::TMaybeNode<NNodes::TCoLambda> Filter;
@@ -135,8 +136,8 @@ double GetDataReplicationFactor(const TExprNode& lambda, TExprContext& ctx);
 
 void WriteStatistics(NYson::TYsonWriter& writer, bool totalOnly, const THashMap<ui32, TOperationStatistics>& statistics);
 
-bool ValidateCompressionForInput(std::string_view compression, TExprContext& ctx);
-bool ValidateCompressionForOutput(std::string_view compression, TExprContext& ctx);
+bool ValidateCompressionForInput(std::string_view format, std::string_view compression, TExprContext& ctx);
+bool ValidateCompressionForOutput(std::string_view format, std::string_view compression, TExprContext& ctx);
 
 bool ValidateFormatForInput(std::string_view format, TExprContext& ctx);
 bool ValidateFormatForOutput(std::string_view format, TExprContext& ctx);

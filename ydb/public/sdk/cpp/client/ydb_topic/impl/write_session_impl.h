@@ -131,7 +131,6 @@ private:
     }
 
     TEventInfo GetEventImpl() { // Assumes that we're under lock and that the event queue has events.
-        Y_VERIFY(!Mutex.TryAcquire());  // We are under lock
         Y_ASSERT(HasEventsImpl());
         if (!Events.empty()) {
             TEventInfo event = std::move(Events.front());
@@ -401,6 +400,7 @@ private:
     IExecutor::TPtr Executor;
     IExecutor::TPtr CompressionExecutor;
     size_t MemoryUsage = 0; //!< Estimated amount of memory used
+    bool FirstTokenSent = false;
 
     TMessageBatch CurrentBatch;
 

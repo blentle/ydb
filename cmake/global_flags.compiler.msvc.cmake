@@ -41,8 +41,6 @@ set(_WARNS_DISABLED
 )
 
 set (_MSVC_COMMON_C_CXX_FLAGS " \
-  /DARCADIA_ROOT=$(SolutionDir.Replace('\\','/')).. \
-  /DARCADIA_BUILD_ROOT=$(SolutionDir.Replace('\\','/'))$(Configuration) \
   /DWIN32 \
   /D_WIN32 \
   /D_WINDOWS \
@@ -67,10 +65,43 @@ set (_MSVC_COMMON_C_CXX_FLAGS " \
   /permissive- \
   /D_WIN32_WINNT=0x0601 \
   /D_MBCS \
-  /DY_UCRT_INCLUDE=\"$(UniversalCRT_IncludePath.Split(';')[0].Replace('\\','/'))\" \
-  /DY_MSVC_INCLUDE=\"$(VC_VC_IncludePath.Split(';')[0].Replace('\\','/'))\" \
   /MP \
 ")
+
+if (CMAKE_GENERATOR MATCHES "Visual.Studio.*")
+  string(APPEND _MSVC_COMMON_C_CXX_FLAGS "\
+    /DY_UCRT_INCLUDE=\"$(UniversalCRT_IncludePath.Split(';')[0].Replace('\\','/'))\" \
+    /DY_MSVC_INCLUDE=\"$(VC_VC_IncludePath.Split(';')[0].Replace('\\','/'))\" \
+  ")
+else()
+  set(UCRT_INCLUDE_FOUND false)
+  foreach(INCLUDE_PATH $ENV{INCLUDE})
+    if (INCLUDE_PATH MATCHES ".*\\\\Windows Kits\\\\[0-9]+\\\\include\\\\[0-9\\.]+\\\\ucrt$")
+      message(VERBOSE "Found Y_UCRT_INCLUDE path \"${INCLUDE_PATH}\"")
+      string(REPLACE "\\" "/" SAFE_INCLUDE_PATH "${INCLUDE_PATH}")
+      string(APPEND _MSVC_COMMON_C_CXX_FLAGS " /DY_UCRT_INCLUDE=\"${SAFE_INCLUDE_PATH}\"")
+      set(UCRT_INCLUDE_FOUND true)
+      break()
+    endif()
+  endforeach()
+  if (NOT UCRT_INCLUDE_FOUND)
+    message(FATAL_ERROR "UniversalCRT include path not found, please add it to the standard INCLUDE environment variable (most likely by calling vcvars64.bat)")
+  endif()
+
+  set(MSVC_INCLUDE_FOUND false)
+  foreach(INCLUDE_PATH $ENV{INCLUDE})
+    if (INCLUDE_PATH MATCHES ".*VC\\\\Tools\\\\MSVC\\\\[0-9\\.]+\\\\include$")
+      message(VERBOSE "Found Y_MSVC_INCLUDE path \"${INCLUDE_PATH}\"")
+      string(REPLACE "\\" "/" SAFE_INCLUDE_PATH "${INCLUDE_PATH}")
+      string(APPEND _MSVC_COMMON_C_CXX_FLAGS " /DY_MSVC_INCLUDE=\"${SAFE_INCLUDE_PATH}\"")
+      set(MSVC_INCLUDE_FOUND true)
+      break()
+    endif()
+  endforeach()
+  if (NOT MSVC_INCLUDE_FOUND)
+    message(FATAL_ERROR "MSVC include path not found, please add it to the standard INCLUDE environment variable (most likely by calling vcvars64.bat)")
+  endif()
+endif()
 
 foreach(WARN ${_WARNS_AS_ERROR})
   string(APPEND _MSVC_COMMON_C_CXX_FLAGS " /we${WARN}")
@@ -84,6 +115,19 @@ foreach(WARN ${_WARNS_DISABLED})
   string(APPEND _MSVC_COMMON_C_CXX_FLAGS " /wd${WARN}")
 endforeach()
 
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+  string(APPEND _MSVC_COMMON_C_CXX_FLAGS " \
+    /D_WIN64 \
+    /DWIN64 \
+    /D__SSE2__ \
+    /D__SSE3__ \
+    /D__SSSE3__ \
+    /D__SSE4_1__ \
+    /D__SSE4_2__ \
+    /D__POPCNT__ \
+  ")
+endif()
+
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${_MSVC_COMMON_C_CXX_FLAGS} \
 ")
 
@@ -94,18 +138,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${_MSVC_COMMON_C_CXX_FLAGS} \
   /std:c++latest \
   /Zc:__cplusplus \
 ")
-set(CMAKE_CXX_FLAGS_DEBUG "/Z7")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/Z7")
 
-if ((CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64") OR (CMAKE_SYSTEM_PROCESSOR STREQUAL "AMD64"))
-  set(CMAKE_C_FLAGS "\
-    ${CMAKE_C_FLAGS} \
-      /D_WIN64 \
-      /DWIN64 \
-  ")
-  set(CMAKE_CXX_FLAGS "\
-    ${CMAKE_CXX_FLAGS} \
-      /D_WIN64 \
-      /DWIN64 \
-  ")
-endif()
+set(CMAKE_CXX_FLAGS_DEBUG "/Z7 /Ob0 /Od /D_DEBUG")
+set(CMAKE_CXX_FLAGS_MINSIZEREL "/O1 /Ob1 /DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "/Ox /Ob2 /Oi /DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/Z7 /Ox /Ob1 /DNDEBUG")

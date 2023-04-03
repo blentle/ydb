@@ -587,4 +587,22 @@ Y_UNIT_TEST_SUITE(TCastTest) {
         UNIT_ASSERT_VALUES_EQUAL(ToString(U'я'), "1103");
         UNIT_ASSERT_VALUES_EQUAL(ToString(U'\U0001F600'), "128512"); // 'GRINNING FACE' (U+1F600)
     }
+
+    Y_UNIT_TEST(TestTIntStringBuf) {
+        static_assert(TStringBuf(TIntStringBuf(111)) == TStringBuf("111"));
+        static_assert(TStringBuf(TIntStringBuf(-111)) == TStringBuf("-111"));
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(TIntStringBuf(0)), "0"sv);
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(TIntStringBuf(1111)), "1111"sv);
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(TIntStringBuf(-1)), "-1"sv);
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(TIntStringBuf(-1111)), "-1111"sv);
+
+        constexpr auto v = TIntStringBuf(-1111);
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(v), TStringBuf(ToString(-1111)));
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(TIntStringBuf<ui16>(65535)), TStringBuf("65535"));
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(TIntStringBuf<i16>(32767)), TStringBuf("32767"));
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(TIntStringBuf<i32>(-32768)), TStringBuf("-32768"));
+
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(TIntStringBuf<i8, 2>(127)), TStringBuf("1111111"));
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(TIntStringBuf<i8, 2>(-128)), TStringBuf("-10000000"));
+    }
 };

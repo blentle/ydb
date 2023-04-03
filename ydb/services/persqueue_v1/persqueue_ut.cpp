@@ -56,7 +56,7 @@ using namespace NNetClassifier;
 TAutoPtr<IEventHandle> GetClassifierUpdate(TServer& server, const TActorId sender) {
     auto& actorSystem = *server.GetRuntime();
     actorSystem.Send(
-            new IEventHandleFat(MakeNetClassifierID(), sender,
+            new IEventHandle(MakeNetClassifierID(), sender,
             new TEvNetClassifier::TEvSubscribe()
         ));
 
@@ -899,11 +899,15 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
             req.set_path("acc/topic1");
             req.set_consumer("user");
             req.set_offset(5);
+            grpc::ClientContext rcontext;
 
             auto status = TopicStubP_->CommitOffset(&rcontext, req, &resp);
 
             Cerr << resp << "\n";
+            UNIT_ASSERT(status.ok());
+            UNIT_ASSERT_VALUES_EQUAL(resp.operation().status(), Ydb::StatusIds::SUCCESS);
         }
+
 
         {
             Ydb::Topic::StreamReadMessage::FromClient req;
@@ -4205,7 +4209,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
 
         const auto edgeActorID = setup.GetServer().GetRuntime()->AllocateEdgeActor();
 
-        setup.GetServer().GetRuntime()->Send(new IEventHandleFat(NPQ::NClusterTracker::MakeClusterTrackerID(), edgeActorID, new NPQ::NClusterTracker::TEvClusterTracker::TEvSubscribe));
+        setup.GetServer().GetRuntime()->Send(new IEventHandle(NPQ::NClusterTracker::MakeClusterTrackerID(), edgeActorID, new NPQ::NClusterTracker::TEvClusterTracker::TEvSubscribe));
         log << TLOG_INFO << "Wait for cluster tracker event";
         auto clustersUpdate = setup.GetServer().GetRuntime()->GrabEdgeEvent<NPQ::NClusterTracker::TEvClusterTracker::TEvClustersUpdate>();
 
@@ -4243,7 +4247,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         TInstant now(TInstant::Now());
         auto session = setup.InitWriteSession(GenerateSessionSetupWithPreferredCluster(setup.GetRemoteCluster()));
 
-        setup.GetServer().GetRuntime()->Send(new IEventHandleFat(NPQ::NClusterTracker::MakeClusterTrackerID(), edgeActorID, new NPQ::NClusterTracker::TEvClusterTracker::TEvSubscribe));
+        setup.GetServer().GetRuntime()->Send(new IEventHandle(NPQ::NClusterTracker::MakeClusterTrackerID(), edgeActorID, new NPQ::NClusterTracker::TEvClusterTracker::TEvSubscribe));
         log << TLOG_INFO << "Wait for cluster tracker event";
         auto clustersUpdate = setup.GetServer().GetRuntime()->GrabEdgeEvent<NPQ::NClusterTracker::TEvClusterTracker::TEvClustersUpdate>();
         AssertStreamingSessionAlive(session.first);
@@ -4267,7 +4271,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
 
         setup.GetFlatMsgBusPQClient().UpdateDC(setup.GetRemoteCluster(), false, true);
 
-        setup.GetServer().GetRuntime()->Send(new IEventHandleFat(NPQ::NClusterTracker::MakeClusterTrackerID(), edgeActorID, new NPQ::NClusterTracker::TEvClusterTracker::TEvSubscribe));
+        setup.GetServer().GetRuntime()->Send(new IEventHandle(NPQ::NClusterTracker::MakeClusterTrackerID(), edgeActorID, new NPQ::NClusterTracker::TEvClusterTracker::TEvSubscribe));
         log << TLOG_INFO << "Wait for cluster tracker event";
         auto clustersUpdate = setup.GetServer().GetRuntime()->GrabEdgeEvent<NPQ::NClusterTracker::TEvClusterTracker::TEvClustersUpdate>();
         TInstant now(TInstant::Now());
@@ -5944,7 +5948,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         };
 
         auto getClustersFromTracker = [&]() {
-            setup.GetServer().GetRuntime()->Send(new IEventHandleFat(
+            setup.GetServer().GetRuntime()->Send(new IEventHandle(
                 NPQ::NClusterTracker::MakeClusterTrackerID(),
                 edgeActorID,
                 new NPQ::NClusterTracker::TEvClusterTracker::TEvSubscribe

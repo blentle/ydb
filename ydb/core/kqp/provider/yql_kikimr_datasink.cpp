@@ -494,13 +494,22 @@ public:
                     YQL_ENSURE(settings.Columns);
                     YQL_ENSURE(!settings.Columns.Cast().Empty());
 
-                    if (!settings.PrimaryKey) {
+                    const bool isExternalTable = settings.TableType && settings.TableType.Cast() == "externalTable";
+                    if (!isExternalTable && !settings.PrimaryKey) {
                         ctx.AddError(TIssue(ctx.GetPosition(node->Pos()), "Primary key is required for ydb tables."));
                         return nullptr;
                     }
 
+                    if (!settings.PrimaryKey.IsValid()) {
+                        settings.PrimaryKey = Build<TCoAtomList>(ctx, node->Pos()).Done();
+                    }
+
                     if (!settings.PartitionBy.IsValid()) {
                         settings.PartitionBy = Build<TCoAtomList>(ctx, node->Pos()).Done();
+                    }
+
+                    if (!settings.NotNullColumns.IsValid()) {
+                        settings.NotNullColumns = Build<TCoAtomList>(ctx, node->Pos()).Done();
                     }
 
                     return Build<TKiCreateTable>(ctx, node->Pos())
@@ -509,6 +518,7 @@ public:
                         .Table().Build(key.GetTablePath())
                         .Columns(settings.Columns.Cast())
                         .PrimaryKey(settings.PrimaryKey.Cast())
+                        .NotNullColumns(settings.NotNullColumns.Cast())
                         .Settings(settings.Other)
                         .Indexes(settings.Indexes.Cast())
                         .Changefeeds(settings.Changefeeds.Cast())

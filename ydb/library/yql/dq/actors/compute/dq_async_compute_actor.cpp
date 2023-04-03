@@ -225,7 +225,8 @@ private:
             if (Y_UNLIKELY(outputChannel.Stats)) {
                 outputChannel.Stats->BlockedByCapacity++;
             }
-            CA_LOG_D("Can not drain channel because it is blocked by capacity. ChannelId: " << channelId
+            CA_LOG(peerState.PeerFreeSpace == peerState.PrevPeerFreeSpace ? NActors::NLog::PRI_TRACE : NActors::NLog::PRI_DEBUG,
+                "Can not drain channel because it is blocked by capacity. ChannelId: " << channelId
                 << ". To send: " << toSend
                 << ". Free space: " << peerState.PeerFreeSpace
                 << ". Inflight: " << peerState.InFlightBytes
@@ -778,7 +779,7 @@ private:
     template <class TEvPtr>
     void ForwardToCheckpoints(TEvPtr&& ev) {
         auto* x = reinterpret_cast<TAutoPtr<NActors::IEventHandle>*>(&ev);
-        Checkpoints->Receive(*x);
+        Checkpoints->Receive(*x, TActivationContext::AsActorContext());
         ev = nullptr;
     }
 

@@ -21,20 +21,9 @@ TDqStageSettings TDqStageSettings::Parse(const TDqStageBase& node) {
             settings.LogicalId = FromString<ui64>(tuple.Value().Cast<TCoAtom>().Value());
         } else if (name == SinglePartitionSettingName) {
             settings.SinglePartition = true;
-        } else if (name == IsExternalSetting) {
-            settings.IsExternalFunction = true;
-        } else if (name == TransformNameSetting) {
-            YQL_ENSURE(tuple.Value().Maybe<TCoAtom>());
-            settings.TransformName = tuple.Value().Cast<TCoAtom>().Value();
-        } else if (name == TransformTypeSetting) {
-            YQL_ENSURE(tuple.Value().Maybe<TCoAtom>());
-            if (const auto type = tuple.Value().Cast<TCoAtom>().Value(); type == "YANDEX-CLOUD") {
-                settings.TransformType = "YandexCloudFunction";
-            } else {
-                YQL_ENSURE(false, "Unknown transform type: " << type);
-            }
-        } else if (name == TransformConcurrencySetting) {
-            settings.TransformConcurrency = FromString<ui32>(tuple.Value().Cast<TCoAtom>().Value());
+        } else if (name == WideChannelsSettingName) {
+            settings.WideChannels = true;
+            settings.OutputNarrowType = tuple.Value().Ref().GetTypeAnn()->Cast<TTypeExprType>()->GetType()->Cast<TStructExprType>();
         }
     }
 
@@ -76,13 +65,17 @@ NNodes::TCoNameValueTupleList TDqStageSettings::BuildNode(TExprContext& ctx, TPo
             .Done());
     }
 
+    if (WideChannels) {
+        YQL_ENSURE(OutputNarrowType);
+        settings.push_back(Build<TCoNameValueTuple>(ctx, pos)
+            .Name().Build(WideChannelsSettingName)
+            .Value(ExpandType(pos, *OutputNarrowType, ctx))
+            .Done());
+    }
+
     return Build<TCoNameValueTupleList>(ctx, pos)
         .Add(settings)
         .Done();
-}
-
-ui32 TDqStageSettings::MaxTransformConcurrency() const {
-    return TransformConcurrency > 0 ? TransformConcurrency : TDqSettings::TDefault::CloudFunctionConcurrency;
 }
 
 TCoAtom BuildAtom(TStringBuf value, TPositionHandle pos, TExprContext& ctx) {
@@ -151,10 +144,15 @@ ui32 GetStageOutputsCount(const TDqStageBase& stage) {
     return resultsTypeTuple->GetSize();
 }
 
-TVector<TDqConnection> FindDqConnections(const TExprBase& node) {
-    TVector<TDqConnection> connections;
+bool IsDqPureNode(const TExprBase& node) {
+    return !node.Maybe<TDqSource>() &&
+           !node.Maybe<TDqConnection>() &&
+           !node.Maybe<TDqPrecompute>();
+}
 
-    VisitExpr(node.Ptr(), [&connections](const TExprNode::TPtr& exprNode) {
+void FindDqConnections(const TExprBase& node, TVector<TDqConnection>& connections, bool& isPure) {
+    isPure = true;
+    VisitExpr(node.Ptr(), [&](const TExprNode::TPtr& exprNode) {
         TExprBase node(exprNode);
 
         if (node.Maybe<TDqPhyPrecompute>()) {
@@ -167,10 +165,12 @@ TVector<TDqConnection> FindDqConnections(const TExprBase& node) {
             return false;
         }
 
+        if (!IsDqPureNode(node)) {
+            isPure = false;
+        }
+
         return true;
     });
-
-    return connections;
 }
 
 bool IsDqPureExpr(const TExprBase& node, bool isPrecomputePure) {
@@ -179,8 +179,7 @@ bool IsDqPureExpr(const TExprBase& node, bool isPrecomputePure) {
     };
 
     auto predicate = [](const TExprNode::TPtr& node) {
-        return TMaybeNode<TDqSource>(node).IsValid() ||
-               TMaybeNode<TDqConnection>(node).IsValid();
+        return !IsDqPureNode(TExprBase(node));
     };
 
     if (isPrecomputePure) {

@@ -1,5 +1,6 @@
 #include "kqp_opt_phy_olap_filter_collection.h"
 
+#include <ydb/core/formats/ssa_runtime_version.h>
 #include <ydb/library/yql/core/yql_expr_type_annotation.h>
 #include <ydb/library/yql/utils/log/log.h>
 
@@ -15,26 +16,27 @@ namespace {
 bool IsSupportedPredicate(const TCoCompare& predicate) {
     if (predicate.Maybe<TCoCmpEqual>()) {
         return true;
-    }
-
-    if (predicate.Maybe<TCoCmpLess>()) {
+    } else if (predicate.Maybe<TCoCmpLess>()) {
         return true;
-    }
-
-    if (predicate.Maybe<TCoCmpGreater>()) {
+    } else if (predicate.Maybe<TCoCmpGreater>()) {
         return true;
-    }
-
-    if (predicate.Maybe<TCoCmpNotEqual>()) {
+    } else if (predicate.Maybe<TCoCmpNotEqual>()) {
         return true;
-    }
-
-    if (predicate.Maybe<TCoCmpGreaterOrEqual>()) {
+    } else if (predicate.Maybe<TCoCmpGreaterOrEqual>()) {
         return true;
-    }
-
-    if (predicate.Maybe<TCoCmpLessOrEqual>()) {
+    } else if (predicate.Maybe<TCoCmpLessOrEqual>()) {
         return true;
+    } else if (predicate.Maybe<TCoCmpLessOrEqual>()) {
+        return true;
+    } else if (NKikimr::NSsa::RuntimeVersion >= 2U) {
+        // We introduced LIKE pushdown in v2 of SSA program
+        if (predicate.Maybe<TCoCmpStringContains>()) {
+            return true;
+        } else if (predicate.Maybe<TCoCmpStartsWith>()) {
+            return true;
+        } else if (predicate.Maybe<TCoCmpEndsWith>()) {
+            return true;
+        }
     }
 
     return false;
@@ -337,11 +339,6 @@ bool CoalesceCanBePushed(const TCoCoalesce& coalesce, const TExprNode* lambdaArg
         return false;
     }
 
-    if (coalesce.Value().Cast<TCoBool>().Literal().Value() != "false") {
-        // Maybe we don't need this check
-        return false;
-    }
-
     if (auto maybeCompare = coalesce.Predicate().Maybe<TCoCompare>()) {
         return CompareCanBePushed(maybeCompare.Cast(), lambdaArg, lambdaBody);
     } else if (auto maybeFlatmap = coalesce.Predicate().Maybe<TCoFlatMap>()) {
@@ -377,6 +374,41 @@ void CollectPredicatesForBinaryBoolOperators(const TExprBase& opNode, TPredicate
 }
 
 } // anonymous namespace end
+
+bool TPredicateNode::IsValid() const {
+    bool res = true;
+    if (Op != EBoolOp::Undefined) {
+        res &= !Children.empty();
+        for (auto& child : Children) {
+            res &= child.IsValid();
+        }
+    }
+
+    return res && ExprNode.IsValid();
+}
+
+void TPredicateNode::SetPredicates(const std::vector<TPredicateNode>& predicates, TExprContext& ctx, TPositionHandle pos) {
+    auto predicatesSize = predicates.size();
+    if (predicatesSize == 0) {
+        return;
+    } else if (predicatesSize == 1) {
+        *this = predicates[0];
+    } else {
+        Op = EBoolOp::And;
+        Children = predicates;
+        CanBePushed = true;
+
+        TVector<TExprBase> exprNodes;
+        exprNodes.reserve(predicatesSize);
+        for (auto& pred : predicates) {
+            exprNodes.emplace_back(pred.ExprNode.Cast());
+            CanBePushed &= pred.CanBePushed;
+        }
+        ExprNode = Build<TCoAnd>(ctx, pos)
+            .Add(exprNodes)
+            .Done();
+    }
+}
 
 void CollectPredicates(const TExprBase& predicate, TPredicateNode& predicateTree, const TExprNode* lambdaArg, const TExprBase& lambdaBody) {
     if (predicate.Maybe<TCoCoalesce>()) {

@@ -57,14 +57,11 @@ TBlobStorageController::TVSlotInfo::TVSlotInfo(TVSlotId vSlotId, TPDiskInfo *pdi
 }
 
 void TBlobStorageController::TGroupInfo::CalculateGroupStatus() {
-    Status = {};
+    Status = {NKikimrBlobStorage::TGroupStatus::FULL, NKikimrBlobStorage::TGroupStatus::FULL};
 
-    if (VirtualGroupState) {
-        if (VirtualGroupState == NKikimrBlobStorage::EVirtualGroupState::WORKING) {
-            Status.MakeWorst(NKikimrBlobStorage::TGroupStatus::FULL, NKikimrBlobStorage::TGroupStatus::FULL);
-        } else {
-            Status.MakeWorst(NKikimrBlobStorage::TGroupStatus::DISINTEGRATED, NKikimrBlobStorage::TGroupStatus::DISINTEGRATED);
-        }
+    if (VirtualGroupState == NKikimrBlobStorage::EVirtualGroupState::CREATE_FAILED ||
+            (VirtualGroupState == NKikimrBlobStorage::EVirtualGroupState::NEW && VDisksInGroup.empty())) {
+        Status.MakeWorst(NKikimrBlobStorage::TGroupStatus::DISINTEGRATED, NKikimrBlobStorage::TGroupStatus::DISINTEGRATED);
     }
 
     if (VDisksInGroup) {
@@ -117,9 +114,6 @@ void TBlobStorageController::OnActivateExecutor(const TActorContext&) {
         }
     }
 
-    // create self-heal actor
-    SelfHealId = Register(CreateSelfHealActor());
-
     // create stat processor
     StatProcessorActorId = Register(CreateStatProcessorActor());
 
@@ -154,10 +148,12 @@ void TBlobStorageController::Handle(TEvInterconnect::TEvNodesInfo::TPtr &ev) {
     const bool initial = !HostRecords;
     HostRecords = std::make_shared<THostRecordMap::element_type>(ev->Get());
     Schedule(TDuration::Minutes(5), new TEvPrivate::TEvHostRecordsTimeToLiveExceeded);
-    Send(SelfHealId, new TEvPrivate::TEvUpdateHostRecords(HostRecords));
     if (initial) {
+        // create self-heal actor
+        SelfHealId = Register(CreateSelfHealActor());
         Execute(CreateTxInitScheme());
     }
+    Send(SelfHealId, new TEvPrivate::TEvUpdateHostRecords(HostRecords));
 }
 
 void TBlobStorageController::HandleHostRecordsTimeToLiveExceeded() {
@@ -176,16 +172,16 @@ void TBlobStorageController::Handle(TEvents::TEvPoisonPill::TPtr&) {
     Become(&TThis::StateBroken);
     for (TActorId *ptr : {&SelfHealId, &StatProcessorActorId, &SystemViewsCollectorId}) {
         if (const TActorId actorId = std::exchange(*ptr, {})) {
-            TActivationContext::Send(new IEventHandleFat(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
+            TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
         }
     }
     for (const auto& [id, info] : GroupMap) {
         if (auto& actorId = info->VirtualGroupSetupMachineId) {
-            TActivationContext::Send(new IEventHandleFat(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
+            TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
             actorId = {};
         }
     }
-    TActivationContext::Send(new IEventHandleFat(TEvents::TSystem::Poison, 0, Tablet(), SelfId(), nullptr, 0));
+    TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, Tablet(), SelfId(), nullptr, 0));
 }
 
 void TBlobStorageController::NotifyNodesAwaitingKeysForGroups(ui32 groupId) {
@@ -216,24 +212,26 @@ void TBlobStorageController::ValidateInternalState() {
         const auto it = vslot->PDisk->VSlotsOnPDisk.find(vslotId.VSlotId);
         Y_VERIFY(it != vslot->PDisk->VSlotsOnPDisk.end());
         Y_VERIFY(it->second == vslot.Get());
+        const TGroupInfo *group = FindGroup(vslot->GroupId);
         if (!vslot->IsBeingDeleted() && vslot->Mood != TMood::Donor) {
-            Y_VERIFY(vslot->Group == FindGroup(vslot->GroupId));
+            Y_VERIFY(group);
+            Y_VERIFY(vslot->Group == group);
         } else {
             Y_VERIFY(!vslot->Group);
         }
         if (vslot->Mood == TMood::Donor) {
-            const TVSlotInfo *acceptor = FindVSlot(vslot->AcceptorVSlotId);
-            Y_VERIFY(acceptor);
-            auto& donors = acceptor->Donors;
-            const auto it = std::find(donors.begin(), donors.end(), std::make_pair(vslotId, vslot->GetVDiskId()));
-            Y_VERIFY(it != donors.end());
+            const TVSlotInfo *acceptor = FindAcceptor(*vslot);
+            Y_VERIFY(!acceptor->IsBeingDeleted());
+            Y_VERIFY(acceptor->Mood != TMood::Donor);
+            Y_VERIFY(acceptor->Donors.contains(vslotId));
         }
-        for (const auto& [donorVSlotId, donorVDiskId] : vslot->Donors) {
+        for (const TVSlotId& donorVSlotId : vslot->Donors) {
             const TVSlotInfo *donor = FindVSlot(donorVSlotId);
             Y_VERIFY(donor);
-            Y_VERIFY(donor->GetVDiskId() == donorVDiskId);
             Y_VERIFY(donor->Mood == TMood::Donor);
-            Y_VERIFY(donor->AcceptorVSlotId == vslotId);
+            Y_VERIFY(donor->GroupId == vslot->GroupId);
+            Y_VERIFY(donor->GroupGeneration < vslot->GroupGeneration + group->ContentChanged);
+            Y_VERIFY(donor->GetShortVDiskId() == vslot->GetShortVDiskId());
         }
         if (vslot->Group) {
             if (vslot->Status == NKikimrBlobStorage::EVDiskStatus::READY) {
@@ -313,7 +311,7 @@ ui32 TBlobStorageController::GetEventPriority(IEventHandle *ev) {
         case TEvBlobStorage::EvControllerConfigRequest: {
             auto *msg = ev->Get<TEvBlobStorage::TEvControllerConfigRequest>();
             if (msg->SelfHeal) {
-                return 1; // locally-generated self-heal commands
+                return 2; // locally-generated self-heal commands
             }
             const auto& record = msg->Record;
             const auto& request = record.GetRequest();

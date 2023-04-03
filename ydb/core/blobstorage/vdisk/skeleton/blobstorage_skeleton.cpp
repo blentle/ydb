@@ -111,11 +111,16 @@ namespace NKikimr {
                 case NKikimrBlobStorage::TGroupDecommitStatus::IN_PROGRESS:
                 case NKikimrBlobStorage::TGroupDecommitStatus::DONE:
                     return true;
+
+                case NKikimrBlobStorage::TGroupDecommitStatus_E_TGroupDecommitStatus_E_INT_MIN_SENTINEL_DO_NOT_USE_:
+                case NKikimrBlobStorage::TGroupDecommitStatus_E_TGroupDecommitStatus_E_INT_MAX_SENTINEL_DO_NOT_USE_:
+                    Y_VERIFY_DEBUG(false);
+                    return true;
             }
         }
 
         template<typename TEvent>
-        bool CheckIfWriteAllowed(TAutoPtr<TEventHandleFat<TEvent>>& ev, const TActorContext& ctx) {
+        bool CheckIfWriteAllowed(TAutoPtr<TEventHandle<TEvent>>& ev, const TActorContext& ctx) {
             if (!SelfVDiskId.SameDisk(ev->Get()->Record.GetVDiskID())) {
                 ReplyError(NKikimrProto::RACE, "group generation mismatch", ev, ctx, TAppData::TimeProvider->Now());
             } else if (Config->BaseInfo.DonorMode) {
@@ -1969,7 +1974,7 @@ namespace NKikimr {
                     Db->ReplID.Set(ctx.Register(CreateReplActor(replCtx)));
                     ActiveActors.Insert(Db->ReplID); // keep forever
                     if (CommenceRepl) {
-                        TActivationContext::Send(new IEventHandleFat(TEvBlobStorage::EvCommenceRepl, 0, Db->ReplID, SelfId(),
+                        TActivationContext::Send(new IEventHandle(TEvBlobStorage::EvCommenceRepl, 0, Db->ReplID, SelfId(),
                             nullptr, 0));
                     }
                 }
@@ -2330,7 +2335,7 @@ namespace NKikimr {
         void HandleCommenceRepl(const TActorContext& /*ctx*/) {
             CommenceRepl = true;
             if (Db->ReplID) {
-                TActivationContext::Send(new IEventHandleFat(TEvBlobStorage::EvCommenceRepl, 0, Db->ReplID, SelfId(), nullptr, 0));
+                TActivationContext::Send(new IEventHandle(TEvBlobStorage::EvCommenceRepl, 0, Db->ReplID, SelfId(), nullptr, 0));
             }
         }
 
@@ -2416,7 +2421,7 @@ namespace NKikimr {
             if (!SnapshotExpirationMap.empty()) {
                 const TMonotonic when = SnapshotExpirationMap.begin()->first;
                 if (SnapshotExpirationCheckSchedule.empty() || when < SnapshotExpirationCheckSchedule.front()) {
-                    TActivationContext::Schedule(when, new IEventHandleFat(TEvPrivate::EvCheckSnapshotExpiration, 0,
+                    TActivationContext::Schedule(when, new IEventHandle(TEvPrivate::EvCheckSnapshotExpiration, 0,
                         SelfId(), {}, nullptr, when.GetValue()));
                     SnapshotExpirationCheckSchedule.push_front(when);
                 }

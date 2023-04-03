@@ -43,6 +43,10 @@ void TNodeWarden::StartLocalProxy(ui32 groupId) {
                     proxy.reset(NBlobDepot::CreateBlobDepotAgent(groupId, info, proxyActorId));
                     group.AgentProxy = true;
                     break;
+
+                case NKikimrBlobStorage::TGroupDecommitStatus_E_TGroupDecommitStatus_E_INT_MIN_SENTINEL_DO_NOT_USE_:
+                case NKikimrBlobStorage::TGroupDecommitStatus_E_TGroupDecommitStatus_E_INT_MAX_SENTINEL_DO_NOT_USE_:
+                    Y_UNREACHABLE();
             }
         } else {
             // create proxy with configuration
@@ -88,7 +92,7 @@ void TNodeWarden::HandleForwarded(TAutoPtr<::NActors::IEventHandle> &ev) {
     } else if (noGroup) {
         const TActorId errorProxy = StartEjectedProxy(id);
         TActivationContext::Forward(ev, errorProxy);
-        TActivationContext::Send(new IEventHandleFat(TEvents::TSystem::Poison, 0, errorProxy, {}, nullptr, 0));
+        TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, errorProxy, {}, nullptr, 0));
         return;
     } else if (TGroupRecord& group = Groups[id]; !group.ProxyId) {
         if (TGroupID(id).ConfigurationType() == EGroupConfigurationType::Virtual) {

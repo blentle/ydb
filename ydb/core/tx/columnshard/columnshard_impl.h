@@ -70,6 +70,41 @@ struct TSettings {
     }
 };
 
+class TBackgroundActivity {
+public:
+    enum EBackActivity : ui32 {
+        NONE = 0x00,
+        INDEX = 0x01,
+        COMPACT = 0x02,
+        CLEAN  = 0x04,
+        TTL = 0x08,
+        ALL = 0xffff
+    };
+
+    static TBackgroundActivity Indexation() { return TBackgroundActivity(INDEX); }
+    static TBackgroundActivity Compaction() { return TBackgroundActivity(COMPACT); }
+    static TBackgroundActivity Cleanup() { return TBackgroundActivity(CLEAN); }
+    static TBackgroundActivity Ttl() { return TBackgroundActivity(TTL); }
+    static TBackgroundActivity All() { return TBackgroundActivity(ALL); }
+    static TBackgroundActivity None() { return TBackgroundActivity(NONE); }
+
+    TBackgroundActivity() = default;
+
+    bool HasIndexation() const { return Activity & INDEX; }
+    bool HasCompaction() const { return Activity & COMPACT; }
+    bool HasCleanup() const { return Activity & CLEAN; }
+    bool HasTtl() const { return Activity & TTL; }
+    bool HasAll() const { return Activity == ALL; }
+    bool IndexationOnly() const { return Activity == INDEX; }
+
+private:
+    EBackActivity Activity = NONE;
+
+    TBackgroundActivity(EBackActivity activity)
+        : Activity(activity)
+    {}
+};
+
 using ITransaction = NTabletFlatExecutor::ITransaction;
 
 template <typename T>
@@ -324,6 +359,7 @@ private:
 
     struct TLongTxWriteInfo {
         ui64 WriteId;
+        ui32 WritePartId;
         NLongTxService::TLongTxId LongTxId;
         ui64 PreparedTxId = 0;
     };
@@ -352,7 +388,7 @@ private:
     TDuration FailActivationDelay = TDuration::Seconds(1);
     TDuration StatsReportInterval = TDuration::Seconds(10);
     TInstant LastAccessTime;
-    TInstant LastBackActivation;
+    TInstant LastPeriodicBackActivation;
     TInstant LastStatsReport;
 
     TActorId IndexingActor;     // It's logically bounded to 1: we move each portion of data to multiple indices.
@@ -380,7 +416,8 @@ private:
     THashMap<ui32, TSchemaPreset> SchemaPresets;
     THashMap<ui64, TTableInfo> Tables;
     THashMap<TWriteId, TLongTxWriteInfo> LongTxWrites;
-    THashMap<TULID, TLongTxWriteInfo*> LongTxWritesByUniqueId;
+    using TPartsForLTXShard = THashMap<ui32, TLongTxWriteInfo*>;
+    THashMap<TULID, TPartsForLTXShard> LongTxWritesByUniqueId;
     TMultiMap<TRowVersion, TEvColumnShard::TEvRead::TPtr> WaitingReads;
     TMultiMap<TRowVersion, TEvColumnShard::TEvScan::TPtr> WaitingScans;
     THashSet<ui64> PathsToDrop;
@@ -421,16 +458,16 @@ private:
         return PrimaryIndex && PrimaryIndex->HasOverloadedGranules();
     }
 
-    TWriteId HasLongTxWrite(const NLongTxService::TLongTxId& longTxId);
-    TWriteId GetLongTxWrite(NIceDb::TNiceDb& db, const NLongTxService::TLongTxId& longTxId);
+    TWriteId HasLongTxWrite(const NLongTxService::TLongTxId& longTxId, const ui32 partId);
+    TWriteId GetLongTxWrite(NIceDb::TNiceDb& db, const NLongTxService::TLongTxId& longTxId, const ui32 partId);
     void AddLongTxWrite(TWriteId writeId, ui64 txId);
-    void LoadLongTxWrite(TWriteId writeId, const NLongTxService::TLongTxId& longTxId);
+    void LoadLongTxWrite(TWriteId writeId, const ui32 writePartId, const NLongTxService::TLongTxId& longTxId);
     bool RemoveLongTxWrite(NIceDb::TNiceDb& db, TWriteId writeId, ui64 txId = 0);
     bool RemoveTx(NTable::TDatabase& database, ui64 txId);
     void TryAbortWrites(NIceDb::TNiceDb& db, NOlap::TDbWrapper& dbTable, THashSet<TWriteId>&& writesToAbort);
 
     void EnqueueProgressTx(const TActorContext& ctx);
-    void EnqueueBackgroundActivities(bool periodic = false, bool insertOnly = false);
+    void EnqueueBackgroundActivities(bool periodic = false, TBackgroundActivity activity = TBackgroundActivity::All());
 
     void UpdateSchemaSeqNo(const TMessageSeqNo& seqNo, NTabletFlatExecutor::TTransactionContext& txc);
     void ProtectSchemaSeqNo(const NKikimrTxColumnShard::TSchemaSeqNo& seqNoProto, NTabletFlatExecutor::TTransactionContext& txc);

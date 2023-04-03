@@ -23,7 +23,7 @@ target_link_libraries(ydb-public-lib-ydb_cli-topic-ut PUBLIC
   topic
   cpp-histogram-hdr
   cpp-threading-local_executor
-  yq-libs-private_client
+  fq-libs-private_client
   cpp-client-ydb_persqueue_public
   public-lib-experimental
   clicommands
@@ -33,8 +33,7 @@ target_link_libraries(ydb-public-lib-ydb_cli-topic-ut PUBLIC
   ydb_persqueue_core-ut-ut_utils
 )
 target_link_options(ydb-public-lib-ydb_cli-topic-ut PRIVATE
-  -Wl,-no_deduplicate
-  -Wl,-sdk_version,10.15
+  -Wl,-platform_version,macos,11.0,11.0
   -fPIC
   -fPIC
   -framework

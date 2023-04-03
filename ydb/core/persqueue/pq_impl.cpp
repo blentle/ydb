@@ -375,11 +375,12 @@ public:
         return NKikimrServices::TActivity::PERSQUEUE_ANS_ACTOR;
     }
 
-    TBuilderProxy(const ui64 tabletId, const TActorId& sender, const ui32 count)
+    TBuilderProxy(const ui64 tabletId, const TActorId& sender, const ui32 count, const ui64 cookie)
     : TabletId(tabletId)
     , Sender(sender)
     , Waiting(count)
     , Result()
+    , Cookie(cookie)
     {}
 
     void Bootstrap(const TActorContext& ctx)
@@ -405,7 +406,7 @@ private:
         for (const auto& p : Result) {
             resp.AddPartResult()->CopyFrom(p);
         }
-        ctx.Send(Sender, res.Release());
+        ctx.Send(Sender, res.Release(), 0, Cookie);
         TThis::Die(ctx);
     }
 
@@ -434,6 +435,7 @@ private:
     TActorId Sender;
     ui32 Waiting;
     TVector<typename T2::TPartResult> Result;
+    ui64 Cookie;
 };
 
 
@@ -441,17 +443,17 @@ TActorId CreateOffsetsProxyActor(const ui64 tabletId, const TActorId& sender, co
 {
     return ctx.Register(new TBuilderProxy<TEvPQ::TEvPartitionOffsetsResponse,
                                           NKikimrPQ::TOffsetsResponse,
-                                          TEvPersQueue::TEvOffsetsResponse>(tabletId, sender, count));
+                                          TEvPersQueue::TEvOffsetsResponse>(tabletId, sender, count, 0));
 }
 
 /******************************************************* StatusProxy *********************************************************/
 
 
-TActorId CreateStatusProxyActor(const ui64 tabletId, const TActorId& sender, const ui32 count, const TActorContext& ctx)
+TActorId CreateStatusProxyActor(const ui64 tabletId, const TActorId& sender, const ui32 count, const ui64 cookie, const TActorContext& ctx)
 {
     return ctx.Register(new TBuilderProxy<TEvPQ::TEvPartitionStatusResponse,
                                           NKikimrPQ::TStatusResponse,
-                                          TEvPersQueue::TEvStatusResponse>(tabletId, sender, count));
+                                          TEvPersQueue::TEvStatusResponse>(tabletId, sender, count, cookie));
 }
 
 /******************************************************* MonitoringProxy *********************************************************/
@@ -610,6 +612,7 @@ void TPersQueue::ApplyNewConfigAndReply(const TActorContext& ctx)
     Y_VERIFY(ConfigInited && PartitionsInited == Partitions.size());
 
     ApplyNewConfig(NewConfig, ctx);
+    ClearNewConfig();
 
     for (auto& p : Partitions) { //change config for already created partitions
         ctx.Send(p.second.Actor, new TEvPQ::TEvChangePartitionConfig(TopicConverter, Config));
@@ -633,9 +636,7 @@ void TPersQueue::ApplyNewConfigAndReply(const TActorContext& ctx)
         }
     }
 
-    if (!ChangePartitionConfigInflight) {
-        OnAllPartitionConfigChanged(ctx);
-    }
+    TrySendUpdateConfigResponses(ctx);
 }
 
 void TPersQueue::ApplyNewConfig(const NKikimrPQ::TPQTabletConfig& newConfig,
@@ -755,7 +756,7 @@ void TPersQueue::ReadConfig(const NKikimrClient::TKeyValueResponse::TReadResult&
         }
 
         TopicName = Config.GetTopicName();
-
+        TopicPath = Config.GetTopicPath();
         IsLocalDC = Config.GetLocalDC();
         auto& pqConfig = AppData(ctx)->PQConfig;
         TopicConverterFactory = std::make_shared<NPersQueue::TTopicNamesConverterFactory>(
@@ -1169,15 +1170,15 @@ void TPersQueue::Handle(TEvPQ::TEvPartitionConfigChanged::TPtr&, const TActorCon
     Y_VERIFY(ChangePartitionConfigInflight > 0);
     --ChangePartitionConfigInflight;
 
+    TrySendUpdateConfigResponses(ctx);
+}
+
+void TPersQueue::TrySendUpdateConfigResponses(const TActorContext& ctx)
+{
     if (ChangePartitionConfigInflight) {
         return;
     }
 
-    OnAllPartitionConfigChanged(ctx);
-}
-
-void TPersQueue::OnAllPartitionConfigChanged(const TActorContext& ctx)
-{
     for (auto& p : ChangeConfigNotification) {
         LOG_INFO_S(ctx, NKikimrServices::PERSQUEUE, "Tablet " << TabletID()
                     << " Config applied version " << Config.GetVersion() << " actor " << p.Actor
@@ -1191,8 +1192,6 @@ void TPersQueue::OnAllPartitionConfigChanged(const TActorContext& ctx)
     }
 
     ChangeConfigNotification.clear();
-    NewConfigShouldBeApplied = false;
-    NewConfig.Clear();
 }
 
 void TPersQueue::ProcessUpdateConfigRequest(TAutoPtr<TEvPersQueue::TEvUpdateConfig> ev, const TActorId& sender, const TActorContext& ctx)
@@ -1235,7 +1234,7 @@ void TPersQueue::ProcessUpdateConfigRequest(TAutoPtr<TEvPersQueue::TEvUpdateConf
     }
     if (curConfigVersion == newConfigVersion) { //nothing to change, will be answered on cfg write from prev step
         LOG_INFO_S(ctx, NKikimrServices::PERSQUEUE, "Tablet " << TabletID()
-                    << " Config update version " << Config.GetVersion() << " is already in progress actor " << sender
+                    << " Config update version " << newConfigVersion << " is already in progress actor " << sender
                     << " txId " << record.GetTxId() << " config:\n" << cfg.DebugString());
         ChangeConfigNotification.insert(TChangeNotification(sender, record.GetTxId()));
         return;
@@ -1243,7 +1242,7 @@ void TPersQueue::ProcessUpdateConfigRequest(TAutoPtr<TEvPersQueue::TEvUpdateConf
 
     if (curConfigVersion > newConfigVersion && NewConfig.HasVersion()) { //already in progress with older version
         LOG_ERROR_S(ctx, NKikimrServices::PERSQUEUE, "Tablet " << TabletID()
-                    << " Config version " << Config.GetVersion() << " is too big, applying right now version " << newConfigVersion
+                    << " Config version " << curConfigVersion << " is too big, applying right now version " << newConfigVersion
                     << " actor " << sender
                     << " txId " << record.GetTxId() << " config:\n" << cfg.DebugString());
 
@@ -1383,6 +1382,12 @@ void TPersQueue::AddCmdWriteConfig(TEvKeyValue::TEvRequest* request,
     }
 }
 
+void TPersQueue::ClearNewConfig()
+{
+    NewConfigShouldBeApplied = false;
+    NewConfig.Clear();
+}
+
 void TPersQueue::Handle(TEvPersQueue::TEvDropTablet::TPtr& ev, const TActorContext& ctx)
 {
     auto& record = ev->Get()->Record;
@@ -1477,7 +1482,7 @@ void TPersQueue::Handle(TEvPersQueue::TEvStatus::TPtr& ev, const TActorContext& 
          cnt += p.second.InitDone;
     }
 
-    TActorId ans = CreateStatusProxyActor(TabletID(), ev->Sender, cnt, ctx);
+    TActorId ans = CreateStatusProxyActor(TabletID(), ev->Sender, cnt, ev->Cookie, ctx);
     for (auto& p : Partitions) {
         if (!p.second.InitDone)
             continue;

@@ -1274,6 +1274,23 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
         return ctx.ProgramBuilder.Unwrap(opt, message, pos.File, pos.Row, pos.Column);
     });
 
+    AddCallable("EmptyFrom", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        const auto type = BuildType(node.Head(), *node.GetTypeAnn(), ctx.ProgramBuilder);
+        switch (node.GetTypeAnn()->GetKind()) {
+            case ETypeAnnotationKind::Flow:
+            case ETypeAnnotationKind::Stream:
+                return ctx.ProgramBuilder.EmptyIterator(type);
+            case ETypeAnnotationKind::Optional:
+                return ctx.ProgramBuilder.NewEmptyOptional(type);
+            case ETypeAnnotationKind::List:
+                return ctx.ProgramBuilder.NewEmptyList(AS_TYPE(TListType, type)->GetItemType());
+            case ETypeAnnotationKind::Dict:
+                return ctx.ProgramBuilder.NewDict(type, {});
+            default:
+                ythrow TNodeException(node) << "Empty from " << *node.GetTypeAnn() << " isn't supported.";
+        }
+    });
+
     AddCallable("Nothing", [](const TExprNode& node, TMkqlBuildContext& ctx) {
         const auto optType = BuildType(node.Head(), *node.Head().GetTypeAnn()->Cast<TTypeExprType>()->GetType(), ctx.ProgramBuilder);
         return ctx.ProgramBuilder.NewEmptyOptional(optType);
@@ -2462,6 +2479,21 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
         auto arg = MkqlBuildExpr(*node.Child(0), ctx);
         auto targetType = BuildType(node, *node.Child(1)->GetTypeAnn()->Cast<TTypeExprType>()->GetType(), ctx.ProgramBuilder);
         return ctx.ProgramBuilder.BlockBitCast(arg, targetType);
+    });
+
+    AddCallable("BlockNth", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        const auto tupleObj = MkqlBuildExpr(node.Head(), ctx);
+        const auto index = FromString<ui32>(node.Tail().Content());
+        return ctx.ProgramBuilder.BlockNth(tupleObj, index);
+    });
+
+    AddCallable("BlockAsTuple", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        TVector<TRuntimeNode> args;
+        for (const auto& x : node.Children()) {
+            args.push_back(MkqlBuildExpr(*x, ctx));
+        }
+
+        return ctx.ProgramBuilder.BlockAsTuple(args);
     });
 
     AddCallable("BlockCombineAll", [](const TExprNode& node, TMkqlBuildContext& ctx) {

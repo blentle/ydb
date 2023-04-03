@@ -19,6 +19,7 @@
 #include <ydb/library/yql/parser/pg_catalog/catalog.h>
 
 #include <chrono>
+#include <format>
 
 namespace NKikimr {
 namespace NMiniKQL {
@@ -121,6 +122,9 @@ TColumnDataPackInfo GetPackInfo(TType* type) {
     NUdf::EDataSlot dataType = NUdf::GetDataSlot(colTypeId);
     res.DataType = dataType;
 
+    const NYql::NUdf::TDataTypeInfo& ti =  GetDataTypeInfo(dataType);
+    res.Name = ti.Name;
+
     switch (dataType){
         case NUdf::EDataSlot::Bool:
             res.Bytes = sizeof(bool); break;
@@ -184,9 +188,7 @@ void TGraceJoinPacker::Pack()  {
 
     TuplesPacked++;
     TuplesBatchPacked++;
-    for (ui64 i = 0; i < NullsBitmapSize; ++i) {
-        TupleIntVals[i] = 0;  // Clearing nulls bit array. Bit 1 means particular column contains null value
-    }
+    std::fill(TupleIntVals.begin(), TupleIntVals.end(), 0);
 
     for (ui64 i = 0; i < ColumnsPackInfo.size(); i++) {
 
@@ -502,8 +504,14 @@ TGraceJoinPacker::TGraceJoinPacker(const std::vector<TType *> & columnTypes, con
     ui32 currIdx = 0;
     std::vector<GraceJoin::TColTypeInterface> ctiv;
 
+    bool prevKeyColumn = false;
+
     for( auto & p: ColumnsPackInfo ) {
         if ( !p.IsString && !p.IsIType ) {
+            if (prevKeyColumn && !p.IsKeyColumn) {
+                currIntOffset = ( (currIntOffset + sizeof(ui64) - 1) / sizeof(ui64) ) * sizeof(ui64); 
+            }
+            prevKeyColumn = p.IsKeyColumn;
             p.Offset = currIntOffset;
             Offsets[p.ColumnIdx] = currIntOffset;
             currIntOffset += p.Bytes;
@@ -746,7 +754,7 @@ EFetchResult TGraceJoinState::FetchValues(TComputationContext& ctx, NUdf::TUnbox
                             auto & valPtr = output[RightRenames[2 * i + 1]];
                             if ( valPtr ) {
                                 *valPtr = valsRight[RightRenames[2 * i]];
-                            }
+                                }
                         }
 
                         return EFetchResult::One;
@@ -851,8 +859,8 @@ IComputationNode* WrapGraceJoin(TCallable& callable, const TComputationNodeFacto
 
     const auto leftFlowNode = callable.GetInput(0);
     const auto rightFlowNode = callable.GetInput(1);
-    const auto leftFlowTupleType = AS_TYPE(TFlowType, leftFlowNode)->GetItemType();
-    const auto rightFlowTupleType = AS_TYPE(TFlowType, rightFlowNode)->GetItemType();
+    const auto leftFlowComponents = GetWideComponents(AS_TYPE(TFlowType, leftFlowNode));
+    const auto rightFlowComponents = GetWideComponents(AS_TYPE(TFlowType, rightFlowNode));
     const auto joinKindNode = callable.GetInput(2);
     const auto leftKeyColumnsNode = AS_VALUE(TTupleLiteral, callable.GetInput(3));
     const auto rightKeyColumnsNode = AS_VALUE(TTupleLiteral, callable.GetInput(4));
@@ -863,17 +871,16 @@ IComputationNode* WrapGraceJoin(TCallable& callable, const TComputationNodeFacto
     const auto flowLeft = dynamic_cast<IComputationWideFlowNode*> (LocateNode(ctx.NodeLocator, callable, 0));
     const auto flowRight = dynamic_cast<IComputationWideFlowNode*> (LocateNode(ctx.NodeLocator, callable, 1));
 
-    const auto tupleType = AS_TYPE(TTupleType, AS_TYPE(TFlowType, callable.GetType()->GetReturnType())->GetItemType());
+    const auto outputFlowComponents = GetWideComponents(AS_TYPE(TFlowType, callable.GetType()->GetReturnType()));
     std::vector<EValueRepresentation> outputRepresentations;
-    outputRepresentations.reserve(tupleType->GetElementsCount());
-    for (ui32 i = 0U; i < tupleType->GetElementsCount(); ++i)
-        outputRepresentations.emplace_back(GetValueRepresentation(tupleType->GetElementType(i)));
+    outputRepresentations.reserve(outputFlowComponents.size());
+    for (ui32 i = 0U; i < outputFlowComponents.size(); ++i) {
+        outputRepresentations.emplace_back(GetValueRepresentation(outputFlowComponents[i]));
+    }
 
     std::vector<ui32> leftKeyColumns, leftRenames, rightKeyColumns, rightRenames;
-    std::vector<TType *> leftColumnsTypes, rightColumnsTypes;
-
-    leftColumnsTypes.resize(AS_TYPE(TTupleType, leftFlowTupleType)->GetElementsCount());
-    rightColumnsTypes.resize(AS_TYPE(TTupleType, rightFlowTupleType)->GetElementsCount());
+    std::vector<TType*> leftColumnsTypes(leftFlowComponents.begin(), leftFlowComponents.end());
+    std::vector<TType*> rightColumnsTypes(rightFlowComponents.begin(), rightFlowComponents.end());
 
     leftKeyColumns.reserve(leftKeyColumnsNode->GetValuesCount());
     for (ui32 i = 0; i < leftKeyColumnsNode->GetValuesCount(); ++i) {
@@ -893,14 +900,6 @@ IComputationNode* WrapGraceJoin(TCallable& callable, const TComputationNodeFacto
     rightRenames.reserve(rightRenamesNode->GetValuesCount());
     for (ui32 i = 0; i < rightRenamesNode->GetValuesCount(); ++i) {
         rightRenames.emplace_back(AS_VALUE(TDataLiteral, rightRenamesNode->GetValue(i))->AsValue().Get<ui32>());
-    }
-
-    for (ui32 i = 0; i < leftColumnsTypes.size(); ++i) {
-        leftColumnsTypes[i] = AS_TYPE(TTupleType, leftFlowTupleType)->GetElementType(i);
-    }
-
-    for (ui32 i = 0; i < rightColumnsTypes.size(); ++i) {
-        rightColumnsTypes[i] = AS_TYPE(TTupleType, rightFlowTupleType)->GetElementType(i);
     }
 
     return new TGraceJoinWrapper(

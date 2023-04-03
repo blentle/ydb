@@ -1,6 +1,8 @@
 #pragma once
 
 #include <library/cpp/actors/core/actor.h>
+#include <library/cpp/actors/core/hfunc.h>
+#include <library/cpp/actors/interconnect/events_local.h>
 
 #include <deque>
 
@@ -10,14 +12,14 @@ namespace NActors {
         TBrokerLeaseHolder(TActorId waiterId, TActorId brokerId)
             : WaiterId(waiterId)
             , BrokerId(brokerId) {
-            if (TActivationContext::Send(new IEventHandleFat(BrokerId, WaiterId, new TEvHandshakeBrokerTake()))) {
+            if (TActivationContext::Send(new IEventHandle(BrokerId, WaiterId, new TEvHandshakeBrokerTake()))) {
                 LeaseRequested = true;
             }
         }
 
         ~TBrokerLeaseHolder() {
             if (LeaseRequested) {
-                TActivationContext::Send(new IEventHandleFat(BrokerId, WaiterId, new TEvHandshakeBrokerFree()));
+                TActivationContext::Send(new IEventHandle(BrokerId, WaiterId, new TEvHandshakeBrokerFree()));
             }
         }
 
@@ -38,11 +40,44 @@ namespace NActors {
 
     class THandshakeBroker : public TActor<THandshakeBroker> {
     private:
+        enum class ESelectionStrategy {
+            FIFO = 0,
+            LIFO,
+            Random,
+        };
+
+    private:
         void PermitNext() {
             if (Capacity == 0 && !Waiters.empty()) {
-                const TActorId waiter = Waiters.front();
-                Waiters.pop_front();
-                WaiterLookup.erase(waiter);
+                TActorId waiter;
+
+                switch (SelectionStrategy) {
+                case ESelectionStrategy::FIFO:
+                    waiter = Waiters.front();
+                    Waiters.pop_front();
+                    SelectionStrategy = ESelectionStrategy::LIFO;
+                    break;
+
+                case ESelectionStrategy::LIFO:
+                    waiter = Waiters.back();
+                    Waiters.pop_back();
+                    SelectionStrategy = ESelectionStrategy::Random;
+                    break;
+
+                case ESelectionStrategy::Random: {
+                    const auto it = WaiterLookup.begin();
+                    waiter = it->first;
+                    Waiters.erase(it->second);
+                    SelectionStrategy = ESelectionStrategy::FIFO;
+                    break;
+                }
+
+                default:
+                    Y_FAIL("Unimplimented selection strategy");
+                }
+
+                const size_t n = WaiterLookup.erase(waiter);
+                Y_VERIFY(n == 1);
 
                 Send(waiter, new TEvHandshakeBrokerPermit());
                 PermittedLeases.insert(waiter);
@@ -56,6 +91,8 @@ namespace NActors {
         TWaiters Waiters;
         std::unordered_map<TActorId, TWaiters::iterator> WaiterLookup;
         std::unordered_set<TActorId> PermittedLeases;
+
+        ESelectionStrategy SelectionStrategy = ESelectionStrategy::FIFO;
 
         ui32 Capacity;
 

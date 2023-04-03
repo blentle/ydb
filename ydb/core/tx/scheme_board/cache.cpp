@@ -96,9 +96,7 @@ namespace {
     template <typename TRequest, typename TEvRequest, typename TDerived>
     class TDbResolver: public TActorBootstrapped<TDerived> {
         void Handle() {
-            auto req = new TEvRequest(Request.Release());
-            req->PrepareSend(Cache, Sender);
-            TlsActivationContext->Send(req);
+            TlsActivationContext->Send(new IEventHandle(Cache, Sender, new TEvRequest(Request.Release())));
             this->PassAway();
         }
 
@@ -228,6 +226,8 @@ namespace {
             entry.SequenceInfo.Drop();
             entry.ReplicationInfo.Drop();
             entry.BlobDepotInfo.Drop();
+            entry.BlockStoreVolumeInfo.Drop();
+            entry.FileStoreInfo.Drop();
         }
 
         static void SetErrorAndClear(TResolveContext* context, TResolve::TEntry& entry) {
@@ -740,6 +740,8 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
             BlobDepotInfo.Drop();
             ExternalTableInfo.Drop();
             ExternalDataSourceInfo.Drop();
+            BlockStoreVolumeInfo.Drop();
+            FileStoreInfo.Drop();
         }
 
         void FillTableInfo(const NKikimrSchemeOp::TPathDescription& pathDesc) {
@@ -1170,6 +1172,8 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
             DESCRIPTION_PART(BlobDepotInfo);
             DESCRIPTION_PART(ExternalTableInfo);
             DESCRIPTION_PART(ExternalDataSourceInfo);
+            DESCRIPTION_PART(BlockStoreVolumeInfo);
+            DESCRIPTION_PART(FileStoreInfo);
 
             #undef DESCRIPTION_PART
 
@@ -1395,8 +1399,6 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
                 FillInfo(Kind, DomainDescription, std::move(*pathDesc.MutableDomainDescription()));
                 break;
             case NKikimrSchemeOp::EPathTypeDir:
-            case NKikimrSchemeOp::EPathTypeBlockStoreVolume:
-            case NKikimrSchemeOp::EPathTypeFileStore:
                 Kind = TNavigate::KindPath;
                 if (entryDesc.GetPathId() == entryDesc.GetParentPathId()) {
                     FillInfo(Kind, DomainDescription, std::move(*pathDesc.MutableDomainDescription()));
@@ -1484,6 +1486,14 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
                 Kind = TNavigate::KindExternalDataSource;
                 FillInfo(Kind, ExternalDataSourceInfo, std::move(*pathDesc.MutableExternalDataSourceDescription()));
                 break;
+            case NKikimrSchemeOp::EPathTypeBlockStoreVolume:
+                Kind = TNavigate::KindBlockStoreVolume;
+                FillInfo(Kind, BlockStoreVolumeInfo, std::move(*pathDesc.MutableBlockStoreVolumeDescription()));
+                break;
+            case NKikimrSchemeOp::EPathTypeFileStore:
+                Kind = TNavigate::KindFileStore;
+                FillInfo(Kind, FileStoreInfo, std::move(*pathDesc.MutableFileStoreDescription()));
+                break;
             case NKikimrSchemeOp::EPathTypeInvalid:
                 Y_VERIFY_DEBUG(false, "Invalid path type");
                 break;
@@ -1501,8 +1511,6 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
                     switch (child.GetPathType()) {
                     case NKikimrSchemeOp::EPathTypeSubDomain:
                     case NKikimrSchemeOp::EPathTypeDir:
-                    case NKikimrSchemeOp::EPathTypeBlockStoreVolume:
-                    case NKikimrSchemeOp::EPathTypeFileStore:
                         ListNodeEntry->Children.emplace_back(name, pathId, TNavigate::KindPath);
                         break;
                     case NKikimrSchemeOp::EPathTypeExtSubDomain:
@@ -1546,6 +1554,12 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
                         break;
                     case NKikimrSchemeOp::EPathTypeExternalDataSource:
                         ListNodeEntry->Children.emplace_back(name, pathId, TNavigate::KindExternalDataSource);
+                        break;
+                    case NKikimrSchemeOp::EPathTypeBlockStoreVolume:
+                        ListNodeEntry->Children.emplace_back(name, pathId, TNavigate::KindBlockStoreVolume);
+                        break;
+                    case NKikimrSchemeOp::EPathTypeFileStore:
+                        ListNodeEntry->Children.emplace_back(name, pathId, TNavigate::KindFileStore);
                         break;
                     case NKikimrSchemeOp::EPathTypeTableIndex:
                     case NKikimrSchemeOp::EPathTypeInvalid:
@@ -1695,11 +1709,13 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
             }
 
             const bool isTable = Kind == TNavigate::KindTable || Kind == TNavigate::KindColumnTable;
+            const bool isTopic = Kind == TNavigate::KindTopic || Kind == TNavigate::KindCdcStream;
+
             if (entry.Operation == TNavigate::OpTable && !isTable) {
                 return SetError(context, entry, TNavigate::EStatus::PathNotTable);
             }
 
-            if (!Created && isTable) {
+            if (!Created && (isTable || isTopic)) {
                 return SetError(context, entry, TNavigate::EStatus::PathErrorUnknown);
             }
 
@@ -1757,6 +1773,8 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
             entry.BlobDepotInfo = BlobDepotInfo;
             entry.ExternalTableInfo = ExternalTableInfo;
             entry.ExternalDataSourceInfo = ExternalDataSourceInfo;
+            entry.BlockStoreVolumeInfo = BlockStoreVolumeInfo;
+            entry.FileStoreInfo = FileStoreInfo;
         }
 
         bool CheckColumns(TResolveContext* context, TResolve::TEntry& entry,
@@ -2036,6 +2054,10 @@ class TSchemeCache: public TMonitorableActor<TSchemeCache> {
 
         // ExternalDataSource specific
         TIntrusivePtr<TNavigate::TExternalDataSourceInfo> ExternalDataSourceInfo;
+
+        // NBS specific
+        TIntrusivePtr<TNavigate::TBlockStoreVolumeInfo> BlockStoreVolumeInfo;
+        TIntrusivePtr<TNavigate::TFileStoreInfo> FileStoreInfo;
 
     }; // TCacheItem
 

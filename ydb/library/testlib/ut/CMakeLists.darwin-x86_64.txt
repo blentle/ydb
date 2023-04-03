@@ -17,8 +17,7 @@ target_link_libraries(ydb-library-testlib-ut PUBLIC
   cpp-testing-gtest_main
 )
 target_link_options(ydb-library-testlib-ut PRIVATE
-  -Wl,-no_deduplicate
-  -Wl,-sdk_version,10.15
+  -Wl,-platform_version,macos,11.0,11.0
   -fPIC
   -fPIC
 )
@@ -30,5 +29,19 @@ add_test(
   ydb-library-testlib-ut
   COMMAND
   ydb-library-testlib-ut
+)
+set_property(
+  TEST
+  ydb-library-testlib-ut
+  PROPERTY
+  LABELS
+  SMALL
+)
+set_property(
+  TEST
+  ydb-library-testlib-ut
+  PROPERTY
+  PROCESSORS
+  1
 )
 vcs_info(ydb-library-testlib-ut)

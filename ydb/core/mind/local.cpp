@@ -196,6 +196,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
             if (tabletInfo.MaxCount != 0) {
                 tabletAvailability->SetMaxCount(tabletInfo.MaxCount);
             }
+            tabletAvailability->SetPriority(tabletInfo.Priority);
         }
 
         NTabletPipe::SendData(ctx, HivePipeClient, request.Release());
@@ -280,7 +281,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
             TVector<TExecutorThreadStats> statsCopy;
             ctx.ExecutorThread.ActorSystem->GetPoolStats(AppData()->UserPoolId, poolStats, statsCopy);
             if (!statsCopy.empty()) {
-                record.MutableResourceMaximum()->SetCPU((statsCopy.size() - 1) * 1000000);
+                record.MutableResourceMaximum()->SetCPU(poolStats.CurrentThreadCount * 1000000);
             }
         }
         if (!record.GetResourceMaximum().HasMemory()) {

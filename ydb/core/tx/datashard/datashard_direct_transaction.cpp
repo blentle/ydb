@@ -5,14 +5,14 @@
 namespace NKikimr {
 namespace NDataShard {
 
-TDirectTransaction::TDirectTransaction(ui64 txId, TInstant receivedAt, ui64 tieBreakerIndex, TEvDataShard::TEvUploadRowsRequest::TPtr& ev)
-    : TOperation(TBasicOpInfo(txId, EOperationKind::DirectTx, Flags, 0, receivedAt, tieBreakerIndex))
+TDirectTransaction::TDirectTransaction(TInstant receivedAt, ui64 tieBreakerIndex, TEvDataShard::TEvUploadRowsRequest::TPtr& ev)
+    : TOperation(TBasicOpInfo(EOperationKind::DirectTx, Flags, 0, receivedAt, tieBreakerIndex))
     , Impl(new TDirectTxUpload(ev))
 {
 }
 
-TDirectTransaction::TDirectTransaction(ui64 txId, TInstant receivedAt, ui64 tieBreakerIndex, TEvDataShard::TEvEraseRowsRequest::TPtr& ev)
-    : TOperation(TBasicOpInfo(txId, EOperationKind::DirectTx, Flags, 0, receivedAt, tieBreakerIndex))
+TDirectTransaction::TDirectTransaction(TInstant receivedAt, ui64 tieBreakerIndex, TEvDataShard::TEvEraseRowsRequest::TPtr& ev)
+    : TOperation(TBasicOpInfo(EOperationKind::DirectTx, Flags, 0, receivedAt, tieBreakerIndex))
     , Impl(new TDirectTxErase(ev))
 {
 }
@@ -32,8 +32,19 @@ void TDirectTransaction::BuildExecutionPlan(bool loaded)
 
 bool TDirectTransaction::Execute(TDataShard* self, TTransactionContext& txc) {
     auto [readVersion, writeVersion] = self->GetReadWriteVersions(this);
-    if (!Impl->Execute(self, txc, readVersion, writeVersion))
+
+    // NOTE: may throw TNeedGlobalTxId exception, which is handled in direct tx unit
+    absl::flat_hash_set<ui64> volatileReadDependencies;
+    if (!Impl->Execute(self, txc, readVersion, writeVersion, GetGlobalTxId(), volatileReadDependencies)) {
+        if (!volatileReadDependencies.empty()) {
+            for (ui64 txId : volatileReadDependencies) {
+                AddVolatileDependency(txId);
+                bool ok = self->GetVolatileTxManager().AttachBlockedOperation(txId, GetTxId());
+                Y_VERIFY_S(ok, "Unexpected failure to attach " << *static_cast<TOperation*>(this) << " to volatile tx " << txId);
+            }
+        }
         return false;
+    }
 
     if (self->IsMvccEnabled()) {
         // Note: we always wait for completion, so we can ignore the result

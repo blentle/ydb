@@ -172,6 +172,12 @@ private:
     ui64 SizeBytes = 0;
 };
 
+struct TRenameIndex {
+    TString SourceName_;
+    TString DestinationName_;
+    bool ReplaceDestination_ = false;
+};
+
 bool operator==(const TIndexDescription& lhs, const TIndexDescription& rhs);
 bool operator!=(const TIndexDescription& lhs, const TIndexDescription& rhs);
 
@@ -207,6 +213,10 @@ public:
     TChangefeedDescription& WithRetentionPeriod(const TDuration& value);
     // Initial scan will output the current state of the table first
     TChangefeedDescription& WithInitialScan();
+    // Attributes
+    TChangefeedDescription& AddAttribute(const TString& key, const TString& value);
+    TChangefeedDescription& SetAttributes(const THashMap<TString, TString>& attrs);
+    TChangefeedDescription& SetAttributes(THashMap<TString, TString>&& attrs);
 
     const TString& GetName() const;
     EChangefeedMode GetMode() const;
@@ -214,6 +224,7 @@ public:
     EChangefeedState GetState() const;
     bool GetVirtualTimestamps() const;
     bool GetInitialScan() const;
+    const THashMap<TString, TString>& GetAttributes() const;
 
     void SerializeTo(Ydb::Table::Changefeed& proto) const;
     TString ToString() const;
@@ -234,6 +245,7 @@ private:
     bool VirtualTimestamps_ = false;
     std::optional<TDuration> RetentionPeriod_;
     bool InitialScan_ = false;
+    THashMap<TString, TString> Attributes_;
 };
 
 bool operator==(const TChangefeedDescription& lhs, const TChangefeedDescription& rhs);
@@ -1407,6 +1419,7 @@ struct TAlterTableSettings : public TOperationRequestSettings<TAlterTableSetting
 
     FLUENT_SETTING_VECTOR(TIndexDescription, AddIndexes);
     FLUENT_SETTING_VECTOR(TString, DropIndexes);
+    FLUENT_SETTING_VECTOR(TRenameIndex, RenameIndexes);
 
     FLUENT_SETTING_VECTOR(TChangefeedDescription, AddChangefeeds);
     FLUENT_SETTING_VECTOR(TString, DropChangefeeds);

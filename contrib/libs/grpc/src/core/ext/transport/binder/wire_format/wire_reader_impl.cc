@@ -21,6 +21,7 @@
 #include <functional>
 #include <limits>
 #include <util/generic/string.h>
+#include <util/string/cast.h>
 #include <utility>
 #include <vector>
 
@@ -32,8 +33,6 @@
 #include "src/core/ext/transport/binder/utils/transport_stream_receiver.h"
 #include "src/core/ext/transport/binder/wire_format/binder.h"
 #include "src/core/ext/transport/binder/wire_format/wire_writer.h"
-
-#include <util/string/cast.h>
 
 #define RETURN_IF_ERROR(expr)           \
   do {                                  \
@@ -190,7 +189,7 @@ y_absl::Status WireReaderImpl::ProcessTransaction(transaction_code_t code,
       gpr_log(GPR_ERROR, "calling uid = %d", uid);
       if (!security_policy_->IsAuthorized(uid)) {
         return y_absl::PermissionDeniedError(
-            "UID " + ToString(uid) +
+            "UID " + ::ToString(uid) +
             " is not allowed to connect to this "
             "transport according to security policy.");
       }

@@ -150,7 +150,7 @@ private:
 
         auto channelIt = ResultChannelProxies.begin();
         auto handle = ev->Forward(channelIt->second->SelfId());
-        channelIt->second->Receive(handle);
+        channelIt->second->Receive(handle, TlsActivationContext->AsActorContext());
     }
 
 private:
@@ -425,7 +425,7 @@ private:
     void GetResourcesSnapshot() {
         GetKqpResourceManager()->RequestClusterResourcesInfo(
             [as = TlsActivationContext->ActorSystem(), self = SelfId()](TVector<NKikimrKqp::TKqpNodeResources>&& resources) {
-                TAutoPtr<IEventHandle> eh = new IEventHandleFat(self, self, new TEvPrivate::TEvResourcesSnapshot(std::move(resources)));
+                TAutoPtr<IEventHandle> eh = new IEventHandle(self, self, new TEvPrivate::TEvResourcesSnapshot(std::move(resources)));
                 as->Send(eh);
             });
     }
@@ -491,6 +491,10 @@ private:
                 BuildScanTasks(stageInfo);
             } else {
                 YQL_ENSURE(false, "Unexpected stage type " << (int) stageInfo.Meta.TableKind);
+            }
+
+            if (stage.GetIsSinglePartition()) {
+                YQL_ENSURE(stageInfo.Tasks.size() == 1, "Unexpected multiple tasks in single-partition stage");
             }
 
             BuildKqpStageChannels(TasksGraph, TableKeys, stageInfo, TxId, AppData()->EnableKqpSpilling);
@@ -750,10 +754,10 @@ private:
         for (auto channelPair: ResultChannelProxies) {
             LOG_D("terminate result channel " << channelPair.first << " proxy at " << channelPair.second->SelfId());
 
-            TAutoPtr<IEventHandle> ev = new IEventHandleFat(
+            TAutoPtr<IEventHandle> ev = new IEventHandle(
                 channelPair.second->SelfId(), SelfId(), new TEvents::TEvPoison
             );
-            channelPair.second->Receive(ev);
+            channelPair.second->Receive(ev, TActivationContext::AsActorContext());
         }
 
         for (auto& [shardId, nodeId] : ShardIdToNodeId) {

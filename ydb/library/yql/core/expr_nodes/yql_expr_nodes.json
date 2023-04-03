@@ -373,6 +373,11 @@
             "Match": {"Type": "Callable", "Name": "UnorderedSubquery"}
         },
         {
+            "Name": "TCoEmptyFrom",
+            "Base": "TCoInputBase",
+            "Match": {"Type": "Callable", "Name": "EmptyFrom"}
+        },
+        {
             "Name": "TCoConditionalValueBase",
             "Base": "TCallable",
             "Match": {"Type": "CallableBase"},
@@ -1198,6 +1203,11 @@
             "Match": {"Type": "Callable", "Name": "EndsWith"}
         },
         {
+            "Name": "TCoCmpStringContains",
+            "Base": "TCoCompare",
+            "Match": {"Type": "Callable", "Name": "StringContains"}
+        },
+        {
             "Name": "TCoInc",
             "Base": "TCallable",
             "Match": {"Type": "Callable", "Name": "Inc"},
@@ -1538,7 +1548,6 @@
             "Name": "TCoTopBase",
             "Base": "TCoInputBase",
             "Match": {"Type": "CallableBase"},
-            "Builder": {"Generate": "None"},
             "Children": [
                 {"Index": 1, "Name": "Count", "Type": "TExprBase"},
                 {"Index": 2, "Name": "SortDirections",    "Type": "TExprBase"},

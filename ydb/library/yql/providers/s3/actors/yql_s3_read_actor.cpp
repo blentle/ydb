@@ -771,8 +771,13 @@ public:
         auto id = index + StartPathIndex;
         const TString requestId = CreateGuidAsString();
         LOG_D("TS3ReadActor", "Download: " << url << ", ID: " << id << ", request id: [" << requestId << "]");
-        Gateway->Download(url, MakeHeaders(Token, requestId), 0U, std::min(size, SizeLimit),
-            std::bind(&TS3ReadActor::OnDownloadFinished, ActorSystem, SelfId(), requestId, std::placeholders::_1, id, path), {}, RetryPolicy);
+        Gateway->Download(url,
+            IHTTPGateway::MakeYcHeaders(requestId, Token),
+            0U,
+            std::min(size, SizeLimit),
+            std::bind(&TS3ReadActor::OnDownloadFinished, ActorSystem, SelfId(), requestId, std::placeholders::_1, id, path),
+            {},
+            RetryPolicy);
     }
 
     TObjectPath ReadPathFromCache() {
@@ -835,16 +840,11 @@ private:
     }
 
     static void OnDownloadFinished(TActorSystem* actorSystem, TActorId selfId, const TString& requestId, IHTTPGateway::TResult&& result, size_t pathInd, const TString path) {
-        switch (result.index()) {
-        case 0U:
-            actorSystem->Send(new IEventHandleFat(selfId, TActorId(), new TEvPrivate::TEvReadResult(std::get<IHTTPGateway::TContent>(std::move(result)), requestId, pathInd, path)));
-            return;
-        case 1U:
-            actorSystem->Send(new IEventHandleFat(selfId, TActorId(), new TEvPrivate::TEvReadError(std::get<TIssues>(std::move(result)), requestId, pathInd, path)));
-            return;
-        default:
-            break;
-        }
+        if (!result.Issues) {
+            actorSystem->Send(new IEventHandle(selfId, TActorId(), new TEvPrivate::TEvReadResult(std::move(result.Content), requestId, pathInd, path)));
+        } else {
+            actorSystem->Send(new IEventHandle(selfId, TActorId(), new TEvPrivate::TEvReadError(std::move(result.Issues), requestId, pathInd, path)));
+        }		
     }
 
     i64 GetAsyncInputData(TUnboxedValueVector& buffer, TMaybe<TInstant>&, bool& finished, i64 freeSpace) final {
@@ -953,14 +953,6 @@ private:
         ContainerCache.Clear();
         Send(FileQueueActor, new NActors::TEvents::TEvPoison());
         TActorBootstrapped<TS3ReadActor>::PassAway();
-    }
-
-    static IHTTPGateway::THeaders MakeHeaders(const TString& token, const TString& requestId) {
-        IHTTPGateway::THeaders headers{TString{"X-Request-ID:"} += requestId};
-        if (token) {
-            headers.emplace_back(TString("X-YaCloud-SubjectToken:") += token);
-        }
-        return headers;
     }
 
 private:
@@ -1082,15 +1074,15 @@ struct TRetryStuff {
 };
 
 void OnDownloadStart(TActorSystem* actorSystem, const TActorId& self, const TActorId& parent, long httpResponseCode) {
-    actorSystem->Send(new IEventHandleFat(self, parent, new TEvPrivate::TEvReadStarted(httpResponseCode)));
+    actorSystem->Send(new IEventHandle(self, parent, new TEvPrivate::TEvReadStarted(httpResponseCode)));
 }
 
 void OnNewData(TActorSystem* actorSystem, const TActorId& self, const TActorId& parent, IHTTPGateway::TCountedContent&& data) {
-    actorSystem->Send(new IEventHandleFat(self, parent, new TEvPrivate::TEvDataPart(std::move(data))));
+    actorSystem->Send(new IEventHandle(self, parent, new TEvPrivate::TEvDataPart(std::move(data))));
 }
 
 void OnDownloadFinished(TActorSystem* actorSystem, const TActorId& self, const TActorId& parent, size_t pathIndex, TIssues issues) {
-    actorSystem->Send(new IEventHandleFat(self, parent, new TEvPrivate::TEvReadFinished(pathIndex, std::move(issues))));
+    actorSystem->Send(new IEventHandle(self, parent, new TEvPrivate::TEvReadFinished(pathIndex, std::move(issues))));
 }
 
 void DownloadStart(const TRetryStuff::TPtr& retryStuff, TActorSystem* actorSystem, const TActorId& self, const TActorId& parent, size_t pathIndex, const ::NMonitoring::TDynamicCounters::TCounterPtr& inflightCounter) {
@@ -1116,12 +1108,12 @@ std::shared_ptr<arrow::Array> ArrowDate32AsYqlDate(const std::shared_ptr<arrow::
                 continue;
             }
         } else if (!item) {
-            throw yexception() << "null value for date could not be represented in non-optional type";
+            throw parquet::ParquetException(TStringBuilder() << "null value for date could not be represented in non-optional type");
         }
 
         const i32 v = item.As<i32>();
         if (v < 0 || v > ::NYql::NUdf::MAX_DATE) {
-            throw yexception() << "date in parquet is out of range [0, " << ::NYql::NUdf::MAX_DATE << "]: " << v;
+            throw parquet::ParquetException(TStringBuilder() << "date in parquet is out of range [0, " << ::NYql::NUdf::MAX_DATE << "]: " << v);
         }
         builder.Add(NUdf::TBlockItem(static_cast<ui16>(v)));
     }
@@ -1343,7 +1335,7 @@ public:
                 --cntBlocksInFly;
             }
             Send(ParentActorId, new TEvPrivate::TEvNextBlock(batch, PathIndex, [actorSystem, selfId]() {
-                actorSystem->Send(new IEventHandleFat(selfId, TActorId{}, new TEvPrivate::TEvBlockProcessed()));
+                actorSystem->Send(new IEventHandle(selfId, TActorId{}, new TEvPrivate::TEvBlockProcessed()));
             }, TakeIngressDelta(), TakeCpuTimeDelta()));
         }
         while (cntBlocksInFly--) {
@@ -1361,14 +1353,20 @@ public:
         for (int i = 0; i < outputSchema->num_fields(); ++i) {
             const auto& targetField = outputSchema->field(i);
             auto srcFieldIndex = dataSchema->GetFieldIndex(targetField->name());
-            YQL_ENSURE(srcFieldIndex != -1, "Missing field: " << targetField->name());
+            if (srcFieldIndex == -1) {
+                throw parquet::ParquetException(TStringBuilder() << "Missing field: " << targetField->name());
+            };
             auto targetType = targetField->type();
             auto originalType = dataSchema->field(srcFieldIndex)->type();
-            YQL_ENSURE(!originalType->layout().has_dictionary, "Unsupported dictionary encoding is used for field: "
-                        << targetField->name() << ", type: " << originalType->ToString());
+            if (originalType->layout().has_dictionary) {
+                throw parquet::ParquetException(TStringBuilder() << "Unsupported dictionary encoding is used for field: "
+                    << targetField->name() << ", type: " << originalType->ToString());
+            }
             columnIndices.push_back(srcFieldIndex);
             auto rowSpecColumnIt = ReadSpec->RowSpec.find(targetField->name());
-            YQL_ENSURE(rowSpecColumnIt != ReadSpec->RowSpec.end(), "Column " << targetField->name() << " not found in row spec");
+            if (rowSpecColumnIt == ReadSpec->RowSpec.end()) {
+                throw parquet::ParquetException(TStringBuilder() << "Column " << targetField->name() << " not found in row spec");
+            }
             columnConverters.emplace_back(BuildColumnConverter(targetField->name(), originalType, targetType, rowSpecColumnIt->second));
         }
     }
@@ -1384,7 +1382,7 @@ public:
 
         auto future = ArrowReader->GetSchema(fileDesc);
         future.Subscribe([actorSystem, selfId](const NThreading::TFuture<IArrowReader::TSchemaResponse>&) {
-            actorSystem->Send(new IEventHandleFat(selfId, selfId, new TEvPrivate::TEvFutureResolved()));
+            actorSystem->Send(new IEventHandle(selfId, selfId, new TEvPrivate::TEvFutureResolved()));
         });
 
         CpuTime += GetCpuTimeDelta();
@@ -1406,7 +1404,7 @@ public:
 
             auto future = ArrowReader->ReadRowGroup(fileDesc, group, columnIndices);
             future.Subscribe([actorSystem, selfId](const NThreading::TFuture<std::shared_ptr<arrow::Table>>&){
-                actorSystem->Send(new IEventHandleFat(selfId, selfId, new TEvPrivate::TEvFutureResolved()));
+                actorSystem->Send(new IEventHandle(selfId, selfId, new TEvPrivate::TEvFutureResolved()));
             });
 
             CpuTime += GetCpuTimeDelta();
@@ -1456,15 +1454,10 @@ public:
     std::map<ui64, ui64> RowGroupReaderIndex;
 
     static void OnResult(TActorSystem* actorSystem, TActorId selfId, TEvPrivate::TReadRange range, ui64 cookie, IHTTPGateway::TResult&& result) {
-        switch (result.index()) {
-        case 0U:
-            actorSystem->Send(new IEventHandleFat(selfId, TActorId{}, new TEvPrivate::TEvReadResult2(range, std::get<IHTTPGateway::TContent>(std::move(result))), 0, cookie));
-            return;
-        case 1U:
-            actorSystem->Send(new IEventHandleFat(selfId, TActorId{}, new TEvPrivate::TEvReadResult2(range, std::get<TIssues>(std::move(result))), 0, cookie));
-            return;
-        default:
-            break;
+        if (!result.Issues) {
+            actorSystem->Send(new IEventHandle(selfId, TActorId{}, new TEvPrivate::TEvReadResult2(range, std::move(result.Content)), 0, cookie));
+        } else {
+            actorSystem->Send(new IEventHandle(selfId, TActorId{}, new TEvPrivate::TEvReadResult2(range, std::move(result.Issues)), 0, cookie));
         }
     }
 
@@ -1542,12 +1535,12 @@ public:
             LOG_CORO_W("Download completed for unknown/discarded range [" << readyRange.Offset << "-" << readyRange.Length << "]");
             return;
         }
-        
+
         if (it->second.Cookie != event.Cookie) {
             LOG_CORO_W("Mistmatched cookie for range [" << readyRange.Offset << "-" << readyRange.Length << "], received " << event.Cookie << ", expected " << it->second.Cookie);
             return;
-        } 
-        
+        }
+
         it->second.Data = event.Get()->Result.Extract();
         ui64 size = it->second.Data.size();
         it->second.Ready = true;
@@ -1557,7 +1550,9 @@ public:
                 ReadyRowGroups.push(*it->second.RowGroupIndex);
             }
             ReadInflightSize[*it->second.RowGroupIndex] += size;
-            RawInflightSize->Add(size);
+            if (RawInflightSize) {
+                RawInflightSize->Add(size);
+            }
         }
     }
 
@@ -1656,7 +1651,7 @@ public:
                     CpuTime += GetCpuTimeDelta();
 
                     // if reordering is not allowed wait for row groups sequentially
-                    while (ReadyRowGroups.empty() 
+                    while (ReadyRowGroups.empty()
                             || (!ReadSpec->RowGroupReordering && ReadyRowGroups.top() > readyGroupCount) ) {
                         ProcessOneEvent();
                     }
@@ -1751,7 +1746,7 @@ public:
                 }
                 Send(ParentActorId, new TEvPrivate::TEvNextRecordBatch(
                     ConvertArrowColumns(batch, columnConverters), PathIndex, [actorSystem, selfId]() {
-                        actorSystem->Send(new IEventHandleFat(selfId, TActorId{}, new TEvPrivate::TEvBlockProcessed()));
+                        actorSystem->Send(new IEventHandle(selfId, TActorId{}, new TEvPrivate::TEvBlockProcessed()));
                     }, TakeIngressDelta(), TakeCpuTimeDelta()
                 ));
             }
@@ -1852,7 +1847,11 @@ public:
         if (Issues) {
             RetryStuff->NextRetryDelay = RetryStuff->GetRetryState()->GetNextRetryDelay(HttpResponseCode >= 300 ? HttpResponseCode : 0);
             LOG_CORO_D("TEvReadFinished with Issues (try to retry): " << Issues.ToOneLineString());
-            if (!RetryStuff->NextRetryDelay) {
+            if (RetryStuff->NextRetryDelay) {
+                // inplace retry: report problem to TransientIssues and repeat
+                Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvAsyncInputError(InputIndex, Issues, NYql::NDqProto::StatusIds::UNSPECIFIED));
+            } else {
+                // can't retry here: fail download
                 RetryStuff->RetryState = nullptr;
                 InputFinished = true;
                 LOG_CORO_W("ReadError: " << Issues.ToOneLineString() << ", LastOffset: " << LastOffset << ", LastData: " << GetLastDataAsText());
@@ -1861,7 +1860,7 @@ public:
         }
 
         if (!RetryStuff->IsCancelled() && RetryStuff->NextRetryDelay && RetryStuff->SizeLimit > 0ULL) {
-            GetActorSystem()->Schedule(*RetryStuff->NextRetryDelay, new IEventHandleFat(ParentActorId, SelfActorId, new TEvPrivate::TEvRetryEventFunc(std::bind(&DownloadStart, RetryStuff, GetActorSystem(), SelfActorId, ParentActorId, PathIndex, HttpInflightSize))));
+            GetActorSystem()->Schedule(*RetryStuff->NextRetryDelay, new IEventHandle(ParentActorId, SelfActorId, new TEvPrivate::TEvRetryEventFunc(std::bind(&DownloadStart, RetryStuff, GetActorSystem(), SelfActorId, ParentActorId, PathIndex, HttpInflightSize))));
             InputBuffer.clear();
             if (DeferredDataParts.size()) {
                 if (DeferredQueueSize) {
@@ -1960,7 +1959,7 @@ private:
         try {
             if (ReadSpec->Arrow) {
                 if (ReadSpec->Compression) {
-                    Issues.AddIssue(TIssue("Blocks optimisations are incompatible with external compression, use Pragma DisableUseBlocks"));
+                    Issues.AddIssue(TIssue("Blocks optimisations are incompatible with external compression"));
                     fatalCode = NYql::NDqProto::StatusIds::BAD_REQUEST;
                 } else {
                     try {
@@ -2208,7 +2207,7 @@ public:
         auto stuff = std::make_shared<TRetryStuff>(
             Gateway,
             Url + objectPath.Path,
-            MakeHeaders(Token, requestId),
+            IHTTPGateway::MakeYcHeaders(requestId, Token),
             objectPath.Size,
             TxId,
             requestId,
@@ -2415,14 +2414,6 @@ private:
         ArrowRowContainerCache.Clear();
 
         TActorBootstrapped<TS3StreamReadActor>::PassAway();
-    }
-
-    static IHTTPGateway::THeaders MakeHeaders(const TString& token, const TString& requestId) {
-        IHTTPGateway::THeaders headers{TString{"X-Request-ID:"} += requestId};
-        if (token) {
-            headers.emplace_back(TString("X-YaCloud-SubjectToken:") += token);
-        }
-        return headers;
     }
 
     void MaybePause() {
@@ -2791,13 +2782,10 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
             ythrow yexception()
                 << "'pathpatternvariant' must be configured for directory listing";
         }
-        auto maybePathPatternVariant =
-            NS3Lister::DeserializePatternVariant(pathPatternVariantValue->second);
-        if (maybePathPatternVariant.Empty()) {
+        if (!TryFromString(pathPatternVariantValue->second, pathPatternVariant)) {
             ythrow yexception()
                 << "Unknown 'pathpatternvariant': " << pathPatternVariantValue->second;
         }
-        pathPatternVariant = *maybePathPatternVariant;
     }
     ui64 fileSizeLimit = cfg.FileSizeLimit;
     if (params.HasFormat()) {
@@ -2828,6 +2816,7 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
         readSpec->ParallelRowGroupCount = std::max(1ul, params.GetParallelRowGroupCount());
         readSpec->RowGroupReordering = params.GetRowGroupReordering();
         if (readSpec->Arrow) {
+            fileSizeLimit = cfg.BlockFileSizeLimit;
             arrow::SchemaBuilder builder;
             const TStringBuf blockLengthColumn("_yql_block_length"sv);
             auto extraStructType = static_cast<TStructType*>(pb->NewStructType(structType, blockLengthColumn,

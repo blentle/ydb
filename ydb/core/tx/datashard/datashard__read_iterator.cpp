@@ -553,6 +553,17 @@ public:
             } else {
                 Self->IncCounter(COUNTER_READ_ITERATOR_MAX_TIME_REACHED);
             }
+
+            NKikimrTxDataShard::TReadContinuationToken continuationToken;
+            continuationToken.SetFirstUnprocessedQuery(FirstUnprocessedQuery);
+
+            // note that when LastProcessedKey set then
+            // FirstUnprocessedQuery is definitely partially read range
+            if (LastProcessedKey)
+                continuationToken.SetLastProcessedKey(LastProcessedKey);
+
+            bool res = continuationToken.SerializeToString(record.MutableContinuationToken());
+            Y_ASSERT(res);
         } else {
             state.IsFinished = true;
             record.SetFinished(true);
@@ -617,17 +628,6 @@ public:
             record.MutableSnapshot()->SetStep(State.ReadVersion.Step);
             record.MutableSnapshot()->SetTxId(State.ReadVersion.TxId);
         }
-
-        NKikimrTxDataShard::TReadContinuationToken continuationToken;
-        continuationToken.SetFirstUnprocessedQuery(FirstUnprocessedQuery);
-
-        // note that when LastProcessedKey set then
-        // FirstUnprocessedQuery is definitely partially read range
-        if (LastProcessedKey)
-            continuationToken.SetLastProcessedKey(LastProcessedKey);
-
-        bool res = continuationToken.SerializeToString(record.MutableContinuationToken());
-        Y_ASSERT(res);
     }
 
     void UpdateState(TReadIteratorState& state) {
@@ -688,8 +688,7 @@ private:
         Y_UNUSED(ctx);
         while (iter->Next(NTable::ENext::Data) == NTable::EReady::Data) {
             TDbTupleRef rowKey = iter->GetKey();
-
-            LastProcessedKey = TSerializedCellVec::Serialize(rowKey.Cells());
+            TSerializedCellVec::Serialize(LastProcessedKey, rowKey.Cells());
 
             TDbTupleRef rowValues = iter->GetValues();
 
@@ -898,8 +897,8 @@ class TDataShard::TReadOperation : public TOperation, public IReadOperation {
     static constexpr ui32 Flags = NTxDataShard::TTxFlags::ReadOnly | NTxDataShard::TTxFlags::Immediate;
 
 public:
-    TReadOperation(TDataShard* ds, ui64 txId, TInstant receivedAt, ui64 tieBreakerIndex, TEvDataShard::TEvRead::TPtr ev)
-        : TOperation(TBasicOpInfo(txId, EOperationKind::ReadTx, Flags, 0, receivedAt, tieBreakerIndex))
+    TReadOperation(TDataShard* ds, TInstant receivedAt, ui64 tieBreakerIndex, TEvDataShard::TEvRead::TPtr ev)
+        : TOperation(TBasicOpInfo(EOperationKind::ReadTx, Flags, 0, receivedAt, tieBreakerIndex))
         , Self(ds)
         , Sender(ev->Sender)
         , Request(ev->Release().Release())
@@ -1662,6 +1661,9 @@ private:
             addLock->SetCounter(lock.Counter);
             addLock->SetSchemeShard(lock.SchemeShard);
             addLock->SetPathId(lock.PathId);
+            if (lock.HasWrites) {
+                addLock->SetHasWrites(true);
+            }
 
             LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, Self->TabletID()
                 << " Acquired lock# " << lock.LockId << ", counter# " << lock.Counter
@@ -1676,6 +1678,7 @@ class TDataShard::TTxReadViaPipeline : public NTabletFlatExecutor::TTransactionB
 
     TOperation::TPtr Op;
     TVector<EExecutionUnitKind> CompleteList;
+    bool WaitComplete = false;
 
 public:
     TTxReadViaPipeline(TDataShard* ds, TEvDataShard::TEvRead::TPtr ev)
@@ -1724,7 +1727,7 @@ public:
 
             if (Ev) {
                 const ui64 tieBreaker = Self->NextTieBreakerIndex++;
-                Op = new TReadOperation(Self, tieBreaker, ctx.Now(), tieBreaker, Ev);
+                Op = new TReadOperation(Self, ctx.Now(), tieBreaker, Ev);
                 Op->BuildExecutionPlan(false);
                 Self->Pipeline.GetExecutionUnit(Op->GetCurrentUnit()).AddOperation(Op);
 
@@ -1749,12 +1752,16 @@ public:
                         Op->IncrementInProgress();
                         Self->ExecuteProgressTx(Op, ctx);
                     }
+                    Op->DecrementInProgress();
                     break;
 
                 case EExecutionStatus::Executed:
                 case EExecutionStatus::Continue:
+                    Op->DecrementInProgress();
+                    break;
+
                 case EExecutionStatus::WaitComplete:
-                    // No special handling
+                    WaitComplete = true;
                     break;
 
                 default:
@@ -1762,8 +1769,10 @@ public:
                             << *Op << " " << Op->GetKind() << " at " << Self->TabletID());
             }
 
-            if (CompleteList.empty()) {
-                Op->DecrementInProgress();
+            if (WaitComplete || !CompleteList.empty()) {
+                // Keep operation active until we run the complete list
+            } else {
+                // Release operation as it's no longer needed
                 Op = nullptr;
             }
 
@@ -1791,13 +1800,17 @@ public:
             Self->Pipeline.RunCompleteList(Op, CompleteList, ctx);
         }
 
-        Op->DecrementInProgress();
+        if (WaitComplete) {
+            Op->DecrementInProgress();
 
-        if (!Op->IsInProgress() && !Op->IsExecutionPlanFinished())
-            Self->Pipeline.AddCandidateOp(Op);
+            if (!Op->IsInProgress() && !Op->IsExecutionPlanFinished()) {
+                Self->Pipeline.AddCandidateOp(Op);
 
-        if (Self->Pipeline.CanRunAnotherOp())
-            Self->PlanQueue.Progress(ctx);
+                if (Self->Pipeline.CanRunAnotherOp()) {
+                    Self->PlanQueue.Progress(ctx);
+                }
+            }
+        }
     }
 };
 
@@ -2084,14 +2097,8 @@ public:
 };
 
 void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ctx) {
-    if (MediatorStateWaiting) {
-        MediatorStateWaitingMsgs.emplace_back(ev.Release());
-        UpdateProposeQueueSize();
-        return;
-    }
-
     // note that ins some cases we mutate this request below
-    const auto* request = ev->Get();
+    auto* request = ev->Get();
     const auto& record = request->Record;
     if (Y_UNLIKELY(!record.HasReadId())) {
         std::unique_ptr<TEvDataShard::TEvReadResult> result(new TEvDataShard::TEvReadResult());
@@ -2101,6 +2108,10 @@ void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ct
     }
 
     TReadIteratorId readId(ev->Sender, record.GetReadId());
+    if (!Pipeline.HandleWaitingReadIterator(readId, request)) {
+        // This request has been cancelled
+        return;
+    }
 
     auto replyWithError = [&] (auto code, const auto& msg) {
         std::unique_ptr<TEvDataShard::TEvReadResult> result(new TEvDataShard::TEvReadResult());
@@ -2111,6 +2122,27 @@ void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ct
         result->Record.SetReadId(readId.ReadId);
         ctx.Send(ev->Sender, result.release());
     };
+
+    if (Y_UNLIKELY(Pipeline.HasWaitingReadIterator(readId) || ReadIterators.contains(readId))) {
+        replyWithError(
+            Ydb::StatusIds::ALREADY_EXISTS,
+            TStringBuilder() << "Request " << readId.ReadId << " already executing");
+        return;
+    }
+
+    if (!IsStateActive()) {
+        replyWithError(
+            Ydb::StatusIds::OVERLOADED,
+            TStringBuilder() << "Shard " << TabletID() << " is splitting/merging");
+        return;
+    }
+
+    if (MediatorStateWaiting) {
+        Pipeline.RegisterWaitingReadIterator(readId, request);
+        MediatorStateWaitingMsgs.emplace_back(ev.Release());
+        UpdateProposeQueueSize();
+        return;
+    }
 
     if (Pipeline.HasDrop()) {
         replyWithError(
@@ -2126,13 +2158,6 @@ void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ct
         replyWithError(
             Ydb::StatusIds::OVERLOADED,
             TStringBuilder() << "Request " << readId.ReadId << " rejected, MaxTxInFly was exceeded");
-        return;
-    }
-
-    if (Y_UNLIKELY(ReadIterators.contains(readId))) {
-        replyWithError(
-            Ydb::StatusIds::ALREADY_EXISTS,
-            TStringBuilder() << "Request " << readId.ReadId << " already executing");
         return;
     }
 
@@ -2399,6 +2424,11 @@ void TDataShard::Handle(TEvDataShard::TEvReadCancel::TPtr& ev, const TActorConte
     LOG_TRACE_S(ctx, NKikimrServices::TX_DATASHARD, TabletID() << " ReadCancel: " << record);
 
     TReadIteratorId readId(ev->Sender, record.GetReadId());
+    if (Pipeline.CancelWaitingReadIterator(readId)) {
+        Y_VERIFY(!ReadIterators.contains(readId));
+        return;
+    }
+
     auto it = ReadIterators.find(readId);
     if (it == ReadIterators.end())
         return;

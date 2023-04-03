@@ -206,6 +206,7 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
     TMaybeNode<TCoAtom> mode;
     TMaybeNode<TExprList> columns;
     TMaybeNode<TCoAtomList> primaryKey;
+    TMaybeNode<TCoAtomList> notNullColumns;
     TMaybeNode<TCoAtomList> partitionBy;
     TMaybeNode<TCoNameValueTupleList> orderBy;
     TMaybeNode<TCoLambda> filter;
@@ -294,6 +295,9 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
             } else if (name == "tableType") {
                 YQL_ENSURE(tuple.Value().Maybe<TCoAtom>());
                 tableType = tuple.Value().Cast<TCoAtom>();
+            } else if (name == "notnull") {
+                YQL_ENSURE(tuple.Value().Maybe<TCoAtomList>());
+                notNullColumns = tuple.Value().Cast<TCoAtomList>();
             } else {
                 other.push_back(tuple);
             }
@@ -328,6 +332,7 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
     ret.Mode = mode;
     ret.Columns = columns;
     ret.PrimaryKey = primaryKey;
+    ret.NotNullColumns = notNullColumns;
     ret.PartitionBy = partitionBy;
     ret.OrderBy = orderBy;
     ret.Filter = filter;
@@ -1139,8 +1144,15 @@ void WriteStatistics(NYson::TYsonWriter& writer, bool totalOnly, const THashMap<
     writer.OnEndMap();
 }
 
-bool ValidateCompressionForInput(std::string_view compression, TExprContext& ctx) {
-    if (compression.empty() || IsIn(Compressions, compression)) {
+bool ValidateCompressionForInput(std::string_view format, std::string_view compression, TExprContext& ctx) {
+    if (compression.empty()) {
+        return true;
+    }
+    if (format == "parquet"sv) {
+        ctx.AddError(TIssue(TStringBuilder() << "External compression for parquet is not supported"));
+        return false;
+    }
+    if (IsIn(Compressions, compression)) {
         return true;
     }
     ctx.AddError(TIssue(TStringBuilder() << "Unknown compression: " << compression
@@ -1148,8 +1160,15 @@ bool ValidateCompressionForInput(std::string_view compression, TExprContext& ctx
     return false;
 }
 
-bool ValidateCompressionForOutput(std::string_view compression, TExprContext& ctx) {
-    if (compression.empty() || IsIn(Compressions, compression)) {
+bool ValidateCompressionForOutput(std::string_view format, std::string_view compression, TExprContext& ctx) {
+    if (compression.empty()) {
+        return true;
+    }
+    if (format == "parquet"sv) {
+        ctx.AddError(TIssue(TStringBuilder() << "External compression for parquet is not supported"));
+        return false;
+    }
+    if (IsIn(Compressions, compression)) {
         return true;
     }
     ctx.AddError(TIssue(TStringBuilder() << "Unknown compression: " << compression

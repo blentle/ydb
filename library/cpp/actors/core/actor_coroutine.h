@@ -25,6 +25,43 @@ namespace NActors {
         TActorIdentity SelfActorId = TActorIdentity(TActorId());
         TActorId ParentActorId;
 
+        // Pre-leave and pre-enter hook functions are called by coroutine actor code to conserve the state of required TLS
+        // variables.
+        //
+        // They are called in the following order:
+        //
+        // 1. coroutine executes WaitForEvent
+        // 2. StoreTlsState() is called
+        // 3. control is returned to the actor system
+        // 4. some event is received, handler called (now in different thread, unconserved TLS variables are changed!)
+        // 5. handler transfers control to the coroutine
+        // 6. RestoreTlsState() is called
+        //
+        // These hooks may be used in the following way:
+        //
+        // thread_local TMyClass *MyObject = nullptr;
+        //
+        // class TMyCoroImpl : public TActorCoroImpl {
+        //     TMyClass *SavedMyObject;
+        //     ...
+        // public:
+        //     TMyCoroImpl()
+        //         : TActorCoroImpl(...)
+        //     {
+        //         StoreTlsState = RestoreTlsState = &TMyCoroImpl::ConserveState;
+        //     }
+        //
+        //     static void ConserveState(TActorCoroImpl *p) {
+        //         TMyCoroImpl *my = static_cast<TMyCoroImpl*>(p);
+        //         std::swap(my->SavedMyObject, MyObject);
+        //     }
+        //
+        //     ...
+        // }
+        void (*StoreTlsState)(TActorCoroImpl*) = nullptr;
+        void (*RestoreTlsState)(TActorCoroImpl*) = nullptr;
+
+
     private:
         template <typename TFirstEvent, typename... TOtherEvents>
         struct TIsOneOf: public TIsOneOf<TOtherEvents...> {
@@ -47,7 +84,7 @@ namespace NActors {
         TActorCoroImpl(size_t stackSize, bool allowUnhandledDtor = false);
         // specify stackSize explicitly for each actor; don't forget about overflow control gap
 
-        virtual ~TActorCoroImpl();
+        virtual ~TActorCoroImpl() = default;
 
         virtual void Run() = 0;
 
@@ -57,8 +94,8 @@ namespace NActors {
         THolder<IEventHandle> WaitForEvent(TMonotonic deadline = TMonotonic::Max());
 
         // Wait for specific event set by filter functor. Function returns first event that matches filter. On any other
-        // kind of event processUnexpectedEvent() is called.
         //
+        // kind of event processUnexpectedEvent() is called.
         // Example: WaitForSpecificEvent([](IEventHandle& ev) { return ev.Cookie == 42; });
         template <typename TFunc, typename TCallback, typename = std::enable_if_t<std::is_invocable_v<TCallback, TAutoPtr<IEventHandle>>>>
         THolder<IEventHandle> WaitForSpecificEvent(TFunc&& filter, TCallback processUnexpectedEvent, TMonotonic deadline = TMonotonic::Max()) {
@@ -117,8 +154,7 @@ namespace NActors {
         bool Send(TAutoPtr<IEventHandle> ev);
 
         bool Forward(THolder<IEventHandle>& ev, const TActorId& recipient) {
-            IEventHandle::Forward(ev, recipient);
-            return Send(ev.Release());
+            return Send(IEventHandle::Forward(ev, recipient).Release());
         }
 
         void Schedule(TDuration delta, IEventBase* ev, ISchedulerCookie* cookie = nullptr) {
@@ -144,6 +180,7 @@ namespace NActors {
     private:
         friend class TActorCoro;
         bool ProcessEvent(THolder<IEventHandle> ev);
+        void Destroy();
 
     private:
         /* Resume() function goes to actor coroutine context and continues (or starts) to execute it until actor finishes
@@ -162,8 +199,10 @@ namespace NActors {
             , Impl(std::move(impl))
         {}
 
+        ~TActorCoro();
+
         TAutoPtr<IEventHandle> AfterRegister(const TActorId& self, const TActorId& parent) override {
-            return new IEventHandleFat(TEvents::TSystem::Bootstrap, 0, self, parent, {}, 0);
+            return new IEventHandle(TEvents::TSystem::Bootstrap, 0, self, parent, {}, 0);
         }
 
     private:

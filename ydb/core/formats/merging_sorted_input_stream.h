@@ -8,15 +8,19 @@
 
 namespace NKikimr::NArrow {
 
+struct IRowsBuffer {
+    virtual bool AddRow(const TSortCursor& cursor) = 0;
+    virtual void Flush() = 0;
+    virtual bool Limit() const = 0;
+    virtual bool HasLimit() const = 0;
+};
+
 /// Merges several sorted streams into one sorted stream.
 class TMergingSortedInputStream : public IInputStream {
 public:
-    using TBuilders = std::vector<std::unique_ptr<arrow::ArrayBuilder>>;
-
     TMergingSortedInputStream(const std::vector<IInputStream::TPtr>& inputs,
                               std::shared_ptr<TSortDescription> description,
-                              size_t maxBatchRows,
-                              ui64 limit = 0);
+                              size_t maxBatchRows, bool slice = false);
 
     std::shared_ptr<arrow::Schema> Schema() const override { return Header; }
 
@@ -27,11 +31,11 @@ private:
     std::shared_ptr<arrow::Schema> Header;
     std::shared_ptr<TSortDescription> Description;
     const ui64 MaxBatchSize;
-    ui64 Limit;
-    ui64 TotalMergedRows = 0;
+    const bool SliceSources;
     bool First = true;
     bool Finished = false;
     ui64 ExpectedBatchSize = 0; /// May be smaller or equal to max_block_size. To do 'reserve' for columns.
+    std::map<std::string, ui64> ColumnSize;
 
     std::vector<std::shared_ptr<arrow::RecordBatch>> SourceBatches;
     std::shared_ptr<TReplaceKey> PrevKey;
@@ -41,7 +45,10 @@ private:
 
     void Init();
     void FetchNextBatch(const TSortCursor& current, TSortingHeap& queue);
-    void Merge(TBuilders& builders, TSortingHeap& queue);
+    void Merge(IRowsBuffer& rowsBuffer, TSortingHeap& queue);
+
+    template <bool replace, bool limit>
+    void MergeImpl(IRowsBuffer& rowsBuffer, TSortingHeap& queue);
 };
 
 }

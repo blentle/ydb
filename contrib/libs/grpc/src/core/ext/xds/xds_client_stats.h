@@ -24,11 +24,13 @@
 #include <atomic>
 #include <map>
 #include <util/generic/string.h>
+#include <util/string/cast.h>
 
 #include "y_absl/strings/str_cat.h"
 #include "y_absl/strings/str_format.h"
 #include "y_absl/strings/string_view.h"
 
+#include "src/core/ext/xds/xds_bootstrap.h"
 #include "src/core/lib/gpr/useful.h"
 #include "src/core/lib/gprpp/memory.h"
 #include "src/core/lib/gprpp/ref_counted.h"
@@ -128,7 +130,7 @@ class XdsClusterDropStats : public RefCounted<XdsClusterDropStats> {
   };
 
   XdsClusterDropStats(RefCountedPtr<XdsClient> xds_client,
-                      y_absl::string_view lrs_server_name,
+                      const XdsBootstrap::XdsServer& lrs_server,
                       y_absl::string_view cluster_name,
                       y_absl::string_view eds_service_name);
   ~XdsClusterDropStats() override;
@@ -141,7 +143,7 @@ class XdsClusterDropStats : public RefCounted<XdsClusterDropStats> {
 
  private:
   RefCountedPtr<XdsClient> xds_client_;
-  y_absl::string_view lrs_server_name_;
+  const XdsBootstrap::XdsServer& lrs_server_;
   y_absl::string_view cluster_name_;
   y_absl::string_view eds_service_name_;
   std::atomic<uint64_t> uncategorized_drops_{0};
@@ -202,7 +204,7 @@ class XdsClusterLocalityStats : public RefCounted<XdsClusterLocalityStats> {
   };
 
   XdsClusterLocalityStats(RefCountedPtr<XdsClient> xds_client,
-                          y_absl::string_view lrs_server_name,
+                          const XdsBootstrap::XdsServer& lrs_server_,
                           y_absl::string_view cluster_name,
                           y_absl::string_view eds_service_name,
                           RefCountedPtr<XdsLocalityName> name);
@@ -216,7 +218,7 @@ class XdsClusterLocalityStats : public RefCounted<XdsClusterLocalityStats> {
 
  private:
   RefCountedPtr<XdsClient> xds_client_;
-  y_absl::string_view lrs_server_name_;
+  const XdsBootstrap::XdsServer& lrs_server_;
   y_absl::string_view cluster_name_;
   y_absl::string_view eds_service_name_;
   RefCountedPtr<XdsLocalityName> name_;

@@ -24,7 +24,7 @@
 #include <ydb/core/security/ticket_parser.h>
 #include <ydb/core/base/grpc_service_factory.h>
 #include <ydb/core/persqueue/actor_persqueue_client_iface.h>
-#include <ydb/core/yq/libs/shared_resources/interface/shared_resources.h>
+#include <ydb/core/fq/libs/shared_resources/interface/shared_resources.h>
 #include <ydb/core/http_proxy/auth_factory.h>
 #include <ydb/library/accessor/accessor.h>
 
@@ -212,6 +212,8 @@ namespace Tests {
     private:
         YDB_FLAG_ACCESSOR(EnableMetadataProvider, true);
         YDB_FLAG_ACCESSOR(EnableBackgroundTasks, false);
+        YDB_FLAG_ACCESSOR(EnableExternalIndex, false);
+        
     };
 
     class TServer : public TThrRefBase, TMoveOnly {
@@ -285,7 +287,7 @@ namespace Tests {
         TAutoPtr<NMsgBusProxy::IMessageBusServer> BusServer;
         std::unique_ptr<NGrpc::TGRpcServer> GRpcServer;
         TIntrusivePtr<::NMonitoring::TDynamicCounters> GRpcServerRootCounters;
-        NYq::IYqSharedResources::TPtr YqSharedResources;
+        NFq::IYqSharedResources::TPtr YqSharedResources;
     };
 
     class TClient {

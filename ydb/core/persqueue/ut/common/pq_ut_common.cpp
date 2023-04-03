@@ -972,4 +972,13 @@ void FillDeprecatedUserInfo(NKikimrClient::TKeyValueRequest_TCmdWrite* write, co
     write->SetValue(idataDeprecated.Data(), idataDeprecated.Size());
 }
 
+THolder<TEvPersQueue::TEvPeriodicTopicStats> GetReadBalancerPeriodicTopicStats(TTestActorRuntime& runtime, ui64 balancerId) {
+    runtime.ResetScheduledCount();
+
+    TActorId sender = runtime.AllocateEdgeActor();
+    runtime.SendToPipe(balancerId, sender, new TEvPersQueue::TEvStatus(), 0, GetPipeConfigWithRetries());
+
+    return runtime.GrabEdgeEvent<TEvPersQueue::TEvPeriodicTopicStats>(TDuration::Seconds(2));
+}
+
 } // namespace NKikimr::NPQ

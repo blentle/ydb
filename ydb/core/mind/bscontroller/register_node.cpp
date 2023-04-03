@@ -176,14 +176,14 @@ public:
             updateIsSuccessful = false;
             auto& nodeInfo = Self->GetNode(nodeId);
             Self->EraseKnownDrivesOnDisconnected(&nodeInfo);
-            STLOG(PRI_ERROR, BS_CONTROLLER, BSCTXRN04,
+            STLOG(PRI_ERROR, BS_CONTROLLER, BSCTXRN00,
                     "Error during UpdateDevicesInfo after receiving TEvControllerRegisterNode", (TExError, e.what()));
         }
 
         result->Record.SetInstanceId(Self->InstanceId);
         result->Record.SetComprehensive(false);
         result->Record.SetAvailDomain(AppData()->DomainsInfo->GetDomainUidByTabletId(Self->TabletID()));
-        Response = std::make_unique<IEventHandleFat>(MakeBlobStorageNodeWardenID(nodeId), Self->SelfId(), result.release(), 0, 0);
+        Response = std::make_unique<IEventHandle>(MakeBlobStorageNodeWardenID(nodeId), Self->SelfId(), result.release(), 0, 0);
 
         TString error;
         if (!updateIsSuccessful || (State->Changed() && !Self->CommitConfigUpdates(*State, false, false, false, txc, &error))) {
@@ -308,11 +308,16 @@ public:
         res->Record.SetInstanceId(Self->InstanceId);
         res->Record.SetComprehensive(true);
         res->Record.SetAvailDomain(AppData()->DomainsInfo->GetDomainUidByTabletId(Self->TabletID()));
-        Response = std::make_unique<IEventHandleFat>(request->Sender, Self->SelfId(), res.release(), 0, request->Cookie);
+        Response = std::make_unique<IEventHandle>(request->Sender, Self->SelfId(), res.release(), 0, request->Cookie);
 
         NIceDb::TNiceDb db(txc.DB);
         auto& node = Self->GetNode(nodeId);
         db.Table<Schema::Node>().Key(nodeId).Update<Schema::Node::LastConnectTimestamp>(node.LastConnectTimestamp);
+
+        for (ui32 groupId : record.GetGroups()) {
+            node.GroupsRequested.insert(groupId);
+            Self->GroupToNode.emplace(groupId, nodeId);
+        }
 
         return true;
     }
@@ -427,7 +432,14 @@ void TBlobStorageController::ReadVSlot(const TVSlotInfo& vslot, TEvBlobStorage::
     if (TGroupInfo *group = FindGroup(vslot.GroupId)) {
         const TStoragePoolInfo& info = StoragePools.at(group->StoragePoolId);
         vDisk->SetStoragePoolName(info.Name);
-        SerializeDonors(vDisk, vslot, *group);
+
+        const TVSlotFinder vslotFinder{[this](TVSlotId vslotId, auto&& callback) {
+            if (const TVSlotInfo *vslot = FindVSlot(vslotId)) {
+                callback(*vslot);
+            }
+        }};
+
+        SerializeDonors(vDisk, vslot, *group, vslotFinder);
     } else {
         Y_VERIFY(vslot.Mood != TMood::Donor);
     }
@@ -511,7 +523,6 @@ void TBlobStorageController::OnWardenDisconnected(TNodeId nodeId) {
                 NotReadyVSlotIds.insert(it->second->VSlotId);
             }
             it->second->SetStatus(NKikimrBlobStorage::EVDiskStatus::ERROR, mono);
-            const_cast<TGroupInfo*>(group)->CalculateGroupStatus();
             sh->VDiskStatusUpdate.emplace_back(it->second->GetVDiskId(), it->second->Status);
             ScrubState.UpdateVDiskState(&*it->second);
         }
@@ -526,6 +537,9 @@ void TBlobStorageController::OnWardenDisconnected(TNodeId nodeId) {
     EraseKnownDrivesOnDisconnected(&node);
     if (!lastSeenReadyQ.empty()) {
         Execute(CreateTxUpdateLastSeenReady(std::move(lastSeenReadyQ)));
+    }
+    for (TGroupId groupId : std::exchange(node.GroupsRequested, {})) {
+        GroupToNode.erase(std::make_tuple(groupId, nodeId));
     }
     node.LastDisconnectTimestamp = now;
     Execute(new TTxUpdateNodeDisconnectTimestamp(nodeId, this));

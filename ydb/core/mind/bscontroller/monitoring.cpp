@@ -60,7 +60,7 @@ public:
         }
         TStringStream str;
         RenderOperationLog(str, count, offset);
-        TActivationContext::Send(new IEventHandleFat(RespondTo, Self->SelfId(), new NMon::TEvRemoteHttpInfoRes(str.Str())));
+        TActivationContext::Send(new IEventHandle(RespondTo, Self->SelfId(), new NMon::TEvRemoteHttpInfoRes(str.Str())));
         return true;
     }
 
@@ -210,7 +210,7 @@ public:
         }
         TStringStream str;
         RenderOperationLogEntry(str);
-        TActivationContext::Send(new IEventHandleFat(RespondTo, Self->SelfId(), new NMon::TEvRemoteHttpInfoRes(str.Str())));
+        TActivationContext::Send(new IEventHandle(RespondTo, Self->SelfId(), new NMon::TEvRemoteHttpInfoRes(str.Str())));
         return true;
     }
 
@@ -516,7 +516,7 @@ public:
     }
 
     void Complete(const TActorContext&) override {
-        TActivationContext::Send(new IEventHandleFat(RespondTo, Self->SelfId(), Json
+        TActivationContext::Send(new IEventHandle(RespondTo, Self->SelfId(), Json
             ? static_cast<IEventBase*>(new NMon::TEvRemoteJsonInfoRes(GenerateJson()))
             : static_cast<IEventBase*>(new NMon::TEvRemoteHttpInfoRes(GenerateHtml()))));
     }
@@ -660,7 +660,7 @@ public:
     void Complete(const TActorContext&) override {
         STLOG(PRI_DEBUG, BS_CONTROLLER, BSCTXMO01, "TBlobStorageController::TTxMonEvent_SetDown",
             (GroupId, GroupId), (Down, Down), (Persist, Persist), (Response, Response));
-        TActivationContext::Send(new IEventHandleFat(Source, Self->SelfId(), new NMon::TEvRemoteJsonInfoRes(Response)));
+        TActivationContext::Send(new IEventHandle(Source, Self->SelfId(), new NMon::TEvRemoteJsonInfoRes(Response)));
     }
 };
 
@@ -711,7 +711,7 @@ public:
     void Complete(const TActorContext&) override {
         STLOG(PRI_DEBUG, BS_CONTROLLER, BSCTXMO02, "TBlobStorageController::TTxMonEvent_GetDown", (GroupId, GroupId),
             (Response, Response));
-        TActivationContext::Send(new IEventHandleFat(Source, Self->SelfId(), new NMon::TEvRemoteJsonInfoRes(Response)));
+        TActivationContext::Send(new IEventHandle(Source, Self->SelfId(), new NMon::TEvRemoteJsonInfoRes(Response)));
     }
 };
 
@@ -847,7 +847,7 @@ void TBlobStorageController::ProcessPostQuery(const NActorsProto::TRemoteHttpInf
             };
 
             const TActorId& processorId = Register(new TQueryExecActor(sender, accept));
-            TActivationContext::Send(new IEventHandleFat(SelfId(), processorId, request.release()));
+            TActivationContext::Send(new IEventHandle(SelfId(), processorId, request.release()));
         }
     }
 }
@@ -893,7 +893,7 @@ bool TBlobStorageController::OnRenderAppHtmlPage(NMon::TEvRemoteHttpInfo::TPtr e
                 Register(new TDisableSelfHealActor(ev->Sender, TStringBuilder() << "?TabletID="
                     << TabletID() << "&page=SelfHeal"));
             } else {
-                TActivationContext::Send(new IEventHandleFat(SelfHealId, ev->Sender, ev->Release().Release(), 0,
+                TActivationContext::Send(new IEventHandle(SelfHealId, ev->Sender, ev->Release().Release(), 0,
                     SelfHealEnable));
             }
             return true;
@@ -1196,7 +1196,7 @@ void TBlobStorageController::RenderGroupDetail(IOutputStream &out, TGroupId grou
                 std::vector<const TVSlotInfo*> donors;
                 for (const TVSlotInfo *slot : group->VDisksInGroup) {
                     RenderVSlotRow(out, *slot);
-                    for (const auto& [vslotId, vdiskId] : slot->Donors) {
+                    for (const TVSlotId& vslotId : slot->Donors) {
                         if (const auto *x = FindVSlot(vslotId)) {
                             donors.push_back(x);
                         }
@@ -1291,17 +1291,16 @@ void TBlobStorageController::RenderVSlotRow(IOutputStream& out, const TVSlotInfo
                 }
             }
             TABLED() {
-                if (vslot.AcceptorVSlotId != TVSlotId()) {
-                    if (const auto *x = FindVSlot(vslot.AcceptorVSlotId)) {
-                        out << "<strong>donor for <a href='#" << x->GetVDiskId() << "'>" << vslot.AcceptorVSlotId << "</a></strong>";
-                    } else {
-                        out << "?";
-                    }
+                if (vslot.Mood == TMood::Donor) {
+                    const auto *x = FindAcceptor(vslot);
+                    out << "<strong>donor for <a href='#" << x->GetVDiskId() << "'>" << x->VSlotId << "</a></strong>";
                 } else {
                     bool first = true;
-                    for (const auto& [vslotId, vdiskId] : vslot.Donors) {
+                    for (const TVSlotId& donorVSlotId : vslot.Donors) {
                         out << (std::exchange(first, false) ? "" : "<br/>");
-                        out << "<a href='#" << vdiskId.ToString() << "'>" << vdiskId << "</a> at " << vslotId;
+                        const TVSlotInfo *donor = FindVSlot(donorVSlotId);
+                        const TVDiskID vdiskId = donor->GetVDiskId();
+                        out << "<a href='#" << vdiskId.ToString() << "'>" << vdiskId << "</a> at " << donorVSlotId;
                     }
                 }
             }

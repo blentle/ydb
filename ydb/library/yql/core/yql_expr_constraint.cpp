@@ -152,7 +152,7 @@ public:
         Functions["Just"] = &TCallableConstraintTransformer::FromFirst<TPassthroughConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TPartOfSortedConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>;
         Functions["Unwrap"] = &TCallableConstraintTransformer::FromFirst<TPassthroughConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TPartOfSortedConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>;
         Functions["ToList"] = &TCallableConstraintTransformer::FromFirst<TPassthroughConstraintNode, TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TPartOfSortedConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>;
-        Functions["ToOptional"] = &TCallableConstraintTransformer::FromFirst<TPassthroughConstraintNode, TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TPartOfSortedConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>;
+        Functions["ToOptional"] = &TCallableConstraintTransformer::FromFirst<TPassthroughConstraintNode, TEmptyConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>;
         Functions["Head"] = &TCallableConstraintTransformer::FromFirst<TPassthroughConstraintNode, TEmptyConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>;
         Functions["Last"] = &TCallableConstraintTransformer::FromFirst<TPassthroughConstraintNode, TEmptyConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>;
         Functions["Reverse"] = &TCallableConstraintTransformer::ReverseWrap;
@@ -162,11 +162,12 @@ public:
         Functions["ForceRemoveMember"] = &TCallableConstraintTransformer::RemoveMemberWrap;
         Functions["ReplaceMember"] = &TCallableConstraintTransformer::ReplaceMemberWrap;
         Functions["AsList"] = &TCallableConstraintTransformer::AsListWrap;
-        Functions["OptionalIf"] = &TCallableConstraintTransformer::FromSecond<TPassthroughConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TSortedConstraintNode, TPartOfSortedConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>;
-        Functions["ListIf"] = &TCallableConstraintTransformer::CopyAllFrom<1>;
-        Functions["FlatListIf"] = &TCallableConstraintTransformer::CopyAllFrom<1>;
-        Functions["FlatOptionalIf"] = &TCallableConstraintTransformer::CopyAllFrom<1>;
+        Functions["OptionalIf"] = &TCallableConstraintTransformer::PassOrEmptyWrap<false, false>;
+        Functions["FlatOptionalIf"] = &TCallableConstraintTransformer::PassOrEmptyWrap<false, true>;
+        Functions["ListIf"] = &TCallableConstraintTransformer::PassOrEmptyWrap<true, false>;
+        Functions["FlatListIf"] = &TCallableConstraintTransformer::PassOrEmptyWrap<true, true>;
         Functions["EmptyIterator"] = &TCallableConstraintTransformer::FromEmpty;
+        Functions["EmptyFrom"] = &TCallableConstraintTransformer::EmptyFromWrap;
         Functions["List"] = &TCallableConstraintTransformer::ListWrap;
         Functions["Dict"] = &TCallableConstraintTransformer::DictWrap;
         Functions["EmptyList"] = &TCallableConstraintTransformer::FromEmpty;
@@ -310,6 +311,20 @@ private:
 
     TStatus FromEmpty(const TExprNode::TPtr& input, TExprNode::TPtr& /*output*/, TExprContext& ctx) const {
         input->AddConstraint(ctx.MakeConstraint<TEmptyConstraintNode>());
+        return TStatus::Ok;
+    }
+
+    TStatus EmptyFromWrap(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) const {
+        auto set = input->Head().GetConstraintSet();
+        set.RemoveConstraint(TEmptyConstraintNode::Name());
+        if (!set) {
+            const auto type = input->GetTypeAnn();
+            output = ctx.NewCallable(input->Pos(), GetEmptyCollectionName(type), {ExpandType(input->Pos(), *type, ctx)});
+            return TStatus::Repeat;
+        }
+
+        set.AddConstraint(ctx.MakeConstraint<TEmptyConstraintNode>());
+        input->SetConstraints(set);
         return TStatus::Ok;
     }
 
@@ -1698,16 +1713,38 @@ private:
         return TStatus::Ok;
     }
 
+    template<bool IsList, bool IsFlat>
+    TStatus PassOrEmptyWrap(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) const {
+        if (const auto part = input->Tail().GetConstraint<TPartOfSortedConstraintNode>())
+            if (const auto filtered = part->CompleteOnly(ctx))
+                input->AddConstraint(filtered);
+
+        if (const auto part = input->Tail().GetConstraint<TPartOfDistinctConstraintNode>())
+            if (const auto filtered = part->CompleteOnly(ctx))
+                input->AddConstraint(filtered);
+
+        if (const auto part = input->Tail().GetConstraint<TPartOfUniqueConstraintNode>())
+            if constexpr (IsList) {
+                if (const auto filtered = part->CompleteOnly(ctx))
+                    input->AddConstraint(filtered);
+            } else
+                input->AddConstraint(part);
+
+        if constexpr (IsFlat) {
+            if (const auto empty = input->Tail().GetConstraint<TEmptyConstraintNode>())
+                input->AddConstraint(empty);
+        }
+
+        return FromSecond<TPassthroughConstraintNode, TUniqueConstraintNode, TDistinctConstraintNode, TSortedConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>(input, output, ctx);
+    }
+
     TStatus IfWrap(const TExprNode::TPtr& input, TExprNode::TPtr&, TExprContext& ctx) const {
         std::vector<const TConstraintSet*> constraints;
         constraints.reserve((input->ChildrenSize() << 1U) + 1U);
-        if (1U != input->Tail().ChildrenSize() || !input->Tail().IsCallable({"List", "Nothing"}))
-            constraints.emplace_back(&input->Tail().GetConstraintSet());
+        constraints.emplace_back(&input->Tail().GetConstraintSet());
 
         for (auto i = 0U; i < input->ChildrenSize() - 1U; ++i) {
-            if (const auto child = input->Child(++i); 1U != child->ChildrenSize() || !child->IsCallable({"List", "Nothing"})) {// TODO: Use empty constraint.
-                constraints.emplace_back(&child->GetConstraintSet());
-            }
+            constraints.emplace_back(&input->Child(++i)->GetConstraintSet());
         }
 
         if (constraints.empty())
@@ -1716,7 +1753,6 @@ private:
             input->SetConstraints(**constraints.cbegin());
         else
             TApplyCommonConstraint<TSortedConstraintNode
-                , TSortedConstraintNode
                 , TPartOfSortedConstraintNode
                 , TUniqueConstraintNode
                 , TPartOfUniqueConstraintNode
@@ -1751,7 +1787,6 @@ private:
 
         const std::vector<const TConstraintSet*> both = { &lambda->GetConstraintSet(), &input->Tail().GetConstraintSet() };
         TApplyCommonConstraint<TSortedConstraintNode
-            , TSortedConstraintNode
             , TPartOfSortedConstraintNode
             , TUniqueConstraintNode
             , TPartOfUniqueConstraintNode
@@ -2851,6 +2886,7 @@ private:
                 columns.emplace_back(child->Content());
             }
             input->AddConstraint(ctx.MakeConstraint<TUniqueConstraintNode>(columns));
+            input->AddConstraint(ctx.MakeConstraint<TDistinctConstraintNode>(columns));
         }
         return TStatus::Ok;
     }

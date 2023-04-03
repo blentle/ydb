@@ -1117,22 +1117,7 @@ TExprNode::TPtr OptimizeContainerIf(const TExprNode::TPtr& node, TExprContext& c
     if (node->Head().IsCallable("Bool")) {
         YQL_CLOG(DEBUG, Core) << node->Content() << " over " << node->Head().Content() << " '" << node->Head().Head().Content();
         const auto value = FromString<bool>(node->Head().Head().Content());
-        auto res = value
-            ? ctx.NewCallable(node->Tail().Pos(), IsList ? "AsList" : "Just", {node->TailPtr()})
-            : //TODO: ctx.NewCallable(node->Head().Pos(), IsList ? "List" : "Nothing", {ExpandType(node->Pos(), *node->GetTypeAnn(), ctx)})
-              ctx.Builder(node->Head().Pos())
-                .Callable(IsList ? "List" : "Nothing")
-                    .Callable(0, IsList ? "ListType" : "OptionalType")
-                        .Callable(0, "TypeOf")
-                            .Add(0, node->TailPtr())
-                        .Seal()
-                    .Seal()
-                .Seal().Build();
-        if (IsList) {
-            res = KeepConstraints(res, *node, ctx);
-        }
-        return res;
-
+        return ctx.WrapByCallableIf(!value, "EmptyFrom", ctx.NewCallable(node->Tail().Pos(), IsList ? "AsList" : "Just", {node->TailPtr()}));
     }
     return node;
 }
@@ -1199,8 +1184,8 @@ TExprNode::TPtr OptimizeToOptional(const TExprNode::TPtr& node, TExprContext& ct
     }
 
     if constexpr (!OrderAware) {
-        if (node->Head().GetConstraint<TSortedConstraintNode>()) {
-            YQL_CLOG(DEBUG, Core) << node->Content() << " over sorted collection";
+        if (const auto sorted = node->Head().GetConstraint<TSortedConstraintNode>()) {
+            YQL_CLOG(DEBUG, Core) << node->Content() << " over " << *sorted << ' ' << node->Head().Content();
             return ctx.ChangeChild(*node, 0, ctx.NewCallable(node->Head().Pos(), "Unordered", {node->HeadPtr()}));
         }
     }
@@ -2376,7 +2361,7 @@ TExprNode::TPtr OptimizeToFlow(const TExprNode::TPtr& node, TExprContext& ctx) {
         return ctx.NewCallable(node->Pos(), "EmptyIterator", {ExpandType(node->Pos(), *node->GetTypeAnn(), ctx)});
     }
 
-    if (node->Head().IsCallable({"ForwardList", "LazyList", "ToStream"})) {
+    if (node->Head().IsCallable({"LazyList", "ToStream"})) {
         YQL_CLOG(DEBUG, Core) << "Drop " << node->Head().Content() << " under " << node->Content();
         return ctx.ChangeChildren(*node, node->Head().ChildrenList());
     }
@@ -3380,6 +3365,13 @@ TExprNode::TPtr BuildJsonCompilePath(const TCoJsonQueryBase& jsonExpr, TExprCont
 
 template<bool Ordered>
 TExprNode::TPtr CanonizeMultiMap(const TExprNode::TPtr& node, TExprContext& ctx) {
+    if constexpr (!Ordered) {
+        if (const auto sorted = node->Head().GetConstraint<TSortedConstraintNode>()) {
+            YQL_CLOG(DEBUG, Core) << node->Content() << " over " << *sorted << ' ' << node->Head().Content();
+            return ctx.ChangeChild(*node, 0, ctx.NewCallable(node->Head().Pos(), "Unordered", {node->HeadPtr()}));
+        }
+    }
+
     YQL_CLOG(DEBUG, Core) << "Canonize " << node->Content() << " of width " << node->Tail().ChildrenSize() - 1U;
     return ctx.Builder(node->Pos())
         .Callable(Ordered ? "OrderedFlatMap" : "FlatMap")
@@ -3661,6 +3653,11 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
     };
 
     map["Filter"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext& optCtx) {
+        if (const auto sorted = node->Head().GetConstraint<TSortedConstraintNode>()) {
+            YQL_CLOG(DEBUG, Core) << node->Content() << " over " << *sorted << ' ' << node->Head().Content();
+            return ctx.ChangeChild(*node, 0, ctx.NewCallable(node->Head().Pos(), "Unordered", {node->HeadPtr()}));
+        }
+
         YQL_CLOG(DEBUG, Core) << "Canonize " << node->Content();
         return ConvertFilterToFlatmap<TCoFilter, TCoFlatMap>(TCoFilter(node), ctx, optCtx);
     };
@@ -3671,6 +3668,11 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
     };
 
     map["Map"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext& /*optCtx*/) {
+        if (const auto sorted = node->Head().GetConstraint<TSortedConstraintNode>()) {
+            YQL_CLOG(DEBUG, Core) << node->Content() << " over " << *sorted << ' ' << node->Head().Content();
+            return ctx.ChangeChild(*node, 0, ctx.NewCallable(node->Head().Pos(), "Unordered", {node->HeadPtr()}));
+        }
+
         YQL_CLOG(DEBUG, Core) << "Canonize " << node->Content();
         return ConvertMapToFlatmap<TCoMap, TCoFlatMap>(TCoMap(node), ctx);
     };
@@ -4542,7 +4544,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
                 .Callable("Take")
                     .Add(0, node->Head().HeadPtr())
                     .Callable(1, "Uint64")
-                        .Atom(0, "1", TNodeFlags::Default)
+                        .Atom(0, 1U)
                     .Seal()
                 .Seal()
                 .Build();
@@ -4688,7 +4690,7 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
             return node->Head().HeadPtr();
         }
 
-        if (node->Head().IsCallable({"Map", "FlatMap", "Filter", "Extend"})) {
+        if (node->Head().IsCallable({"Unordered", "Map", "FlatMap", "MultiMap", "Filter", "Extend"})) {
             YQL_CLOG(DEBUG, Core) << "Drop " << node->Content() << " over unordered " << node->Head().Content();
             return node->HeadPtr();
         }
@@ -5327,11 +5329,9 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
         }
         if (TCoNothing::Match(&node->Head())) {
             YQL_CLOG(DEBUG, Core) << node->Content() << " over " << node->Head().Content();
-            return ctx.Builder(node->Pos())
-                .Callable("Nothing")
-                    .Add(0, ExpandType(node->Pos(), *node->GetTypeAnn(), ctx))
-                .Seal()
-                .Build();
+            return Build<TCoNothing>(ctx, node->Pos())
+                .OptionalType(ExpandType(node->Pos(), *node->GetTypeAnn(), ctx))
+                .Done().Ptr();
         }
         return node;
     };
@@ -5502,8 +5502,8 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
     };
 
     map["Unordered"] = map["UnorderedSubquery"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext& /*optCtx*/) {
-        if (node->Head().IsCallable("AsList")) {
-            YQL_CLOG(DEBUG, Core) << node->Content() << " over " << node->Head().Content();
+        if (node->Head().IsCallable({"AsList","EquiJoin","Filter","Map","FlatMap","MultiMap","Extend"})) {
+            YQL_CLOG(DEBUG, Core) << "Drop " << node->Content() << " over " << node->Head().Content();
             return node->HeadPtr();
         }
 
@@ -6671,17 +6671,11 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
         }
 
         if (node->Head().IsCallable("PgConst")) {
-            auto name = node->Head().GetTypeAnn()->Cast<TPgExprType>()->GetName();
+            const auto name = node->Head().GetTypeAnn()->Cast<TPgExprType>()->GetName();
             if (name == "bool") {
-                auto value = node->Head().Head().Content();
-                if (value.StartsWith('t') || value.StartsWith('f')) {
-                    return ctx.Builder(node->Pos())
-                        .Callable("Just")
-                            .Callable(0, "Bool")
-                                .Atom(0, (value[0] == 't') ? "1" : "0")
-                            .Seal()
-                        .Seal()
-                        .Build();
+                const auto value = node->Head().Head().Content();
+                if (value.starts_with('t') || value.starts_with('f')) {
+                    return MakeOptionalBool(node->Pos(), value.front() == 't', ctx);
                 }
             }
         }

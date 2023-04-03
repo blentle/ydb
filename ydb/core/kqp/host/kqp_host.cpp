@@ -22,6 +22,8 @@
 #include <library/cpp/random_provider/random_provider.h>
 #include <library/cpp/time_provider/time_provider.h>
 
+#include <util/system/env.h>
+
 namespace NKikimr {
 namespace NKqp {
 
@@ -681,7 +683,7 @@ public:
                 case EKikimrQueryType::Scan:
                     return KqpRunner->PrepareScanQuery(cluster, query, ctx, settings);
                 case EKikimrQueryType::Query:
-                case EKikimrQueryType::FederatedQuery:
+                case EKikimrQueryType::Script:
                     return KqpRunner->PrepareQuery(cluster, query, ctx, settings);
                 case EKikimrQueryType::YqlScript:
                 case EKikimrQueryType::YqlScriptStreaming:
@@ -968,7 +970,7 @@ public:
     IAsyncQueryResultPtr PrepareFederatedQuery(const TString& query, const TPrepareSettings& settings) override {
         return CheckedProcessQuery(*ExprCtx,
             [this, &query, settings] (TExprContext& ctx) mutable {
-                return PrepareQueryInternal(query, EKikimrQueryType::FederatedQuery, settings, ctx);
+                return PrepareQueryInternal(query, EKikimrQueryType::Script, settings, ctx);
             });
     }
 
@@ -1049,6 +1051,18 @@ private:
         if (isSql) {
             NSQLTranslation::TTranslationSettings settings;
 
+            // TODO: remove this test crutch when dynamic bindings discovery will be implemented // YQ-1964
+            if (SessionCtx->Query().Type == EKikimrQueryType::Script && GetEnv("TEST_S3_CONNECTION")) {
+                NSQLTranslation::TTableBindingSettings binding;
+                binding.ClusterType = "s3";
+                binding.Settings["cluster"] = GetEnv("TEST_S3_CONNECTION");
+                binding.Settings["path"] = GetEnv("TEST_S3_OBJECT");
+                binding.Settings["format"] = GetEnv("TEST_S3_FORMAT");
+                binding.Settings["schema"] = GetEnv("TEST_S3_SCHEMA");
+
+                settings.PrivateBindings[GetEnv("TEST_S3_BINDING")] = binding;
+            }
+
             if (sqlVersion) {
                 settings.SyntaxVersion = *sqlVersion;
 
@@ -1071,11 +1085,16 @@ private:
                 settings.PathPrefix = tablePathPrefix;
             }
             settings.EndOfQueryCommit = sqlAutoCommit;
-            settings.Flags.insert("DisableEmitStartsWith");
             settings.Flags.insert("FlexibleTypes");
-            if (SessionCtx->Query().Type == EKikimrQueryType::Scan) {
-                // We enable EmitAggApply for aggregate pushdowns to Column Shards which are accessed by Scan query only
+            if (SessionCtx->Query().Type == EKikimrQueryType::Scan
+                || SessionCtx->Query().Type == EKikimrQueryType::YqlScript
+                || SessionCtx->Query().Type == EKikimrQueryType::YqlScriptStreaming)
+            {
+                // We enable EmitAggApply and AnsiLike for filter and aggregate pushdowns to Column Shards
                 settings.Flags.insert("EmitAggApply");
+                settings.Flags.insert("AnsiLike");
+            } else {
+                settings.Flags.insert("DisableEmitStartsWith");
             }
 
             ui16 actualSyntaxVersion = 0;
@@ -1424,7 +1443,15 @@ private:
         state->FunctionRegistry = FuncRegistry;
         state->CredentialsFactory = nullptr; // TODO
 
-        state->Configuration->Init(NYql::TS3GatewayConfig(), TypesCtx);
+        // TODO: remove this test crutch after dynamic connections resolving implementation // YQ-1964
+        NYql::TS3GatewayConfig cfg;
+        if (GetEnv("TEST_S3_CONNECTION")) {
+            auto* mapping = cfg.AddClusterMapping();
+            mapping->SetName(GetEnv("TEST_S3_CONNECTION"));
+            mapping->SetUrl(TStringBuilder() << GetEnv("S3_ENDPOINT") << "/" << GetEnv("TEST_S3_BUCKET") << "/");
+        }
+
+        state->Configuration->Init(cfg, TypesCtx);
 
         auto dataSource = NYql::CreateS3DataSource(state, HttpGateway);
         auto dataSink = NYql::CreateS3DataSink(state, HttpGateway);
@@ -1434,7 +1461,7 @@ private:
     }
 
     void Init(EKikimrQueryType queryType) {
-        if (queryType == EKikimrQueryType::FederatedQuery) {
+        if (queryType == EKikimrQueryType::Script) {
             InitS3Provider();
         }
 
@@ -1517,6 +1544,9 @@ private:
     }
 
     void SetupSession(EKikimrQueryType queryType) {
+        SessionCtx->Reset(KeepConfigChanges);
+        SessionCtx->Query().Type = queryType;
+
         Init(queryType);
 
         ExprCtx->Reset();
@@ -1527,10 +1557,6 @@ private:
         std::get<0>(TypesCtx->CachedRandom).reset();
         std::get<1>(TypesCtx->CachedRandom).reset();
         std::get<2>(TypesCtx->CachedRandom).reset();
-
-        SessionCtx->Reset(KeepConfigChanges);
-
-        SessionCtx->Query().Type = queryType;
     }
 
     void SetupYqlTransformer(EKikimrQueryType queryType) {

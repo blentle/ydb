@@ -12,6 +12,7 @@
 #include <ydb/library/yql/core/yql_opt_utils.h>
 #include <ydb/library/yql/utils/log/log.h>
 
+#include <util/generic/size_literals.h>
 
 namespace NYql {
 
@@ -165,7 +166,6 @@ public:
         , State_(state)
     {
 #define HNDL(name) "LogicalOptimizer-"#name, Hndl(&TS3LogicalOptProposalTransformer::name)
-        AddHandler(0, &TCoLeft::Match, HNDL(TrimReadWorld));
         AddHandler(0, &TCoFlatMapBase::Match, HNDL(TryPrunePaths));
         AddHandler(0, &TDqSourceWrap::Match, HNDL(ApplyPrunedPath));
         AddHandler(0, &TCoExtractMembers::Match, HNDL(ExtractMembersOverDqSource));
@@ -232,6 +232,9 @@ public:
                                 fileSizeLimit = it->second;
                             }
                         }
+                        if (formatName == "parquet" && State_->Configuration->UseBlocksSource.Get().GetOrElse(State_->Types->UseBlocks)) {
+                            fileSizeLimit = State_->Configuration->BlockFileSizeLimit;
+                        }
 
                         for (const TS3Path& batch : maybeS3SourceSettings.Cast().Paths()) {
                             TStringBuf packed = batch.Data().Literal().Value();
@@ -280,15 +283,6 @@ public:
             YQL_CLOG(INFO, ProviderS3) << "Will read from S3 " << count << " files with total size " << totalSize << " bytes";
         }
         return TStatus::Ok;
-    }
-
-    TMaybeNode<TExprBase> TrimReadWorld(TExprBase node, TExprContext& ctx) const {
-        const auto& maybeRead = node.Cast<TCoLeft>().Input().Maybe<TS3ReadObject>();
-        if (!maybeRead) {
-            return node;
-        }
-
-        return TExprBase(ctx.NewWorld(node.Pos()));
     }
 
     TMaybeNode<TExprBase> ApplyPrunedPath(TExprBase node, TExprContext& ctx) const {

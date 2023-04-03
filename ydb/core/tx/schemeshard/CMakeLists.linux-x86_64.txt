@@ -83,6 +83,7 @@ target_link_libraries(core-tx-schemeshard PUBLIC
   contrib-libs-protobuf
   cpp-deprecated-enum_codegen
   cpp-html-pcdata
+  library-cpp-json
   ydb-core-actorlib_impl
   ydb-core-audit
   ydb-core-base
@@ -90,6 +91,7 @@ target_link_libraries(core-tx-schemeshard PUBLIC
   core-blockstore-core
   ydb-core-engine
   core-engine-minikql
+  ydb-core-external_sources
   core-filestore-core
   core-kesus-tablet
   ydb-core-metering
@@ -225,6 +227,7 @@ target_sources(core-tx-schemeshard PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard__upgrade_access_database.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard__make_access_database_no_inheritable.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_audit_log_fragment.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_audit_log.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_impl.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_billing_helpers.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_cdc_stream_scan.cpp
@@ -262,6 +265,7 @@ target_sources(core-tx-schemeshard PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_build_index__get.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_build_index__progress.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_validate_ttl.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/user_attributes.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_import_scheme_getter.cpp
 )
 generate_enum_serilization(core-tx-schemeshard

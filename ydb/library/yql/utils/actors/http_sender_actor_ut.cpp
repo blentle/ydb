@@ -1,10 +1,10 @@
 #include "ydb/core/testlib/basics/appdata.h"
 
-#include <ydb/core/yq/libs/actors/logging/log.h>
-#include <ydb/core/yq/libs/ydb/util.h>
-#include <ydb/core/yq/libs/ydb/ydb.h>
+#include <ydb/core/fq/libs/actors/logging/log.h>
+#include <ydb/core/fq/libs/ydb/util.h>
+#include <ydb/core/fq/libs/ydb/ydb.h>
 
-#include <ydb/core/yq/libs/control_plane_proxy/events/events.h>
+#include <ydb/core/fq/libs/control_plane_proxy/events/events.h>
 
 #include <library/cpp/actors/core/executor_pool_basic.h>
 #include <library/cpp/actors/core/scheduler_basic.h>
@@ -18,7 +18,7 @@
 
 #include <util/system/env.h>
 
-namespace NYq {
+namespace NYql {
 
 using namespace NActors;
 using namespace NKikimr;
@@ -51,7 +51,7 @@ struct TTestBootstrap {
         auto sender = Runtime->AllocateEdgeActor();
         auto req = NHttp::THttpOutgoingRequest::CreateRequestGet("124");
         auto request = std::make_unique<NHttp::TEvHttpProxy::TEvHttpOutgoingRequest>(req);
-        Runtime->Send(new IEventHandleFat(HttpSenderActorId, sender, request.release()));
+        Runtime->Send(new IEventHandle(HttpSenderActorId, sender, request.release()));
     }
 
     template<typename T>
@@ -68,7 +68,7 @@ struct TTestBootstrap {
 
         NHttp::THttpOutgoingRequestPtr request = nullptr; //new NHttp::THttpOutgoingRequest();
 
-        Runtime->Send(new IEventHandleFat(
+        Runtime->Send(new IEventHandle(
             HttpSenderActorId,
             HttpProxyActorId,
             new NHttp::TEvHttpProxy::TEvHttpIncomingResponse(event->Request, response.release())));
@@ -204,4 +204,4 @@ Y_UNIT_TEST_SUITE(THttpSenderTests) {
 
 
 
-} // namespace NYq
+} // namespace NYql

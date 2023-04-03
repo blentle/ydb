@@ -1809,8 +1809,7 @@ bool TDataShard::OnRenderAppHtmlPage(NMon::TEvRemoteHttpInfo::TPtr ev, const TAc
 
     auto cgi = ev->Get()->Cgi();
 
-    auto action = cgi.Get("action");
-    if (action) {
+    if (const auto& action = cgi.Get("action")) {
         if (action == "cleanup-borrowed-parts") {
             Execute(CreateTxMonitoringCleanupBorrowedParts(this, ev), ctx);
             return true;
@@ -1832,8 +1831,24 @@ bool TDataShard::OnRenderAppHtmlPage(NMon::TEvRemoteHttpInfo::TPtr ev, const TAc
         return true;
     }
 
-    Execute(CreateTxMonitoring(this, ev), ctx);
+    if (const auto& page = cgi.Get("page")) {
+        if (page == "main") {
+            // fallthrough
+        } else if (page == "change-sender") {
+            if (OutChangeSender) {
+                ctx.Send(ev->Forward(OutChangeSender));
+                return true;
+            } else {
+                ctx.Send(ev->Sender, new NMon::TEvRemoteHttpInfoRes("Change sender is not running"));
+                return true;
+            }
+        } else {
+            ctx.Send(ev->Sender, new NMon::TEvRemoteBinaryInfoRes(NMonitoring::HTTPNOTFOUND));
+            return true;
+        }
+    }
 
+    Execute(CreateTxMonitoring(this, ev), ctx);
     return true;
 }
 
@@ -2104,7 +2119,7 @@ void TDataShard::SendWithConfirmedReadOnlyLease(
         TSendState(const TActorId& sessionId, const TActorId& target, const TActorId& src, IEventBase* event, ui64 cookie)
         {
             const ui32 flags = 0;
-            Ev = MakeHolder<IEventHandleFat>(target, src, event, flags, cookie);
+            Ev = MakeHolder<IEventHandle>(target, src, event, flags, cookie);
 
             if (sessionId) {
                 Ev->Rewrite(TEvInterconnect::EvForward, sessionId);
@@ -3869,7 +3884,7 @@ void SendViaSession(const TActorId& sessionId,
                     ui32 flags,
                     ui64 cookie)
 {
-    THolder<IEventHandle> ev = MakeHolder<IEventHandleFat>(target, src, event, flags, cookie);
+    THolder<IEventHandle> ev = MakeHolder<IEventHandle>(target, src, event, flags, cookie);
 
     if (sessionId) {
         ev->Rewrite(TEvInterconnect::EvForward, sessionId);
@@ -3879,6 +3894,8 @@ void SendViaSession(const TActorId& sessionId,
 }
 
 class TBreakWriteConflictsTxObserver : public NTable::ITransactionObserver {
+    friend class TBreakWriteConflictsTxObserverVolatileDependenciesGuard;
+
 public:
     TBreakWriteConflictsTxObserver(TDataShard* self)
         : Self(self)
@@ -3886,7 +3903,14 @@ public:
     }
 
     void OnSkipUncommitted(ui64 txId) override {
-        Self->SysLocksTable().BreakLock(txId);
+        if (auto* info = Self->GetVolatileTxManager().FindByCommitTxId(txId)) {
+            if (info->State != EVolatileTxState::Aborting) {
+                Y_VERIFY(VolatileDependencies);
+                VolatileDependencies->insert(txId);
+            }
+        } else {
+            Self->SysLocksTable().BreakLock(txId);
+        }
     }
 
     void OnSkipCommitted(const TRowVersion&) override {
@@ -3907,9 +3931,31 @@ public:
 
 private:
     TDataShard* Self;
+    absl::flat_hash_set<ui64>* VolatileDependencies = nullptr;
 };
 
-bool TDataShard::BreakWriteConflicts(NTable::TDatabase& db, const TTableId& tableId, TArrayRef<const TCell> keyCells) {
+class TBreakWriteConflictsTxObserverVolatileDependenciesGuard {
+public:
+    TBreakWriteConflictsTxObserverVolatileDependenciesGuard(
+            TBreakWriteConflictsTxObserver* observer,
+            absl::flat_hash_set<ui64>& volatileDependencies)
+        : Observer(observer)
+    {
+        Y_VERIFY(!Observer->VolatileDependencies);
+        Observer->VolatileDependencies = &volatileDependencies;
+    }
+
+    ~TBreakWriteConflictsTxObserverVolatileDependenciesGuard() {
+        Observer->VolatileDependencies = nullptr;
+    }
+
+private:
+    TBreakWriteConflictsTxObserver* const Observer;
+};
+
+bool TDataShard::BreakWriteConflicts(NTable::TDatabase& db, const TTableId& tableId,
+        TArrayRef<const TCell> keyCells, absl::flat_hash_set<ui64>& volatileDependencies)
+{
     const auto localTid = GetLocalTableId(tableId);
     Y_VERIFY(localTid);
     const NTable::TScheme& scheme = db.GetScheme();
@@ -3920,6 +3966,10 @@ bool TDataShard::BreakWriteConflicts(NTable::TDatabase& db, const TTableId& tabl
     if (!BreakWriteConflictsTxObserver) {
         BreakWriteConflictsTxObserver = new TBreakWriteConflictsTxObserver(this);
     }
+
+    TBreakWriteConflictsTxObserverVolatileDependenciesGuard guard(
+        static_cast<TBreakWriteConflictsTxObserver*>(BreakWriteConflictsTxObserver.Get()),
+        volatileDependencies);
 
     // We are not actually interested in the row version, we only need to
     // detect uncommitted transaction skips on the path to that version.
@@ -3964,6 +4014,15 @@ private:
 
 void TDataShard::Handle(TEvDataShard::TEvGetOpenTxs::TPtr& ev, const TActorContext& ctx) {
     Execute(new TTxGetOpenTxs(this, std::move(ev)), ctx);
+}
+
+void TDataShard::Handle(TEvTxUserProxy::TEvAllocateTxIdResult::TPtr& ev, const TActorContext& ctx) {
+    auto op = Pipeline.FindOp(ev->Cookie);
+    if (op && op->HasWaitingForGlobalTxIdFlag()) {
+        Pipeline.ProvideGlobalTxId(op, ev->Get()->TxId);
+        Pipeline.AddCandidateOp(op);
+        PlanQueue.Progress(ctx);
+    }
 }
 
 

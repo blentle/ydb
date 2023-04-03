@@ -230,7 +230,8 @@ private:
 
     void AfterTypeAnnotation(TTransformationPipeline* pipeline) const final {
         pipeline->Add(NDqs::CreateDqsReplacePrecomputesTransformer(*pipeline->GetTypeAnnotationContext(), State_->FunctionRegistry), "ReplacePrecomputes");
-        pipeline->Add(NDq::CreateDqBuildPhyStagesTransformer(false), "BuildPhy");
+        bool useWideChannels = State_->Settings->UseWideChannels.Get().GetOrElse(false);
+        pipeline->Add(NDq::CreateDqBuildPhyStagesTransformer(false, useWideChannels), "BuildPhy");
         pipeline->Add(NDqs::CreateDqsRewritePhyCallablesTransformer(*pipeline->GetTypeAnnotationContext()), "RewritePhyCallables");
     }
 
@@ -1720,7 +1721,7 @@ private:
         TPeepholeSettings peepholeSettings;
         peepholeSettings.CommonConfig = &peepholeConfig;
         bool hasNonDeterministicFunctions;
-        auto status = PeepHoleOptimizeNode<true>(input, output, ctx, *State->TypeCtx, nullptr, hasNonDeterministicFunctions, peepholeSettings);
+        auto status = PeepHoleOptimizeNode(input, output, ctx, *State->TypeCtx, nullptr, hasNonDeterministicFunctions, peepholeSettings);
         if (status.Level != TStatus::Ok) {
             ctx.AddError(TIssue(ctx.GetPosition(output->Pos()), TString("Peephole optimization failed for Dq stage")));
             return status;

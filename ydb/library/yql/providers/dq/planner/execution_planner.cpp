@@ -236,6 +236,11 @@ namespace NYql::NDqs {
         for (const auto& stage : stages) {
             auto& stageInfo = TasksGraph.GetStageInfo(stage);
             YQL_ENSURE(!stageInfo.Tasks.empty());
+
+            auto stageSettings = NDq::TDqStageSettings::Parse(stage);
+            if (stageSettings.SinglePartition) {
+                YQL_ENSURE(stageInfo.Tasks.size() == 1, "Unexpected multiple tasks in single-partition stage");
+            }
         }
 
         TMaybeNode<TDqPhyStage> finalStage;
@@ -530,9 +535,6 @@ namespace NYql::NDqs {
         YQL_ENSURE(datasource);
         const auto stageSettings = TDqStageSettings::Parse(stage);
         auto tasksPerStage = settings->MaxTasksPerStage.Get().GetOrElse(TDqSettings::TDefault::MaxTasksPerStage);
-        if (stageSettings.IsExternalFunction) {
-            tasksPerStage = Min(tasksPerStage, stageSettings.MaxTransformConcurrency());
-        }
         const size_t maxPartitions = stageSettings.SinglePartition ? 1ULL : tasksPerStage;
         TVector<TString> parts;
         if (auto dqIntegration = (*datasource)->GetDqIntegration()) {
@@ -612,7 +614,7 @@ THashMap<TStageId, std::tuple<TString,ui64,ui64>> TDqsExecutionPlanner::BuildAll
 
             TExprNode::TPtr lambdaInput = ExprContext.DeepCopyLambda(stage.Program().Ref());
             bool hasNonDeterministicFunctions;
-            auto status = PeepHoleOptimizeNode<true>(lambdaInput, lambdaInput, ExprContext, *TypeContext, nullptr, hasNonDeterministicFunctions);
+            auto status = PeepHoleOptimizeNode(lambdaInput, lambdaInput, ExprContext, *TypeContext, nullptr, hasNonDeterministicFunctions);
             if (status != IGraphTransformer::TStatus::Ok) {
                 ExprContext.AddError(TIssue(ExprContext.GetPosition(lambdaInput->Pos()), TString("Peephole optimization failed for Dq stage")));
                 ExprContext.IssueManager.GetIssues().PrintTo(Cerr);

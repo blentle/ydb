@@ -19,15 +19,18 @@ namespace NKikimr::NDataShard {
             Y_VERIFY(Self->VolatileTxManager.PendingCommitTxScheduled);
             Self->VolatileTxManager.PendingCommitTxScheduled = false;
 
-            Y_VERIFY(!Self->VolatileTxManager.PendingCommits.empty());
-            TxId = Self->VolatileTxManager.PendingCommits.front();
-            Self->VolatileTxManager.PendingCommits.pop_front();
+            // We may have changed our mind
+            if (Self->VolatileTxManager.PendingCommits.Empty()) {
+                TxId = 0;
+                return true;
+            }
+
+            auto* info = Self->VolatileTxManager.PendingCommits.PopFront();
+            Y_VERIFY(info && info->State == EVolatileTxState::Committed);
+            TxId = info->TxId;
 
             // Schedule another transaction if needed
             Self->VolatileTxManager.RunPendingCommitTx();
-
-            auto* info = Self->VolatileTxManager.FindByTxId(TxId);
-            Y_VERIFY(info && info->State == EVolatileTxState::Committed);
 
             for (auto& pr : Self->GetUserTables()) {
                 auto tid = pr.second->LocalTid;
@@ -65,6 +68,8 @@ namespace NKikimr::NDataShard {
 
             Self->VolatileTxManager.PersistRemoveVolatileTx(TxId, txc);
 
+            Self->VolatileTxManager.RemoveFromCommitOrder(info);
+
             if (info->AddCommitted) {
                 OnCommitted(ctx);
             } else {
@@ -75,9 +80,14 @@ namespace NKikimr::NDataShard {
         }
 
         void Complete(const TActorContext& ctx) override {
+            if (TxId == 0) {
+                return;
+            }
+
             if (Delayed) {
                 OnCommitted(ctx);
             }
+
             if (Collected) {
                 Self->EnqueueChangeRecords(std::move(Collected));
             }
@@ -117,15 +127,18 @@ namespace NKikimr::NDataShard {
             Y_VERIFY(Self->VolatileTxManager.PendingAbortTxScheduled);
             Self->VolatileTxManager.PendingAbortTxScheduled = false;
 
-            Y_VERIFY(!Self->VolatileTxManager.PendingAborts.empty());
-            TxId = Self->VolatileTxManager.PendingAborts.front();
-            Self->VolatileTxManager.PendingAborts.pop_front();
+            // We may have changed our mind
+            if (Self->VolatileTxManager.PendingAborts.Empty()) {
+                TxId = 0;
+                return true;
+            }
+
+            auto* info = Self->VolatileTxManager.PendingAborts.PopFront();
+            Y_VERIFY(info && info->State == EVolatileTxState::Aborting);
+            TxId = info->TxId;
 
             // Schedule another transaction if needed
             Self->VolatileTxManager.RunPendingAbortTx();
-
-            auto* info = Self->VolatileTxManager.FindByTxId(TxId);
-            Y_VERIFY(info && info->State == EVolatileTxState::Aborting);
 
             for (auto& pr : Self->GetUserTables()) {
                 auto tid = pr.second->LocalTid;
@@ -141,6 +154,10 @@ namespace NKikimr::NDataShard {
         }
 
         void Complete(const TActorContext& ctx) override {
+            if (TxId == 0) {
+                return;
+            }
+
             auto* info = Self->VolatileTxManager.FindByTxId(TxId);
             Y_VERIFY(info && info->State == EVolatileTxState::Aborting);
             Y_VERIFY(info->AddCommitted);
@@ -189,7 +206,9 @@ namespace NKikimr::NDataShard {
         VolatileTxs.clear();
         VolatileTxByVersion.clear();
         VolatileTxByCommitTxId.clear();
+        VolatileTxByCommitOrder.Clear();
         TxMap.Reset();
+        NextCommitOrder = 1;
     }
 
     bool TVolatileTxManager::Load(NIceDb::TNiceDb& db) {
@@ -199,6 +218,7 @@ namespace NKikimr::NDataShard {
             VolatileTxs.empty() &&
             VolatileTxByVersion.empty() &&
             VolatileTxByCommitTxId.empty() &&
+            VolatileTxByCommitOrder.Empty() &&
             !TxMap,
             "Unexpected Load into non-empty volatile tx manager");
 
@@ -231,10 +251,12 @@ namespace NKikimr::NDataShard {
                     }
                     break;
                 case EVolatileTxState::Committed:
-                    PendingCommits.push_back(pr.first);
+                    if (ReadyToDbCommit(pr.second.get())) {
+                        PendingCommits.PushBack(pr.second.get());
+                    }
                     break;
                 case EVolatileTxState::Aborting:
-                    PendingAborts.push_back(pr.first);
+                    PendingAborts.PushBack(pr.second.get());
                     Y_FAIL("FIXME: unexpected persistent aborting state");
                     break;
             }
@@ -251,6 +273,8 @@ namespace NKikimr::NDataShard {
         if (!rowset.IsReady()) {
             return false;
         }
+
+        ui64 maxCommitOrder = 0;
 
         while (!rowset.EndOfSet()) {
             ui64 txId = rowset.GetValue<Schema::TxVolatileDetails::TxId>();
@@ -274,13 +298,23 @@ namespace NKikimr::NDataShard {
                 info->ChangeGroup = details.GetChangeGroup();
             }
             info->AddCommitted = true; // we loaded it from local db, so it is committed
+            info->CommitOrder = details.GetCommitOrder();
+            info->CommitOrdered = details.GetCommitOrdered();
+
+            maxCommitOrder = Max(maxCommitOrder, info->CommitOrder);
 
             if (!rowset.Next()) {
                 return false;
             }
         }
 
-        auto postProcessTxInfo = [this](TVolatileTxInfo* info) {
+        NextCommitOrder = maxCommitOrder + 1;
+
+        // Prepare and sort a vector later (intrusive list sorting isn't good enough)
+        std::vector<TVolatileTxInfo*> byCommitOrder;
+        byCommitOrder.reserve(VolatileTxs.size());
+
+        auto postProcessTxInfo = [this, &byCommitOrder](TVolatileTxInfo* info) {
             switch (info->State) {
                 case EVolatileTxState::Waiting:
                 case EVolatileTxState::Committed: {
@@ -308,6 +342,7 @@ namespace NKikimr::NDataShard {
                         ++it;
                     }
 
+                    byCommitOrder.push_back(info);
                     return;
                 }
 
@@ -325,6 +360,13 @@ namespace NKikimr::NDataShard {
         for (auto& pr : VolatileTxs) {
             postProcessTxInfo(pr.second.get());
             VolatileTxByVersion.insert(pr.second.get());
+        }
+
+        std::sort(byCommitOrder.begin(), byCommitOrder.end(), [](TVolatileTxInfo* a, TVolatileTxInfo* b) -> bool {
+            return a->CommitOrder < b->CommitOrder;
+        });
+        for (TVolatileTxInfo* info : byCommitOrder) {
+            VolatileTxByCommitOrder.PushBack(info);
         }
 
         return true;
@@ -390,9 +432,10 @@ namespace NKikimr::NDataShard {
     void TVolatileTxManager::PersistAddVolatileTx(
             ui64 txId, const TRowVersion& version,
             TConstArrayRef<ui64> commitTxIds,
-            TConstArrayRef<ui64> dependencies,
+            const absl::flat_hash_set<ui64>& dependencies,
             TConstArrayRef<ui64> participants,
             std::optional<ui64> changeGroup,
+            bool commitOrdered,
             TTransactionContext& txc)
     {
         using Schema = TDataShard::Schema;
@@ -409,9 +452,11 @@ namespace NKikimr::NDataShard {
         info->TxId = txId;
         info->Version = version;
         info->CommitTxIds.insert(commitTxIds.begin(), commitTxIds.end());
-        info->Dependencies.insert(dependencies.begin(), dependencies.end());
+        info->Dependencies = dependencies;
         info->Participants.insert(participants.begin(), participants.end());
         info->ChangeGroup = changeGroup;
+        info->CommitOrder = NextCommitOrder++;
+        info->CommitOrdered = commitOrdered;
 
         if (info->Participants.empty()) {
             // Transaction is committed when we don't have to wait for other participants
@@ -419,6 +464,7 @@ namespace NKikimr::NDataShard {
         }
 
         VolatileTxByVersion.insert(info);
+        VolatileTxByCommitOrder.PushBack(info);
 
         if (!TxMap) {
             TxMap = MakeIntrusive<TTxMap>();
@@ -461,6 +507,11 @@ namespace NKikimr::NDataShard {
             details.SetChangeGroup(*info->ChangeGroup);
         }
 
+        details.SetCommitOrder(info->CommitOrder);
+        if (info->CommitOrdered) {
+            details.SetCommitOrdered(true);
+        }
+
         db.Table<Schema::TxVolatileDetails>().Key(info->TxId).Update(
             NIceDb::TUpdate<Schema::TxVolatileDetails::State>(info->State),
             NIceDb::TUpdate<Schema::TxVolatileDetails::Details>(std::move(details)));
@@ -468,6 +519,9 @@ namespace NKikimr::NDataShard {
             db.Table<Schema::TxVolatileParticipants>().Key(info->TxId, shardId).Update();
         }
 
+        txc.DB.OnRollback([this, txId]() {
+            RollbackAddVolatileTx(txId);
+        });
         txc.OnCommitted([this, txId]() {
             auto* info = FindByTxId(txId);
             Y_VERIFY_S(info, "Unexpected failure to find volatile txId# " << txId);
@@ -477,13 +531,35 @@ namespace NKikimr::NDataShard {
                 RunCommitCallbacks(info);
             }
         });
-        txc.OnRollback([txId]() {
-            Y_VERIFY_S(false, "Unexpected rollback of volatile txId# " << txId);
-        });
 
-        if (info->State == EVolatileTxState::Committed && info->Dependencies.empty()) {
+        if (ReadyToDbCommit(info)) {
             AddPendingCommit(info->TxId);
         }
+    }
+
+    void TVolatileTxManager::RollbackAddVolatileTx(ui64 txId) {
+        auto* info = FindByTxId(txId);
+        Y_VERIFY_S(info, "Rollback cannot find volatile txId# " << txId);
+
+        // Unlink dependencies
+        for (ui64 dependencyTxId : info->Dependencies) {
+            if (auto* dependency = FindByTxId(dependencyTxId)) {
+                dependency->Dependents.erase(txId);
+            }
+        }
+
+        // Unlink commits
+        for (ui64 commitTxId : info->CommitTxIds) {
+            TxMap->Remove(commitTxId);
+            VolatileTxByCommitTxId.erase(commitTxId);
+        }
+
+        VolatileTxByVersion.erase(info);
+
+        // FIXME: do we need to handle WaitingSnapshotEvents somehow?
+
+        // This will also unlink from linked lists
+        VolatileTxs.erase(txId);
     }
 
     void TVolatileTxManager::PersistRemoveVolatileTx(ui64 txId, TTransactionContext& txc) {
@@ -507,6 +583,8 @@ namespace NKikimr::NDataShard {
 
         Y_VERIFY_S(info->Dependencies.empty(), "Unexpected remove of volatile tx " << txId << " with dependencies");
         Y_VERIFY_S(info->Dependents.empty(), "Unexpected remove of volatile tx " << txId << " with dependents");
+        Y_VERIFY_S(!info->IsInList<TVolatileTxInfoCommitOrderListTag>(),
+            "Unexpected remove of volatile tx " << txId << " which is in commit order linked list");
 
         UnblockWaitingRemovalOperations(info);
 
@@ -616,6 +694,10 @@ namespace NKikimr::NDataShard {
 
         // We will unblock operations when we persist the abort
         AddPendingAbort(txId);
+
+        // Note that abort is always enqueued, never executed immediately,
+        // so it is safe to use info in this call.
+        RemoveFromCommitOrder(info);
     }
 
     void TVolatileTxManager::ProcessReadSet(
@@ -703,7 +785,7 @@ namespace NKikimr::NDataShard {
             if (info->AddCommitted) {
                 RunCommitCallbacks(info);
             }
-            if (info->Dependencies.empty()) {
+            if (info->Dependencies.empty() && ReadyToDbCommit(info)) {
                 AddPendingCommit(txId);
             }
         }
@@ -797,27 +879,58 @@ namespace NKikimr::NDataShard {
     }
 
     void TVolatileTxManager::AddPendingCommit(ui64 txId) {
-        PendingCommits.push_back(txId);
-        RunPendingCommitTx();
+        if (auto* info = FindByTxId(txId)) {
+            PendingCommits.PushBack(info);
+            RunPendingCommitTx();
+        }
     }
 
     void TVolatileTxManager::AddPendingAbort(ui64 txId) {
-        PendingAborts.push_back(txId);
-        RunPendingAbortTx();
+        if (auto* info = FindByTxId(txId)) {
+            PendingAborts.PushBack(info);
+            RunPendingAbortTx();
+        }
     }
 
     void TVolatileTxManager::RunPendingCommitTx() {
-        if (!PendingCommitTxScheduled && !PendingCommits.empty()) {
+        if (!PendingCommitTxScheduled && !PendingCommits.Empty()) {
             PendingCommitTxScheduled = true;
             Self->Execute(new TDataShard::TTxVolatileTxCommit(Self));
         }
     }
 
     void TVolatileTxManager::RunPendingAbortTx() {
-        if (!PendingAbortTxScheduled && !PendingAborts.empty()) {
+        if (!PendingAbortTxScheduled && !PendingAborts.Empty()) {
             PendingAbortTxScheduled = true;
             Self->EnqueueExecute(new TDataShard::TTxVolatileTxAbort(Self));
         }
+    }
+
+    void TVolatileTxManager::RemoveFromCommitOrder(TVolatileTxInfo* info) {
+        Y_VERIFY(info->IsInList<TVolatileTxInfoCommitOrderListTag>(),
+            "Volatile transaction is not in a commit order linked list");
+        Y_VERIFY(!VolatileTxByCommitOrder.Empty(), "Commit order linked list is unexpectedly empty");
+        const bool wasFirst = VolatileTxByCommitOrder.Front() == info;
+        info->UnlinkFromList<TVolatileTxInfoCommitOrderListTag>();
+        if (wasFirst && !VolatileTxByCommitOrder.Empty()) {
+            auto* next = VolatileTxByCommitOrder.Front();
+            if (next->CommitOrdered && ReadyToDbCommit(next)) {
+                AddPendingCommit(next->TxId);
+            }
+        }
+    }
+
+    bool TVolatileTxManager::ReadyToDbCommit(TVolatileTxInfo* info) const {
+        if (info->State == EVolatileTxState::Committed && info->Dependencies.empty()) {
+            if (info->CommitOrdered) {
+                Y_VERIFY_DEBUG(!VolatileTxByCommitOrder.Empty());
+                return VolatileTxByCommitOrder.Front() == info;
+            }
+
+            return true;
+        }
+
+        return false;
     }
 
 } // namespace NKikimr::NDataShard

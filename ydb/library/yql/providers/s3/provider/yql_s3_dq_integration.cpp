@@ -121,7 +121,7 @@ public:
         return 0;
     }
 
-    TMaybe<ui64> CanRead(const TDqSettings&, const TExprNode& read, TExprContext&, bool) override {
+    TMaybe<ui64> CanRead(ui64 /*dataSizePerJob*/, ui32 /*maxTasksPerStage*/, const TExprNode& read, TExprContext&, bool) override {
         if (TS3ReadObject::Match(&read)) {
             return 0ul; // TODO: return real size
         }
@@ -182,7 +182,10 @@ public:
             auto format = s3ReadObject.Object().Format().Ref().Content();
             if (const auto useCoro = State_->Configuration->SourceCoroActor.Get(); (!useCoro || *useCoro) && format != "raw" && format != "json_list") {
                 bool supportedArrowTypes = false;
-                if (State_->Types->UseBlocks && State_->Types->ArrowResolver) {
+                if (State_->Types->UseBlocks) {
+                    YQL_ENSURE(State_->Configuration->UseBlocksSource.Get().GetOrElse(true), "Scalar Source is not compatible with Blocks engine");
+                }
+                if (State_->Configuration->UseBlocksSource.Get().GetOrElse(State_->Types->UseBlocks) && State_->Types->ArrowResolver) {
                     TVector<const TTypeAnnotationNode*> allTypes;
                     for (const auto& x : rowType->Cast<TStructExprType>()->GetItems()) {
                         allTypes.push_back(x->GetItemType());
@@ -357,6 +360,7 @@ public:
                 sinkDesc.SetCompression(TString(compression));
 
             sinkDesc.SetMultipart(GetMultipart(settings.Settings().Ref()));
+            sinkDesc.SetAtomicUploadCommit(State_->Configuration->AtomicUploadCommit.Get().GetOrElse(false));
 
             protoSettings.PackFrom(sinkDesc);
             sinkType = "S3Sink";

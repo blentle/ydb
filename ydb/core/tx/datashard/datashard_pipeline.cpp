@@ -1132,7 +1132,7 @@ void TPipeline::ProcessDisconnected(ui32 nodeId)
     for (auto &pr : ActiveOps) {
         if (pr.second->HasProcessDisconnectsFlag()) {
             auto *ev = new TDataShard::TEvPrivate::TEvNodeDisconnected(nodeId);
-            pr.second->AddInputEvent(new IEventHandleFat(Self->SelfId(), Self->SelfId(), ev));
+            pr.second->AddInputEvent(new IEventHandle(Self->SelfId(), Self->SelfId(), ev));
             AddCandidateOp(pr.second);
         }
     }
@@ -1764,6 +1764,9 @@ void TPipeline::AddWaitingReadIterator(
     TEvDataShard::TEvRead::TPtr ev,
     const TActorContext& ctx)
 {
+    // Combined with registration for convenience
+    RegisterWaitingReadIterator(TReadIteratorId(ev->Sender, ev->Get()->Record.GetReadId()), ev->Get());
+
     if (Y_UNLIKELY(Self->MvccSwitchState == TSwitchState::SWITCHING)) {
         // postpone tx processing till mvcc state switch is finished
         WaitingDataReadIterators.emplace(TRowVersion::Min(), ev);
@@ -1785,6 +1788,35 @@ void TPipeline::AddWaitingReadIterator(
         << " to wait version# " << version
         << ", waitStep# " << waitStep
         << ", current unreliable edge# " << unreadableEdge);
+}
+
+bool TPipeline::HasWaitingReadIterator(const TReadIteratorId& readId) {
+    return WaitingReadIteratorsById.contains(readId);
+}
+
+bool TPipeline::CancelWaitingReadIterator(const TReadIteratorId& readId) {
+    auto it = WaitingReadIteratorsById.find(readId);
+    if (it != WaitingReadIteratorsById.end()) {
+        it->second->Cancelled = true;
+        WaitingReadIteratorsById.erase(it);
+        return true;
+    }
+
+    return false;
+}
+
+void TPipeline::RegisterWaitingReadIterator(const TReadIteratorId& readId, TEvDataShard::TEvRead* event) {
+    auto res = WaitingReadIteratorsById.emplace(readId, event);
+    Y_VERIFY(res.second);
+}
+
+bool TPipeline::HandleWaitingReadIterator(const TReadIteratorId& readId, TEvDataShard::TEvRead* event) {
+    auto it = WaitingReadIteratorsById.find(readId);
+    if (it != WaitingReadIteratorsById.end() && it->second == event) {
+        WaitingReadIteratorsById.erase(it);
+    }
+
+    return !event->Cancelled;
 }
 
 TRowVersion TPipeline::GetReadEdge() const {
@@ -1998,6 +2030,35 @@ bool TPipeline::AddLockDependencies(const TOperation::TPtr& op, TLocksUpdate& gu
     }
 
     return addedDependencies;
+}
+
+void TPipeline::ProvideGlobalTxId(const TOperation::TPtr& op, ui64 globalTxId) {
+    Y_VERIFY(op->HasWaitingForGlobalTxIdFlag());
+    ui64 localTxId = op->GetTxId();
+
+    auto itImmediate = ImmediateOps.find(localTxId);
+    Y_VERIFY(itImmediate != ImmediateOps.end());
+    ImmediateOps.erase(itImmediate);
+    auto itActive = ActiveOps.find(op->GetStepOrder());
+    Y_VERIFY(itActive != ActiveOps.end());
+    ActiveOps.erase(itActive);
+    bool removedCandidate = false;
+    auto itCandidate = CandidateOps.find(op->GetStepOrder());
+    if (itCandidate != CandidateOps.end()) {
+        CandidateOps.erase(itCandidate);
+        removedCandidate = true;
+    }
+
+    op->SetGlobalTxId(globalTxId);
+    op->SetWaitingForGlobalTxIdFlag(false);
+    auto resImmediate = ImmediateOps.emplace(op->GetTxId(), op);
+    Y_VERIFY(resImmediate.second);
+    auto resActive = ActiveOps.emplace(op->GetStepOrder(), op);
+    Y_VERIFY(resActive.second);
+    if (removedCandidate) {
+        auto resCandidate = CandidateOps.emplace(op->GetStepOrder(), op);
+        Y_VERIFY(resCandidate.second);
+    }
 }
 
 }}

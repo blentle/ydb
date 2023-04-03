@@ -21,6 +21,7 @@
 
 #include <map>
 #include <util/generic/string.h>
+#include <util/string/cast.h>
 #include <vector>
 
 #include "y_absl/types/optional.h"
@@ -205,7 +206,7 @@ class XdsRouteConfigResourceType
                                       y_absl::string_view serialized_resource,
                                       bool /*is_v2*/) const override;
 
-  void InitUpbSymtab(upb_symtab* symtab) const override {
+  void InitUpbSymtab(upb_DefPool* symtab) const override {
     envoy_config_route_v3_RouteConfiguration_getmsgdef(symtab);
   }
 };

@@ -77,7 +77,7 @@ static constexpr ui64 txInitiator = 42; // 0 means LongTx, we need another value
 void WriteData(TTestBasicRuntime& runtime, TActorId sender, ui64 tabletId, ui64 pathId, ui64 writeId, TString data) {
     const TString dedupId = ToString(writeId);
 
-    auto evWrite = std::make_unique<TEvColumnShard::TEvWrite>(sender, txInitiator, writeId, pathId, dedupId, data);
+    auto evWrite = std::make_unique<TEvColumnShard::TEvWrite>(sender, txInitiator, writeId, pathId, dedupId, data, 1);
 
     ForwardToTablet(runtime, tabletId, sender, evWrite.release());
     TAutoPtr<IEventHandle> handle;
@@ -565,7 +565,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
             AlterSchemaPresets {
                 Name: "default"
                 AlterSchema {
-                    AddColumns { Name: "comment" Type: "Utf8" }
+                    Columns { Name: "comment" Type: "Utf8" }
                 }
             }
         )", {NKikimrScheme::StatusInvalidParameter});

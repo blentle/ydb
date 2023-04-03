@@ -22,20 +22,25 @@ class TDirectTxErase : public IDirectTx {
         TTransactionContext* const Txc;
         const TRowVersion ReadVersion;
         const TRowVersion WriteVersion;
+        const ui64 GlobalTxId;
+        absl::flat_hash_set<ui64>* const VolatileReadDependencies;
 
     private:
         explicit TExecuteParams(TDirectTxErase* tx, TTransactionContext* txc,
-                const TRowVersion& readVersion, const TRowVersion& writeVersion)
+                const TRowVersion& readVersion, const TRowVersion& writeVersion,
+                ui64 globalTxId, absl::flat_hash_set<ui64>* volatileReadDependencies)
             : Tx(tx)
             , Txc(txc)
             , ReadVersion(readVersion)
             , WriteVersion(writeVersion)
+            , GlobalTxId(globalTxId)
+            , VolatileReadDependencies(volatileReadDependencies)
         {
         }
 
     public:
         static TExecuteParams ForCheck() {
-            return TExecuteParams(nullptr, nullptr, TRowVersion(), TRowVersion());
+            return TExecuteParams(nullptr, nullptr, TRowVersion(), TRowVersion(), 0, nullptr);
         }
 
         template <typename... Args>
@@ -68,7 +73,9 @@ public:
     static bool CheckRequest(TDataShard* self, const NKikimrTxDataShard::TEvEraseRowsRequest& request,
         NKikimrTxDataShard::TEvEraseRowsResponse::EStatus& status, TString& error);
 
-    bool Execute(TDataShard* self, TTransactionContext& txc, const TRowVersion& readVersion, const TRowVersion& writeVersion) override;
+    bool Execute(TDataShard* self, TTransactionContext& txc,
+        const TRowVersion& readVersion, const TRowVersion& writeVersion,
+        ui64 globalTxId, absl::flat_hash_set<ui64>& volatileReadDependencies) override;
     TDirectTxResult GetResult(TDataShard* self) override;
     TVector<IDataShardChangeCollector::TChange> GetCollectedChanges() const override;
 };

@@ -307,6 +307,10 @@ private:
         VisitType<TBlockType>(node);
     }
 
+    void Visit(TMultiType& node) override {
+        VisitType<TMultiType>(node);
+    }
+
     void Visit(TTaggedType& node) override {
         VisitType<TTaggedType>(node);
     }
@@ -459,11 +463,7 @@ private:
             name == "KqpWideReadTableRanges" ||
             name == "KqpBlockReadTableRanges" ||
             name == "KqpLookupTable" ||
-            name == "KqpReadTable" ||
-            name == "RangeMultiply" ||
-            name == "RangeUnion" ||
-            name == "RangeIntersect" ||
-            name == "RangeFinalize"
+            name == "KqpReadTable"
         ) {
             PatternNodes->SuitableForCache = false;
         }

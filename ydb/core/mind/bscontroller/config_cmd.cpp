@@ -218,8 +218,8 @@ namespace NKikimr::NBsController {
                             MAP_TIMING(ReadIntent, READ_INTENT)
                             MAP_TIMING(DropDonorDisk, DROP_DONOR_DISK)
                             MAP_TIMING(ReassignGroupDisk, REASSIGN_GROUP_DISK)
-                            MAP_TIMING(WipeVDisk, REASSIGN_GROUP_DISK)
-                            MAP_TIMING(SanitizeGroup, REASSIGN_GROUP_DISK)
+                            MAP_TIMING(WipeVDisk, WIPE_VDISK)
+                            MAP_TIMING(SanitizeGroup, SANITIZE_GROUP)
 
                             default:
                                 break;
@@ -340,7 +340,7 @@ namespace NKikimr::NBsController {
                     STLOG(PRI_INFO, BS_CONTROLLER_AUDIT, BSCA09, "Transaction complete", (UniqueId, state->UniqueId));
                     state->ApplyConfigUpdates();
                 }
-                TActivationContext::Send(new IEventHandleFat(NotifyId, Self->SelfId(), Ev.Release(), 0, Cookie));
+                TActivationContext::Send(new IEventHandle(NotifyId, Self->SelfId(), Ev.Release(), 0, Cookie));
                 Self->UpdatePDisksCounters();
             }
         };

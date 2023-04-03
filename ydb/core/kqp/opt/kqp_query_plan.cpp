@@ -923,6 +923,8 @@ private:
             operatorId = Visit(maybeCombiner.Cast(), planNode);
         } else if (auto maybeSort = TMaybeNode<TCoSort>(node)) {
             operatorId = Visit(maybeSort.Cast(), planNode);
+        } else if (auto maybeTop = TMaybeNode<TCoTop>(node)) {
+            operatorId = Visit(maybeTop.Cast(), planNode);
         } else if (auto maybeTopSort = TMaybeNode<TCoTopSort>(node)) {
             operatorId = Visit(maybeTopSort.Cast(), planNode);
         } else if (auto maybeTake = TMaybeNode<TCoTake>(node)) {
@@ -989,6 +991,15 @@ private:
         op.Properties["SortBy"] = PrettyExprStr(sort.KeySelectorLambda());
 
         return AddOperator(planNode, "Sort", std::move(op));
+    }
+
+    ui32 Visit(const TCoTop& top, TQueryPlanNode& planNode) {
+        TOperator op;
+        op.Properties["Name"] = "Top";
+        op.Properties["TopBy"] = PrettyExprStr(top.KeySelectorLambda());
+        op.Properties["Limit"] = PrettyExprStr(top.Count());
+
+        return AddOperator(planNode, "Top", std::move(op));
     }
 
     ui32 Visit(const TCoTopSort& topSort, TQueryPlanNode& planNode) {
@@ -1653,7 +1664,10 @@ TString AddExecStatsToTxPlan(const TString& txPlanJson, const NYql::NDqProto::TD
         SetNonZero(node, "PendingInputTimeUs", taskStats.GetPendingInputTimeUs());
         SetNonZero(node, "PendingOutputTimeUs", taskStats.GetPendingOutputTimeUs());
 
-        SetNonZero(node, "ErrorsCount", taskStats.GetErrorsCount());
+        NKqpProto::TKqpTaskExtraStats taskExtraStats;
+        if (taskStats.GetExtra().UnpackTo(&taskExtraStats)) {
+            SetNonZero(node, "ScanRetries", taskExtraStats.GetScanTaskExtraStats().GetRetriesCount());
+        }
 
         for (auto& inputStats : taskStats.GetInputChannels()) {
             auto& inputNode = node["InputChannels"].AppendValue(NJson::TJsonValue());
@@ -1690,7 +1704,6 @@ TString AddExecStatsToTxPlan(const TString& txPlanJson, const NYql::NDqProto::TD
                 stats["TotalInputBytes"] = (*stat)->GetInputBytes().GetSum();
                 stats["TotalOutputRows"] = (*stat)->GetOutputRows().GetSum();
                 stats["TotalOutputBytes"] = (*stat)->GetOutputBytes().GetSum();
-                stats["TotalErrosCount"] = (*stat)->GetTotalErrorsCount();
 
                 for (auto& caStats : (*stat)->GetComputeActors()) {
                     auto& caNode = stats["ComputeNodes"].AppendValue(NJson::TJsonValue());

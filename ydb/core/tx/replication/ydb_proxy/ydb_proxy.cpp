@@ -14,22 +14,24 @@
 #include <memory>
 #include <mutex>
 
-namespace NKikimr {
-namespace NReplication {
+namespace NKikimr::NReplication {
 
 using namespace NKikimrReplication;
 using namespace NYdb;
 using namespace NYdb::NScheme;
 using namespace NYdb::NTable;
+using namespace NYdb::NTopic;
 
 template <typename TDerived>
 class TBaseProxyActor: public TActor<TDerived> {
     class TRequest;
     using TRequestPtr = std::shared_ptr<TRequest>;
 
+protected:
     struct TEvPrivate {
         enum EEv {
             EvComplete = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
+            EvTopicEventReady,
 
             EvEnd,
         };
@@ -45,8 +47,20 @@ class TBaseProxyActor: public TActor<TDerived> {
             }
         };
 
+        struct TEvTopicEventReady: public TEventLocal<TEvTopicEventReady, EvTopicEventReady> {
+            const TActorId Sender;
+            const ui64 Cookie;
+
+            explicit TEvTopicEventReady(const TActorId& sender, ui64 cookie)
+                : Sender(sender)
+                , Cookie(cookie)
+            {
+            }
+        };
+
     }; // TEvPrivate
 
+private:
     class TRequest: public std::enable_shared_from_this<TRequest> {
         friend class TBaseProxyActor<TDerived>;
 
@@ -69,7 +83,7 @@ class TBaseProxyActor: public TActor<TDerived> {
             std::lock_guard<std::mutex> lock(RWActorSystem);
 
             if (ActorSystem) {
-                ActorSystem->Send(new IEventHandleFat(recipient, Self, ev, 0, cookie));
+                ActorSystem->Send(new IEventHandle(recipient, Self, ev, 0, cookie));
             }
         }
 
@@ -98,11 +112,6 @@ class TBaseProxyActor: public TActor<TDerived> {
         Requests.erase(ev->Get()->Request);
     }
 
-    void PassAway() override {
-        Requests.clear();
-        IActor::PassAway();
-    }
-
 protected:
     using TActor<TDerived>::TActor;
 
@@ -112,7 +121,12 @@ protected:
         }
     }
 
-    std::weak_ptr<TRequest> MakeRequest(const TActorId& sender, ui64 cookie) {
+    void PassAway() override {
+        Requests.clear();
+        IActor::PassAway();
+    }
+
+    std::weak_ptr<TRequest> MakeRequest(const TActorId& sender, ui64 cookie = 0) {
         auto request = std::make_shared<TRequest>(TlsActivationContext->ActorSystem(), this->SelfId(), sender, cookie);
         Requests.emplace(request);
         return request;
@@ -144,15 +158,80 @@ private:
 
 }; // TBaseProxyActor
 
+class TTopicReader: public TBaseProxyActor<TTopicReader> {
+    void Handle(TEvYdbProxy::TEvReadTopicRequest::TPtr& ev) {
+        auto request = MakeRequest(SelfId());
+        auto cb = [request, sender = ev->Sender, cookie = ev->Cookie](const NThreading::TFuture<void>&) {
+            if (auto r = request.lock()) {
+                r->Complete(new TEvPrivate::TEvTopicEventReady(sender, cookie));
+            }
+        };
+
+        Session->WaitEvent().Subscribe(std::move(cb));
+    }
+
+    void Handle(TEvPrivate::TEvTopicEventReady::TPtr& ev) {
+        auto event = Session->GetEvent(true);
+        Y_VERIFY(event.Defined());
+        Send(ev->Get()->Sender, new TEvYdbProxy::TEvReadTopicResponse(std::move(*event)), 0, ev->Get()->Cookie);
+    }
+
+    void PassAway() override {
+        Session->Close(TDuration::MilliSeconds(100)); // non-blocking if there is no inflight commits
+        TBaseProxyActor<TTopicReader>::PassAway();
+    }
+
+public:
+    explicit TTopicReader(const std::shared_ptr<IReadSession>& session)
+        : TBaseProxyActor(&TThis::StateWork)
+        , Session(session)
+    {
+    }
+
+    STATEFN(StateWork) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvYdbProxy::TEvReadTopicRequest, Handle);
+            hFunc(TEvPrivate::TEvTopicEventReady, Handle);
+
+        default:
+            return StateBase(ev, TlsActivationContext->AsActorContext());
+        }
+    }
+
+private:
+    std::shared_ptr<IReadSession> Session;
+
+}; // TTopicReader
+
 class TYdbProxy: public TBaseProxyActor<TYdbProxy> {
     template <typename TEvResponse, typename TClient, typename... Args>
     using TFunc = typename TEvResponse::TAsyncResult(TClient::*)(Args...);
 
-    template <typename TClient>
+    template <typename TSettings>
+    static TSettings ClientSettings(const TCommonClientSettings& base) {
+        auto derived = TSettings();
+
+        if (base.DiscoveryEndpoint_) {
+            derived.DiscoveryEndpoint(*base.DiscoveryEndpoint_);
+        }
+        if (base.DiscoveryMode_) {
+            derived.DiscoveryMode(*base.DiscoveryMode_);
+        }
+        if (base.Database_) {
+            derived.Database(*base.Database_);
+        }
+        if (base.CredentialsProviderFactory_) {
+            derived.CredentialsProviderFactory(*base.CredentialsProviderFactory_);
+        }
+
+        return derived;
+    }
+
+    template <typename TClient, typename TSettings>
     TClient* EnsureClient(THolder<TClient>& client) {
         if (!client) {
             Y_VERIFY(AppData()->YdbDriver);
-            client.Reset(new TClient(*AppData()->YdbDriver, Settings));
+            client.Reset(new TClient(*AppData()->YdbDriver, ClientSettings<TSettings>(CommonSettings)));
         }
 
         return client.Get();
@@ -161,9 +240,11 @@ class TYdbProxy: public TBaseProxyActor<TYdbProxy> {
     template <typename TClient>
     TClient* EnsureClient() {
         if constexpr (std::is_same_v<TClient, TSchemeClient>) {
-            return EnsureClient<TClient>(SchemeClient);
+            return EnsureClient<TClient, TCommonClientSettings>(SchemeClient);
         } else if constexpr (std::is_same_v<TClient, TTableClient>) {
-            return EnsureClient<TClient>(TableClient);
+            return EnsureClient<TClient, TClientSettings>(TableClient);
+        } else if constexpr (std::is_same_v<TClient, TTopicClient>) {
+            return EnsureClient<TClient, TTopicClientSettings>(TopicClient);
         } else {
             Y_FAIL("unreachable");
         }
@@ -246,19 +327,46 @@ class TYdbProxy: public TBaseProxyActor<TYdbProxy> {
         CallSession<TEvYdbProxy::TEvDescribeTableResponse>(ev, &TSession::DescribeTable);
     }
 
-    static TClientSettings MakeSettings(const TString& endpoint, const TString& database) {
-        return TClientSettings()
+    void Handle(TEvYdbProxy::TEvCreateTopicRequest::TPtr& ev) {
+        Call<TEvYdbProxy::TEvCreateTopicResponse>(ev, &TTopicClient::CreateTopic);
+    }
+
+    void Handle(TEvYdbProxy::TEvAlterTopicRequest::TPtr& ev) {
+        Call<TEvYdbProxy::TEvAlterTopicResponse>(ev, &TTopicClient::AlterTopic);
+    }
+
+    void Handle(TEvYdbProxy::TEvDropTopicRequest::TPtr& ev) {
+        Call<TEvYdbProxy::TEvDropTopicResponse>(ev, &TTopicClient::DropTopic);
+    }
+
+    void Handle(TEvYdbProxy::TEvDescribeTopicRequest::TPtr& ev) {
+        Call<TEvYdbProxy::TEvDescribeTopicResponse>(ev, &TTopicClient::DescribeTopic);
+    }
+
+    void Handle(TEvYdbProxy::TEvDescribeConsumerRequest::TPtr& ev) {
+        Call<TEvYdbProxy::TEvDescribeConsumerResponse>(ev, &TTopicClient::DescribeConsumer);
+    }
+
+    void Handle(TEvYdbProxy::TEvCreateTopicReaderRequest::TPtr& ev) {
+        auto* client = EnsureClient<TTopicClient>();
+        auto args = std::move(ev->Get()->GetArgs());
+        auto session = std::apply(&TTopicClient::CreateReadSession, std::tuple_cat(std::tie(client), std::move(args)));
+        Send(ev->Sender, new TEvYdbProxy::TEvCreateTopicReaderResponse(RegisterWithSameMailbox(new TTopicReader(session))));
+    }
+
+    static TCommonClientSettings MakeSettings(const TString& endpoint, const TString& database) {
+        return TCommonClientSettings()
             .DiscoveryEndpoint(endpoint)
             .DiscoveryMode(EDiscoveryMode::Async)
             .Database(database);
     }
 
-    static TClientSettings MakeSettings(const TString& endpoint, const TString& database, const TString& token) {
+    static TCommonClientSettings MakeSettings(const TString& endpoint, const TString& database, const TString& token) {
         return MakeSettings(endpoint, database)
             .AuthToken(token);
     }
 
-    static TClientSettings MakeSettings(const TString& endpoint, const TString& database, const TStaticCredentials& credentials) {
+    static TCommonClientSettings MakeSettings(const TString& endpoint, const TString& database, const TStaticCredentials& credentials) {
         return MakeSettings(endpoint, database)
             .CredentialsProviderFactory(CreateLoginCredentialsProviderFactory({
                 .User = credentials.GetUser(),
@@ -270,7 +378,7 @@ public:
     template <typename... Args>
     explicit TYdbProxy(Args&&... args)
         : TBaseProxyActor(&TThis::StateWork)
-        , Settings(MakeSettings(std::forward<Args>(args)...))
+        , CommonSettings(MakeSettings(std::forward<Args>(args)...))
     {
     }
 
@@ -290,6 +398,13 @@ public:
             hFunc(TEvYdbProxy::TEvCopyTablesRequest, Handle);
             hFunc(TEvYdbProxy::TEvRenameTablesRequest, Handle);
             hFunc(TEvYdbProxy::TEvDescribeTableRequest, Handle);
+            // Topic
+            hFunc(TEvYdbProxy::TEvCreateTopicRequest, Handle);
+            hFunc(TEvYdbProxy::TEvAlterTopicRequest, Handle);
+            hFunc(TEvYdbProxy::TEvDropTopicRequest, Handle);
+            hFunc(TEvYdbProxy::TEvDescribeTopicRequest, Handle);
+            hFunc(TEvYdbProxy::TEvDescribeConsumerRequest, Handle);
+            hFunc(TEvYdbProxy::TEvCreateTopicReaderRequest, Handle);
 
         default:
             return StateBase(ev, TlsActivationContext->AsActorContext());
@@ -297,9 +412,10 @@ public:
     }
 
 private:
-    const TClientSettings Settings;
+    const TCommonClientSettings CommonSettings;
     THolder<TSchemeClient> SchemeClient;
     THolder<TTableClient> TableClient;
+    THolder<TTopicClient> TopicClient;
 
 }; // TYdbProxy
 
@@ -315,5 +431,4 @@ IActor* CreateYdbProxy(const TString& endpoint, const TString& database, const T
     return new TYdbProxy(endpoint, database, credentials);
 }
 
-} // NReplication
-} // NKikimr
+}
