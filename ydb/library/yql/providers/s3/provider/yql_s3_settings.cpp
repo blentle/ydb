@@ -20,6 +20,7 @@ TS3Configuration::TS3Configuration()
     REGISTER_SETTING(*this, ArrowRowGroupReordering);
     REGISTER_SETTING(*this, UseBlocksSource);
     REGISTER_SETTING(*this, AtomicUploadCommit);
+    REGISTER_SETTING(*this, UseConcurrentDirectoryLister);
 }
 
 TS3Settings::TConstPtr TS3Configuration::Snapshot() const {
@@ -54,6 +55,15 @@ void TS3Configuration::Init(const TS3GatewayConfig& config, TIntrusivePtr<TTypeA
         config.HasMaxReadSizePerQuery() ? config.GetMaxReadSizePerQuery() : 4_GB;
     MaxInflightListsPerQuery =
         config.HasMaxInflightListsPerQuery() ? config.GetMaxInflightListsPerQuery() : 1;
+    ListingCallbackThreadCount = config.HasListingCallbackThreadCount()
+                                     ? config.GetListingCallbackThreadCount()
+                                     : 1;
+    ListingCallbackPerThreadQueueSize = config.HasListingCallbackPerThreadQueueSize()
+                                            ? config.GetListingCallbackPerThreadQueueSize()
+                                            : 100;
+    RegexpCacheSize = config.HasRegexpCacheSize() ? config.GetRegexpCacheSize() : 100;
+    AllowConcurrentListings =
+        config.HasAllowConcurrentListings() ? config.GetAllowConcurrentListings() : false;
 
     TVector<TString> clusters(Reserve(config.ClusterMappingSize()));
     for (auto& cluster: config.GetClusterMapping()) {

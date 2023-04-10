@@ -767,7 +767,7 @@ private:
                     enableLocalRun);
 
                 if (lambdaResult.first.Level == TStatus::Error) {
-                    if (State->Settings->FallbackPolicy.Get().GetOrElse("default") == "never"
+                    if (State->Settings->FallbackPolicy.Get().GetOrElse(EFallbackPolicy::Default) == EFallbackPolicy::Never
                         || State->TypeCtx->ForceDq)
                     {
                         return SyncError();
@@ -844,7 +844,7 @@ private:
                 state->Statistics[state->MetricId++] = res.Statistics;
 
                 if (res.Fallback) {
-                    if (state->Settings->FallbackPolicy.Get().GetOrElse("default") == "never" || state->TypeCtx->ForceDq) {
+                    if (state->Settings->FallbackPolicy.Get().GetOrElse(EFallbackPolicy::Default) == EFallbackPolicy::Never || state->TypeCtx->ForceDq) {
                         auto issues = TIssues{TIssue(ctx.GetPosition(input->Pos()), "Gateway Error").SetCode(TIssuesIds::DQ_GATEWAY_NEED_FALLBACK_ERROR, TSeverityIds::S_WARNING)};
                         issues.AddIssues(res.Issues());
                         ctx.AssociativeIssues.emplace(input.Get(), std::move(issues));
@@ -1044,15 +1044,16 @@ private:
         FlushCounter("FreezeUsedFiles");
         // copy-paste }
 
+        auto settings = std::make_shared<TDqSettings>(*State->Settings);
+
         auto executionPlanner = MakeHolder<TDqsExecutionPlanner>(
-            State->TypeCtx, ctx, State->FunctionRegistry,
+            settings, State->TypeCtx, ctx, State->FunctionRegistry,
             optimizedInput);
 
         // exprRoot must be DqCnResult or DqQuery
 
         executionPlanner->SetPublicIds(publicIds->Stage2publicId);
 
-        auto settings = std::make_shared<TDqSettings>(*State->Settings);
         auto tasksPerStage = settings->MaxTasksPerStage.Get().GetOrElse(TDqSettings::TDefault::MaxTasksPerStage);
         const auto maxTasksPerOperation = State->Settings->MaxTasksPerOperation.Get().GetOrElse(TDqSettings::TDefault::MaxTasksPerOperation);
 
@@ -1060,10 +1061,10 @@ private:
         auto stagesCount = executionPlanner->StagesCount();
 
         if (!executionPlanner->CanFallback()) {
-            settings->FallbackPolicy = State->TypeCtx->DqFallbackPolicy = "never";
+            settings->FallbackPolicy = State->TypeCtx->DqFallbackPolicy = EFallbackPolicy::Never;
         }
 
-        bool canFallback = (settings->FallbackPolicy.Get().GetOrElse("default") != "never" && !State->TypeCtx->ForceDq);
+        bool canFallback = (settings->FallbackPolicy.Get().GetOrElse(EFallbackPolicy::Default) != EFallbackPolicy::Never && !State->TypeCtx->ForceDq);
 
         if (stagesCount > maxTasksPerOperation && canFallback) {
             return SyncStatus(FallbackWithMessage(
@@ -1077,7 +1078,7 @@ private:
         YQL_ENSURE(stagesCount <= maxTasksPerOperation);
 
         try {
-            while (executionPlanner->PlanExecution(settings, canFallback) > maxTasksPerOperation && tasksPerStage > 1) {
+            while (executionPlanner->PlanExecution(canFallback) > maxTasksPerOperation && tasksPerStage > 1) {
                 tasksPerStage /= 2;
                 settings->MaxTasksPerStage = tasksPerStage;
                 executionPlanner->Clear();
@@ -1241,7 +1242,7 @@ private:
 
             if (truncated && !state->TypeCtx->ForceDq && !enableFullResultWrite) {
                 auto issue = TIssue(ctx.GetPosition(input->Pos()), TStringBuilder() << "DQ cannot execute the query. Cause: " << "too big result " <<  trStr).SetCode(TIssuesIds::DQ_GATEWAY_NEED_FALLBACK_ERROR, TSeverityIds::S_INFO);
-                bool error = settings->FallbackPolicy.Get().GetOrElse("default") == "never";
+                bool error = settings->FallbackPolicy.Get().GetOrElse(EFallbackPolicy::Default) == EFallbackPolicy::Never;
                 for (const auto& i : res.Issues()) {
                     TIssuePtr subIssue = new TIssue(i);
                     if (error && subIssue->Severity == TSeverityIds::S_WARNING) {
@@ -1531,15 +1532,15 @@ private:
             FlushCounter("FreezeUsedFiles");
             // copy-paste }
 
+            auto settings = std::make_shared<TDqSettings>(*commonSettings);
+
             auto executionPlanner = MakeHolder<TDqsExecutionPlanner>(
-                State->TypeCtx, ctx, State->FunctionRegistry,
+                settings, State->TypeCtx, ctx, State->FunctionRegistry,
                 optimizedInput);
 
             // exprRoot must be DqCnResult or DqQuery
 
             executionPlanner->SetPublicIds(publicIds->Stage2publicId);
-
-            auto settings = std::make_shared<TDqSettings>(*commonSettings);
 
             auto tasksPerStage = settings->MaxTasksPerStage.Get().GetOrElse(TDqSettings::TDefault::MaxTasksPerStage);
             const auto maxTasksPerOperation = State->Settings->MaxTasksPerOperation.Get().GetOrElse(TDqSettings::TDefault::MaxTasksPerOperation);
@@ -1548,10 +1549,10 @@ private:
             auto stagesCount = executionPlanner->StagesCount();
 
             if (!executionPlanner->CanFallback()) {
-                settings->FallbackPolicy = State->TypeCtx->DqFallbackPolicy = "never";
+                settings->FallbackPolicy = State->TypeCtx->DqFallbackPolicy = EFallbackPolicy::Never;
             }
 
-            bool canFallback = (settings->FallbackPolicy.Get().GetOrElse("default") != "never" && !State->TypeCtx->ForceDq);
+            bool canFallback = (settings->FallbackPolicy.Get().GetOrElse(EFallbackPolicy::Default) != EFallbackPolicy::Never && !State->TypeCtx->ForceDq);
 
             if (stagesCount > maxTasksPerOperation && canFallback) {
                 return FallbackWithMessage(
@@ -1565,7 +1566,7 @@ private:
             YQL_ENSURE(stagesCount <= maxTasksPerOperation);
 
             try {
-                while (executionPlanner->PlanExecution(settings, canFallback) > maxTasksPerOperation && tasksPerStage > 1) {
+                while (executionPlanner->PlanExecution(canFallback) > maxTasksPerOperation && tasksPerStage > 1) {
                     tasksPerStage /= 2;
                     settings->MaxTasksPerStage = tasksPerStage;
                     executionPlanner->Clear();
@@ -1641,7 +1642,7 @@ private:
 
             executionPlanner.Destroy();
 
-            bool neverFallback = settings->FallbackPolicy.Get().GetOrElse("default") == "never";
+            bool neverFallback = settings->FallbackPolicy.Get().GetOrElse(EFallbackPolicy::Default) == EFallbackPolicy::Never;
             future.Subscribe([publicIds, state = State, startTime, execState = ExecState, node = input.Get(), neverFallback, logCtx](const NThreading::TFuture<IDqGateway::TResult>& completedFuture) {
                 YQL_LOG_CTX_ROOT_SESSION_SCOPE(logCtx);
                 YQL_ENSURE(!completedFuture.HasException());

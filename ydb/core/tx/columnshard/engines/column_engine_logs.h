@@ -25,6 +25,7 @@ public:
         explicit TMark(const std::shared_ptr<arrow::Scalar>& s)
             : Border(s)
         {
+            Y_VERIFY(Border);
             Y_VERIFY_DEBUG(NArrow::IsGoodScalar(Border));
         }
 
@@ -43,20 +44,14 @@ public:
         TMark& operator = (const TMark& m) = default;
 
         bool operator == (const TMark& m) const {
-            Y_VERIFY(Border);
-            Y_VERIFY(m.Border);
             return Border->Equals(*m.Border);
         }
 
         bool operator < (const TMark& m) const {
-            Y_VERIFY(Border);
-            Y_VERIFY(m.Border);
             return NArrow::ScalarLess(*Border, *m.Border);
         }
 
         bool operator <= (const TMark& m) const {
-            Y_VERIFY(Border);
-            Y_VERIFY(m.Border);
             return Border->Equals(*m.Border) || NArrow::ScalarLess(*Border, *m.Border);
         }
 
@@ -95,6 +90,32 @@ public:
             }
             return NArrow::MinScalar(type);
         }
+    };
+
+    class TMarksGranules {
+    public:
+        using TPair = std::pair<TMark, ui64>;
+
+        TMarksGranules() = default;
+        TMarksGranules(std::vector<TPair>&& marks) noexcept;
+        TMarksGranules(std::vector<TMark>&& points);
+        TMarksGranules(const TSelectInfo& selectInfo);
+
+        const std::vector<TPair>& GetOrderedMarks() const noexcept {
+             return Marks;
+        }
+
+        bool Empty() const noexcept {
+            return Marks.empty();
+        }
+
+        bool MakePrecedingMark(const TIndexInfo& indexInfo);
+
+        THashMap<ui64, std::shared_ptr<arrow::RecordBatch>>
+        SliceIntoGranules(const std::shared_ptr<arrow::RecordBatch>& batch, const TIndexInfo& indexInfo);
+
+    private:
+        std::vector<TPair> Marks;
     };
 
     class TChanges : public TColumnEngineChanges {
@@ -145,7 +166,7 @@ public:
         }
 
         bool AddPathIfNotExists(ui64 pathId) {
-            if (PathToGranule.count(pathId)) {
+            if (PathToGranule.contains(pathId)) {
                 return false;
             }
 
@@ -161,7 +182,7 @@ public:
 
         ui64 SetTmpGranule(ui64 pathId, const TMark& mark) {
             Y_VERIFY(pathId == SrcGranule->PathId);
-            if (!TmpGranuleIds.count(mark)) {
+            if (!TmpGranuleIds.contains(mark)) {
                 TmpGranuleIds[mark] = FirstGranuleId;
                 ++FirstGranuleId;
             }
@@ -199,7 +220,7 @@ public:
         std::optional<TSrcGranule> SrcGranule;
         THashMap<ui64, std::pair<ui64, TMark>> NewGranules; // granule -> {pathId, key}
         THashMap<TMark, ui32> TmpGranuleIds; // mark -> tmp granule id
-        TMap<TMark, ui64> MergeBorders;
+        TMarksGranules MergeBorders;
         ui64 FirstGranuleId{0};
         ui32 ReservedGranuleIds{0};
     };
@@ -227,7 +248,7 @@ public:
     const TIndexInfo& GetIndexInfo() const override { return IndexInfo; }
 
     const THashSet<ui64>* GetOverloadedGranules(ui64 pathId) const override {
-        if (PathsGranulesOverloaded.count(pathId)) {
+        if (PathsGranulesOverloaded.contains(pathId)) {
             return &PathsGranulesOverloaded.find(pathId)->second;
         }
         return nullptr;
@@ -352,17 +373,5 @@ private:
 
     TVector<TVector<std::pair<TMark, ui64>>> EmptyGranuleTracks(ui64 pathId) const;
 };
-
-
-std::shared_ptr<arrow::Array> GetFirstPKColumn(const TIndexInfo& indexInfo,
-                                               const std::shared_ptr<arrow::RecordBatch>& batch);
-THashMap<ui64, std::shared_ptr<arrow::RecordBatch>>
-SliceIntoGranules(const std::shared_ptr<arrow::RecordBatch>& batch,
-                  const TMap<TColumnEngineForLogs::TMark, ui64>& tsGranules,
-                  const TIndexInfo& indexInfo);
-THashMap<ui64, std::shared_ptr<arrow::RecordBatch>>
-SliceIntoGranules(const std::shared_ptr<arrow::RecordBatch>& batch,
-                  const std::vector<std::pair<TColumnEngineForLogs::TMark, ui64>>& tsGranules,
-                  const TIndexInfo& indexInfo);
 
 }

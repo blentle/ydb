@@ -132,6 +132,7 @@ enum ETypeAnnotationFlags : ui32 {
     TypeHasNestedOptional = 0x800,
     TypeNonPresortable = 0x1000,
     TypeHasDynamicSize = 0x2000,
+    TypeNonComparableInternal = 0x4000,
 };
 
 const ui64 TypeHashMagic = 0x10000;
@@ -211,6 +212,10 @@ public:
 
     bool IsComparable() const {
         return IsPersistable() && (GetFlags() & TypeNonComparable) == 0;
+    }
+
+    bool IsComparableInternal() const {
+        return IsPersistable() && (GetFlags() & TypeNonComparableInternal) == 0;
     }
 
     bool HasNull() const {
@@ -712,6 +717,7 @@ public:
 
         if (!(props & NUdf::CanCompare)) {
             ret |= TypeNonComparable;
+            ret |= TypeNonComparableInternal;
         }
 
         if (slot == NUdf::EDataSlot::Yson) {
@@ -1638,6 +1644,16 @@ public:
         return !OuterLambda;
     }
 
+    bool IsLiteralList() const {
+        YQL_ENSURE(IsList());
+        return LiteralList;
+    }
+
+    void SetLiteralList(bool literal) {
+        YQL_ENSURE(IsList());
+        LiteralList = literal;
+    }
+
     void Ref() {
         ENSURE_NOT_DELETED
         ENSURE_NOT_FROZEN
@@ -2116,6 +2132,7 @@ private:
         ui8 UsedInDependsOn : 1;
         ui8 UnordChildren   : 1;
         ui8 ShallBeDisclosed: 1;
+        ui8 LiteralList     : 1;
     };
 };
 

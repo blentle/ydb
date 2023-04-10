@@ -660,7 +660,7 @@ void TConfigsProvider::CheckSubscription(TInMemorySubscription::TPtr subscriptio
         }
     }
 
-    if (affectedKinds.empty() && !yamlChanged) {
+    if (affectedKinds.empty() && !yamlChanged && subscription->FirstUpdateSent) {
         LOG_TRACE_S(ctx, NKikimrServices::CMS_CONFIGS,
                     "TConfigsProvider: no changes found for subscription"
                         << " " << subscription->Subscriber.ToString() << ":" << subscription->Generation);
@@ -709,6 +709,8 @@ void TConfigsProvider::CheckSubscription(TInMemorySubscription::TPtr subscriptio
     subscription->VolatileYamlConfigHashes = VolatileYamlConfigHashes;
 
     ctx.Send(subscription->Worker, request.Release());
+
+    subscription->FirstUpdateSent = true;
 }
 
 void TConfigsProvider::DumpStateHTML(IOutputStream &os) const {
@@ -1085,6 +1087,16 @@ void TConfigsProvider::Handle(TEvConsole::TEvGetNodeConfigRequest::TPtr &ev, con
 
     LOG_TRACE_S(ctx, NKikimrServices::CMS_CONFIGS,
                 "Send TEvGetNodeConfigResponse: " << response->Record.ShortDebugString());
+
+    if (rec.HasServeYaml() && rec.GetServeYaml()) {
+        response->Record.SetYamlConfig(YamlConfig);
+
+        for (auto &[id, config] : VolatileYamlConfigs) {
+            auto &item = *response->Record.AddVolatileConfigs();
+            item.SetId(id);
+            item.SetConfig(config);
+        }
+    }
 
     ctx.Send(ev->Sender, response.Release(), 0, ev->Cookie);
 }

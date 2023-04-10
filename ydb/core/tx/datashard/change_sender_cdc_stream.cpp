@@ -73,6 +73,7 @@ class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderParti
     STATEFN(StateWaitingRecords) {
         switch (ev->GetTypeRewrite()) {
             hFunc(TEvChangeExchange::TEvRecords, Handle);
+            sFunc(TEvPartitionWriter::TEvWriteResponse, Lost);
         default:
             return StateBase(ev, TlsActivationContext->AsActorContext());
         }
@@ -214,7 +215,7 @@ class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderParti
                 HTML(html) {
                     DL_CLASS("dl-horizontal") {
                         TermDesc(html, "PartitionId", PartitionId);
-                        TermDesc(html, "ShardId", ShardId);
+                        TermDescLink(html, "ShardId", ShardId, TabletPath(ShardId));
                         TermDesc(html, "SourceId", SourceId);
                         TermDesc(html, "Writer", Writer);
                         TermDesc(html, "MaxSeqNo", MaxSeqNo);
@@ -226,6 +227,16 @@ class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderParti
         }
 
         Send(ev->Sender, new NMon::TEvRemoteHttpInfoRes(html.Str()));
+    }
+
+    void Disconnected() {
+        LOG_D("Disconnected");
+        Leave();
+    }
+
+    void Lost() {
+        LOG_W("Lost");
+        Leave();
     }
 
     void Leave() {
@@ -271,7 +282,7 @@ public:
 
     STATEFN(StateBase) {
         switch (ev->GetTypeRewrite()) {
-            sFunc(TEvPartitionWriter::TEvDisconnected, Leave);
+            sFunc(TEvPartitionWriter::TEvDisconnected, Disconnected);
             hFunc(NMon::TEvRemoteHttpInfo, Handle);
             sFunc(TEvents::TEvPoison, PassAway);
         }
@@ -515,6 +526,14 @@ class TCdcChangeSenderMain
             return;
         }
 
+        if (entry.Self && entry.Self->Info.GetPathState() == NKikimrSchemeOp::EPathStateDrop) {
+            LOG_D("Stream is planned to drop, waiting for the EvRemoveSender command");
+
+            RemoveRecords();
+            KillSenders();
+            return Become(&TThis::StatePendingRemove);
+        }
+
         Stream = TUserTable::TCdcStream(entry.CdcStreamInfo->Description);
 
         Y_VERIFY(entry.ListNodeEntry->Children.size() == 1);
@@ -539,7 +558,7 @@ class TCdcChangeSenderMain
     STATEFN(StateResolveTopic) {
         switch (ev->GetTypeRewrite()) {
             hFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, HandleTopic);
-            sFunc(TEvents::TEvWakeup, ResolveTopic);
+            sFunc(TEvents::TEvWakeup, ResolveCdcStream);
         default:
             return StateBase(ev, TlsActivationContext->AsActorContext());
         }
@@ -641,7 +660,7 @@ class TCdcChangeSenderMain
     }
 
     void Resolve() override {
-        ResolveTopic();
+        ResolveCdcStream();
     }
 
     bool IsResolved() const override {
@@ -726,6 +745,11 @@ class TCdcChangeSenderMain
         PassAway();
     }
 
+    void AutoRemove(TEvChangeExchange::TEvEnqueueRecords::TPtr& ev) {
+        LOG_D("Handle " << ev->Get()->ToString());
+        RemoveRecords(std::move(ev->Get()->Records));
+    }
+
     void Handle(NMon::TEvRemoteHttpInfo::TPtr& ev, const TActorContext& ctx) {
         RenderHtmlPage(ESenderType::CdcStream, ev, ctx);
     }
@@ -758,6 +782,15 @@ public:
             hFunc(TEvChangeExchange::TEvRemoveSender, Handle);
             hFunc(TEvChangeExchangePrivate::TEvReady, Handle);
             hFunc(TEvChangeExchangePrivate::TEvGone, Handle);
+            HFunc(NMon::TEvRemoteHttpInfo, Handle);
+            sFunc(TEvents::TEvPoison, PassAway);
+        }
+    }
+
+    STFUNC(StatePendingRemove) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvChangeExchange::TEvEnqueueRecords, AutoRemove);
+            hFunc(TEvChangeExchange::TEvRemoveSender, Handle);
             HFunc(NMon::TEvRemoteHttpInfo, Handle);
             sFunc(TEvents::TEvPoison, PassAway);
         }

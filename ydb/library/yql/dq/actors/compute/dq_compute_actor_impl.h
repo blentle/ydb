@@ -575,17 +575,21 @@ protected:
     void FillExtraData(NDqProto::TEvComputeActorState& state) {
         auto* extraData = state.MutableExtraData();
         for (auto& [index, input] : SourcesMap) {
-            if (auto data = input.AsyncInput->ExtraData()) {
-                auto* entry = extraData->AddSourcesExtraData();
-                entry->SetIndex(index);
-                entry->MutableData()->CopyFrom(*data);
+            if (input.AsyncInput) {
+                if (auto data = input.AsyncInput->ExtraData()) {
+                    auto* entry = extraData->AddSourcesExtraData();
+                    entry->SetIndex(index);
+                    entry->MutableData()->CopyFrom(*data);
+                }
             }
         }
         for (auto& [index, input] : InputTransformsMap) {
-            if (auto data = input.AsyncInput->ExtraData()) {
-                auto* entry = extraData->AddInputTransformsData();
-                entry->SetIndex(index);
-                entry->MutableData()->CopyFrom(*data);
+            if (input.AsyncInput) {
+                if (auto data = input.AsyncInput->ExtraData()) {
+                    auto* entry = extraData->AddInputTransformsData();
+                    entry->SetIndex(index);
+                    entry->MutableData()->CopyFrom(*data);
+                }
             }
         }
     }
@@ -1284,7 +1288,7 @@ private:
 
         const i64 toSend = peerState.PeerFreeSpace + allowedOvercommit - peerState.InFlightBytes;
 
-        CA_LOG_D("About to drain channelId: " << channelId
+        CA_LOG_T("About to drain channelId: " << channelId
             << ", hasPeer: " << outputChannel.HasPeer
             << ", peerFreeSpace: " << peerState.PeerFreeSpace
             << ", inFlightBytes: " << peerState.InFlightBytes
@@ -1948,8 +1952,8 @@ public:
             // More accurate cpu time counter:
             if (TDerived::HasAsyncTaskRunner) {
                 protoTask->SetCpuTimeUs(BasicStats->CpuTime.MicroSeconds() + taskStats->ComputeCpuTime.MicroSeconds() + taskStats->BuildCpuTime.MicroSeconds());
-                protoTask->SetSourceCpuTimeUs(SourceCpuTime.MicroSeconds());
             }
+            protoTask->SetSourceCpuTimeUs(SourceCpuTime.MicroSeconds());
 
             for (auto& [outputIndex, sinkInfo] : SinksMap) {
 

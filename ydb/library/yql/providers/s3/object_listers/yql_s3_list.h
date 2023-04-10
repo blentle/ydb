@@ -1,7 +1,11 @@
 #pragma once
 
+#include <library/cpp/cache/cache.h>
 #include <library/cpp/threading/future/future.h>
+#include <util/thread/pool.h>
 #include <ydb/library/yql/providers/common/http_gateway/yql_http_gateway.h>
+
+#include <contrib/libs/re2/re2/re2.h>
 
 #include <memory>
 #include <variant>
@@ -36,6 +40,68 @@ enum class ES3PatternType {
      */
     Regexp
 };
+
+class TSharedListingContext {
+public:
+    TSharedListingContext(
+        size_t callbackThreadCount, size_t callbackPerThreadQueueSize, size_t regexpCacheSize)
+        : ThreadPoolEnabled(callbackThreadCount != 0)
+        , RegexpCacheEnabled(regexpCacheSize != 0)
+        , RegexpCache(regexpCacheSize) {
+        if (ThreadPoolEnabled) {
+            CallbackProcessingPool.Start(callbackThreadCount, callbackPerThreadQueueSize);
+        }
+    }
+
+    template<typename F>
+    void SubmitCallbackProcessing(F&& f) {
+        if (ThreadPoolEnabled && CallbackProcessingPool.AddFunc(std::forward<F>(f))) {
+            return;
+        }
+        f();
+    }
+
+    std::shared_ptr<RE2> GetOrCreateRegexp(const TString& regexp) {
+        if (!RegexpCacheEnabled) {
+            return std::make_shared<RE2>(re2::StringPiece(regexp), RE2::Options());
+        }
+
+        if (auto it = GetRegexp(regexp); it != nullptr) {
+            return it;
+        } else {
+            auto re = std::make_shared<RE2>(re2::StringPiece(regexp), RE2::Options());
+            Y_ENSURE(re->ok());
+            auto wLock = TWriteGuard{RWLock};
+            RegexpCache.Insert(regexp, re);
+            return re;
+        }
+    }
+
+    ~TSharedListingContext() {
+        if (ThreadPoolEnabled) {
+            CallbackProcessingPool.Stop();
+        }
+    }
+
+private:
+    std::shared_ptr<RE2> GetRegexp(const TString& regexp) {
+        auto lock = TReadGuard{RWLock};
+        if (auto it = RegexpCache.Find(regexp); it != RegexpCache.End()) {
+            return *it;
+        } else {
+            return nullptr;
+        }
+    }
+
+private:
+    bool ThreadPoolEnabled = true;
+    bool RegexpCacheEnabled = true;
+    TThreadPool CallbackProcessingPool;
+    TLRUCache<TString, std::shared_ptr<RE2>> RegexpCache;
+    TRWMutex RWLock;
+};
+
+using TSharedListingContextPtr = std::shared_ptr<TSharedListingContext>;
 
 struct TObjectListEntry {
     TString Path;
@@ -92,7 +158,27 @@ IS3Lister::TPtr MakeS3Lister(
     const IHTTPGateway::TPtr& httpGateway,
     const TListingRequest& listingRequest,
     const TMaybe<TString>& delimiter,
-    bool allowLocalFiles);
+    bool allowLocalFiles,
+    TSharedListingContextPtr sharedCtx = nullptr);
+
+class IS3ListerFactory {
+public:
+    using TPtr = std::shared_ptr<IS3ListerFactory>;
+
+    virtual NThreading::TFuture<NS3Lister::IS3Lister::TPtr> Make(
+        const IHTTPGateway::TPtr& httpGateway,
+        const NS3Lister::TListingRequest& listingRequest,
+        const TMaybe<TString>& delimiter,
+        bool allowLocalFiles) = 0;
+
+    virtual ~IS3ListerFactory() = default;
+};
+
+IS3ListerFactory::TPtr MakeS3ListerFactory(
+    size_t maxParallelOps,
+    size_t callbackThreadCount,
+    size_t callbackPerThreadQueueSize,
+    size_t regexpCacheSize);
 
 } // namespace NS3Lister
 } // namespace NYql

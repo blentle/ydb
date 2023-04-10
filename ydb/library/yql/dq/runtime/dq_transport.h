@@ -29,7 +29,8 @@ public:
     NDqProto::TData Serialize(TForwardIterator first, TForwardIterator last, const NKikimr::NMiniKQL::TType* itemType) const {
         switch (TransportVersion) {
             case NDqProto::DATA_TRANSPORT_VERSION_UNSPECIFIED:
-            case NDqProto::DATA_TRANSPORT_UV_PICKLE_1_0: {
+            case NDqProto::DATA_TRANSPORT_UV_PICKLE_1_0:
+            case NDqProto::DATA_TRANSPORT_UV_FAST_PICKLE_1_0: {
                 auto count = std::distance(first, last);
                 const auto listType = NKikimr::NMiniKQL::TListType::Create(
                     const_cast<NKikimr::NMiniKQL::TType*>(itemType), TypeEnv);
@@ -38,10 +39,6 @@ public:
                 auto data = Serialize(listValue, listType);
                 data.SetRows(count);
                 return data;
-            }
-            case NDqProto::DATA_TRANSPORT_ARROW_1_0: {
-                NKikimr::NMiniKQL::TUnboxedValueVector buffer(first, last);
-                return Serialize(buffer, itemType);
             }
             default:
                 YQL_ENSURE(false, "Unsupported TransportVersion");

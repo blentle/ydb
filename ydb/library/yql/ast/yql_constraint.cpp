@@ -340,33 +340,31 @@ const TSortedConstraintNode* TSortedConstraintNode::MakeCommon(const std::vector
 
     std::optional<TContainerType> content;
     for (size_t i = 0U; i < constraints.size(); ++i) {
-        if (!constraints[i]->GetConstraint<TEmptyConstraintNode>()) {
-            if (const auto sort = constraints[i]->GetConstraint<TSortedConstraintNode>()) {
-                const auto& nextContent = sort->GetContent();
-                if (content) {
-                    const auto size = std::min(content->size(), nextContent.size());
-                    content->resize(size);
-                    for (auto j = 0U; j < size; ++j) {
-                        auto& one = (*content)[j];
-                        auto& two = nextContent[j];
-                        TSetType common;
-                        common.reserve(std::min(one.first.size(), two.first.size()));
-                        std::set_intersection(one.first.cbegin(), one.first.cend(), two.first.cbegin(), two.first.cend(), std::back_inserter(common));
-                        if (common.empty() || one.second != two.second) {
-                            content->resize(j);
-                            break;
-                        } else
-                            one.first = std::move(common);
-                    }
-                    if (content->empty())
+        if (const auto sort = constraints[i]->GetConstraint<TSortedConstraintNode>()) {
+            const auto& nextContent = sort->GetContent();
+            if (content) {
+                const auto size = std::min(content->size(), nextContent.size());
+                content->resize(size);
+                for (auto j = 0U; j < size; ++j) {
+                    auto& one = (*content)[j];
+                    auto& two = nextContent[j];
+                    TSetType common;
+                    common.reserve(std::min(one.first.size(), two.first.size()));
+                    std::set_intersection(one.first.cbegin(), one.first.cend(), two.first.cbegin(), two.first.cend(), std::back_inserter(common));
+                    if (common.empty() || one.second != two.second) {
+                        content->resize(j);
                         break;
-                } else {
-                    content = nextContent;
+                    } else
+                        one.first = std::move(common);
                 }
+                if (content->empty())
+                    break;
             } else {
-                content.reset();
-                break;
+                content = nextContent;
             }
+        } else if (!constraints[i]->GetConstraint<TEmptyConstraintNode>()) {
+            content.reset();
+            break;
         }
     }
 
@@ -529,7 +527,7 @@ TUniqueConstraintNodeBase<Distinct>::ColumnsListToSet(const std::vector<std::str
     YQL_ENSURE(!columns.empty());
     TSetType set;
     set.reserve(columns.size());
-    std::transform(columns.cbegin(), columns.cend(), std::back_inserter(set), [](const std::string_view& column) { return TPathType(1U, column); });
+    std::transform(columns.cbegin(), columns.cend(), std::back_inserter(set), [](const std::string_view& column) { return column.empty() ? TPathType() : TPathType(1U, column); });
     std::sort(set.begin(), set.end());
     return set;
 }
@@ -994,6 +992,24 @@ TPartOfConstraintNode<TOriginalConstraintNode>::GetColumnMapping(const std::stri
 }
 
 template<class TOriginalConstraintNode>
+typename TPartOfConstraintNode<TOriginalConstraintNode>::TMapType
+TPartOfConstraintNode<TOriginalConstraintNode>::GetColumnMapping(TExprContext& ctx, const std::string_view& prefix) const {
+    auto mapping = Mapping_;
+    if (!prefix.empty()) {
+        const TString str(prefix);
+        for (auto& item : mapping) {
+            for (auto& part : item.second) {
+                if (part.first.empty())
+                    part.first.emplace_front(prefix);
+                else
+                    part.first.front() = ctx.AppendString(str + part.first.front());
+            }
+        }
+    }
+    return mapping;
+}
+
+template<class TOriginalConstraintNode>
 const TPartOfConstraintNode<TOriginalConstraintNode>*
 TPartOfConstraintNode<TOriginalConstraintNode>::MakeCommon(const std::vector<const TConstraintSet*>& constraints, TExprContext& ctx) {
     if (constraints.empty()) {
@@ -1274,6 +1290,17 @@ void TPassthroughConstraintNode::ToJson(NJson::TJsonWriter& out) const {
     out.CloseMap();
 }
 
+void TPassthroughConstraintNode::UniqueMerge(TMapType& output, TMapType&& input) {
+    output.merge(std::move(input));
+    while (!input.empty()) {
+        const auto exists = input.extract(input.cbegin());
+        auto& target = output[exists.key()];
+        target.reserve(target.size() + exists.mapped().size());
+        for (auto& item : exists.mapped())
+            target.insert_unique(std::move(item));
+    }
+}
+
 const TPassthroughConstraintNode* TPassthroughConstraintNode::ExtractField(TExprContext& ctx, const std::string_view& field) const {
     TMapType passtrought;
     for (const auto& part : Mapping_) {
@@ -1388,7 +1415,7 @@ const TPassthroughConstraintNode::TMapType& TPassthroughConstraintNode::GetColum
     return Mapping_;
 }
 
-TPassthroughConstraintNode::TMapType TPassthroughConstraintNode::GetMappingForField(const std::string_view& field) const {
+TPassthroughConstraintNode::TMapType TPassthroughConstraintNode::GetColumnMapping(const std::string_view& field) const {
     TMapType mapping(Mapping_.size());
     for (const auto& map : Mapping_) {
         TPartType part;
@@ -1402,16 +1429,32 @@ TPassthroughConstraintNode::TMapType TPassthroughConstraintNode::GetMappingForFi
     return mapping;
 }
 
-TPassthroughConstraintNode::TReverseMapType TPassthroughConstraintNode::GetReverseMapping() const {
-    if (1U == Mapping_.size() && 1U == Mapping_.cbegin()->second.size() && Mapping_.cbegin()->second.cbegin()->first.empty())
-        return {{Mapping_.cbegin()->second.cbegin()->second, Mapping_.cbegin()->second.cbegin()->second}};
+TPassthroughConstraintNode::TMapType TPassthroughConstraintNode::GetColumnMapping(TExprContext& ctx, const std::string_view& prefix) const {
+    TMapType mapping(Mapping_.size());
+    for (const auto& map : Mapping_) {
+        TPartType part;
+        part.reserve(map.second.size());
+        const TString str(prefix);
+        std::transform(map.second.cbegin(), map.second.cend(), std::back_inserter(part), [&](TPartType::value_type item) {
+            if (item.first.empty())
+                item.first.emplace_front(prefix);
+            else
+                item.first.front() = ctx.AppendString(str + item.first.front());
+            return item;
+        });
+        mapping.emplace(map.first ? map.first : this, std::move(part));
+    }
+    return mapping;
+}
 
+TPassthroughConstraintNode::TReverseMapType TPassthroughConstraintNode::GetReverseMapping() const {
     TReverseMapType reverseMapping;
     for (const auto& part : Mapping_) {
         for (const auto& item : part.second) {
-            if (1U == item.first.size()) {
+            if (item.first.empty())
+                reverseMapping.emplace_back(item.second, std::string_view());
+            else if (1U == item.first.size())
                 reverseMapping.emplace_back(item.second, item.first.front());
-            }
         }
     }
     ::Sort(reverseMapping);

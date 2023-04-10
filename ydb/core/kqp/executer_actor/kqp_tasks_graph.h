@@ -83,6 +83,14 @@ struct TStageInfoMeta {
 
 };
 
+// things which are common for all tasks in the graph.
+struct TGraphMeta {
+    TKqpTableKeys TableKeys;
+    IKqpGateway::TKqpSnapshot Snapshot;
+    std::unordered_map<ui64, TActorId> ResultChannelProxies;
+    TActorId ExecuterId;
+};
+
 struct TTaskInputMeta {};
 
 struct TTaskOutputMeta {
@@ -117,12 +125,16 @@ struct TShardKeyRanges {
     std::pair<const TSerializedCellVec*, bool> GetRightBorder() const;
 };
 
-// TODO: use two different structs for scans and data queries
+
 struct TTaskMeta {
     ui64 ShardId = 0; // only in case of non-scans (data-query & legacy scans)
     ui64 NodeId = 0;  // only in case of scans over persistent snapshots
+    bool ScanTask = false;
+    TActorId ExecuterId;
 
     TMap<TString, NYql::NDqProto::TData> Params;
+    THashMap<TString, TString> DqTaskParams; // Params for sources/sinks
+    THashMap<TString, TString> DqSecureParams;
 
     struct TColumn {
         ui32 Id = 0;
@@ -192,12 +204,16 @@ using TTaskOutput = NYql::NDq::TTaskOutput<TTaskOutputMeta>;
 using TTaskOutputType = NYql::NDq::TTaskOutputType;
 using TTaskInput = NYql::NDq::TTaskInput<TTaskInputMeta>;
 using TTask = NYql::NDq::TTask<TStageInfoMeta, TTaskMeta, TTaskInputMeta, TTaskOutputMeta>;
-using TKqpTasksGraph = NYql::NDq::TDqTasksGraph<TStageInfoMeta, TTaskMeta, TTaskInputMeta, TTaskOutputMeta>;
+using TKqpTasksGraph = NYql::NDq::TDqTasksGraph<TGraphMeta, TStageInfoMeta, TTaskMeta, TTaskInputMeta, TTaskOutputMeta>;
 
 void FillKqpTasksGraphStages(TKqpTasksGraph& tasksGraph, const TVector<IKqpGateway::TPhysicalTxData>& txs);
 void BuildKqpTaskGraphResultChannels(TKqpTasksGraph& tasksGraph, const TKqpPhyTxHolder::TConstPtr& tx, ui64 txIdx);
 void BuildKqpStageChannels(TKqpTasksGraph& tasksGraph, const TKqpTableKeys& tableKeys, const TStageInfo& stageInfo,
     ui64 txId, bool enableSpilling);
+
+NYql::NDqProto::TDqTask SerializeTaskToProto(const TKqpTasksGraph& tasksGraph, const TTask& task);
+void FillTableMeta(const TStageInfo& stageInfo, NKikimrTxDataShard::TKqpTransaction_TTableMeta* meta);
+void FillChannelDesc(const TKqpTasksGraph& tasksGraph, NYql::NDqProto::TChannel& channelDesc, const NYql::NDq::TChannel& channel);
 
 template<typename Proto>
 TVector<TTaskMeta::TColumn> BuildKqpColumns(const Proto& op, const TKqpTableKeys::TTable& table) {
@@ -226,7 +242,7 @@ struct TKqpTaskOutputType {
 
 void LogStage(const NActors::TActorContext& ctx, const TStageInfo& stageInfo);
 
-bool IsCrossShardChannel(TKqpTasksGraph& tasksGraph, const NYql::NDq::TChannel& channel);
+bool IsCrossShardChannel(const TKqpTasksGraph& tasksGraph, const NYql::NDq::TChannel& channel);
 
 } // namespace NKqp
 } // namespace NKikimr

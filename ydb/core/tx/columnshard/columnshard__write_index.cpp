@@ -43,7 +43,7 @@ private:
 bool TTxWriteIndex::Execute(TTransactionContext& txc, const TActorContext& ctx) {
     Y_VERIFY(Ev);
     Y_VERIFY(Self->InsertTable);
-    Y_VERIFY(Self->PrimaryIndex);
+    Y_VERIFY(Self->TablesManager.HasPrimaryIndex());
 
     txc.DB.NoMoreReadsForTx();
 
@@ -66,7 +66,7 @@ bool TTxWriteIndex::Execute(TTransactionContext& txc, const TActorContext& ctx) 
 
         TBlobGroupSelector dsGroupSelector(Self->Info());
         NOlap::TDbWrapper dbWrap(txc.DB, &dsGroupSelector);
-        ok = Self->PrimaryIndex->ApplyChanges(dbWrap, changes, snapshot); // update changes + apply
+        ok = Self->TablesManager.MutablePrimaryIndex().ApplyChanges(dbWrap, changes, snapshot); // update changes + apply
         if (ok) {
             LOG_S_DEBUG("TTxWriteIndex (" << changes->TypeString() << ") apply at tablet " << Self->TabletID());
 
@@ -141,10 +141,16 @@ bool TTxWriteIndex::Execute(TTransactionContext& txc, const TActorContext& ctx) 
 
                     for (auto& rec : portionInfo.Records) {
                         auto& blobId = rec.BlobRange.BlobId;
-                        if (!blobsToExport.count(blobId)) {
+                        if (!blobsToExport.contains(blobId)) {
                             NKikimrTxColumnShard::TEvictMetadata meta;
                             meta.SetTierName(tierName);
-                            if (Self->BlobManager->ExportOneToOne(blobId, meta, blobManagerDb)) {
+
+                            NOlap::TEvictedBlob evict{
+                                .State = EEvictState::EVICTING,
+                                .Blob = blobId,
+                                .ExternBlob = blobId.MakeS3BlobId(evictionFeatures.PathId)
+                            };
+                            if (Self->BlobManager->ExportOneToOne(std::move(evict), meta, blobManagerDb)) {
                                 blobsToExport.emplace(blobId, evictionFeatures);
                             } else {
                                 // TODO: support S3 -> S3 eviction
@@ -161,11 +167,11 @@ bool TTxWriteIndex::Execute(TTransactionContext& txc, const TActorContext& ctx) 
             THashSet<TUnifiedBlobId> blobsToDrop;
             for (const auto& rec : changes->EvictedRecords) {
                 const auto& blobId = rec.BlobRange.BlobId;
-                if (blobsToExport.count(blobId)) {
+                if (blobsToExport.contains(blobId)) {
                     // Eviction to S3. TTxExportFinish will delete src blob when dst blob get EEvictState::EXTERN state.
-                } else if (!protectedBlobs.count(blobId)) {
+                } else if (!protectedBlobs.contains(blobId)) {
                     // We could drop the blob immediately
-                    if (!blobsToDrop.count(blobId)) {
+                    if (!blobsToDrop.contains(blobId)) {
                         LOG_S_TRACE("Delete evicted blob '" << blobId.ToStringNew() << "' at tablet " << Self->TabletID());
                         blobsToDrop.insert(blobId);
                     }
@@ -177,7 +183,7 @@ bool TTxWriteIndex::Execute(TTransactionContext& txc, const TActorContext& ctx) 
             for (const auto& portionInfo : changes->PortionsToDrop) {
                 for (const auto& rec : portionInfo.Records) {
                     const auto& blobId = rec.BlobRange.BlobId;
-                    if (!blobsToDrop.count(blobId)) {
+                    if (!blobsToDrop.contains(blobId)) {
                         LOG_S_TRACE("Delete blob '" << blobId.ToStringNew() << "' at tablet " << Self->TabletID());
                         blobsToDrop.insert(blobId);
                     }
@@ -242,7 +248,7 @@ bool TTxWriteIndex::Execute(TTransactionContext& txc, const TActorContext& ctx) 
         Schema::SaveSpecialValue(db, Schema::EValueIds::LastExportNumber, Self->LastExportNo);
     }
 
-    Self->PrimaryIndex->FreeLocks(changes);
+    Self->TablesManager.MutablePrimaryIndex().FreeLocks(changes);
 
     if (changes->IsInsert()) {
         Self->ActiveIndexingOrCompaction = false;
