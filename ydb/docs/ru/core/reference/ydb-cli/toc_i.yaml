@@ -1,12 +1,12 @@
 items:
   - name: Установка
     href: install.md
+  - name: Соединение с БД и аутентификация
+    href: connect.md
   - name: Все команды по алфавиту
     href: commands.md
   - name: Сервисные команды
     href: commands/service.md
-  - name: Соединение с БД и аутентификация
-    href: connect.md
   - name: Глобальные параметры
     href: commands/global-options.md
   - name: Команды YDB CLI
@@ -75,6 +75,8 @@ items:
       href: scripting-yql.md
     - name: Выполнение запроса
       href: table-query-execute.md
+    - name: Передача параметров в команды выполнения YQL-запросов
+      href: parameterized-queries-cli.md
 #  - name: Утилиты
 #    items:
     # - name: Снятие бэкапа

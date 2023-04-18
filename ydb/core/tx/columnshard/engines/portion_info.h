@@ -4,6 +4,9 @@
 #include "columns_table.h"
 #include "index_info.h"
 
+#include <ydb/core/formats/replace_key.h>
+
+
 namespace NKikimr::NOlap {
 
 struct TPortionMeta {
@@ -55,7 +58,7 @@ struct TPortionInfo {
     bool Produced() const { return Meta.Produced != TPortionMeta::UNSPECIFIED; }
     bool Valid() const { return !Empty() && Produced() && HasMinMax(FirstPkColumn); }
     bool IsInserted() const { return Meta.Produced == TPortionMeta::INSERTED; }
-    bool CanHaveDups() const { return !Valid(); /* || IsInserted(); */ }
+    bool CanHaveDups() const { return !Produced(); /* || IsInserted(); */ }
     bool CanIntersectOthers() const { return !Valid() || IsInserted(); }
     size_t NumRecords() const { return Records.size(); }
 
@@ -156,20 +159,16 @@ struct TPortionInfo {
     std::shared_ptr<arrow::Scalar> MinValue(ui32 columnId) const;
     std::shared_ptr<arrow::Scalar> MaxValue(ui32 columnId) const;
 
-    std::shared_ptr<arrow::Scalar> PkStart() const {
-        if (FirstPkColumn) {
-            Y_VERIFY(Meta.ColumnMeta.contains(FirstPkColumn));
-            return MinValue(FirstPkColumn);
-        }
-        return {};
+    NArrow::TReplaceKey EffKeyStart() const {
+        Y_VERIFY(FirstPkColumn);
+        Y_VERIFY(Meta.ColumnMeta.contains(FirstPkColumn));
+        return NArrow::TReplaceKey::FromScalar(MinValue(FirstPkColumn));
     }
 
-    std::shared_ptr<arrow::Scalar> PkEnd() const {
-        if (FirstPkColumn) {
-            Y_VERIFY(Meta.ColumnMeta.contains(FirstPkColumn));
-            return MaxValue(FirstPkColumn);
-        }
-        return {};
+    NArrow::TReplaceKey EffKeyEnd() const {
+        Y_VERIFY(FirstPkColumn);
+        Y_VERIFY(Meta.ColumnMeta.contains(FirstPkColumn));
+        return NArrow::TReplaceKey::FromScalar(MaxValue(FirstPkColumn));
     }
 
     ui32 NumRows() const {
