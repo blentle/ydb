@@ -739,7 +739,7 @@ public:
                 case EKikimrQueryType::YqlScriptStreaming:
                     if (useScanQuery) {
                         future = Gateway->StreamExecScanQueryAst(Cluster, queryAstStr, CollectParameters(query),
-                            querySettings, SessionCtx->Query().ReplyTarget);
+                            querySettings, SessionCtx->Query().ReplyTarget, SessionCtx->Query().RpcCtx);
                     } else {
                         Ydb::Table::TransactionSettings txSettings;
                         txSettings.mutable_serializable_read_write();
@@ -881,12 +881,14 @@ public:
     TKqpHost(TIntrusivePtr<IKqpGateway> gateway, const TString& cluster, const TString& database,
         TKikimrConfiguration::TPtr config, IModuleResolver::TPtr moduleResolver,
         NYql::IHTTPGateway::TPtr httpGateway,
-        const NKikimr::NMiniKQL::IFunctionRegistry* funcRegistry, bool keepConfigChanges)
+        const NKikimr::NMiniKQL::IFunctionRegistry* funcRegistry, bool keepConfigChanges,
+        bool isInternalCall)
         : Gateway(gateway)
         , Cluster(cluster)
         , ExprCtx(new TExprContext())
         , ModuleResolver(moduleResolver)
         , KeepConfigChanges(keepConfigChanges)
+        , IsInternalCall(isInternalCall)
         , HttpGateway(std::move(httpGateway))
         , SessionCtx(new TKikimrSessionContext(funcRegistry, config, TAppData::TimeProvider, TAppData::RandomProvider))
         , ClustersMap({{Cluster, TString(KikimrProviderName)}})
@@ -1246,6 +1248,9 @@ private:
         if (settings.DocumentApiRestricted) {
             SessionCtx->Query().DocumentApiRestricted = *settings.DocumentApiRestricted;
         }
+        if (settings.IsInternalCall) {
+            SessionCtx->Query().IsInternalCall = *settings.IsInternalCall;
+        }
 
         TMaybe<TSqlVersion> sqlVersion;
         auto queryExpr = CompileYqlQuery(query, /* isSql */ true, /* sqlAutoCommit */ false, ctx, sqlVersion);
@@ -1267,6 +1272,9 @@ private:
         SessionCtx->Query().PreparingQuery = std::make_unique<NKikimrKqp::TPreparedQuery>();
         if (settings.DocumentApiRestricted) {
             SessionCtx->Query().DocumentApiRestricted = *settings.DocumentApiRestricted;
+        }
+        if (settings.IsInternalCall) {
+            SessionCtx->Query().IsInternalCall = *settings.IsInternalCall;
         }
 
         TMaybe<TSqlVersion> sqlVersion;
@@ -1290,6 +1298,9 @@ private:
         SessionCtx->Query().PreparingQuery = std::make_unique<NKikimrKqp::TPreparedQuery>();
         if (settings.DocumentApiRestricted) {
             SessionCtx->Query().DocumentApiRestricted = *settings.DocumentApiRestricted;
+        }
+        if (settings.IsInternalCall) {
+            SessionCtx->Query().IsInternalCall = *settings.IsInternalCall;
         }
 
         // TODO: Support PG
@@ -1377,6 +1388,7 @@ private:
         SetupYqlTransformer(EKikimrQueryType::YqlScriptStreaming);
 
         SessionCtx->Query().Deadlines = settings.Deadlines;
+        SessionCtx->Query().RpcCtx = settings.RpcCtx;
         SessionCtx->Query().StatsMode = settings.StatsMode;
         SessionCtx->Query().ReplyTarget = target;
         SessionCtx->Query().PreparingQuery = std::make_unique<NKikimrKqp::TPreparedQuery>();
@@ -1478,7 +1490,7 @@ private:
 
         // Kikimr provider
         auto queryExecutor = MakeIntrusive<TKqpQueryExecutor>(Gateway, Cluster, SessionCtx, KqpRunner);
-        auto kikimrDataSource = CreateKikimrDataSource(*FuncRegistry, *TypesCtx, Gateway, SessionCtx, ExternalSourceFactory);
+        auto kikimrDataSource = CreateKikimrDataSource(*FuncRegistry, *TypesCtx, Gateway, SessionCtx, ExternalSourceFactory, IsInternalCall);
         auto kikimrDataSink = CreateKikimrDataSink(*FuncRegistry, *TypesCtx, Gateway, SessionCtx, queryExecutor);
 
         FillSettings.AllResultsBytesLimit = Nothing();
@@ -1583,6 +1595,7 @@ private:
     THolder<TExprContext> ExprCtx;
     IModuleResolver::TPtr ModuleResolver;
     bool KeepConfigChanges;
+    bool IsInternalCall;
     NYql::IHTTPGateway::TPtr HttpGateway;
 
     TIntrusivePtr<TKikimrSessionContext> SessionCtx;
@@ -1621,10 +1634,10 @@ Ydb::Table::QueryStatsCollection::Mode GetStatsMode(NYql::EKikimrStatsMode stats
 
 TIntrusivePtr<IKqpHost> CreateKqpHost(TIntrusivePtr<IKqpGateway> gateway,
     const TString& cluster, const TString& database, TKikimrConfiguration::TPtr config, IModuleResolver::TPtr moduleResolver,
-    NYql::IHTTPGateway::TPtr httpGateway, const NKikimr::NMiniKQL::IFunctionRegistry* funcRegistry, bool keepConfigChanges)
+    NYql::IHTTPGateway::TPtr httpGateway, const NKikimr::NMiniKQL::IFunctionRegistry* funcRegistry, bool keepConfigChanges, bool isInternalCall)
 {
     return MakeIntrusive<TKqpHost>(gateway, cluster, database, config, moduleResolver, std::move(httpGateway), funcRegistry,
-        keepConfigChanges);
+        keepConfigChanges, isInternalCall);
 }
 
 } // namespace NKqp

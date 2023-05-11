@@ -40,15 +40,24 @@ public:
     /// Appends the special columns to the batch.
     static std::shared_ptr<arrow::RecordBatch> AddSpecialColumns(
         const std::shared_ptr<arrow::RecordBatch>& batch,
-        const ui64 platStep,
-        const ui64 txId);
+        const TSnapshot& snapshot);
 
     /// Makes schema as set of the special columns.
     static std::shared_ptr<arrow::Schema> ArrowSchemaSnapshot();
 
     /// Matches name of the filed with names of the special columns.
     static bool IsSpecialColumn(const arrow::Field& field);
-
+    static bool IsSpecialColumn(const ui32 field);
+    static bool IsSpecialColumn(const std::string& fieldName);
+    template <class TContainer>
+    static bool IsSpecialColumns(const TContainer& c) {
+        for (auto&& i : c) {
+            if (!IsSpecialColumn(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
 public:
     TIndexInfo(const TString& name, ui32 id);
 
@@ -58,19 +67,20 @@ public:
     }
 
     /// Returns an id of the column located by name. The name should exists in the schema.
-    ui32 GetColumnId(const TString& name) const;
+    ui32 GetColumnId(const std::string& name) const;
+    std::optional<ui32> GetColumnIdOptional(const std::string& name) const;
 
     /// Returns a name of the column located by id.
     TString GetColumnName(ui32 id, bool required = true) const;
 
     /// Returns names of columns defined by the specific ids.
-    TVector<TString> GetColumnNames(const TVector<ui32>& ids) const;
+    std::vector<TString> GetColumnNames(const std::vector<ui32>& ids) const;
 
     /// Returns info of columns defined by specific ids.
-    TVector<TNameTypeInfo> GetColumns(const TVector<ui32>& ids) const;
+    std::vector<TNameTypeInfo> GetColumns(const std::vector<ui32>& ids) const;
 
     /// Traditional Primary Key (includes uniqueness, search and sorting logic)
-    TVector<TNameTypeInfo> GetPrimaryKey() const {
+    std::vector<TNameTypeInfo> GetPrimaryKey() const {
         return GetColumns(KeyColumns);
     }
 
@@ -80,7 +90,7 @@ public:
         return KeyColumns[0];
     }
 
-    // Sorting key: colud be less or greater then traditional PK
+    // Sorting key: could be less or greater then traditional PK
     // It could be empty for append-only tables. It could be greater then PK for better columns compression.
     // If sorting key includes uniqueness key as a prefix we are able to use MergeSort for REPLACE.
     const std::shared_ptr<arrow::Schema>& GetSortingKey() const { return SortingKey; }
@@ -102,13 +112,15 @@ public:
         Y_VERIFY(MinMaxIdxColumnsIds.contains(GetColumnId(ttlColumn)));
     }
 
+    std::vector<ui32> GetColumnIds(const std::vector<TString>& columnNames) const;
+
     std::shared_ptr<arrow::Schema> ArrowSchema() const;
     std::shared_ptr<arrow::Schema> ArrowSchemaWithSpecials() const;
     std::shared_ptr<arrow::Schema> AddColumns(const std::shared_ptr<arrow::Schema>& schema,
-                                              const TVector<TString>& columns) const;
+                                              const std::vector<TString>& columns) const;
 
-    std::shared_ptr<arrow::Schema> ArrowSchema(const TVector<ui32>& columnIds) const;
-    std::shared_ptr<arrow::Schema> ArrowSchema(const TVector<TString>& columnNames) const;
+    std::shared_ptr<arrow::Schema> ArrowSchema(const std::vector<ui32>& columnIds, bool withSpecials = false) const;
+    std::shared_ptr<arrow::Schema> ArrowSchema(const std::vector<TString>& columnNames) const;
     std::shared_ptr<arrow::Field> ArrowColumnField(ui32 columnId) const;
     std::shared_ptr<arrow::RecordBatch> PrepareForInsert(const TString& data, const TString& metadata,
                                                          TString& strError) const;
@@ -134,11 +146,14 @@ public:
 
     void SetDefaultCompression(const TCompression& compression) { DefaultCompression = compression; }
     const TCompression& GetDefaultCompression() const { return DefaultCompression; }
-
-    void UpdatePathTiering(THashMap<ui64, NOlap::TTiering>& pathTiering) const;
-    void SetPathTiering(THashMap<ui64, TTiering>&& pathTierings);
-    const TTiering* GetTiering(ui64 pathId) const;
-
+    static const std::vector<std::string>& GetSpecialColumnNames() {
+        static const std::vector<std::string> result = { std::string(SPEC_COL_PLAN_STEP), std::string(SPEC_COL_TX_ID) };
+        return result;
+    }
+    static const std::vector<ui32>& GetSpecialColumnIds() {
+        static const std::vector<ui32> result = { (ui32)ESpecialColumn::PLAN_STEP, (ui32)ESpecialColumn::TX_ID };
+        return result;
+    }
 private:
     ui32 Id;
     TString Name;
@@ -151,12 +166,11 @@ private:
     THashSet<TString> RequiredColumns;
     THashSet<ui32> MinMaxIdxColumnsIds;
     TCompression DefaultCompression;
-    THashMap<ui64, TTiering> PathTiering;
 };
 
-std::shared_ptr<arrow::Schema> MakeArrowSchema(const NTable::TScheme::TTableSchema::TColumns& columns, const TVector<ui32>& ids);
+std::shared_ptr<arrow::Schema> MakeArrowSchema(const NTable::TScheme::TTableSchema::TColumns& columns, const std::vector<ui32>& ids, bool withSpecials = false);
 
 /// Extracts columns with the specific ids from the schema.
-TVector<TNameTypeInfo> GetColumns(const NTable::TScheme::TTableSchema& tableSchema, const TVector<ui32>& ids);
+std::vector<TNameTypeInfo> GetColumns(const NTable::TScheme::TTableSchema& tableSchema, const std::vector<ui32>& ids);
 
 } // namespace NKikimr::NOlap

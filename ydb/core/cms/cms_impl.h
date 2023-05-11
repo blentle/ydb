@@ -105,12 +105,14 @@ private:
         NKikimrCms::ETenantPolicy TenantPolicy;
         NKikimrCms::EAvailabilityMode AvailabilityMode;
         bool PartialPermissionAllowed;
+        ui64 Order;
 
         TActionOptions(TDuration dur)
             : PermissionDuration(dur)
             , TenantPolicy(NKikimrCms::DEFAULT)
             , AvailabilityMode(NKikimrCms::MODE_MAX_AVAILABILITY)
             , PartialPermissionAllowed(false)
+            , Order(0)
         {}
     };
 
@@ -275,6 +277,7 @@ private:
     bool CheckPermissionRequest(const NKikimrCms::TPermissionRequest &request,
         NKikimrCms::TPermissionResponse &response,
         NKikimrCms::TPermissionRequest &scheduled,
+        const ui64 requestOrder,
         const TActorContext &ctx);
     bool IsActionHostValid(const NKikimrCms::TAction &action, TErrorInfo &error) const;
     bool ParseServices(const NKikimrCms::TAction &action, TServices &services, TErrorInfo &error) const;
@@ -301,8 +304,7 @@ private:
     bool CheckActionReplaceDevices(const NKikimrCms::TAction &action,
         const TActionOptions &options,
         TErrorInfo &error) const;
-    bool CheckSysTabletsNode(const NKikimrCms::TAction &action,
-        const TActionOptions &opts,
+    bool CheckSysTabletsNode(const TActionOptions &opts,
         const TNodeInfo &node,
         TErrorInfo &error) const;
     bool TryToLockNode(const NKikimrCms::TAction &action,

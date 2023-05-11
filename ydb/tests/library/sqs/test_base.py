@@ -61,6 +61,12 @@ VISIBILITY_CHANGE_METHOD_PARAMS = {
     'ids': ['with_delete_message', 'with_change_visibility'],
 }
 
+HAS_QUEUES_PARAMS = {
+    'argnames': 'has_queues',
+    'argvalues': [True, False],
+    'ids': ['with_queues', 'without_queues']
+}
+
 
 def get_sqs_client_path():
     return yatest_common.binary_path("ydb/core/ymq/client/bin/sqs")
@@ -561,7 +567,7 @@ class KikimrSqsTestBase(object):
     def _get_ymq_counters(self, cloud, folder, node_index=0, counters_format='json'):
         return self._get_counters(node_index, "ymq_public", counters_format, cloud=cloud, folder=folder)
 
-    def _get_counters(self, node_index, component, counters_format, cloud=None, folder=None):
+    def _get_counters(self, node_index, component, counters_format, cloud=None, folder=None, dump_to_log=True):
         mon_port = self._get_mon_port(node_index)
 
         if counters_format == 'json':
@@ -587,7 +593,8 @@ class KikimrSqsTestBase(object):
             ret = reply.text
 
         assert_that(ret, not_none())
-        logging.debug('Got counters from node {}:\n{}'.format(node_index, json.dumps(ret, sort_keys=True, indent=2)))
+        if dump_to_log:
+            logging.debug('Got counters from node {}:\n{}'.format(node_index, json.dumps(ret, sort_keys=True, indent=2)))
         return ret
 
     def _get_counter(self, counters, labels):

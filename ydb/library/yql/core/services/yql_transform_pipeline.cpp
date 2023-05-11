@@ -1,6 +1,7 @@
 #include "yql_transform_pipeline.h"
 #include "yql_eval_expr.h"
 #include "yql_eval_params.h"
+#include "yql_lineage.h"
 
 #include <ydb/library/yql/core/type_ann/type_ann_core.h>
 #include <ydb/library/yql/core/type_ann/type_ann_expr.h>
@@ -111,9 +112,9 @@ TTransformationPipeline& TTransformationPipeline::AddTypeAnnotation(EYqlIssueCod
     return *this;
 }
 
-TTransformationPipeline& TTransformationPipeline::AddPostTypeAnnotation(bool forSubGraph, EYqlIssueCode issueCode) {
+TTransformationPipeline& TTransformationPipeline::AddPostTypeAnnotation(bool forSubGraph, bool disableConstraintCheck, EYqlIssueCode issueCode) {
     Transformers_.push_back(TTransformStage(
-        CreateConstraintTransformer(*TypeAnnotationContext_, false, forSubGraph), "Constraints", issueCode));
+        CreateConstraintTransformer(*TypeAnnotationContext_, false, forSubGraph, disableConstraintCheck), "Constraints", issueCode));
     Transformers_.push_back(TTransformStage(
         CreateFunctorTransformer(
             [](const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) {
@@ -176,6 +177,22 @@ TTransformationPipeline& TTransformationPipeline::AddOptimization(bool checkWorl
         AddFinalCommonOptimization(issueCode);
     }
     AddCheckExecution(checkWorld, issueCode);
+    return *this;
+}
+
+TTransformationPipeline& TTransformationPipeline::AddLineageOptimization(TMaybe<TString>& lineageOut, EYqlIssueCode issueCode) {
+    AddCommonOptimization(issueCode);
+    Transformers_.push_back(TTransformStage(
+        CreateFunctorTransformer(
+            [typeCtx = TypeAnnotationContext_, &lineageOut](const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) {
+                Y_UNUSED(ctx);
+                output = input;
+                lineageOut = CalculateLineage(*input, *typeCtx);
+                return IGraphTransformer::TStatus::Ok;
+            }
+        ),
+        "LineageScanner",
+        issueCode));
     return *this;
 }
 

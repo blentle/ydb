@@ -176,11 +176,13 @@ public:
     TRuntimeNode NewStruct(TType* structType, const TArrayRef<const std::pair<std::string_view, TRuntimeNode>>& members);
 
     TType* NewListType(TType* itemType);
+    TRuntimeNode NewEmptyList();
     TRuntimeNode NewEmptyList(TType* itemType);
     TRuntimeNode NewEmptyListOfVoid();
     TRuntimeNode NewList(TType* itemType, const TArrayRef<const TRuntimeNode>& items);
 
     TType* NewDictType(TType* keyType, TType* payloadType, bool multi);
+    TRuntimeNode NewEmptyDict();
     TRuntimeNode NewDict(TType* dictType, const TArrayRef<const std::pair<TRuntimeNode, TRuntimeNode>>& items);
 
     TType* NewStreamType(TType* itemType);
@@ -259,6 +261,10 @@ public:
     TRuntimeNode BlockCoalesce(TRuntimeNode first, TRuntimeNode second);
     TRuntimeNode BlockNth(TRuntimeNode tuple, ui32 index);
     TRuntimeNode BlockAsTuple(const TArrayRef<const TRuntimeNode>& args);
+    TRuntimeNode BlockToPg(TRuntimeNode input, TType* returnType);
+    TRuntimeNode BlockFromPg(TRuntimeNode input, TType* returnType);
+    TRuntimeNode BlockPgResolvedCall(const std::string_view& name, ui32 id,
+        const TArrayRef<const TRuntimeNode>& args, TType* returnType);
 
     //-- logical functions
     TRuntimeNode BlockNot(TRuntimeNode data);

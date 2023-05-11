@@ -21,7 +21,7 @@ namespace NFs {
         FP_NONSECRET_FILE = 0744,
     };
 
-    Y_DECLARE_FLAGS(EFilePermissions, EFilePermission);
+    Y_DECLARE_FLAGS(EFilePermissions, EFilePermission)
 
     /// Remove a file or empty directory
     ///
@@ -31,6 +31,7 @@ namespace NFs {
     bool Remove(const TString& path);
 
     /// Remove a file or directory with contents
+    /// Does nothing if path does not exist
     ///
     /// @param[in] path  Path to file or directory
     /// @throws

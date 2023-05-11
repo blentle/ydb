@@ -230,6 +230,7 @@ class _Execution(object):
         if self._process_progress_listener:
             self._process_progress_listener()
             self._process_progress_listener.close()
+
         if not self._user_stdout:
             if self._out_file is None:
                 pass
@@ -237,8 +238,10 @@ class _Execution(object):
                 self._out_file.flush()
                 self._out_file.seek(0, os.SEEK_SET)
                 self._std_out = self._out_file.read()
+                self._out_file.close()
             else:
                 self._std_out = self._process.stdout.read()
+
         if not self._user_stderr:
             if self._err_file is None:
                 pass
@@ -246,6 +249,7 @@ class _Execution(object):
                 self._err_file.flush()
                 self._err_file.seek(0, os.SEEK_SET)
                 self._std_err = self._err_file.read()
+                self._err_file.close()
             else:
                 self._std_err = self._process.stderr.read()
 
@@ -533,6 +537,10 @@ def execute(
     if popen_kwargs is None:
         popen_kwargs = {}
 
+    if 'text' not in popen_kwargs and six.PY3:
+        # Return str for python3 if it not setted
+        popen_kwargs['text'] = True
+
     # if subprocess.PIPE in [stdout, stderr]:
     #     raise ValueError("Don't use pipe to obtain stream data - it may leads to the deadlock")
 
@@ -586,9 +594,11 @@ def execute(
 
     if stdin:
         name = "PIPE" if stdin == subprocess.PIPE else stdin.name
-        yatest_logger.debug("Executing '%s' with input '%s' in '%s'", command, name, cwd)
+        yatest_logger.debug(
+            "Executing '%s' with input '%s' in '%s' (%s)", command, name, cwd, 'waiting' if wait else 'no wait'
+        )
     else:
-        yatest_logger.debug("Executing '%s' in '%s'", command, cwd)
+        yatest_logger.debug("Executing '%s' in '%s' (%s)", command, cwd, 'waiting' if wait else 'no wait')
     # XXX
 
     started = time.time()

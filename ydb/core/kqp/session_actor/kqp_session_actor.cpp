@@ -68,9 +68,12 @@ public:
     {}
 };
 
-std::unique_ptr<TEvKqp::TEvQueryResponse> AllocQueryResponse(const std::shared_ptr<TKqpQueryState>& state) {
+std::unique_ptr<TEvKqp::TEvQueryResponse> AllocQueryResponse(const std::shared_ptr<TKqpQueryState>& state,
+    bool disableReqArena)
+{
     auto resEv = std::make_unique<TEvKqp::TEvQueryResponse>();
-    if (auto reqArena = state->GetArena()) {
+    auto reqArena = state->GetArena();
+    if (!disableReqArena && reqArena) {
         resEv->Record.ReallocRef(reqArena);
     } else {
         auto arena = std::make_shared<google::protobuf::Arena>();
@@ -179,11 +182,11 @@ public:
     }
 
     bool ConvertParameters() {
-        auto& event = QueryState->RequestEv->Record;
+        auto& proto = QueryState->RequestEv->Record;
 
-        if (!event.GetRequest().HasParameters() && event.GetRequest().YdbParametersSize()) {
+        if (!proto.GetRequest().HasParameters() && QueryState->RequestEv->GetYdbParameters().size()) {
             try {
-                ConvertYdbParamsToMiniKQLParams(event.GetRequest().GetYdbParameters(), *event.MutableRequest()->MutableParameters());
+                ConvertYdbParamsToMiniKQLParams(QueryState->RequestEv->GetYdbParameters(), *proto.MutableRequest()->MutableParameters());
             } catch (const std::exception& ex) {
                 TString message = TStringBuilder() << "Failed to parse query parameters. "<< ex.what();
                 ReplyProcessError(QueryState->Sender, QueryState->ProxyRequestId, Ydb::StatusIds::BAD_REQUEST, message);
@@ -197,8 +200,6 @@ public:
     void ForwardRequest(TEvKqp::TEvQueryRequest::TPtr& ev) {
         if (!ConvertParameters())
             return;
-
-        QueryState->RequestEv->PrepareRemote();
 
         if (!WorkerId) {
             std::unique_ptr<IActor> workerActor(CreateKqpWorkerActor(SelfId(), SessionId, KqpSettings, Settings,
@@ -346,6 +347,8 @@ public:
             << " action: " << action
             << " type: " << QueryState->GetType()
             << " text: " << QueryState->GetQuery()
+            << " rpcActor: " << QueryState->RequestActorId
+            << " database: " << QueryState->GetDatabase()
         );
 
         switch (action) {
@@ -411,6 +414,7 @@ public:
     void CompileQuery() {
         YQL_ENSURE(QueryState);
         auto ev = QueryState->BuildCompileRequest();
+        LOG_D("Sending CompileQuery request");
         Send(MakeKqpCompileServiceID(SelfId().NodeId()), ev.release(), 0, QueryState->QueryId);
         Become(&TKqpSessionActor::CompileState);
     }
@@ -494,6 +498,7 @@ public:
     }
 
     void AcquirePersistentSnapshot() {
+        LOG_D("acquire persistent snapshot");
         auto timeout = QueryState->QueryDeadlines.TimeoutAt - TAppData::TimeProvider->Now();
 
         auto* snapMgr = CreateKqpSnapshotManager(Settings.Database, timeout);
@@ -718,10 +723,7 @@ public:
         auto request = PrepareBaseRequest(queryState, queryState->TxCtx->TxAlloc);
 
         request.MaxComputeActors = Config->_KqpMaxComputeActors.Get().GetRef();
-        request.DisableLlvmForUdfStages = Config->DisableLlvmForUdfStages();
         YQL_ENSURE(queryState);
-        bool enableLlvm = queryState->PreparedQuery->GetEnableLlvm().value_or(true);
-        request.LlvmEnabled = enableLlvm && IsSqlQuery(queryState->GetType());
         request.Snapshot = queryState->TxCtx->GetSnapshot();
 
         return request;
@@ -1001,7 +1003,7 @@ public:
         auto executerActor = CreateKqpExecuter(std::move(request), Settings.Database,
             QueryState ? QueryState->UserToken : TIntrusiveConstPtr<NACLib::TUserToken>(),
             RequestCounters, Settings.Service.GetAggregationConfig(), Settings.Service.GetExecuterRetriesConfig(),
-            AsyncIoFactory);
+            AsyncIoFactory, QueryState ? QueryState->PreparedQuery : nullptr);
 
         auto exId = RegisterWithSameMailbox(executerActor);
         LOG_D("Created new KQP executer: " << exId << " isRollback: " << isRollback);
@@ -1264,7 +1266,7 @@ public:
 
     void ReplySuccess() {
         YQL_ENSURE(QueryState);
-        auto resEv = AllocQueryResponse(QueryState);
+        auto resEv = AllocQueryResponse(QueryState, QueryState->IsStreamResult());
         auto *record = &resEv->Record.GetRef();
         auto *response = record->MutableResponse();
 
@@ -1573,6 +1575,7 @@ public:
             Counters->ReportTxAborted(Settings.DbCounters, Transactions.ToBeAbortedSize());
         }
 
+        auto workerId = WorkerId;
         if (WorkerId) {
             auto ev = std::make_unique<TEvKqp::TEvCloseSessionRequest>();
             ev->Record.MutableRequest()->SetSessionId(SessionId);
@@ -1593,7 +1596,8 @@ public:
         }
 
         LOG_I("Cleanup start, isFinal: " << isFinal << " CleanupCtx: " << bool{CleanupCtx}
-            << " TransactionsToBeAborted.size(): " << (CleanupCtx ? CleanupCtx->TransactionsToBeAborted.size() : 0));
+            << " TransactionsToBeAborted.size(): " << (CleanupCtx ? CleanupCtx->TransactionsToBeAborted.size() : 0)
+            << " WorkerId: " << (workerId ? *workerId : TActorId()));
         if (CleanupCtx) {
             Become(&TKqpSessionActor::CleanupState);
         } else {

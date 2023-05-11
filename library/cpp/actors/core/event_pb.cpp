@@ -77,8 +77,17 @@ namespace NActors {
             if (CancelFlag || AbortFlag) {
                 return false;
             } else if (const size_t bytesToAppend = Min<size_t>(size, SizeRemain)) {
-                if (!Produce(data, bytesToAppend)) {
-                    return false;
+                if ((reinterpret_cast<uintptr_t>(data) & 63) + bytesToAppend <= 64 &&
+                        (NumChunks == 0 || data != Chunks[NumChunks - 1].first + Chunks[NumChunks - 1].second)) {
+                    memcpy(BufferPtr, data, bytesToAppend);
+                    if (!Produce(BufferPtr, bytesToAppend)) {
+                        return false;
+                    }
+                    BufferPtr += bytesToAppend;
+                } else {
+                    if (!Produce(data, bytesToAppend)) {
+                        return false;
+                    }
                 }
                 data = static_cast<const char*>(data) + bytesToAppend;
                 size -= bytesToAppend;
@@ -148,6 +157,7 @@ namespace NActors {
         // fill in base params
         BufferPtr = static_cast<char*>(data);
         SizeRemain = size;
+        Y_VERIFY_DEBUG(size);
 
         // transfer control to the coroutine
         Y_VERIFY(Event);

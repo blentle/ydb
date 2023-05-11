@@ -17,6 +17,7 @@
 #include <ydb/core/protos/config_units.pb.h>
 #include <ydb/core/protos/counters_cms.pb.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
+#include <ydb/public/api/protos/draft/ydb_maintenance.pb.h>
 
 #include <library/cpp/actors/core/actor.h>
 #include <library/cpp/actors/core/hfunc.h>
@@ -110,6 +111,7 @@ namespace {
 bool TCms::CheckPermissionRequest(const TPermissionRequest &request,
                                   TPermissionResponse &response,
                                   TPermissionRequest &scheduled,
+                                  ui64 requestOrder,
                                   const TActorContext &ctx)
 {
     static THashMap<EStatusCode, ui32> CodesRate = BuildCodesRateMap({
@@ -166,6 +168,7 @@ bool TCms::CheckPermissionRequest(const TPermissionRequest &request,
         opts.TenantPolicy = request.GetTenantPolicy();
         opts.AvailabilityMode = request.GetAvailabilityMode();
         opts.PartialPermissionAllowed = allowPartial;
+        opts.Order = requestOrder;
 
         TErrorInfo error;
 
@@ -335,7 +338,7 @@ bool TCms::CheckAction(const TAction &action,
         case TAction::SHUTDOWN_HOST:
             return CheckActionShutdownHost(action, opts, error, ctx);
         case TAction::REPLACE_DEVICES:
-            return CheckActionReplaceDevices(action, opts.PermissionDuration, error);
+            return CheckActionReplaceDevices(action, opts, error);
         case TAction::START_SERVICES:
         case TAction::STOP_SERVICES:
         case TAction::ADD_HOST:
@@ -373,7 +376,7 @@ bool TCms::CheckActionShutdownNode(const NKikimrCms::TAction &action,
     }
 
     if (!AppData(ctx)->DisableCheckingSysNodesCms &&
-        !CheckSysTabletsNode(action, opts, node, error)) {
+        !CheckSysTabletsNode(opts, node, error)) {
         return false;
     }
 
@@ -533,8 +536,7 @@ bool TCms::TryToLockStateStorageReplica(const TAction& action,
     return true;
 }
 
-bool TCms::CheckSysTabletsNode(const TAction &action,
-                               const TActionOptions &opts,
+bool TCms::CheckSysTabletsNode(const TActionOptions &opts,
                                const TNodeInfo &node,
                                TErrorInfo &error) const
 {
@@ -543,55 +545,13 @@ bool TCms::CheckSysTabletsNode(const TAction &action,
     }
 
     for (auto &tabletType : ClusterInfo->NodeToTabletTypes[node.NodeId]) {
-            ui32 disabledNodesCnt = 1; // сounting including this node
-            TErrorInfo err;
-            TDuration duration = TDuration::MicroSeconds(action.GetDuration()) + opts.PermissionDuration;
-            TInstant defaultDeadline = TActivationContext::Now() + State->Config.DefaultRetryTime;
-
-            for (auto &nodeId : ClusterInfo->TabletTypeToNodes[tabletType]) {
-                if (nodeId == node.NodeId) {
-                    continue;
-                }
-                if (ClusterInfo->Node(nodeId).IsLocked(err, State->Config.DefaultRetryTime,
-                                                       TActivationContext::Now(), duration) ||
-                    ClusterInfo->Node(nodeId).IsDown(err, defaultDeadline))
-                {
-                    ++disabledNodesCnt;
-                }
-            }
-
-            ui32 tabletNodes = ClusterInfo->TabletTypeToNodes[tabletType].size();
-            switch (opts.AvailabilityMode) {
-                case MODE_MAX_AVAILABILITY:
-                    if (tabletNodes > 1 && disabledNodesCnt * 2 > tabletNodes){
-                        error.Code = TStatus::DISALLOW_TEMP;
-                        error.Reason = TStringBuilder() << NKikimrConfig::TBootstrap_ETabletType_Name(tabletType)
-                                                        << " has too many locked nodes: " << disabledNodesCnt
-                                                        << " limit: " << tabletNodes / 2 << " (50%)";
-                        error.Deadline = defaultDeadline;
-                        return false;
-                    }
-                    break;
-                case MODE_KEEP_AVAILABLE:
-                    if (tabletNodes > 1 && disabledNodesCnt > tabletNodes - 1) {
-                        error.Code = TStatus::DISALLOW_TEMP;
-                        error.Reason = TStringBuilder() << NKikimrConfig::TBootstrap_ETabletType_Name(tabletType)
-                                                        << " has too many locked nodes: " << disabledNodesCnt
-                                                        << ". At least one node must be available";
-                        error.Deadline = defaultDeadline;
-                        return false;
-                    }
-                    break;
-                case MODE_FORCE_RESTART:
-                    break;
-                default:
-                    error.Code = TStatus::WRONG_REQUEST;
-                    error.Reason = Sprintf("Unknown availability mode: %s (%" PRIu32 ")",
-                                   EAvailabilityMode_Name(opts.AvailabilityMode).data(),
-                                   static_cast<ui32>(opts.AvailabilityMode));
-                    error.Deadline = defaultDeadline;
-                    return false;
-            }
+        auto reason = ClusterInfo->SysNodesCheckers[tabletType]->TryToLockNode(node.NodeId, opts.AvailabilityMode, 0, opts.Order);
+        if (reason != Ydb::Maintenance::ActionState::ACTION_REASON_OK) {
+            error.Code = TStatus::DISALLOW_TEMP;
+            error.Reason = ClusterInfo->SysNodesCheckers[tabletType]->ReadableReason(node.NodeId, opts.AvailabilityMode, reason);
+            error.Deadline = TActivationContext::Now() + State->Config.DefaultRetryTime;
+            return false;
+        }
     }
 
     return true;
@@ -605,26 +565,27 @@ bool TCms::TryToLockNode(const TAction& action,
     TDuration duration = TDuration::MicroSeconds(action.GetDuration());
     duration += opts.PermissionDuration;
 
-    bool isForceRestart = opts.AvailabilityMode == NKikimrCms::MODE_FORCE_RESTART;
-
-    if (!ClusterInfo->ClusterNodes->TryToLockNode(node.NodeId, isForceRestart))
+    auto clusterReason = ClusterInfo->ClusterNodes->TryToLockNode(node.NodeId, opts.AvailabilityMode, 0, opts.Order);
+    if (clusterReason != Ydb::Maintenance::ActionState::ACTION_REASON_OK)
     {
         error.Code = TStatus::DISALLOW_TEMP;
-        error.Reason = ClusterInfo->ClusterNodes->ReadableReason();
+        error.Reason = ClusterInfo->ClusterNodes->ReadableReason(node.NodeId, opts.AvailabilityMode, clusterReason);
         error.Deadline = TActivationContext::Now() + State->Config.DefaultRetryTime;
 
         return false;
     }
 
     if (node.Tenant
-        && opts.TenantPolicy != NONE
-        && !ClusterInfo->TenantNodesChecker[node.Tenant]->TryToLockNode(node.NodeId, isForceRestart))
-    {
-        error.Code = TStatus::DISALLOW_TEMP;
-        error.Reason = ClusterInfo->TenantNodesChecker[node.Tenant]->ReadableReason();
-        error.Deadline = TActivationContext::Now() + State->Config.DefaultRetryTime;
+        && opts.TenantPolicy != NONE) {
+        auto tenantReason = ClusterInfo->TenantNodesChecker[node.Tenant]->TryToLockNode(node.NodeId, opts.AvailabilityMode, 0, opts.Order);
 
-        return false;
+        if (tenantReason != Ydb::Maintenance::ActionState::ACTION_REASON_OK) {
+            error.Code = TStatus::DISALLOW_TEMP;
+            error.Reason = ClusterInfo->TenantNodesChecker[node.Tenant]->ReadableReason(node.NodeId, opts.AvailabilityMode, tenantReason);
+            error.Deadline = TActivationContext::Now() + State->Config.DefaultRetryTime;
+
+            return false;
+        }
     }
 
     return true;
@@ -703,35 +664,37 @@ bool TCms::TryToLockVDisk(const TActionOptions& opts,
             return false;
         }
 
-        auto counters = CreateErasureCounter(ClusterInfo->BSGroup(groupId).Erasure.GetErasure(), vdisk, groupId);
-        counters->CountGroupState(ClusterInfo, State->Config.DefaultRetryTime, duration, error);
+        ui32 tempLocksCount = 0;
+        for (auto& vdiskId : group.VDisks) {
+            if (vdisk.VDiskId == vdiskId)
+                continue;
 
-        switch (opts.AvailabilityMode) {
-        case MODE_MAX_AVAILABILITY:
-            if (!counters->CheckForMaxAvailability(error, defaultDeadline, opts.PartialPermissionAllowed)) {
-                return false;
+            if (!ClusterInfo->VDisk(vdiskId).TempLocks.empty()
+                || !ClusterInfo->Node(ClusterInfo->VDisk(vdiskId).NodeId).TempLocks.empty()
+                || !ClusterInfo->PDisk(ClusterInfo->VDisk(vdiskId).PDiskId).TempLocks.empty()) {
+                tempLocksCount += 1;
             }
-            break;
-        case MODE_KEEP_AVAILABLE:
-            if (!counters->CheckForKeepAvailability(ClusterInfo, error, defaultDeadline, opts.PartialPermissionAllowed)) {
-                return false;
-            }
-            break;
-        case MODE_FORCE_RESTART:
-            if ( counters->GroupAlreadyHasLockedDisks() && opts.PartialPermissionAllowed) {
-                error.Code = TStatus::DISALLOW_TEMP;
-                error.Reason = "You cannot get two or more disks from the same group at the same time"
-                               " without specifying the PartialPermissionAllowed parameter";
-                error.Deadline = defaultDeadline;
-                return false;
-            }
-            // Any number of down disks is OK for this mode.
-            break;
-        default:
-            error.Code = TStatus::WRONG_REQUEST;
-            error.Reason = Sprintf("Unknown availability mode: %s (%" PRIu32 ")",
-                                   EAvailabilityMode_Name(opts.AvailabilityMode).data(),
-                                   static_cast<ui32>(opts.AvailabilityMode));
+        }
+
+        if (opts.PartialPermissionAllowed && tempLocksCount == 1) {
+            error.Code = TStatus::DISALLOW_TEMP;
+            error.Reason = "You cannot get two or more disks from the same group at the same time";
+            error.Deadline = defaultDeadline;
+            return false;
+        }
+
+        auto result = group.GroupChecker->TryToLockVDisk(vdisk.VDiskId, opts.AvailabilityMode, 0, opts.Order);
+        bool resultIsOk = result == Ydb::Maintenance::ActionState::ACTION_REASON_OK;
+
+        if (!resultIsOk && !opts.PartialPermissionAllowed && tempLocksCount > 0) {
+            error.Code = TStatus::DISALLOW;
+            error.Reason = "Request is incorrect. You will never get a permissions. Try with PartialPermissionAllowed";
+            return false;
+        }
+
+        if (!resultIsOk) {
+            error.Code = TStatus::DISALLOW_TEMP;
+            error.Reason = group.GroupChecker->ReadableReason(vdisk.VDiskId, opts.AvailabilityMode, result);
             error.Deadline = defaultDeadline;
             return false;
         }
@@ -1427,6 +1390,9 @@ void TCms::Handle(TEvPrivate::TEvClusterInfo::TPtr &ev, const TActorContext &ctx
     // all the information about the tenants on the disconnected nodes
     info->GenerateTenantNodesCheckers();
 
+    if (!AppData(ctx)->DisableCheckingSysNodesCms)
+        info->GenerateSysTabletsNodesCheckers();
+
     AdjustInfo(info, ctx);
 
     State->ClusterInfo = info;
@@ -1593,13 +1559,9 @@ void TCms::Handle(TEvCms::TEvPermissionRequest::TPtr &ev,
         }
     }
 
-    ClusterInfo->LogManager.PushRollbackPoint();
-    for (const auto &scheduled_request : State->ScheduledRequests) {
-            for (auto &action : scheduled_request.second.Request.GetActions())
-                ClusterInfo->LogManager.ApplyAction(action, ClusterInfo);
-    }
-    bool ok = CheckPermissionRequest(rec, resp->Record, scheduled.Request, ctx);
-    ClusterInfo->LogManager.RollbackOperations();
+    LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::CMS, "Next request Id: " << State->NextRequestId);
+
+    bool ok = CheckPermissionRequest(rec, resp->Record, scheduled.Request, State->NextRequestId, ctx);
 
     // Schedule request if required.
     if (rec.GetDryRun()) {
@@ -1659,20 +1621,12 @@ void TCms::Handle(TEvCms::TEvCheckRequest::TPtr &ev, const TActorContext &ctx)
 
     auto requestStartTime = TInstant::Now();
 
-    ClusterInfo->LogManager.PushRollbackPoint();
-    for (const auto &scheduled_request : State->ScheduledRequests) {
-        if (scheduled_request.second.Order < request.Order) {
-            for (auto &action : scheduled_request.second.Request.GetActions())
-                ClusterInfo->LogManager.ApplyAction(action, ClusterInfo);
-        }
-    }
     // Deactivate locks of this and later requests to
     // avoid false conflicts.
     ClusterInfo->DeactivateScheduledLocks(request.Order);
     request.Request.SetAvailabilityMode(rec.GetAvailabilityMode());
-    bool ok = CheckPermissionRequest(request.Request, resp->Record, scheduled.Request, ctx);
+    bool ok = CheckPermissionRequest(request.Request, resp->Record, scheduled.Request, request.Order, ctx);
     ClusterInfo->ReactivateScheduledLocks();
-    ClusterInfo->LogManager.RollbackOperations();
 
     // Schedule request if required.
     if (rec.GetDryRun()) {

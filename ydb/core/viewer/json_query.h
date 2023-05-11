@@ -110,7 +110,11 @@ public:
             request.SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
             request.SetType(NKikimrKqp::QUERY_TYPE_SQL_SCAN);
             request.SetKeepSession(false);
-        } else if (Action == "explain" || Action == "explain-ast") {
+        } else if (Action == "execute-data") {
+            request.SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
+            request.SetType(NKikimrKqp::QUERY_TYPE_SQL_DML);
+            request.SetKeepSession(false);
+        } else if (Action == "explain" || Action == "explain-ast" || Action == "explain-data") {
             request.SetAction(NKikimrKqp::QUERY_ACTION_EXPLAIN);
             request.SetType(NKikimrKqp::QUERY_TYPE_SQL_DML);
         } else if (Action == "explain-scan") {
@@ -122,6 +126,7 @@ public:
         }
         if (Stats == "profile") {
             request.SetStatsMode(NYql::NDqProto::DQ_STATS_MODE_PROFILE);
+            request.SetCollectStats(Ydb::Table::QueryStatsCollection::STATS_COLLECTION_PROFILE);
         }
         if (database) {
             request.SetDatabase(database);

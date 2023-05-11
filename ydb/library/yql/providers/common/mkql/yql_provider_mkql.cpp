@@ -2430,6 +2430,34 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
         return ctx.ProgramBuilder.PgResolvedCall(false, procName, procId, args, returnType);
     });
 
+    AddCallable("BlockPgResolvedCall", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        auto name = node.Head().Content();
+        auto id = FromString<ui32>(node.Child(1)->Content());
+        std::vector<TRuntimeNode> args;
+        args.reserve(node.ChildrenSize() - 3);
+        for (ui32 i = 3; i < node.ChildrenSize(); ++i) {
+            args.push_back(MkqlBuildExpr(*node.Child(i), ctx));
+        }
+
+        auto returnType = BuildType(node, *node.GetTypeAnn(), ctx.ProgramBuilder);
+        return ctx.ProgramBuilder.BlockPgResolvedCall(name, id, args, returnType);
+    });
+
+    AddCallable("BlockPgResolvedOp", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        auto operId = FromString<ui32>(node.Child(1)->Content());
+        auto procId = NPg::LookupOper(operId).ProcId;
+        auto procName = NPg::LookupProc(procId).Name;
+        std::vector<TRuntimeNode> args;
+        args.reserve(node.ChildrenSize() - 2);
+        for (ui32 i = 2; i < node.ChildrenSize(); ++i) {
+            args.push_back(MkqlBuildExpr(*node.Child(i), ctx));
+        }
+
+        auto returnType = BuildType(node, *node.GetTypeAnn(), ctx.ProgramBuilder);
+        return ctx.ProgramBuilder.BlockPgResolvedCall(procName, procId, args, returnType);
+    });
+
+
     AddCallable("PgCast", [](const TExprNode& node, TMkqlBuildContext& ctx) {
         auto input = MkqlBuildExpr(*node.Child(0), ctx);
         auto returnType = BuildType(node, *node.GetTypeAnn(), ctx.ProgramBuilder);
@@ -2461,6 +2489,18 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
         auto input = MkqlBuildExpr(*node.Child(0), ctx);
         auto returnType = BuildType(node, *node.GetTypeAnn(), ctx.ProgramBuilder);
         return ctx.ProgramBuilder.ToPg(input, returnType);
+    });
+
+    AddCallable("BlockFromPg", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        auto input = MkqlBuildExpr(*node.Child(0), ctx);
+        auto returnType = BuildType(node, *node.GetTypeAnn(), ctx.ProgramBuilder);
+        return ctx.ProgramBuilder.BlockFromPg(input, returnType);
+    });
+
+    AddCallable("BlockToPg", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        auto input = MkqlBuildExpr(*node.Child(0), ctx);
+        auto returnType = BuildType(node, *node.GetTypeAnn(), ctx.ProgramBuilder);
+        return ctx.ProgramBuilder.BlockToPg(input, returnType);
     });
 
     AddCallable("WithContext", [](const TExprNode& node, TMkqlBuildContext& ctx) {

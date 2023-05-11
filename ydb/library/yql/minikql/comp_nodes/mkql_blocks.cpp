@@ -10,6 +10,8 @@
 #include <ydb/library/yql/minikql/mkql_node_builder.h>
 #include <ydb/library/yql/minikql/mkql_node_cast.h>
 
+#include <ydb/library/yql/parser/pg_wrapper/interface/arrow.h>
+
 #include <arrow/scalar.h>
 #include <arrow/array.h>
 #include <arrow/datum.h>
@@ -30,7 +32,7 @@ public:
 
     NUdf::TUnboxedValuePod DoCalculate(TComputationContext& ctx) const {
         const auto maxLen = CalcBlockLen(CalcMaxBlockItemSize(ItemType_));
-        auto builder = MakeArrayBuilder(TTypeInfoHelper(), ItemType_, ctx.ArrowMemoryPool, maxLen);
+        auto builder = MakeArrayBuilder(TTypeInfoHelper(), ItemType_, ctx.ArrowMemoryPool, maxLen, &ctx.Builder->GetPgBuilder());
 
         for (size_t i = 0; i < builder->MaxLength(); ++i) {
             auto result = Flow_->GetValue(ctx);
@@ -132,7 +134,7 @@ private:
 
             for (size_t i = 0; i < types.size(); ++i) {
                 ValuePointers_[i] = &Values_[i];
-                Builders_.push_back(MakeArrayBuilder(TTypeInfoHelper(), types[i], ctx.ArrowMemoryPool, MaxLength_));
+                Builders_.push_back(MakeArrayBuilder(TTypeInfoHelper(), types[i], ctx.ArrowMemoryPool, MaxLength_, &ctx.Builder->GetPgBuilder()));
             }
         }
     };
@@ -190,10 +192,10 @@ private:
     struct TState : public TComputationValue<TState> {
         using TComputationValue::TComputationValue;
 
-        TState(TMemoryUsageInfo* memInfo, TType* itemType)
+        TState(TMemoryUsageInfo* memInfo, TType* itemType, const NUdf::IPgBuilder& pgBuilder)
             : TComputationValue(memInfo)
             , Reader_(MakeBlockReader(TTypeInfoHelper(), itemType))
-            , Converter_(MakeBlockItemConverter(TTypeInfoHelper(), itemType))
+            , Converter_(MakeBlockItemConverter(TTypeInfoHelper(), itemType, pgBuilder))
         {
         }
 
@@ -239,7 +241,7 @@ private:
     TState& GetState(TComputationContext& ctx) const {
         auto& result = ctx.MutableValues[StateIndex_];
         if (!result.HasValue()) {
-            result = ctx.HolderFactory.Create<TState>(ItemType_);
+            result = ctx.HolderFactory.Create<TState>(ItemType_, ctx.Builder->GetPgBuilder());
         }
         return *static_cast<TState*>(result.AsBoxed().Get());
     }
@@ -307,7 +309,7 @@ private:
         size_t Count_ = 0;
         size_t Index_ = 0;
 
-        TState(TMemoryUsageInfo* memInfo, const TVector<TType*>& types)
+        TState(TMemoryUsageInfo* memInfo, const TVector<TType*>& types, const NUdf::IPgBuilder& pgBuilder)
             : TComputationValue(memInfo)
             , Values_(types.size() + 1)
             , ValuePointers_(types.size() + 1)
@@ -318,7 +320,7 @@ private:
 
             for (size_t i = 0; i < types.size(); ++i) {
                 Readers_.push_back(MakeBlockReader(TTypeInfoHelper(), types[i]));
-                Converters_.push_back(MakeBlockItemConverter(TTypeInfoHelper(), types[i]));
+                Converters_.push_back(MakeBlockItemConverter(TTypeInfoHelper(), types[i], pgBuilder));
             }
         }
     };
@@ -330,7 +332,7 @@ private:
 
     TState& GetState(NUdf::TUnboxedValue& state, TComputationContext& ctx) const {
         if (!state.HasValue()) {
-            state = ctx.HolderFactory.Create<TState>(Types_);
+            state = ctx.HolderFactory.Create<TState>(Types_, ctx.Builder->GetPgBuilder());
         }
         return *static_cast<TState*>(state.AsBoxed().Get());
     }
@@ -427,6 +429,10 @@ private:
             default:
                 MKQL_ENSURE(false, "Unsupported data slot");
             }
+        }
+
+        if (type->IsPg()) {
+            return NYql::MakePgScalar(AS_TYPE(TPgType, type), value, ctx.ArrowMemoryPool);
         }
 
         MKQL_ENSURE(false, "Unsupported type");

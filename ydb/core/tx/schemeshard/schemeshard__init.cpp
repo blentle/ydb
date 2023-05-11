@@ -302,7 +302,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
         return true;
     }
 
-    typedef std::tuple<TPathId, ui32, ui64, TString, TString, TString, ui64, TString, bool> TTableRec;
+    typedef std::tuple<TPathId, ui32, ui64, TString, TString, TString, ui64, TString, bool, TString> TTableRec;
     typedef TDeque<TTableRec> TTableRows;
 
     template <typename SchemaTable, typename TRowSet>
@@ -315,7 +315,8 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
             rowSet.template GetValueOrDefault<typename SchemaTable::AlterTable>(),
             rowSet.template GetValueOrDefault<typename SchemaTable::PartitioningVersion>(0),
             rowSet.template GetValueOrDefault<typename SchemaTable::TTLSettings>(),
-            rowSet.template GetValueOrDefault<typename SchemaTable::IsBackup>(false)
+            rowSet.template GetValueOrDefault<typename SchemaTable::IsBackup>(false),
+            rowSet.template GetValueOrDefault<typename SchemaTable::ReplicationConfig>()
         );
     }
 
@@ -1223,6 +1224,29 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
         return true;
     }
 
+    template <typename TRowSet>
+    TSchemeLimits LoadSchemeLimits(const TSchemeLimits& defaults, TRowSet& rowSet) {
+        return TSchemeLimits {
+            .MaxDepth = rowSet.template GetValueOrDefault<Schema::SubDomains::DepthLimit>(defaults.MaxDepth),
+            .MaxPaths = rowSet.template GetValueOrDefault<Schema::SubDomains::PathsLimit>(defaults.MaxPaths),
+            .MaxChildrenInDir = rowSet.template GetValueOrDefault<Schema::SubDomains::ChildrenLimit>(defaults.MaxChildrenInDir),
+            .MaxAclBytesSize = rowSet.template GetValueOrDefault<Schema::SubDomains::AclByteSizeLimit>(defaults.MaxAclBytesSize),
+            .MaxPathElementLength = rowSet.template GetValueOrDefault<Schema::SubDomains::PathElementLength>(defaults.MaxPathElementLength),
+            .ExtraPathSymbolsAllowed = rowSet.template GetValueOrDefault<Schema::SubDomains::ExtraPathSymbolsAllowed>(defaults.ExtraPathSymbolsAllowed),
+            .MaxTableColumns = rowSet.template GetValueOrDefault<Schema::SubDomains::TableColumnsLimit>(defaults.MaxTableColumns),
+            .MaxTableColumnNameLength = rowSet.template GetValueOrDefault<Schema::SubDomains::TableColumnNameLengthLimit>(defaults.MaxTableColumnNameLength),
+            .MaxTableKeyColumns = rowSet.template GetValueOrDefault<Schema::SubDomains::TableKeyColumnsLimit>(defaults.MaxTableKeyColumns),
+            .MaxTableIndices = rowSet.template GetValueOrDefault<Schema::SubDomains::TableIndicesLimit>(defaults.MaxTableIndices),
+            .MaxTableCdcStreams = rowSet.template GetValueOrDefault<Schema::SubDomains::TableCdcStreamsLimit>(defaults.MaxTableCdcStreams),
+            .MaxShards = rowSet.template GetValueOrDefault<Schema::SubDomains::ShardsLimit>(defaults.MaxShards),
+            .MaxShardsInPath = rowSet.template GetValueOrDefault<Schema::SubDomains::PathShardsLimit>(defaults.MaxShardsInPath),
+            .MaxConsistentCopyTargets = rowSet.template GetValueOrDefault<Schema::SubDomains::ConsistentCopyingTargetsLimit>(defaults.MaxConsistentCopyTargets),
+            .MaxPQPartitions = rowSet.template GetValueOrDefault<Schema::SubDomains::PQPartitionsLimit>(defaults.MaxPQPartitions),
+            .MaxExports = rowSet.template GetValueOrDefault<Schema::SubDomains::ExportsLimit>(defaults.MaxExports),
+            .MaxImports = rowSet.template GetValueOrDefault<Schema::SubDomains::ImportsLimit>(defaults.MaxImports),
+        };
+    }
+
     bool ReadEverything(TTransactionContext& txc, const TActorContext& ctx) {
         const TOwnerId selfId = Self->TabletID();
 
@@ -1435,21 +1459,8 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
 
                 if (row.IsValid()) {
                     version = row.GetValue<Schema::SubDomains::AlterVersion>();
-                    rootLimits.MaxDepth = row.GetValueOrDefault<Schema::SubDomains::DepthLimit>(rootLimits.MaxDepth);
-                    rootLimits.MaxPaths = row.GetValueOrDefault<Schema::SubDomains::PathsLimit>(rootLimits.MaxPathsCompat);
-                    rootLimits.MaxChildrenInDir = row.GetValueOrDefault<Schema::SubDomains::ChildrenLimit>(rootLimits.MaxChildrenInDir);
-                    rootLimits.MaxAclBytesSize = row.GetValueOrDefault<Schema::SubDomains::AclByteSizeLimit>(rootLimits.MaxAclBytesSize);
-                    rootLimits.MaxTableColumns = row.GetValueOrDefault<Schema::SubDomains::TableColumnsLimit>(rootLimits.MaxTableColumns);
-                    rootLimits.MaxTableColumnNameLength = row.GetValueOrDefault<Schema::SubDomains::TableColumnNameLengthLimit>(rootLimits.MaxTableColumnNameLength);
-                    rootLimits.MaxTableKeyColumns = row.GetValueOrDefault<Schema::SubDomains::TableKeyColumnsLimit>(rootLimits.MaxTableKeyColumns);
-                    rootLimits.MaxTableIndices = row.GetValueOrDefault<Schema::SubDomains::TableIndicesLimit>(rootLimits.MaxTableIndices);
-                    rootLimits.MaxTableCdcStreams = row.GetValueOrDefault<Schema::SubDomains::TableCdcStreamsLimit>(rootLimits.MaxTableCdcStreams);
-                    rootLimits.MaxShards = row.GetValueOrDefault<Schema::SubDomains::ShardsLimit>(rootLimits.MaxShards);
-                    rootLimits.MaxShardsInPath = row.GetValueOrDefault<Schema::SubDomains::PathShardsLimit>(rootLimits.MaxShardsInPath);
-                    rootLimits.MaxConsistentCopyTargets = row.GetValueOrDefault<Schema::SubDomains::ConsistentCopyingTargetsLimit>(rootLimits.MaxConsistentCopyTargets);
-                    rootLimits.MaxPathElementLength = row.GetValueOrDefault<Schema::SubDomains::PathElementLength>(rootLimits.MaxPathElementLength);
-                    rootLimits.ExtraPathSymbolsAllowed = row.GetValueOrDefault<Schema::SubDomains::ExtraPathSymbolsAllowed>(rootLimits.ExtraPathSymbolsAllowed);
-                    rootLimits.MaxPQPartitions = row.GetValueOrDefault<Schema::SubDomains::PQPartitionsLimit>(rootLimits.MaxPQPartitions);
+                    rootLimits.MaxPaths = rootLimits.MaxPathsCompat;
+                    rootLimits = LoadSchemeLimits(rootLimits, row);
                 }
 
                 TSubDomainInfo::TPtr rootDomainInfo = new TSubDomainInfo(version, Self->RootPathId());
@@ -1493,24 +1504,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                     TTabletId sharedHiveId = rowset.GetValue<Schema::SubDomains::SharedHiveId>();
                     domainInfo->SetSharedHive(sharedHiveId);
 
-                    TSchemeLimits limits = rootLimits;
-                    limits.MaxDepth = rowset.GetValueOrDefault<Schema::SubDomains::DepthLimit>(limits.MaxDepth);
-                    limits.MaxPaths = rowset.GetValueOrDefault<Schema::SubDomains::PathsLimit>(limits.MaxPaths);
-                    limits.MaxChildrenInDir = rowset.GetValueOrDefault<Schema::SubDomains::ChildrenLimit>(limits.MaxChildrenInDir);
-                    limits.MaxAclBytesSize = rowset.GetValueOrDefault<Schema::SubDomains::AclByteSizeLimit>(limits.MaxAclBytesSize);
-                    limits.MaxTableColumns = rowset.GetValueOrDefault<Schema::SubDomains::TableColumnsLimit>(limits.MaxTableColumns);
-                    limits.MaxTableColumnNameLength = rowset.GetValueOrDefault<Schema::SubDomains::TableColumnNameLengthLimit>(limits.MaxTableColumnNameLength);
-                    limits.MaxTableKeyColumns = rowset.GetValueOrDefault<Schema::SubDomains::TableKeyColumnsLimit>(limits.MaxTableKeyColumns);
-                    limits.MaxTableIndices = rowset.GetValueOrDefault<Schema::SubDomains::TableIndicesLimit>(limits.MaxTableIndices);
-                    limits.MaxTableCdcStreams = rowset.GetValueOrDefault<Schema::SubDomains::TableCdcStreamsLimit>(limits.MaxTableCdcStreams);
-                    limits.MaxShards = rowset.GetValueOrDefault<Schema::SubDomains::ShardsLimit>(limits.MaxShards);
-                    limits.MaxShardsInPath = rowset.GetValueOrDefault<Schema::SubDomains::PathShardsLimit>(limits.MaxShardsInPath);
-                    limits.MaxConsistentCopyTargets = rowset.GetValueOrDefault<Schema::SubDomains::ConsistentCopyingTargetsLimit>(limits.MaxConsistentCopyTargets);
-                    limits.MaxPathElementLength = rowset.GetValueOrDefault<Schema::SubDomains::PathElementLength>(limits.MaxPathElementLength);
-                    limits.ExtraPathSymbolsAllowed = rowset.GetValueOrDefault<Schema::SubDomains::ExtraPathSymbolsAllowed>(limits.ExtraPathSymbolsAllowed);
-                    limits.MaxPQPartitions = rowset.GetValueOrDefault<Schema::SubDomains::PQPartitionsLimit>(limits.MaxPQPartitions);
-
-                    domainInfo->SetSchemeLimits(limits);
+                    domainInfo->SetSchemeLimits(LoadSchemeLimits(rootLimits, rowset));
 
                     if (rowset.HaveValue<Schema::SubDomains::DeclaredSchemeQuotas>()) {
                         NKikimrSubDomains::TSchemeQuotas declaredSchemeQuotas;
@@ -1760,9 +1754,13 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
 
                 tableInfo->PartitioningVersion = std::get<6>(rec);
 
-                TString ttlSettings = std::get<7>(rec);
-                if (ttlSettings) {
+                if (const auto ttlSettings = std::get<7>(rec)) {
                     bool parseOk = ParseFromStringNoSizeLimit(tableInfo->MutableTTLSettings(), ttlSettings);
+                    Y_VERIFY(parseOk);
+                }
+
+                if (const auto replicationConfig = std::get<9>(rec)) {
+                    bool parseOk = ParseFromStringNoSizeLimit(tableInfo->MutableReplicationConfig(), replicationConfig);
                     Y_VERIFY(parseOk);
                 }
 

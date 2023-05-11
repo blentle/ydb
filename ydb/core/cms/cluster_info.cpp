@@ -1,8 +1,11 @@
 #include "cluster_info.h"
 #include "cms_state.h"
 #include "node_checkers.h"
+#include "erasure_checkers.h"
 
+#include <ydb/core/protos/cms.pb.h>
 #include <ydb/core/protos/services.pb.h>
+#include <ydb/public/api/protos/draft/ydb_maintenance.pb.h>
 
 #include <library/cpp/actors/core/actor.h>
 #include <library/cpp/actors/core/log.h>
@@ -376,7 +379,9 @@ void TClusterInfo::AddNode(const TEvInterconnect::TNodeInfo &info, const TActorC
             break;
         }
     }
-    ClusterNodes->AddNode(node->NodeId);
+
+    node->AddNodeGroup(ClusterNodes);
+
     HostNameToNodeId.emplace(node->Host, node->NodeId);
     LockableItems[node->ItemName()] = node;
 }
@@ -391,8 +396,6 @@ void TClusterInfo::SetNodeState(ui32 nodeId, NKikimrCms::EState state, const NKi
     node.StartTime = TInstant::MilliSeconds(info.GetStartTime());
     node.Version = info.GetVersion();
 
-    ClusterNodes->UpdateNode(nodeId, state);
-
     node.Services = TServices();
     for (const auto& role : info.GetRoles()) {
         EService value;
@@ -400,6 +403,8 @@ void TClusterInfo::SetNodeState(ui32 nodeId, NKikimrCms::EState state, const NKi
             node.Services |= value;
         }
     }
+
+    node.UpdateNodeState();
 }
 
 void TClusterInfo::ClearNode(ui32 nodeId)
@@ -411,10 +416,13 @@ void TClusterInfo::ClearNode(ui32 nodeId)
     for (auto tablet : node.Tablets)
         Tablets.erase(tablet);
     node.Tablets.clear();
-    node.State = NKikimrCms::DOWN;
     node.HasTenantInfo = false;
+    node.State = NKikimrCms::DOWN;
+    node.UpdateNodeState();
 
-    ClusterNodes->UpdateNode(node.NodeId, NKikimrCms::DOWN);
+    for (auto& vdisk : node.VDisks) {
+        BSGroup(vdisk.GroupID).GroupChecker->UpdateVDisk(vdisk, DOWN);
+    }
 }
 
 void TClusterInfo::ApplyInitialNodeTenants(const TActorContext& ctx, const THashMap<ui32, TString>& nodeTenants)
@@ -488,7 +496,15 @@ void TClusterInfo::UpdatePDiskState(const TPDiskID &id, const NKikimrWhiteboard:
     }
 
     auto &pdisk = PDiskRef(id);
-    pdisk.State = info.GetState() == NKikimrBlobStorage::TPDiskState::Normal ? UP : DOWN;
+    auto state = info.GetState() == NKikimrBlobStorage::TPDiskState::Normal ? UP : DOWN;
+    pdisk.State = state;
+
+    if (state == UP)
+        return;
+
+    for (auto &vdisk : pdisk.VDisks) {
+        BSGroup(vdisk.GroupID).GroupChecker->UpdateVDisk(vdisk, state);
+    }
 }
 
 void TClusterInfo::AddVDisk(const NKikimrBlobStorage::TBaseConfig::TVSlot &info)
@@ -544,10 +560,13 @@ void TClusterInfo::UpdateVDiskState(const TVDiskID &id, const NKikimrWhiteboard:
     }
 
     auto &vdisk = VDiskRef(id);
-    if (info.GetVDiskState() == NKikimrWhiteboard::OK && info.GetReplicated())
+    if (info.GetVDiskState() == NKikimrWhiteboard::OK && info.GetReplicated()) {
         vdisk.State = UP;
-    else
+        BSGroup(vdisk.VDiskId.GroupID).GroupChecker->UpdateVDisk(id, UP);
+    } else {
         vdisk.State = DOWN;
+        BSGroup(vdisk.VDiskId.GroupID).GroupChecker->UpdateVDisk(id, DOWN);
+    }
 }
 
 void TClusterInfo::AddBSGroup(const NKikimrBlobStorage::TBaseConfig::TGroup &info)
@@ -556,6 +575,8 @@ void TClusterInfo::AddBSGroup(const NKikimrBlobStorage::TBaseConfig::TGroup &inf
     bsgroup.GroupId = info.GetGroupId();
     if (info.GetErasureSpecies())
         bsgroup.Erasure = {TErasureType::ErasureSpeciesByName(info.GetErasureSpecies())};
+
+    bsgroup.GroupChecker = CreateStorageGroupChecker(bsgroup.Erasure.GetErasure(), bsgroup.GroupId);
     for (const auto &vdisk : info.GetVSlotId()) {
         TPDiskID pdiskId = {vdisk.GetNodeId(), vdisk.GetPDiskId()};
         Y_VERIFY_DEBUG(HasPDisk(pdiskId));
@@ -575,8 +596,10 @@ void TClusterInfo::AddBSGroup(const NKikimrBlobStorage::TBaseConfig::TGroup &inf
         bsgroup.VDisks.insert(pdisk.VSlots.at(vdisk.GetVSlotId()));
     }
 
-    for (auto &vdisk : bsgroup.VDisks)
+    for (auto &vdisk : bsgroup.VDisks) {
         VDiskRef(vdisk).BSGroups.insert(bsgroup.GroupId);
+        bsgroup.GroupChecker->AddVDisk(vdisk);
+    }
     BSGroups[bsgroup.GroupId] = std::move(bsgroup);
 }
 
@@ -611,12 +634,18 @@ void TClusterInfo::AddPDiskTempLock(TPDiskID pdiskId, const NKikimrCms::TAction 
 {
     auto &pdisk = PDiskRef(pdiskId);
     pdisk.TempLocks.push_back({RollbackPoint, action});
+
+    for (auto& vdisk : pdisk.VDisks) {
+        LogManager.AddLockVDiskOperation(vdisk ,BSGroup(vdisk.GroupID).GroupChecker);
+    }
 }
 
 void TClusterInfo::AddVDiskTempLock(TVDiskID vdiskId, const NKikimrCms::TAction &action)
 {
     auto &vdisk = VDiskRef(vdiskId);
     vdisk.TempLocks.push_back({RollbackPoint, action});
+
+    LogManager.AddLockVDiskOperation(vdiskId, BSGroup(vdiskId.GroupID).GroupChecker);
 }
 
 static TServices MakeServices(const NKikimrCms::TAction &action) {
@@ -647,9 +676,11 @@ void TClusterInfo::ApplyActionWithoutLog(const NKikimrCms::TAction &action)
     case TAction::SHUTDOWN_HOST:
         if (auto nodes = NodePtrs(action.GetHost(), MakeServices(action))) {
             for (const auto node : nodes) {
-                ClusterNodes->LockNode(node->NodeId);
-                if (node->Tenant) {
-                    TenantNodesChecker[node->Tenant]->LockNode(node->NodeId);
+                for (auto &nodeGroup: node->NodeGroups)
+                    nodeGroup->LockNode(node->NodeId);
+
+                for (auto vdisk : node->VDisks) {
+                    BSGroup(vdisk.GroupID).GroupChecker->LockVDisk(vdisk);
                 }
             }
         }
@@ -658,10 +689,12 @@ void TClusterInfo::ApplyActionWithoutLog(const NKikimrCms::TAction &action)
         for (const auto &device : action.GetDevices()) {
             if (HasPDisk(device)) {
                 auto pdisk = &PDiskRef(device);
-                ClusterNodes->LockNode(pdisk->NodeId);
+                for (auto vdisk : pdisk->VDisks)
+                    BSGroup(vdisk.GroupID).GroupChecker->LockVDisk(vdisk);
             } else if (HasVDisk(device)) {
                 auto vdisk = &VDiskRef(device);
-                ClusterNodes->LockNode(vdisk->NodeId);
+
+                BSGroup(vdisk->VDiskId.GroupID).GroupChecker->LockVDisk(vdisk->VDiskId);
             }
         }
         break;
@@ -824,8 +857,9 @@ ui64 TClusterInfo::AddTempLocks(const NKikimrCms::TAction &action, const TActorC
 
     LogManager.ApplyAction(action, this);
 
-    for (auto item : items)
+    for (auto item : items) {
         item->TempLocks.push_back({RollbackPoint, action});
+    }
 
     return items.size();
 }
@@ -840,6 +874,38 @@ ui64 TClusterInfo::ScheduleActions(const TRequestInfo &request, const TActorCont
             item->ScheduleLock({action, request.Owner, request.RequestId, request.Order});
 
         locks += items.size();
+
+        switch (action.GetType()) {
+            case NKikimrCms::TAction::RESTART_SERVICES:
+            case NKikimrCms::TAction::SHUTDOWN_HOST:
+                if (auto nodes = NodePtrs(action.GetHost(), MakeServices(action))) {
+                    for (const auto node : nodes) {
+                        for (auto& group : node->NodeGroups) {
+                            group->EmplaceTask(node->NodeId, 0, request.Order, request.RequestId);
+                        }
+                        for (auto &vdisk: node->VDisks) {
+                            BSGroup(vdisk.GroupID).GroupChecker->EmplaceTask(vdisk, 0, request.Order, request.RequestId);
+                        }
+                }
+            }
+            break;
+        case NKikimrCms::TAction::REPLACE_DEVICES:
+            for (const auto &device : action.GetDevices()) {
+                if (HasPDisk(device)) {
+                    auto pdisk = &PDisk(device);
+                    for (auto &vdisk: pdisk->VDisks) {
+                        BSGroup(vdisk.GroupID).GroupChecker->EmplaceTask(vdisk, 0, request.Order, request.RequestId);
+                    }
+                } else if (HasVDisk(device)) {
+                    auto vdisk = &VDisk(device);
+                    BSGroup(vdisk->VDiskId.GroupID).GroupChecker->EmplaceTask(vdisk->VDiskId, 0, request.Order, request.RequestId);
+                }
+            }
+            break;
+
+        default:
+            break;
+        }
     }
 
     return locks;
@@ -849,6 +915,20 @@ void TClusterInfo::UnscheduleActions(const TString &requestId)
 {
     for (auto &entry : LockableItems)
         entry.second->RemoveScheduledLocks(requestId);
+
+    for (auto &group : BSGroups) {
+        group.second.GroupChecker->RemoveTask(requestId);
+    }
+
+    ClusterNodes->RemoveTask(requestId);
+
+    for (auto& [_, tenantChecker] : TenantNodesChecker) {
+        tenantChecker->RemoveTask(requestId);
+    }
+
+    for (auto& [_, sysNodesCheckers] : SysNodesCheckers) {
+        sysNodesCheckers->RemoveTask(requestId);
+    }
 }
 
 void TClusterInfo::DeactivateScheduledLocks(ui64 order)
@@ -884,18 +964,6 @@ void TClusterInfo::MigrateOldInfo(TClusterInfoPtr old)
     }
 }
 
-void TClusterInfo::ApplySysTabletsInfo(const NKikimrConfig::TBootstrap& config) {
-    for (ui32 i = 0; i < config.TabletSize(); ++i) {
-        const auto &tablet = config.GetTablet(i);
-
-        for (ui32 j = 0; j < tablet.NodeSize(); ++j) {
-            ui32 nodeId = tablet.GetNode(j);
-            TabletTypeToNodes[tablet.GetType()].push_back(nodeId);
-            NodeToTabletTypes[nodeId].push_back(tablet.GetType());
-        }
-    }
-}
-
 void TClusterInfo::ApplyStateStorageInfo(TIntrusiveConstPtr<TStateStorageInfo> info) {
     StateStorageInfoReceived = true;
     for (ui32 ringId = 0; ringId < info->Rings.size(); ++ringId) {
@@ -920,9 +988,20 @@ void TClusterInfo::GenerateTenantNodesCheckers() {
     for (auto &[nodeId, nodeInfo] : Nodes) {
         if (nodeInfo->Tenant) {
             if (!TenantNodesChecker.contains(nodeInfo->Tenant))
-                TenantNodesChecker[nodeInfo->Tenant] = TSimpleSharedPtr<TNodesStateBase>(new TTenantState(nodeInfo->Tenant, 0, 0));
+                TenantNodesChecker[nodeInfo->Tenant] = TSimpleSharedPtr<TNodesLimitsCounterBase>(new TTenantLimitsCounter(nodeInfo->Tenant, 0, 0));
 
-            TenantNodesChecker[nodeInfo->Tenant]->UpdateNode(nodeId, nodeInfo->State);
+            nodeInfo->AddNodeGroup(TenantNodesChecker[nodeInfo->Tenant]);
+        }
+    }
+}
+
+void TClusterInfo::GenerateSysTabletsNodesCheckers() {
+    for (auto tablet : BootstrapConfig.GetTablet()) {
+        SysNodesCheckers[tablet.GetType()] = TSimpleSharedPtr<TSysTabletsNodesCounter>(new TSysTabletsNodesCounter(tablet.GetType()));
+
+        for (auto nodeId : tablet.GetNode()) {
+            NodeToTabletTypes[nodeId].push_back(tablet.GetType());
+            NodeRef(nodeId).AddNodeGroup(SysNodesCheckers[tablet.GetType()]);
         }
     }
 }
@@ -997,10 +1076,11 @@ void TOperationLogManager::ApplyAction(const NKikimrCms::TAction &action,
     case NKikimrCms::TAction::SHUTDOWN_HOST:
         if (auto nodes = clusterState->NodePtrs(action.GetHost(), MakeServices(action))) {
             for (const auto node : nodes) {
-                AddNodeLockOperation(node->NodeId, clusterState->ClusterNodes);
+                for (auto &nodeGroup: node->NodeGroups)
+                    AddNodeLockOperation(node->NodeId, nodeGroup);
 
-                if (node->Tenant) {
-                    AddNodeLockOperation(node->NodeId, clusterState->TenantNodesChecker[node->Tenant]);
+                for (auto& vdisk : node->VDisks) {
+                    AddLockVDiskOperation(vdisk, clusterState->BSGroup(vdisk.GroupID).GroupChecker);
                 }
             }
         }
@@ -1009,11 +1089,13 @@ void TOperationLogManager::ApplyAction(const NKikimrCms::TAction &action,
         for (const auto &device : action.GetDevices()) {
             if (clusterState->HasPDisk(device)) {
                 auto pdisk = &clusterState->PDisk(device);
-                AddNodeLockOperation(pdisk->NodeId, clusterState->ClusterNodes);
+                for (auto& vdisk : pdisk->VDisks) {
+                    AddLockVDiskOperation(vdisk, clusterState->BSGroup(vdisk.GroupID).GroupChecker);
+                }
 
             } else if (clusterState->HasVDisk(device)) {
                 auto vdisk = &clusterState->VDisk(device);
-                AddNodeLockOperation(vdisk->NodeId, clusterState->ClusterNodes);
+                AddLockVDiskOperation(vdisk->VDiskId, clusterState->BSGroup(vdisk->VDiskId.GroupID).GroupChecker);
             }
         }
         break;

@@ -19,15 +19,17 @@ public:
 
     struct TPrepareSettings {
         TMaybe<bool> DocumentApiRestricted;
+        TMaybe<bool> IsInternalCall;
 
         TString ToString() const {
-            return TStringBuilder() << "TPrepareSettings{ DocumentApiRestricted: " << DocumentApiRestricted << " }";
+            return TStringBuilder() << "TPrepareSettings{ DocumentApiRestricted: " << DocumentApiRestricted << " IsInternalCall: " << IsInternalCall << " }";
         }
     };
 
     struct TExecScriptSettings {
         NYql::TKikimrQueryDeadlines Deadlines;
         NYql::EKikimrStatsMode StatsMode = NYql::EKikimrStatsMode::None;
+        std::shared_ptr<NGRpcService::IRequestCtxMtSafe> RpcCtx;
     };
 
     virtual ~IKqpHost() {}
@@ -74,7 +76,7 @@ public:
 
 TIntrusivePtr<IKqpHost> CreateKqpHost(TIntrusivePtr<IKqpGateway> gateway,
     const TString& cluster, const TString& database, NYql::TKikimrConfiguration::TPtr config, NYql::IModuleResolver::TPtr moduleResolver,
-    NYql::IHTTPGateway::TPtr httpGateway, const NKikimr::NMiniKQL::IFunctionRegistry* funcRegistry = nullptr, bool keepConfigChanges = false);
+    NYql::IHTTPGateway::TPtr httpGateway, const NKikimr::NMiniKQL::IFunctionRegistry* funcRegistry = nullptr, bool keepConfigChanges = false, bool isInternalCall = false);
 
 } // namespace NKqp
 } // namespace NKikimr

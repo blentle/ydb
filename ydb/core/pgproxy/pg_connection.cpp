@@ -45,7 +45,6 @@ public:
         {"IntervalStyle", "postgres"},
         {"integer_datetimes", "on"},
     };
-    std::unordered_map<TString, TString> ClientParams;
     TSocketBuffer BufferOutput;
     TActorId DatabaseProxy;
     std::shared_ptr<TPGInitial> InitialMessage;
@@ -299,13 +298,20 @@ protected:
         SendStream(errorResponse);
     }
 
+    void BecomeReadyForQuery() {
+        SendReadyForQuery();
+        ++OutgoingSequenceNumber;
+        ReplayPostponedEvents();
+        FlushAndPoll();
+    }
+
     void FinishHandshake() {
         for (const auto& [name, value] : ServerParams) {
             SendParameterStatus(name, value);
         }
         SendReadyForQuery();
         ConnectionEstablished = true;
-        Send(DatabaseProxy, new TEvPGEvents::TEvConnectionOpened(std::move(InitialMessage)));
+        Send(DatabaseProxy, new TEvPGEvents::TEvConnectionOpened(std::move(InitialMessage), Address));
     }
 
     void HandleMessage(const TPGInitial* message) {
@@ -344,7 +350,7 @@ protected:
         }
         InitialMessage = MakePGMessageCopy(message);
         if (IsAuthRequired) {
-            Send(DatabaseProxy, new TEvPGEvents::TEvAuth(InitialMessage), 0, IncomingSequenceNumber++);
+            Send(DatabaseProxy, new TEvPGEvents::TEvAuth(InitialMessage, Address), 0, IncomingSequenceNumber++);
         } else {
             SendAuthOk();
             FinishHandshake();
@@ -353,21 +359,41 @@ protected:
 
     void HandleMessage(const TPGPasswordMessage* message) {
         PasswordWasSupplied = true;
-        Send(DatabaseProxy, new TEvPGEvents::TEvAuth(InitialMessage, MakePGMessageCopy(message)), 0, IncomingSequenceNumber++);
+        Send(DatabaseProxy, new TEvPGEvents::TEvAuth(InitialMessage, Address, MakePGMessageCopy(message)), 0, IncomingSequenceNumber++);
         return;
     }
 
+    inline static bool IsWhitespaceASCII(char c)
+    {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+    }
+
+    static bool IsWhitespace(TStringBuf query) {
+        for (char c : query) {
+            if (!IsWhitespaceASCII(c)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool IsQueryEmpty(TStringBuf query) {
+        return IsWhitespace(query);
+    }
+
     void HandleMessage(const TPGQuery* message) {
-        if (message->GetQuery().empty()) {
+        if (IsQueryEmpty(message->GetQuery())) {
             SendMessage(TPGEmptyQueryResponse());
+            BecomeReadyForQuery();
         } else {
             Send(DatabaseProxy, new TEvPGEvents::TEvQuery(MakePGMessageCopy(message)), 0, IncomingSequenceNumber++);
         }
     }
 
     void HandleMessage(const TPGParse* message) {
-        if (message->GetQueryData().Query.empty()) {
+        if (IsQueryEmpty(message->GetQueryData().Query)) {
             SendMessage(TPGEmptyQueryResponse());
+            BecomeReadyForQuery();
         } else {
             Send(DatabaseProxy, new TEvPGEvents::TEvParse(MakePGMessageCopy(message)), 0, IncomingSequenceNumber++);
         }
@@ -524,10 +550,7 @@ protected:
                 errorResponse << '\0';
                 SendStream(errorResponse);
             }
-            SendReadyForQuery();
-            ++OutgoingSequenceNumber;
-            ReplayPostponedEvents();
-            FlushAndPoll();
+            BecomeReadyForQuery();
         } else {
             PostponeEvent(ev);
         }
@@ -588,10 +611,7 @@ protected:
                 errorResponse << '\0';
                 SendStream(errorResponse);
             }
-            SendReadyForQuery();
-            ++OutgoingSequenceNumber;
-            ReplayPostponedEvents();
-            FlushAndPoll();
+            BecomeReadyForQuery();
         } else {
             PostponeEvent(ev);
         }
@@ -601,10 +621,7 @@ protected:
         if (IsEventExpected(ev)) {
             TPGStreamOutput<TPGParseComplete> parseComplete;
             SendStream(parseComplete);
-            SendReadyForQuery();
-            ++OutgoingSequenceNumber;
-            ReplayPostponedEvents();
-            FlushAndPoll();
+            BecomeReadyForQuery();
         } else {
             PostponeEvent(ev);
         }

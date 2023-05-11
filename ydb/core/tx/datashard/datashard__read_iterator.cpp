@@ -1,9 +1,10 @@
+#include "datashard_failpoints.h"
 #include "datashard_impl.h"
 #include "datashard_read_operation.h"
 #include "setup_sys_locks.h"
 #include "datashard_locks_db.h"
 
-#include <ydb/core/formats/arrow_batch_builder.h>
+#include <ydb/core/formats/arrow/arrow_batch_builder.h>
 
 #include <util/system/hp_timer.h>
 
@@ -19,7 +20,7 @@ constexpr ui64 MinRowsPerCheck = 1000;
 
 class TRowCountBlockBuilder : public IBlockBuilder {
 public:
-    bool Start(const TVector<std::pair<TString, NScheme::TTypeInfo>>&, ui64, ui64, TString&) override
+    bool Start(const std::vector<std::pair<TString, NScheme::TTypeInfo>>&, ui64, ui64, TString&) override
     {
         return true;
     }
@@ -46,7 +47,7 @@ private:
 class TCellBlockBuilder : public IBlockBuilder {
 public:
     bool Start(
-        const TVector<std::pair<TString, NScheme::TTypeInfo>>& columns,
+        const std::vector<std::pair<TString, NScheme::TTypeInfo>>& columns,
         ui64 maxRowsInBlock,
         ui64 maxBytesInBlock,
         TString& err) override
@@ -75,7 +76,7 @@ public:
     TVector<TOwnedCellVec> FlushBatch() { return std::move(Rows); }
 
 private:
-    TVector<std::pair<TString, NScheme::TTypeInfo>> Columns;
+    std::vector<std::pair<TString, NScheme::TTypeInfo>> Columns;
 
     TVector<TOwnedCellVec> Rows;
     ui64 BytesCount = 0;
@@ -1404,7 +1405,10 @@ public:
             << ", firstUnprocessed# " << state.FirstUnprocessedQuery);
 
         Reader->FillResult(*Result, state);
-        Self->SendImmediateReadResult(Sender, Result.release(), 0, state.SessionId);
+
+        if (!gSkipReadIteratorResultFailPoint.Check(Self->TabletID())) {
+            Self->SendImmediateReadResult(Sender, Result.release(), 0, state.SessionId);
+        }
     }
 
     void Complete(const TActorContext& ctx) override {

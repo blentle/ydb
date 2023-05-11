@@ -3,6 +3,7 @@
 #include "defs.h"
 #include "config.h"
 #include "downtime.h"
+#include "erasure_checkers.h"
 #include "node_checkers.h"
 #include "services.h"
 
@@ -12,7 +13,9 @@
 #include <ydb/core/mind/tenant_pool.h>
 #include <ydb/core/node_whiteboard/node_whiteboard.h>
 #include <ydb/core/protos/cms.pb.h>
+#include <ydb/core/protos/config.pb.h>
 #include <ydb/core/protos/console.pb.h>
+#include <ydb/public/api/protos/draft/ydb_maintenance.pb.h>
 
 #include <library/cpp/actors/core/actor.h>
 #include <library/cpp/actors/interconnect/interconnect.h>
@@ -317,6 +320,17 @@ public:
         return Sprintf("Host %s:%" PRIu16 " (%" PRIu32 ")", Host.data(), IcPort, NodeId);
     }
 
+    void AddNodeGroup(TSimpleSharedPtr<INodesChecker> group) {
+        NodeGroups.push_back(group);
+        group->UpdateNode(NodeId, State);
+    }
+
+    void UpdateNodeState() {
+        for (auto &group : NodeGroups) {
+            group->UpdateNode(NodeId, State);
+        }
+    }
+
     void MigrateOldInfo(const TLockableItem &old) override;
 
     ui32 NodeId = 0;
@@ -333,6 +347,8 @@ public:
     TString PreviousTenant;
     TServices Services;
     TInstant StartTime;
+
+    TVector<TSimpleSharedPtr<INodesChecker>> NodeGroups;
 };
 
 using TNodeInfoPtr = TIntrusivePtr<TNodeInfo>;
@@ -457,6 +473,8 @@ struct TBSGroupInfo {
     ui32 GroupId = 0;
     TErasureType Erasure;
     TSet<TVDiskID> VDisks;
+
+    TSimpleSharedPtr<IStorageGroupChecker> GroupChecker;
 };
 
 /**
@@ -561,10 +579,10 @@ public:
     const ui32 NodeId;
 
 private:
-    TSimpleSharedPtr<TNodesStateBase> NodesState;
+    TSimpleSharedPtr<INodesChecker> NodesState;
 
 public:
-    TLockNodeOperation(ui32 nodeId, TSimpleSharedPtr<TNodesStateBase> nodesState)
+    TLockNodeOperation(ui32 nodeId, TSimpleSharedPtr<INodesChecker> nodesState)
         : TOperationBase(OPERATION_TYPE_LOCK_NODE)
         , NodeId(nodeId)
         , NodesState(nodesState)
@@ -580,6 +598,32 @@ public:
     void Undo() override final {
         NodesState->UnlockNode(NodeId);
     }
+};
+
+class TLockDiskOperation : public TOperationBase {
+private:
+    TVDiskID VDiskId;
+
+private:
+    TSimpleSharedPtr<IStorageGroupChecker> StorageGroupChecker;
+
+public:
+    TLockDiskOperation(const TVDiskID& vdiskId, TSimpleSharedPtr<IStorageGroupChecker> checker)
+        : TOperationBase(OPERATION_TYPE_LOCK_DISK)
+        , VDiskId(vdiskId)
+        , StorageGroupChecker(checker)
+    {
+    }
+
+    void Do() override final {
+        StorageGroupChecker->LockVDisk(VDiskId);
+    }
+
+    void Undo() override final {
+        StorageGroupChecker->UnlockVDisk(VDiskId);
+    }
+
+
 };
 
 class TLogRollbackPoint : public TOperationBase {
@@ -606,18 +650,21 @@ public:
         Log.emplace_back(new TLogRollbackPoint());
     }
 
-    void AddNodeLockOperation(ui32 nodeId, TSimpleSharedPtr<TNodesStateBase> nodesState) {
+    void AddNodeLockOperation(ui32 nodeId, TSimpleSharedPtr<INodesChecker> nodesState) {
         Log.emplace_back(new TLockNodeOperation(nodeId, nodesState))->Do();
     }
 
-    void RollbackOperations() {
-        for (auto operation : Log) {
-            if (operation->Type == OPERATION_TYPE_ROLLBACK_POINT) {
-                Log.pop_back();
-                break;
-            }
+    void AddLockVDiskOperation(const TVDiskID& vdiskId, TSimpleSharedPtr<IStorageGroupChecker> checker) {
+        Log.emplace_back(new TLockDiskOperation(vdiskId, checker))->Do();
+    }
 
-            operation->Undo();
+    void RollbackOperations() {
+        while (!Log.empty() && Log.back()->Type != OPERATION_TYPE_ROLLBACK_POINT) {
+            Log.back()->Undo();
+            Log.pop_back();
+        }
+
+        if (!Log.empty() && Log.back()->Type == OPERATION_TYPE_ROLLBACK_POINT) {
             Log.pop_back();
         }
     }
@@ -642,12 +689,12 @@ public:
     using TVDisks = THashMap<TVDiskID, TVDiskInfoPtr>;
     using TBSGroups = THashMap<ui32, TBSGroupInfo>;
 
-    using TenantNodesCheckers = THashMap<TString, TSimpleSharedPtr<TNodesStateBase>>;
+    using TenantNodesCheckers = THashMap<TString, TSimpleSharedPtr<TNodesLimitsCounterBase>>;
 
     friend TOperationLogManager;
 
     TenantNodesCheckers TenantNodesChecker;
-    TSimpleSharedPtr<TClusterNodesState> ClusterNodes = MakeSimpleShared<TClusterNodesState>(0u, 0u);
+    TSimpleSharedPtr<TClusterLimitsCounter> ClusterNodes = MakeSimpleShared<TClusterLimitsCounter>(0u, 0u);
 
     TOperationLogManager LogManager;
     TOperationLogManager ScheduledLogManager;
@@ -666,6 +713,7 @@ public:
     void ApplyStateStorageInfo(TIntrusiveConstPtr<TStateStorageInfo> info);
 
     void GenerateTenantNodesCheckers();
+    void GenerateSysTabletsNodesCheckers();
 
     bool IsStateStorageReplicaNode(ui32 nodeId) {
         return StateStorageReplicas.contains(nodeId);
@@ -904,8 +952,6 @@ public:
     bool IsOutdated() const { return Outdated; }
     void SetOutdated(bool val) { Outdated = val; }
 
-    void ApplySysTabletsInfo(const NKikimrConfig::TBootstrap& config);
-
     static EGroupConfigurationType VDiskConfigurationType(const TVDiskID &vdId) {
         return TGroupID(vdId.GroupID).ConfigurationType();
     }
@@ -1010,8 +1056,10 @@ private:
 
 public:
     bool IsLocalBootConfDiffersFromConsole = false;
-    THashMap<NKikimrConfig::TBootstrap::ETabletType, TVector<ui32>> TabletTypeToNodes;
+    NKikimrConfig::TBootstrap BootstrapConfig;
     THashMap<ui32, TVector<NKikimrConfig::TBootstrap::ETabletType>> NodeToTabletTypes;
+
+    THashMap<NKikimrConfig::TBootstrap::ETabletType, TSimpleSharedPtr<TSysTabletsNodesCounter>> SysNodesCheckers;
 
     TIntrusiveConstPtr<TStateStorageInfo> StateStorageInfo;
     TVector<TStateStorageRingInfoPtr> StateStorageRings;

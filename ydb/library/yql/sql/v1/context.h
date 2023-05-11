@@ -164,7 +164,7 @@ namespace NSQLTranslationV1 {
         }
 
         bool IsAlreadyDeclared(const TString& varName) const;
-        void DeclareVariable(const TString& varName, const TNodePtr& typeNode);
+        void DeclareVariable(const TString& varName, const TNodePtr& typeNode, bool isWeak = false);
 
         bool AddExport(TPosition symbolPos, const TString& symbolName);
         TString AddImport(const TVector<TString>& modulePath);
@@ -215,6 +215,7 @@ namespace NSQLTranslationV1 {
 
     public:
         THashMap<TString, TNodePtr> Variables;
+        THashSet<TString> WeakVariables;
         NSQLTranslation::TTranslationSettings Settings;
         std::unique_ptr<TMemoryPool> Pool;
         NYql::TIssues& Issues;
@@ -272,7 +273,9 @@ namespace NSQLTranslationV1 {
         // see YQL-10265
         bool AnsiCurrentRow = false;
         TMaybe<bool> YsonCastToString;
-        THashMap<TString, TMaybe<std::pair<TString, TString>>> Libraries; // alias -> optional file with token
+        using TLiteralWithPosition = std::pair<TString, TPosition>;
+        using TLibraryStuff = std::tuple<TPosition, std::optional<TLiteralWithPosition>, std::optional<TLiteralWithPosition>>;
+        std::unordered_map<TString, TLibraryStuff> Libraries; // alias -> optional file with token
         THashMap<TString, ui32> PackageVersions;
         NYql::TWarningPolicy WarningPolicy;
         TString PqReadByRtmrCluster;

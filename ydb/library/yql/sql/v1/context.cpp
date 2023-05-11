@@ -86,7 +86,7 @@ TContext::TContext(const NSQLTranslation::TTranslationSettings& settings,
     , AnsiQuotedIdentifiers(settings.AnsiLexer)
 {
     for (auto lib : settings.Libraries) {
-        Libraries[lib] = Nothing();
+        Libraries.emplace(lib, TLibraryStuff());
     }
 
     Scoped = MakeIntrusive<TScopedState>();
@@ -299,12 +299,18 @@ TNodePtr TContext::UniversalAlias(const TString& baseName, TNodePtr&& node) {
 }
 
 bool TContext::IsAlreadyDeclared(const TString& varName) const {
-    return Variables.find(varName) != Variables.end();
+    return Variables.find(varName) != Variables.end() && !WeakVariables.contains(varName);
 }
 
-void TContext::DeclareVariable(const TString& varName, const TNodePtr& typeNode) {
-    auto inserted = Variables.emplace(varName, typeNode);
-    YQL_ENSURE(inserted.second);
+void TContext::DeclareVariable(const TString& varName, const TNodePtr& typeNode, bool isWeak) {
+    if (isWeak) {
+        auto inserted = Variables.emplace(varName, typeNode);
+        YQL_ENSURE(inserted.second);
+        WeakVariables.insert(varName);
+    } else {
+        WeakVariables.erase(WeakVariables.find(varName));
+        Variables[varName] = typeNode;
+    }
 }
 
 bool TContext::AddExport(TPosition pos, const TString& name) {

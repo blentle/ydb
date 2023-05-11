@@ -8,7 +8,7 @@
 #include <contrib/libs/apache/arrow/cpp/src/arrow/ipc/writer.h>
 
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor.h>
-#include <ydb/core/formats/ssa_runtime_version.h>
+#include <ydb/core/formats/arrow/ssa_runtime_version.h>
 #include <ydb/core/kqp/executer_actor/kqp_executer.h>
 #include <ydb/core/tx/datashard/datashard.h>
 #include <ydb/core/tx/datashard/datashard_ut_common_kqp.h>
@@ -1134,12 +1134,14 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         Cerr << result.QueryStats->query_plan() << Endl;
         Cerr << result.QueryStats->query_ast() << Endl;
 
-        node = FindPlanNodeByKv(plan, "Node Type", "Limit-TableFullScan");
+        node = FindPlanNodeByKv(plan, "Node Type", "TopSort-TableFullScan");
         UNIT_ASSERT(node.IsDefined());
         reverse = FindPlanNodeByKv(node, "Reverse", "false");
         UNIT_ASSERT(!reverse.IsDefined());
         pushedLimit = FindPlanNodeByKv(node, "ReadLimit", "4");
         UNIT_ASSERT(pushedLimit.IsDefined());
+        limit = FindPlanNodeByKv(node, "Limit", "4");
+        UNIT_ASSERT(limit.IsDefined());
 
         // Check that Reverse flag is set in query plan
         it = tableClient.StreamExecuteScanQuery(selectQueryWithSort, scanSettings).GetValueSync();
@@ -1151,7 +1153,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         Cerr << result.QueryStats->query_plan() << Endl;
         Cerr << result.QueryStats->query_ast() << Endl;
 
-        node = FindPlanNodeByKv(plan, "Node Type", "Limit-TableFullScan");
+        node = FindPlanNodeByKv(plan, "Node Type", "TopSort-TableFullScan");
         UNIT_ASSERT(node.IsDefined());
         reverse = FindPlanNodeByKv(node, "Reverse", "true");
         UNIT_ASSERT(reverse.IsDefined());
@@ -1232,7 +1234,8 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
                     (`timestamp` <= CAST(1001000 AS Timestamp) AND `timestamp` >= CAST(1000999 AS Timestamp)) OR
                     (`timestamp` > CAST(1002000 AS Timestamp))
-                ORDER BY `timestamp` DESC;
+                ORDER BY `timestamp` DESC
+                LIMIT 1000;
         )");
 
         auto rows = ExecuteScanQuery(tableClient, selectQuery);
@@ -1622,8 +1625,6 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
     }
 
     Y_UNIT_TEST(AggregationCountGroupByPushdown) {
-        // Should be fixed in KIKIMR-17007
-        return;
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false)
             .SetEnableOlapSchemaOperations(true);
@@ -1646,6 +1647,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         {
             TString query = R"(
                 --!syntax_v1
+                PRAGMA Kikimr.OptUseFinalizeByKey;
                 SELECT
                     level, COUNT(level)
                 FROM `/Root/olapStore/olapTable`
@@ -1661,7 +1663,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
             // Check plan
 #if SSA_RUNTIME_VERSION >= 2U
-            CheckPlanForAggregatePushdown(query, tableClient, { "WideCombiner" }, "TableFullScan");
+            CheckPlanForAggregatePushdown(query, tableClient, { "WideCombiner" }, "Aggregate-TableFullScan");
 //            CheckPlanForAggregatePushdown(query, tableClient, { "TKqpOlapAgg" }, "TableFullScan");
 #else
             CheckPlanForAggregatePushdown(query, tableClient, { "CombineCore" }, "");
@@ -1692,7 +1694,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         {
             TString query = fmt::format(R"(
                 --!syntax_v1
-                PRAGMA ydb.EnableLlvm = "{}";
+                PRAGMA ydb.UseLlvm = "{}";
 
                 SELECT
                     COUNT(*)
@@ -3943,6 +3945,12 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         settings.AppConfig.MutableColumnShardConfig()->MutableTablesStorageLayoutPolicy()->MutableIdentityGroups();
         Y_VERIFY(settings.AppConfig.GetColumnShardConfig().GetTablesStorageLayoutPolicy().HasIdentityGroups());
         TKikimrRunner kikimr(settings);
+        TLocalHelper(kikimr).CreateTestOlapTable("olapTable", "olapStore1", 20, 4);
+        UNIT_ASSERT(TExtLocalHelper(kikimr).TryCreateTable("olapStore1", "olapTable_1", 5));
+        UNIT_ASSERT(TExtLocalHelper(kikimr).TryCreateTable("olapStore1", "olapTable_2", 5));
+        UNIT_ASSERT(TExtLocalHelper(kikimr).TryCreateTable("olapStore1", "olapTable_3", 5));
+        UNIT_ASSERT(TExtLocalHelper(kikimr).TryCreateTable("olapStore1", "olapTable_4", 5));
+
         TLocalHelper(kikimr).CreateTestOlapTable("olapTable", "olapStore", 16, 4);
         UNIT_ASSERT(TExtLocalHelper(kikimr).TryCreateTable("olapStore", "olapTable_1", 4));
         UNIT_ASSERT(TExtLocalHelper(kikimr).TryCreateTable("olapStore", "olapTable_2", 4));
