@@ -4,6 +4,7 @@
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 
 namespace NKikimr::NColumnShard {
+namespace {
 
 class TReadActor : public TActorBootstrapped<TReadActor> {
 private:
@@ -64,13 +65,13 @@ public:
             WaitIndexed.erase(event.BlobRange);
             IndexedData.AddIndexed(event.BlobRange, event.Data);
         } else if (CommittedBlobs.contains(blobId)) {
-            auto cmt = WaitCommitted.extract(NOlap::TCommittedBlob{blobId, NOlap::TSnapshot::Zero()});
+            auto cmt = WaitCommitted.extract(NOlap::TCommittedBlob::BuildKeyBlob(blobId));
             if (cmt.empty()) {
                 return; // ignore duplicates
             }
             const NOlap::TCommittedBlob& cmtBlob = cmt.key();
             ui32 batchNo = cmt.mapped();
-            IndexedData.AddNotIndexed(batchNo, event.Data, cmtBlob.GetSnapshot());
+            IndexedData.AddNotIndexed(batchNo, event.Data, cmtBlob);
         } else {
             LOG_S_ERROR("TEvReadBlobRangeResult returned unexpected blob at tablet "
                 << TabletId << " (read)");
@@ -180,12 +181,12 @@ public:
 
         // Add cached batches without read
         for (auto& [blobId, batch] : ReadMetadata->CommittedBatches) {
-            auto cmt = WaitCommitted.extract(NOlap::TCommittedBlob{blobId, NOlap::TSnapshot::Zero()});
+            auto cmt = WaitCommitted.extract(NOlap::TCommittedBlob::BuildKeyBlob(blobId));
             Y_VERIFY(!cmt.empty());
 
             const NOlap::TCommittedBlob& cmtBlob = cmt.key();
             ui32 batchNo = cmt.mapped();
-            IndexedData.AddNotIndexed(batchNo, batch, cmtBlob.GetSnapshot());
+            IndexedData.AddNotIndexed(batchNo, batch, cmtBlob);
         }
 
         LOG_S_DEBUG("Starting read (" << WaitIndexed.size() << " indexed, "
@@ -285,6 +286,8 @@ private:
         return NArrow::SerializeSchema(*batch->schema());
     }
 };
+
+} // namespace
 
 IActor* CreateReadActor(ui64 tabletId,
                         const TActorId& dstActor,

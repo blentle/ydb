@@ -13,7 +13,9 @@
 #include <ydb/core/protos/tx_datashard.pb.h>
 #include <ydb/core/tablet_flat/flat_row_versions.h>
 
+#include <library/cpp/lwtrace/shuttle.h>
 #include <library/cpp/time_provider/time_provider.h>
+#include <library/cpp/containers/absl_flat_hash/flat_hash_set.h>
 
 namespace arrow {
 
@@ -489,6 +491,9 @@ struct TEvDataShard {
         TStringBuf GetTxBody() const {
             return Record.GetTxBody();
         }
+
+        // Orbit used for tracking request events
+        NLWTrace::TOrbit Orbit;
     };
 
     struct TEvCancelTransactionProposal : public TEventPB<TEvCancelTransactionProposal, NKikimrTxDataShard::TEvCancelTransactionProposal, TEvDataShard::EvCancelTransactionProposal> {
@@ -661,6 +666,10 @@ struct TEvDataShard {
     private:
         bool ForceOnline = false;
         bool ForceDirty = false;
+
+    public:
+        // Orbit used for tracking request events
+        NLWTrace::TOrbit Orbit;
     };
 
     struct TEvProposeTransactionRestart : public TEventPB<TEvProposeTransactionRestart, NKikimrTxDataShard::TEvProposeTransactionRestart, TEvDataShard::EvProposeTransactionRestart> {
@@ -911,6 +920,9 @@ struct TEvDataShard {
 
         // True when TEvRead is cancelled while enqueued in a waiting queue
         bool Cancelled = false;
+
+        // Orbit used for tracking request events
+        NLWTrace::TOrbit Orbit;
     };
 
     struct TEvReadResult : public TEventPB<TEvReadResult,
@@ -1597,9 +1609,9 @@ struct TEvDataShard {
 
     struct TEvGetOpenTxsResult : public TEventLocal<TEvGetOpenTxsResult, EvGetOpenTxsResult> {
         TPathId PathId;
-        TVector<ui64> OpenTxs;
+        absl::flat_hash_set<ui64> OpenTxs;
 
-        TEvGetOpenTxsResult(const TPathId& pathId, TVector<ui64> openTxs)
+        TEvGetOpenTxsResult(const TPathId& pathId, absl::flat_hash_set<ui64> openTxs)
             : PathId(pathId)
             , OpenTxs(std::move(openTxs))
         { }

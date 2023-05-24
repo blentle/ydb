@@ -1528,6 +1528,43 @@ private:
     bool MultiDims = false;
 };
 
+template <bool PassByValue, bool IsCString>
+class TPgClone : public TMutableComputationNode<TPgClone<PassByValue, IsCString>> {
+    typedef TMutableComputationNode<TPgClone<PassByValue, IsCString>> TBaseComputation;
+public:
+    TPgClone(TComputationMutables& mutables, IComputationNode* input, TComputationNodePtrVector&& dependentNodes)
+        : TBaseComputation(mutables)
+        , Input(input)
+        , DependentNodes(std::move(dependentNodes))
+    {
+    }
+
+    NUdf::TUnboxedValuePod DoCalculate(TComputationContext& compCtx) const {
+        auto value = Input->GetValue(compCtx);
+        if constexpr (PassByValue) {
+            return value.Release();
+        }
+
+        auto datum = PointerDatumFromPod(value);
+        if constexpr (IsCString) {
+            return PointerDatumToPod((Datum)MakeCString(TStringBuf((const char*)datum)));
+        } else {
+            return PointerDatumToPod((Datum)MakeVar(GetVarBuf((const text*)datum)));
+        }
+    }
+
+private:
+    void RegisterDependencies() const final {
+        this->DependsOn(Input);
+        for (auto arg : DependentNodes) {
+            this->DependsOn(arg);
+        }
+    }
+
+    IComputationNode* const Input;
+    TComputationNodePtrVector DependentNodes;
+};
+
 struct TFromPgExec {
     TFromPgExec(ui32 sourceId)
         : SourceId(sourceId)
@@ -1902,7 +1939,7 @@ TComputationNodeFactory GetPgFactory() {
                 auto execFunc = FindExec(id);
                 YQL_ENSURE(execFunc);
                 auto kernel = MakePgKernel(argTypes, returnType, execFunc, id);
-                return new TBlockFuncNode(ctx.Mutables, std::move(argNodes), argTypes, *kernel, kernel);
+                return new TBlockFuncNode(ctx.Mutables, callable.GetType()->GetName(), std::move(argNodes), argTypes, *kernel, kernel);
             }
 
             if (name == "PgCast") {
@@ -1958,7 +1995,7 @@ TComputationNodeFactory GetPgFactory() {
                 auto returnType = callable.GetType()->GetReturnType();
                 ui32 sourceId = AS_TYPE(TPgType, AS_TYPE(TBlockType, inputType)->GetItemType())->GetTypeId();
                 auto kernel = MakeFromPgKernel(inputType, returnType, sourceId);
-                return new TBlockFuncNode(ctx.Mutables, { arg }, { inputType }, *kernel, kernel);
+                return new TBlockFuncNode(ctx.Mutables, callable.GetType()->GetName(), { arg }, { inputType }, *kernel, kernel);
             }
 
             if (name == "ToPg") {
@@ -1993,7 +2030,7 @@ TComputationNodeFactory GetPgFactory() {
                 auto returnType = callable.GetType()->GetReturnType();
                 auto targetId = AS_TYPE(TPgType, AS_TYPE(TBlockType, returnType)->GetItemType())->GetTypeId();
                 auto kernel = MakeToPgKernel(inputType, returnType, targetId);
-                return new TBlockFuncNode(ctx.Mutables, { arg }, { inputType }, *kernel, kernel);
+                return new TBlockFuncNode(ctx.Mutables, callable.GetType()->GetName(), { arg }, { inputType }, *kernel, kernel);
             }
 
             if (name == "PgArray") {
@@ -2007,6 +2044,25 @@ TComputationNodeFactory GetPgFactory() {
                 auto returnType = callable.GetType()->GetReturnType();
                 auto arrayTypeId = AS_TYPE(TPgType, returnType)->GetTypeId();
                 return new TPgArray(ctx.Mutables, std::move(argNodes), std::move(argTypes), arrayTypeId);
+            }
+
+            if (name == "PgClone") {
+                auto input = LocateNode(ctx.NodeLocator, callable, 0);
+                TComputationNodePtrVector dependentNodes;
+                for (ui32 i = 1; i < callable.GetInputsCount(); ++i) {
+                    dependentNodes.emplace_back(LocateNode(ctx.NodeLocator, callable, i));
+                }
+
+                auto returnType = callable.GetType()->GetReturnType();
+                auto typeId = AS_TYPE(TPgType, returnType)->GetTypeId();
+                const auto& desc = NPg::LookupType(typeId);
+                if (desc.PassByValue) {
+                    return new TPgClone<true, false>(ctx.Mutables, input, std::move(dependentNodes));
+                } else if (desc.TypeLen == -1) {
+                    return new TPgClone<false, false>(ctx.Mutables, input, std::move(dependentNodes));
+                } else {
+                    return new TPgClone<false, true>(ctx.Mutables, input, std::move(dependentNodes));
+                }
             }
 
             return nullptr;

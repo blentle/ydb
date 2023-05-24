@@ -31,21 +31,26 @@ struct TCompactionLimits {
     ui32 InGranuleCompactSeconds{2 * 60}; // Trigger in-granule comcation to guarantee no PK intersections
 };
 
-struct TMark {
-    /// @note It's possible to share columns in TReplaceKey between multiple marks:
-    /// read all marks as a batch; create TMark for each row
-    NArrow::TReplaceKey Border;
+class TMark {
+public:
+    struct TCompare {
+        using is_transparent = void;
+
+        bool operator() (const TMark& a, const TMark& b) const {
+            return a < b;
+        }
+
+        bool operator() (const arrow::Scalar& a, const TMark& b) const {
+            return a < b;
+        }
+
+        bool operator() (const TMark& a, const arrow::Scalar& b) const {
+            return a < b;
+        }
+    };
 
     explicit TMark(const NArrow::TReplaceKey& key)
         : Border(key)
-    {}
-
-    explicit TMark(const std::shared_ptr<arrow::Schema>& schema)
-        : Border(MinBorder(schema))
-    {}
-
-    TMark(const TString& key, const std::shared_ptr<arrow::Schema>& schema)
-        : Border(Deserialize(key, schema))
     {}
 
     TMark(const TMark& m) = default;
@@ -59,6 +64,27 @@ struct TMark {
         return Border <=> m.Border;
     }
 
+    bool operator == (const arrow::Scalar& firstKey) const {
+        // TODO: avoid ToScalar()
+        return NArrow::ScalarCompare(*NArrow::TReplaceKey::ToScalar(Border, 0), firstKey) == 0;
+    }
+
+    std::partial_ordering operator <=> (const arrow::Scalar& firstKey) const {
+        // TODO: avoid ToScalar()
+        const int cmp = NArrow::ScalarCompare(*NArrow::TReplaceKey::ToScalar(Border, 0), firstKey);
+        if (cmp < 0) {
+            return std::partial_ordering::less;
+        } else if (cmp > 0) {
+            return std::partial_ordering::greater;
+        } else {
+            return std::partial_ordering::equivalent;
+        }
+    }
+
+    const NArrow::TReplaceKey& GetBorder() const noexcept {
+        return Border;
+    }
+
     ui64 Hash() const {
         return Border.Hash();
     }
@@ -69,13 +95,22 @@ struct TMark {
 
     operator bool () const = delete;
 
-    static TString Serialize(const NArrow::TReplaceKey& key, const std::shared_ptr<arrow::Schema>& schema);
-    static NArrow::TReplaceKey Deserialize(const TString& key, const std::shared_ptr<arrow::Schema>& schema);
+    static TString SerializeScalar(const NArrow::TReplaceKey& key, const std::shared_ptr<arrow::Schema>& schema);
+    static NArrow::TReplaceKey DeserializeScalar(const TString& key, const std::shared_ptr<arrow::Schema>& schema);
+
+    static TString SerializeComposite(const NArrow::TReplaceKey& key, const std::shared_ptr<arrow::Schema>& schema);
+    static NArrow::TReplaceKey DeserializeComposite(const TString& key, const std::shared_ptr<arrow::Schema>& schema);
+
+    static NArrow::TReplaceKey MinBorder(const std::shared_ptr<arrow::Schema>& schema);
+
     std::string ToString() const;
 
 private:
+    /// @note It's possible to share columns in TReplaceKey between multiple marks:
+    /// read all marks as a batch; create TMark for each row
+    NArrow::TReplaceKey Border;
+
     static std::shared_ptr<arrow::Scalar> MinScalar(const std::shared_ptr<arrow::DataType>& type);
-    static NArrow::TReplaceKey MinBorder(const std::shared_ptr<arrow::Schema>& schema);
 };
 
 struct TCompactionInfo {
@@ -121,8 +156,9 @@ public:
 
     virtual ~TColumnEngineChanges() = default;
 
-    explicit TColumnEngineChanges(EType type)
+    TColumnEngineChanges(const EType type, const TCompactionLimits& limits)
         : Type(type)
+        , Limits(limits)
     {}
 
     void SetBlobs(THashMap<TBlobRange, TString>&& blobs) {
@@ -130,10 +166,9 @@ public:
         Blobs = std::move(blobs);
     }
 
-    EType Type{UNSPECIFIED};
+    EType Type;
     TCompactionLimits Limits;
     TSnapshot InitSnapshot = TSnapshot::Zero();
-    TSnapshot ApplySnapshot = TSnapshot::Zero();
     std::unique_ptr<TCompactionInfo> CompactionInfo;
     std::vector<NOlap::TInsertedData> DataToIndex;
     std::vector<TPortionInfo> SwitchedPortions; // Portions that would be replaced by new ones
@@ -158,7 +193,9 @@ public:
             case INSERT:
                 return "insert";
             case COMPACTION:
-                return "compaction";
+                return CompactionInfo
+                    ? (CompactionInfo->InGranule ? "compaction in granule" : "compaction split granule" )
+                    : "compaction";
             case CLEANUP:
                 return "cleanup";
             case TTL:
@@ -337,19 +374,17 @@ struct TColumnEngineStats {
 
 class TVersionedIndex {
     std::map<TSnapshot, ISnapshotSchema::TPtr> Snapshots;
+    std::shared_ptr<arrow::Schema> IndexKey;
 public:
     ISnapshotSchema::TPtr GetSchema(const TSnapshot& version) const {
-        Y_UNUSED(version);
-        return GetLastSchema();
-        /*
-            for (auto it = Snapshots.rbegin(); it != Snapshots.rend(); ++it) {
-                if (it->first <= version) {
-                    return it->second;
-                }
+        for (auto it = Snapshots.rbegin(); it != Snapshots.rend(); ++it) {
+            if (it->first <= version) {
+                return it->second;
             }
-            Y_VERIFY(false);
-            return nullptr;
-        */
+        }
+        Y_VERIFY(!Snapshots.empty());
+        Y_VERIFY(version.IsZero());
+        return Snapshots.begin()->second; // For old compaction logic compatibility
     }
 
     ISnapshotSchema::TPtr GetLastSchema() const {
@@ -357,7 +392,16 @@ public:
         return Snapshots.rbegin()->second;
     }
 
+    const std::shared_ptr<arrow::Schema>& GetIndexKey() const noexcept {
+        return IndexKey;
+    }
+
     void AddIndex(const TSnapshot& version, TIndexInfo&& indexInfo) {
+        if (Snapshots.empty()) {
+            IndexKey = indexInfo.GetIndexKey();
+        } else {
+            Y_VERIFY(IndexKey->Equals(indexInfo.GetIndexKey()));
+        }
         Snapshots.emplace(version, std::make_shared<TSnapshotSchema>(std::move(indexInfo), version));
     }
 };
@@ -383,11 +427,11 @@ public:
     virtual std::shared_ptr<TSelectInfo> Select(ui64 pathId, TSnapshot snapshot,
                                                 const THashSet<ui32>& columnIds,
                                                 const TPKRangesFilter& pkRangesFilter) const = 0;
-    virtual std::unique_ptr<TCompactionInfo> Compact(ui64& lastCompactedGranule) = 0;
-    virtual std::shared_ptr<TColumnEngineChanges> StartInsert(std::vector<TInsertedData>&& dataToIndex) = 0;
+    virtual std::unique_ptr<TCompactionInfo> Compact(const TCompactionLimits& limits, ui64& lastCompactedGranule) = 0;
+    virtual std::shared_ptr<TColumnEngineChanges> StartInsert(const TCompactionLimits& limits, std::vector<TInsertedData>&& dataToIndex) = 0;
     virtual std::shared_ptr<TColumnEngineChanges> StartCompaction(std::unique_ptr<TCompactionInfo>&& compactionInfo,
-                                                                  const TSnapshot& outdatedSnapshot) = 0;
-    virtual std::shared_ptr<TColumnEngineChanges> StartCleanup(const TSnapshot& snapshot, THashSet<ui64>& pathsToDrop,
+                                                                  const TSnapshot& outdatedSnapshot, const TCompactionLimits& limits) = 0;
+    virtual std::shared_ptr<TColumnEngineChanges> StartCleanup(const TSnapshot& snapshot, const TCompactionLimits& limits, THashSet<ui64>& pathsToDrop,
                                                                ui32 maxRecords) = 0;
     virtual std::shared_ptr<TColumnEngineChanges> StartTtl(const THashMap<ui64, TTiering>& pathEviction, const std::shared_ptr<arrow::Schema>& schema,
                                                            ui64 maxBytesToEvict = TCompactionLimits::DEFAULT_EVICTION_BYTES) = 0;
@@ -395,7 +439,6 @@ public:
     virtual void FreeLocks(std::shared_ptr<TColumnEngineChanges> changes) = 0;
     virtual void UpdateDefaultSchema(const TSnapshot& snapshot, TIndexInfo&& info) = 0;
     //virtual void UpdateTableSchema(ui64 pathId, const TSnapshot& snapshot, TIndexInfo&& info) = 0; // TODO
-    virtual void UpdateCompactionLimits(const TCompactionLimits& limits) = 0;
     virtual const TMap<ui64, std::shared_ptr<TColumnEngineStats>>& GetStats() const = 0;
     virtual const TColumnEngineStats& GetTotalStats() = 0;
     virtual ui64 MemoryUsage() const { return 0; }

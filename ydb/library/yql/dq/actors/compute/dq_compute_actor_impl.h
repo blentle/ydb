@@ -184,7 +184,7 @@ protected:
         , Task(std::move(task))
         , RuntimeSettings(settings)
         , MemoryLimits(memoryLimits)
-        , CanAllocateExtraMemory(RuntimeSettings.ExtraMemoryAllocationPool != 0 && MemoryLimits.AllocateMemoryFn)
+        , CanAllocateExtraMemory(RuntimeSettings.ExtraMemoryAllocationPool != 0)
         , AsyncIoFactory(std::move(asyncIoFactory))
         , FunctionRegistry(functionRegistry)
         , CheckpointingMode(GetTaskCheckpointingMode(Task))
@@ -218,7 +218,7 @@ protected:
         , Task(task)
         , RuntimeSettings(settings)
         , MemoryLimits(memoryLimits)
-        , CanAllocateExtraMemory(RuntimeSettings.ExtraMemoryAllocationPool != 0 && MemoryLimits.AllocateMemoryFn)
+        , CanAllocateExtraMemory(RuntimeSettings.ExtraMemoryAllocationPool != 0)
         , AsyncIoFactory(std::move(asyncIoFactory))
         , FunctionRegistry(functionRegistry)
         , State(Task.GetCreateSuspended() ? NDqProto::COMPUTE_STATE_UNKNOWN : NDqProto::COMPUTE_STATE_EXECUTING)
@@ -323,22 +323,29 @@ protected:
     }
 
     void DoExecute() {
-        auto guard = BindAllocator();
-        auto* alloc = guard.GetMutex();
+        {
+            auto guard = BindAllocator();
+            auto* alloc = guard.GetMutex();
 
-        if (State == NDqProto::COMPUTE_STATE_FINISHED) {
-            if (!DoHandleChannelsAfterFinishImpl()) {
-                return;
+            if (State == NDqProto::COMPUTE_STATE_FINISHED) {
+                if (!DoHandleChannelsAfterFinishImpl()) {
+                    return;
+                }
+            } else {
+                DoExecuteImpl();
             }
-        } else {
-            DoExecuteImpl();
-        }
 
-        if (MemoryQuota) {
-            MemoryQuota->TryShrinkMemory(alloc);
-        }
+            if (MemoryQuota) {
+                MemoryQuota->TryShrinkMemory(alloc);
+            }
 
-        ReportStats(TInstant::Now());
+            ReportStats(TInstant::Now());
+        }
+        if (Terminated) {
+            TaskRunner.Reset();
+            MemoryQuota.Reset();
+            MemoryLimits.MemoryQuotaManager.reset();
+        }
     }
 
     virtual void DoExecuteImpl() {
@@ -545,10 +552,6 @@ protected:
                 }
             }
 
-            if (RuntimeSettings.TerminateHandler) {
-                RuntimeSettings.TerminateHandler(success, issues);
-            }
-
             {
                 if (guard) {
                     // free MKQL memory then destroy TaskRunner and Allocator
@@ -564,8 +567,12 @@ protected:
             }
         }
 
+        if (RuntimeSettings.TerminateHandler) {
+            RuntimeSettings.TerminateHandler(success, issues);
+        }
+
         this->PassAway();
-        MemoryQuota = nullptr;
+        Terminated = true;
     }
 
     void Terminate(bool success, const TString& message) {
@@ -1468,7 +1475,8 @@ protected:
         TaskRunner = taskRunner;
     }
 
-    void PrepareTaskRunner(const IDqTaskRunnerExecutionContext& execCtx = TDqTaskRunnerExecutionContext()) {
+    void PrepareTaskRunner(const IDqTaskRunnerExecutionContext& execCtx = TDqTaskRunnerExecutionContext(),
+        const TDqTaskRunnerParameterProvider& parameterProvider = {}) {
         YQL_ENSURE(TaskRunner);
 
         auto guard = TaskRunner->BindAllocator(MemoryQuota->GetMkqlMemoryLimit());
@@ -1480,7 +1488,7 @@ protected:
         limits.ChannelBufferSize = MemoryLimits.ChannelBufferSize;
         limits.OutputChunkMaxSize = GetDqExecutionSettings().FlowControl.MaxOutputChunkSize;
 
-        TaskRunner->Prepare(Task, limits, execCtx);
+        TaskRunner->Prepare(Task, limits, execCtx, parameterProvider);
 
         FillIoMaps(
             TaskRunner->GetHolderFactory(),
@@ -2094,7 +2102,7 @@ protected:
     const NDqProto::TDqTask Task;
     TString LogPrefix;
     const TComputeRuntimeSettings RuntimeSettings;
-    const TComputeMemoryLimits MemoryLimits;
+    TComputeMemoryLimits MemoryLimits;
     const bool CanAllocateExtraMemory = false;
     const IDqAsyncIoFactory::TPtr AsyncIoFactory;
     const NKikimr::NMiniKQL::IFunctionRegistry* FunctionRegistry = nullptr;
@@ -2137,6 +2145,7 @@ private:
     bool Running = true;
     TInstant LastSendStatsTime;
     bool PassExceptions = false;
+    bool Terminated = false;
 protected:
     ::NMonitoring::TDynamicCounters::TCounterPtr MkqlMemoryQuota;
     ::NMonitoring::TDynamicCounters::TCounterPtr OutputChannelSize;

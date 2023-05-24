@@ -610,7 +610,7 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
         {"Now", &TProgramBuilder::Now},
         {"CurrentUtcDate", &TProgramBuilder::CurrentUtcDate},
         {"CurrentUtcDatetime", &TProgramBuilder::CurrentUtcDatetime},
-        {"CurrentUtcTimestamp", &TProgramBuilder::CurrentUtcTimestamp}
+        {"CurrentUtcTimestamp", &TProgramBuilder::CurrentUtcTimestamp},
     });
 
     AddSimpleCallables({
@@ -2501,6 +2501,24 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
         auto input = MkqlBuildExpr(*node.Child(0), ctx);
         auto returnType = BuildType(node, *node.GetTypeAnn(), ctx.ProgramBuilder);
         return ctx.ProgramBuilder.BlockToPg(input, returnType);
+    });
+
+    AddCallable("PgClone", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        auto input = MkqlBuildExpr(*node.Child(0), ctx);
+        if (IsNull(node.Head())) {
+            return input;
+        }
+
+        if (NPg::LookupType(node.GetTypeAnn()->Cast<TPgExprType>()->GetId()).PassByValue) {
+            return input;
+        }
+
+        TVector<TRuntimeNode> dependentNodes;
+        for (ui32 i = 1; i < node.ChildrenSize(); ++i) {
+            dependentNodes.push_back(MkqlBuildExpr(*node.Child(i), ctx));
+        }
+        
+        return ctx.ProgramBuilder.PgClone(input, dependentNodes);
     });
 
     AddCallable("WithContext", [](const TExprNode& node, TMkqlBuildContext& ctx) {

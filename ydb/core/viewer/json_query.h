@@ -192,7 +192,7 @@ private:
             case NYdb::EPrimitiveType::DyNumber:
                 return valueParser.GetDyNumber();
             case NYdb::EPrimitiveType::Uuid:
-                return "<uuid not implemented>";
+                return valueParser.GetUuid().ToString();
         }
     }
 
@@ -218,6 +218,9 @@ private:
             case NYdb::TTypeParser::ETypeKind::Tagged:
                 valueParser.OpenTagged();
                 return ColumnValueToJsonValue(valueParser);
+
+            case NYdb::TTypeParser::ETypeKind::Pg:
+                return valueParser.GetPg().Content_;
 
             default:
                 return NJson::JSON_UNDEFINED;

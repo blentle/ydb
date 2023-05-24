@@ -2804,6 +2804,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 auto mode = rowset.GetValue<Schema::CdcStream::Mode>();
                 auto format = rowset.GetValue<Schema::CdcStream::Format>();
                 auto vt = rowset.GetValueOrDefault<Schema::CdcStream::VirtualTimestamps>(false);
+                auto awsRegion = rowset.GetValue<Schema::CdcStream::AwsRegion>();
                 auto state = rowset.GetValue<Schema::CdcStream::State>();
 
                 Y_VERIFY_S(Self->PathsById.contains(pathId), "Path doesn't exist, pathId: " << pathId);
@@ -2814,7 +2815,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                     << ", path type: " << NKikimrSchemeOp::EPathType_Name(path->PathType));
 
                 Y_VERIFY(!Self->CdcStreams.contains(pathId));
-                Self->CdcStreams[pathId] = new TCdcStreamInfo(alterVersion, mode, format, vt, state);
+                Self->CdcStreams[pathId] = new TCdcStreamInfo(alterVersion, mode, format, vt, awsRegion, state);
                 Self->IncrementPathDbRefCount(pathId);
 
                 if (state == NKikimrSchemeOp::ECdcStreamStateScan) {
@@ -2847,6 +2848,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 auto mode = rowset.GetValue<Schema::CdcStreamAlterData::Mode>();
                 auto format = rowset.GetValue<Schema::CdcStreamAlterData::Format>();
                 auto vt = rowset.GetValueOrDefault<Schema::CdcStreamAlterData::VirtualTimestamps>(false);
+                auto awsRegion = rowset.GetValue<Schema::CdcStreamAlterData::AwsRegion>();
                 auto state = rowset.GetValue<Schema::CdcStreamAlterData::State>();
 
                 Y_VERIFY_S(Self->PathsById.contains(pathId), "Path doesn't exist, pathId: " << pathId);
@@ -2858,14 +2860,14 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
 
                 if (!Self->CdcStreams.contains(pathId)) {
                     Y_VERIFY(alterVersion == 1);
-                    Self->CdcStreams[pathId] = TCdcStreamInfo::New(mode, format, vt);
+                    Self->CdcStreams[pathId] = TCdcStreamInfo::New(mode, format, vt, awsRegion);
                     Self->IncrementPathDbRefCount(pathId);
                 }
 
                 auto stream = Self->CdcStreams.at(pathId);
                 Y_VERIFY(stream->AlterData == nullptr);
                 Y_VERIFY(stream->AlterVersion < alterVersion);
-                stream->AlterData = new TCdcStreamInfo(alterVersion, mode, format, vt, state);
+                stream->AlterData = new TCdcStreamInfo(alterVersion, mode, format, vt, awsRegion, state);
 
                 Y_VERIFY_S(Self->PathsById.contains(path->ParentPathId), "Parent path is not found"
                     << ", cdc stream pathId: " << pathId
@@ -4444,7 +4446,9 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 NKikimrSchemeOp::TColumnStoreSharding sharding;
                 Y_VERIFY(sharding.ParseFromString(rowset.GetValue<Schema::OlapStores::Sharding>()));
 
-                Self->OlapStores[pathId] = new TOlapStoreInfo(alterVersion, std::move(description), std::move(sharding));
+                TOlapStoreInfo::TPtr storeInfo = new TOlapStoreInfo(alterVersion, std::move(sharding));
+                storeInfo->ParseFromLocalDB(description);
+                Self->OlapStores[pathId] = storeInfo;
                 Self->IncrementPathDbRefCount(pathId);
                 Self->SetPartitioning(pathId, Self->OlapStores[pathId]);
 
@@ -4476,7 +4480,9 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 Y_VERIFY_S(Self->OlapStores.contains(pathId),
                     "Cannot load alter for olap store " << pathId);
 
-                Self->OlapStores[pathId]->AlterData = new TOlapStoreInfo(alterVersion, std::move(description), std::move(sharding), std::move(alterBody));
+                TOlapStoreInfo::TPtr storeInfo = new TOlapStoreInfo(alterVersion, std::move(sharding), std::move(alterBody));
+                storeInfo->ParseFromLocalDB(description);
+                Self->OlapStores[pathId]->AlterData = storeInfo;
 
                 if (!rowset.Next()) {
                     return false;

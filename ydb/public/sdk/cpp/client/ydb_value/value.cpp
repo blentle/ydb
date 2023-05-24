@@ -5,7 +5,6 @@
 #undef INCLUDE_YDB_INTERNAL_H
 
 #include <ydb/public/sdk/cpp/client/ydb_params/params.h>
-#include <ydb/public/sdk/cpp/client/ydb_proto/accessor.h>
 #include <ydb/public/sdk/cpp/client/ydb_types/fatal_error_handlers/handlers.h>
 
 #include <ydb/public/api/protos/ydb_value.pb.h>
@@ -70,7 +69,7 @@ static TTypeParser::ETypeKind GetKind(const Ydb::Type& type) {
 }
 
 bool TypesEqual(const TType& t1, const TType& t2) {
-    return TypesEqual(TProtoAccessor::GetProto(t1), TProtoAccessor::GetProto(t2));
+    return TypesEqual(t1.GetProto(), t2.GetProto());
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -123,7 +122,7 @@ public:
 
     void Reset() {
         Path_.clear();
-        Path_.emplace_back(TProtoPosition{&TProtoAccessor::GetProto(Type_), -1});
+        Path_.emplace_back(TProtoPosition{&Type_.GetProto(), -1});
     }
 
     ETypeKind GetKind(ui32 offset = 0) const {
@@ -562,6 +561,10 @@ void FormatTypeInternal(TTypeParser& parser, IOutputStream& out) {
             out << "Void"sv;
             break;
 
+        case TTypeParser::ETypeKind::Null:
+            out << "Null"sv;
+            break;
+
         default:
             ThrowFatalError(TStringBuilder()
                 << "Unexpected type kind: " << parser.GetKind());
@@ -626,7 +629,7 @@ public:
     }
 
     void Optional(const TType& itemType) {
-        GetProto().mutable_optional_type()->mutable_item()->CopyFrom(TProtoAccessor::GetProto(itemType));
+        GetProto().mutable_optional_type()->mutable_item()->CopyFrom(itemType.GetProto());
     }
 
     void BeginList() {
@@ -638,7 +641,7 @@ public:
     }
 
     void List(const TType& itemType) {
-        GetProto().mutable_list_type()->mutable_item()->CopyFrom(TProtoAccessor::GetProto(itemType));
+        GetProto().mutable_list_type()->mutable_item()->CopyFrom(itemType.GetProto());
     }
 
     void BeginStruct() {
@@ -660,7 +663,7 @@ public:
 
     void AddMember(const TString& memberName, const TType& memberType) {
         AddMember(memberName);
-        GetProto().CopyFrom(TProtoAccessor::GetProto(memberType));
+        GetProto().CopyFrom(memberType.GetProto());
     }
 
     void SelectMember(size_t index) {
@@ -687,7 +690,7 @@ public:
 
     void AddElement(const TType& elementType) {
         AddElement();
-        GetProto().CopyFrom(TProtoAccessor::GetProto(elementType));
+        GetProto().CopyFrom(elementType.GetProto());
     }
 
     void SelectElement(size_t index) {
@@ -713,7 +716,7 @@ public:
 
     void DictKey(const TType& keyType) {
         DictKey();
-        GetProto().CopyFrom(TProtoAccessor::GetProto(keyType));
+        GetProto().CopyFrom(keyType.GetProto());
     }
 
     void DictPayload() {
@@ -724,7 +727,7 @@ public:
 
     void DictPayload(const TType& payloadType) {
         DictPayload();
-        GetProto().CopyFrom(TProtoAccessor::GetProto(payloadType));
+        GetProto().CopyFrom(payloadType.GetProto());
     }
 
     void BeginTagged(const TString& tag) {
@@ -739,7 +742,7 @@ public:
     void Tagged(const TString& tag, const TType& itemType) {
         auto taggedType = GetProto().mutable_tagged_type();
         taggedType->set_tag(tag);
-        taggedType->mutable_type()->CopyFrom(TProtoAccessor::GetProto(itemType));
+        taggedType->mutable_type()->CopyFrom(itemType.GetProto());
     }
 
     Ydb::Type& GetProto(ui32 offset = 0) {
@@ -747,7 +750,7 @@ public:
     }
 
     void SetType(const TType& type) {
-        GetProto().CopyFrom(TProtoAccessor::GetProto(type));
+        GetProto().CopyFrom(type.GetProto());
     }
 
     void SetType(TType&& type) {
@@ -1001,6 +1004,11 @@ bool TPgValue::IsText() const {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+TUuidValue::TUuidValue(ui64 low_128, ui64 high_128) {
+    Buf_.Halfs[0] = low_128;
+    Buf_.Halfs[1] = high_128;
+}
 
 TUuidValue::TUuidValue(const Ydb::Value& valueProto) {
     Buf_.Halfs[0] = valueProto.low_128();
@@ -1977,7 +1985,7 @@ public:
         : TypeBuilder_()
     {
         PushPath(ProtoValue_);
-        GetType().CopyFrom(TProtoAccessor::GetProto(type));
+        GetType().CopyFrom(type.GetProto());
     }
 
     TValueBuilderImpl(Ydb::Type& type, Ydb::Value& value)
@@ -2526,7 +2534,7 @@ private:
     }
 
     void SetProtoValue(const TValue& value) {
-        GetValue().CopyFrom(TProtoAccessor::GetProto(value));
+        GetValue().CopyFrom(value.GetProto());
     }
 
     void SetProtoValue(TValue&& value) {

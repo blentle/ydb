@@ -344,6 +344,7 @@ private:
 
     void HandlePrepare(TEvDataShard::TEvProposeTransactionResult::TPtr& ev) {
         TEvDataShard::TEvProposeTransactionResult* res = ev->Get();
+        ResponseEv->Orbit.Join(res->Orbit);
         const ui64 shardId = res->GetOrigin();
         TShardState* shardState = ShardStates.FindPtr(shardId);
         YQL_ENSURE(shardState, "Unexpected propose result from unknown tabletId " << shardId);
@@ -971,6 +972,7 @@ private:
 
     void HandleExecute(TEvDataShard::TEvProposeTransactionResult::TPtr& ev) {
         TEvDataShard::TEvProposeTransactionResult* res = ev->Get();
+        ResponseEv->Orbit.Join(res->Orbit);
         const ui64 shardId = res->GetOrigin();
         LastShard = shardId;
 
@@ -1316,19 +1318,11 @@ private:
                         YQL_ENSURE(!shardInfo.KeyWriteRanges);
 
                         auto& task = getShardTask(shardId);
-                        for (auto& [name, value] : shardInfo.Params) {
-                            task.Meta.Params.emplace(name, std::move(value));
-                        }
-
                         FillGeneralReadInfo(task.Meta, readSettings.ItemsLimit, readSettings.Reverse);
 
                         TTaskMeta::TShardReadInfo readInfo;
                         readInfo.Ranges = std::move(*shardInfo.KeyReadRanges);
                         readInfo.Columns = columns;
-
-                        if (readSettings.ItemsLimitParamName) {
-                            task.Meta.Params.emplace(readSettings.ItemsLimitParamName, readSettings.ItemsLimitBytes);
-                        }
 
                         if (!task.Meta.Reads) {
                             task.Meta.Reads.ConstructInPlace();
@@ -1377,7 +1371,6 @@ private:
                             YQL_ENSURE(shardInfo.KeyWriteRanges);
 
                             auto& task = getShardTask(shardId);
-                            task.Meta.Params = std::move(shardInfo.Params);
 
                             if (!task.Meta.Writes) {
                                 task.Meta.Writes.ConstructInPlace();
@@ -1469,7 +1462,7 @@ private:
                 }
 
                 case NKqpProto::TKqpPhyConnection::kStreamLookup:
-                    HasStreamLookup = true;
+                    UnknownAffectedShardCount = true;
                 case NKqpProto::TKqpPhyConnection::kMap: {
                     partitionsCount = originStageInfo.Tasks.size();
                     break;
@@ -1549,8 +1542,9 @@ private:
             const ui32 flags =
                 (ImmediateTx ? NTxDataShard::TTxFlags::Immediate : 0) |
                 (VolatileTx ? NTxDataShard::TTxFlags::VolatilePrepare : 0);
+            std::unique_ptr<TEvDataShard::TEvProposeTransaction> evData;
             if (GetSnapshot().IsValid() && (ReadOnlyTx || Request.UseImmediateEffects)) {
-                ev.reset(new TEvDataShard::TEvProposeTransaction(
+                evData.reset(new TEvDataShard::TEvProposeTransaction(
                     NKikimrTxDataShard::TX_KIND_DATA,
                     SelfId(),
                     TxId,
@@ -1559,13 +1553,15 @@ private:
                     GetSnapshot().TxId,
                     flags));
             } else {
-                ev.reset(new TEvDataShard::TEvProposeTransaction(
+                evData.reset(new TEvDataShard::TEvProposeTransaction(
                     NKikimrTxDataShard::TX_KIND_DATA,
                     SelfId(),
                     TxId,
                     dataTransaction.SerializeAsString(),
                     flags));
             }
+            ResponseEv->Orbit.Fork(evData->Orbit);
+            ev = std::move(evData);
         }
         auto traceId = ExecuterSpan.GetTraceId();
 
@@ -1596,15 +1592,12 @@ private:
         limits.MkqlLightProgramMemoryLimit = Request.MkqlMemoryLimit > 0 ? std::min(500_MB, Request.MkqlMemoryLimit) : 500_MB;
         limits.MkqlHeavyProgramMemoryLimit = Request.MkqlMemoryLimit > 0 ? std::min(2_GB, Request.MkqlMemoryLimit) : 2_GB;
 
-        auto id = SelfId();
-        limits.AllocateMemoryFn = [TxId = TxId, actorId = id](auto /* txId */, ui64 taskId, ui64 memory) {
-            auto SelfId = [actorId] () {
-                return actorId;
-            };
-            LOG_E("Data query task cannot allocate additional memory during executing."
-                      << " Task: " << taskId << ", memory: " << memory);
-            return false;
-        };
+        auto& taskOpts = taskDesc.GetProgram().GetSettings();
+        auto limit = taskOpts.GetHasMapJoin() /* || opts.GetHasSort()*/
+            ? limits.MkqlHeavyProgramMemoryLimit
+            : limits.MkqlLightProgramMemoryLimit;
+
+        limits.MemoryQuotaManager = std::make_shared<TGuaranteeQuotaManager>(limit, limit);
 
         auto computeActor = CreateKqpComputeActor(SelfId(), TxId, std::move(taskDesc), AsyncIoFactory,
             AppData()->FunctionRegistry, settings, limits);
@@ -1667,7 +1660,11 @@ private:
                 if (stage.SourcesSize() > 0) {
                     switch (stage.GetSources(0).GetTypeCase()) {
                         case NKqpProto::TKqpSource::kReadRangesSource:
-                            readActors += BuildScanTasksFromSource(stageInfo, LockTxId);
+                            if (auto actors = BuildScanTasksFromSource(stageInfo, LockTxId)) {
+                                readActors += *actors;
+                            } else {
+                                UnknownAffectedShardCount = true;
+                            }
                             break;
                         case NKqpProto::TKqpSource::kExternalSource:
                             BuildReadTasksFromSource(stageInfo);
@@ -1763,7 +1760,7 @@ private:
         auto datashardTxs = BuildDatashardTxs(datashardTasks, topicTxs);
 
         // Single-shard transactions are always immediate
-        ImmediateTx = (datashardTxs.size() + Request.TopicOperations.GetSize() + readActors) <= 1 && !HasStreamLookup;
+        ImmediateTx = (datashardTxs.size() + Request.TopicOperations.GetSize() + readActors) <= 1 && !UnknownAffectedShardCount;
 
         if (ImmediateTx) {
             // Transaction cannot be both immediate and volatile
@@ -2228,7 +2225,7 @@ private:
             }
             transaction.SetImmediate(ImmediateTx);
 
-            ActorIdToProto(SelfId(), ev->Record.MutableActor());
+            ActorIdToProto(SelfId(), ev->Record.MutableSourceActor());
             ev->Record.MutableData()->Swap(&transaction);
             ev->Record.SetTxId(TxId);
 
@@ -2324,7 +2321,7 @@ private:
     NYql::NDq::IDqAsyncIoFactory::TPtr AsyncIoFactory;
     bool StreamResult = false;
 
-    bool HasStreamLookup = false;
+    bool UnknownAffectedShardCount = false;
 
     ui64 TxCoordinator = 0;
     THashMap<ui64, TShardState> ShardStates;

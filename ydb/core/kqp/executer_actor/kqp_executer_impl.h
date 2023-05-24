@@ -700,7 +700,7 @@ protected:
         }
     }
 
-    size_t BuildScanTasksFromSource(TStageInfo& stageInfo, const TMaybe<ui64> lockTxId = {}) {
+    TMaybe<size_t> BuildScanTasksFromSource(TStageInfo& stageInfo, const TMaybe<ui64> lockTxId = {}) {
         THashMap<ui64, std::vector<ui64>> nodeTasks;
         THashMap<ui64, ui64> assignedShardsCount;
 
@@ -720,30 +720,20 @@ protected:
         YQL_ENSURE(table.TableKind != NKikimr::NKqp::ETableKind::Olap);
 
         auto columns = BuildKqpColumns(source, table);
-        auto partitions = PrunePartitions(GetTableKeys(), source, stageInfo, HolderFactory(), TypeEnv());
-
-        ui64 itemsLimit = 0;
-
-        TString itemsLimitParamName;
-        NYql::NDqProto::TData itemsLimitBytes;
-        NKikimr::NMiniKQL::TType* itemsLimitType = nullptr;
 
         const auto& snapshot = GetSnapshot();
 
-        for (auto& [shardId, shardInfo] : partitions) {
+        auto addPartiton = [&](TMaybe<ui64> shardId, const TShardInfo& shardInfo, TMaybe<ui64> maxInFlightShards = Nothing()) {
             YQL_ENSURE(!shardInfo.KeyWriteRanges);
 
             auto& task = TasksGraph.AddTask(stageInfo);
             task.Meta.ExecuterId = this->SelfId();
-            if (auto ptr = ShardIdToNodeId.FindPtr(shardId)) {
-                task.Meta.NodeId = *ptr;
-            } else {
-                task.Meta.ShardId = shardId;
-            }
-
-            for (auto& [name, value] : shardInfo.Params) {
-                auto ret = task.Meta.Params.emplace(name, std::move(value));
-                YQL_ENSURE(ret.second);
+            if (shardId) {
+                if (auto ptr = ShardIdToNodeId.FindPtr(*shardId)) {
+                    task.Meta.NodeId = *ptr;
+                } else {
+                    task.Meta.ShardId = *shardId;
+                }
             }
 
             NKikimrTxDataShard::TKqpReadRangesSourceSettings settings;
@@ -785,13 +775,19 @@ protected:
             settings.SetReverse(source.GetReverse());
             settings.SetSorted(source.GetSorted());
 
-            settings.SetShardIdHint(shardId);
-            if (Stats) {
-                Stats->AffectedShards.insert(shardId);
+            if (maxInFlightShards) {
+                settings.SetMaxInFlightShards(*maxInFlightShards);
             }
 
-            ExtractItemsLimit(stageInfo, source.GetItemsLimit(), Request.TxAlloc->HolderFactory,
-                Request.TxAlloc->TypeEnv, itemsLimit, itemsLimitParamName, itemsLimitBytes, itemsLimitType);
+            if (shardId) {
+                settings.SetShardIdHint(*shardId);
+                if (Stats) {
+                    Stats->AffectedShards.insert(*shardId);
+                }
+            }
+
+            ui64 itemsLimit = ExtractItemsLimit(stageInfo, source.GetItemsLimit(), Request.TxAlloc->HolderFactory,
+                Request.TxAlloc->TypeEnv);
             settings.SetItemsLimit(itemsLimit);
 
             auto self = static_cast<TDerived*>(this)->SelfId();
@@ -807,8 +803,23 @@ protected:
             taskSourceSettings.ConstructInPlace();
             taskSourceSettings->PackFrom(settings);
             input.SourceType = NYql::KqpReadRangesSourceName;
+        };
+
+        if (source.GetSequentialAccessHint()) {
+            auto shardInfo = MakeFakePartition(GetTableKeys(), source, stageInfo, HolderFactory(), TypeEnv());
+            if (shardInfo.KeyReadRanges) {
+                addPartiton({}, shardInfo, source.GetSequentialAccessHint());
+                return {};
+            } else {
+                return 0;
+            }
+        } else {
+            THashMap<ui64, TShardInfo> partitions = PrunePartitions(GetTableKeys(), source, stageInfo, HolderFactory(), TypeEnv());
+            for (auto& [shardId, shardInfo] : partitions) {
+                addPartiton(shardId, shardInfo, {});
+            }
+            return partitions.size();
         }
-        return partitions.size();
     }
 
 protected:

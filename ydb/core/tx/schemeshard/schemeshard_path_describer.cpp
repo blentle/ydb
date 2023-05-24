@@ -373,7 +373,7 @@ void TPathDescriber::DescribeOlapStore(TPathId pathId, TPathElement::TPtr pathEl
     Y_UNUSED(pathEl);
 
     auto description = Result->Record.MutablePathDescription()->MutableColumnStoreDescription();
-    description->CopyFrom(storeInfo->Description);
+    description->CopyFrom(storeInfo->GetDescription());
 
     description->ClearColumnShards();
     description->MutableColumnShards()->Reserve(storeInfo->ColumnShards.size());
@@ -402,7 +402,7 @@ void TPathDescriber::DescribeColumnTable(TPathId pathId, TPathElement::TPtr path
         Y_VERIFY(storeInfo, "OlapStore not found");
 
         auto& preset = storeInfo->SchemaPresets.at(description->GetSchemaPresetId());
-        auto& presetProto = storeInfo->Description.GetSchemaPresets(preset.GetProtoIndex());
+        auto& presetProto = storeInfo->GetDescription().GetSchemaPresets(preset.GetProtoIndex());
         *description->MutableSchema() = presetProto.GetSchema();
         if (description->HasSchemaPresetVersionAdj()) {
             description->MutableSchema()->SetVersion(description->GetSchema().GetVersion() + description->GetSchemaPresetVersionAdj());
@@ -1162,6 +1162,7 @@ void TSchemeShard::DescribeCdcStream(const TPathId& pathId, const TString& name,
     desc.SetMode(info->Mode);
     desc.SetFormat(info->Format);
     desc.SetVirtualTimestamps(info->VirtualTimestamps);
+    desc.SetAwsRegion(info->AwsRegion);
     PathIdFromPathId(pathId, desc.MutablePathId());
     desc.SetState(info->State);
     desc.SetSchemaVersion(info->AlterVersion);

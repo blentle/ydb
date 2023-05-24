@@ -127,9 +127,10 @@ public:
     public:
         NKikimrBlobStorage::EVDiskStatus Status = NKikimrBlobStorage::EVDiskStatus::INIT_PENDING;
         bool IsReady = false;
+        bool OnlyPhantomsRemain = false;
 
     public:
-        void SetStatus(NKikimrBlobStorage::EVDiskStatus status, TMonotonic now, TInstant instant) {
+        void SetStatus(NKikimrBlobStorage::EVDiskStatus status, TMonotonic now, TInstant instant, bool onlyPhantomsRemain) {
             if (status != Status) {
                 if (status == NKikimrBlobStorage::EVDiskStatus::REPLICATING) { // became "replicating"
                     LastGotReplicating = instant;
@@ -153,6 +154,9 @@ public:
                     DropFromVSlotReadyTimestampQ();
                 }
                 const_cast<TGroupInfo&>(*Group).CalculateGroupStatus();
+            }
+            if (status == NKikimrBlobStorage::EVDiskStatus::REPLICATING) {
+                OnlyPhantomsRemain = onlyPhantomsRemain;
             }
         }
 
@@ -287,7 +291,12 @@ public:
         }
 
         TString GetStatusString() const {
-            return NKikimrBlobStorage::EVDiskStatus_Name(Status);
+            TStringStream s;
+            s << NKikimrBlobStorage::EVDiskStatus_Name(Status);
+            if (Status == NKikimrBlobStorage::REPLICATING && OnlyPhantomsRemain) {
+                s << "/p";
+            }
+            return s.Str();
         }
 
         bool IsOperational() const {
@@ -444,7 +453,6 @@ public:
 
         bool BadInTermsOfSelfHeal() const {
             return Status == NKikimrBlobStorage::EDriveStatus::FAULTY
-                || Status == NKikimrBlobStorage::EDriveStatus::TO_BE_REMOVED
                 || Status == NKikimrBlobStorage::EDriveStatus::INACTIVE;
         }
 
@@ -527,6 +535,7 @@ public:
         TMaybe<Table::VirtualGroupName::Type> VirtualGroupName;
         TMaybe<Table::VirtualGroupState::Type> VirtualGroupState;
         TMaybe<Table::HiveId::Type> HiveId;
+        TMaybe<Table::Database::Type> Database;
         TMaybe<Table::BlobDepotConfig::Type> BlobDepotConfig;
         TMaybe<Table::BlobDepotId::Type> BlobDepotId;
         TMaybe<Table::ErrorReason::Type> ErrorReason;
@@ -597,6 +606,7 @@ public:
                     Table::VirtualGroupName,
                     Table::VirtualGroupState,
                     Table::HiveId,
+                    Table::Database,
                     Table::BlobDepotConfig,
                     Table::BlobDepotId,
                     Table::ErrorReason,
@@ -618,6 +628,7 @@ public:
                     &TGroupInfo::VirtualGroupName,
                     &TGroupInfo::VirtualGroupState,
                     &TGroupInfo::HiveId,
+                    &TGroupInfo::Database,
                     &TGroupInfo::BlobDepotConfig,
                     &TGroupInfo::BlobDepotId,
                     &TGroupInfo::ErrorReason,
@@ -1547,6 +1558,7 @@ private:
 
     TVSlotInfo* FindVSlot(TVDiskID id) { // GroupGeneration may be zero
         if (TGroupInfo *group = FindGroup(id.GroupID); group && !group->VDisksInGroup.empty()) {
+            Y_VERIFY(group->Topology->IsValidId(id));
             const ui32 index = group->Topology->GetOrderNumber(id);
             const TVSlotInfo *slot = group->VDisksInGroup[index];
             Y_VERIFY(slot->GetShortVDiskId() == TVDiskIdShort(id)); // sanity check

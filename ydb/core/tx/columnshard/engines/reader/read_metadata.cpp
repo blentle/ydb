@@ -94,16 +94,10 @@ bool TReadMetadata::Init(const TReadDescription& readDescription, const TDataSto
             CommittedBatches.emplace(cmt.GetBlobId(), batch);
         }
     }
-
-    auto loadSchema = GetLoadSchema(Snapshot);
-    if (!loadSchema) {
-        return false;
-    }
-
+    
     THashSet<ui32> columnIds;
-    for (auto& field : loadSchema->fields()) {
-        TString column(field->name().data(), field->name().size());
-        columnIds.insert(indexInfo.GetColumnId(column));
+    for (auto& columnId : AllColumns) {
+        columnIds.insert(columnId);
     }
 
     Program = readDescription.Program;
@@ -211,7 +205,8 @@ void TReadStats::PrintToLog() {
 
 NIndexedReader::IOrderPolicy::TPtr TReadMetadata::BuildSortingPolicy() const {
     auto& indexInfo = ResultIndexSchema->GetIndexInfo();
-    if (Limit && IsSorted() && indexInfo.IsSorted() && indexInfo.GetSortingKey()->num_fields()) {
+    if (Limit && IsSorted() && indexInfo.IsSorted() && indexInfo.GetSortingKey()->num_fields() &&
+        indexInfo.GetReplaceKey()->Equals(indexInfo.GetIndexKey())) {
         ui32 idx = 0;
         for (auto&& i : indexInfo.GetPrimaryKey()) {
             if (idx >= indexInfo.GetSortingKey()->fields().size()) {

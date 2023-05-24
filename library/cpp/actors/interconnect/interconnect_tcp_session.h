@@ -295,6 +295,8 @@ namespace NActors {
         ui64 ConfirmedByInput;
 
         std::shared_ptr<IInterconnectMetrics> Metrics;
+        std::array<ui32, 16> InputTrafficArray;
+        THashMap<ui16, ui32> InputTrafficMap;
 
         bool CloseInputSessionRequested = false;
 
@@ -568,7 +570,7 @@ namespace NActors {
         size_t OutgoingOffset = 0;
         size_t XdcOffset = 0;
         size_t OutgoingIndex = 0; // index into current packet in SendQueue
-        bool ForceCurrentPacket = false;
+        size_t ForcedWriteLength = 0;
 
         ui64 XdcBytesSent = 0;
 

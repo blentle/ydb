@@ -601,47 +601,53 @@ void TColumnShard::EnqueueBackgroundActivities(bool periodic, TBackgroundActivit
         LastPeriodicBackActivation = TInstant::Now();
     }
 
-    const TActorContext& ctx = ActorContext();
     SendPeriodicStats();
 
-    if (activity.IndexationOnly()) {
-        if (auto event = SetupIndexation()) {
-            ctx.Send(IndexingActor, event.release());
-        }
+    if (!TablesManager.HasPrimaryIndex()) {
+        LOG_S_NOTICE("Background activities cannot be started: no index at tablet " << TabletID());
         return;
     }
 
-    // Preventing conflicts between indexing and compaction leads to election between them.
-    // Indexing vs compaction probability depends on index and insert table overload status.
-    // Prefer compaction: 25% by default; 50% if IndexOverloaded(); 6.25% if InsertTableOverloaded().
-    if (activity.HasIndexation() && activity.HasCompaction()) {
-        ui32 mask = IndexOverloaded() ? 0x1 : 0x3;
-        if (InsertTableOverloaded()) {
-            mask = 0x0F;
-        }
-        bool preferIndexing = (++BackgroundActivation) & mask;
+    const TActorContext& ctx = ActorContext();
+    // Schedule either indexing or compaction.
+    if (activity.HasIndexation() || activity.HasCompaction()) {
+        [&] {
+            if (ActiveIndexing || ActiveCompaction > 0) {
+                LOG_S_DEBUG("Indexing or compaction already in progress at tablet " << TabletID());
+                return;
+            }
+            // Preventing conflicts between indexing and compaction leads to election between them.
+            // Indexing vs compaction probability depends on index and insert table overload status.
+            // Prefer compaction: 25% by default; 50% if IndexOverloaded(); 6.25% if InsertTableOverloaded().
+            const ui32 mask = InsertTableOverloaded() ? 0xF : (IndexOverloaded() ? 0x1 : 0x3);
+            const bool preferIndexing = BackgroundActivation & mask;
 
-        if (preferIndexing) {
-            if (auto evIdx = SetupIndexation()) {
-                ctx.Send(IndexingActor, evIdx.release());
-            } else if (auto event = SetupCompaction()) {
-                ctx.Send(CompactionActor, event.release());
+            if (preferIndexing) {
+                if (activity.HasIndexation()) {
+                    if (SetupIndexation()) {
+                        BackgroundActivation++;
+                        return;
+                    }
+                }
+                if (activity.HasCompaction()) {
+                    if (SetupCompaction()) {
+                        return;
+                    }
+                }
+            } else {
+                if (activity.HasCompaction()) {
+                    if (SetupCompaction()) {
+                        BackgroundActivation++;
+                        return;
+                    }
+                }
+                if (activity.HasIndexation()) {
+                    if (SetupIndexation()) {
+                        return;
+                    }
+                }
             }
-        } else {
-            if (auto event = SetupCompaction()) {
-                ctx.Send(CompactionActor, event.release());
-            } else if (auto evIdx = SetupIndexation()) {
-                ctx.Send(IndexingActor, evIdx.release());
-            }
-        }
-    } else if (activity.HasIndexation()) {
-        if (auto evIdx = SetupIndexation()) {
-            ctx.Send(IndexingActor, evIdx.release());
-        }
-    } else if (activity.HasCompaction()) {
-        if (auto event = SetupCompaction()) {
-            ctx.Send(CompactionActor, event.release());
-        }
+        }();
     }
 
     if (activity.HasCleanup()) {
@@ -666,16 +672,7 @@ void TColumnShard::EnqueueBackgroundActivities(bool periodic, TBackgroundActivit
     }
 }
 
-std::unique_ptr<TEvPrivate::TEvIndexing> TColumnShard::SetupIndexation() {
-    if (ActiveIndexingOrCompaction) {
-        LOG_S_DEBUG("Indexing/compaction already in progress at tablet " << TabletID());
-        return {};
-    }
-    if (!TablesManager.HasPrimaryIndex()) {
-        LOG_S_NOTICE("Indexing not started: no index at tablet " << TabletID());
-        return {};
-    }
-
+bool TColumnShard::SetupIndexation() {
     ui32 blobs = 0;
     ui32 ignored = 0;
     ui64 size = 0;
@@ -719,7 +716,7 @@ std::unique_ptr<TEvPrivate::TEvIndexing> TColumnShard::SetupIndexation() {
         // Force small indexations simetimes to keep BatchCache smaller
         if (!bytesToIndex || SkippedIndexations < TSettings::MAX_INDEXATIONS_TO_SKIP) {
             ++SkippedIndexations;
-            return {};
+            return false;
         }
     }
     SkippedIndexations = 0;
@@ -740,58 +737,68 @@ std::unique_ptr<TEvPrivate::TEvIndexing> TColumnShard::SetupIndexation() {
     }
 
     Y_VERIFY(data.size());
-    auto indexChanges = TablesManager.MutablePrimaryIndex().StartInsert(std::move(data));
+    auto indexChanges = TablesManager.MutablePrimaryIndex().StartInsert(CompactionLimits.Get(), std::move(data));
     if (!indexChanges) {
         LOG_S_NOTICE("Cannot prepare indexing at tablet " << TabletID());
-        return {};
+        return false;
     }
 
-    auto actualIndexInfo = TablesManager.GetIndexInfo();
-    ActiveIndexingOrCompaction = true;
+    auto actualIndexInfo = TablesManager.GetPrimaryIndex()->GetVersionedIndex();
+    ActiveIndexing = true;
     auto ev = std::make_unique<TEvPrivate::TEvWriteIndex>(std::move(actualIndexInfo), indexChanges,
         Settings.CacheDataAfterIndexing, std::move(cachedBlobs));
     if (Tiers) {
         ev->SetTiering(Tiers->GetTiering());
     }
-    return std::make_unique<TEvPrivate::TEvIndexing>(std::move(ev));
+
+    ActorContext().Send(IndexingActor, std::make_unique<TEvPrivate::TEvIndexing>(std::move(ev)));
+    return true;
 }
 
-std::unique_ptr<TEvPrivate::TEvCompaction> TColumnShard::SetupCompaction() {
-    if (ActiveIndexingOrCompaction) {
-        LOG_S_DEBUG("Compaction/indexing already in progress at tablet " << TabletID());
-        return {};
-    }
-    if (!TablesManager.HasPrimaryIndex()) {
-        LOG_S_NOTICE("Compaction not started: no index at tablet " << TabletID());
-        return {};
+bool TColumnShard::SetupCompaction() {
+    std::vector<std::unique_ptr<TEvPrivate::TEvCompaction>> events;
+
+    while (ActiveCompaction < TSettings::MAX_ACTIVE_COMPACTIONS) {
+        auto limits = CompactionLimits.Get();
+        auto compactionInfo = TablesManager.MutablePrimaryIndex().Compact(limits, LastCompactedGranule);
+        if (!compactionInfo || compactionInfo->Empty()) {
+            if (events.empty()) {
+                LOG_S_DEBUG("Compaction not started: no portions to compact at tablet " << TabletID());
+            }
+            break;
+        }
+
+        Y_VERIFY(compactionInfo->Good());
+
+        LOG_S_DEBUG("Prepare " << *compactionInfo << " at tablet " << TabletID());
+
+        ui64 outdatedStep = GetOutdatedStep();
+        auto indexChanges = TablesManager.MutablePrimaryIndex().StartCompaction(std::move(compactionInfo), NOlap::TSnapshot(outdatedStep, 0), limits);
+        if (!indexChanges) {
+            if (events.empty()) {
+                LOG_S_DEBUG("Compaction not started: cannot prepare compaction at tablet " << TabletID());
+            }
+            break;
+        }
+
+        auto actualIndexInfo = TablesManager.GetPrimaryIndex()->GetVersionedIndex();
+        ActiveCompaction++;
+        auto ev = std::make_unique<TEvPrivate::TEvWriteIndex>(std::move(actualIndexInfo), indexChanges,
+            Settings.CacheDataAfterCompaction);
+        if (Tiers) {
+            ev->SetTiering(Tiers->GetTiering());
+        }
+
+        events.push_back(std::make_unique<TEvPrivate::TEvCompaction>(std::move(ev), *BlobManager));
     }
 
-    TablesManager.MutablePrimaryIndex().UpdateCompactionLimits(CompactionLimits.Get());
-    auto compactionInfo = TablesManager.MutablePrimaryIndex().Compact(LastCompactedGranule);
-    if (!compactionInfo || compactionInfo->Empty()) {
-        LOG_S_DEBUG("Compaction not started: no portions to compact at tablet " << TabletID());
-        return {};
+    LOG_S_DEBUG("Compaction events " << events.size() << " ActiveCompaction " << ActiveCompaction << " at tablet " << TabletID());
+
+    for (auto& ev : events) {
+        ActorContext().Send(CompactionActor, std::move(ev));
     }
 
-    Y_VERIFY(compactionInfo->Good());
-
-    LOG_S_DEBUG("Prepare " << *compactionInfo << " at tablet " << TabletID());
-
-    ui64 ourdatedStep = GetOutdatedStep();
-    auto indexChanges = TablesManager.MutablePrimaryIndex().StartCompaction(std::move(compactionInfo), NOlap::TSnapshot(ourdatedStep, 0));
-    if (!indexChanges) {
-        LOG_S_DEBUG("Compaction not started: cannot prepare compaction at tablet " << TabletID());
-        return {};
-    }
-
-    auto actualIndexInfo = TablesManager.GetIndexInfo();
-    ActiveIndexingOrCompaction = true;
-    auto ev = std::make_unique<TEvPrivate::TEvWriteIndex>(std::move(actualIndexInfo), indexChanges,
-        Settings.CacheDataAfterCompaction);
-    if (Tiers) {
-        ev->SetTiering(Tiers->GetTiering());
-    }
-    return std::make_unique<TEvPrivate::TEvCompaction>(std::move(ev), *BlobManager);
+    return events.size() != 0;
 }
 
 std::unique_ptr<TEvPrivate::TEvEviction> TColumnShard::SetupTtl(const THashMap<ui64, NOlap::TTiering>& pathTtls,
@@ -802,10 +809,6 @@ std::unique_ptr<TEvPrivate::TEvEviction> TColumnShard::SetupTtl(const THashMap<u
     }
     if (ActiveEvictions) {
         LOG_S_DEBUG("Do not start TTL while eviction is in progress at tablet " << TabletID());
-        return {};
-    }
-    if (!TablesManager.HasPrimaryIndex()) {
-        LOG_S_NOTICE("TTL not started. No index for TTL at tablet " << TabletID());
         return {};
     }
 
@@ -828,9 +831,9 @@ std::unique_ptr<TEvPrivate::TEvEviction> TColumnShard::SetupTtl(const THashMap<u
         LOG_S_DEBUG("Evicting path " << i.first << " with " << i.second.GetDebugString() << " at tablet " << TabletID());
     }
 
-    auto actualIndexInfo = TablesManager.GetIndexInfo();
+    auto actualIndexInfo = TablesManager.GetPrimaryIndex()->GetVersionedIndex();
     std::shared_ptr<NOlap::TColumnEngineChanges> indexChanges;
-    indexChanges = TablesManager.MutablePrimaryIndex().StartTtl(eviction, actualIndexInfo.ArrowSchema());
+    indexChanges = TablesManager.MutablePrimaryIndex().StartTtl(eviction, actualIndexInfo.GetLastSchema()->GetIndexInfo().ArrowSchema());
 
     if (!indexChanges) {
         LOG_S_DEBUG("Cannot prepare TTL at tablet " << TabletID());
@@ -853,14 +856,10 @@ std::unique_ptr<TEvPrivate::TEvWriteIndex> TColumnShard::SetupCleanup() {
         LOG_S_DEBUG("Cleanup already in progress at tablet " << TabletID());
         return {};
     }
-    if (!TablesManager.HasPrimaryIndex()) {
-        LOG_S_NOTICE("Cleanup not started. No index for cleanup at tablet " << TabletID());
-        return {};
-    }
 
     NOlap::TSnapshot cleanupSnapshot{GetMinReadStep(), 0};
 
-    auto changes = TablesManager.StartIndexCleanup(cleanupSnapshot, TLimits::MAX_TX_RECORDS);
+    auto changes = TablesManager.StartIndexCleanup(cleanupSnapshot, CompactionLimits.Get(), TLimits::MAX_TX_RECORDS);
     if (!changes) {
         LOG_S_NOTICE("Cannot prepare cleanup at tablet " << TabletID());
         return {};
@@ -893,7 +892,7 @@ std::unique_ptr<TEvPrivate::TEvWriteIndex> TColumnShard::SetupCleanup() {
         return {};
     }
 
-    auto actualIndexInfo = TablesManager.GetIndexInfo();
+    auto actualIndexInfo = TablesManager.GetPrimaryIndex()->GetVersionedIndex();
 #if 0 // No need for now
     if (Tiers) {
         ...
@@ -943,9 +942,9 @@ void TColumnShard::ExportBlobs(const TActorContext& ctx, ui64 exportNo, const TS
                                TEvPrivate::TEvExport::TBlobDataMap&& blobsInfo) const {
     Y_VERIFY(blobsInfo.size());
 
-    TString strBlobs;
+    TStringBuilder strBlobs;
     for (auto& [blobId, _] : blobsInfo) {
-        strBlobs += "'" + blobId.ToStringNew() + "' ";
+        strBlobs << "'" << blobId.ToStringNew() << "' ";
     }
     LOG_S_NOTICE("Export blobs " << strBlobs << "at tablet " << TabletID());
 
@@ -967,14 +966,14 @@ void TColumnShard::ForgetTierBlobs(const TActorContext& ctx, const TString& tier
 void TColumnShard::ForgetBlobs(const TActorContext& ctx, const THashSet<NOlap::TEvictedBlob>& evictedBlobs) {
     THashMap<TString, std::vector<NOlap::TEvictedBlob>> tierBlobs;
 
-    TString strBlobs;
-    TString strBlobsDelayed;
+    TStringBuilder strBlobs;
+    TStringBuilder strBlobsDelayed;
 
     for (const auto& ev : evictedBlobs) {
         auto& blobId = ev.Blob;
         if (BlobManager->BlobInUse(blobId)) {
             LOG_S_DEBUG("Blob '" << blobId.ToStringNew() << "' in use at tablet " << TabletID());
-            strBlobsDelayed += "'" + blobId.ToStringNew() + "' ";
+            strBlobsDelayed << "'" << blobId.ToStringNew() << "' ";
             continue;
         }
 
@@ -985,11 +984,11 @@ void TColumnShard::ForgetBlobs(const TActorContext& ctx, const THashSet<NOlap::T
             LOG_S_ERROR("Forget unknown blob '" << blobId.ToStringNew() << "' at tablet " << TabletID());
         } else if (NOlap::CouldBeExported(evict.State)) {
             Y_VERIFY(evict.Blob == blobId);
-            strBlobs += "'" + blobId.ToStringNew() + "' ";
+            strBlobs << "'" << blobId.ToStringNew() << "' ";
             tierBlobs[meta.GetTierName()].emplace_back(std::move(evict));
         } else {
             Y_VERIFY(evict.Blob == blobId);
-            strBlobsDelayed += "'" + blobId.ToStringNew() + "' ";
+            strBlobsDelayed << "'"<< blobId.ToStringNew() << "' ";
         }
     }
 
