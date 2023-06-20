@@ -46,8 +46,8 @@ NKqpProto::TKqpPhyQuery::EType GetPhyQueryType(const EPhysicalQueryType& type) {
     switch (type) {
         case EPhysicalQueryType::Data: return NKqpProto::TKqpPhyQuery::TYPE_DATA;
         case EPhysicalQueryType::Scan: return NKqpProto::TKqpPhyQuery::TYPE_SCAN;
-        case EPhysicalQueryType::Query: return NKqpProto::TKqpPhyQuery::TYPE_QUERY;
-        case EPhysicalQueryType::FederatedQuery: return NKqpProto::TKqpPhyQuery::TYPE_FEDERATED_QUERY;
+        case EPhysicalQueryType::GenericQuery: return NKqpProto::TKqpPhyQuery::TYPE_QUERY;
+        case EPhysicalQueryType::GenericScript: return NKqpProto::TKqpPhyQuery::TYPE_SCRIPT;
 
         case EPhysicalQueryType::Unspecified:
             break;
@@ -504,6 +504,22 @@ public:
             auto& txBindingProto = *queryBindingProto.MutableTxResultBinding();
             txBindingProto.SetTxIndex(txIndex);
             txBindingProto.SetResultIndex(txResultIndex);
+
+            auto type = binding.Ref().GetTypeAnn()->Cast<TListExprType>()->GetItemType()->Cast<TStructExprType>();
+            YQL_ENSURE(type);
+            YQL_ENSURE(type->GetKind() == ETypeAnnotationKind::Struct);
+
+            NKikimrMiniKQL::TType kikimrProto;
+
+            NYql::ExportTypeToKikimrProto(*type, kikimrProto, ctx);
+
+            auto resultMeta = queryBindingProto.MutableResultSetMeta();
+
+            for (const auto& column : kikimrProto.GetStruct().GetMember()) {
+                auto columnMeta = resultMeta->add_columns();
+                columnMeta->set_name(column.GetName());
+                ConvertMiniKQLTypeToYdbType(column.GetType(), *columnMeta->mutable_type());
+            }
         }
 
         return true;
@@ -847,8 +863,8 @@ private:
             readProto.SetSorted(readSettings.Sorted);
             YQL_ENSURE(readSettings.SkipNullKeys.empty());
 
-            if (readSettings.SequentialHint) {
-                readProto.SetSequentialAccessHint(*readSettings.SequentialHint);
+            if (readSettings.SequentialInFlight) {
+                readProto.SetSequentialInFlightShards(*readSettings.SequentialInFlight);
             }
 
             auto ranges = settings.RangesExpr().template Maybe<TCoParameter>();

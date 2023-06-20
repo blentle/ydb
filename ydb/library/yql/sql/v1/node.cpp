@@ -2339,9 +2339,10 @@ TMaybe<TStringContent> StringContentOrIdContent(TContext& ctx, TPosition pos, co
         (ctx.AnsiQuotedIdentifiers && input.StartsWith('"'))? EStringContentMode::AnsiIdent : EStringContentMode::Default);
 }
 
-TTtlSettings::TTtlSettings(const TIdentifier& columnName, const TNodePtr& expr)
+TTtlSettings::TTtlSettings(const TIdentifier& columnName, const TNodePtr& expr, const TMaybe<EUnit>& columnUnit)
     : ColumnName(columnName)
     , Expr(expr)
+    , ColumnUnit(columnUnit)
 {
 }
 
@@ -3462,7 +3463,9 @@ TNodePtr BuildBinaryOp(TContext& ctx, TPosition pos, const TString& opName, TNod
         const bool oneArgNull  = a->IsNull() || b->IsNull();
 
         if (bothArgNull || (opName != "Or" && oneArgNull)) {
-            ctx.Warning(pos, TIssuesIds::YQL_OPERATION_WILL_RETURN_NULL) << "Binary operation " << opName << " will return NULL here";
+            ctx.Warning(pos, TIssuesIds::YQL_OPERATION_WILL_RETURN_NULL) << "Binary operation "
+            << opName.substr(0, opName.Size() - 7 * opName.EndsWith("MayWarn"))
+            << " will return NULL here";
         }
     }
 

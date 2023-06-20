@@ -1,5 +1,6 @@
 #include <ydb/library/yql/parser/pg_wrapper/interface/interface.h>
 
+#include <ydb/library/yql/minikql/computation/mkql_computation_node_pack_impl.h>
 #include <ydb/library/yql/minikql/mkql_buffer.h>
 
 namespace NSQLTranslationPG {
@@ -180,6 +181,12 @@ NUdf::TUnboxedValue PGUnpackImpl(const TPgType* type, TStringBuf& buf) {
    throw yexception() << "PG types are not supported";
 }
 
+NUdf::TUnboxedValue PGUnpackImpl(const TPgType* type, NDetails::TChunkedInputBuffer& buf) {
+   Y_UNUSED(type);
+   Y_UNUSED(buf);
+   throw yexception() << "PG types are not supported";
+}
+
 void EncodePresortPGValue(TPgType* type, const NUdf::TUnboxedValue& value, TVector<ui8>& output) {
     Y_UNUSED(type);
     Y_UNUSED(value);
@@ -224,6 +231,10 @@ NUdf::IBlockItemComparator::TPtr MakePgItemComparator(ui32 typeId) {
     throw yexception() << "PG types are not supported";
 }
 
+void RegisterPgBlockAggs(THashMap<TString, std::unique_ptr<IBlockAggregatorFactory>>& registry) {
+    Y_UNUSED(registry);
+}
+
 } // namespace NMiniKQL
 } // namespace NKikimr
 
@@ -234,6 +245,12 @@ arrow::Datum MakePgScalar(NKikimr::NMiniKQL::TPgType* type, const NKikimr::NUdf:
     Y_UNUSED(value);
     Y_UNUSED(pool);
     return arrow::Datum();
+}
+
+TColumnConverter BuildPgColumnConverter(const std::shared_ptr<arrow::DataType>& originalType, NKikimr::NMiniKQL::TPgType* targetType) {
+    Y_UNUSED(originalType);
+    Y_UNUSED(targetType);
+    return {};
 }
 
 TMaybe<ui32> ConvertToPgType(NKikimr::NUdf::EDataSlot slot) {
@@ -430,6 +447,13 @@ TConvertResult PgNativeTextFromNativeBinary(const TString& binary, ui32 pgTypeId
     Y_UNUSED(binary);
     Y_UNUSED(pgTypeId);
     throw yexception() << "PG types are not supported";
+}
+
+TString GetPostgresServerVersionNum() {
+    return "-1";
+}
+TString GetPostgresServerVersionStr() {
+    return "pg_sql_dummy";
 }
 
 } // namespace NKikimr::NPg

@@ -65,7 +65,10 @@ TString MakeQuery(const TString& tmpl) {
 namespace NKikimr {
 namespace NKqp {
 
+class TKqpCounters;
 const TString KikimrDefaultUtDomainRoot = "Root";
+
+extern const TString EXPECTED_EIGHTSHARD_VALUE1;
 
 TVector<NKikimrKqp::TKqpSetting> SyntaxV1Settings();
 
@@ -82,6 +85,7 @@ struct TKikimrSettings: public TTestFeatureFlagsHolder<TKikimrSettings> {
 
     TKikimrSettings()
     {
+        FeatureFlags.SetForceColumnTablesCompositeMarks(true);
     }
 
     TKikimrSettings& SetAppConfig(const NKikimrConfig::TAppConfig& value) { AppConfig = value; return *this; }
@@ -243,10 +247,11 @@ public:
     NYdb::EStatus Status;
 };
 
-TString StreamResultToYson(NYdb::NTable::TScanQueryPartIterator& it, bool throwOnTImeout = false);
-TString StreamResultToYson(NYdb::NScripting::TYqlResultPartIterator& it, bool throwOnTImeout = false);
-TString StreamResultToYson(NYdb::NTable::TTablePartIterator& it, bool throwOnTImeout = false);
+TString StreamResultToYson(NYdb::NTable::TScanQueryPartIterator& it, bool throwOnTImeout = false, const NYdb::EStatus& opStatus = NYdb::EStatus::SUCCESS);
+TString StreamResultToYson(NYdb::NScripting::TYqlResultPartIterator& it, bool throwOnTImeout = false, const NYdb::EStatus& opStatus = NYdb::EStatus::SUCCESS);
+TString StreamResultToYson(NYdb::NTable::TTablePartIterator& it, bool throwOnTImeout = false, const NYdb::EStatus& opStatus = NYdb::EStatus::SUCCESS);
 
+bool ValidatePlanNodeIds(const NJson::TJsonValue& plan);
 ui32 CountPlanNodesByKv(const NJson::TJsonValue& plan, const TString& key, const TString& value);
 NJson::TJsonValue FindPlanNodeByKv(const NJson::TJsonValue& plan, const TString& key, const TString& value);
 std::vector<NJson::TJsonValue> FindPlanNodes(const NJson::TJsonValue& plan, const TString& key);
@@ -259,7 +264,7 @@ inline void AssertSuccessResult(const NYdb::TStatus& result) {
     UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
 }
 
-void CreateSampleTablesWithIndex(NYdb::NTable::TSession& session);
+void CreateSampleTablesWithIndex(NYdb::NTable::TSession& session, bool populateTables = true);
 
 // KQP proxy needs to asynchronously receive tenants info before it is able to serve requests that have
 // database name specified. Before that it returns errors.
@@ -276,6 +281,8 @@ NKikimrScheme::TEvDescribeSchemeResult DescribeTable(Tests::TServer* server, TAc
 TVector<ui64> GetTableShards(Tests::TServer* server, TActorId sender, const TString &path);
 
 TVector<ui64> GetTableShards(Tests::TServer::TPtr server, TActorId sender, const TString &path);
+
+void WaitForZeroSessions(const NKqp::TKqpCounters& counters);
 
 } // namespace NKqp
 } // namespace NKikimr

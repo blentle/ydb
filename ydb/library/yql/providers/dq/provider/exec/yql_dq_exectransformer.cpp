@@ -140,10 +140,11 @@ public:
         settings.CollectBasicStats = true;
         settings.CollectProfileStats = true;
         auto runner = NDq::MakeDqTaskRunner(executionContext, settings, {});
+        auto runnerSettings = NDq::TDqTaskSettings(&task);
 
         {
             auto guard = runner->BindAllocator(State->Settings->MemoryLimit.Get().GetOrElse(0));
-            runner->Prepare(task, limits);
+            runner->Prepare(runnerSettings, limits);
         }
 
         TVector<NDqProto::TData> rows;

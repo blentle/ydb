@@ -20,6 +20,7 @@
 #include "progress_queue.h"
 #include "read_iterator.h"
 #include "volatile_tx.h"
+#include "conflicts_cache.h"
 
 #include <ydb/core/tx/time_cast/time_cast.h>
 #include <ydb/core/tx/tx_processing.h>
@@ -223,6 +224,7 @@ class TDataShard
     class TTxVolatileTxAbort;
     class TTxCdcStreamScanRun;
     class TTxCdcStreamScanProgress;
+    class TTxUpdateFollowerReadEdge;
 
     template <typename T> friend class TTxDirectBase;
     class TTxUploadRows;
@@ -268,6 +270,7 @@ class TDataShard
     friend class TSnapshotManager;
     friend class TSchemaSnapshotManager;
     friend class TVolatileTxManager;
+    friend class TConflictsCache;
     friend class TCdcStreamScanManager;
     friend class TReplicationSourceOffsetsClient;
     friend class TReplicationSourceOffsetsServer;
@@ -336,6 +339,7 @@ class TDataShard
             EvCdcStreamScanProgress,
             EvCdcStreamScanContinue,
             EvRestartOperation, // used to restart after an aborted scan (e.g. backup)
+            EvChangeExchangeExecuteHandshakes,
             EvEnd
         };
 
@@ -516,6 +520,8 @@ class TDataShard
 
             const ui64 TxId;
         };
+
+        struct TEvChangeExchangeExecuteHandshakes : public TEventLocal<TEvChangeExchangeExecuteHandshakes, EvChangeExchangeExecuteHandshakes> {};
     };
 
     struct Schema : NIceDb::Schema {
@@ -1055,6 +1061,14 @@ class TDataShard
 
             Sys_LastLoanTableTid, // 41 Last tid that we used in LoanTable
 
+            // The last step:txId that is unconditionally readable on followers
+            // without producing possibly inconsistent results. When repeatable
+            // is set leader will also never add new writes to this edge, making
+            // it possible to use the edge as a local snapshot.
+            SysMvcc_FollowerReadEdgeStep = 42,
+            SysMvcc_FollowerReadEdgeTxId = 43,
+            SysMvcc_FollowerReadEdgeRepeatable = 44,
+
             // reserved
             SysPipeline_Flags = 1000,
             SysPipeline_LimitActiveTx,
@@ -1237,6 +1251,7 @@ class TDataShard
     void Handle(TEvPrivate::TEvRemoveChangeRecords::TPtr& ev, const TActorContext& ctx);
     // change receiving
     void Handle(TEvChangeExchange::TEvHandshake::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvChangeExchangeExecuteHandshakes::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvChangeExchange::TEvApplyRecords::TPtr& ev, const TActorContext& ctx);
     // activation
     void Handle(TEvChangeExchange::TEvActivateSender::TPtr& ev, const TActorContext& ctx);
@@ -1777,6 +1792,8 @@ public:
     TVolatileTxManager& GetVolatileTxManager() { return VolatileTxManager; }
     const TVolatileTxManager& GetVolatileTxManager() const { return VolatileTxManager; }
 
+    TConflictsCache& GetConflictsCache() { return ConflictsCache; }
+
     TCdcStreamScanManager& GetCdcStreamScanManager() { return CdcStreamScanManager; }
     const TCdcStreamScanManager& GetCdcStreamScanManager() const { return CdcStreamScanManager; }
 
@@ -1790,6 +1807,13 @@ public:
 
     // Returns true when datashard is working in mvcc mode
     bool IsMvccEnabled() const;
+
+    // Calculates current follower read edge
+    std::tuple<TRowVersion, bool, ui64> CalculateFollowerReadEdge() const;
+
+    // Promotes current follower read edge
+    bool PromoteFollowerReadEdge(TTransactionContext& txc);
+    bool PromoteFollowerReadEdge();
 
     // Returns a suitable row version for performing a transaction
     TRowVersion GetMvccTxVersion(EMvccTxMode mode, TOperation* op = nullptr) const;
@@ -1880,6 +1904,16 @@ public:
      */
     bool BreakWriteConflicts(NTable::TDatabase& db, const TTableId& tableId,
         TArrayRef<const TCell> keyCells, absl::flat_hash_set<ui64>& volatileDependencies);
+
+    /**
+     * Handles a specific write conflict txId
+     *
+     * Prerequisites: TSetupSysLocks is active and caller does not have any
+     * uncommitted write locks.
+     *
+     * Either adds txId to volatile dependencies or breaks a known write lock.
+     */
+    void BreakWriteConflict(ui64 txId, absl::flat_hash_set<ui64>& volatileDependencies);
 
 private:
     ///
@@ -2216,6 +2250,7 @@ private:
 
     // For follower only
     struct TFollowerState {
+        ui64 LastSysUpdate = 0;
         ui64 LastSchemeUpdate = 0;
         ui64 LastSnapshotsUpdate = 0;
     };
@@ -2322,7 +2357,7 @@ private:
     };
 
     TProposeQueue ProposeQueue;
-    TVector<THolder<TEvDataShard::TEvProposeTransaction::THandle>> DelayedProposeQueue;
+    TVector<THolder<IEventHandle>> DelayedProposeQueue;
 
     TIntrusivePtr<NTabletPipe::TBoundedClientCacheConfig> PipeClientCacheConfig;
     THolder<NTabletPipe::IClientCache> PipeClientCache;
@@ -2402,6 +2437,7 @@ private:
     TSnapshotManager SnapshotManager;
     TSchemaSnapshotManager SchemaSnapshotManager;
     TVolatileTxManager VolatileTxManager;
+    TConflictsCache ConflictsCache;
     TCdcStreamScanManager CdcStreamScanManager;
 
     TReplicationSourceOffsetsServerLink ReplicationSourceOffsetsServer;
@@ -2592,6 +2628,13 @@ private:
 
     // in
     THashMap<ui64, TInChangeSender> InChangeSenders; // ui64 is shard id
+    TList<std::pair<TActorId, NKikimrChangeExchange::TEvHandshake>> PendingChangeExchangeHandshakes;
+    bool ChangeExchangeHandshakesCollecting = false;
+    bool ChangeExchangeHandshakeTxScheduled = false;
+
+    void StartCollectingChangeExchangeHandshakes(const TActorContext& ctx);
+    void RunChangeExchangeHandshakeTx();
+    void ChangeExchangeHandshakeExecuted();
 
     // compactionId, actorId
     using TCompactionWaiter = std::tuple<ui64, TActorId>;
@@ -2631,6 +2674,8 @@ private:
     THashMap<TActorId, TReadIteratorSession> ReadIteratorSessions;
 
     NTable::ITransactionObserverPtr BreakWriteConflictsTxObserver;
+
+    bool UpdateFollowerReadEdgePending = false;
 
 public:
     auto& GetLockChangeRecords() {
@@ -2791,6 +2836,7 @@ protected:
             HFunc(TEvPrivate::TEvRequestChangeRecords, Handle);
             HFunc(TEvPrivate::TEvRemoveChangeRecords, Handle);
             HFunc(TEvChangeExchange::TEvHandshake, Handle);
+            HFunc(TEvPrivate::TEvChangeExchangeExecuteHandshakes, Handle);
             HFunc(TEvChangeExchange::TEvApplyRecords, Handle);
             HFunc(TEvChangeExchange::TEvActivateSender, Handle);
             HFunc(TEvChangeExchange::TEvActivateSenderAck, Handle);

@@ -286,7 +286,7 @@ private:
     void AsyncInputPush(
         ui64 cookie,
         ui64 index,
-        NKikimr::NMiniKQL::TUnboxedValueVector&& batch,
+        NKikimr::NMiniKQL::TUnboxedValueBatch&& batch,
         i64 space,
         bool finish) override
     {
@@ -385,7 +385,7 @@ private:
         auto guard = TaskRunner->BindAllocator();
         auto sink = TaskRunner->GetSink(ev->Get()->Index);
 
-        NKikimr::NMiniKQL::TUnboxedValueVector batch;
+        NKikimr::NMiniKQL::TUnboxedValueBatch batch(sink->GetOutputType());
         NDqProto::TCheckpoint checkpoint;
         TMaybe<NDqProto::TCheckpoint> maybeCheckpoint;
         i64 size = 0;
@@ -408,11 +408,12 @@ private:
 
     void OnDqTask(TEvTaskRunnerCreate::TPtr& ev) {
         ParentId = ev->Sender;
-        TaskRunner = Factory(ev->Get()->Task, [this](const TString& message) {
+        auto settings = NDq::TDqTaskSettings(&ev->Get()->Task);
+        TaskRunner = Factory(settings, [this](const TString& message) {
             LOG_D(message);
         });
 
-        auto& inputs = ev->Get()->Task.GetInputs();
+        auto& inputs = settings.GetInputs();
         for (auto inputId = 0; inputId < inputs.size(); inputId++) {
             auto& input = inputs[inputId];
             if (input.HasSource()) {
@@ -429,7 +430,7 @@ private:
             MemoryQuota->TrySetIncreaseMemoryLimitCallback(guard.GetMutex());
         }
 
-        TaskRunner->Prepare(ev->Get()->Task, ev->Get()->MemoryLimits, *ev->Get()->ExecCtx, ev->Get()->ParameterProvider);
+        TaskRunner->Prepare(settings, ev->Get()->MemoryLimits, *ev->Get()->ExecCtx);
 
         auto event = MakeHolder<TEvTaskRunnerCreateFinished>(
             TaskRunner->GetSecureParams(),

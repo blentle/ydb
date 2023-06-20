@@ -120,7 +120,7 @@ message TKqpLocks {
 
     enum ELocksOp {
         Unspecified = 0;
-        Validate = 1;
+        reserved 1; // Validate op is deprecated
         Commit = 2; // Validate locks, commit buffered changes and erase locks
         Rollback = 3; // Rollback buffered changes and erase locks
     }
@@ -275,6 +275,7 @@ message TKqpReadRangesSourceSettings {
     optional uint32 LockNodeId = 14;
 
     optional uint64 MaxInFlightShards = 16;
+    optional bool UseFollowers = 17 [default = false];
 }
 
 message TKqpTaskInfo {

@@ -11,8 +11,6 @@
 namespace NKikimr {
 namespace NDataShard {
 
-#define LOAD_SYS_UI64(db, row, value) if (!TDataShard::SysGetUi64(db, row, value)) return false;
-
 TPipeline::TPipeline(TDataShard * self)
     : Self(self)
     , DepTracker(self)
@@ -45,14 +43,19 @@ bool TPipeline::Load(NIceDb::TNiceDb& db) {
     using Schema = TDataShard::Schema;
 
     Y_VERIFY(!SchemaTx);
-    LOAD_SYS_UI64(db, Schema::Sys_LastPlannedStep, LastPlannedTx.Step);
-    LOAD_SYS_UI64(db, Schema::Sys_LastPlannedTx, LastPlannedTx.TxId);
-    LOAD_SYS_UI64(db, Schema::Sys_LastCompleteStep, LastCompleteTx.Step);
-    LOAD_SYS_UI64(db, Schema::Sys_LastCompleteTx, LastCompleteTx.TxId);
-    LOAD_SYS_UI64(db, Schema::Sys_AliveStep, KeepSchemaStep);
-    LOAD_SYS_UI64(db, Schema::SysPipeline_Flags, Config.Flags);
-    LOAD_SYS_UI64(db, Schema::SysPipeline_LimitActiveTx, Config.LimitActiveTx);
-    LOAD_SYS_UI64(db, Schema::SysPipeline_LimitDataTxCache, Config.LimitDataTxCache);
+
+    bool ready = true;
+    ready &= Self->SysGetUi64(db, Schema::Sys_LastPlannedStep, LastPlannedTx.Step);
+    ready &= Self->SysGetUi64(db, Schema::Sys_LastPlannedTx, LastPlannedTx.TxId);
+    ready &= Self->SysGetUi64(db, Schema::Sys_LastCompleteStep, LastCompleteTx.Step);
+    ready &= Self->SysGetUi64(db, Schema::Sys_LastCompleteTx, LastCompleteTx.TxId);
+    ready &= Self->SysGetUi64(db, Schema::Sys_AliveStep, KeepSchemaStep);
+    ready &= Self->SysGetUi64(db, Schema::SysPipeline_Flags, Config.Flags);
+    ready &= Self->SysGetUi64(db, Schema::SysPipeline_LimitActiveTx, Config.LimitActiveTx);
+    ready &= Self->SysGetUi64(db, Schema::SysPipeline_LimitDataTxCache, Config.LimitDataTxCache);
+    if (!ready) {
+        return false;
+    }
 
     Config.Validate();
     UtmostCompleteTx = LastCompleteTx;
@@ -941,6 +944,10 @@ void TPipeline::CompleteTx(const TOperation::TPtr op, TTransactionContext& txc, 
     Self->TransQueue.RemoveTx(db, *op);
     RemoveInReadSets(op, db);
 
+    if (Self->IsMvccEnabled()) {
+        Self->PromoteFollowerReadEdge(txc);
+    }
+
     while (!DelayedAcks.empty()
            && DelayedAcks.begin()->first.Step <= OutdatedReadSetStep())
     {
@@ -1143,15 +1150,17 @@ ui64 TPipeline::GetInactiveTxSize() const {
     return res;
 }
 
-void TPipeline::SaveForPropose(TValidatedDataTx::TPtr tx) {
+bool TPipeline::SaveForPropose(TValidatedDataTx::TPtr tx) {
     Y_VERIFY(tx && tx->TxId());
     if (DataTxCache.size() <= Config.LimitDataTxCache) {
         ui64 quota = tx->GetTxSize() + tx->GetMemoryAllocated();
         if (Self->TryCaptureTxCache(quota)) {
             tx->SetTxCacheUsage(quota);
             DataTxCache[tx->TxId()] = tx;
+            return true;
         }
     }
+    return false;
 }
 
 void TPipeline::SetProposed(ui64 txId, const TActorId& actorId) {
@@ -1393,7 +1402,7 @@ TOperation::TPtr TPipeline::BuildOperation(TEvDataShard::TEvProposeTransaction::
         } else if (tx->IsReadTable() && dataTx->GetReadTableTransaction().HasSnapshotStep() && dataTx->GetReadTableTransaction().HasSnapshotTxId()) {
             badRequest("Ambiguous snapshot info. Cannot use both MVCC and read table snapshots in one transaction");
             return tx;
-        } else if (tx->IsKqpScanTransaction() && dataTx->GetKqpTransaction().HasSnapshot()) {
+        } else if (tx->IsKqpScanTransaction() && dataTx->HasKqpSnapshot()) {
             badRequest("Ambiguous snapshot info. Cannot use both MVCC and kqp scan snapshots in one transaction");
             return tx;
         }
@@ -1421,9 +1430,9 @@ TOperation::TPtr TPipeline::BuildOperation(TEvDataShard::TEvProposeTransaction::
 
         if (!tx->IsImmediate() || !Self->IsMvccEnabled()) {
             // No op
-        } else if (tx->IsKqpScanTransaction() && dataTx->GetKqpTransaction().HasSnapshot()) {
+        } else if (tx->IsKqpScanTransaction() && dataTx->HasKqpSnapshot()) {
             // to be consistent while dependencies calculation
-            auto snapshot = dataTx->GetKqpTransaction().GetSnapshot();
+            auto snapshot = dataTx->GetKqpSnapshot();
             tx->SetMvccSnapshot(TRowVersion(snapshot.GetStep(), snapshot.GetTxId()));
         }
     }
@@ -1439,6 +1448,31 @@ void TPipeline::BuildDataTx(TActiveTransaction *tx, TTransactionContext &txc, co
     // for restarted immediate tx.
     if (dataTx->ProgramSize() || dataTx->IsKqpDataTx())
         dataTx->ExtractKeys(false);
+}
+
+void TPipeline::RegisterDistributedWrites(const TOperation::TPtr& op, NTable::TDatabase& db)
+{
+    if (op->HasFlag(TTxFlags::DistributedWritesRegistered)) {
+        return;
+    }
+
+    // Try to cache write keys if possible
+    if (!op->IsImmediate() && op->HasKeysInfo()) {
+        auto& keysInfo = op->GetKeysInfo();
+        if (keysInfo.WritesCount > 0) {
+            TConflictsCache::TPendingWrites writes;
+            for (const auto& vk : keysInfo.Keys) {
+                const auto& k = *vk.Key;
+                if (vk.IsWrite && k.Range.Point && Self->IsUserTable(k.TableId)) {
+                    writes.emplace_back(Self->GetLocalTableId(k.TableId), k.Range.GetOwnedFrom());
+                }
+            }
+            if (!writes.empty()) {
+                Self->GetConflictsCache().RegisterDistributedWrites(op->GetTxId(), std::move(writes), db);
+            }
+            op->SetFlag(TTxFlags::DistributedWritesRegistered);
+        }
+    }
 }
 
 EExecutionStatus TPipeline::RunExecutionUnit(TOperation::TPtr op, TTransactionContext &txc, const TActorContext &ctx)
@@ -1933,7 +1967,7 @@ void TPipeline::RemoveCommittingOp(const TOperation::TPtr& op) {
 }
 
 bool TPipeline::WaitCompletion(const TOperation::TPtr& op) const {
-    if (!Self->IsMvccEnabled() || !op->IsMvccSnapshotRead() || op->HasWaitCompletionFlag())
+    if (Self->IsFollower() || !Self->IsMvccEnabled() || !op->IsMvccSnapshotRead() || op->HasWaitCompletionFlag())
         return true;
 
     // don't send errors early

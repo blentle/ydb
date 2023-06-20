@@ -61,7 +61,8 @@ THolder<NKikimr::TEvDataShard::TEvReadAck> DefaultAckSettings() {
     return result;
 }
 
-NActors::TActorId PipeCacheId = NKikimr::MakePipePeNodeCacheID(false);
+NActors::TActorId MainPipeCacheId = NKikimr::MakePipePeNodeCacheID(false);
+NActors::TActorId FollowersPipeCacheId =  NKikimr::MakePipePeNodeCacheID(true);
 
 TDuration StartRetryDelay = TDuration::MilliSeconds(250);
 
@@ -104,6 +105,7 @@ public:
 
         size_t ResolveAttempt = 0;
         size_t RetryAttempt = 0;
+        size_t SuccessBatches = 0;
 
         TShardState(ui64 tabletId)
             : TabletId(tabletId)
@@ -360,6 +362,8 @@ public:
         , HolderFactory(args.HolderFactory)
         , Alloc(args.Alloc)
         , Counters(counters)
+        , UseFollowers(false)
+        , PipeCacheId(MainPipeCacheId)
     {
         TableId = TTableId(
             Settings.GetTable().GetTableId().GetOwnerId(),
@@ -367,6 +371,13 @@ public:
             Settings.GetTable().GetSysViewInfo(),
             Settings.GetTable().GetTableId().GetSchemaVersion()
         );
+
+        if (Settings.GetUseFollowers() && !Snapshot.IsValid()) {
+            // reading from followers is allowed only of snapshot is not specified and
+            // specific flag is set. otherwise we always read from main replicas.
+            PipeCacheId = FollowersPipeCacheId;
+            UseFollowers = true;
+        }
 
         InitResultColumns();
 
@@ -442,6 +453,7 @@ public:
         }
 
         if (!Settings.HasShardIdHint()) {
+            InFlightShards.PushBack(&state);
             ResolveShard(&state);
         } else {
             StartShards();
@@ -521,7 +533,15 @@ public:
         CA_LOG_D("Received TEvResolveKeySetResult update for table '" << Settings.GetTable().GetTablePath() << "'");
 
         auto* request = ev->Get()->Request.Get();
-        if (request->ErrorCount > 0) {
+        THolder<TShardState> state;
+        if (!request->ResultSet.empty()) {
+            if (auto ptr = ResolveShards[request->ResultSet[0].UserData]) {
+                state = THolder<TShardState>(ptr);
+                ResolveShards.erase(request->ResultSet[0].UserData);
+            }
+        }
+
+        if (request->ErrorCount > 0 || !state) {
             CA_LOG_E("Resolve request failed for table '" << Settings.GetTable().GetTablePath() << "', ErrorCount# " << request->ErrorCount);
 
             auto statusCode = NDqProto::StatusIds::UNAVAILABLE;
@@ -557,13 +577,6 @@ public:
         }
 
         auto keyDesc = std::move(request->ResultSet[0].KeyDescription);
-        THolder<TShardState> state;
-        if (auto ptr = ResolveShards[request->ResultSet[0].UserData]) {
-            state = THolder<TShardState>(ptr);
-            ResolveShards.erase(request->ResultSet[0].UserData);
-        } else {
-            return;
-        }
 
         if (keyDesc->GetPartitions().size() == 1) {
             auto& partition = keyDesc->GetPartitions()[0];
@@ -828,7 +841,7 @@ public:
 
         Counters->CreatedIterators->Inc();
         ReadIdByTabletId[state->TabletId].push_back(id);
-        Send(::PipeCacheId, new TEvPipeCache::TEvForward(ev.Release(), state->TabletId, true),
+        Send(PipeCacheId, new TEvPipeCache::TEvForward(ev.Release(), state->TabletId, true),
             IEventHandle::FlagTrackDelivery);
     }
 
@@ -866,9 +879,20 @@ public:
             CA_LOG_D("read id #" << id << " got issue " << issue.Getmessage());
             Reads[id].Shard->Issues.push_back(issue);
         }
+
+        if (UseFollowers && record.GetStatus().GetCode() != Ydb::StatusIds::SUCCESS && Reads[id].Shard->SuccessBatches > 0) {
+            // read from follower is interrupted with error after several successful responses.
+            // in this case read is not safe because we can return inconsistent data.
+            NYql::TIssues issues;
+            NYql::IssuesFromMessage(record.GetStatus().GetIssues(), issues);
+            return RuntimeError("Failed to read from follower", NYql::NDqProto::StatusIds::UNAVAILABLE, issues);
+        }
+
         switch (record.GetStatus().GetCode()) {
-            case Ydb::StatusIds::SUCCESS:
+            case Ydb::StatusIds::SUCCESS: {
+                Reads[id].Shard->SuccessBatches++;
                 break;
+            }
             case Ydb::StatusIds::OVERLOADED: {
                 return RetryRead(id, false);
             }
@@ -938,7 +962,7 @@ public:
             auto* state = Reads[id].Shard;
             auto cancel = MakeHolder<TEvDataShard::TEvReadCancel>();
             cancel->Record.SetReadId(id);
-            Send(::PipeCacheId, new TEvPipeCache::TEvForward(cancel.Release(), state->TabletId, false));
+            Send(PipeCacheId, new TEvPipeCache::TEvForward(cancel.Release(), state->TabletId, false));
 
             Reads[id].Reset();
             ResetReads++;
@@ -1084,7 +1108,7 @@ public:
     }
 
     i64 GetAsyncInputData(
-        NKikimr::NMiniKQL::TUnboxedValueVector& resultVector,
+        NKikimr::NMiniKQL::TUnboxedValueBatch& resultBatch,
         TMaybe<TInstant>&,
         bool& finished,
         i64 freeSpace) override
@@ -1094,6 +1118,8 @@ public:
             StartTableScan();
             return 0;
         }
+
+        YQL_ENSURE(!resultBatch.IsWide(), "Wide stream is not supported");
 
         CA_LOG_D(TStringBuilder() << " enter getasyncinputdata results size " << Results.size());
         ui64 bytes = 0;
@@ -1118,7 +1144,7 @@ public:
 
             for (; result.ProcessedRows < result.PackedRows; ++result.ProcessedRows) {
                 NMiniKQL::TBytesStatistics rowSize = GetRowSize((*batch)[result.ProcessedRows].GetElements());
-                resultVector.push_back(std::move((*batch)[result.ProcessedRows]));
+                resultBatch.push_back(std::move((*batch)[result.ProcessedRows]));
                 ProcessedRowCount += 1;
                 bytes += rowSize.AllocatedBytes;
                 if (ProcessedRowCount == Settings.GetItemsLimit()) {
@@ -1127,7 +1153,7 @@ public:
                     return bytes;
                 }
             }
-            CA_LOG_D(TStringBuilder() << "returned " << resultVector.size() << " rows; processed " << ProcessedRowCount << " rows");
+            CA_LOG_D(TStringBuilder() << "returned " << resultBatch.RowCount() << " rows; processed " << ProcessedRowCount << " rows");
 
             size_t rowCount = result.ReadResult.Get()->Get()->GetRowsCount();
             if (rowCount == result.ProcessedRows) {
@@ -1148,7 +1174,7 @@ public:
                         }
                         Counters->SentIteratorAcks->Inc();
                         CA_LOG_D("sending ack for read #" << id << " limit " << limit << " seqno = " << record.GetSeqNo());
-                        Send(::PipeCacheId, new TEvPipeCache::TEvForward(request.Release(), Reads[id].Shard->TabletId, true),
+                        Send(PipeCacheId, new TEvPipeCache::TEvForward(request.Release(), Reads[id].Shard->TabletId, true),
                             IEventHandle::FlagTrackDelivery);
                     } else {
                         Reads[id].Finished = true;
@@ -1159,8 +1185,6 @@ public:
                     ResetRead(id);
                 }
 
-                StartShards();
-
                 Results.pop();
                 CA_LOG_D("dropping batch for read #" << id);
 
@@ -1168,12 +1192,14 @@ public:
                     finished = true;
                     break;
                 }
+
+                StartShards();
             } else {
                 break;
             }
         }
 
-        if (RunningReads() == 0 && PendingShards.Empty() && ScanStarted) {
+        if (ScanStarted && RunningReads() == 0 && PendingShards.Empty() && ResolveShards.empty()) {
             finished = true;
         }
 
@@ -1231,7 +1257,10 @@ public:
             for (size_t i = 0; i < Reads.size(); ++i) {
                 ResetRead(i);
             }
-            Send(PipeCacheId, new TEvPipeCache::TEvUnlink(0));
+            Send(::MainPipeCacheId, new TEvPipeCache::TEvUnlink(0));
+            if (UseFollowers) {
+                Send(::FollowersPipeCacheId, new TEvPipeCache::TEvUnlink(0));
+            }
         }
         TBase::PassAway();
     }
@@ -1330,6 +1359,8 @@ private:
     std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> Alloc;
 
     TIntrusivePtr<TKqpCounters> Counters;
+    bool UseFollowers;
+    NActors::TActorId PipeCacheId;
 };
 
 
@@ -1351,7 +1382,7 @@ void InjectRangeEvReadAckSettings(const NKikimrTxDataShard::TEvReadAck& ack) {
 }
 
 void InterceptReadActorPipeCache(NActors::TActorId id) {
-    ::PipeCacheId = id;
+    ::MainPipeCacheId = id;
 }
 
 } // namespace NKqp

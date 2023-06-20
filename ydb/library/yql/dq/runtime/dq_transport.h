@@ -7,6 +7,7 @@
 #include <ydb/library/yql/ast/yql_expr.h>
 #include <ydb/library/yql/minikql/mkql_function_registry.h>
 #include <ydb/library/yql/minikql/computation/mkql_computation_node.h>
+#include <ydb/library/yql/minikql/computation/mkql_computation_node_holders.h>
 #include <ydb/library/yql/minikql/computation/mkql_computation_node_pack.h>
 
 
@@ -23,26 +24,26 @@ public:
     NDqProto::EDataTransportVersion GetTransportVersion() const;
 
     NDqProto::TData Serialize(const NUdf::TUnboxedValue& value, const NKikimr::NMiniKQL::TType* itemType) const;
+    NDqProto::TData Serialize(const NKikimr::NMiniKQL::TUnboxedValueBatch& buffer, const NKikimr::NMiniKQL::TType* itemType) const;
 
     template <class TForwardIterator>
     NDqProto::TData Serialize(TForwardIterator first, TForwardIterator last, const NKikimr::NMiniKQL::TType* itemType) const {
-        const auto listType = NKikimr::NMiniKQL::TListType::Create(const_cast<NKikimr::NMiniKQL::TType*>(itemType), TypeEnv);
         if (TransportVersion == NDqProto::DATA_TRANSPORT_VERSION_UNSPECIFIED ||
             TransportVersion == NDqProto::DATA_TRANSPORT_UV_PICKLE_1_0)
         {
-            NKikimr::NMiniKQL::TValuePackerTransport<false> packer(listType);
+            NKikimr::NMiniKQL::TValuePackerTransport<false> packer(itemType);
             return SerializeBatch(packer, first, last);
         }
         
         if (TransportVersion == NDqProto::DATA_TRANSPORT_UV_FAST_PICKLE_1_0) {
-            NKikimr::NMiniKQL::TValuePackerTransport<true> packer(listType);
+            NKikimr::NMiniKQL::TValuePackerTransport<true> packer(itemType);
             return SerializeBatch(packer, first, last);
         }
         YQL_ENSURE(false, "Unsupported TransportVersion");
     }
 
     void Deserialize(const NDqProto::TData& data, const NKikimr::NMiniKQL::TType* itemType,
-        NKikimr::NMiniKQL::TUnboxedValueVector& buffer) const;
+        NKikimr::NMiniKQL::TUnboxedValueBatch& buffer) const;
     void Deserialize(const NDqProto::TData& data, const NKikimr::NMiniKQL::TType* itemType, NUdf::TUnboxedValue& value) const;
 
     struct TEstimateSizeSettings {
@@ -78,8 +79,8 @@ private:
         const auto& packed = packer.Finish();
         NDqProto::TData data;
         data.SetTransportVersion(TransportVersion);
-        data.MutableRaw()->reserve(packed.Size());
-        packed.CopyTo(*data.MutableRaw());
+        data.MutableRaw()->reserve(packed->Size());
+        packed->CopyTo(*data.MutableRaw());
         data.SetRows(count);
         return data;
     }

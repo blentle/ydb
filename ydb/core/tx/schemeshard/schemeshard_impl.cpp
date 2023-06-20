@@ -824,6 +824,29 @@ bool TSchemeShard::ResolveRtmrChannels(const TPathId domainId, TChannelsBindings
     return ResolveChannelCommon(profileId, domainId, channelsBinding, &ResolveChannelsDetailsAsIs);
 }
 
+bool TSchemeShard::ResolveSolomonChannels(const NKikimrSchemeOp::TKeyValueStorageConfig &config, const TPathId domainId, TChannelsBindings& channelsBinding) const
+{
+    TSubDomainInfo::TPtr domainInfo = SubDomains.at(domainId);
+    auto& storagePools = domainInfo->EffectiveStoragePools();
+
+    if (!storagePools) {
+        // no storage pool no binding it's Ok
+        channelsBinding.clear();
+        return false;
+    }
+
+    auto getPoolKind = [&] (ui32 channel) {
+        return TStringBuf(config.GetChannel(channel).GetPreferredPoolKind());
+    };
+
+    return ResolvePoolNames(
+        config.ChannelSize(),
+        getPoolKind,
+        storagePools,
+        channelsBinding
+    );
+}
+
 bool TSchemeShard::ResolveSolomonChannels(ui32 profileId, const TPathId domainId, TChannelsBindings &channelsBinding) const
 {
     return ResolveChannelCommon(profileId, domainId, channelsBinding, &ResolveChannelsDetailsAsIs);
@@ -1546,6 +1569,7 @@ void TSchemeShard::PersistCdcStream(NIceDb::TNiceDb& db, const TPathId& pathId) 
         NIceDb::TUpdate<Schema::CdcStream::Mode>(alterData->Mode),
         NIceDb::TUpdate<Schema::CdcStream::Format>(alterData->Format),
         NIceDb::TUpdate<Schema::CdcStream::VirtualTimestamps>(alterData->VirtualTimestamps),
+        NIceDb::TUpdate<Schema::CdcStream::ResolvedTimestampsIntervalMs>(alterData->ResolvedTimestamps.MilliSeconds()),
         NIceDb::TUpdate<Schema::CdcStream::AwsRegion>(alterData->AwsRegion),
         NIceDb::TUpdate<Schema::CdcStream::State>(alterData->State)
     );
@@ -1571,6 +1595,7 @@ void TSchemeShard::PersistCdcStreamAlterData(NIceDb::TNiceDb& db, const TPathId&
         NIceDb::TUpdate<Schema::CdcStreamAlterData::Mode>(alterData->Mode),
         NIceDb::TUpdate<Schema::CdcStreamAlterData::Format>(alterData->Format),
         NIceDb::TUpdate<Schema::CdcStreamAlterData::VirtualTimestamps>(alterData->VirtualTimestamps),
+        NIceDb::TUpdate<Schema::CdcStreamAlterData::ResolvedTimestampsIntervalMs>(alterData->ResolvedTimestamps.MilliSeconds()),
         NIceDb::TUpdate<Schema::CdcStreamAlterData::AwsRegion>(alterData->AwsRegion),
         NIceDb::TUpdate<Schema::CdcStreamAlterData::State>(alterData->State)
     );
@@ -2508,7 +2533,7 @@ void TSchemeShard::PersistRemovePersQueueGroup(NIceDb::TNiceDb& db, TPathId path
 
         for (const auto& shard : pqGroup->Shards) {
             for (const auto& pqInfo : shard.second->Partitions) {
-                PersistRemovePersQueue(db, pathId, pqInfo.PqId);
+                PersistRemovePersQueue(db, pathId, pqInfo->PqId);
             }
         }
 
@@ -2541,10 +2566,20 @@ void TSchemeShard::PersistRemovePersQueueGroupAlter(NIceDb::TNiceDb& db, TPathId
 void TSchemeShard::PersistPersQueue(NIceDb::TNiceDb &db, TPathId pathId, TShardIdx shardIdx, const TTopicTabletInfo::TTopicPartitionInfo& pqInfo) {
     Y_VERIFY(IsLocalId(pathId));
 
-    db.Table<Schema::PersQueues>().Key(pathId.LocalPathId, pqInfo.PqId).Update(
-        NIceDb::TUpdate<Schema::PersQueues::ShardIdx>(shardIdx.GetLocalId()),
-        NIceDb::TUpdate<Schema::PersQueues::GroupId>(pqInfo.GroupId),
-        NIceDb::TUpdate<Schema::PersQueues::AlterVersion>(pqInfo.AlterVersion));
+    Y_VERIFY(pqInfo.ParentPartitionIds.size() <= 2);
+    auto it = pqInfo.ParentPartitionIds.begin();
+    const auto parent = it != pqInfo.ParentPartitionIds.end() ? (it++).cur->val : Max<ui32>();
+    const auto adjacentParent = it != pqInfo.ParentPartitionIds.end() ? (it++).cur->val : Max<ui32>();
+
+    db.Table<Schema::PersQueues>()
+        .Key(pathId.LocalPathId, pqInfo.PqId)
+        .Update(NIceDb::TUpdate<Schema::PersQueues::ShardIdx>(shardIdx.GetLocalId()),
+                NIceDb::TUpdate<Schema::PersQueues::GroupId>(pqInfo.GroupId),
+                NIceDb::TUpdate<Schema::PersQueues::AlterVersion>(pqInfo.AlterVersion),
+                NIceDb::TUpdate<Schema::PersQueues::CreateVersion>(pqInfo.CreateVersion),
+                NIceDb::TUpdate<Schema::PersQueues::Status>(pqInfo.Status),
+                NIceDb::TUpdate<Schema::PersQueues::Parent>(parent),
+                NIceDb::TUpdate<Schema::PersQueues::AdjacentParent>(adjacentParent));
 
     if (pqInfo.KeyRange) {
         if (pqInfo.KeyRange->FromBound) {
@@ -6678,6 +6713,10 @@ void TSchemeShard::ChangeDiskSpaceTablesIndexBytes(i64 delta) {
 
 void TSchemeShard::ChangeDiskSpaceTablesTotalBytes(i64 delta) {
     TabletCounters->Simple()[COUNTER_DISK_SPACE_TABLES_TOTAL_BYTES].Add(delta);
+}
+
+void TSchemeShard::ChangeDiskSpaceTopicsTotalBytes(ui64 value) {
+    TabletCounters->Simple()[COUNTER_DISK_SPACE_TOPICS_TOTAL_BYTES].Set(value);
 }
 
 void TSchemeShard::ChangeDiskSpaceQuotaExceeded(i64 delta) {

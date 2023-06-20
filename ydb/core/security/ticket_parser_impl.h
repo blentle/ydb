@@ -964,8 +964,9 @@ protected:
         bool NeedsRefresh() const {
             switch (TokenType) {
                 case TDerived::ETokenType::Builtin:
-                case TDerived::ETokenType::Login:
                     return false;
+                case TDerived::ETokenType::Login:
+                    return true;
                 default:
                     return Signature.AccessKeyId.empty();
             }
@@ -1167,10 +1168,55 @@ protected:
     }
 
     template <typename TTokenRecord>
+    bool CanRefreshAccessServiceTicket(const TTokenRecord& record) {
+        if (!AccessServiceValidator) {
+            return false;
+        }
+        if (record.TokenType == TDerived::ETokenType::AccessService) {
+            return (record.Error && record.Error.Retryable) || !record.Signature.AccessKeyId;
+        }
+        return record.TokenType == TDerived::ETokenType::Unknown;
+    }
+
+    template <typename TTokenRecord>
+    bool CanRefreshLoginTicket(const TTokenRecord& record) {
+        return record.TokenType == TDerived::ETokenType::Login && record.Error.empty();
+    }
+
+    template <typename TTokenRecord>
+    bool RefreshLoginTicket(const TString& key, TTokenRecord& record) {
+        GetDerived()->ResetTokenRecord(record);
+        const TString& database = Config.GetDomainLoginOnly() ? DomainName : record.Database;
+        auto itLoginProvider = LoginProviders.find(database);
+        if (itLoginProvider == LoginProviders.end()) {
+            return false;
+        }
+        NLogin::TLoginProvider& loginProvider(itLoginProvider->second);
+        const TString userSID = record.GetToken()->GetUserSID();
+        if (loginProvider.CheckUserExists(userSID)) {
+            const std::vector<TString> providerGroups = loginProvider.GetGroupsMembership(userSID);
+            const TVector<NACLib::TSID> groups(providerGroups.begin(), providerGroups.end());
+            SetToken(key, record, new NACLib::TUserToken({
+                                    .OriginalUserToken = record.Ticket,
+                                    .UserSID = userSID,
+                                    .GroupSIDs = groups,
+                                    .AuthType = record.GetAuthType()
+                                }));
+        } else {
+            TEvTicketParser::TError error;
+            error.Message = "User not found";
+            error.Retryable = false;
+            SetError(key, record, error);
+        }
+        return true;
+    }
+
+    template <typename TTokenRecord>
     bool CanRefreshTicket(const TString& key, TTokenRecord& record) {
-        if (AccessServiceValidator
-            && ((record.TokenType == TDerived::ETokenType::AccessService && !record.Signature.AccessKeyId)
-                || record.TokenType == TDerived::ETokenType::Unknown)) {
+        if (CanRefreshLoginTicket(record)) {
+            return RefreshLoginTicket(key, record);
+        }
+        if (CanRefreshAccessServiceTicket(record)) {
             GetDerived()->ResetTokenRecord(record);
             if (record.Permissions) {
                 RequestAccessServiceAuthorization(key, record);

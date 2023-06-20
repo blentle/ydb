@@ -1120,7 +1120,7 @@ public:
                 return x.GetKey() < y.GetKey();
             }
 
-            Y_SAVELOAD_DEFINE(Type, SharedWithOs, ReadCentric, Kind)
+            Y_SAVELOAD_DEFINE(Type, SharedWithOs, ReadCentric, Kind);
         };
 
         Table::Name::Type Name;
@@ -1424,7 +1424,6 @@ public:
 
 private:
     TString InstanceId;
-    TActorId SelfHealId;
     std::shared_ptr<std::atomic_uint64_t> SelfHealUnreassignableGroups = std::make_shared<std::atomic_uint64_t>();
     TMaybe<TActorId> MigrationId;
     TVSlots VSlots; // ordering is important
@@ -1728,6 +1727,7 @@ public:
     // It interacts with BS_CONTROLLER and group observer (which provides information about group state on a per-vdisk
     // basis). BS_CONTROLLER reports faulty PDisks and all involved groups in a push notification manner.
     IActor *CreateSelfHealActor();
+    TActorId SelfHealId;
 
     bool IsGroupLayoutSanitizerEnabled() const {
         return GroupLayoutSanitizerEnabled;
@@ -1738,6 +1738,8 @@ public:
         TEvInterconnect::TEvNodesInfo nodes;
         HostRecords = std::make_shared<THostRecordMapImpl>(&nodes);
     }
+
+    ui64 NextConfigTxSeqNo = 1;
 
 private:
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2100,8 +2102,13 @@ public:
 
         const TMonotonic now = TActivationContext::Monotonic();
         THashSet<TGroupInfo*> groups;
+
+        auto sh = std::make_unique<TEvControllerUpdateSelfHealInfo>();
         for (auto it = VSlotReadyTimestampQ.begin(); it != VSlotReadyTimestampQ.end() && it->first <= now;
                 it = VSlotReadyTimestampQ.erase(it)) {
+            Y_VERIFY_DEBUG(!it->second->IsReady);
+            
+            sh->VDiskIsReadyUpdate.emplace_back(it->second->GetVDiskId(), true);
             it->second->IsReady = true;
             it->second->ResetVSlotReadyTimestampIter();
             if (const TGroupInfo *group = it->second->Group) {
@@ -2118,6 +2125,9 @@ public:
         ScheduleVSlotReadyUpdate();
         if (!timingQ.empty()) {
             Execute(CreateTxUpdateLastSeenReady(std::move(timingQ)));
+        }
+        if (sh->VDiskIsReadyUpdate) {
+            Send(SelfHealId, sh.release());
         }
     }
 

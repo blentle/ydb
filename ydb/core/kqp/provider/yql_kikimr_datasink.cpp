@@ -95,6 +95,12 @@ private:
         return TStatus::Ok;
     }
 
+    TStatus HandleModifyPermissions(TKiModifyPermissions node, TExprContext& ctx) override {
+        ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
+            << "ModifyPermissions is not yet implemented for intent determination transformer"));
+        return TStatus::Error;
+    }
+
     TStatus HandleCreateUser(TKiCreateUser node, TExprContext& ctx) override {
         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
             << "CreateUser is not yet implemented for intent determination transformer"));
@@ -110,6 +116,12 @@ private:
     TStatus HandleDropUser(TKiDropUser node, TExprContext& ctx) override {
         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
             << "DropUser is not yet implemented for intent determination transformer"));
+        return TStatus::Error;
+    }
+
+    TStatus HandleUpsertObject(TKiUpsertObject node, TExprContext& ctx) override {
+        ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
+            << "UpsertObject is not yet implemented for intent determination transformer"));
         return TStatus::Error;
     }
 
@@ -260,6 +272,8 @@ private:
             case TKikimrKey::Type::Object:
                 return TStatus::Ok;
             case TKikimrKey::Type::Topic:
+                return TStatus::Ok;
+            case TKikimrKey::Type::Permission:
                 return TStatus::Ok;
         }
 
@@ -430,10 +444,15 @@ public:
             || node.IsCallable(TKiCreateGroup::CallableName())
             || node.IsCallable(TKiAlterGroup::CallableName())
             || node.IsCallable(TKiDropGroup::CallableName())
+            || node.IsCallable(TKiUpsertObject::CallableName())
             || node.IsCallable(TKiCreateObject::CallableName())
             || node.IsCallable(TKiAlterObject::CallableName())
             || node.IsCallable(TKiDropObject::CallableName()))
-{
+        {
+            return true;
+        }
+
+        if (node.IsCallable(TKiModifyPermissions::CallableName())) {
             return true;
         }
 
@@ -628,7 +647,16 @@ public:
                 YQL_ENSURE(settings.Mode);
                 auto mode = settings.Mode.Cast();
 
-                if (mode == "createObject") {
+                if (mode == "upsertObject") {
+                    return Build<TKiUpsertObject>(ctx, node->Pos())
+                        .World(node->Child(0))
+                        .DataSink(node->Child(1))
+                        .ObjectId().Build(key.GetObjectId())
+                        .TypeId().Build(key.GetObjectType())
+                        .Features(settings.Features)
+                        .Done()
+                        .Ptr();
+                } else if (mode == "createObject") {
                     return Build<TKiCreateObject>(ctx, node->Pos())
                         .World(node->Child(0))
                         .DataSink(node->Child(1))
@@ -716,6 +744,26 @@ public:
                         .Ptr();
                 } else {
                     YQL_ENSURE(false, "unknown Role mode \"" << TString(mode) << "\"");
+                }
+                break;
+            }
+
+            case TKikimrKey::Type::Permission: {
+                NCommon::TWritePermissionSettings settings = NCommon::ParseWritePermissionsSettings(TExprList(node->Child(4)), ctx);
+                const auto& mode = key.GetPermissionAction();
+
+                if (mode == "grant" || mode == "revoke") {
+                    return Build<TKiModifyPermissions>(ctx, node->Pos())
+                        .World(node->Child(0))
+                        .DataSink(node->Child(1))
+                        .Action().Build(mode)
+                        .Permissions(settings.Permissions.Cast())
+                        .Pathes(settings.Pathes.Cast())
+                        .Roles(settings.RoleNames.Cast())
+                        .Done()
+                        .Ptr();
+                } else {
+                    YQL_ENSURE(false, "unknown Permission action \"" << TString(mode) << "\"");
                 }
                 break;
             }
@@ -808,6 +856,10 @@ IGraphTransformer::TStatus TKiSinkVisitorTransformer::DoTransform(TExprNode::TPt
         return HandleDropTopic(node.Cast(), ctx);
     }
 
+    if (auto node = TMaybeNode<TKiUpsertObject>(input)) {
+        return HandleUpsertObject(node.Cast(), ctx);
+    }
+
     if (auto node = TMaybeNode<TKiCreateObject>(input)) {
         return HandleCreateObject(node.Cast(), ctx);
     }
@@ -818,6 +870,10 @@ IGraphTransformer::TStatus TKiSinkVisitorTransformer::DoTransform(TExprNode::TPt
 
     if (auto node = TMaybeNode<TKiDropObject>(input)) {
         return HandleDropObject(node.Cast(), ctx);
+    }
+
+    if (auto node = TMaybeNode<TKiModifyPermissions>(input)) {
+        return HandleModifyPermissions(node.Cast(), ctx);
     }
 
     if (auto node = TMaybeNode<TKiCreateUser>(input)) {

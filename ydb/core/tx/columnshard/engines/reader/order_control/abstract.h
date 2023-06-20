@@ -1,4 +1,5 @@
 #pragma once
+#include "result.h"
 #include <ydb/core/tx/columnshard/engines/reader/granule.h>
 #include <ydb/core/tx/columnshard/engines/reader/read_metadata.h>
 
@@ -13,15 +14,14 @@ public:
         NeedNotAppliedEarlyFilter = 1 << 1
     };
     using TFeatures = ui32;
-private:
-    mutable std::optional<TFeatures> Features;
 protected:
     TReadMetadata::TConstPtr ReadMetadata;
+    virtual TString DoDebugString() const = 0;
     virtual void DoFill(TGranulesFillingContext& context) = 0;
     virtual bool DoWakeup(const TGranule& /*granule*/, TGranulesFillingContext& /*context*/) {
         return true;
     }
-    virtual std::vector<TGranule*> DoDetachReadyGranules(THashMap<ui64, NIndexedReader::TGranule*>& granulesToOut) = 0;
+    virtual std::vector<TGranule::TPtr> DoDetachReadyGranules(TResultController& granulesToOut) = 0;
     virtual bool DoOnFilterReady(TBatch& batchInfo, const TGranule& /*granule*/, TGranulesFillingContext& context) {
         OnBatchFilterInitialized(batchInfo, context);
         return true;
@@ -32,10 +32,7 @@ protected:
         return 0;
     }
     TFeatures GetFeatures() const {
-        if (!Features) {
-            Features = DoGetFeatures();
-        }
-        return *Features;
+        return DoGetFeatures();
     }
 public:
     using TPtr = std::shared_ptr<IOrderPolicy>;
@@ -66,7 +63,7 @@ public:
 
     virtual bool ReadyForAddNotIndexedToEnd() const = 0;
 
-    std::vector<TGranule*> DetachReadyGranules(THashMap<ui64, NIndexedReader::TGranule*>& granulesToOut) {
+    std::vector<TGranule::TPtr> DetachReadyGranules(TResultController& granulesToOut) {
         return DoDetachReadyGranules(granulesToOut);
     }
 
@@ -76,6 +73,10 @@ public:
 
     bool Wakeup(const TGranule& granule, TGranulesFillingContext& context) {
         return DoWakeup(granule, context);
+    }
+
+    TString DebugString() const {
+        return DoDebugString();
     }
 };
 

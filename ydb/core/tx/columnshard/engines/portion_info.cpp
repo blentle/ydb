@@ -4,40 +4,92 @@
 
 namespace NKikimr::NOlap {
 
-std::shared_ptr<arrow::RecordBatch> ISnapshotSchema::NormalizeFullBatch(const ISnapshotSchema& dataSchema, const std::shared_ptr<arrow::RecordBatch> batch) const {
-    auto schema = GetIndexInfo().ArrowSchema();
-    return NormalizeBatchImpl(dataSchema, batch, GetIndexInfo().ArrowSchema());
-}
-
 std::shared_ptr<arrow::RecordBatch> ISnapshotSchema::NormalizeBatch(const ISnapshotSchema& dataSchema, const std::shared_ptr<arrow::RecordBatch> batch) const {
-    return NormalizeBatchImpl(dataSchema, batch, GetSchema());
-}
-
-std::shared_ptr<arrow::RecordBatch> ISnapshotSchema::NormalizeBatchImpl(const ISnapshotSchema& dataSchema, const std::shared_ptr<arrow::RecordBatch> batch,
-                const std::shared_ptr<arrow::Schema>& resultArrowSchema) const {
-    if (dataSchema.GetSnapshot() == GetSnapshot()) {    
+    if (dataSchema.GetSnapshot() == GetSnapshot()) {
         return batch;
     }
+    const std::shared_ptr<arrow::Schema>& resultArrowSchema = GetSchema();
     Y_VERIFY(dataSchema.GetSnapshot() < GetSnapshot());
     std::vector<std::shared_ptr<arrow::Array>> newColumns;
-    newColumns.resize(resultArrowSchema->num_fields(), 0);
+    newColumns.reserve(resultArrowSchema->num_fields());
 
     for (size_t i = 0; i < resultArrowSchema->fields().size(); ++i) {
-        auto& field = resultArrowSchema->fields()[i];
-        auto columnId = GetIndexInfo().GetColumnId(field->name());
+        auto& resultField = resultArrowSchema->fields()[i];
+        auto columnId = GetIndexInfo().GetColumnId(resultField->name());
         auto oldColumnIndex = dataSchema.GetFieldIndex(columnId);
         if (oldColumnIndex >= 0) { // ClumnExists
-            auto oldColumnInfo = dataSchema.GetField(oldColumnIndex);
+            auto oldColumnInfo = dataSchema.GetFieldByIndex(oldColumnIndex);
             Y_VERIFY(oldColumnInfo);
             auto columnData = batch->GetColumnByName(oldColumnInfo->name());
             Y_VERIFY(columnData);
-            newColumns[i] = columnData;
+            newColumns.push_back(columnData);
         } else { // AddNullColumn
-            auto nullColumn = NArrow::MakeEmptyBatch(arrow::schema({field}), batch->num_rows());
-            newColumns[i] = nullColumn->column(0);
+            auto nullColumn = NArrow::MakeEmptyBatch(arrow::schema({resultField}), batch->num_rows());
+            newColumns.push_back(nullColumn->column(0));
         }
     }
     return arrow::RecordBatch::Make(resultArrowSchema, batch->num_rows(), newColumns);
+}
+
+std::shared_ptr<arrow::RecordBatch> ISnapshotSchema::PrepareForInsert(const TString& data, const TString& dataSchemaStr, TString& strError) const {
+    std::shared_ptr<arrow::Schema> dstSchema = GetIndexInfo().ArrowSchema();
+    std::shared_ptr<arrow::Schema> dataSchema;
+    if (dataSchemaStr.size()) {
+        dataSchema = NArrow::DeserializeSchema(dataSchemaStr);
+        if (!dataSchema) {
+            strError = "DeserializeSchema() failed";
+            return nullptr;
+        }
+    }
+
+    auto batch = NArrow::DeserializeBatch(data, (dataSchema ? dataSchema : dstSchema));
+    if (!batch) {
+        strError = "DeserializeBatch() failed";
+        return nullptr;
+    }
+    if (batch->num_rows() == 0) {
+        strError = "empty batch";
+        return nullptr;
+    }
+
+    // Correct schema
+    if (dataSchema) {
+        batch = NArrow::ExtractColumns(batch, dstSchema, true);
+        if (!batch) {
+            strError = "cannot correct schema";
+            return nullptr;
+        }
+    }
+
+    if (!batch->schema()->Equals(dstSchema)) {
+        strError = "unexpected schema for insert batch: '" + batch->schema()->ToString() + "'";
+        return nullptr;
+    }
+
+    const auto& sortingKey = GetIndexInfo().GetSortingKey();
+    Y_VERIFY(sortingKey);
+
+    // Check PK is NOT NULL
+    for (auto& field : sortingKey->fields()) {
+        auto column = batch->GetColumnByName(field->name());
+        if (!column) {
+            strError = "missing PK column '" + field->name() + "'";
+            return nullptr;
+        }
+        if (NArrow::HasNulls(column)) {
+            strError = "PK column '" + field->name() + "' contains NULLs";
+            return nullptr;
+        }
+    }
+
+    auto status = batch->ValidateFull();
+    if (!status.ok()) {
+        strError = status.ToString();
+        return nullptr;
+    }
+    batch = NArrow::SortBatch(batch, sortingKey);
+    Y_VERIFY_DEBUG(NArrow::IsSorted(batch, sortingKey));
+    return batch;
 }
 
 TString TPortionInfo::SerializeColumn(const std::shared_ptr<arrow::Array>& array,
@@ -50,19 +102,9 @@ TString TPortionInfo::SerializeColumn(const std::shared_ptr<arrow::Array>& array
     return saver.Apply(batch);
 }
 
-TString TPortionInfo::AddOneChunkColumn(const std::shared_ptr<arrow::Array>& array,
-                                        const std::shared_ptr<arrow::Field>& field,
-                                        TColumnRecord&& record,
-                                        const TColumnSaver saver,
-                                        const ui32 limitBytes) {
-    auto blob = SerializeColumn(array, field, saver);
-    if (blob.size() >= limitBytes) {
-        return {};
-    }
-
+void TPortionInfo::AppendOneChunkColumn(TColumnRecord&& record) {
     record.Chunk = 0;
     Records.emplace_back(std::move(record));
-    return blob;
 }
 
 void TPortionInfo::AddMinMax(ui32 columnId, const std::shared_ptr<arrow::Array>& column, bool sorted) {
@@ -90,21 +132,21 @@ void TPortionInfo::AddMetadata(const ISnapshotSchema& snapshotSchema, const std:
     Meta.FirstPkColumn = indexInfo.GetPKFirstColumnId();
 
     // Copy first and last key rows into new batch to free source batch's memory
-    std::shared_ptr<arrow::RecordBatch> edgesBatch;
     {
-        auto keyBatch = NArrow::ExtractColumns(batch, indexInfo.GetIndexKey());
+        auto keyBatch = NArrow::ExtractColumns(batch, indexInfo.GetReplaceKey());
         std::vector<bool> bits(batch->num_rows(), false);
         bits[0] = true;
-        bits[batch->num_rows() - 1] = true;
+        bits[batch->num_rows() - 1] = true; // it colud be 0 if batch has one row
 
         auto filter = NArrow::TColumnFilter(std::move(bits)).BuildArrowFilter(batch->num_rows());
         auto res = arrow::compute::Filter(keyBatch, filter);
         Y_VERIFY(res.ok());
 
-        edgesBatch = res->record_batch();
-        Y_VERIFY(edgesBatch->num_rows() == 1 || edgesBatch->num_rows() == 2);
+        Meta.ReplaceKeyEdges = res->record_batch();
+        Y_VERIFY(Meta.ReplaceKeyEdges->num_rows() == 1 || Meta.ReplaceKeyEdges->num_rows() == 2);
     }
 
+    auto edgesBatch = NArrow::ExtractColumns(Meta.ReplaceKeyEdges, indexInfo.GetIndexKey());
     Meta.IndexKeyStart = NArrow::TReplaceKey::FromBatch(edgesBatch, 0);
     Meta.IndexKeyEnd = NArrow::TReplaceKey::FromBatch(edgesBatch, edgesBatch->num_rows() - 1);
 
@@ -127,7 +169,7 @@ void TPortionInfo::AddMetadata(const ISnapshotSchema& snapshotSchema, const std:
     }
 }
 
-TString TPortionInfo::GetMetadata(const TIndexInfo& indexInfo, const TColumnRecord& rec) const {
+TString TPortionInfo::GetMetadata(const TColumnRecord& rec) const {
     NKikimrTxColumnShard::TIndexColumnMeta meta; // TODO: move proto serialization out of engines folder
     if (Meta.ColumnMeta.contains(rec.ColumnId)) {
         const auto& columnMeta = Meta.ColumnMeta.find(rec.ColumnId)->second;
@@ -171,14 +213,11 @@ TString TPortionInfo::GetMetadata(const TIndexInfo& indexInfo, const TColumnReco
             portionMeta->SetTierName(TierName);
         }
 
-        Y_VERIFY(Meta.IndexKeyStart && Meta.IndexKeyEnd);
-        const bool compositeIndexKey = indexInfo.GetIndexKey()->num_fields() > 1;
-        if (compositeIndexKey) {
-            // We know that IndexKeyStart and IndexKeyEnd are made from edgesBatch. Restore it.
-            auto edgesBatch = Meta.IndexKeyStart->RestoreBatch(indexInfo.GetIndexKey());
-            Y_VERIFY(edgesBatch && edgesBatch->ValidateFull().ok());
-            Y_VERIFY(edgesBatch->num_rows() == 1 || edgesBatch->num_rows() == 2);
-            portionMeta->SetIndexKeyBorders(NArrow::SerializeBatchNoCompression(edgesBatch));
+        if (const auto& keyEdgesBatch = Meta.ReplaceKeyEdges) {
+            Y_VERIFY(keyEdgesBatch);
+            Y_VERIFY_DEBUG(keyEdgesBatch->ValidateFull().ok());
+            Y_VERIFY(keyEdgesBatch->num_rows() == 1 || keyEdgesBatch->num_rows() == 2);
+            portionMeta->SetPrimaryKeyBorders(NArrow::SerializeBatchNoCompression(keyEdgesBatch));
         }
     }
 
@@ -198,7 +237,7 @@ void TPortionInfo::LoadMetadata(const TIndexInfo& indexInfo, const TColumnRecord
 
     Meta.FirstPkColumn = indexInfo.GetPKFirstColumnId();
     auto field = indexInfo.ArrowColumnField(rec.ColumnId);
-    const bool compositeIndexKey = indexInfo.GetIndexKey()->num_fields() > 1;
+    const bool compositeIndexKey = indexInfo.IsCompositeIndexKey();
 
     if (meta.HasPortionMeta()) {
         Y_VERIFY_DEBUG(rec.ColumnId == Meta.FirstPkColumn);
@@ -216,14 +255,18 @@ void TPortionInfo::LoadMetadata(const TIndexInfo& indexInfo, const TColumnRecord
             Meta.Produced = TPortionMeta::EVICTED;
         }
 
-        if (compositeIndexKey) {
-            Y_VERIFY(portionMeta.HasIndexKeyBorders());
-            auto edgesBatch = NArrow::DeserializeBatch(portionMeta.GetIndexKeyBorders(), indexInfo.GetIndexKey());
-            Y_VERIFY(edgesBatch && edgesBatch->ValidateFull().ok());
-            Y_VERIFY(edgesBatch->num_rows() == 1 || edgesBatch->num_rows() == 2);
+        if (portionMeta.HasPrimaryKeyBorders()) {
+            Meta.ReplaceKeyEdges = NArrow::DeserializeBatch(portionMeta.GetPrimaryKeyBorders(), indexInfo.GetReplaceKey());
+            Y_VERIFY(Meta.ReplaceKeyEdges);
+            Y_VERIFY_DEBUG(Meta.ReplaceKeyEdges->ValidateFull().ok());
+            Y_VERIFY(Meta.ReplaceKeyEdges->num_rows() == 1 || Meta.ReplaceKeyEdges->num_rows() == 2);
 
-            Meta.IndexKeyStart = NArrow::TReplaceKey::FromBatch(edgesBatch, 0);
-            Meta.IndexKeyEnd = NArrow::TReplaceKey::FromBatch(edgesBatch, edgesBatch->num_rows() - 1);
+            if (compositeIndexKey) {
+                auto edgesBatch = NArrow::ExtractColumns(Meta.ReplaceKeyEdges, indexInfo.GetIndexKey());
+                Y_VERIFY(edgesBatch);
+                Meta.IndexKeyStart = NArrow::TReplaceKey::FromBatch(edgesBatch, 0);
+                Meta.IndexKeyEnd = NArrow::TReplaceKey::FromBatch(edgesBatch, edgesBatch->num_rows() - 1);
+            }
         }
     }
     if (meta.HasNumRows()) {
@@ -250,14 +293,11 @@ void TPortionInfo::LoadMetadata(const TIndexInfo& indexInfo, const TColumnRecord
             Meta.IndexKeyEnd = NArrow::TReplaceKey::FromScalar(scalar);
         }
     }
-}
 
-std::tuple<std::shared_ptr<arrow::Scalar>, std::shared_ptr<arrow::Scalar>> TPortionInfo::MinMaxValue(const ui32 columnId) const {
-    auto it = Meta.ColumnMeta.find(columnId);
-    if (it == Meta.ColumnMeta.end()) {
-        return std::make_tuple(std::shared_ptr<arrow::Scalar>(), std::shared_ptr<arrow::Scalar>());
-    } else {
-        return std::make_tuple(it->second.Min, it->second.Max);
+    // Portion genarated without PrimaryKeyBorders and loaded with indexInfo.IsCompositeIndexKey()
+    // We should have no such portions for ForceColumnTablesCompositeMarks feature
+    if (rec.ColumnId == Meta.FirstPkColumn) {
+        Y_VERIFY(Meta.IndexKeyStart && Meta.IndexKeyEnd);
     }
 }
 

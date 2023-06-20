@@ -103,6 +103,35 @@ Y_UNIT_TEST_SUITE(TCdcStreamTests) {
         });
     }
 
+    Y_UNIT_TEST(ResolvedTimestamps) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime, TTestEnvOptions().EnableProtoSourceIdInfo(true));
+        ui64 txId = 100;
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Uint64" }
+            Columns { Name: "value" Type: "Uint64" }
+            KeyColumnNames: ["key"]
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TestCreateCdcStream(runtime, ++txId, "/MyRoot", R"(
+            TableName: "Table"
+            StreamDescription {
+              Name: "Stream"
+              Mode: ECdcStreamModeKeysOnly
+              Format: ECdcStreamFormatProto
+              ResolvedTimestampsIntervalMs: 1000
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/Table/Stream"), {
+            NLs::StreamResolvedTimestamps(TDuration::MilliSeconds(1000)),
+        });
+    }
+
     Y_UNIT_TEST(RetentionPeriod) {
         TTestBasicRuntime runtime;
         TTestEnv env(runtime, TTestEnvOptions().EnableProtoSourceIdInfo(true));
@@ -267,7 +296,7 @@ Y_UNIT_TEST_SUITE(TCdcStreamTests) {
 
     Y_UNIT_TEST(DocApi) {
         TTestBasicRuntime runtime;
-        TTestEnv env(runtime);
+        TTestEnv env(runtime, TTestEnvOptions().EnableChangefeedDynamoDBStreamsFormat(true));
         ui64 txId = 100;
 
         TestCreateTable(runtime, ++txId, "/MyRoot", R"(
@@ -335,6 +364,30 @@ Y_UNIT_TEST_SUITE(TCdcStreamTests) {
             NLs::StreamFormat(NKikimrSchemeOp::ECdcStreamFormatDynamoDBStreamsJson),
             NLs::StreamAwsRegion("ru-central1"),
         });
+    }
+
+    Y_UNIT_TEST(DocApiNegative) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime, TTestEnvOptions().EnableChangefeedDynamoDBStreamsFormat(false));
+        ui64 txId = 100;
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "DocumentTable"
+            Columns { Name: "key" Type: "Uint64" }
+            Columns { Name: "value" Type: "Uint64" }
+            KeyColumnNames: ["key"]
+        )", {NKikimrScheme::StatusAccepted}, AlterUserAttrs({{"__document_api_version", "1"}}));
+        env.TestWaitNotification(runtime, txId);
+
+        TestCreateCdcStream(runtime, ++txId, "/MyRoot", R"(
+            TableName: "DocumentTable"
+            StreamDescription {
+              Name: "Stream"
+              Mode: ECdcStreamModeNewAndOldImages
+              Format: ECdcStreamFormatDynamoDBStreamsJson
+              AwsRegion: "ru-central1"
+            }
+        )", {NKikimrScheme::StatusPreconditionFailed});
     }
 
     Y_UNIT_TEST(Negative) {

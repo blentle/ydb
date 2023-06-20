@@ -207,21 +207,22 @@ std::shared_ptr<arrow::RecordBatch> ExtractColumns(const std::shared_ptr<arrow::
 
     for (auto& field : dstSchema->fields()) {
         columns.push_back(srcBatch->GetColumnByName(field->name()));
-        Y_VERIFY(columns.back());
-        if (!columns.back()->type()->Equals(field->type())) {
-            columns.back() = {};
-        }
-
         if (!columns.back()) {
             if (addNotExisted) {
                 auto result = arrow::MakeArrayOfNull(field->type(), srcBatch->num_rows());
                 if (!result.ok()) {
-                    return {};
+                    return nullptr;
                 }
                 columns.back() = *result;
             } else {
-                return {};
+                return nullptr;
             }
+        }
+
+        Y_VERIFY(columns.back());
+        if (!columns.back()->type()->Equals(field->type())) {
+            AFL_ERROR(NKikimrServices::TX_COLUMNSHARD)("event", "cannot_parse_incoming_batch")("reason", "invalid_column_type")("column", field->name())("column_type", field->type()->ToString());
+            return nullptr;
         }
     }
 
@@ -753,7 +754,7 @@ std::shared_ptr<arrow::UInt64Array> MakeSortPermutation(const std::shared_ptr<ar
     } else {
         std::sort(points.begin(), points.end(),
             [](const TRawReplaceKey& a, const TRawReplaceKey& b) {
-                return a.LessNotNull(b);
+                return a.CompareNotNull(b) == std::partial_ordering::less;
             }
         );
     }
@@ -796,14 +797,19 @@ bool ArrayScalarsEqual(const std::shared_ptr<arrow::Array>& lhs, const std::shar
 }
 
 bool ReserveData(arrow::ArrayBuilder& builder, const size_t size) {
+    arrow::Status result = arrow::Status::OK();
     if (builder.type()->id() == arrow::Type::BINARY) {
         arrow::BaseBinaryBuilder<arrow::BinaryType>& bBuilder = static_cast<arrow::BaseBinaryBuilder<arrow::BinaryType>&>(builder);
-        return bBuilder.ReserveData(size).ok();
+        result = bBuilder.ReserveData(size);
     } else if (builder.type()->id() == arrow::Type::STRING) {
         arrow::BaseBinaryBuilder<arrow::StringType>& bBuilder = static_cast<arrow::BaseBinaryBuilder<arrow::StringType>&>(builder);
-        return bBuilder.ReserveData(size).ok();
+        result = bBuilder.ReserveData(size);
     }
-    return true;
+
+    if (!result.ok()) {
+        AFL_ERROR(NKikimrServices::ARROW_HELPER)("event", "ReserveData")("error", result.ToString());
+    }
+    return result.ok();
 }
 
 bool MergeBatchColumns(const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches, std::shared_ptr<arrow::RecordBatch>& result,
@@ -873,6 +879,53 @@ std::shared_ptr<arrow::RecordBatch> BuildSingleRecordBatch(const std::shared_ptr
     auto arrays = NArrow::Finish(std::move(builders));
     Y_VERIFY(arrays.size() == builders.size());
     return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+NJson::TJsonValue DebugJson(std::shared_ptr<arrow::Array> array, const ui32 head, const ui32 tail) {
+    if (!array) {
+        return NJson::JSON_NULL;
+    }
+    NJson::TJsonValue resultFull = NJson::JSON_MAP;
+    resultFull.InsertValue("length", array->length());
+    SwitchType(array->type_id(), [&](const auto& type) {
+        using TWrap = std::decay_t<decltype(type)>;
+        using TArray = typename arrow::TypeTraits<typename TWrap::T>::ArrayType;
+
+        auto& column = static_cast<const TArray&>(*array);
+        resultFull.InsertValue("type", typeid(TArray).name());
+        resultFull.InsertValue("head", head);
+        resultFull.InsertValue("tail", tail);
+        auto& result = resultFull.InsertValue("data", NJson::JSON_ARRAY);
+        for (int i = 0; i < column.length(); ++i) {
+            if (i >= (int)head && i + (int)tail <= column.length()) {
+                continue;
+            }
+            if constexpr (arrow::has_string_view<typename TWrap::T>()) {
+                auto value = column.GetString(i);
+                result.AppendValue(TString(value.data(), value.size()));
+            }
+            if constexpr (arrow::has_c_type<typename TWrap::T>()) {
+                result.AppendValue(column.Value(i));
+            }
+        }
+        return true;
+        });
+    return resultFull;
+}
+
+NJson::TJsonValue DebugJson(std::shared_ptr<arrow::RecordBatch> batch, const ui32 head, const ui32 tail) {
+    if (!batch) {
+        return NJson::JSON_NULL;
+    }
+    NJson::TJsonValue result = NJson::JSON_ARRAY;
+    ui32 idx = 0;
+    for (auto&& i : batch->columns()) {
+        auto& jsonColumn = result.AppendValue(NJson::JSON_MAP);
+        jsonColumn.InsertValue("name", batch->column_name(idx));
+        jsonColumn.InsertValue("data", DebugJson(i, head, tail));
+        ++idx;
+    }
+    return result;
 }
 
 }

@@ -152,8 +152,16 @@ struct TColumnFamily {
 };
 
 struct TTtlSettings {
+    enum class EUnit: ui32 {
+        Seconds = 1,
+        Milliseconds = 2,
+        Microseconds = 3,
+        Nanoseconds = 4,
+    };
+
     TString ColumnName;
     TDuration ExpireAfter;
+    TMaybe<EUnit> ColumnUnit;
 
     static bool TryParse(const NNodes::TCoNameValueTupleList& node, TTtlSettings& settings, TString& error);
 };
@@ -488,6 +496,19 @@ struct TCreateUserSettings {
     bool PasswordEncrypted = false;
 };
 
+struct TModifyPermissionsSettings {
+    enum class EAction : ui32 {
+        Grant,
+        Revoke
+    };
+
+    EAction Action;
+    THashSet<TString> Permissions;
+    THashSet<TString> Pathes;
+    THashSet<TString> Roles;
+    bool IsPermissionsClear = false;
+};
+
 struct TAlterUserSettings {
     TString UserName;
     TString Password;
@@ -651,6 +672,7 @@ public:
         TString QueryPlan;
         std::shared_ptr<google::protobuf::Arena> ProtobufArenaPtr;
         TMaybe<ui16> SqlVersion;
+        google::protobuf::RepeatedPtrField<NKqpProto::TResultSetMeta> ResultSetsMeta;
     };
 
     struct TLoadTableMetadataSettings {
@@ -712,11 +734,15 @@ public:
 
     virtual NThreading::TFuture<TGenericResult> DropTopic(const TString& cluster, const TString& topic) = 0;
 
+    virtual NThreading::TFuture<TGenericResult> ModifyPermissions(const TString& cluster, const TModifyPermissionsSettings& settings) = 0;
+
     virtual NThreading::TFuture<TGenericResult> CreateUser(const TString& cluster, const TCreateUserSettings& settings) = 0;
 
     virtual NThreading::TFuture<TGenericResult> AlterUser(const TString& cluster, const TAlterUserSettings& settings) = 0;
 
     virtual NThreading::TFuture<TGenericResult> DropUser(const TString& cluster, const TDropUserSettings& settings) = 0;
+
+    virtual NThreading::TFuture<TGenericResult> UpsertObject(const TString& cluster, const TUpsertObjectSettings& settings) = 0;
 
     virtual NThreading::TFuture<TGenericResult> CreateObject(const TString& cluster, const TCreateObjectSettings& settings) = 0;
 

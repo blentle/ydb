@@ -131,7 +131,7 @@ protected:
         ArrowBatch = 1,
         CSV = 2,
     };
-
+public:
     // Positions of key and value fields in the request proto struct
     struct TFieldDescription {
         ui32 ColId;
@@ -141,6 +141,7 @@ protected:
         i32 Typmod;
         bool NotNull = false;
     };
+protected:
     TVector<TString> KeyColumnNames;
     TVector<TFieldDescription> KeyColumnPositions;
     TVector<TString> ValueColumnNames;
@@ -728,22 +729,13 @@ private:
         const auto& description = entry.ColumnTableInfo->Description;
         const auto& schema = description.GetSchema();
 
-#if 1 // TODO: do we need this restriction?
-        if ((size_t)schema.GetColumns().size() != KeyColumnPositions.size() + ValueColumnPositions.size()) {
-            ReplyWithError(Ydb::StatusIds::SCHEME_ERROR,
-                "Column count in the request doesn't match column count in the schema", ctx);
-            return {};
-        }
-#endif
         std::vector<TString> outColumns;
         outColumns.reserve(YdbSchema.size());
 
         for (size_t i = 0; i < (size_t)schema.GetColumns().size(); ++i) {
             auto columnId = schema.GetColumns(i).GetId();
             if (!Id2Position.count(columnId)) {
-                ReplyWithError(Ydb::StatusIds::SCHEME_ERROR,
-                    "Column id in the request doesn't match column id in the schema", ctx);
-                return {};
+                continue;
             }
             size_t position = Id2Position[columnId];
             outColumns.push_back(YdbSchema[position].first);
@@ -1111,6 +1103,34 @@ private:
         }
     }
 };
+
+using TFieldDescription = NTxProxy::TUploadRowsBase<NKikimrServices::TActivity::GRPC_REQ>::TFieldDescription;
+
+template <class TProto>
+inline bool FillCellsFromProto(TVector<TCell>& cells, const TVector<TFieldDescription>& descr, const TProto& proto,
+                            TString& err, TMemoryPool& valueDataPool)
+{
+    cells.clear();
+    cells.reserve(descr.size());
+
+    for (auto& fd : descr) {
+        if (proto.items_size() <= (int)fd.PositionInStruct) {
+            err = "Invalid request";
+            return false;
+        }
+        cells.push_back({});
+        if (!CellFromProtoVal(fd.Type, fd.Typmod, &proto.Getitems(fd.PositionInStruct), cells.back(), err, valueDataPool)) {
+            return false;
+        }
+
+        if (fd.NotNull && cells.back().IsNull()) {
+            err = TStringBuilder() << "Received NULL value for not null column: " << fd.ColName;
+            return false;
+        }
+    }
+
+    return true;
+}
 
 } // namespace NTxProxy
 } // namespace NKikimr

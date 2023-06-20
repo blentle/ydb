@@ -94,7 +94,7 @@ private:
     class TTxRemoveExpiredNotifications;
     class TTxRemoveRequest;
     class TTxRemovePermissions;
-    class TTxRemoveWalleTask;
+    template <typename TTable> class TTxRemoveTask;
     class TTxStorePermissions;
     class TTxStoreWalleTask;
     class TTxUpdateConfig;
@@ -105,14 +105,12 @@ private:
         NKikimrCms::ETenantPolicy TenantPolicy;
         NKikimrCms::EAvailabilityMode AvailabilityMode;
         bool PartialPermissionAllowed;
-        ui64 Order;
 
         TActionOptions(TDuration dur)
             : PermissionDuration(dur)
             , TenantPolicy(NKikimrCms::DEFAULT)
             , AvailabilityMode(NKikimrCms::MODE_MAX_AVAILABILITY)
             , PartialPermissionAllowed(false)
-            , Order(0)
         {}
     };
 
@@ -137,9 +135,11 @@ private:
     ITransaction *CreateTxRemoveRequest(const TString &id, THolder<IEventBase> req, TAutoPtr<IEventHandle> resp);
     ITransaction *CreateTxRemovePermissions(TVector<TString> ids, THolder<IEventBase> req, TAutoPtr<IEventHandle> resp, bool expired = false);
     ITransaction *CreateTxRemoveWalleTask(const TString &id);
+    ITransaction *CreateTxRemoveMaintenanceTask(const TString &id);
     ITransaction *CreateTxStorePermissions(THolder<IEventBase> req, TAutoPtr<IEventHandle> resp,
-                                           const TString &owner, TAutoPtr<TRequestInfo> scheduled);
-    ITransaction *CreateTxStoreWalleTask(const TWalleTaskInfo &task, THolder<IEventBase> req, TAutoPtr<IEventHandle> resp);
+                                           const TString &owner, TAutoPtr<TRequestInfo> scheduled,
+                                           const TMaybe<TString> &maintenanceTaskId = {});
+    ITransaction *CreateTxStoreWalleTask(const TTaskInfo &task, THolder<IEventBase> req, TAutoPtr<IEventHandle> resp);
     ITransaction *CreateTxUpdateConfig(TEvCms::TEvSetConfigRequest::TPtr &ev);
     ITransaction *CreateTxUpdateConfig(TEvConsole::TEvConfigNotificationRequest::TPtr &ev);
     ITransaction *CreateTxUpdateDowntimes();
@@ -240,6 +240,15 @@ private:
             HFunc(TEvCms::TEvWalleRemoveTaskRequest, Handle);
             HFunc(TEvCms::TEvStoreWalleTask, Handle);
             HFunc(TEvCms::TEvRemoveWalleTask, Handle);
+            // public api begin
+            HFunc(TEvCms::TEvListClusterNodesRequest, Handle);
+            HFunc(TEvCms::TEvCreateMaintenanceTaskRequest, Handle);
+            HFunc(TEvCms::TEvRefreshMaintenanceTaskRequest, Handle);
+            HFunc(TEvCms::TEvGetMaintenanceTaskRequest, Handle);
+            HFunc(TEvCms::TEvListMaintenanceTasksRequest, Handle);
+            HFunc(TEvCms::TEvDropMaintenanceTaskRequest, Handle);
+            HFunc(TEvCms::TEvCompleteActionRequest, Handle);
+            // public api end
             HFunc(TEvCms::TEvGetConfigRequest, Handle);
             HFunc(TEvCms::TEvSetConfigRequest, Handle);
             HFunc(TEvCms::TEvResetMarkerRequest, Handle);
@@ -277,7 +286,6 @@ private:
     bool CheckPermissionRequest(const NKikimrCms::TPermissionRequest &request,
         NKikimrCms::TPermissionResponse &response,
         NKikimrCms::TPermissionRequest &scheduled,
-        const ui64 requestOrder,
         const TActorContext &ctx);
     bool IsActionHostValid(const NKikimrCms::TAction &action, TErrorInfo &error) const;
     bool ParseServices(const NKikimrCms::TAction &action, TServices &services, TErrorInfo &error) const;
@@ -339,7 +347,8 @@ private:
     void ScheduleLogCleanup(const TActorContext &ctx);
     void DoPermissionsCleanup(const TActorContext &ctx);
     void CleanupWalleTasks(const TActorContext &ctx);
-    void RemoveEmptyWalleTasks(const TActorContext &ctx);
+    TVector<TString> FindEmptyTasks(const THashMap<TString, TTaskInfo> &tasks, const TActorContext &ctx);
+    void RemoveEmptyTasks(const TActorContext &ctx);
     void StartCollecting();
     bool CheckNotificationDeadline(const NKikimrCms::TAction &action, TInstant time,
         TErrorInfo &error, const TActorContext &ctx) const;
@@ -395,6 +404,15 @@ private:
     void Handle(TEvCms::TEvWalleRemoveTaskRequest::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvCms::TEvStoreWalleTask::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvCms::TEvRemoveWalleTask::TPtr &ev, const TActorContext &ctx);
+    // public api begin
+    void Handle(TEvCms::TEvListClusterNodesRequest::TPtr &ev, const TActorContext &ctx);
+    void Handle(TEvCms::TEvCreateMaintenanceTaskRequest::TPtr &ev, const TActorContext &ctx);
+    void Handle(TEvCms::TEvRefreshMaintenanceTaskRequest::TPtr &ev, const TActorContext &ctx);
+    void Handle(TEvCms::TEvGetMaintenanceTaskRequest::TPtr &ev, const TActorContext &ctx);
+    void Handle(TEvCms::TEvListMaintenanceTasksRequest::TPtr &ev, const TActorContext &ctx);
+    void Handle(TEvCms::TEvDropMaintenanceTaskRequest::TPtr &ev, const TActorContext &ctx);
+    void Handle(TEvCms::TEvCompleteActionRequest::TPtr &ev, const TActorContext &ctx);
+    // public api end
     void Handle(TEvCms::TEvGetConfigRequest::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvCms::TEvSetConfigRequest::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvCms::TEvResetMarkerRequest::TPtr &ev, const TActorContext &ctx);

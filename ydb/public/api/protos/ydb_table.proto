@@ -161,6 +161,8 @@ message Changefeed {
     map<string, string> attributes = 7 [(map_key).length.range = {min: 1, max: 100}, (length).range = {min: 1, max: 4096}];
     // Value that will be emitted in the `awsRegion` field of the record in DYNAMODB_STREAMS_JSON format
     string aws_region = 8 [(length).le = 128];
+    // Periodically emit resolved timestamps. If unspecified, resolved timestamps are not emitted.
+    google.protobuf.Duration resolved_timestamps_interval = 9;
 }
 
 message ChangefeedDescription {
@@ -193,6 +195,8 @@ message ChangefeedDescription {
     map<string, string> attributes = 6;
     // Value that will be emitted in the `awsRegion` field of the record in DYNAMODB_STREAMS_JSON format
     string aws_region = 7;
+    // Interval of emitting of resolved timestamps. If unspecified, resolved timestamps are not emitted.
+    google.protobuf.Duration resolved_timestamps_interval = 8;
 }
 
 message StoragePool {
@@ -509,7 +513,7 @@ message CreateTableRequest {
     Ydb.FeatureFlag.Status key_bloom_filter = 16;
     // Read replicas settings for table
     ReadReplicasSettings read_replicas_settings = 17;
-    // Tiering name for table
+    // Tiering rules name. It specifies how data migrates from one tier (logical storage) to another.
     string tiering = 18;
 }
 
@@ -706,6 +710,8 @@ message DescribeTableResult {
     ReadReplicasSettings read_replicas_settings = 14;
     // List of changefeeds
     repeated ChangefeedDescription changefeeds = 15;
+    // Tiering rules name
+    string tiering = 16;
 }
 
 message Query {
@@ -1048,6 +1054,26 @@ message ReadTableResponse {
 message ReadTableResult {
     // Result set (same as result of sql request)
     Ydb.ResultSet result_set = 1;
+}
+
+message ReadRowsRequest {
+    // Session identifier
+    string session_id = 1;
+    // Path to table to read
+    string path = 2;
+    // Keys to read
+    TypedValue keys = 3;
+    // Output columns
+    repeated string columns = 4;
+}
+
+message ReadRowsResponse {
+    // Status of request (same as other statuses)
+    StatusIds.StatusCode status = 1;
+    // Issues
+    repeated Ydb.Issue.IssueMessage issues = 2;
+    // Result set (same as result of sql request)
+    Ydb.ResultSet result_set = 3;
 }
 
 message BulkUpsertRequest {

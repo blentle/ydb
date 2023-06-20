@@ -874,6 +874,9 @@ protected:
     bool ParseExternalDataSourceSettings(std::map<TString, TDeferredAtom> & result, const TRule_with_table_settings & settings);
     bool RoleNameClause(const TRule_role_name& node, TDeferredAtom& result, bool allowSystemRoles);
     bool RoleParameters(const TRule_create_user_option& node, TRoleParameters& result);
+    bool PermissionNameClause(const TRule_permission_name_target& node, TVector<TDeferredAtom>& result, bool withGrantOption);
+    bool PermissionNameClause(const TRule_permission_name& node, TDeferredAtom& result);
+    bool PermissionNameClause(const TRule_permission_id& node, TDeferredAtom& result);
 
     bool ValidateExternalTable(const TCreateTableParameters& params);
 private:
@@ -1880,6 +1883,12 @@ static bool ChangefeedSettingsEntry(const TRule_changefeed_settings_entry& node,
             return false;
         }
         settings.VirtualTimestamps = exprNode;
+    } else if (to_lower(id.Name) == "resolved_timestamps") {
+        if (exprNode->GetOpName() != "Interval") {
+            ctx.Context().Error() << "Literal of Interval type is expected for " << id.Name;
+            return false;
+        }
+        settings.ResolvedTimestamps = exprNode;
     } else if (to_lower(id.Name) == "retention_period") {
         if (exprNode->GetOpName() != "Interval") {
             ctx.Context().Error() << "Literal of Interval type is expected for " << id.Name;
@@ -2224,7 +2233,17 @@ namespace {
                 return false;
             }
 
-            to.Set(TTtlSettings(columnName, exprNode));
+            TMaybe<TTtlSettings::EUnit> columnUnit;
+            if (from.GetAlt_table_setting_value5().HasBlock4()) {
+                const TString unit = to_lower(ctx.Token(from.GetAlt_table_setting_value5().GetBlock4().GetToken2()));
+                columnUnit.ConstructInPlace();
+                if (!TryFromString<TTtlSettings::EUnit>(unit, *columnUnit)) {
+                    ctx.Error() << "Invalid unit: " << unit;
+                    return false;
+                }
+            }
+
+            to.Set(TTtlSettings(columnName, exprNode, columnUnit));
             break;
         }
         default:
@@ -5950,19 +5969,19 @@ TNodePtr TSqlExpression::BinOpList(const TNode& node, TGetNode getNode, TIter be
                 Ctx.IncrementMonCounter("sql_binary_operations", "GreaterOrEq");
                 break;
             case SQLv1LexerTokens::TOKEN_PLUS:
-                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedAdd" : "+";
+                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedAdd" : "+MayWarn";
                 Ctx.IncrementMonCounter("sql_binary_operations", "Plus");
                 break;
             case SQLv1LexerTokens::TOKEN_MINUS:
-                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedSub" : "-";
+                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedSub" : "-MayWarn";
                 Ctx.IncrementMonCounter("sql_binary_operations", "Minus");
                 break;
             case SQLv1LexerTokens::TOKEN_ASTERISK:
-                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedMul" : "*";
+                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedMul" : "*MayWarn";
                 Ctx.IncrementMonCounter("sql_binary_operations", "Multiply");
                 break;
             case SQLv1LexerTokens::TOKEN_SLASH:
-                opName = "/";
+                opName = "/MayWarn";
                 Ctx.IncrementMonCounter("sql_binary_operations", "Divide");
                 if (!Ctx.Scoped->PragmaClassicDivision && partialResult) {
                     partialResult = new TCallNodeImpl(pos, "SafeCast", {std::move(partialResult), BuildDataType(pos, "Double")});
@@ -5971,7 +5990,7 @@ TNodePtr TSqlExpression::BinOpList(const TNode& node, TGetNode getNode, TIter be
                 }
                 break;
             case SQLv1LexerTokens::TOKEN_PERCENT:
-                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedMod" : "%";
+                opName = Ctx.Scoped->PragmaCheckedOps ? "CheckedMod" : "%MayWarn";
                 Ctx.IncrementMonCounter("sql_binary_operations", "Mod");
                 break;
             default:
@@ -7052,6 +7071,177 @@ bool TSqlTranslation::RoleParameters(const TRule_create_user_option& node, TRole
         result.Password = MakeAtomFromExpression(Ctx, password);
     }
 
+    return true;
+}
+
+bool TSqlTranslation::PermissionNameClause(const TRule_permission_id& node, TDeferredAtom& result) {
+    // permission_id:
+    //   CONNECT
+    // | LIST
+    // | INSERT
+    // | MANAGE
+    // | DROP
+    // | GRANT
+    // | MODIFY (TABLES | ATTRIBUTES)
+    // | (UPDATE | ERASE) ROW
+    // | (REMOVE | DESCRIBE | ALTER) SCHEMA
+    // | SELECT (TABLES | ATTRIBUTES | ROW)?
+    // | (USE | FULL) LEGACY?
+    // | CREATE (DIRECTORY | TABLE | QUEUE)?
+
+    auto handleOneIdentifier = [&result, this] (const auto& permissionNameKeyword) {
+        result = TDeferredAtom(Ctx.Pos(), GetIdentifier(*this, permissionNameKeyword).Name);
+    };
+
+    auto handleTwoIdentifiers = [&result, this] (const auto& permissionNameKeyword) {
+        const auto& token1 = permissionNameKeyword.GetToken1();
+        const auto& token2 = permissionNameKeyword.GetToken2();
+        TString identifierName = TIdentifier(TPosition(token1.GetColumn(), token1.GetLine()), Identifier(token1)).Name +
+                                "_" +
+                                TIdentifier(TPosition(token2.GetColumn(), token2.GetLine()), Identifier(token2)).Name;
+        result = TDeferredAtom(Ctx.Pos(), identifierName);
+    };
+
+    auto handleOneOrTwoIdentifiers = [&result, this] (const auto& permissionNameKeyword) {
+        TString identifierName = GetIdentifier(*this, permissionNameKeyword).Name;
+        if (permissionNameKeyword.HasBlock2()) {
+            identifierName += "_" + GetIdentifier(*this, permissionNameKeyword.GetBlock2()).Name;
+        }
+        result = TDeferredAtom(Ctx.Pos(), identifierName);
+    };
+
+    switch (node.GetAltCase()) {
+        case TRule_permission_id::kAltPermissionId1:
+        {
+            // CONNECT
+            handleOneIdentifier(node.GetAlt_permission_id1());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId2:
+        {
+            // LIST
+            handleOneIdentifier(node.GetAlt_permission_id2());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId3:
+        {
+            // INSERT
+            handleOneIdentifier(node.GetAlt_permission_id3());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId4:
+        {
+            // MANAGE
+            handleOneIdentifier(node.GetAlt_permission_id4());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId5:
+        {
+            // DROP
+            handleOneIdentifier(node.GetAlt_permission_id5());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId6:
+        {
+            // GRANT
+            handleOneIdentifier(node.GetAlt_permission_id6());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId7:
+        {
+            // MODIFY (TABLES | ATTRIBUTES)
+            handleTwoIdentifiers(node.GetAlt_permission_id7());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId8:
+        {
+            // (UPDATE | ERASE) ROW
+            handleTwoIdentifiers(node.GetAlt_permission_id8());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId9:
+        {
+            // (REMOVE | DESCRIBE | ALTER) SCHEMA
+            handleTwoIdentifiers(node.GetAlt_permission_id9());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId10:
+        {
+            // SELECT (TABLES | ATTRIBUTES | ROW)?
+            handleOneOrTwoIdentifiers(node.GetAlt_permission_id10());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId11:
+        {
+            // (USE | FULL) LEGACY?
+            handleOneOrTwoIdentifiers(node.GetAlt_permission_id11());
+            break;
+        }
+        case TRule_permission_id::kAltPermissionId12:
+        {
+            // CREATE (DIRECTORY | TABLE | QUEUE)?
+            handleOneOrTwoIdentifiers(node.GetAlt_permission_id12());
+            break;
+        }
+        default:
+            Y_FAIL("You should change implementation according to grammar changes");
+    }
+    return true;
+}
+
+bool TSqlTranslation::PermissionNameClause(const TRule_permission_name& node, TDeferredAtom& result) {
+    // permission_name: permission_id | STRING_VALUE;
+    switch (node.Alt_case()) {
+        case TRule_permission_name::kAltPermissionName1:
+        {
+            return PermissionNameClause(node.GetAlt_permission_name1().GetRule_permission_id1(), result);
+            break;
+        }
+        case TRule_permission_name::kAltPermissionName2:
+        {
+            const TString stringValue(Ctx.Token(node.GetAlt_permission_name2().GetToken1()));
+            auto unescaped = StringContent(Ctx, Ctx.Pos(), stringValue);
+            if (!unescaped) {
+                return false;
+            }
+            result = TDeferredAtom(Ctx.Pos(), unescaped->Content);
+            break;
+        }
+        default:
+            Y_FAIL("You should change implementation according to grammar changes");
+    }
+    return true;
+}
+
+bool TSqlTranslation::PermissionNameClause(const TRule_permission_name_target& node, TVector<TDeferredAtom>& result, bool withGrantOption) {
+    // permission_name_target: permission_name (COMMA permission_name)* COMMA? | ALL PRIVILEGES?;
+    switch (node.Alt_case()) {
+        case TRule_permission_name_target::kAltPermissionNameTarget1:
+        {
+            const auto& permissionNameRule = node.GetAlt_permission_name_target1();
+            result.emplace_back();
+            if (!PermissionNameClause(permissionNameRule.GetRule_permission_name1(), result.back())) {
+                return false;
+            }
+            for (const auto& item : permissionNameRule.GetBlock2()) {
+                result.emplace_back();
+                if (!PermissionNameClause(item.GetRule_permission_name2(), result.back())) {
+                    return false;
+                }
+            }
+            break;
+        }
+        case TRule_permission_name_target::kAltPermissionNameTarget2:
+        {
+            result.emplace_back(Ctx.Pos(), "all_privileges");
+            break;
+        }
+        default:
+            Y_FAIL("You should change implementation according to grammar changes");
+    }
+    if (withGrantOption) {
+        result.emplace_back(Ctx.Pos(), "grant");
+    }
     return true;
 }
 
@@ -9012,6 +9202,7 @@ private:
     void AlterTableRenameIndexTo(const TRule_alter_table_rename_index_to& node, TAlterTableParameters& params);
     TNodePtr PragmaStatement(const TRule_pragma_stmt& stmt, bool& success);
     void AddStatementToBlocks(TVector<TNodePtr>& blocks, TNodePtr node);
+    bool ParseTableStoreFeatures(std::map<TString, TDeferredAtom> & result, const TRule_alter_table_store_action & actions);
 
     TNodePtr Build(const TRule_delete_stmt& stmt);
 
@@ -9899,6 +10090,138 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                 return false;
             }
             AddStatementToBlocks(blocks, BuildDropTopic(Ctx.Pos(), tr, Ctx.Scoped));
+            break;
+        }
+        case TRule_sql_stmt_core::kAltSqlStmtCore36: {
+            // GRANT permission_name_target ON an_id_schema (COMMA an_id_schema)* TO role_name (COMMA role_name)* COMMA? (WITH GRANT OPTION)?;
+            Ctx.BodyPart();
+            auto& node = core.GetAlt_sql_stmt_core36().GetRule_grant_permissions_stmt1();
+
+            Ctx.Token(node.GetToken1());
+            const TPosition pos = Ctx.Pos();
+
+            TString service = Ctx.Scoped->CurrService;
+            TDeferredAtom cluster = Ctx.Scoped->CurrCluster;
+            if (cluster.Empty()) {
+                Error() << "USE statement is missing - no default cluster is selected";
+                return false;
+            }
+
+            TVector<TDeferredAtom> permissions;
+            if (!PermissionNameClause(node.GetRule_permission_name_target2(), permissions, node.has_block10())) {
+                return false;
+            }
+
+            TVector<TDeferredAtom> schemaPathes;
+            schemaPathes.emplace_back(Ctx.Pos(), Id(node.GetRule_an_id_schema4(), *this));
+            for (const auto& item : node.GetBlock5()) {
+                schemaPathes.emplace_back(Ctx.Pos(), Id(item.GetRule_an_id_schema2(), *this));
+            }
+
+            TVector<TDeferredAtom> roleNames;
+            const bool allowSystemRoles = false;
+            roleNames.emplace_back();
+            if (!RoleNameClause(node.GetRule_role_name7(), roleNames.back(), allowSystemRoles)) {
+                return false;
+            }
+            for (const auto& item : node.GetBlock8()) {
+                roleNames.emplace_back();
+                if (!RoleNameClause(item.GetRule_role_name2(), roleNames.back(), allowSystemRoles)) {
+                    return false;
+                }
+            }
+
+            AddStatementToBlocks(blocks, BuildGrantPermissions(pos, service, cluster, permissions, schemaPathes, roleNames, Ctx.Scoped));
+            break;
+        }
+        case TRule_sql_stmt_core::kAltSqlStmtCore37:
+        {
+            // REVOKE (GRANT OPTION FOR)? permission_name_target ON an_id_schema (COMMA an_id_schema)* FROM role_name (COMMA role_name)*;
+            Ctx.BodyPart();
+            auto& node = core.GetAlt_sql_stmt_core37().GetRule_revoke_permissions_stmt1();
+
+            Ctx.Token(node.GetToken1());
+            const TPosition pos = Ctx.Pos();
+
+            TString service = Ctx.Scoped->CurrService;
+            TDeferredAtom cluster = Ctx.Scoped->CurrCluster;
+            if (cluster.Empty()) {
+                Error() << "USE statement is missing - no default cluster is selected";
+                return false;
+            }
+
+            TVector<TDeferredAtom> permissions;
+            if (!PermissionNameClause(node.GetRule_permission_name_target3(), permissions, node.HasBlock2())) {
+                return false;
+            }
+
+            TVector<TDeferredAtom> schemaPathes;
+            schemaPathes.emplace_back(Ctx.Pos(), Id(node.GetRule_an_id_schema5(), *this));
+            for (const auto& item : node.GetBlock6()) {
+                schemaPathes.emplace_back(Ctx.Pos(), Id(item.GetRule_an_id_schema2(), *this));
+            }
+
+            TVector<TDeferredAtom> roleNames;
+            const bool allowSystemRoles = false;
+            roleNames.emplace_back();
+            if (!RoleNameClause(node.GetRule_role_name8(), roleNames.back(), allowSystemRoles)) {
+                return false;
+            }
+            for (const auto& item : node.GetBlock9()) {
+                roleNames.emplace_back();
+                if (!RoleNameClause(item.GetRule_role_name2(), roleNames.back(), allowSystemRoles)) {
+                    return false;
+                }
+            }
+
+            AddStatementToBlocks(blocks, BuildRevokePermissions(pos, service, cluster, permissions, schemaPathes, roleNames, Ctx.Scoped));
+            break;
+        }
+        case TRule_sql_stmt_core::kAltSqlStmtCore38:
+        {
+            // ALTER TABLESTORE object_ref alter_table_store_action (COMMA alter_table_store_action)*;
+            auto& node = core.GetAlt_sql_stmt_core38().GetRule_alter_table_store_stmt1();
+            TObjectOperatorContext context(Ctx.Scoped);
+            
+            if (node.GetRule_object_ref3().HasBlock1()) {
+                if (!ClusterExpr(node.GetRule_object_ref3().GetBlock1().GetRule_cluster_expr1(),
+                    false, context.ServiceId, context.Cluster)) {
+                    return false;
+                }
+            }
+
+            const TString& objectId = Id(node.GetRule_object_ref3().GetRule_id_or_at2(), *this).second;
+            const TString& typeId = "TABLESTORE";
+            std::map<TString, TDeferredAtom> kv;
+            if (!ParseTableStoreFeatures(kv, node.GetRule_alter_table_store_action4())) {
+                return false;
+            }
+
+            AddStatementToBlocks(blocks, BuildAlterObjectOperation(Ctx.Pos(), objectId, typeId, std::move(kv), context));
+            break;
+        }
+        case TRule_sql_stmt_core::kAltSqlStmtCore39:
+        {
+            // create_object_stmt: UPSERT OBJECT name (TYPE type [WITH k=v,...]);
+            auto& node = core.GetAlt_sql_stmt_core39().GetRule_upsert_object_stmt1();
+            TObjectOperatorContext context(Ctx.Scoped);
+            if (node.GetRule_object_ref3().HasBlock1()) {
+                if (!ClusterExpr(node.GetRule_object_ref3().GetBlock1().GetRule_cluster_expr1(),
+                    false, context.ServiceId, context.Cluster)) {
+                    return false;
+                }
+            }
+
+            const TString& objectId = Id(node.GetRule_object_ref3().GetRule_id_or_at2(), *this).second;
+            const TString& typeId = Id(node.GetRule_object_type_ref6().GetRule_an_id_or_type1(), *this);
+            std::map<TString, TDeferredAtom> kv;
+            if (node.HasBlock8()) {
+                if (!ParseObjectFeatures(kv, node.GetBlock8().GetRule_create_object_features1().GetRule_object_features2())) {
+                    return false;
+                }
+            }
+
+            AddStatementToBlocks(blocks, BuildUpsertObjectOperation(Ctx.Pos(), objectId, typeId, std::move(kv), context));
             break;
         }
         default:
@@ -11470,6 +11793,73 @@ bool TSqlTranslation::ParseObjectFeatures(std::map<TString, TDeferredAtom>& resu
         }
     } else {
         return false;
+    }
+    return true;
+}
+namespace {
+
+    static bool BuildColumnFeatures(std::map<TString, TDeferredAtom>& result, const TRule_column_schema& columnSchema, const NYql::TPosition& pos, TSqlTranslation& transaction) {
+        const bool nullable = !columnSchema.HasBlock4() || !columnSchema.GetBlock4().HasBlock1();
+        const TString columnName(Id(columnSchema.GetRule_an_id_schema1(), transaction));
+        TString columnType;
+
+        auto& typeBind = columnSchema.GetRule_type_name_or_bind2();
+        switch (typeBind.Alt_case()) {
+            case TRule_type_name_or_bind::kAltTypeNameOrBind1:
+            {
+                auto& typeNameOrBind = typeBind.GetAlt_type_name_or_bind1().GetRule_type_name1();
+                if (typeNameOrBind.Alt_case() != TRule_type_name::kAltTypeName2) {
+                    return false;
+                }
+                auto& alt = typeNameOrBind.GetAlt_type_name2();
+                auto& block = alt.GetBlock1();
+                auto& simpleType = block.GetAlt2().GetRule_type_name_simple1();
+                columnType = Id(simpleType.GetRule_an_id_pure1(), transaction);
+                if (columnType.empty()) {
+                    return false;
+                }
+                break;
+            }
+            case TRule_type_name_or_bind::kAltTypeNameOrBind2:
+                return false;
+            default:
+                Y_FAIL("You should change implementation according to grammar changes");
+        }
+
+        result["NAME"] = TDeferredAtom(pos, columnName);
+        YQL_ENSURE(columnType, "Unknown column type");
+        result["TYPE"] = TDeferredAtom(pos, columnType);
+        if (!nullable) {
+            result["NOT_NULL"] = TDeferredAtom(pos, "true");    
+        }
+        return true;
+    }
+}
+
+bool TSqlQuery::ParseTableStoreFeatures(std::map<TString, TDeferredAtom> & result, const TRule_alter_table_store_action & actions) {
+    switch (actions.Alt_case()) {
+        case TRule_alter_table_store_action::kAltAlterTableStoreAction1: {
+            // ADD COLUMN
+            const auto& addRule = actions.GetAlt_alter_table_store_action1().GetRule_alter_table_add_column1();
+            if (!BuildColumnFeatures(result, addRule.GetRule_column_schema3(), Ctx.Pos(), *this)) {
+                return false;
+            }
+            result["ACTION"] = TDeferredAtom(Ctx.Pos(), "NEW_COLUMN");
+            break;
+        }
+        case TRule_alter_table_store_action::kAltAlterTableStoreAction2: {
+            // DROP COLUMN
+            const auto& dropRule = actions.GetAlt_alter_table_store_action2().GetRule_alter_table_drop_column1();
+            TString columnName = Id(dropRule.GetRule_an_id3(), *this);
+            if (!columnName) {
+                return false;
+            }
+            result["NAME"] = TDeferredAtom(Ctx.Pos(), columnName);
+            result["ACTION"] = TDeferredAtom(Ctx.Pos(), "DROP_COLUMN");
+            break;
+        }
+        default:
+            Y_FAIL("You should change implementation according to grammar changes");
     }
     return true;
 }

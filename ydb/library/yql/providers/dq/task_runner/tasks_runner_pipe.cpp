@@ -586,7 +586,7 @@ public:
     }
 
     [[nodiscard]]
-    bool Pop(NKikimr::NMiniKQL::TUnboxedValueVector& batch) override {
+    bool Pop(NKikimr::NMiniKQL::TUnboxedValueBatch& batch) override {
         Y_UNUSED(batch);
         ythrow yexception() << "unimplemented";
     }
@@ -726,11 +726,11 @@ public:
         }
     }
 
-    void Push(NKikimr::NMiniKQL::TUnboxedValueVector&& batch, i64 space) override {
+    void Push(NKikimr::NMiniKQL::TUnboxedValueBatch&& batch, i64 space) override {
         auto inputType = GetInputType();
         NDqProto::TSourcePushRequest data;
         TDqDataSerializer dataSerializer(TaskRunner->GetTypeEnv(), TaskRunner->GetHolderFactory(), NDqProto::DATA_TRANSPORT_UV_PICKLE_1_0);
-        *data.MutableData() = dataSerializer.Serialize(batch.begin(), batch.end(), static_cast<NKikimr::NMiniKQL::TType*>(inputType));
+        *data.MutableData() = dataSerializer.Serialize(batch, inputType);
         data.SetSpace(space);
 
         NDqProto::TCommandHeader header;
@@ -740,10 +740,11 @@ public:
         header.SetChannelId(InputIndex);
         header.Save(&Output);
         data.Save(&Output);
+
     }
 
     [[nodiscard]]
-    bool Pop(NKikimr::NMiniKQL::TUnboxedValueVector& batch) override {
+    bool Pop(NKikimr::NMiniKQL::TUnboxedValueBatch& batch) override {
         Y_UNUSED(batch);
         ythrow yexception() << "unimplemented";
     }
@@ -909,6 +910,12 @@ public:
     // can throw TDqChannelStorageException
     void Push(NUdf::TUnboxedValue&& value) override {
         Y_UNUSED(value);
+        ythrow yexception() << "unimplemented";
+    }
+
+    void WidePush(NUdf::TUnboxedValue* values, ui32 count) override {
+        Y_UNUSED(values);
+        Y_UNUSED(count);
         ythrow yexception() << "unimplemented";
     }
 
@@ -1087,7 +1094,7 @@ public:
         }
     }
 
-    ui64 Pop(NKikimr::NMiniKQL::TUnboxedValueVector& batch, ui64 bytes) override {
+    ui64 Pop(NKikimr::NMiniKQL::TUnboxedValueBatch& batch, ui64 bytes) override {
         try {
             NDqProto::TCommandHeader header;
             header.SetVersion(5);
@@ -1198,6 +1205,12 @@ public:
 
     void Push(NUdf::TUnboxedValue&& value) override {
         Y_UNUSED(value);
+        Y_FAIL("Unimplemented");
+    }
+
+    void WidePush(NUdf::TUnboxedValue* values, ui32 count) override {
+        Y_UNUSED(values);
+        Y_UNUSED(count);
         Y_FAIL("Unimplemented");
     }
 
@@ -1477,8 +1490,8 @@ public:
         return Task.GetId();
     }
 
-    void Prepare(const NDqProto::TDqTask& task, const TDqTaskRunnerMemoryLimits& memoryLimits,
-        const IDqTaskRunnerExecutionContext& execCtx, const TDqTaskRunnerParameterProvider&) override
+    void Prepare(const TDqTaskSettings& task, const TDqTaskRunnerMemoryLimits& memoryLimits,
+        const IDqTaskRunnerExecutionContext& execCtx) override
     {
         Y_UNUSED(memoryLimits);
         Y_UNUSED(execCtx);
@@ -1729,7 +1742,7 @@ public:
         TaskScheduler.Start();
     }
 
-    ITaskRunner::TPtr GetOld(const NDqProto::TDqTask& tmp, const TString& traceId) override {
+    ITaskRunner::TPtr GetOld(const NDq::TDqTaskSettings& tmp, const TString& traceId) override {
         Yql::DqsProto::TTaskMeta taskMeta;
         tmp.GetMeta().UnpackTo(&taskMeta);
         ui64 stageId = taskMeta.GetStageId();
@@ -1738,7 +1751,7 @@ public:
         return new TTaskRunner(task, std::move(result), stageId, traceId);
     }
 
-    TIntrusivePtr<NDq::IDqTaskRunner> Get(const NDqProto::TDqTask& tmp, const TString& traceId) override
+    TIntrusivePtr<NDq::IDqTaskRunner> Get(const NDq::TDqTaskSettings& tmp, const TString& traceId) override
     {
         Yql::DqsProto::TTaskMeta taskMeta;
         tmp.GetMeta().UnpackTo(&taskMeta);
@@ -1780,9 +1793,9 @@ private:
         return exePath + "," + settings.ToString();
     }
 
-    NDqProto::TDqTask PrepareTask(const NDqProto::TDqTask& tmp, TChildProcess* result) {
+    NDqProto::TDqTask PrepareTask(const NDq::TDqTaskSettings& tmp, TChildProcess* result) {
         // get files from fileCache
-        NDqProto::TDqTask task = tmp;
+        auto task = tmp.GetSerializedTask();
         Yql::DqsProto::TTaskMeta taskMeta;
 
         task.GetMeta().UnpackTo(&taskMeta);

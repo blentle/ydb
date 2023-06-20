@@ -50,7 +50,7 @@ inline bool PrepareUrl(const std::string_view& keyStr, TUri& parser) {
     }; \
     END_SIMPLE_ARROW_UDF(udfName, udfName##KernelExec::Do);
 
-SIMPLE_UDF(TNormalize, TOptional<char*>(TOptional<char*>)) {
+BEGIN_SIMPLE_ARROW_UDF(TNormalize, TOptional<char*>(TOptional<char*>)) {
     EMPTY_RESULT_ON_EMPTY_ARG(0);
     TUri url;
     const bool success = PrepareUrl(args[0].AsStringRef(), url);
@@ -58,6 +58,21 @@ SIMPLE_UDF(TNormalize, TOptional<char*>(TOptional<char*>)) {
                 ? valueBuilder->NewString(url.PrintS(TUri::FlagNoFrag))
                 : TUnboxedValue();
 }
+struct TNormalizeKernelExec : public TUnaryKernelExec<TNormalizeKernelExec> {
+    template <typename TSink>
+    static void Process(TBlockItem arg, const TSink& sink) {
+        if (!arg) {
+            return sink(TBlockItem());
+        }
+        TUri url;
+        const bool success = PrepareUrl(arg.AsStringRef(), url);
+        if (success) {
+            return sink(TBlockItem(TStringRef(url.PrintS(TUri::FlagNoFrag))));
+        }
+        sink(TBlockItem());
+    }
+};
+END_SIMPLE_ARROW_UDF(TNormalize, TNormalizeKernelExec::Do);
 
 BEGIN_SIMPLE_STRICT_ARROW_UDF(TGetScheme, char*(TAutoMap<char*>)) {
     const std::string_view url(args[0].AsStringRef());
@@ -231,10 +246,18 @@ SIMPLE_UDF(TGetDomain, TOptional<char*>(TOptional<char*>, ui8)) {
     return TUnboxedValue();
 }
 
-SIMPLE_UDF(TGetTLD, char*(TAutoMap<char*>)) {
+BEGIN_SIMPLE_ARROW_UDF(TGetTLD, char*(TAutoMap<char*>)) {
     const TStringBuf url(args[0].AsStringRef());
     return valueBuilder->NewString(GetZone(GetOnlyHost(url)));
 }
+struct TGetTLDKernelExec : public TUnaryKernelExec<TGetTLDKernelExec> {
+    template <typename TSink>
+    static void Process(TBlockItem arg, const TSink& sink) {
+        const TStringBuf url(arg.AsStringRef());
+        return sink(TBlockItem(GetZone(GetOnlyHost(url))));
+    }
+};
+END_SIMPLE_ARROW_UDF(TGetTLD, TGetTLDKernelExec::Do);
 
 SIMPLE_UDF(TGetDomainLevel, ui64(TAutoMap<char*>)) {
     Y_UNUSED(valueBuilder);
@@ -366,46 +389,105 @@ struct TDecodeKernelExec : public TUnaryKernelExec<TDecodeKernelExec> {
 };
 END_SIMPLE_ARROW_UDF(TDecode, TDecodeKernelExec::Do);
 
-SIMPLE_UDF(TIsKnownTLD, bool(TAutoMap<char*>)) {
+BEGIN_SIMPLE_ARROW_UDF(TIsKnownTLD, bool(TAutoMap<char*>)) {
     Y_UNUSED(valueBuilder);
     return TUnboxedValuePod(IsTld(args[0].AsStringRef()));
 }
+struct TIsKnownTLDKernelExec : public TUnaryKernelExec<TIsKnownTLDKernelExec> {
+    template <typename TSink>
+    static void Process(TBlockItem arg, const TSink& sink) {
+        sink(TBlockItem(static_cast<ui8>(IsTld(arg.AsStringRef()))));
+    }
+};
+END_SIMPLE_ARROW_UDF(TIsKnownTLD, TIsKnownTLDKernelExec::Do);
 
-SIMPLE_UDF(TIsWellKnownTLD, bool(TAutoMap<char*>)) {
+BEGIN_SIMPLE_ARROW_UDF(TIsWellKnownTLD, bool(TAutoMap<char*>)) {
     Y_UNUSED(valueBuilder);
     return TUnboxedValuePod(IsVeryGoodTld(args[0].AsStringRef()));
 }
+struct TIsWellKnownTLDKernelExec : public TUnaryKernelExec<TIsWellKnownTLDKernelExec> {
+    template <typename TSink>
+    static void Process(TBlockItem arg, const TSink& sink) {
+        sink(TBlockItem(static_cast<ui8>(IsVeryGoodTld(arg.AsStringRef()))));
+    }
+};
+END_SIMPLE_ARROW_UDF(TIsWellKnownTLD, TIsWellKnownTLDKernelExec::Do);
 
-SIMPLE_UDF(THostNameToPunycode, TOptional<char*>(TAutoMap<char*>)) try {
+BEGIN_SIMPLE_ARROW_UDF(THostNameToPunycode, TOptional<char*>(TAutoMap<char*>)) try {
     const TUtf16String& input = UTF8ToWide(args[0].AsStringRef());
     return valueBuilder->NewString(HostNameToPunycode(input));
 } catch (TPunycodeError&) {
     return TUnboxedValue();
 }
+struct THostNameToPunycodeKernelExec : public TUnaryKernelExec<THostNameToPunycodeKernelExec> {
+    template <typename TSink>
+    static void Process(TBlockItem arg, const TSink& sink) try {
+        const TUtf16String& input = UTF8ToWide(arg.AsStringRef());
+        return sink(TBlockItem(TStringRef(HostNameToPunycode(input))));
+    } catch (TPunycodeError&) {
+        return sink(TBlockItem());
+    }
+};
+END_SIMPLE_ARROW_UDF(THostNameToPunycode, THostNameToPunycodeKernelExec::Do);
 
-SIMPLE_UDF(TForceHostNameToPunycode, char*(TAutoMap<char*>)) {
+BEGIN_SIMPLE_ARROW_UDF(TForceHostNameToPunycode, char*(TAutoMap<char*>)) {
     const TUtf16String& input = UTF8ToWide(args[0].AsStringRef());
     return valueBuilder->NewString(ForceHostNameToPunycode(input));
 }
+struct TForceHostNameToPunycodeKernelExec : public TUnaryKernelExec<TForceHostNameToPunycodeKernelExec> {
+    template <typename TSink>
+    static void Process(TBlockItem arg, const TSink& sink) {
+        const TUtf16String& input = UTF8ToWide(arg.AsStringRef());
+        sink(TBlockItem(TStringRef(ForceHostNameToPunycode(input))));
+    }
+};
+END_SIMPLE_ARROW_UDF(TForceHostNameToPunycode, TForceHostNameToPunycodeKernelExec::Do);
 
-SIMPLE_UDF(TPunycodeToHostName, TOptional<char*>(TAutoMap<char*>)) try {
+BEGIN_SIMPLE_ARROW_UDF(TPunycodeToHostName, TOptional<char*>(TAutoMap<char*>)) try {
     const TStringRef& input = args[0].AsStringRef();
     const auto& result = WideToUTF8(PunycodeToHostName(input));
     return valueBuilder->NewString(result);
 } catch (TPunycodeError&) {
     return TUnboxedValue();
 }
+struct TPunycodeToHostNameKernelExec : public TUnaryKernelExec<TPunycodeToHostNameKernelExec> {
+    template <typename TSink>
+    static void Process(TBlockItem arg, const TSink& sink) try {
+        const TStringRef& input = arg.AsStringRef();
+        const auto& result = WideToUTF8(PunycodeToHostName(input));
+        return sink(TBlockItem(TStringRef(result)));
+    } catch (TPunycodeError&) {
+        return sink(TBlockItem());
+    }
+};
+END_SIMPLE_ARROW_UDF(TPunycodeToHostName, TPunycodeToHostNameKernelExec::Do);
 
-SIMPLE_UDF(TForcePunycodeToHostName, char*(TAutoMap<char*>)) {
+BEGIN_SIMPLE_ARROW_UDF(TForcePunycodeToHostName, char*(TAutoMap<char*>)) {
     const TStringRef& input = args[0].AsStringRef();
     const auto& result = WideToUTF8(ForcePunycodeToHostName(input));
     return valueBuilder->NewString(result);
 }
+struct TForcePunycodeToHostNameKernelExec : public TUnaryKernelExec<TForcePunycodeToHostNameKernelExec> {
+    template <typename TSink>
+    static void Process(TBlockItem arg, const TSink& sink) {
+        const TStringRef& input = arg.AsStringRef();
+        const auto& result = WideToUTF8(ForcePunycodeToHostName(input));
+        sink(TBlockItem(TStringRef(result)));
+    }
+};
+END_SIMPLE_ARROW_UDF(TForcePunycodeToHostName, TForcePunycodeToHostNameKernelExec::Do);
 
-SIMPLE_UDF(TCanBePunycodeHostName, bool(TAutoMap<char*>)) {
+BEGIN_SIMPLE_ARROW_UDF(TCanBePunycodeHostName, bool(TAutoMap<char*>)) {
     Y_UNUSED(valueBuilder);
     return TUnboxedValuePod(CanBePunycodeHostName(args[0].AsStringRef()));
 }
+struct TCanBePunycodeHostNameKernelExec : public TUnaryKernelExec<TCanBePunycodeHostNameKernelExec> {
+    template <typename TSink>
+    static void Process(TBlockItem arg, const TSink& sink) {
+        sink(TBlockItem(static_cast<ui8>(CanBePunycodeHostName(arg.AsStringRef()))));
+    }
+};
+END_SIMPLE_ARROW_UDF(TCanBePunycodeHostName, TCanBePunycodeHostNameKernelExec::Do);
 
 #define EXPORTED_URL_BASE_UDF \
     TNormalize, \

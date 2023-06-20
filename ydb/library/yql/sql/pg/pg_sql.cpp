@@ -1,7 +1,11 @@
+#include "util/charset/utf8.h"
 #include "utils.h"
 #include <ydb/library/yql/sql/settings/partitioning.h>
+#include <ydb/library/yql/parser/pg_wrapper/interface/config.h>
 #include <ydb/library/yql/parser/pg_wrapper/interface/parser.h>
+#include <ydb/library/yql/parser/pg_wrapper/interface/utils.h>
 #include <ydb/library/yql/parser/pg_wrapper/parser.h>
+#include <ydb/library/yql/parser/pg_wrapper/postgresql/src/backend/catalog/pg_type_d.h>
 #include <ydb/library/yql/parser/pg_catalog/catalog.h>
 #include <ydb/library/yql/providers/common/provider/yql_provider_names.h>
 #include <ydb/library/yql/core/yql_callable_names.h>
@@ -30,6 +34,8 @@ extern "C" {
 #undef SortBy
 }
 
+constexpr auto PREPARED_PARAM_PREFIX =  "$p";
+
 namespace NSQLTranslationPG {
 
 using namespace NYql;
@@ -55,11 +61,6 @@ int NodeTag(const Value& node) {
 int IntVal(const Value& node) {
     Y_ENSURE(node.type == T_Integer);
     return intVal(&node);
-}
-
-double FloatVal(const Value& node) {
-    Y_ENSURE(node.type == T_Float);
-    return floatVal(&node);
 }
 
 const char* StrFloatVal(const Value& node) {
@@ -217,6 +218,11 @@ public:
             Provider = provider;
             break;
         }
+        
+        for (size_t i = 0; i < Settings.PgParameterTypeOids.size(); ++i) {
+            auto paramName = PREPARED_PARAM_PREFIX + ToString(i + 1);
+            ParamNameToTypeOid[paramName] = Settings.PgParameterTypeOids[i];
+        }
     }
 
     void OnResult(const List* raw) {
@@ -247,9 +253,15 @@ public:
             return nullptr;
         }
 
-        Statements.push_back(L(A("let"), A("world"), L(A("CommitAll!"),
-            A("world"))));
+        if (Settings.EndOfQueryCommit) {
+            Statements.push_back(L(A("let"), A("world"), L(A("CommitAll!"),
+                A("world"))));
+        }
+
+        AddVariableDeclarations();
+
         Statements.push_back(L(A("return"), A("world")));
+
 
         if (DqEngineEnabled) {
             Statements[DqEnginePgmPos] = L(A("let"), A("world"), L(A(TString(NYql::ConfigureName)), A("world"), configSource,
@@ -280,6 +292,8 @@ public:
             return ParseVariableSetStmt(CAST_NODE(VariableSetStmt, node)) != nullptr;
         case T_DeleteStmt:
             return ParseDeleteStmt(CAST_NODE(DeleteStmt, node)) != nullptr;
+        case T_VariableShowStmt:
+            return ParseVariableShowStmt(CAST_NODE(VariableShowStmt, node)) != nullptr;
         case T_TransactionStmt:
             return true;
         default:
@@ -896,11 +910,6 @@ public:
 
     [[nodiscard]]
     TAstNode* ParseInsertStmt(const InsertStmt* value) {
-        if (!value->selectStmt) {
-            AddError("InsertStmt: expected Select");
-            return nullptr;
-        }
-
         if (value->onConflictClause) {
             AddError("InsertStmt: not supported onConflictClause");
             return nullptr;
@@ -938,16 +947,15 @@ public:
             }
         }
 
-        auto select = ParseSelectStmt(CAST_NODE(SelectStmt, value->selectStmt), true, targetColumns);
+        const auto select = (value->selectStmt) 
+            ? ParseSelectStmt(CAST_NODE(SelectStmt, value->selectStmt), true, targetColumns)
+            : L(A("Void"));
         if (!select) {
             return nullptr;
         }
 
-        auto insertMode = (ProviderToInsertModeMap.contains(Provider))
-            ? ProviderToInsertModeMap.at(Provider)
-            : "append";
+        const auto writeOptions = BuildWriteOptions(value);
 
-        auto writeOptions = QL(QL(QA("mode"), QA(insertMode)));
         Statements.push_back(L(
             A("let"),
             A("world"),
@@ -1037,6 +1045,7 @@ private:
         std::vector<TAstNode*> PrimaryKey;
         std::vector<TAstNode*> NotNullColumns;
         std::unordered_set<TString> NotNullColSet;
+        bool isTemporary;
     };
 
     bool CheckConstraintSupported(const Constraint* pk) {
@@ -1104,6 +1113,22 @@ private:
         return inserted;
     }
 
+    const TString& FindColumnTypeAlias(const TString& colType) {
+        const static std::unordered_map<TString, TString> aliasMap {
+            {"smallserial", "int2"},
+            {"serial2", "int2"},
+            {"serial", "int4"},
+            {"serial4", "int4"},
+            {"bigserial", "int8"},
+            {"serial8", "int8"},
+        };
+        const auto aliasIt = aliasMap.find(ToLowerUTF8(colType));
+        if (aliasIt == aliasMap.end()) {
+            return colType;
+        }
+        return aliasIt->second;
+    }
+
     bool AddColumn(TCreateTableCtx& ctx, const ColumnDef* node) {
         auto success = true;
 
@@ -1143,8 +1168,9 @@ private:
             return success;
 
         // for now we pass just the last part of the type name
-        auto colType = StrVal( ListNodeNth(node->typeName->names,
+        auto colTypeVal = StrVal( ListNodeNth(node->typeName->names,
                                            ListLength(node->typeName->names) - 1));
+        const auto colType = FindColumnTypeAlias(colTypeVal);
 
         ctx.Columns.push_back(
                 QL(QA(node->colname), L(A("PgType"), QA(colType)))
@@ -1187,6 +1213,24 @@ private:
         if (!ctx.NotNullColumns.empty()) {
             options.push_back(QL(QA("notnull"), QVL(ctx.NotNullColumns.data(), ctx.NotNullColumns.size())));
         }
+        if (ctx.isTemporary) {
+            options.push_back(QL(QA("temporary")));
+        }
+        return QVL(options.data(), options.size());
+    }
+
+    TAstNode* BuildWriteOptions(const InsertStmt* value) {
+        std::vector<TAstNode*> options;
+
+        const auto insertMode = (ProviderToInsertModeMap.contains(Provider))
+            ? ProviderToInsertModeMap.at(Provider)
+            : "append";
+        options.push_back(QL(QA("mode"), QA(insertMode)));
+
+        if (!value->selectStmt) {
+            options.push_back(QL(QA("default_values")));
+        }
+
         return QVL(options.data(), options.size());
     }
 
@@ -1242,29 +1286,25 @@ public:
             success = false;
         }
 
-        { auto relPersistence = static_cast<NPg::ERelPersistence>(value->relation->relpersistence);
-        if (relPersistence != NPg::ERelPersistence::Permanent) {
-            switch (relPersistence) {
-                case NPg::ERelPersistence::Temp:
-                    AddError("CREATE TEMP TABLE not supported");
-                    break;
+        TCreateTableCtx ctx {};
 
-                case NPg::ERelPersistence::Unlogged:
-                    AddError("UNLOGGED tables not supported");
-                    break;
-
-                default:
-                    Y_UNREACHABLE();
-            }
-            success = false;
-        }}
+        const auto relPersistence = static_cast<NPg::ERelPersistence>(value->relation->relpersistence);
+        switch (relPersistence) {
+            case NPg::ERelPersistence::Temp:
+                ctx.isTemporary = true;
+                break;
+            case NPg::ERelPersistence::Unlogged:
+                AddError("UNLOGGED tables not supported");
+                success = false;
+                break;
+            case NPg::ERelPersistence::Permanent:
+                break;
+        }
 
         auto [sink, key] = ParseWriteRangeVar(value->relation, true);
 
         if (!sink || !key)
             success = false;
-
-        TCreateTableCtx ctx;
 
         for (ui32 i = 0; i < ListLength(value->tableElts); ++i) {
             auto rawNode = ListNodeNth(value->tableElts, i);
@@ -1346,7 +1386,23 @@ public:
         }
 
         auto name = to_lower(TString(value->name));
-        if (name == "dqengine") {
+        if (name == "useblocks" || name == "emitaggapply") {
+            if (ListLength(value->args) != 1) {
+                AddError(TStringBuilder() << "VariableSetStmt, expected 1 arg, but got: " << ListLength(value->args));
+                return nullptr;
+            }
+
+            auto arg = ListNodeNth(value->args, 0);
+            if (NodeTag(arg) == T_A_Const && (NodeTag(CAST_NODE(A_Const, arg)->val) == T_String)) {
+                auto rawStr = StrVal(CAST_NODE(A_Const, arg)->val);
+                auto configSource = L(A("DataSource"), QA(TString(NYql::ConfigProviderName)));
+                Statements.push_back(L(A("let"), A("world"), L(A(TString(NYql::ConfigureName)), A("world"), configSource,
+                    QA(TString(rawStr == "true" ? "" : "Disable") + TString((name == "useblocks") ? "UseBlocks" : "PgEmitAggApply")))));
+            } else {
+                AddError(TStringBuilder() << "VariableSetStmt, expected string literal for " << value->name << " option");
+                return nullptr;
+            }
+        } else if (name == "dqengine") {
             if (ListLength(value->args) != 1) {
                 AddError(TStringBuilder() << "VariableSetStmt, expected 1 arg, but got: " << ListLength(value->args));
                 return nullptr;
@@ -1373,7 +1429,7 @@ public:
                 AddError(TStringBuilder() << "VariableSetStmt, expected string literal for " << value->name << " option");
                 return nullptr;
             }
-        } else if (name.StartsWith("dq.") || name.StartsWith("yt.")) {
+        } else if (name.StartsWith("dq.") || name.StartsWith("yt.") || name.StartsWith("s3.")) {
             if (ListLength(value->args) != 1) {
                 AddError(TStringBuilder() << "VariableSetStmt, expected 1 arg, but got: " << ListLength(value->args));
                 return nullptr;
@@ -1383,7 +1439,16 @@ public:
             if (NodeTag(arg) == T_A_Const && (NodeTag(CAST_NODE(A_Const, arg)->val) == T_String)) {
                 auto dotPos = name.find('.');
                 auto provider = name.substr(0, dotPos);
-                auto providerSource = L(A("DataSource"), QA(TString(name.StartsWith("dq.") ? NYql::DqProviderName : NYql::YtProviderName)), QA("$all"));
+                TString providerName;
+                if (name.StartsWith("dq.")) {
+                    providerName = NYql::DqProviderName;
+                } else if (name.StartsWith("yt.")) {
+                    providerName = NYql::YtProviderName;
+                } else {
+                    providerName = NYql::S3ProviderName;
+                }
+
+                auto providerSource = L(A("DataSource"), QA(providerName), QA("$all"));
 
                 auto rawStr = StrVal(CAST_NODE(A_Const, arg)->val);
 
@@ -1494,6 +1559,50 @@ public:
                 )
             )
         ));
+        return Statements.back();
+    }
+    
+    TMaybe<TString> GetConfigVariable(const TString& varName) {
+        if (varName == "server_version") {
+            return GetPostgresServerVersionStr();
+        }
+        if (varName == "server_version_num") {
+            return GetPostgresServerVersionNum();
+        }
+        return {};
+    }
+
+    [[nodiscard]]
+    TAstNode* ParseVariableShowStmt(const VariableShowStmt* value) {
+        const auto varName = to_lower(TString(value->name));
+
+        const auto varValue = GetConfigVariable(varName);
+        if (!varValue) {
+            AddError("unrecognized configuration parameter \"" + varName + "\"");
+            return nullptr;
+        }
+
+        const auto columnName = QAX(varName);
+        const auto varValueNode = 
+            L(A("PgConst"), QAX(*varValue), L(A("PgType"), QA("text")));
+
+        const auto lambda = L(A("lambda"), QL(), varValueNode);
+        const auto res = QL(L(A("PgResultItem"), columnName, L(A("Void")), lambda));
+
+        const auto setItem = L(A("PgSetItem"), QL(QL(QA("result"), res)));
+        const auto setItems = QL(QA("set_items"), QL(setItem));
+        const auto setOps = QL(QA("set_ops"), QVL(QA("push")));
+        const auto selectOptions = QL(setItems, setOps);
+
+        const auto output = L(A("PgSelect"), selectOptions);
+        Statements.push_back(L(A("let"), A("output"), output));
+        Statements.push_back(L(A("let"), A("result_sink"), L(A("DataSink"), QA(TString(NYql::ResultProviderName)))));
+
+        const auto resOptions = QL(QL(QA("type")), QL(QA("autoref")));
+        Statements.push_back(L(A("let"), A("world"), L(A("Write!"),
+            A("world"), A("result_sink"), L(A("Key")), A("output"), resOptions)));
+        Statements.push_back(L(A("let"), A("world"), L(A("Commit!"),
+            A("world"), A("result_sink"))));
         return Statements.back();
     }
 
@@ -1870,6 +1979,14 @@ public:
         return L(A("If"), final.Pred, final.Value, defaultResult);
     }
 
+    TAstNode* ParseParamRefExpr(const ParamRef* value) {
+        const auto varName = PREPARED_PARAM_PREFIX + ToString(value->number);
+        if (!ParamNameToTypeOid.contains(varName)) {
+            ParamNameToTypeOid[varName] = UNKNOWNOID;
+        }
+        return A(varName);
+    }
+
     TAstNode* ParseExpr(const Node* node, const TExprSettings& settings) {
         switch (NodeTag(node)) {
         case T_A_Const: {
@@ -1908,6 +2025,9 @@ public:
         case T_GroupingFunc: {
             return ParseGroupingFunc(CAST_NODE(GroupingFunc, node));
         }
+        case T_ParamRef: {
+            return ParseParamRefExpr(CAST_NODE(ParamRef, node));
+        }
         default:
             NodeNotImplemented(node);
             return nullptr;
@@ -1922,7 +2042,10 @@ public:
             return L(A("PgConst"), QA(ToString(IntVal(val))), L(A("PgType"), QA("int4")));
         }
         case T_Float: {
-            return L(A("PgConst"), QA(ToString(StrFloatVal(val))), L(A("PgType"), QA("float8")));
+            auto s = StrFloatVal(val);
+            i64 v;
+            const bool isInt8 = TryFromString<i64>(s, v);
+            return L(A("PgConst"), QA(ToString(s)), L(A("PgType"), isInt8 ? QA("int8") : QA("numeric")));
         }
         case T_String: {
             return L(A("PgConst"), QAX(ToString(StrVal(val))), L(A("PgType"), QA("text")));
@@ -2992,6 +3115,15 @@ public:
 
     }
 
+    void AddVariableDeclarations() {
+      for (const auto &[varName, typeOid] : ParamNameToTypeOid) {
+        const auto &typeName =
+            typeOid != UNKNOWNOID ? NPg::LookupType(typeOid).Name : "text";
+        const auto pgType = L(A("PgType"), QA(typeName));
+        Statements.push_back(L(A("declare"), A(varName), pgType));
+      }
+    }
+
     template <typename T>
     void NodeNotImplementedImpl(const Node* nodeptr) {
         TStringBuilder b;
@@ -3178,6 +3310,8 @@ private:
     ui32 QuerySize;
     TString Provider;
     static const THashMap<TStringBuf, TString> ProviderToInsertModeMap;
+
+    THashMap<TString, Oid> ParamNameToTypeOid;
 };
 
 const THashMap<TStringBuf, TString> TConverter::ProviderToInsertModeMap = {

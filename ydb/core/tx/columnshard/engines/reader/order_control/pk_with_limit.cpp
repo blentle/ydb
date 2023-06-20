@@ -35,13 +35,14 @@ bool TPKSortingWithLimit::DoWakeup(const TGranule& granule, TGranulesFillingCont
             ++CountProcessedBatches;
             MergeStream.AddPoolSource(b.GetPoolId(), b->GetFetchedInfo().GetFilterBatch(), b->GetFetchedInfo().GetNotAppliedEarlyFilter());
             OnBatchFilterInitialized(*b, context);
+            const bool currentHasFrom = !!batches.front().GetFrom();
             batches.pop_front();
             if (batches.size()) {
-                auto nextBatchControlPoint = batches.front()->GetFirstPK(ReadMetadata->IsDescSorted(), ReadMetadata->GetIndexInfo());
-                if (!nextBatchControlPoint) {
+                if (!batches.front().GetFrom() || !currentHasFrom) {
                     continue;
                 }
-                MergeStream.PutControlPoint(nextBatchControlPoint);
+                Y_VERIFY(b.GetFrom()->Compare(*batches.front().GetFrom()) != std::partial_ordering::greater);
+                MergeStream.PutControlPoint(batches.front().GetFrom());
             }
             while (CurrentItemsLimit && MergeStream.DrainCurrent()) {
                 --CurrentItemsLimit;
@@ -91,23 +92,22 @@ bool TPKSortingWithLimit::DoOnFilterReady(TBatch& /*batchInfo*/, const TGranule&
 }
 
 void TPKSortingWithLimit::DoFill(TGranulesFillingContext& context) {
-    auto granulesOrder = ReadMetadata->SelectInfo->GranulesOrder(ReadMetadata->IsDescSorted());
-    for (ui64 granule : granulesOrder) {
-        TGranule& g = context.GetGranuleVerified(granule);
-        GranulesOutOrder.emplace_back(&g);
-        GranulesOutOrderForPortions.emplace_back(g.SortBatchesByPK(ReadMetadata->IsDescSorted(), ReadMetadata), &g);
+    for (auto&& granule : ReadMetadata->SelectInfo->GetGranulesOrdered(ReadMetadata->IsDescSorted())) {
+        TGranule::TPtr g = context.GetGranuleVerified(granule.Granule);
+        GranulesOutOrder.emplace_back(g);
+        GranulesOutOrderForPortions.emplace_back(g->SortBatchesByPK(ReadMetadata->IsDescSorted(), ReadMetadata), g);
     }
 }
 
-std::vector<TGranule*> TPKSortingWithLimit::DoDetachReadyGranules(THashMap<ui64, NIndexedReader::TGranule*>& granulesToOut) {
-    std::vector<TGranule*> result;
+std::vector<TGranule::TPtr> TPKSortingWithLimit::DoDetachReadyGranules(TResultController& granulesToOut) {
+    std::vector<TGranule::TPtr> result;
     while (GranulesOutOrder.size()) {
-        NIndexedReader::TGranule* granule = GranulesOutOrder.front();
+        NIndexedReader::TGranule::TPtr granule = GranulesOutOrder.front();
         if (!granule->IsReady()) {
             break;
         }
         result.emplace_back(granule);
-        Y_VERIFY(granulesToOut.erase(granule->GetGranuleId()));
+        Y_VERIFY(granulesToOut.ExtractResult(granule->GetGranuleId()));
         GranulesOutOrder.pop_front();
     }
     return result;

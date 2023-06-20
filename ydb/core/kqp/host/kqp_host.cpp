@@ -26,8 +26,6 @@
 #include <library/cpp/random_provider/random_provider.h>
 #include <library/cpp/time_provider/time_provider.h>
 
-#include <util/system/env.h>
-
 namespace NKikimr {
 namespace NKqp {
 
@@ -35,8 +33,6 @@ using namespace NYql;
 using namespace NYql::NCommon;
 using namespace NYql::NNodes;
 using namespace NThreading;
-
-using TSqlVersion = ui16;
 
 namespace {
 
@@ -297,7 +293,12 @@ public:
     void FillResult(TResult& queryResult) const override {
         YQL_ENSURE(ExecuteCtx.QueryResults.size() == 1);
         queryResult = std::move(ExecuteCtx.QueryResults[0]);
-        queryResult.QueryPlan = SerializeExplainPlan(queryResult.PreparingQuery->GetPhysicalQuery());
+        queryResult.QueryPlan = queryResult.PreparingQuery->GetPhysicalQuery().GetQueryPlan();
+        auto& bindings = queryResult.PreparingQuery->GetPhysicalQuery().GetResultBindings();
+        for (const auto& binding: bindings) {
+            auto meta = queryResult.ResultSetsMeta.Add();
+            meta->CopyFrom(binding.GetResultSetMeta());
+        }
     }
 
 private:
@@ -329,7 +330,7 @@ public:
         prepareResult.SqlVersion = SqlVersion;
 
         YQL_ENSURE(prepareResult.PreparingQuery->GetVersion() == NKikimrKqp::TPreparedQuery::VERSION_PHYSICAL_V1);
-        prepareResult.QueryPlan = SerializeExplainPlan(prepareResult.PreparingQuery->GetPhysicalQuery());
+        prepareResult.QueryPlan = prepareResult.PreparingQuery->GetPhysicalQuery().GetQueryPlan();
         prepareResult.QueryAst = prepareResult.PreparingQuery->GetPhysicalQuery().GetQueryAst();
     }
 
@@ -967,14 +968,14 @@ public:
             });
     }
 
-    IAsyncQueryResultPtr PrepareQuery(const TKqpQueryRef& query, const TPrepareSettings& settings) override {
+    IAsyncQueryResultPtr PrepareGenericQuery(const TKqpQueryRef& query, const TPrepareSettings& settings) override {
         return CheckedProcessQuery(*ExprCtx,
             [this, &query, settings] (TExprContext& ctx) mutable {
                 return PrepareQueryInternal(query, EKikimrQueryType::Query, settings, ctx);
             });
     }
 
-    IAsyncQueryResultPtr PrepareFederatedQuery(const TKqpQueryRef& query, const TPrepareSettings& settings) override {
+    IAsyncQueryResultPtr PrepareGenericScript(const TKqpQueryRef& query, const TPrepareSettings& settings) override {
         return CheckedProcessQuery(*ExprCtx,
             [this, &query, settings] (TExprContext& ctx) mutable {
                 return PrepareQueryInternal(query, EKikimrQueryType::Script, settings, ctx);
@@ -1052,24 +1053,14 @@ public:
 
 private:
     TExprNode::TPtr CompileQuery(const TKqpQueryRef& query, bool isSql, bool sqlAutoCommit, TExprContext& ctx,
-        TMaybe<TSqlVersion>& sqlVersion) const
+        TMaybe<TSqlVersion>& sqlVersion, const TMaybe<bool>& usePgParser) const
     {
         TAstParseResult astRes;
         if (isSql) {
             NSQLTranslation::TTranslationSettings settings{};
-
-            // TODO: remove this test crutch when dynamic bindings discovery will be implemented // YQ-1964
-            if (SessionCtx->Query().Type == EKikimrQueryType::Script && GetEnv("TEST_S3_CONNECTION")) {
-                NSQLTranslation::TTableBindingSettings binding;
-                binding.ClusterType = "s3";
-                binding.Settings["cluster"] = GetEnv("TEST_S3_CONNECTION");
-                binding.Settings["path"] = GetEnv("TEST_S3_OBJECT");
-                binding.Settings["format"] = GetEnv("TEST_S3_FORMAT");
-                binding.Settings["schema"] = GetEnv("TEST_S3_SCHEMA");
-
-                settings.PrivateBindings[GetEnv("TEST_S3_BINDING")] = binding;
+            if (usePgParser) {
+                settings.PgParser = *usePgParser;
             }
-
             if (sqlVersion) {
                 settings.SyntaxVersion = *sqlVersion;
 
@@ -1152,9 +1143,9 @@ private:
     }
 
     TExprNode::TPtr CompileYqlQuery(const TKqpQueryRef& query, bool isSql, bool sqlAutoCommit, TExprContext& ctx,
-        TMaybe<TSqlVersion>& sqlVersion) const
+        TMaybe<TSqlVersion>& sqlVersion, const TMaybe<bool>& usePgParser) const
     {
-        auto queryExpr = CompileQuery(query, isSql, sqlAutoCommit, ctx, sqlVersion);
+        auto queryExpr = CompileQuery(query, isSql, sqlAutoCommit, ctx, sqlVersion, usePgParser);
         if (!queryExpr) {
             return nullptr;
         }
@@ -1226,7 +1217,7 @@ private:
         }
 
         TMaybe<TSqlVersion> sqlVersion;
-        auto queryExpr = CompileYqlQuery(query, isSql, false, ctx, sqlVersion);
+        auto queryExpr = CompileYqlQuery(query, isSql, false, ctx, sqlVersion, {});
         if (!queryExpr) {
             return nullptr;
         }
@@ -1280,7 +1271,7 @@ private:
         }
 
         TMaybe<TSqlVersion> sqlVersion;
-        auto queryExpr = CompileYqlQuery(query, /* isSql */ true, /* sqlAutoCommit */ false, ctx, sqlVersion);
+        auto queryExpr = CompileYqlQuery(query, /* isSql */ true, /* sqlAutoCommit */ false, ctx, sqlVersion, {});
         if (!queryExpr) {
             return nullptr;
         }
@@ -1305,7 +1296,7 @@ private:
         }
 
         TMaybe<TSqlVersion> sqlVersion;
-        auto queryExpr = CompileYqlQuery(queryAst, false, false, ctx, sqlVersion);
+        auto queryExpr = CompileYqlQuery(queryAst, false, false, ctx, sqlVersion, {});
         if (!queryExpr) {
             return nullptr;
         }
@@ -1316,8 +1307,8 @@ private:
             SessionCtx, *ExecuteCtx);
     }
 
-    IAsyncQueryResultPtr PrepareQueryInternal(const TKqpQueryRef& query, EKikimrQueryType queryType, const TPrepareSettings& settings,
-        TExprContext& ctx)
+    IAsyncQueryResultPtr PrepareQueryInternal(const TKqpQueryRef& query, EKikimrQueryType queryType,
+        const TPrepareSettings& settings, TExprContext& ctx)
     {
         SetupYqlTransformer(queryType);
 
@@ -1330,9 +1321,13 @@ private:
             SessionCtx->Query().IsInternalCall = *settings.IsInternalCall;
         }
 
-        // TODO: Support PG
-        TMaybe<TSqlVersion> sqlVersion = 1;
-        auto queryExpr = CompileYqlQuery(query, /* isSql */ true, /* sqlAutoCommit */ false, ctx, sqlVersion);
+        TMaybe<TSqlVersion> sqlVersion = settings.SyntaxVersion;
+        if (!sqlVersion) {
+            sqlVersion = 1;
+        }
+
+        auto queryExpr = CompileYqlQuery(query, /* isSql */ true, /* sqlAutoCommit */ false, ctx, sqlVersion,
+            settings.UsePgParser);
         if (!queryExpr) {
             return nullptr;
         }
@@ -1349,7 +1344,9 @@ private:
             : PrepareScanQueryAstInternal(query, ctx);
     }
 
-    IAsyncQueryResultPtr PrepareScanQueryInternal(const TKqpQueryRef& query, TExprContext& ctx, EKikimrStatsMode statsMode = EKikimrStatsMode::None) {
+    IAsyncQueryResultPtr PrepareScanQueryInternal(const TKqpQueryRef& query, TExprContext& ctx,
+        EKikimrStatsMode statsMode = EKikimrStatsMode::None)
+    {
         SetupYqlTransformer(EKikimrQueryType::Scan);
 
         SessionCtx->Query().PrepareOnly = true;
@@ -1357,7 +1354,7 @@ private:
         SessionCtx->Query().PreparingQuery = std::make_unique<NKikimrKqp::TPreparedQuery>();
 
         TMaybe<TSqlVersion> sqlVersion = 1;
-        auto queryExpr = CompileYqlQuery(query, true, false, ctx, sqlVersion);
+        auto queryExpr = CompileYqlQuery(query, true, false, ctx, sqlVersion, {});
         if (!queryExpr) {
             return nullptr;
         }
@@ -1374,7 +1371,7 @@ private:
         SessionCtx->Query().PreparingQuery = std::make_unique<NKikimrKqp::TPreparedQuery>();
 
         TMaybe<TSqlVersion> sqlVersion;
-        auto queryExpr = CompileYqlQuery(queryAst, false, false, ctx, sqlVersion);
+        auto queryExpr = CompileYqlQuery(queryAst, false, false, ctx, sqlVersion, {});
         if (!queryExpr) {
             return nullptr;
         }
@@ -1396,7 +1393,7 @@ private:
         SessionCtx->Query().PreparedQuery.reset();
 
         TMaybe<TSqlVersion> sqlVersion;
-        auto scriptExpr = CompileYqlQuery(script, true, true, ctx, sqlVersion);
+        auto scriptExpr = CompileYqlQuery(script, true, true, ctx, sqlVersion, {});
         if (!scriptExpr) {
             return nullptr;
         }
@@ -1422,7 +1419,7 @@ private:
         SessionCtx->Query().PreparedQuery.reset();
 
         TMaybe<TSqlVersion> sqlVersion;
-        auto scriptExpr = CompileYqlQuery(script, true, true, ctx, sqlVersion);
+        auto scriptExpr = CompileYqlQuery(script, true, true, ctx, sqlVersion, {});
         if (!scriptExpr) {
             return nullptr;
         }
@@ -1444,7 +1441,7 @@ private:
         SessionCtx->Query().PreparedQuery.reset();
 
         TMaybe<TSqlVersion> sqlVersion;
-        auto scriptExpr = CompileYqlQuery(script, true, true, ctx, sqlVersion);
+        auto scriptExpr = CompileYqlQuery(script, true, true, ctx, sqlVersion, {});
         if (!scriptExpr) {
             return nullptr;
         }
@@ -1468,7 +1465,7 @@ private:
         SessionCtx->Query().PreparingQuery = std::make_unique<NKikimrKqp::TPreparedQuery>();
 
         TMaybe<TSqlVersion> sqlVersion;
-        auto scriptExpr = CompileYqlQuery(script, true, true, ctx, sqlVersion);
+        auto scriptExpr = CompileYqlQuery(script, true, true, ctx, sqlVersion, {});
         if (!scriptExpr) {
             return nullptr;
         }
@@ -1483,14 +1480,7 @@ private:
         state->FunctionRegistry = FuncRegistry;
         state->CredentialsFactory = nullptr; // TODO
 
-        // TODO: remove this test crutch after dynamic connections resolving implementation // YQ-1964
         NYql::TS3GatewayConfig cfg;
-        if (GetEnv("TEST_S3_CONNECTION")) {
-            auto* mapping = cfg.AddClusterMapping();
-            mapping->SetName(GetEnv("TEST_S3_CONNECTION"));
-            mapping->SetUrl(TStringBuilder() << GetEnv("S3_ENDPOINT") << "/" << GetEnv("TEST_S3_BUCKET") << "/");
-        }
-
         state->Configuration->Init(cfg, TypesCtx);
 
         auto dataSource = NYql::CreateS3DataSource(state, HttpGateway);
@@ -1501,7 +1491,7 @@ private:
     }
 
     void Init(EKikimrQueryType queryType) {
-        if (queryType == EKikimrQueryType::Script) {
+        if (queryType == EKikimrQueryType::Script || queryType == EKikimrQueryType::Query) {
             InitS3Provider();
         }
 

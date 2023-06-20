@@ -7,10 +7,8 @@
 namespace NKikimr::NOlap::NIndexedReader {
 
 void TGranule::OnBatchReady(const TBatch& batchInfo, std::shared_ptr<arrow::RecordBatch> batch) {
-    if (Owner->GetSortingPolicy()->CanInterrupt()) {
-        if (ReadyFlag) {
-            return;
-        }
+    if (Owner->GetSortingPolicy()->CanInterrupt() && ReadyFlag) {
+        return;
     }
     AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD_SCAN)("event", "new_batch")("granule_id", GranuleId)
         ("batch_address", batchInfo.GetBatchAddress().ToString())("count", WaitBatches.size());
@@ -33,11 +31,11 @@ void TGranule::OnBatchReady(const TBatch& batchInfo, std::shared_ptr<arrow::Reco
     CheckReady();
 }
 
-NKikimr::NOlap::NIndexedReader::TBatch& TGranule::AddBatch(const TPortionInfo& portionInfo) {
+NKikimr::NOlap::NIndexedReader::TBatch& TGranule::RegisterBatchForFetching(const TPortionInfo& portionInfo) {
     Y_VERIFY(!ReadyFlag);
     ui32 batchGranuleIdx = Batches.size();
     WaitBatches.emplace(batchGranuleIdx);
-    Batches.emplace_back(TBatch(TBatchAddress(GranuleIdx, batchGranuleIdx), *this, portionInfo));
+    Batches.emplace_back(TBatch(TBatchAddress(GranuleId, batchGranuleIdx), *this, portionInfo));
     Y_VERIFY(GranuleBatchNumbers.emplace(batchGranuleIdx).second);
     Owner->OnNewBatch(Batches.back());
     return Batches.back();
@@ -70,34 +68,34 @@ std::deque<TGranule::TBatchForMerge> TGranule::SortBatchesByPK(const bool revers
     ui32 currentPoolId = 0;
     std::map<TSortableBatchPosition, ui32> poolIds;
     for (auto&& i : batches) {
-        if (!i.GetFrom() && !i.GetTo()) {
+        if (!i.GetFrom()) {
+            Y_VERIFY(!currentPoolId);
             continue;
         }
-        if (i.GetFrom()) {
-            auto it = poolIds.rbegin();
-            for (; it != poolIds.rend(); ++it) {
-                if (it->first.Compare(*i.GetFrom()) < 0) {
-                    break;
-                }
+        auto it = poolIds.rbegin();
+        for (; it != poolIds.rend(); ++it) {
+            if (it->first.Compare(*i.GetFrom()) < 0) {
+                break;
             }
-            if (it != poolIds.rend()) {
-                i.SetPoolId(it->second);
-                if (i.GetTo()) {
-                    poolIds.erase(it->first);
-                    poolIds.emplace(*i.GetTo(), *i.GetPoolId());
-                } else {
-                    poolIds.erase(it->first);
-                }
-            } else if (i.GetTo()) {
-                i.SetPoolId(++currentPoolId);
-                poolIds.emplace(*i.GetTo(), *i.GetPoolId());
-            }
+        }
+        if (it != poolIds.rend()) {
+            i.SetPoolId(it->second);
+            poolIds.erase(it->first);
+        } else {
+            i.SetPoolId(++currentPoolId);
+        }
+        if (i.GetTo()) {
+            poolIds.emplace(*i.GetTo(), *i.GetPoolId());
         }
     }
     return batches;
 }
 
 void TGranule::AddNotIndexedBatch(std::shared_ptr<arrow::RecordBatch> batch) {
+    if (Owner->GetSortingPolicy()->CanInterrupt() && ReadyFlag) {
+        return;
+    }
+    Y_VERIFY(!ReadyFlag);
     Y_VERIFY(!NotIndexedBatchReadyFlag || !batch);
     if (!NotIndexedBatchReadyFlag) {
         AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD_SCAN)("event", "new_batch")("granule_id", GranuleId)("batch_no", "add_not_indexed_batch")("count", WaitBatches.size());
@@ -111,9 +109,7 @@ void TGranule::AddNotIndexedBatch(std::shared_ptr<arrow::RecordBatch> batch) {
         if (NotIndexedBatch) {
             RecordBatches.emplace_back(NotIndexedBatch);
         }
-        if (Owner->GetReadMetadata()->Program) {
-            NotIndexedBatchFutureFilter = std::make_shared<NArrow::TColumnFilter>(NOlap::EarlyFilter(batch, Owner->GetReadMetadata()->Program));
-        }
+        NotIndexedBatchFutureFilter = Owner->GetReadMetadata()->GetProgram().BuildEarlyFilter(batch);
         DuplicationsAvailableFlag = true;
     }
     CheckReady();
@@ -123,8 +119,17 @@ void TGranule::AddNotIndexedBatch(std::shared_ptr<arrow::RecordBatch> batch) {
 void TGranule::CheckReady() {
     if (WaitBatches.empty() && NotIndexedBatchReadyFlag) {
         ReadyFlag = true;
-        Owner->OnGranuleReady(*this);
+        Owner->OnGranuleReady(GranuleId);
     }
+}
+
+void TGranule::OnBlobReady(const TBlobRange& range) noexcept {
+    if (Owner->GetSortingPolicy()->CanInterrupt() && ReadyFlag) {
+        return;
+    }
+    Y_VERIFY(!ReadyFlag);
+    BlobsDataSize += range.Size;
+    Owner->OnBlobReady(GranuleId, range);
 }
 
 }

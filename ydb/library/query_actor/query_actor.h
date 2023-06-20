@@ -31,6 +31,8 @@ protected:
         bool Continue = false;
     };
 
+    using TQueryResultHandler = void (TQueryBase::*)();
+
 private:
     struct TEvQueryBasePrivate {
         // Event ids
@@ -39,6 +41,7 @@ private:
             EvCreateSessionResult,
             EvDeleteSessionResult,
             EvRollbackTransactionResponse,
+            EvCommitTransactionResponse,
 
             EvEnd
         };
@@ -81,12 +84,20 @@ private:
             Ydb::StatusIds::StatusCode Status;
             NYql::TIssues Issues;
         };
+
+        struct TEvCommitTransactionResponse : public NActors::TEventLocal<TEvCommitTransactionResponse, EvCommitTransactionResponse> {
+            TEvCommitTransactionResponse(Ydb::StatusIds::StatusCode status, NYql::TIssues&& issues);
+            TEvCommitTransactionResponse(const Ydb::Table::CommitTransactionResponse& resp);
+
+            Ydb::StatusIds::StatusCode Status;
+            NYql::TIssues Issues;
+        };
     };
 
 public:
     static constexpr char ActorName[] = "SQL_QUERY";
 
-    explicit TQueryBase(ui64 logComponent, TString sessionId = {}, TString database = GetDefaultDatabase());
+    explicit TQueryBase(ui64 logComponent, TString sessionId = {}, TString database = {});
 
     void Bootstrap();
 
@@ -99,11 +110,17 @@ protected:
     void Finish();
 
     void RunDataQuery(const TString& sql, NYdb::TParamsBuilder* params = nullptr, TTxControl txControl = TTxControl::BeginAndCommitTx());
+    void CommitTransaction();
+
+    template <class THandlerFunc>
+    void SetQueryResultHandler(THandlerFunc handler) {
+        QueryResultHandler = static_cast<TQueryResultHandler>(handler);
+    }
 
 private:
     // Methods for implementing in derived classes.
     virtual void OnRunQuery() = 0;
-    virtual void OnQueryResult() = 0; // Must either run next query or finish
+    virtual void OnQueryResult() {} // Must either run next query or finish
     virtual void OnFinish(Ydb::StatusIds::StatusCode status, NYql::TIssues&& issues) = 0;
 
 private:
@@ -124,21 +141,27 @@ private:
     void Handle(TEvQueryBasePrivate::TEvDeleteSessionResult::TPtr& ev);
     void Handle(TEvQueryBasePrivate::TEvDataQueryResult::TPtr& ev);
     void Handle(TEvQueryBasePrivate::TEvRollbackTransactionResponse::TPtr& ev);
+    void Handle(TEvQueryBasePrivate::TEvCommitTransactionResponse::TPtr& ev);
 
     void RunQuery();
     void RunCreateSession();
     void RunDeleteSession();
     void RollbackTransaction();
 
+    void CallOnQueryResult();
+
 protected:
     const ui64 LogComponent;
-    const TString Database;
+    TString Database;
     TString SessionId;
     TString TxId;
     bool DeleteSession = false;
     bool RunningQuery = false;
+    bool RunningCommit = false;
     bool Finished = false;
     bool CommitRequested = false;
+
+    TQueryResultHandler QueryResultHandler = &TQueryBase::CallOnQueryResult;
 
     NActors::TActorId Owner;
 

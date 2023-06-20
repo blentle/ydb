@@ -106,6 +106,15 @@ public:
             request.SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
             request.SetType(NKikimrKqp::QUERY_TYPE_SQL_SCRIPT);
             request.SetKeepSession(false);
+        } else if (Action == "execute-query") {
+            request.SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
+            request.SetType(NKikimrKqp::QUERY_TYPE_SQL_GENERIC_QUERY);
+            request.mutable_txcontrol()->mutable_begin_tx()->mutable_serializable_read_write();
+            request.SetKeepSession(false);
+        } else if (Action == "explain-query") {
+            request.SetAction(NKikimrKqp::QUERY_ACTION_EXPLAIN);
+            request.SetType(NKikimrKqp::QUERY_TYPE_SQL_GENERIC_QUERY);
+            request.SetKeepSession(false);
         } else if (Action == "execute-scan") {
             request.SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
             request.SetType(NKikimrKqp::QUERY_TYPE_SQL_SCAN);
@@ -113,6 +122,7 @@ public:
         } else if (Action == "execute-data") {
             request.SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
             request.SetType(NKikimrKqp::QUERY_TYPE_SQL_DML);
+            request.mutable_txcontrol()->mutable_begin_tx()->mutable_serializable_read_write();
             request.SetKeepSession(false);
         } else if (Action == "explain" || Action == "explain-ast" || Action == "explain-data") {
             request.SetAction(NKikimrKqp::QUERY_ACTION_EXPLAIN);

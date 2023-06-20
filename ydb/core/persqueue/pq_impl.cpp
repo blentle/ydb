@@ -77,8 +77,9 @@ struct TChangeNotification {
     ui64 TxId;
 };
 
-static TMaybe<TPartitionKeyRange> GetPartitionKeyRange(const NKikimrPQ::TPQTabletConfig::TPartition& proto) {
-    if (!proto.HasKeyRange()) {
+static TMaybe<TPartitionKeyRange> GetPartitionKeyRange(const NKikimrPQ::TPQTabletConfig& config,
+                                                       const NKikimrPQ::TPQTabletConfig::TPartition& proto) {
+    if (!proto.HasKeyRange() || config.GetPartitionKeySchema().empty()) {
         return Nothing();
     }
     return TPartitionKeyRange::Parse(proto.GetKeyRange());
@@ -636,9 +637,9 @@ void TPersQueue::ApplyNewConfigAndReply(const TActorContext& ctx)
     for (const auto& partition : Config.GetPartitions()) {
         const auto partitionId = partition.GetPartitionId();
         if (Partitions.find(partitionId) == Partitions.end()) {
-            Partitions.emplace(partitionId, TPartitionInfo(
-                ctx.Register(CreatePartitionActor(partitionId, TopicConverter, Config, true, ctx)),
-                GetPartitionKeyRange(partition),
+            Partitions.emplace(partitionId,
+                TPartitionInfo(ctx.Register(CreatePartitionActor(partitionId, TopicConverter, Config, true, ctx)),
+                GetPartitionKeyRange(Config, partition),
                 true,
                 *Counters
             ));
@@ -857,7 +858,7 @@ void TPersQueue::ReadConfig(const NKikimrClient::TKeyValueResponse::TReadResult&
         const auto partitionId = partition.GetPartitionId();
         Partitions.emplace(partitionId, TPartitionInfo(
             ctx.Register(CreatePartitionActor(partitionId, TopicConverter, Config, false, ctx)),
-            GetPartitionKeyRange(partition),
+            GetPartitionKeyRange(Config, partition),
             false,
             *Counters
         ));
@@ -1753,7 +1754,7 @@ void TPersQueue::HandleWriteRequest(const ui64 responseCookie, const TActorId& p
             errorStr = "no SeqNo";
         } else if (!cmd.HasData() || cmd.GetData().empty()){
             errorStr = "empty Data";
-        } else if ((!cmd.HasSourceId() || cmd.GetSourceId().empty()) && !req.GetIsDirectWrite()) {
+        } else if ((!cmd.HasSourceId() || cmd.GetSourceId().empty()) && !req.GetIsDirectWrite() && !cmd.GetDisableDeduplication()) {
             errorStr = "empty SourceId";
         } else if (cmd.GetPartitionKey().size() > 256) {
             errorStr = "too long partition key";
@@ -2884,8 +2885,6 @@ void TPersQueue::SendEvReadSetToReceivers(const TActorContext& ctx,
             SendToPipe(receiverId, tx, std::move(event), ctx);
         }
     }
-
-    tx.ReadSetAcks.clear();
 }
 
 void TPersQueue::SendEvReadSetAckToSenders(const TActorContext& ctx,
@@ -3131,7 +3130,11 @@ void TPersQueue::CheckTxState(const TActorContext& ctx,
         [[fallthrough]];
 
     case NKikimrPQ::TTransaction::WAIT_RS:
-        Y_VERIFY(tx.ReadSetAcks.size() <= tx.Receivers.size());
+        //
+        // the number of TEvReadSetAck sent should not be greater than the number of senders
+        // from TEvProposeTransaction
+        //
+        Y_VERIFY(tx.ReadSetAcks.size() <= tx.Senders.size());
 
         if (tx.HaveParticipantsDecision()) {
             SendEvProposeTransactionResult(ctx, tx);
@@ -3275,7 +3278,6 @@ TPartition* TPersQueue::CreatePartitionActor(ui32 partitionId,
                           ctx.SelfID,
                           CacheActor,
                           topicConverter,
-                          IsLocalDC,
                           DCId,
                           IsServerless,
                           config,
@@ -3309,7 +3311,7 @@ void TPersQueue::CreateNewPartitions(NKikimrPQ::TPQTabletConfig& config,
         Partitions.emplace(std::piecewise_construct,
                            std::forward_as_tuple(partitionId),
                            std::forward_as_tuple(actorId,
-                                                 GetPartitionKeyRange(partition),
+                                                 GetPartitionKeyRange(config, partition),
                                                  true,
                                                  *Counters));
 

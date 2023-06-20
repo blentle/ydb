@@ -328,6 +328,11 @@ std::unique_ptr<typename TTraits::TResult> MakeBlockReaderImpl(const ITypeInfoHe
             }
         }
 
+        if (TPgTypeInspector(typeInfoHelper, currentType)) {
+            previousType = currentType;
+            ++nestLevel;
+        }
+
         auto reader = MakeBlockReaderImpl<TTraits>(typeInfoHelper, previousType, pgBuilder);
         for (ui32 i = 1; i < nestLevel; ++i) {
             reader = std::make_unique<typename TTraits::TExtOptional>(std::move(reader));
@@ -379,8 +384,10 @@ std::unique_ptr<typename TTraits::TResult> MakeBlockReaderImpl(const ITypeInfoHe
         case NUdf::EDataSlot::Double:
             return MakeFixedSizeBlockReaderImpl<TTraits, double>(isOptional);
         case NUdf::EDataSlot::String:
+        case NUdf::EDataSlot::Yson:
             return MakeStringBlockReaderImpl<TTraits, arrow::BinaryType>(isOptional);
         case NUdf::EDataSlot::Utf8:
+        case NUdf::EDataSlot::Json:
             return MakeStringBlockReaderImpl<TTraits, arrow::StringType>(isOptional);
         default:
             Y_ENSURE(false, "Unsupported data slot");
@@ -434,6 +441,19 @@ inline void UpdateBlockItemSerializeProps(const ITypeInfoHelper& typeInfoHelper,
         } else {
             *props.MaxSize += dataTypeInfo.FixedSize;
         }
+        return;
+    }
+
+    TPgTypeInspector typePg(typeInfoHelper, type);
+    if (typePg) {
+        auto desc = typeInfoHelper.FindPgTypeDescription(typePg.GetTypeId());
+        if (desc->PassByValue) {
+            *props.MaxSize += desc->Typelen;
+        } else {
+            props.MaxSize = {};
+            props.IsFixed = false;
+        }
+
         return;
     }
 

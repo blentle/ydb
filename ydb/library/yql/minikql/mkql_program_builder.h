@@ -460,7 +460,7 @@ public:
         TType* returnType);
     TRuntimeNode GraceJoin(TRuntimeNode flowLeft, TRuntimeNode flowRight, EJoinKind joinKind,
         const TArrayRef<const ui32>& leftKeyColumns, const TArrayRef<const ui32>& rightKeyColumns,
-        const TArrayRef<const ui32>& leftRenames, const TArrayRef<const ui32>& rightRenames, TType* returnType);
+        const TArrayRef<const ui32>& leftRenames, const TArrayRef<const ui32>& rightRenames, TType* returnType, EAnyJoinSettings anyJoinSettings = EAnyJoinSettings::None);
     TRuntimeNode CombineCore(TRuntimeNode stream,
         const TUnaryLambda& keyExtractor,
         const TBinaryLambda& init,
@@ -689,6 +689,8 @@ public:
     TRuntimeNode WithContext(TRuntimeNode input, const std::string_view& contextType);
     TRuntimeNode PgInternal0(TType* returnType);
     TRuntimeNode PgArray(const TArrayRef<const TRuntimeNode>& args, TType* returnType);
+
+    TRuntimeNode ScalarApply(const TArrayRef<const TRuntimeNode>& args, const TArrayLambda& handler);
 
 protected:
     TRuntimeNode Invoke(const std::string_view& funcName, TType* resultType, const TArrayRef<const TRuntimeNode>& args);

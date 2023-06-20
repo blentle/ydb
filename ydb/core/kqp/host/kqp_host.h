@@ -10,6 +10,8 @@ namespace NKqp {
 
 struct TKqpQueryRef;
 
+using TSqlVersion = ui16;
+
 class IKqpHost : public TThrRefBase {
 public:
     using TQueryResult = IKqpGateway::TQueryResult;
@@ -29,6 +31,8 @@ public:
 
     struct TPrepareSettings: public TExecSettings {
         TMaybe<bool> IsInternalCall;
+        TMaybe<bool> UsePgParser;
+        TMaybe<TSqlVersion> SyntaxVersion;
 
         TString ToString() const {
             return TStringBuilder() << "TPrepareSettings{ DocumentApiRestricted: " << DocumentApiRestricted << " IsInternalCall: " << IsInternalCall << " }";
@@ -62,10 +66,10 @@ public:
     virtual IAsyncQueryResultPtr ExplainScanQuery(const TKqpQueryRef& query, bool isSql) = 0;
 
     /* Generic queries */
-    virtual IAsyncQueryResultPtr PrepareQuery(const TKqpQueryRef& query, const TPrepareSettings& settings) = 0;
+    virtual IAsyncQueryResultPtr PrepareGenericQuery(const TKqpQueryRef& query, const TPrepareSettings& settings) = 0;
 
     /* Federated queries */
-    virtual IAsyncQueryResultPtr PrepareFederatedQuery(const TKqpQueryRef& query, const TPrepareSettings& settings) = 0;
+    virtual IAsyncQueryResultPtr PrepareGenericScript(const TKqpQueryRef& query, const TPrepareSettings& settings) = 0;
 
     /* Scripting */
     virtual IAsyncQueryResultPtr ValidateYqlScript(const TKqpQueryRef& script) = 0;

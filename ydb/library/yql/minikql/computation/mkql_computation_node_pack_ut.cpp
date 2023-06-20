@@ -44,6 +44,8 @@ struct TPackerTraits<Fast, true> {
     using TPackerType = TValuePackerTransport<Fast>;
 };
 
+using NDetails::TChunkedInputBuffer;
+
 template<bool Fast, bool Transport>
 class TMiniKQLComputationNodePackTest: public TTestBase {
     using TValuePackerType = typename TPackerTraits<Fast, Transport>::TPackerType;
@@ -307,12 +309,25 @@ protected:
         TestVariantTypeImpl(PgmBuilder.NewVariantType(tupleType));
     }
 
-    void ValidateEmbeddedLength(const TStringBuf& buf, const TString& info) {
+    void ValidateEmbeddedLength(TRope buf, const TString& info) {
+        size_t size = buf.GetSize();
+        TChunkedInputBuffer chunked(std::move(buf));
+        return ValidateEmbeddedLength(chunked, size, info);
+    }
+
+    void ValidateEmbeddedLength(TStringBuf buf, const TString& info) {
+        TChunkedInputBuffer chunked(buf);
+        return ValidateEmbeddedLength(chunked, buf.size(), info);
+    }
+
+    void ValidateEmbeddedLength(TChunkedInputBuffer& buf, size_t totalSize, const TString& info) {
         if constexpr (!Fast) {
-            if (buf.size() > 8) {
-                UNIT_ASSERT_VALUES_EQUAL_C(*(const ui32*)buf.data() + 4, buf.size(), info);
+            if (totalSize > 8) {
+                ui32 len = NDetails::GetRawData<ui32>(buf);
+                UNIT_ASSERT_VALUES_EQUAL_C(len + 4, totalSize, info);
             } else {
-                UNIT_ASSERT_VALUES_EQUAL_C(((ui32(*buf.data()) & 0x0f) >> 1) + 1, buf.size(), info);
+                ui32 len = NDetails::GetRawData<ui8>(buf);
+                UNIT_ASSERT_VALUES_EQUAL_C(((len & 0x0f) >> 1) + 1, totalSize, info);
             }
         }
     }
@@ -329,16 +344,18 @@ protected:
     NUdf::TUnboxedValue TestPackUnpack(TValuePackerType& packer, const NUdf::TUnboxedValuePod& uValue,
         const TString& additionalMsg, const std::optional<ui32>& expectedLength = {})
     {
-        const auto& packedValue = packer.Pack(uValue);
-        if (expectedLength) {
-            UNIT_ASSERT_VALUES_EQUAL_C(packedValue.Size(), *expectedLength, additionalMsg);
-        }
+        auto packedValue = packer.Pack(uValue);
         if constexpr (Transport) {
-            TString str;
-            packedValue.CopyTo(str);
+            if (expectedLength) {
+                UNIT_ASSERT_VALUES_EQUAL_C(packedValue->Size(), *expectedLength, additionalMsg);
+            }
+            TRope str = TPagedBuffer::AsRope(packedValue);
             ValidateEmbeddedLength(str, additionalMsg);
-            return packer.Unpack(str, HolderFactory);
+            return packer.Unpack(std::move(str), HolderFactory);
         } else {
+            if (expectedLength) {
+                UNIT_ASSERT_VALUES_EQUAL_C(packedValue.Size(), *expectedLength, additionalMsg);
+            }
             ValidateEmbeddedLength(packedValue, additionalMsg);
             return packer.Unpack(packedValue, HolderFactory);
         }
@@ -524,21 +541,24 @@ protected:
         if constexpr (Transport) {
             auto itemType = PgmBuilder.NewDataType(NUdf::TDataType<char *>::Id);
             auto listType = PgmBuilder.NewListType(itemType);
-            TValuePackerType packer(false, listType);
+            TValuePackerType packer(false, itemType);
+            TValuePackerType listPacker(false, listType);
 
-            TStringBuf str = "01234567890ABCDEF";
+            TStringBuf str = "01234567890ABCDEFG";
 
-            size_t count = 50000;
+            size_t count = 500000;
 
             for (size_t i = 0; i < count; ++i) {
                 NUdf::TUnboxedValue item(MakeString(str));
                 packer.AddItem(item);
             }
 
-            TString serializedStr;
-            packer.Finish().CopyTo(serializedStr);
+            auto serializedPagedBuffer = packer.Finish();
 
-            auto listObj = packer.Unpack(serializedStr, HolderFactory);
+            TString serializedStr;
+            serializedPagedBuffer->CopyTo(serializedStr);
+
+            auto listObj = listPacker.Unpack(serializedStr, HolderFactory);
             UNIT_ASSERT_VALUES_EQUAL(listObj.GetListLength(), count);
             ui32 i = 0;
             const auto iter = listObj.GetListIterator();
@@ -547,13 +567,13 @@ protected:
                 UNIT_ASSERT_VALUES_EQUAL(std::string_view(uVal.AsStringRef()), str);
             }
 
-            TUnboxedValueVector items;
-            packer.UnpackBatch(serializedStr, HolderFactory, items);
-            UNIT_ASSERT_VALUES_EQUAL(items.size(), count);
-            for (auto& uVal : items) {
-                UNIT_ASSERT(uVal);
-                UNIT_ASSERT_VALUES_EQUAL(std::string_view(uVal.AsStringRef()), str);
-            }
+            TUnboxedValueBatch items;
+            packer.UnpackBatch(TPagedBuffer::AsRope(serializedPagedBuffer), HolderFactory, items);
+            UNIT_ASSERT_VALUES_EQUAL(items.RowCount(), count);
+            items.ForEachRow([&](const NUdf::TUnboxedValue& value) {
+                UNIT_ASSERT(value);
+                UNIT_ASSERT_VALUES_EQUAL(std::string_view(value.AsStringRef()), str);
+            });
         }
     }
 

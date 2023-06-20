@@ -5,6 +5,7 @@
 #include <ydb/core/base/subdomain.h>
 #include <ydb/core/base/tablet_types.h>
 #include <ydb/core/base/domain.h>
+#include <ydb/core/driver_lib/run/config.h>
 #include <ydb/public/sdk/cpp/client/ydb_driver/driver.h>
 #include <ydb/public/lib/deprecated/client/msgbus_client.h>
 #include <ydb/core/client/server/grpc_server.h>
@@ -94,6 +95,7 @@ namespace Tests {
 
         ui16 Port;
         ui16 GrpcPort = 0;
+        int GrpcMaxMessageSize = 0;  // 0 - default (4_MB), -1 - no limit
         NKikimrProto::TAuthConfig AuthConfig;
         NKikimrPQ::TPQConfig PQConfig;
         NKikimrPQ::TPQClusterDiscoveryConfig PQClusterDiscoveryConfig;
@@ -114,6 +116,7 @@ namespace Tests {
         TLoggerInitializer LoggerInitializer;
         TStoragePoolKinds StoragePoolTypes;
         TVector<NKikimrKqp::TKqpSetting> KqpSettings;
+        bool EnableForceFollowers = false;
         bool EnableConsole = true;
         bool EnableNodeBroker = false;
         bool EnableConfigsDispatcher = true;
@@ -124,6 +127,7 @@ namespace Tests {
         ui64 ChangesQueueItemsLimit = 0;
         ui64 ChangesQueueBytesLimit = 0;
         NKikimrConfig::TAppConfig AppConfig;
+        std::shared_ptr<TKikimrRunConfig> KikimrRunConfig;
         NKikimrConfig::TCompactionConfig CompactionConfig;
         TMap<ui32, TString> NodeKeys;
         ui64 DomainPlanResolution = 0;
@@ -138,6 +142,7 @@ namespace Tests {
         std::shared_ptr<TGrpcServiceFactory> GrpcServiceFactory;
 
         TServerSettings& SetGrpcPort(ui16 value) { GrpcPort = value; return *this; }
+        TServerSettings& SetGrpcMaxMessageSize(int value) { GrpcMaxMessageSize = value; return *this; }
         TServerSettings& SetSupportsRedirect(bool value) { SupportsRedirect = value; return *this; }
         TServerSettings& SetTracePath(const TString& value) { TracePath = value; return *this; }
         TServerSettings& SetDomain(ui32 value) { Domain = value; return *this; }
@@ -159,8 +164,10 @@ namespace Tests {
         TServerSettings& SetEnableConfigsDispatcher(bool value) { EnableConfigsDispatcher = value; return *this; }
         TServerSettings& SetUseRealThreads(bool value) { UseRealThreads = value; return *this; }
         TServerSettings& SetAppConfig(const NKikimrConfig::TAppConfig value) { AppConfig = value; return *this; }
+        TServerSettings& InitKikimrRunConfig() { KikimrRunConfig = std::make_shared<TKikimrRunConfig>(AppConfig); return *this; }
         TServerSettings& SetKeyFor(ui32 nodeId, TString keyValue) { NodeKeys[nodeId] = keyValue; return *this; }
         TServerSettings& SetEnableKqpSpilling(bool value) { EnableKqpSpilling = value; return *this; }
+        TServerSettings& SetEnableForceFollowers(bool value) { EnableForceFollowers = value; return *this; }
         TServerSettings& SetDomainPlanResolution(ui64 resolution) { DomainPlanResolution = resolution; return *this; }
         TServerSettings& SetFeatureFlags(const NKikimrConfig::TFeatureFlags& value) { FeatureFlags = value; return *this; }
         TServerSettings& SetCompactionConfig(const NKikimrConfig::TCompactionConfig& value) { CompactionConfig = value; return *this; }
@@ -269,6 +276,7 @@ namespace Tests {
         const NScheme::TTypeRegistry* GetTypeRegistry();
         const NMiniKQL::IFunctionRegistry* GetFunctionRegistry();
         const NYdb::TDriver& GetDriver() const;
+        const NGrpc::TGRpcServer& GetGRpcServer() const;
 
         ui32 StaticNodes() const {
             return Settings->NodeCount;
@@ -480,16 +488,20 @@ namespace Tests {
         THolder<NKesus::TEvKesus::TEvGetConfigResult> GetKesusConfig(TTestActorRuntime* runtime, const TString& kesusPath);
 
     protected:
-        template <class TMsg>
-        TString PrintResult(NBus::TBusMessage* msg, size_t maxSz = 1000) {
-            auto res = dynamic_cast<TMsg*>(msg);
+        TString PrintToString(const ::google::protobuf::Message& msg, size_t maxSz = 1000) {
             TString s;
-            ::google::protobuf::TextFormat::PrintToString(res->Record, &s);
+            ::google::protobuf::TextFormat::PrintToString(msg, &s);
             if (s.size() > maxSz) {
                 s.resize(maxSz);
                 s += "...\n(TRUNCATED)\n";
             }
             return s;
+        }
+
+        template <class TMsg>
+        TString PrintToString(const NBus::TBusMessage* msg, size_t maxSz = 1000) {
+            auto res = dynamic_cast<const TMsg*>(msg);
+            return PrintToString(res->Record, maxSz);
         }
 
         // Waits for kikimr server to become ready

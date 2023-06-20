@@ -40,6 +40,7 @@ extern "C" {
 #include "nodes/execnodes.h"
 #include "executor/executor.h"
 #include "lib/stringinfo.h"
+#include "miscadmin.h"
 #include "thread_inits.h"
 
 #undef Abs
@@ -68,6 +69,8 @@ namespace NYql {
 
 using namespace NKikimr::NMiniKQL;
 
+TVPtrHolder TVPtrHolder::Instance;
+
 // use 'false' for native format
 static __thread bool NeedCanonizeFp = false;
 
@@ -76,126 +79,9 @@ struct TMainContext {
     MemoryContext PrevCurrentMemoryContext = nullptr;
     MemoryContext PrevErrorContext = nullptr;
     TimestampTz StartTimestamp;
+    pg_stack_base_t PrevStackBase;
+    TString LastError;
 };
-
-ui32 GetFullVarSize(const text* s) {
-    return VARSIZE(s);
-}
-
-ui32 GetCleanVarSize(const text* s) {
-    return VARSIZE(s) - VARHDRSZ;
-}
-
-const char* GetVarData(const text* s) {
-    return VARDATA(s);
-}
-
-TStringBuf GetVarBuf(const text* s) {
-    return TStringBuf(GetVarData(s), GetCleanVarSize(s));
-}
-
-char* GetMutableVarData(text* s) {
-    return VARDATA(s);
-}
-
-void UpdateCleanVarSize(text* s, ui32 cleanSize) {
-    SET_VARSIZE(s, cleanSize + VARHDRSZ);
-}
-
-char* MakeCString(TStringBuf s) {
-    char* ret = (char*)palloc(s.Size() + 1);
-    memcpy(ret, s.Data(), s.Size());
-    ret[s.Size()] = '\0';
-    return ret;
-}
-
-text* MakeVar(TStringBuf s) {
-    text* ret = (text*)palloc(s.Size() + VARHDRSZ);
-    UpdateCleanVarSize(ret, s.Size());
-    memcpy(GetMutableVarData(ret), s.Data(), s.Size());
-    return ret;
-}
-
-// allow to construct TListEntry in the space for IBoxedValue
-static_assert(sizeof(NUdf::IBoxedValue) >= sizeof(TAllocState::TListEntry));
-
-constexpr size_t PallocHdrSize = sizeof(void*) + sizeof(NUdf::IBoxedValue);
-
-NUdf::TUnboxedValuePod ScalarDatumToPod(Datum datum) {
-    return NUdf::TUnboxedValuePod((ui64)datum);
-}
-
-Datum ScalarDatumFromPod(const NUdf::TUnboxedValuePod& value) {
-    return (Datum)value.Get<ui64>();
-}
-
-Datum ScalarDatumFromItem(const NUdf::TBlockItem& value) {
-    return (Datum)value.As<ui64>();
-}
-
-class TBoxedValueWithFree : public NUdf::TBoxedValueBase {
-public:
-    void operator delete(void *mem) noexcept {
-        return MKQLFreeDeprecated(mem);
-    }
-};
-
-NUdf::TUnboxedValuePod PointerDatumToPod(Datum datum) {
-    auto original = (char*)datum - PallocHdrSize;
-    // remove this block from list
-    ((TAllocState::TListEntry*)original)->Unlink();
-
-    auto raw = (NUdf::IBoxedValue*)original;
-    new(raw) TBoxedValueWithFree();
-    NUdf::IBoxedValuePtr ref(raw);
-    return NUdf::TUnboxedValuePod(std::move(ref));
-}
-
-NUdf::TUnboxedValuePod OwnedPointerDatumToPod(Datum datum) {
-    auto original = (char*)datum - PallocHdrSize;
-    auto raw = (NUdf::IBoxedValue*)original;
-    NUdf::IBoxedValuePtr ref(raw);
-    return NUdf::TUnboxedValuePod(std::move(ref));
-}
-
-class TVPtrHolder {
-public:
-    TVPtrHolder() {
-        new(Dummy) TBoxedValueWithFree();
-    }
-
-    static bool IsBoxedVPtr(Datum ptr) {
-        return *(const uintptr_t*)((char*)ptr - PallocHdrSize) == *(const uintptr_t*)Instance.Dummy;
-    }
-
-private:
-    char Dummy[sizeof(NUdf::IBoxedValue)];
-
-    static TVPtrHolder Instance;
-};
-
-TVPtrHolder TVPtrHolder::Instance;
-
-NUdf::TUnboxedValuePod AnyDatumToPod(Datum datum, bool passByValue) {
-    if (passByValue) {
-        return ScalarDatumToPod(datum);
-    }
-
-    if (TVPtrHolder::IsBoxedVPtr(datum)) {
-        // returned one of arguments
-        return OwnedPointerDatumToPod(datum);
-    }
-
-    return PointerDatumToPod(datum);
-}
-
-Datum PointerDatumFromPod(const NUdf::TUnboxedValuePod& value) {
-    return (Datum)(((const char*)value.AsBoxed().Get()) + PallocHdrSize);
-}
-
-Datum PointerDatumFromItem(const NUdf::TBlockItem& value) {
-    return (Datum)value.AsStringRef().Data();
-}
 
 NUdf::TUnboxedValue CreatePgString(i32 typeLen, ui32 targetTypeId, TStringBuf data) {
     // typname => 'cstring', typlen => '-2', the only type with typlen == -2
@@ -282,10 +168,6 @@ const MemoryContextMethods MkqlMethods = {
 #endif
 };
 
-inline ui32 MakeTypeIOParam(const NPg::TTypeDesc& desc) {
-    return desc.ElementTypeId ? desc.ElementTypeId : desc.TypeId;
-}
-
 class TPgConst : public TMutableComputationNode<TPgConst> {
     typedef TMutableComputationNode<TPgConst> TBaseComputation;
 public:
@@ -328,22 +210,9 @@ public:
         callInfo->args[2] = { Int32GetDatum(typeMod), false };
 
         TPAllocScope call;
-        PG_TRY();
-        {
-            auto ret = FInfo.fn_addr(callInfo);
-            Y_ENSURE(!callInfo->isnull);
-            return AnyDatumToPod(ret, TypeDesc.PassByValue);
-        }
-        PG_CATCH();
-        {
-            auto error_data = CopyErrorData();
-            TStringBuilder errMsg;
-            errMsg << "Error in function: " << NPg::LookupProc(TypeDesc.InFuncId).Name << ", reason: " << error_data->message;
-            FreeErrorData(error_data);
-            FlushErrorState();
-            UdfTerminate(errMsg.c_str());
-        }
-        PG_END_TRY();
+        auto ret = FInfo.fn_addr(callInfo);
+        Y_ENSURE(!callInfo->isnull);
+        return AnyDatumToPod(ret, TypeDesc.PassByValue);
     }
 
 private:
@@ -572,25 +441,12 @@ public:
 
 private:
     NUdf::TUnboxedValuePod DoCall(FunctionCallInfoBaseData& callInfo) const {
-        PG_TRY();
-        {
-            auto ret = this->FInfo.fn_addr(&callInfo);
-            if (callInfo.isnull) {
-                return NUdf::TUnboxedValuePod();
-            }
+        auto ret = this->FInfo.fn_addr(&callInfo);
+        if (callInfo.isnull) {
+            return NUdf::TUnboxedValuePod();
+        }
 
-            return AnyDatumToPod(ret, this->RetTypeDesc.PassByValue);
-        }
-        PG_CATCH();
-        {
-            auto error_data = CopyErrorData();
-            TStringBuilder errMsg;
-            errMsg << "Error in function: " << this->Name << ", reason: " << error_data->message;
-            FreeErrorData(error_data);
-            FlushErrorState();
-            UdfTerminate(errMsg.c_str());
-        }
-        PG_END_TRY();
+        return AnyDatumToPod(ret, this->RetTypeDesc.PassByValue);
     }
 
     TPgResolvedCallState& GetState(TComputationContext& compCtx) const {
@@ -649,33 +505,20 @@ private:
                 }
 
                 auto& callInfo = CallInfo.Ref();
-                PG_TRY();
-                {
-                    callInfo.isnull = false;
-                    auto ret = callInfo.flinfo->fn_addr(&callInfo);
-                    if (RSInfo.Ref().isDone == ExprEndResult) {
-                        IsFinished = true;
-                        return false;
-                    }
-
-                    if (callInfo.isnull) {
-                        value = NUdf::TUnboxedValuePod();
-                    } else {
-                        value = AnyDatumToPod(ret, RetTypeDesc.PassByValue);
-                    }
-
-                    return true;
+                callInfo.isnull = false;
+                auto ret = callInfo.flinfo->fn_addr(&callInfo);
+                if (RSInfo.Ref().isDone == ExprEndResult) {
+                    IsFinished = true;
+                    return false;
                 }
-                PG_CATCH();
-                {
-                    auto error_data = CopyErrorData();
-                    TStringBuilder errMsg;
-                    errMsg << "Error in function: " << Name << ", reason: " << error_data->message;
-                    FreeErrorData(error_data);
-                    FlushErrorState();
-                    UdfTerminate(errMsg.c_str());
+
+                if (callInfo.isnull) {
+                    value = NUdf::TUnboxedValuePod();
+                } else {
+                    value = AnyDatumToPod(ret, RetTypeDesc.PassByValue);
                 }
-                PG_END_TRY();
+
+                return true;
             }
 
             const std::string_view Name;
@@ -981,7 +824,6 @@ private:
             }
         };
 
-        PG_TRY();
         {
             auto ret = FInfo1.fn_addr(&callInfo1);
             Y_ENSURE(!callInfo1.isnull);
@@ -1011,16 +853,6 @@ private:
 
             return ret;
         }
-        PG_CATCH();
-        {
-            auto error_data = CopyErrorData();
-            TStringBuilder errMsg;
-            errMsg << "Error in cast, reason: " << error_data->message;
-            FreeErrorData(error_data);
-            FlushErrorState();
-            UdfTerminate(errMsg.c_str());
-        }
-        PG_END_TRY();
     }
 
     const ui32 StateIndex;
@@ -1310,7 +1142,6 @@ public:
             }
         }
 
-        PG_TRY();
         {
             int ndims = 0;
             int dims[MAXDIM];
@@ -1501,16 +1332,6 @@ public:
                 return PointerDatumToPod(PointerGetDatum(result));
             }
         }
-        PG_CATCH();
-        {
-            auto error_data = CopyErrorData();
-            TStringBuilder errMsg;
-            errMsg << "Error in PgArray, reason: " << error_data->message;
-            FreeErrorData(error_data);
-            FlushErrorState();
-            UdfTerminate(errMsg.c_str());
-        }
-        PG_END_TRY();
     }
 
 private:
@@ -1629,7 +1450,7 @@ struct TFromPgExec {
         case BYTEAOID:
         case CSTRINGOID: {
             NUdf::TStringBlockReader<arrow::BinaryType, true> reader;
-            NUdf::TStringArrayBuilder<arrow::BinaryType, true> builder(NKikimr::NMiniKQL::TTypeInfoHelper(), arrow::uint64(), *ctx->memory_pool(), length);
+            NUdf::TStringArrayBuilder<arrow::BinaryType, true> builder(NKikimr::NMiniKQL::TTypeInfoHelper(), SourceId == BYTEAOID ? arrow::binary() : arrow::utf8(), *ctx->memory_pool(), length);
             for (size_t i = 0; i < length; ++i) {
                 auto item = reader.GetItem(array, i);
                 if (!item) {
@@ -1638,12 +1459,12 @@ struct TFromPgExec {
                 }
 
                 ui32 len;
-                const char* ptr = item.AsStringRef().Data();
+                const char* ptr = item.AsStringRef().Data() + sizeof(void*);
                 if (SourceId == CSTRINGOID) {
-                    len = strlen(item.AsStringRef().Data());
+                    len = strlen(ptr);
                 } else {
-                    len = GetCleanVarSize((const text*)item.AsStringRef().Data());
-                    Y_ENSURE(len + VARHDRSZ == item.AsStringRef().Size());
+                    len = GetCleanVarSize((const text*)ptr);
+                    Y_ENSURE(len + VARHDRSZ + sizeof(void*) == item.AsStringRef().Size());
                     ptr += VARHDRSZ;
                 }
 
@@ -1758,7 +1579,7 @@ struct TToPgExec {
         case BYTEAOID:
         case CSTRINGOID: {
             NUdf::TStringBlockReader<arrow::BinaryType, true> reader;
-            NUdf::TStringArrayBuilder<arrow::BinaryType, true> builder(NKikimr::NMiniKQL::TTypeInfoHelper(), arrow::uint64(), *ctx->memory_pool(), length);
+            NUdf::TStringArrayBuilder<arrow::BinaryType, true> builder(NKikimr::NMiniKQL::TTypeInfoHelper(), arrow::binary(), *ctx->memory_pool(), length);
             std::vector<char> tmp;
             for (size_t i = 0; i < length; ++i) {
                 auto item = reader.GetItem(array, i);
@@ -1769,7 +1590,7 @@ struct TToPgExec {
 
                 ui32 len;
                 if (TargetId == CSTRINGOID) {
-                    len = 1 + item.AsStringRef().Size();
+                    len = sizeof(void*) + 1 + item.AsStringRef().Size();
                     if (Y_UNLIKELY(len < item.AsStringRef().Size())) {
                         ythrow yexception() << "Too long string";
                     }
@@ -1779,10 +1600,11 @@ struct TToPgExec {
                     }
 
                     tmp.resize(len);
-                    memcpy(tmp.data(), item.AsStringRef().Data(), len - 1);
+                    NUdf::ZeroMemoryContext(tmp.data() + sizeof(void*));
+                    memcpy(tmp.data() + sizeof(void*), item.AsStringRef().Data(), len - 1 - sizeof(void*));
                     tmp[len - 1] = 0;
                 } else {
-                    len = VARHDRSZ + item.AsStringRef().Size();
+                    len = sizeof(void*) + VARHDRSZ + item.AsStringRef().Size();
                     if (Y_UNLIKELY(len < item.AsStringRef().Size())) {
                         ythrow yexception() << "Too long string";
                     }
@@ -1792,8 +1614,9 @@ struct TToPgExec {
                     }
 
                     tmp.resize(len);
-                    memcpy(tmp.data() + VARHDRSZ, item.AsStringRef().Data(), len - VARHDRSZ);
-                    UpdateCleanVarSize((text*)tmp.data(), item.AsStringRef().Size());
+                    NUdf::ZeroMemoryContext(tmp.data() + sizeof(void*));
+                    memcpy(tmp.data() + sizeof(void*) + VARHDRSZ, item.AsStringRef().Data(), len - VARHDRSZ);
+                    UpdateCleanVarSize((text*)(tmp.data() + sizeof(void*)), item.AsStringRef().Size());
                 }
 
                 builder.Add(NUdf::TBlockItem(NUdf::TStringRef(tmp.data(), len)));
@@ -2088,7 +1911,6 @@ TString PgValueToNativeText(const NUdf::TUnboxedValuePod& value, ui32 pgTypeId) 
         }
     };
 
-    PG_TRY();
     {
         FmgrInfo finfo;
         Zero(finfo);
@@ -2111,16 +1933,6 @@ TString PgValueToNativeText(const NUdf::TUnboxedValuePod& value, ui32 pgTypeId) 
 
         return TString(str);
     }
-    PG_CATCH();
-    {
-        auto error_data = CopyErrorData();
-        TStringBuilder errMsg;
-        errMsg << "Error in 'out' function: " << NPg::LookupProc(outFuncId).Name << ", reason: " << error_data->message;
-        FreeErrorData(error_data);
-        FlushErrorState();
-        UdfTerminate(errMsg.c_str());
-    }
-    PG_END_TRY();
 }
 
 template <typename F>
@@ -2147,7 +1959,6 @@ void PgValueToNativeBinaryImpl(const NUdf::TUnboxedValuePod& value, ui32 pgTypeI
         }
     };
 
-    PG_TRY();
     {
         FmgrInfo finfo;
         Zero(finfo);
@@ -2173,16 +1984,6 @@ void PgValueToNativeBinaryImpl(const NUdf::TUnboxedValuePod& value, ui32 pgTypeI
         ui32 len = s.Size();
         f(TStringBuf(s.Data(), s.Size()));
     }
-    PG_CATCH();
-    {
-        auto error_data = CopyErrorData();
-        TStringBuilder errMsg;
-        errMsg << "Error in 'send' function: " << NPg::LookupProc(sendFuncId).Name << ", reason: " << error_data->message;
-        FreeErrorData(error_data);
-        FlushErrorState();
-        UdfTerminate(errMsg.c_str());
-    }
-    PG_END_TRY();
 }
 
 TString PgValueToNativeBinary(const NUdf::TUnboxedValuePod& value, ui32 pgTypeId) {
@@ -2370,7 +2171,6 @@ NUdf::TUnboxedValue PgValueFromNativeBinary(const TStringBuf binary, ui32 pgType
         receiveFuncId = NPg::LookupProc("array_recv", { 0,0,0 }).ProcId;
     }
 
-    PG_TRY();
     {
         FmgrInfo finfo;
         Zero(finfo);
@@ -2398,16 +2198,6 @@ NUdf::TUnboxedValue PgValueFromNativeBinary(const TStringBuf binary, ui32 pgType
         }
         return AnyDatumToPod(x, typeInfo.PassByValue);
     }
-    PG_CATCH();
-    {
-        auto error_data = CopyErrorData();
-        TStringBuilder errMsg;
-        errMsg << "Error in 'recv' function: " << NPg::LookupProc(receiveFuncId).Name << ", reason: " << error_data->message;
-        FreeErrorData(error_data);
-        FlushErrorState();
-        UdfTerminate(errMsg.c_str());
-    }
-    PG_END_TRY();
 }
 
 NUdf::TUnboxedValue PgValueFromNativeText(const TStringBuf text, ui32 pgTypeId) {
@@ -2421,7 +2211,6 @@ NUdf::TUnboxedValue PgValueFromNativeText(const TStringBuf text, ui32 pgTypeId) 
         inFuncId = NPg::LookupProc("array_in", { 0,0,0 }).ProcId;
     }
 
-    PG_TRY();
     {
         FmgrInfo finfo;
         Zero(finfo);
@@ -2444,16 +2233,6 @@ NUdf::TUnboxedValue PgValueFromNativeText(const TStringBuf text, ui32 pgTypeId) 
         Y_ENSURE(!callInfo->isnull);
         return AnyDatumToPod(x, typeInfo.PassByValue);
     }
-    PG_CATCH();
-    {
-        auto error_data = CopyErrorData();
-        TStringBuilder errMsg;
-        errMsg << "Error in 'in' function: " << NPg::LookupProc(inFuncId).Name << ", reason: " << error_data->message;
-        FreeErrorData(error_data);
-        FlushErrorState();
-        UdfTerminate(errMsg.c_str());
-    }
-    PG_END_TRY();
 }
 
 NUdf::TUnboxedValue PgValueFromString(const TStringBuf s, ui32 pgTypeId) {
@@ -2680,8 +2459,9 @@ arrow::Datum MakePgScalar(NKikimr::NMiniKQL::TPgType* type, const NKikimr::NUdf:
             size = strlen(ptr) + 1;
         }
 
-        std::shared_ptr<arrow::Buffer> buffer(ARROW_RESULT(arrow::AllocateBuffer(size, &pool)));
-        std::memcpy(buffer->mutable_data(), ptr, size);
+        std::shared_ptr<arrow::Buffer> buffer(ARROW_RESULT(arrow::AllocateBuffer(size + sizeof(void*), &pool)));
+        NUdf::ZeroMemoryContext(buffer->mutable_data() + sizeof(void*));
+        std::memcpy(buffer->mutable_data() + sizeof(void*), ptr, size);
         return arrow::Datum(std::make_shared<arrow::BinaryScalar>(buffer));
     }
 }
@@ -2873,6 +2653,11 @@ void PGPackImpl(bool stable, const TPgType* type, const NUdf::TUnboxedValuePod& 
 }
 
 NUdf::TUnboxedValue PGUnpackImpl(const TPgType* type, TStringBuf& buf) {
+    NDetails::TChunkedInputBuffer chunked(buf);
+    return PGUnpackImpl(type, chunked);
+}
+
+NUdf::TUnboxedValue PGUnpackImpl(const TPgType* type, NDetails::TChunkedInputBuffer& buf) {
     switch (type->GetTypeId()) {
     case BOOLOID: {
         const auto x = NDetails::GetRawData<bool>(buf);
@@ -2902,26 +2687,24 @@ NUdf::TUnboxedValue PGUnpackImpl(const TPgType* type, TStringBuf& buf) {
     case VARCHAROID:
     case TEXTOID: {
         auto size = NDetails::UnpackUInt32(buf);
-        MKQL_ENSURE(size <= buf.size(), "Bad packed data. Buffer too small");
-        const char* ptr = buf.data();
-        buf.Skip(size);
-        auto ret = MakeVar(TStringBuf(ptr, size));
-        return PointerDatumToPod((Datum)ret);
+        auto deleter = [](text* ptr) { pfree(ptr); };
+        std::unique_ptr<text, decltype(deleter)> ret(MakeVarNotFilled(size));
+        buf.CopyTo(GetMutableVarData(ret.get()), size);
+        return PointerDatumToPod((Datum)ret.release());
     }
     case CSTRINGOID: {
         auto size = NDetails::UnpackUInt32(buf);
-        MKQL_ENSURE(size <= buf.size(), "Bad packed data. Buffer too small");
-        const char* ptr = buf.data();
-        buf.Skip(size);
-        auto ret = MakeCString(TStringBuf(ptr, size));
-        return PointerDatumToPod((Datum)ret);
+        auto deleter = [](char* ptr) { pfree(ptr); };
+        std::unique_ptr<char, decltype(deleter)> ret(MakeCStringNotFilled(size));
+        buf.CopyTo(ret.get(), size);
+        return PointerDatumToPod((Datum)ret.release());
     }
     default:
         TPAllocScope call;
         auto size = NDetails::UnpackUInt32(buf);
-        MKQL_ENSURE(size <= buf.size(), "Bad packed data. Buffer too small");
-        TStringBuf s = buf.Head(size);
-        buf.Skip(size);
+        std::unique_ptr<char[]> tmpBuf(new char[size]);
+        buf.CopyTo(tmpBuf.get(), size);
+        TStringBuf s{tmpBuf.get(), size};
         return NYql::NCommon::PgValueFromNativeBinary(s, type->GetTypeId());
     }
 }
@@ -3390,7 +3173,7 @@ NUdf::IEquate::TPtr MakePgEquate(const TPgType* type) {
 }
 
 void* PgInitializeMainContext() {
-    auto ctx = (TMainContext*)malloc(sizeof(TMainContext));
+    auto ctx = new TMainContext();
     MemoryContextCreate((MemoryContext)&ctx->Data,
         T_AllocSetContext,
         &MkqlMethods,
@@ -3401,7 +3184,7 @@ void* PgInitializeMainContext() {
 }
 
 void PgDestroyMainContext(void* ctx) {
-    free(ctx);
+    delete (TMainContext*)ctx;
 }
 
 void PgAcquireThreadContext(void* ctx) {
@@ -3412,6 +3195,8 @@ void PgAcquireThreadContext(void* ctx) {
         main->PrevErrorContext = ErrorContext;
         CurrentMemoryContext = ErrorContext = (MemoryContext)&main->Data;
         SetParallelStartTimestamps(main->StartTimestamp, main->StartTimestamp);
+        main->PrevStackBase = set_stack_base();
+        yql_error_report_active = true;
     }
 }
 
@@ -3420,7 +3205,19 @@ void PgReleaseThreadContext(void* ctx) {
         auto main = (TMainContext*)ctx;
         CurrentMemoryContext = main->PrevCurrentMemoryContext;
         ErrorContext = main->PrevErrorContext;
+        restore_stack_base(main->PrevStackBase);
+        yql_error_report_active = false;
     }
+}
+
+extern "C" void yql_prepare_error(const char* msg) {
+    auto ctx  = (TMainContext*)TlsAllocState->MainContext;
+    ctx->LastError = msg;
+}
+
+extern "C" void yql_raise_error() {
+    auto ctx  = (TMainContext*)TlsAllocState->MainContext;
+    UdfTerminate(ctx->LastError.c_str());
 }
 
 } // namespace NMiniKQL
@@ -3599,32 +3396,23 @@ public:
                     pfree((void*)datumR);
             }
         };
-        PG_TRY();
-        {
-            datumL = Receive(dataL, sizeL);
-            datumR = Receive(dataR, sizeR);
-            FmgrInfo finfo;
-            InitFunc(CompareProcId, &finfo, 2, 2);
-            LOCAL_FCINFO(callInfo, 2);
-            Zero(*callInfo);
-            callInfo->flinfo = &finfo;
-            callInfo->nargs = 2;
-            callInfo->fncollation = DEFAULT_COLLATION_OID;
-            callInfo->isnull = false;
-            callInfo->args[0] = { datumL, false };
-            callInfo->args[1] = { datumR, false };
 
-            auto result = finfo.fn_addr(callInfo);
-            Y_ENSURE(!callInfo->isnull);
-            return DatumGetInt32(result);
-        }
-        PG_CATCH();
-        {
-            // TODO
-            Y_FAIL("PG error in Compare");
-        }
-        PG_END_TRY();
-        return 0;
+        datumL = Receive(dataL, sizeL);
+        datumR = Receive(dataR, sizeR);
+        FmgrInfo finfo;
+        InitFunc(CompareProcId, &finfo, 2, 2);
+        LOCAL_FCINFO(callInfo, 2);
+        Zero(*callInfo);
+        callInfo->flinfo = &finfo;
+        callInfo->nargs = 2;
+        callInfo->fncollation = DEFAULT_COLLATION_OID;
+        callInfo->isnull = false;
+        callInfo->args[0] = { datumL, false };
+        callInfo->args[1] = { datumR, false };
+
+        auto result = finfo.fn_addr(callInfo);
+        Y_ENSURE(!callInfo->isnull);
+        return DatumGetInt32(result);
     }
 
     ui64 Hash(const char* data, size_t size) const {
@@ -3636,30 +3424,20 @@ public:
                 pfree((void*)datum);
             }
         };
-        PG_TRY();
-        {
-            datum = Receive(data, size);
-            FmgrInfo finfo;
-            InitFunc(HashProcId, &finfo, 1, 1);
-            LOCAL_FCINFO(callInfo, 1);
-            Zero(*callInfo);
-            callInfo->flinfo = &finfo;
-            callInfo->nargs = 1;
-            callInfo->fncollation = DEFAULT_COLLATION_OID;
-            callInfo->isnull = false;
-            callInfo->args[0] = { datum, false };
+        datum = Receive(data, size);
+        FmgrInfo finfo;
+        InitFunc(HashProcId, &finfo, 1, 1);
+        LOCAL_FCINFO(callInfo, 1);
+        Zero(*callInfo);
+        callInfo->flinfo = &finfo;
+        callInfo->nargs = 1;
+        callInfo->fncollation = DEFAULT_COLLATION_OID;
+        callInfo->isnull = false;
+        callInfo->args[0] = { datum, false };
 
-            auto result = finfo.fn_addr(callInfo);
-            Y_ENSURE(!callInfo->isnull);
-            return DatumGetUInt32(result);
-        }
-        PG_CATCH();
-        {
-            // TODO
-            Y_FAIL("PG error in Hash");
-        }
-        PG_END_TRY();
-        return 0;
+        auto result = finfo.fn_addr(callInfo);
+        Y_ENSURE(!callInfo->isnull);
+        return DatumGetUInt32(result);
     }
 
     TConvertResult NativeBinaryFromNativeText(const TString& str) const {
@@ -3677,36 +3455,36 @@ public:
         };
         PG_TRY();
         {
-            {
-                FmgrInfo finfo;
-                InitFunc(InFuncId, &finfo, 1, 3);
-                LOCAL_FCINFO(callInfo, 3);
-                Zero(*callInfo);
-                callInfo->flinfo = &finfo;
-                callInfo->nargs = 3;
-                callInfo->fncollation = DEFAULT_COLLATION_OID;
-                callInfo->isnull = false;
-                callInfo->args[0] = { (Datum)str.c_str(), false };
-                callInfo->args[1] = { ObjectIdGetDatum(NMiniKQL::MakeTypeIOParam(*this)), false };
-                callInfo->args[2] = { Int32GetDatum(-1), false };
-
-                datum = finfo.fn_addr(callInfo);
-                Y_ENSURE(!callInfo->isnull);
-            }
+        {
             FmgrInfo finfo;
-            InitFunc(SendFuncId, &finfo, 1, 1);
-            LOCAL_FCINFO(callInfo, 1);
+            InitFunc(InFuncId, &finfo, 1, 3);
+            LOCAL_FCINFO(callInfo, 3);
             Zero(*callInfo);
             callInfo->flinfo = &finfo;
-            callInfo->nargs = 1;
+            callInfo->nargs = 3;
             callInfo->fncollation = DEFAULT_COLLATION_OID;
             callInfo->isnull = false;
-            callInfo->args[0] = { datum, false };
+            callInfo->args[0] = { (Datum)str.c_str(), false };
+            callInfo->args[1] = { ObjectIdGetDatum(NMiniKQL::MakeTypeIOParam(*this)), false };
+            callInfo->args[2] = { Int32GetDatum(-1), false };
 
-            serialized = (text*)finfo.fn_addr(callInfo);
+            datum = finfo.fn_addr(callInfo);
             Y_ENSURE(!callInfo->isnull);
-            return {TString(NMiniKQL::GetVarBuf(serialized)), {}};
         }
+        FmgrInfo finfo;
+        InitFunc(SendFuncId, &finfo, 1, 1);
+        LOCAL_FCINFO(callInfo, 1);
+        Zero(*callInfo);
+        callInfo->flinfo = &finfo;
+        callInfo->nargs = 1;
+        callInfo->fncollation = DEFAULT_COLLATION_OID;
+        callInfo->isnull = false;
+        callInfo->args[0] = { datum, false };
+
+        serialized = (text*)finfo.fn_addr(callInfo);
+        Y_ENSURE(!callInfo->isnull);
+        return {TString(NMiniKQL::GetVarBuf(serialized)), {}};
+    }
         PG_CATCH();
         {
             auto error_data = CopyErrorData();
@@ -3734,20 +3512,20 @@ public:
         };
         PG_TRY();
         {
-            datum = Receive(binary.Data(), binary.Size());
-            FmgrInfo finfo;
-            InitFunc(OutFuncId, &finfo, 1, 1);
-            LOCAL_FCINFO(callInfo, 1);
-            Zero(*callInfo);
-            callInfo->flinfo = &finfo;
-            callInfo->nargs = 1;
-            callInfo->fncollation = DEFAULT_COLLATION_OID;
-            callInfo->isnull = false;
-            callInfo->args[0] = { datum, false };
+        datum = Receive(binary.Data(), binary.Size());
+        FmgrInfo finfo;
+        InitFunc(OutFuncId, &finfo, 1, 1);
+        LOCAL_FCINFO(callInfo, 1);
+        Zero(*callInfo);
+        callInfo->flinfo = &finfo;
+        callInfo->nargs = 1;
+        callInfo->fncollation = DEFAULT_COLLATION_OID;
+        callInfo->isnull = false;
+        callInfo->args[0] = { datum, false };
 
-            str = (char*)finfo.fn_addr(callInfo);
-            Y_ENSURE(!callInfo->isnull);
-            return {TString(str), {}};
+        str = (char*)finfo.fn_addr(callInfo);
+        Y_ENSURE(!callInfo->isnull);
+        return {TString(str), {}};
         }
         PG_CATCH();
         {
@@ -3865,9 +3643,9 @@ public:
         };
         PG_TRY();
         {
-            datum = Receive(binary.Data(), binary.Size());
-            return {};
-        }
+        datum = Receive(binary.Data(), binary.Size());
+        return {};
+    }
         PG_CATCH();
         {
             auto error_data = CopyErrorData();

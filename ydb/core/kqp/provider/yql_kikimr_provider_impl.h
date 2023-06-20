@@ -46,6 +46,8 @@ private:
     virtual TStatus HandleCreateUser(NNodes::TKiCreateUser node, TExprContext& ctx) = 0;
     virtual TStatus HandleAlterUser(NNodes::TKiAlterUser node, TExprContext& ctx) = 0;
     virtual TStatus HandleDropUser(NNodes::TKiDropUser node, TExprContext& ctx) = 0;
+
+    virtual TStatus HandleUpsertObject(NNodes::TKiUpsertObject node, TExprContext& ctx) = 0;
     virtual TStatus HandleCreateObject(NNodes::TKiCreateObject node, TExprContext& ctx) = 0;
     virtual TStatus HandleAlterObject(NNodes::TKiAlterObject node, TExprContext& ctx) = 0;
     virtual TStatus HandleDropObject(NNodes::TKiDropObject node, TExprContext& ctx) = 0;
@@ -58,6 +60,8 @@ private:
     virtual TStatus HandleDataQueryBlocks(NNodes::TKiDataQueryBlocks node, TExprContext& ctx) = 0;
     virtual TStatus HandleDataQueryBlock(NNodes::TKiDataQueryBlock node, TExprContext& ctx) = 0;
     virtual TStatus HandleEffects(NNodes::TKiEffects node, TExprContext& ctx) = 0;
+
+    virtual TStatus HandleModifyPermissions(NNodes::TKiModifyPermissions node, TExprContext& ctx) = 0;
 };
 
 class TKikimrKey {
@@ -68,7 +72,8 @@ public:
         TableScheme,
         Role,
         Object,
-        Topic
+        Topic,
+        Permission
     };
 
 public:
@@ -119,6 +124,12 @@ public:
         Y_VERIFY_DEBUG(ObjectType.Defined());
         Y_VERIFY_DEBUG(KeyType == Type::Object);
         return *ObjectType;
+    }
+
+    const TString& GetPermissionAction() const {
+        Y_VERIFY_DEBUG(KeyType.Defined());
+        Y_VERIFY_DEBUG(KeyType == Type::Permission);
+        return Target;
     }
 
     bool Extract(const TExprNode& key);

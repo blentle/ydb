@@ -1988,7 +1988,7 @@ TRuntimeNode TProgramBuilder::JoinDict(TRuntimeNode dict1, bool isMulti1, TRunti
 
 TRuntimeNode TProgramBuilder::GraceJoin(TRuntimeNode flowLeft, TRuntimeNode flowRight, EJoinKind joinKind,
         const TArrayRef<const ui32>& leftKeyColumns, const TArrayRef<const ui32>& rightKeyColumns,
-        const TArrayRef<const ui32>& leftRenames, const TArrayRef<const ui32>& rightRenames, TType* returnType) {
+        const TArrayRef<const ui32>& leftRenames, const TArrayRef<const ui32>& rightRenames, TType* returnType, EAnyJoinSettings anyJoinSettings ) {
 
     MKQL_ENSURE(!leftKeyColumns.empty(), "At least one key column must be specified");
     MKQL_ENSURE(!rightKeyColumns.empty(), "At least one key column must be specified");
@@ -2016,6 +2016,7 @@ TRuntimeNode TProgramBuilder::GraceJoin(TRuntimeNode flowLeft, TRuntimeNode flow
     callableBuilder.Add(NewTuple(rightKeyColumnsNodes));
     callableBuilder.Add(NewTuple(leftRenamesNodes));
     callableBuilder.Add(NewTuple(rightRenamesNodes));
+    callableBuilder.Add(NewDataLiteral((ui32)anyJoinSettings));
 
 
     return TRuntimeNode(callableBuilder.Build(), false);
@@ -5675,6 +5676,38 @@ TRuntimeNode TProgramBuilder::BlockMergeManyFinalizeHashed(TRuntimeNode flow, co
     }
 
     builder.Add(NewTuple(streamsNodes));
+    return TRuntimeNode(builder.Build(), false);
+}
+
+TRuntimeNode TProgramBuilder::ScalarApply(const TArrayRef<const TRuntimeNode>& args, const TArrayLambda& handler) {
+    if constexpr (RuntimeVersion < 39U) {
+        THROW yexception() << "Runtime version (" << RuntimeVersion << ") too old for " << __func__;
+    }
+
+    MKQL_ENSURE(!args.empty(), "Required at least one argument");
+    TVector<TRuntimeNode> lambdaArgs;
+    bool scalarOnly = true;
+    std::shared_ptr<arrow::DataType> arrowType;
+    for (const auto& arg : args) {
+        auto blockType = AS_TYPE(TBlockType, arg.GetStaticType());
+        scalarOnly = scalarOnly && blockType->GetShape() == TBlockType::EShape::Scalar;
+        MKQL_ENSURE(ConvertArrowType(blockType->GetItemType(), arrowType), "Unsupported arrow type");
+        lambdaArgs.emplace_back(Arg(blockType->GetItemType()));
+    }
+
+    auto ret = handler(lambdaArgs);
+    MKQL_ENSURE(ConvertArrowType(ret.GetStaticType(), arrowType), "Unsupported arrow type");
+    auto returnType = NewBlockType(ret.GetStaticType(), scalarOnly ? TBlockType::EShape::Scalar : TBlockType::EShape::Many);
+    TCallableBuilder builder(Env, __func__, returnType);
+    for (const auto& arg : args) {
+        builder.Add(arg);
+    }
+
+    for (const auto& arg : lambdaArgs) {
+        builder.Add(arg);
+    }
+
+    builder.Add(ret);
     return TRuntimeNode(builder.Build(), false);
 }
 

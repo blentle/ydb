@@ -281,6 +281,10 @@ public:
                 kv.second.OptimizeSplitKeys(rdb);
             }
 
+            if (mvcc) {
+                Self->PromoteFollowerReadEdge(txc);
+            }
+
             Self->State = TShardState::Ready;
             Self->PersistSys(db, Schema::Sys_State, Self->State);
         }
@@ -500,7 +504,7 @@ public:
             source.EnsureSplitKey(rdb, leftKey, itBegin->MaxOffset);
 
             // Dump final split keys and offsets for debugging
-            if (IS_LOG_PRIORITY_ENABLED(ctx, NLog::PRI_TRACE, NKikimrServices::TX_DATASHARD)) {
+            if (IS_LOG_PRIORITY_ENABLED(NLog::PRI_TRACE, NKikimrServices::TX_DATASHARD)) {
                 for (const auto* state : source.Offsets) {
                     LOG_TRACE_S(ctx, NKikimrServices::TX_DATASHARD, Self->TabletID()
                         << " Source " << EscapeC(sourceName)

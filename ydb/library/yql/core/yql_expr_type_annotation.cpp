@@ -1225,6 +1225,9 @@ const TTupleExprType* DryType(const TTupleExprType* type, bool& hasOptional, TEx
 
 template<bool Strict = true>
 const TStructExprType* DryType(const TStructExprType* type, bool& hasOptional, TExprContext& ctx) {
+    if (!type->GetSize())
+        return type;
+
     auto items = type->GetItems();
     auto it = items.begin();
     for (const auto& item : items) {
@@ -5449,6 +5452,12 @@ bool HasContextFuncs(const TExprNode& input) {
             return false;
         }
 
+        if (node.IsCallable({"AggApply","AggApplyState","AggApplyManyState","AggBlockApply","AggBlockApplyState"}) && 
+            node.Head().Content().StartsWith("pg_")) {
+            needCtx = true;
+            return false;
+        }
+
         return true;
     });
 
@@ -5751,7 +5760,7 @@ IGraphTransformer::TStatus ExtractPgTypesFromMultiLambda(TExprNode::TPtr& lambda
     return IGraphTransformer::TStatus::Ok;
 }
 
-TExprNode::TPtr ExpandPgAggregationTraits(TPositionHandle pos, const NPg::TAggregateDesc& aggDesc, bool onWindow, 
+TExprNode::TPtr ExpandPgAggregationTraits(TPositionHandle pos, const NPg::TAggregateDesc& aggDesc, bool onWindow,
     const TExprNode::TPtr& lambda, const TVector<ui32>& argTypes, const TTypeAnnotationNode* itemType, TExprContext& ctx) {
     auto idLambda = ctx.Builder(pos)
         .Lambda()
@@ -6078,5 +6087,27 @@ bool ApplyOriginalType(TExprNode::TPtr input, bool isMany, const TTypeAnnotation
     return true;
 }
 
+TExprNode::TPtr ConvertToMultiLambda(const TExprNode::TPtr& lambda, TExprContext& ctx) {
+    Y_ENSURE(lambda->ChildrenSize() == 2);
+    auto tupleTypeSize = lambda->GetTypeAnn()->Cast<TTupleExprType>()->GetSize();
+    auto newArg = ctx.NewArgument(lambda->Pos(), "row");
+    auto newBody = ctx.ReplaceNode(lambda->TailPtr(), lambda->Head().Head(), newArg);
+    TExprNode::TListType bodies;
+    for (ui32 i = 0; i < tupleTypeSize; ++i) {
+        bodies.push_back(ctx.Builder(lambda->Pos())
+            .Callable("Nth")
+                .Add(0, newBody)
+                .Atom(1, ToString(i))
+            .Seal()
+            .Build());
+    }
+
+    return ctx.NewLambda(lambda->Pos(), ctx.NewArguments(lambda->Pos(), { newArg }), std::move(bodies));
+}
+
+TStringBuf NormalizeCallableName(TStringBuf name) {
+    name.ChopSuffix("MayWarn"sv);
+    return name;
+}
 
 } // NYql

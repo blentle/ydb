@@ -59,9 +59,10 @@ public:
         std::srand(seed);
     }
 
-    void Start(bool waitInit = true, bool addBrokenDatacenter = false) {
+    void Start(bool waitInit = true, bool addBrokenDatacenter = false, 
+            const TVector<NKikimrServices::EServiceKikimr>& logServices = TTestServer::LOGGED_SERVICES, NActors::NLog::EPriority logPriority = NActors::NLog::PRI_DEBUG) {
         Server.StartServer(false);
-        //Server.EnableLogs({NKikimrServices::PQ_WRITE_PROXY, NKikimrServices::PQ_READ_PROXY});
+        Server.EnableLogs(logServices, logPriority);
         Server.AnnoyingClient->InitRoot();
         if (DataCenters.empty()) {
             THashMap<TString, NKikimr::NPersQueueTests::TPQTestClusterInfo> dataCenters;
@@ -80,15 +81,15 @@ public:
         }
     }
 
-    TString GetTestTopic() const {
-        return "topic1";
+    static TString GetTestTopic() {
+        return "test-topic";
     }
 
-    TString GetTestClient() const {
+    static TString GetTestClient() {
         return "test-reader";
     }
 
-    TString GetTestMessageGroupId() const {
+    static TString GetTestMessageGroupId() {
         return "test-message-group-id";
     }
 

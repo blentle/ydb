@@ -31,7 +31,9 @@ public:
         const ::Ydb::Table::QueryStatsCollection::Mode collectStats,
         const ::Ydb::Table::QueryCachePolicy* queryCachePolicy,
         const ::Ydb::Operations::OperationParams* operationParams,
-        bool keepSession = false);
+        bool keepSession = false,
+        bool useCancelAfter = true,
+        const ::Ydb::Query::Syntax syntax = Ydb::Query::Syntax::SYNTAX_UNSPECIFIED);
 
     TEvQueryRequest() = default;
 
@@ -95,6 +97,10 @@ public:
 
     NKikimrKqp::EQueryType GetType() const {
         return RequestCtx ? QueryType : Record.GetRequest().GetType();
+    }
+
+    Ydb::Query::Syntax GetSyntax() const {
+        return RequestCtx ? Syntax : Record.GetRequest().GetSyntax();
     }
 
     bool HasPreparedQuery() const {
@@ -251,7 +257,7 @@ public:
 
     void SetClientLostAction(TActorId actorId, NActors::TActorSystem* as) {
         if (RequestCtx) {
-            RequestCtx->SetClientLostAction([actorId, as]() {
+            RequestCtx->SetFinishAction([actorId, as]() {
                 as->Send(actorId, new NGRpcService::TEvClientLost());
                 });
         } else if (Record.HasCancelationActor()) {
@@ -281,10 +287,11 @@ private:
     const ::google::protobuf::Map<TProtoStringType, ::Ydb::TypedValue>* YdbParameters = nullptr;
     const ::Ydb::Table::QueryStatsCollection::Mode CollectStats = Ydb::Table::QueryStatsCollection::STATS_COLLECTION_NONE;
     const ::Ydb::Table::QueryCachePolicy* QueryCachePolicy = nullptr;
-    const ::Ydb::Operations::OperationParams* OperationParams = nullptr;
+    const bool HasOperationParams = false;
     bool KeepSession = false;
     TDuration OperationTimeout;
     TDuration CancelAfter;
+    const ::Ydb::Query::Syntax Syntax = Ydb::Query::Syntax::SYNTAX_UNSPECIFIED;
 };
 
 struct TEvDataQueryStreamPart: public TEventPB<TEvDataQueryStreamPart,

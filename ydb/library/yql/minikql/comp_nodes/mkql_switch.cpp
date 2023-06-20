@@ -33,7 +33,6 @@ using TSwitchHandlersList = std::vector<TSwitchHandler, TMKQLAllocator<TSwitchHa
 class TState : public TComputationValue<TState> {
     typedef TComputationValue<TState> TBase;
 public:
-    using TLLVMBase = TLLVMFieldsStructure<TComputationValue<TState>>;
     TState(TMemoryUsageInfo* memInfo, ui32 size)
         : TBase(memInfo), ChildReadIndex(size)
     {}
@@ -43,9 +42,9 @@ public:
 };
 
 #ifndef MKQL_DISABLE_CODEGEN
-class TLLVMFieldsStructureForState: public TState::TLLVMBase {
+class TLLVMFieldsStructureForState: public TLLVMFieldsStructure<TComputationValue<TState>> {
 private:
-    using TBase = TState::TLLVMBase;
+    using TBase = TLLVMFieldsStructure<TComputationValue<TState>>;
     llvm::IntegerType* IndexType;
     llvm::IntegerType* StatusType;
     const ui32 FieldsCount = 0;
@@ -92,13 +91,12 @@ class TSwitchFlowWrapper : public TStatefulFlowCodegeneratorNode<TSwitchFlowWrap
 private:
     class TFlowState : public TState {
     public:
-        using TLLVMBase = TLLVMFieldsStructureForState;
         TFlowState(TMemoryUsageInfo* memInfo, TAlignedPagePool& pool, ui32 size)
             : TState(memInfo, size), Buffer(pool)
         {}
 
         void Add(NUdf::TUnboxedValuePod item) {
-            Buffer.Add(item);
+            Buffer.Add(std::move(item));
         }
 
         void PushStat(IStatsRegistry* stats) const {
@@ -126,7 +124,7 @@ private:
             Position = 0U;
         }
 
-        NUdf::TUnboxedValuePod Handler(ui32 index, const TSwitchHandler& handler, TComputationContext& ctx) {
+        NUdf::TUnboxedValuePod Handler(ui32, const TSwitchHandler& handler, TComputationContext& ctx) {
             while (true) {
                 auto current = Get(Position++);
                 if (current.IsSpecial()) {
@@ -161,14 +159,34 @@ public:
         , Flow(flow)
         , MemLimit(memLimit)
         , Handlers(std::move(handlers))
-    {}
+    {
+        size_t handlersSize = Handlers.size();
+        for (ui32 handlerIndex = 0; handlerIndex < handlersSize; ++handlerIndex) {
+            Handlers[handlerIndex].Item->SetGetter([stateIndex = mutables.CurValueIndex - 1, handlerIndex, this](TComputationContext & context) {
+                NUdf::TUnboxedValue& state = context.MutableValues[stateIndex];
+                if (!state.HasValue()) {
+                    MakeState(context, state);
+                }
+
+                auto ptr = static_cast<TFlowState*>(state.AsBoxed().Get());
+                return ptr->Handler(handlerIndex, Handlers[handlerIndex], context);
+            });
+
+#ifndef MKQL_DISABLE_CODEGEN
+            EnsureDynamicCast<ICodegeneratorExternalNode*>(Handlers[handlerIndex].Item)->SetValueGetterBuilder([handlerIndex, this](const TCodegenContext& ctx) {
+                return GenerateHandler(handlerIndex, ctx.Codegen);
+            });
+#endif
+        }
+    }
 
     NUdf::TUnboxedValuePod DoCalculate(NUdf::TUnboxedValue& state, TComputationContext& ctx) const {
         if (!state.HasValue()) {
             MakeState(ctx, state);
         }
 
-        while (const auto ptr = static_cast<TFlowState*>(state.AsBoxed().Get())) {
+        auto ptr = static_cast<TFlowState*>(state.AsBoxed().Get());
+        while (true) {
             if (ptr->ChildReadIndex == Handlers.size()) {
                 switch (ptr->InputStatus) {
                     case NUdf::EFetchStatus::Ok: break;
@@ -225,9 +243,9 @@ public:
     }
 #ifndef MKQL_DISABLE_CODEGEN
 private:
-    class TLLVMFieldsStructureForFlowState: public TFlowState::TLLVMBase {
+    class TLLVMFieldsStructureForFlowState: public TLLVMFieldsStructureForState {
     private:
-        using TBase = typename TFlowState::TLLVMBase;
+        using TBase = TLLVMFieldsStructureForState;
         llvm::PointerType* StructPtrType;
         llvm::IntegerType* IndexType;
     protected:
@@ -240,11 +258,11 @@ private:
             return result;
         }
 
-        llvm::Constant* GetPosition() {
+        llvm::Constant* GetPosition() const {
             return ConstantInt::get(Type::getInt32Ty(Context), TBase::GetFieldsCount() + 0);
         }
 
-        llvm::Constant* GetBuffer() {
+        llvm::Constant* GetBuffer() const {
             return ConstantInt::get(Type::getInt32Ty(Context), TBase::GetFieldsCount() + 1);
         }
 
@@ -254,6 +272,7 @@ private:
             , IndexType(Type::getInt32Ty(context)) {
         }
     };
+
     Function* GenerateHandler(ui32 i, const NYql::NCodegen::ICodegen::TPtr& codegen) const {
         auto& module = codegen->GetModule();
         auto& context = codegen->GetContext();
@@ -354,10 +373,6 @@ private:
     }
 public:
     Value* DoGenerateGetValue(const TCodegenContext& ctx, Value* statePtr, BasicBlock*& block) const {
-        for (ui32 i = 0U; i < Handlers.size(); ++i) {
-            EnsureDynamicCast<ICodegeneratorExternalNode*>(Handlers[i].Item)->SetValueGetter(GenerateHandler(i, ctx.Codegen));
-        }
-
         auto& context = ctx.Codegen->GetContext();
 
         const auto valueType = Type::getInt128Ty(context);
@@ -533,12 +548,6 @@ public:
 private:
     void MakeState(TComputationContext& ctx, NUdf::TUnboxedValue& state) const {
         state = ctx.HolderFactory.Create<TFlowState>(ctx.HolderFactory.GetPagePool(), Handlers.size());
-        if (const auto ptr = static_cast<TFlowState*>(state.AsBoxed().Get())) {
-            for (ui32 i = 0U; i <  Handlers.size(); ++i) {
-                const auto& handler = Handlers[i];
-                handler.Item->SetGetter(std::bind(&TFlowState::Handler, ptr, i, std::cref(handler), std::placeholders::_1));
-            }
-        }
     }
 
     void RegisterDependencies() const final {
@@ -617,8 +626,6 @@ private:
 
     class TValueBase : public TState {
     public:
-        using TLLVMBase = TLLVMFieldsStructureForState;
-
         void Add(NUdf::TUnboxedValue&& item) {
             Buffer.Add(std::move(item));
         }
@@ -694,7 +701,7 @@ private:
 
                     const auto initUsage = this->MemLimit ? this->Ctx.HolderFactory.GetMemoryUsed() : 0ULL;
 
-                    do  {
+                    do {
                         NUdf::TUnboxedValue current;
                         this->InputStatus = this->Stream.Fetch(current);
                         if (NUdf::EFetchStatus::Ok != this->InputStatus) {
@@ -758,16 +765,16 @@ public:
 private:
     void RegisterDependencies() const final {
         this->DependsOn(Stream);
-        for (const auto& x : Handlers) {
-            this->Own(x.Item);
-            this->DependsOn(x.NewItem);
+        for (const auto& handler : Handlers) {
+            this->Own(handler.Item);
+            this->DependsOn(handler.NewItem);
         }
     }
 
 #ifndef MKQL_DISABLE_CODEGEN
-    class TLLVMFieldsStructureForValueBase: public TValueBase::TLLVMBase {
+    class TLLVMFieldsStructureForValueBase: public TLLVMFieldsStructureForState {
     private:
-        using TBase = typename TValueBase::TLLVMBase;
+        using TBase = TLLVMFieldsStructureForState;
     protected:
         using TBase::Context;
     public:
@@ -997,7 +1004,7 @@ IComputationNode* WrapSwitch(TCallable& callable, const TComputationNodeFactoryC
             handler.ResultVariantOffset = AS_VALUE(TDataLiteral, offsetNode)->AsValue().Get<ui32>();
         }
 
-        handlers.emplace_back(handler);
+        handlers.emplace_back(std::move(handler));
     }
 
     const bool trackRss = EGraphPerProcess::Single == ctx.GraphPerProcess;

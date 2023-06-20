@@ -1,5 +1,4 @@
 #include "index_info.h"
-#include "insert_table.h"
 #include "column_engine.h"
 
 #include <ydb/core/formats/arrow/arrow_batch_builder.h>
@@ -104,6 +103,16 @@ TString TIndexInfo::GetColumnName(ui32 id, bool required) const {
     }
 }
 
+std::vector<ui32> TIndexInfo::GetColumnIds() const {
+    std::vector<ui32> result;
+    for (auto&& i : Columns) {
+        result.emplace_back(i.first);
+    }
+    result.emplace_back((ui32)ESpecialColumn::PLAN_STEP);
+    result.emplace_back((ui32)ESpecialColumn::TX_ID);
+    return result;
+}
+
 std::vector<TString> TIndexInfo::GetColumnNames(const std::vector<ui32>& ids) const {
     std::vector<TString> out;
     out.reserve(ids.size());
@@ -119,81 +128,19 @@ std::vector<TNameTypeInfo> TIndexInfo::GetColumns(const std::vector<ui32>& ids) 
     return NOlap::GetColumns(*this, ids);
 }
 
-std::shared_ptr<arrow::RecordBatch> TIndexInfo::PrepareForInsert(const TString& data, const TString& metadata,
-                                                                 TString& strError) const {
-    std::shared_ptr<arrow::Schema> schema = ArrowSchema();
-    std::shared_ptr<arrow::Schema> differentSchema;
-    if (metadata.size()) {
-        differentSchema = NArrow::DeserializeSchema(metadata);
-        if (!differentSchema) {
-            strError = "DeserializeSchema() failed";
-            return {};
-        }
-    }
-
-    auto batch = NArrow::DeserializeBatch(data, (differentSchema ? differentSchema : schema));
-    if (!batch) {
-        strError = "DeserializeBatch() failed";
-        return {};
-    }
-    if (batch->num_rows() == 0) {
-        strError = "empty batch";
-        return {};
-    }
-
-    // Correct schema
-    if (differentSchema) {
-        batch = NArrow::ExtractColumns(batch, ArrowSchema());
-        if (!batch) {
-            strError = "cannot correct schema";
-            return {};
-        }
-    }
-
-    if (!batch->schema()->Equals(ArrowSchema())) {
-        strError = "unexpected schema for insert batch: '" + batch->schema()->ToString() + "'";
-        return {};
-    }
-
-    // Check PK is NOT NULL
-    for (auto& field : SortingKey->fields()) {
-        auto column = batch->GetColumnByName(field->name());
-        if (!column) {
-            strError = "missing PK column '" + field->name() + "'";
-            return {};
-        }
-        if (NArrow::HasNulls(column)) {
-            strError = "PK column '" + field->name() + "' contains NULLs";
-            return {};
-        }
-    }
-
-    auto status = batch->ValidateFull();
-    if (!status.ok()) {
-        strError = status.ToString();
-        return {};
-    }
-
-    Y_VERIFY(SortingKey);
-    batch = NArrow::SortBatch(batch, SortingKey);
-    Y_VERIFY_DEBUG(NArrow::IsSorted(batch, SortingKey));
-    return batch;
-}
-
 std::shared_ptr<arrow::Schema> TIndexInfo::ArrowSchema() const {
-    if (Schema) {
-        return Schema;
+    if (!Schema) {
+        std::vector<ui32> ids;
+        ids.reserve(Columns.size());
+        for (const auto& [id, _] : Columns) {
+            ids.push_back(id);
+        }
+
+        // The ids had a set type before so we keep them sorted.
+        std::sort(ids.begin(), ids.end());
+        Schema = MakeArrowSchema(Columns, ids);
     }
 
-    std::vector<ui32> ids;
-    ids.reserve(Columns.size());
-    for (const auto& [id, _] : Columns) {
-        ids.push_back(id);
-    }
-
-    // The ids had a set type before so we keep them sorted.
-    std::sort(ids.begin(), ids.end());
-    Schema = MakeArrowSchema(Columns, ids);
     return Schema;
 }
 
@@ -263,7 +210,11 @@ std::shared_ptr<arrow::Schema> TIndexInfo::ArrowSchema(const std::vector<TString
 }
 
 std::shared_ptr<arrow::Field> TIndexInfo::ArrowColumnField(ui32 columnId) const {
-    return ArrowSchema()->GetFieldByName(GetColumnName(columnId, true));
+    auto it = ArrowColumnByColumnIdCache.find(columnId);
+    if (it == ArrowColumnByColumnIdCache.end()) {
+        it = ArrowColumnByColumnIdCache.emplace(columnId, ArrowSchema()->GetFieldByName(GetColumnName(columnId, true))).first;
+    }
+    return it->second;
 }
 
 void TIndexInfo::SetAllKeys() {
@@ -365,21 +316,17 @@ TColumnSaver TIndexInfo::GetColumnSaver(const ui32 columnId, const TSaverContext
     }
 }
 
-std::shared_ptr<TColumnLoader> TIndexInfo::GetColumnLoader(const ui32 columnId) const {
+TColumnFeatures& TIndexInfo::GetOrCreateColumnFeatures(const ui32 columnId) const {
     auto it = ColumnFeatures.find(columnId);
-    NArrow::NTransformation::ITransformer::TPtr transformer;
-    if (it != ColumnFeatures.end()) {
-        transformer = it->second.GetLoadTransformer();
+    if (it == ColumnFeatures.end()) {
+        it = ColumnFeatures.emplace(columnId, TColumnFeatures(columnId)).first;
     }
-    if (!transformer) {
-        return std::make_shared<TColumnLoader>(transformer,
-            std::make_shared<NArrow::NSerialization::TBatchPayloadDeserializer>(GetColumnSchema(columnId)),
-            GetColumnSchema(columnId), columnId);
-    } else {
-        return std::make_shared<TColumnLoader>(transformer,
-            std::make_shared<NArrow::NSerialization::TFullDataDeserializer>(),
-            GetColumnSchema(columnId), columnId);
-    }
+    return it->second;
+}
+
+std::shared_ptr<TColumnLoader> TIndexInfo::GetColumnLoader(const ui32 columnId) const {
+    TColumnFeatures& features = GetOrCreateColumnFeatures(columnId);
+    return features.GetLoader(*this);
 }
 
 std::shared_ptr<arrow::Schema> TIndexInfo::GetColumnSchema(const ui32 columnId) const {
@@ -406,7 +353,7 @@ bool TIndexInfo::DeserializeFromProto(const NKikimrSchemeOp::TColumnTableSchema&
             col.HasTypeInfo() ? &col.GetTypeInfo() : nullptr);
         Columns[id] = NTable::TColumn(name, id, typeInfoMod.TypeInfo, typeInfoMod.TypeMod);
         ColumnNames[name] = id;
-        std::optional<TColumnFeatures> cFeatures = TColumnFeatures::BuildFromProto(col);
+        std::optional<TColumnFeatures> cFeatures = TColumnFeatures::BuildFromProto(col, id);
         if (!cFeatures) {
             AFL_ERROR(NKikimrServices::TX_COLUMNSHARD)("event", "cannot_parse_column_feature");
             return false;
@@ -463,22 +410,6 @@ std::vector<TNameTypeInfo> GetColumns(const NTable::TScheme::TTableSchema& table
         out.emplace_back(ci->second.Name, ci->second.PType);
     }
     return out;
-}
-
-NArrow::NTransformation::ITransformer::TPtr TColumnFeatures::GetSaveTransformer() const {
-    NArrow::NTransformation::ITransformer::TPtr transformer;
-    if (DictionaryEncoding) {
-        transformer = DictionaryEncoding->BuildEncoder();
-    }
-    return transformer;
-}
-
-NArrow::NTransformation::ITransformer::TPtr TColumnFeatures::GetLoadTransformer() const {
-    NArrow::NTransformation::ITransformer::TPtr transformer;
-    if (DictionaryEncoding) {
-        transformer = DictionaryEncoding->BuildDecoder();
-    }
-    return transformer;
 }
 
 } // namespace NKikimr::NOlap

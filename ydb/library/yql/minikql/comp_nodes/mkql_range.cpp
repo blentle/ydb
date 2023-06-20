@@ -277,9 +277,8 @@ bool RangeCanMerge(const TExpandedRange& a, const TExpandedRange& b, const TRang
 
 class TRangeComputeBase {
 public:
-    TRangeComputeBase(TComputationMutables& mutables, TComputationNodePtrVector&& lists, std::vector<TRangeTypeInfo>&& typeInfos)
-        : TypeInfos(std::move(typeInfos))
-        , Lists(std::move(lists))
+    TRangeComputeBase(TComputationMutables&, TComputationNodePtrVector&& lists, std::vector<TRangeTypeInfo>&& typeInfos)
+        : Lists(std::move(lists)), TypeInfos(std::move(typeInfos))
     {
         Y_ENSURE(Lists.size() == TypeInfos.size());
         Y_ENSURE(!Lists.empty());
@@ -437,8 +436,8 @@ private:
 
     void DoIntersect(TComputationContext& ctx, TUnboxedValueQueue& current, TUnboxedValueQueue&& next) const {
         TUnboxedValueQueue result;
-        auto cmp = TypeInfos.front().RangeCompare;
-        auto boundaryCmp = TypeInfos.front().BoundaryCompare;
+        auto cmp = TypeInfos.front().RangeCompare.Get();
+        auto boundaryCmp = TypeInfos.front().BoundaryCompare.Get();
         while (!current.empty() && !next.empty()) {
             TUnboxedValueQueue* minInput;
             TUnboxedValueQueue* maxInput;

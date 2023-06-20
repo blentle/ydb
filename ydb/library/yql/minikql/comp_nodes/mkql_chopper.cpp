@@ -29,6 +29,14 @@ public:
         , Output(output)
     {
         Input->SetGetter(std::bind(&TChopperFlowWrapper::Getter, this, std::bind(&TChopperFlowWrapper::RefState, this, std::placeholders::_1), std::placeholders::_1));
+
+#ifndef MKQL_DISABLE_CODEGEN
+        const auto codegenInput = dynamic_cast<ICodegeneratorExternalNode*>(Input);
+        MKQL_ENSURE(codegenInput, "Input arg must be codegenerator node.");
+        codegenInput->SetValueGetterBuilder([this](const TCodegenContext& ctx) {
+            return GenerateHandler(ctx.Codegen);
+        });
+#endif
     }
 
     NUdf::TUnboxedValuePod DoCalculate(NUdf::TUnboxedValue& state, TComputationContext& ctx) const {
@@ -41,11 +49,12 @@ public:
                 KeyArg->SetValue(ctx, Key->GetValue(ctx));
             }
         } else if (EState::Skip == EState(state.Get<ui64>())) {
-            do if (auto next = Flow->GetValue(ctx); next.IsSpecial())
-                return next.Release();
-            else
-                ItemArg->SetValue(ctx, std::move(next));
-            while (!Chop->GetValue(ctx).Get<bool>());
+            do {
+                if (auto next = Flow->GetValue(ctx); next.IsSpecial())
+                    return next.Release();
+                else
+                    ItemArg->SetValue(ctx, std::move(next));
+            } while (!Chop->GetValue(ctx).Get<bool>());
 
             KeyArg->SetValue(ctx, Key->GetValue(ctx));
             state = NUdf::TUnboxedValuePod(ui64(EState::Next));
@@ -58,13 +67,15 @@ public:
                 switch (EState(state.Get<ui64>())) {
                     case EState::Work:
                     case EState::Next:
-                        do if (auto next = Flow->GetValue(ctx); next.IsSpecial()) {
-                            if (next.IsYield()) {
-                                state = NUdf::TUnboxedValuePod(ui64(EState::Skip));
+                        do {
+                            if (auto next = Flow->GetValue(ctx); next.IsSpecial()) {
+                                if (next.IsYield()) {
+                                    state = NUdf::TUnboxedValuePod(ui64(EState::Skip));
+                                }
+                                return next.Release();
+                            } else {
+                                ItemArg->SetValue(ctx, std::move(next));
                             }
-                            return next.Release();
-                        } else {
-                            ItemArg->SetValue(ctx, std::move(next));
                         } while (!Chop->GetValue(ctx).Get<bool>());
                     case EState::Chop:
                         KeyArg->SetValue(ctx, Key->GetValue(ctx));
@@ -181,8 +192,6 @@ public:
         MKQL_ENSURE(codegenItemArg, "Item arg must be codegenerator node.");
         MKQL_ENSURE(codegenKeyArg, "Key arg must be codegenerator node.");
         MKQL_ENSURE(codegenInput, "Input arg must be codegenerator node.");
-
-        codegenInput->SetValueGetter(GenerateHandler(ctx.Codegen));
 
         auto& context = ctx.Codegen->GetContext();
 
@@ -321,11 +330,9 @@ private:
     public:
         using TBase = TComputationValue<TSubStream>;
 
-        TSubStream(TMemoryUsageInfo* memInfo, const TStatePtr& state, const NUdf::TUnboxedValue& stream, IComputationExternalNode* itemArg, IComputationNode* key, IComputationExternalNode* keyArg, IComputationNode* chop, TComputationContext& ctx)
+        TSubStream(TMemoryUsageInfo* memInfo, const TStatePtr& state, const NUdf::TUnboxedValue& stream, IComputationExternalNode* itemArg, IComputationNode* chop, TComputationContext& ctx)
             : TBase(memInfo), State(state), Stream(stream)
             , ItemArg(itemArg)
-            , Key(key)
-            , KeyArg(keyArg)
             , Chop(chop)
             , Ctx(ctx)
         {}
@@ -362,8 +369,6 @@ private:
         const NUdf::TUnboxedValue Stream;
 
         IComputationExternalNode *const ItemArg;
-        IComputationNode *const Key;
-        IComputationExternalNode *const KeyArg;
         IComputationNode *const Chop;
 
         TComputationContext& Ctx;
@@ -372,7 +377,7 @@ private:
     class TMainStream : public TComputationValue<TMainStream> {
     public:
         TMainStream(TMemoryUsageInfo* memInfo, TStatePtr&& state, NUdf::TUnboxedValue&& stream, const IComputationExternalNode *itemArg, const IComputationNode *key, const IComputationExternalNode *keyArg, const IComputationNode *chop, const IComputationExternalNode *input, const IComputationNode *output, TComputationContext& ctx)
-            : TComputationValue(memInfo), State(std::move(state)), ItemArg(itemArg), Key(key), KeyArg(keyArg), Chop(chop), Input(input), Output(output), InputStream(std::move(stream)), Ctx(ctx)
+            : TComputationValue(memInfo), State(std::move(state)), ItemArg(itemArg), Key(key), Chop(chop), KeyArg(keyArg), Input(input), Output(output), InputStream(std::move(stream)), Ctx(ctx)
         {}
     private:
         NUdf::EFetchStatus Fetch(NUdf::TUnboxedValue& result) override {
@@ -498,7 +503,7 @@ public:
             Input->SetValue(ctx, ctx.HolderFactory.Create<TCodegenInput>(InputPtr, stream, &ctx, sharedState));
         else
 #endif
-            Input->SetValue(ctx, ctx.HolderFactory.Create<TSubStream>(sharedState, stream, ItemArg, Key, KeyArg, Chop, ctx));
+            Input->SetValue(ctx, ctx.HolderFactory.Create<TSubStream>(sharedState, stream, ItemArg, Chop, ctx));
 
 #ifndef MKQL_DISABLE_CODEGEN
         if (ctx.ExecuteLLVM && OutputPtr)

@@ -38,6 +38,8 @@ private:
 
     using TQueueInfoPtr = TIntrusivePtr<TQueueInfo>;
 
+    class TLocalLeaderManager;
+
     STATEFN(StateFunc);
 
     void InitSchemeCache();
@@ -57,6 +59,8 @@ private:
     void HandleInsertQueueCounters(TSqsEvents::TEvInsertQueueCounters::TPtr& ev);
     void HandleUserSettingsChanged(TSqsEvents::TEvUserSettingsChanged::TPtr& ev);
     void HandleQueuesList(TSqsEvents::TEvQueuesList::TPtr& ev);
+    void HandleReloadStateRequest(TSqsEvents::TEvReloadStateRequest::TPtr& ev);
+    void HandleLeaderStarted(TSqsEvents::TEvLeaderStarted::TPtr& ev);
     void HandleNodeTrackingSubscriptionStatus(TSqsEvents::TEvNodeTrackerSubscriptionStatus::TPtr& ev);
     void CreateNodeTrackingSubscription(TQueueInfoPtr queueInfo);
     void CancleNodeTrackingSubscription(TQueueInfoPtr queueInfo);
@@ -175,6 +179,7 @@ private:
         TDuration RescanInterval = TDuration::Minutes(1);
     };
     TYcSearchEventsConfig YcSearchEventsConfig;
+    THolder<TLocalLeaderManager> LocalLeaderManager;
 };
 
 } // namespace NKikimr::NSQS

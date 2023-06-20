@@ -7,13 +7,16 @@ namespace NKikimr::NColumnShard {
 namespace {
 
 class TIndexingActor : public TActorBootstrapped<TIndexingActor> {
+private:
+    const TIndexationCounters Counters;
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
         return NKikimrServices::TActivity::TX_COLUMNSHARD_INDEXING_ACTOR;
     }
 
-    TIndexingActor(ui64 tabletId, const TActorId& parent)
-        : TabletId(tabletId)
+    TIndexingActor(ui64 tabletId, const TActorId& parent, const TIndexationCounters& counters)
+        : Counters(counters)
+        , TabletId(tabletId)
         , Parent(parent)
         , BlobCacheActorId(NBlobCache::MakeBlobCacheServiceId())
     {}
@@ -39,6 +42,7 @@ public:
             auto res = BlobsToRead.emplace(blobId, i);
             Y_VERIFY(res.second, "Duplicate blob in DataToIndex: %s", blobId.ToStringNew().c_str());
             SendReadRequest(NBlobCache::TBlobRange(blobId, 0, blobId.BlobSize()));
+            Counters.ReadBytes->Add(blobId.BlobSize());
         }
 
         if (BlobsToRead.empty()) {
@@ -58,9 +62,10 @@ public:
                 << " at tablet " << TabletId << " (index)");
 
             BlobsToRead.erase(blobId);
-            TxEvent->PutStatus = event.Status;
-            if (TxEvent->PutStatus == NKikimrProto::UNKNOWN) {
-                TxEvent->PutStatus = NKikimrProto::ERROR;
+            if (event.Status == NKikimrProto::UNKNOWN) {
+                TxEvent->SetPutStatus(NKikimrProto::ERROR);
+            } else {
+                TxEvent->SetPutStatus(event.Status);
             }
             return;
         }
@@ -121,12 +126,12 @@ private:
 
     void Index(const TActorContext& ctx) {
         Y_VERIFY(TxEvent);
-        if (TxEvent->PutStatus == NKikimrProto::UNKNOWN) {
+        if (TxEvent->GetPutStatus() == NKikimrProto::UNKNOWN) {
             LOG_S_DEBUG("Indexing started at tablet " << TabletId);
 
             TCpuGuard guard(TxEvent->ResourceUsage);
-            NOlap::TIndexationLogic indexationLogic(TxEvent->IndexInfo, TxEvent->Tiering);
-            TxEvent->Blobs = indexationLogic.Apply(TxEvent->IndexChanges);
+            NOlap::TIndexationLogic indexationLogic(TxEvent->IndexInfo, TxEvent->Tiering, Counters);
+            TxEvent->Blobs = std::move(indexationLogic.Apply(TxEvent->IndexChanges).DetachResult());
             LOG_S_DEBUG("Indexing finished at tablet " << TabletId);
         } else {
             LOG_S_ERROR("Indexing failed at tablet " << TabletId);
@@ -140,8 +145,8 @@ private:
 
 } // namespace
 
-IActor* CreateIndexingActor(ui64 tabletId, const TActorId& parent) {
-    return new TIndexingActor(tabletId, parent);
+IActor* CreateIndexingActor(ui64 tabletId, const TActorId& parent, const TIndexationCounters& counters) {
+    return new TIndexingActor(tabletId, parent, counters);
 }
 
 }

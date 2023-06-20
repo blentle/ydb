@@ -36,7 +36,7 @@ public:
     TTxType GetTxType() const override { return TXTYPE_START_SCAN; }
 
 private:
-    std::shared_ptr<NOlap::TReadMetadataBase> CreateReadMetadata(const TActorContext& ctx, NOlap::TReadDescription& read,
+    std::shared_ptr<NOlap::TReadMetadataBase> CreateReadMetadata(NOlap::TReadDescription& read,
         bool isIndexStats, bool isReverse, ui64 limit);
 
 private:
@@ -142,25 +142,26 @@ private:
             InFlightReadBytes += blobRange.Size;
             ranges[blobRange.BlobId].emplace_back(blobRange);
         }
-        if (ranges.size()) {
-            auto& externBlobs = ReadMetadataRanges[ReadMetadataIndex]->ExternBlobs;
-            for (auto&& i : ranges) {
-                bool fallback = externBlobs && externBlobs->contains(i.first);
-                NBlobCache::TReadBlobRangeOptions readOpts{
-                    .CacheAfterRead = true,
-                    .ForceFallback = fallback,
-                    .IsBackgroud = false
-                };
-                ui32 size = 0;
-                for (auto&& s : i.second) {
-                    size += s.Size;
-                }
-                LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::TX_COLUMNSHARD_SCAN,
-                    "Scan " << ScanActorId << " blobs request:" << i.first << "/" << i.second.size() << "/" << size
-                    << " txId: " << TxId << " scanId: " << ScanId << " gen: " << ScanGen << " tablet: " << TabletId);
-                Stats.RequestSent(i.second);
-                Send(BlobCacheActorId, new NBlobCache::TEvBlobCache::TEvReadBlobRangeBatch(std::move(i.second), std::move(readOpts)));
+        if (!ranges.size()) {
+            return true;
+        }
+        auto& externBlobs = ReadMetadataRanges[ReadMetadataIndex]->ExternBlobs;
+        for (auto&& i : ranges) {
+            bool fallback = externBlobs && externBlobs->contains(i.first);
+            NBlobCache::TReadBlobRangeOptions readOpts{
+                .CacheAfterRead = true,
+                .ForceFallback = fallback,
+                .IsBackgroud = false
+            };
+            ui32 size = 0;
+            for (auto&& s : i.second) {
+                size += s.Size;
             }
+            LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::TX_COLUMNSHARD_SCAN,
+                "Scan " << ScanActorId << " blobs request:" << i.first << "/" << i.second.size() << "/" << size
+                << " txId: " << TxId << " scanId: " << ScanId << " gen: " << ScanGen << " tablet: " << TabletId);
+            Stats.RequestSent(i.second);
+            Send(BlobCacheActorId, new NBlobCache::TEvBlobCache::TEvReadBlobRangeBatch(std::move(i.second), std::move(readOpts)));
         }
         return true;
     }
@@ -761,10 +762,8 @@ static bool FillPredicatesFromRange(NOlap::TReadDescription& read, const ::NKiki
 std::shared_ptr<NOlap::TReadStatsMetadata>
 PrepareStatsReadMetadata(ui64 tabletId, const NOlap::TReadDescription& read, const std::unique_ptr<NOlap::IColumnEngine>& index, TString& error, const bool isReverse) {
     THashSet<ui32> readColumnIds(read.ColumnIds.begin(), read.ColumnIds.end());
-    if (read.Program) {
-        for (auto& [id, name] : read.Program->SourceColumns) {
-            readColumnIds.insert(id);
-        }
+    for (auto& [id, name] : read.GetProgram().GetSourceColumns()) {
+        readColumnIds.insert(id);
     }
 
     for (ui32 colId : readColumnIds) {
@@ -774,12 +773,13 @@ PrepareStatsReadMetadata(ui64 tabletId, const NOlap::TReadDescription& read, con
         }
     }
 
-    auto out = std::make_shared<NOlap::TReadStatsMetadata>(tabletId, isReverse ? NOlap::TReadStatsMetadata::ESorting::DESC : NOlap::TReadStatsMetadata::ESorting::ASC);
+    auto out = std::make_shared<NOlap::TReadStatsMetadata>(tabletId,
+                isReverse ? NOlap::TReadStatsMetadata::ESorting::DESC : NOlap::TReadStatsMetadata::ESorting::ASC,
+                read.GetProgram());
 
     out->SetPKRangesFilter(read.PKRangesFilter);
     out->ReadColumnIds.assign(readColumnIds.begin(), readColumnIds.end());
     out->ResultColumnIds = read.ColumnIds;
-    out->Program = read.Program;
 
     if (!index) {
         return out;
@@ -805,14 +805,14 @@ PrepareStatsReadMetadata(ui64 tabletId, const NOlap::TReadDescription& read, con
     return out;
 }
 
-std::shared_ptr<NOlap::TReadMetadataBase> TTxScan::CreateReadMetadata(const TActorContext& ctx, NOlap::TReadDescription& read,
+std::shared_ptr<NOlap::TReadMetadataBase> TTxScan::CreateReadMetadata(NOlap::TReadDescription& read,
     bool indexStats, bool isReverse, ui64 itemsLimit)
 {
     std::shared_ptr<NOlap::TReadMetadataBase> metadata;
     if (indexStats) {
         metadata = PrepareStatsReadMetadata(Self->TabletID(), read, Self->TablesManager.GetPrimaryIndex(), ErrorDescription, isReverse);
     } else {
-        metadata = PrepareReadMetadata(ctx, read, Self->InsertTable, Self->TablesManager.GetPrimaryIndex(), Self->BatchCache,
+        metadata = PrepareReadMetadata(read, Self->InsertTable, Self->TablesManager.GetPrimaryIndex(), Self->BatchCache,
                                        ErrorDescription, isReverse);
     }
 
@@ -868,10 +868,10 @@ bool TTxScan::Execute(TTransactionContext& txc, const TActorContext& ctx) {
 
     if (!isIndexStats) {
         TIndexColumnResolver columnResolver(*indexInfo);
-        parseResult = ParseProgram(ctx, record.GetOlapProgramType(), record.GetOlapProgram(), read, columnResolver);
+        parseResult = ParseProgram(record.GetOlapProgramType(), record.GetOlapProgram(), read, columnResolver);
     } else {
         TStatsColumnResolver columnResolver;
-        parseResult = ParseProgram(ctx, record.GetOlapProgramType(), record.GetOlapProgram(), read, columnResolver);
+        parseResult = ParseProgram(record.GetOlapProgramType(), record.GetOlapProgram(), read, columnResolver);
     }
 
     if (!parseResult) {
@@ -879,7 +879,7 @@ bool TTxScan::Execute(TTransactionContext& txc, const TActorContext& ctx) {
     }
 
     if (!record.RangesSize()) {
-        auto range = CreateReadMetadata(ctx, read, isIndexStats, record.GetReverse(), itemsLimit);
+        auto range = CreateReadMetadata(read, isIndexStats, record.GetReverse(), itemsLimit);
         if (range) {
             if (!isIndexStats) {
                 Self->MapExternBlobs(ctx, static_cast<NOlap::TReadMetadata&>(*range));
@@ -902,7 +902,7 @@ bool TTxScan::Execute(TTransactionContext& txc, const TActorContext& ctx) {
         }
     }
     {
-        auto newRange = CreateReadMetadata(ctx, read, isIndexStats, record.GetReverse(), itemsLimit);
+        auto newRange = CreateReadMetadata(read, isIndexStats, record.GetReverse(), itemsLimit);
         if (!newRange) {
             ReadMetadataRanges.clear();
             return true;
@@ -948,7 +948,7 @@ void TTxScan::Complete(const TActorContext& ctx) {
     }
 
     TStringStream detailedInfo;
-    if (IS_LOG_PRIORITY_ENABLED(ctx, NActors::NLog::PRI_TRACE, NKikimrServices::TX_COLUMNSHARD)) {
+    if (IS_LOG_PRIORITY_ENABLED(NActors::NLog::PRI_TRACE, NKikimrServices::TX_COLUMNSHARD)) {
         detailedInfo << " read metadata: (" << TContainerPrinter(ReadMetadataRanges) << ")" << " req: " << request;
     }
     std::vector<NOlap::TReadMetadata::TConstPtr> rMetadataRanges;

@@ -3,6 +3,7 @@
 #include "stock_workload.h"
 #include "kv_workload.h"
 #include "click_bench.h"
+#include "tpch.h"
 #include "topic_workload/topic_workload.h"
 
 #include <ydb/library/workload/workload_factory.h>
@@ -40,6 +41,7 @@ TCommandWorkload::TCommandWorkload()
     AddCommand(std::make_unique<TCommandKv>());
     AddCommand(std::make_unique<TCommandClickBench>());
     AddCommand(std::make_unique<TCommandWorkloadTopic>());
+    AddCommand(std::make_unique<TCommandTpch>());
 }
 
 TWorkloadCommand::TWorkloadCommand(const TString& name, const std::initializer_list<TString>& aliases, const TString& description)
@@ -108,13 +110,18 @@ void TWorkloadCommand::WorkerFn(int taskId, TWorkloadQueryGenPtr workloadGen, co
     int retryCount = -1;
 
     NYdbWorkload::TQueryInfo queryInfo;
-    auto runQuery = [&queryInfo, &querySettings, &retryCount] (NYdb::NTable::TSession session) -> NYdb::TStatus {
+    auto runQuery = [this, &queryInfo, &querySettings, &retryCount] (NYdb::NTable::TSession session) -> NYdb::TStatus {
         ++retryCount;
         TStatus result(EStatus::SUCCESS, NYql::TIssues());
-        result = session.ExecuteDataQuery(queryInfo.Query.c_str(),
-            NYdb::NTable::TTxControl::BeginTx(NYdb::NTable::TTxSettings::SerializableRW()).CommitTx(),
-            queryInfo.Params, querySettings
-        ).GetValueSync();
+        if (queryInfo.UseReadRows) {
+            result = TableClient->ReadRows(queryInfo.TablePath, std::move(*queryInfo.KeyToRead))
+                .GetValueSync();
+        } else {
+            result = session.ExecuteDataQuery(queryInfo.Query.c_str(),
+                NYdb::NTable::TTxControl::BeginTx(NYdb::NTable::TTxSettings::SerializableRW()).CommitTx(),
+                queryInfo.Params, querySettings
+            ).GetValueSync();
+        }
         return result;
     };
 

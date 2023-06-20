@@ -9,13 +9,16 @@ namespace {
 using NOlap::TBlobRange;
 
 class TEvictionActor : public TActorBootstrapped<TEvictionActor> {
+private:
+    const TIndexationCounters Counters;
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
         return NKikimrServices::TActivity::TX_COLUMNSHARD_EVICTION_ACTOR;
     }
 
-    TEvictionActor(ui64 tabletId, const TActorId& parent)
-        : TabletId(tabletId)
+    TEvictionActor(ui64 tabletId, const TActorId& parent, const TIndexationCounters& counters)
+        : Counters(counters)
+        , TabletId(tabletId)
         , Parent(parent)
         , BlobCacheActorId(NBlobCache::MakeBlobCacheServiceId())
     {}
@@ -36,6 +39,7 @@ public:
 
             for (const auto& blobRange : ranges) {
                 Y_VERIFY(blobId == blobRange.BlobId);
+                Counters.ReadBytes->Add(blobRange.Size);
                 Blobs[blobRange] = {};
             }
             SendReadRequest(std::move(ranges), event.Externals.contains(blobId));
@@ -63,9 +67,10 @@ public:
             LOG_S_ERROR("TEvReadBlobRangeResult cannot get blob " << blobId.ToString()
                 << " status " << NKikimrProto::EReplyStatus_Name(event.Status)
                 << " at tablet " << TabletId << " (eviction)");
-            TxEvent->PutStatus = event.Status;
-            if (TxEvent->PutStatus == NKikimrProto::UNKNOWN) {
-                TxEvent->PutStatus = NKikimrProto::ERROR;
+            if (event.Status == NKikimrProto::UNKNOWN) {
+                TxEvent->SetPutStatus(NKikimrProto::ERROR);
+            } else {
+                TxEvent->SetPutStatus(event.Status);
             }
         }
 
@@ -117,7 +122,7 @@ private:
 
     void EvictPortions(const TActorContext& ctx) {
         Y_VERIFY(TxEvent);
-        if (TxEvent->PutStatus != NKikimrProto::EReplyStatus::UNKNOWN) {
+        if (TxEvent->GetPutStatus() != NKikimrProto::EReplyStatus::UNKNOWN) {
             LOG_S_INFO("Portions eviction not started at tablet " << TabletId);
             ctx.Send(Parent, TxEvent.release());
             return;
@@ -128,11 +133,10 @@ private:
             TCpuGuard guard(TxEvent->ResourceUsage);
 
             TxEvent->IndexChanges->SetBlobs(std::move(Blobs));
-            NOlap::TEvictionLogic evictionLogic(TxEvent->IndexInfo, TxEvent->Tiering);
-            TxEvent->Blobs = evictionLogic.Apply(TxEvent->IndexChanges);
-
+            NOlap::TEvictionLogic evictionLogic(TxEvent->IndexInfo, TxEvent->Tiering, Counters);
+            TxEvent->Blobs = std::move(evictionLogic.Apply(TxEvent->IndexChanges).DetachResult());
             if (TxEvent->Blobs.empty()) {
-                TxEvent->PutStatus = NKikimrProto::OK;
+                TxEvent->SetPutStatus(NKikimrProto::OK);
             }
         }
         ui32 blobsSize = TxEvent->Blobs.size();
@@ -145,8 +149,8 @@ private:
 
 } // namespace
 
-IActor* CreateEvictionActor(ui64 tabletId, const TActorId& parent) {
-    return new TEvictionActor(tabletId, parent);
+IActor* CreateEvictionActor(ui64 tabletId, const TActorId& parent, const TIndexationCounters& counters) {
+    return new TEvictionActor(tabletId, parent, counters);
 }
 
 }

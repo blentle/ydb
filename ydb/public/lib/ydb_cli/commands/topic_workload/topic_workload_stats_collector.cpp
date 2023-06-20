@@ -7,7 +7,8 @@ using namespace NYdb::NConsoleClient;
 TTopicWorkloadStatsCollector::TTopicWorkloadStatsCollector(
     size_t writerCount, size_t readerCount,
     bool quiet, bool printTimestamp,
-    ui32 windowDurationSec, ui32 totalDurationSec,
+    ui32 windowDurationSec, ui32 totalDurationSec, ui32 warmupSec,
+    ui8 percentile,
     std::shared_ptr<std::atomic_bool> errorFlag)
     : WriterCount(writerCount)
     , ReaderCount(readerCount)
@@ -15,6 +16,8 @@ TTopicWorkloadStatsCollector::TTopicWorkloadStatsCollector(
     , PrintTimestamp(printTimestamp)
     , WindowDurationSec(windowDurationSec)
     , TotalDurationSec(totalDurationSec)
+    , WarmupSec(warmupSec)
+    , Percentile(percentile)
     , ErrorFlag(errorFlag)
     , WindowStats(MakeHolder<TTopicWorkloadStats>())
 {
@@ -35,9 +38,26 @@ void TTopicWorkloadStatsCollector::PrintHeader(bool total) const {
     if (Quiet && !total)
         return;
 
-    Cout << "Window\t" << (WriterCount > 0 ? "Write speed\tWrite time\tInflight\t" : "") << (ReaderCount > 0 ? "Lag\t\tLag time\tRead speed\tFull time\t" : "") << (PrintTimestamp ? "Timestamp" : "") << Endl;
-    Cout << "#\t" << (WriterCount > 0 ? "msg/s\tMB/s\tP99(ms)\t\tP99(msg)\t" : "") << (ReaderCount > 0 ? "P99(msg)\tP99(ms)\t\tmsg/s\tMB/s\tP99(ms)" : "");
-    Cout << Endl;
+    TStringBuilder header;
+
+    header << "Window\t";
+    if (WriterCount > 0)
+        header << "Write speed\tWrite time\tInflight\t";
+    if (ReaderCount > 0)
+        header << "Lag\t\tLag time\tRead speed\tFull time\t";
+    if (PrintTimestamp)
+        header << "Timestamp";
+    header << "\n";
+
+    header << "#\t";
+    auto percentile = TStringBuilder() << "P" << (ui32)Percentile;
+    if (WriterCount > 0)
+        header << "msg/s\tMB/s\t" << percentile << "(ms)\t\t" << percentile << "(msg)\t";
+    if (ReaderCount > 0)
+        header << percentile << "(msg)\t" << percentile << "(ms)\t\tmsg/s\tMB/s\t" << percentile << "(ms)";
+    header << "\n";
+
+    Cout << header << Flush;
 }
 
 void TTopicWorkloadStatsCollector::PrintWindowStatsLoop() {
@@ -47,12 +67,12 @@ void TTopicWorkloadStatsCollector::PrintWindowStatsLoop() {
     auto windowDuration = TDuration::Seconds(WindowDurationSec);
     while (Now() < StopTime && !*ErrorFlag) {
         if (Now() > StartTime + windowIt * windowDuration && !*ErrorFlag) {
-            CollectThreadEvents();
+            CollectThreadEvents(windowIt);
             PrintWindowStats(windowIt++);
         }
         Sleep(std::max(TDuration::Zero(), Now() - StartTime - windowIt * windowDuration));
     }
-    CollectThreadEvents();
+    CollectThreadEvents(windowIt);
 }
 
 void TTopicWorkloadStatsCollector::PrintWindowStats(ui32 windowIt) {
@@ -77,15 +97,15 @@ void TTopicWorkloadStatsCollector::PrintStats(TMaybe<ui32> windowIt) const {
     if (WriterCount > 0) {
         Cout << "\t" << (int)(stats.WriteMessages / seconds)
              << "\t" << (int)(stats.WriteBytes / seconds / 1024 / 1024)
-             << "\t" << stats.WriteTimeHist.GetValueAtPercentile(99) << "\t"
-             << "\t" << stats.InflightMessagesHist.GetValueAtPercentile(99) << "\t";
+             << "\t" << stats.WriteTimeHist.GetValueAtPercentile(Percentile) << "\t"
+             << "\t" << stats.InflightMessagesHist.GetValueAtPercentile(Percentile) << "\t";
     }
     if (ReaderCount > 0) {
-        Cout << "\t" << stats.LagMessagesHist.GetValueAtPercentile(99) << "\t"
-             << "\t" << stats.LagTimeHist.GetValueAtPercentile(99) << "\t"
+        Cout << "\t" << stats.LagMessagesHist.GetValueAtPercentile(Percentile) << "\t"
+             << "\t" << stats.LagTimeHist.GetValueAtPercentile(Percentile) << "\t"
              << "\t" << (int)(stats.ReadMessages / seconds)
              << "\t" << (int)(stats.ReadBytes / seconds / 1024 / 1024)
-             << "\t" << stats.FullTimeHist.GetValueAtPercentile(99) << "\t";
+             << "\t" << stats.FullTimeHist.GetValueAtPercentile(Percentile) << "\t";
     }
     if (PrintTimestamp) {
         Cout << "\t" << Now().ToStringUpToSeconds();
@@ -93,11 +113,13 @@ void TTopicWorkloadStatsCollector::PrintStats(TMaybe<ui32> windowIt) const {
     Cout << Endl;
 }
 
-void TTopicWorkloadStatsCollector::CollectThreadEvents()
+void TTopicWorkloadStatsCollector::CollectThreadEvents(ui32 windowIt)
 {
     for (auto& queue : WriterEventQueues) {
         TTopicWorkloadStats::WriterEventRef event;
         while (queue->Dequeue(&event)) {
+            if (windowIt <= WarmupSec)
+                continue;
             WindowStats->AddWriterEvent(*event);
             TotalStats.AddWriterEvent(*event);
         }
@@ -106,6 +128,8 @@ void TTopicWorkloadStatsCollector::CollectThreadEvents()
     {
         TTopicWorkloadStats::ReaderEventRef event;
         while (queue->Dequeue(&event)) {
+            if (windowIt <= WarmupSec)
+                continue;
             WindowStats->AddReaderEvent(*event);
             TotalStats.AddReaderEvent(*event);
         }
@@ -114,6 +138,8 @@ void TTopicWorkloadStatsCollector::CollectThreadEvents()
     {
         TTopicWorkloadStats::LagEventRef event;
         while (queue->Dequeue(&event)) {
+            if (windowIt <= WarmupSec)
+                continue;
             WindowStats->AddLagEvent(*event);
             TotalStats.AddLagEvent(*event);
         }

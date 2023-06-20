@@ -61,6 +61,46 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
         setup.Run(cases);
     }
 
+    Y_UNIT_TEST(GrantPermissions) {
+        TCases cases {
+            {"use plato;grant connect, modify tables, list on `/Root` to user;", "USE plato;\nGRANT CONNECT, MODIFY TABLES, LIST ON `/Root` TO user;\n\n"},
+            {"use plato;grant select , select tables, select attributes on `/Root` to user;", "USE plato;\nGRANT SELECT, SELECT TABLES, SELECT ATTRIBUTES ON `/Root` TO user;\n\n"},
+            {"use plato;grant insert, modify attributes on `/Root` to user;", "USE plato;\nGRANT INSERT, MODIFY ATTRIBUTES ON `/Root` TO user;\n\n"},
+            {"use plato;grant use legacy, use on `/Root` to user1, user2;", "USE plato;\nGRANT USE LEGACY, USE ON `/Root` TO user1, user2;\n\n"},
+            {"use plato;grant manage, full legacy, full, create on `/Root` to user;", "USE plato;\nGRANT MANAGE, FULL LEGACY, FULL, CREATE ON `/Root` TO user;\n\n"},
+            {"use plato;grant drop, grant, select row, update row on `/Root` to user;", "USE plato;\nGRANT DROP, GRANT, SELECT ROW, UPDATE ROW ON `/Root` TO user;\n\n"},
+            {"use plato;grant erase row, create directory on `/Root` to user;", "USE plato;\nGRANT ERASE ROW, CREATE DIRECTORY ON `/Root` TO user;\n\n"},
+            {"use plato;grant create table, create queue, remove schema on `/Root` to user;", "USE plato;\nGRANT CREATE TABLE, CREATE QUEUE, REMOVE SCHEMA ON `/Root` TO user;\n\n"},
+            {"use plato;grant describe schema, alter schema on `/Root` to user;", "USE plato;\nGRANT DESCRIBE SCHEMA, ALTER SCHEMA ON `/Root` TO user;\n\n"},
+            {"use plato;grant select, on `/Root` to user, with grant option;", "USE plato;\nGRANT SELECT, ON `/Root` TO user, WITH GRANT OPTION;\n\n"},
+            {"use plato;grant all privileges on `/Root` to user;", "USE plato;\nGRANT ALL PRIVILEGES ON `/Root` TO user;\n\n"},
+            {"use plato;grant list on `/Root/db1`, `/Root/db2` to user;", "USE plato;\nGRANT LIST ON `/Root/db1`, `/Root/db2` TO user;\n\n"}
+        };
+
+        TSetup setup;
+        setup.Run(cases);
+    }
+
+    Y_UNIT_TEST(RevokePermissions) {
+        TCases cases {
+            {"use plato;revoke connect, modify tables, list on `/Root` from user;", "USE plato;\nREVOKE CONNECT, MODIFY TABLES, LIST ON `/Root` FROM user;\n\n"},
+            {"use plato;revoke select , select tables, select attributes on `/Root` from user;", "USE plato;\nREVOKE SELECT, SELECT TABLES, SELECT ATTRIBUTES ON `/Root` FROM user;\n\n"},
+            {"use plato;revoke insert, modify attributes on `/Root` from user;", "USE plato;\nREVOKE INSERT, MODIFY ATTRIBUTES ON `/Root` FROM user;\n\n"},
+            {"use plato;revoke use legacy, use on `/Root` from user1, user2;", "USE plato;\nREVOKE USE LEGACY, USE ON `/Root` FROM user1, user2;\n\n"},
+            {"use plato;revoke manage, full legacy, full, create on `/Root` from user;", "USE plato;\nREVOKE MANAGE, FULL LEGACY, FULL, CREATE ON `/Root` FROM user;\n\n"},
+            {"use plato;revoke drop, grant, select row, update row on `/Root` from user;", "USE plato;\nREVOKE DROP, GRANT, SELECT ROW, UPDATE ROW ON `/Root` FROM user;\n\n"},
+            {"use plato;revoke erase row, create directory on `/Root` from user;", "USE plato;\nREVOKE ERASE ROW, CREATE DIRECTORY ON `/Root` FROM user;\n\n"},
+            {"use plato;revoke create table, create queue, remove schema on `/Root` from user;", "USE plato;\nREVOKE CREATE TABLE, CREATE QUEUE, REMOVE SCHEMA ON `/Root` FROM user;\n\n"},
+            {"use plato;revoke describe schema, alter schema on `/Root` from user;", "USE plato;\nREVOKE DESCRIBE SCHEMA, ALTER SCHEMA ON `/Root` FROM user;\n\n"},
+            {"use plato;revoke grant option for insert, on `/Root` from user;", "USE plato;\nREVOKE GRANT OPTION FOR INSERT, ON `/Root` FROM user;\n\n"},
+            {"use plato;revoke all privileges on `/Root` from user;", "USE plato;\nREVOKE ALL PRIVILEGES ON `/Root` FROM user;\n\n"},
+            {"use plato;revoke list on `/Root/db1`, `/Root/db2` from user;", "USE plato;\nREVOKE LIST ON `/Root/db1`, `/Root/db2` FROM user;\n\n"}
+        };
+
+        TSetup setup;
+        setup.Run(cases);
+    }
+
     Y_UNIT_TEST(DropRole) {
         TCases cases = {
             {"use plato;drop user user,user,user;","USE plato;\nDROP USER user, user, user;\n\n"},
@@ -217,6 +257,14 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
             {"create table user(partition by (user,user))","CREATE TABLE user (\n\tPARTITION BY (user, user)\n);\n\n"},
             {"create table user(order by (user asc))","CREATE TABLE user (\n\tORDER BY (user ASC)\n);\n\n"},
             {"create table user(order by (user desc,user))","CREATE TABLE user (\n\tORDER BY (user DESC, user)\n);\n\n"},
+            {"create table user(user int32) with (ttl=interval('P1D') on user as seconds)",
+             "CREATE TABLE user (\n\tuser int32\n)\nWITH (ttl = interval('P1D') ON user AS SECONDS);\n\n"},
+            {"create table user(user int32) with (ttl=interval('P1D') on user as MilliSeconds)",
+             "CREATE TABLE user (\n\tuser int32\n)\nWITH (ttl = interval('P1D') ON user AS MILLISECONDS);\n\n"},
+            {"create table user(user int32) with (ttl=interval('P1D') on user as microSeconds)",
+             "CREATE TABLE user (\n\tuser int32\n)\nWITH (ttl = interval('P1D') ON user AS MICROSECONDS);\n\n"},
+            {"create table user(user int32) with (ttl=interval('P1D') on user as nAnOsEcOnDs)",
+             "CREATE TABLE user (\n\tuser int32\n)\nWITH (ttl = interval('P1D') ON user AS NANOSECONDS);\n\n"},
             {"create table user(index user global unique sync with (user=user,user=user) on (user,user))",
              "CREATE TABLE user (\n\tINDEX user GLOBAL UNIQUE SYNC WITH (user = user, user = user) ON (user, user)\n);\n\n"},
             {"create table user(index user global async with (user=user,) on (user))",
@@ -267,6 +315,18 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
              "DROP OBJECT usEr (TYPE abcde) WITH (aeEE);\n\n"},
             {"dRop oBject usEr (tYpe abcde) With aeEE",
              "DROP OBJECT usEr (TYPE abcde) WITH aeEE;\n\n"}
+        };
+
+        TSetup setup;
+        setup.Run(cases);
+    }
+    
+    Y_UNIT_TEST(TableStoreOperations) {
+        TCases cases = {
+            {"alter tableStore uSer aDd column usEr int32",
+             "ALTER TABLESTORE uSer ADD COLUMN usEr int32;\n\n"},
+             {"alter tableStore uSer drOp column usEr",
+             "ALTER TABLESTORE uSer DROP COLUMN usEr;\n\n"}
         };
 
         TSetup setup;
@@ -373,6 +433,8 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
              "ALTER TABLE user\n\tADD CHANGEFEED user WITH (virtual_timestamps = TRUE);\n\n"},
             {"alter table user add changefeed user with (virtual_timestamps = fAlSe)",
              "ALTER TABLE user\n\tADD CHANGEFEED user WITH (virtual_timestamps = FALSE);\n\n"},
+            {"alter table user add changefeed user with (resolved_timestamps = Interval(\"PT1S\"))",
+             "ALTER TABLE user\n\tADD CHANGEFEED user WITH (resolved_timestamps = Interval(\"PT1S\"));\n\n"},
         };
 
         TSetup setup;
@@ -1237,5 +1299,5 @@ Y_UNIT_TEST_SUITE(CheckSqlFormatter) {
         setup.Run(cases);
     }
 
-    
+
 }

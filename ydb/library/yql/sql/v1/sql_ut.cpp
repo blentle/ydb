@@ -187,7 +187,7 @@ NSQLTranslation::TTranslationSettings GetSettingsWithS3Binding(const TString& na
                             ]
     ]])__";
     bindSettings.Settings["partitioned_by"] = "[\"key\", \"subkey\"]";
-    settings.PrivateBindings[name] = bindSettings;
+    settings.Bindings[name] = bindSettings;
     return settings;
 }
 
@@ -275,6 +275,26 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
     Y_UNIT_TEST(ReplicationKeywordNotReservedForNames) {
         UNIT_ASSERT(SqlToYql("USE plato; CREATE TABLE REPLICATION (REPLICATION Uint32, PRIMARY KEY (REPLICATION));").IsOk());
         UNIT_ASSERT(SqlToYql("USE plato; SELECT REPLICATION FROM REPLICATION").IsOk());
+    }
+
+    Y_UNIT_TEST(SecondsKeywordNotReservedForNames) {
+        UNIT_ASSERT(SqlToYql("USE plato; CREATE TABLE SECONDS (SECONDS Uint32, PRIMARY KEY (SECONDS));").IsOk());
+        UNIT_ASSERT(SqlToYql("USE plato; SELECT SECONDS FROM SECONDS").IsOk());
+    }
+
+    Y_UNIT_TEST(MillisecondsKeywordNotReservedForNames) {
+        UNIT_ASSERT(SqlToYql("USE plato; CREATE TABLE MILLISECONDS (MILLISECONDS Uint32, PRIMARY KEY (MILLISECONDS));").IsOk());
+        UNIT_ASSERT(SqlToYql("USE plato; SELECT MILLISECONDS FROM MILLISECONDS").IsOk());
+    }
+
+    Y_UNIT_TEST(MicrosecondsKeywordNotReservedForNames) {
+        UNIT_ASSERT(SqlToYql("USE plato; CREATE TABLE MICROSECONDS (MICROSECONDS Uint32, PRIMARY KEY (MICROSECONDS));").IsOk());
+        UNIT_ASSERT(SqlToYql("USE plato; SELECT MICROSECONDS FROM MICROSECONDS").IsOk());
+    }
+
+    Y_UNIT_TEST(NanosecondsKeywordNotReservedForNames) {
+        UNIT_ASSERT(SqlToYql("USE plato; CREATE TABLE NANOSECONDS (NANOSECONDS Uint32, PRIMARY KEY (NANOSECONDS));").IsOk());
+        UNIT_ASSERT(SqlToYql("USE plato; SELECT NANOSECONDS FROM NANOSECONDS").IsOk());
     }
 
     Y_UNIT_TEST(Jubilee) {
@@ -538,7 +558,7 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
         UNIT_ASSERT(res.Root);
         TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
             if (word == "Sort") {
-                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("\"+\""));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("\"+MayWarn\""));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("key"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("subkey"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("(Bool 'true)"));
@@ -557,7 +577,7 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
         UNIT_ASSERT(res.Root);
         TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
             if (word == "Sort") {
-                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("\"-\""));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("\"-MayWarn\""));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("\"key\""));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("\"subkey\""));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("(Bool 'false)"));
@@ -580,7 +600,7 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
         UNIT_ASSERT(res.Root);
         TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
             if (word == "Sort") {
-                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("\"%\""));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("\"%MayWarn\""));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("\"key\""));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("\"subkey\""));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("(Bool 'true)"));
@@ -630,6 +650,24 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
             if (word == "Write") {
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("'('\"K2\" '\"V2\") '('\"Key1\" '\"Value1\")"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("createObject"));
+            }
+        };
+
+        TWordCountHive elementStat = { {TString("Write"), 0}, {TString("SECRET"), 0} };
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["Write"]);
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["SECRET"]);
+    }
+
+    Y_UNIT_TEST(UpsertObjectWithFeatures) {
+        NYql::TAstParseResult res = SqlToYql("USE plato; UPSERT OBJECT secretId (TYPE SECRET) WITH (Key1=Value1, K2=V2);");
+        UNIT_ASSERT(res.Root);
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "Write") {
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("'('\"K2\" '\"V2\") '('\"Key1\" '\"Value1\")"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("upsertObject"));
             }
         };
 
@@ -1771,11 +1809,11 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
         UNIT_ASSERT_VALUES_EQUAL(1, elementStat["Write"]);
     }
 
-    Y_UNIT_TEST(TtlParseCorrect) {
+    Y_UNIT_TEST(DateTimeTtlParseCorrect) {
         NYql::TAstParseResult res = SqlToYql(
             R"( USE plato;
                 CREATE TABLE tableName (Key Uint32, CreatedAt Timestamp, PRIMARY KEY (Key))
-                WITH ( TTL = Interval("P1D") On CreatedAt);)"
+                WITH (TTL = Interval("P1D") On CreatedAt);)"
         );
         UNIT_ASSERT(res.Root);
 
@@ -1784,6 +1822,30 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("setTtlSettings"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("expireAfter"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("86400000"));
+            }
+        };
+
+        TWordCountHive elementStat = { {TString("Write"), 0} };
+        VerifyProgram(res, elementStat, verifyLine);
+
+        UNIT_ASSERT_VALUES_EQUAL(1, elementStat["Write"]);
+    }
+
+    Y_UNIT_TEST(IntTtlParseCorrect) {
+        NYql::TAstParseResult res = SqlToYql(
+            R"( USE plato;
+                CREATE TABLE tableName (Key Uint32, CreatedAt Uint32, PRIMARY KEY (Key))
+                WITH (TTL = Interval("P1D") On CreatedAt AS SECONDS);)"
+        );
+        UNIT_ASSERT(res.Root);
+
+        TVerifyLineFunc verifyLine = [](const TString& word, const TString& line) {
+            if (word == "Write") {
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("setTtlSettings"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("expireAfter"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("86400000"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("columnUnit"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("seconds"));
             }
         };
 
@@ -1823,6 +1885,7 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
                     FORMAT = 'json',
                     INITIAL_SCAN = TRUE,
                     VIRTUAL_TIMESTAMPS = FALSE,
+                    RESOLVED_TIMESTAMPS = Interval("PT1S"),
                     RETENTION_PERIOD = Interval("P1D"),
                     AWS_REGION = 'aws:region'
                 )
@@ -1841,6 +1904,7 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("true"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("virtual_timestamps"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("false"));
+                UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("resolved_timestamps"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("retention_period"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("aws_region"));
                 UNIT_ASSERT_VALUES_UNEQUAL(TString::npos, line.find("aws:region"));
@@ -2003,6 +2067,7 @@ Y_UNIT_TEST_SUITE(SqlParsingOnly) {
 
     Y_UNIT_TEST(AlterTableSetTTLIsCorrect) {
         UNIT_ASSERT(SqlToYql("USE plato; ALTER TABLE table SET (TTL = Interval(\"PT3H\") ON column)").IsOk());
+        UNIT_ASSERT(SqlToYql("USE plato; ALTER TABLE table SET (TTL = Interval(\"PT3H\") ON column AS SECONDS)").IsOk());
     }
 
     Y_UNIT_TEST(AlterTableSetTieringIsCorrect) {
@@ -3464,16 +3529,27 @@ select FormatType($f());
                                           "<main>:6:39: Error: Unknown correlation name: t\n");
     }
 
-    Y_UNIT_TEST(InvalidTtl) {
+    Y_UNIT_TEST(InvalidTtlInterval) {
         auto req = R"(
             USE plato;
             CREATE TABLE tableName (Key Uint32, CreatedAt Timestamp, PRIMARY KEY (Key))
-            WITH ( TTL = 1 On ExpireAt );
+            WITH (TTL = 1 On CreatedAt);
         )";
         auto res = SqlToYql(req);
         UNIT_ASSERT(!res.Root);
-        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:4:26: Error: Literal of Interval type is expected for TTL\n"
-                                          "<main>:4:26: Error: Invalid TTL settings\n");
+        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:4:25: Error: Literal of Interval type is expected for TTL\n"
+                                          "<main>:4:25: Error: Invalid TTL settings\n");
+    }
+
+    Y_UNIT_TEST(InvalidTtlUnit) {
+        auto req = R"(
+            USE plato;
+            CREATE TABLE tableName (Key Uint32, CreatedAt Uint32, PRIMARY KEY (Key))
+            WITH (TTL = Interval("P1D") On CreatedAt AS PICOSECONDS);
+        )";
+        auto res = SqlToYql(req);
+        UNIT_ASSERT(!res.Root);
+        UNIT_ASSERT_STRING_CONTAINS(Err2Str(res), "<main>:4:56: Error: Unexpected token 'PICOSECONDS'");
     }
 
     Y_UNIT_TEST(InvalidChangefeedSink) {
@@ -3526,6 +3602,19 @@ select FormatType($f());
         auto res = SqlToYql(req);
         UNIT_ASSERT(!res.Root);
         UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:5:101: Error: Literal of Bool type is expected for VIRTUAL_TIMESTAMPS\n");
+    }
+
+    Y_UNIT_TEST(InvalidChangefeedResolvedTimestamps) {
+        auto req = R"(
+            USE plato;
+            CREATE TABLE tableName (
+                Key Uint32, PRIMARY KEY (Key),
+                CHANGEFEED feedName WITH (MODE = "KEYS_ONLY", FORMAT = "json", RESOLVED_TIMESTAMPS = "foo")
+            );
+        )";
+        auto res = SqlToYql(req);
+        UNIT_ASSERT(!res.Root);
+        UNIT_ASSERT_NO_DIFF(Err2Str(res), "<main>:5:102: Error: Literal of Interval type is expected for RESOLVED_TIMESTAMPS\n");
     }
 
     Y_UNIT_TEST(InvalidChangefeedRetentionPeriod) {
@@ -3762,6 +3851,11 @@ select FormatType($f());
     Y_UNIT_TEST(CreateAlterUserWithoutCluster) {
         ExpectFailWithError("\n CREATE USER user ENCRYPTED PASSWORD 'foobar';", "<main>:2:2: Error: USE statement is missing - no default cluster is selected\n");
         ExpectFailWithError("ALTER USER CURRENT_USER RENAME TO $foo;", "<main>:1:1: Error: USE statement is missing - no default cluster is selected\n");
+    }
+
+    Y_UNIT_TEST(ModifyPermissionsWithoutCluster) {
+        ExpectFailWithError("\n GRANT CONNECT ON `/Root` TO user;", "<main>:2:2: Error: USE statement is missing - no default cluster is selected\n");
+        ExpectFailWithError("\n REVOKE MANAGE ON `/Root` FROM user;", "<main>:2:2: Error: USE statement is missing - no default cluster is selected\n");
     }
 
     Y_UNIT_TEST(ReservedRoleNames) {

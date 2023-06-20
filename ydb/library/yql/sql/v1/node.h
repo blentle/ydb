@@ -1125,10 +1125,18 @@ namespace NSQLTranslationV1 {
     TMaybe<TStringContent> StringContentOrIdContent(TContext& ctx, TPosition pos, const TString& input);
 
     struct TTtlSettings {
+        enum class EUnit {
+            Seconds /* "seconds" */,
+            Milliseconds /* "milliseconds" */,
+            Microseconds /* "microseconds" */,
+            Nanoseconds /* "nanoseconds" */,
+        };
+
         TIdentifier ColumnName;
         TNodePtr Expr;
+        TMaybe<EUnit> ColumnUnit;
 
-        TTtlSettings(const TIdentifier& columnName, const TNodePtr& expr);
+        TTtlSettings(const TIdentifier& columnName, const TNodePtr& expr, const TMaybe<EUnit>& columnUnit = {});
     };
 
     struct TTableSettings {
@@ -1195,6 +1203,7 @@ namespace NSQLTranslationV1 {
         TNodePtr Format;
         TNodePtr InitialScan;
         TNodePtr VirtualTimestamps;
+        TNodePtr ResolvedTimestamps;
         TNodePtr RetentionPeriod;
         TNodePtr AwsRegion;
         std::optional<std::variant<TLocalSinkSettings>> SinkSettings;
@@ -1474,6 +1483,10 @@ namespace NSQLTranslationV1 {
         TScopedStatePtr scoped);
     TNodePtr BuildRenameGroup(TPosition pos, const TString& service, const TDeferredAtom& cluster, const TDeferredAtom& name, const TDeferredAtom& newName, TScopedStatePtr scoped);
     TNodePtr BuildDropRoles(TPosition pos, const TString& service, const TDeferredAtom& cluster, const TVector<TDeferredAtom>& toDrop, bool isUser, bool force, TScopedStatePtr scoped);
+    TNodePtr BuildGrantPermissions(TPosition pos, const TString& service, const TDeferredAtom& cluster, const TVector<TDeferredAtom>& permissions, const TVector<TDeferredAtom>& schemaPathes, const TVector<TDeferredAtom>& roleName, TScopedStatePtr scoped);
+    TNodePtr BuildRevokePermissions(TPosition pos, const TString& service, const TDeferredAtom& cluster, const TVector<TDeferredAtom>& permissions, const TVector<TDeferredAtom>& schemaPathes, const TVector<TDeferredAtom>& roleName, TScopedStatePtr scoped);
+    TNodePtr BuildUpsertObjectOperation(TPosition pos, const TString& objectId, const TString& typeId,
+        std::map<TString, TDeferredAtom>&& features, const TObjectOperatorContext& context);
     TNodePtr BuildCreateObjectOperation(TPosition pos, const TString& objectId, const TString& typeId,
         std::map<TString, TDeferredAtom>&& features, const TObjectOperatorContext& context);
     TNodePtr BuildAlterObjectOperation(TPosition pos, const TString& secretId, const TString& typeId,

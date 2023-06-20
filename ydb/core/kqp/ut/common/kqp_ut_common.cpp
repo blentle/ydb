@@ -1,6 +1,7 @@
 #include "kqp_ut_common.h"
 
 #include <ydb/core/tx/schemeshard/schemeshard.h>
+#include <ydb/core/kqp/counters/kqp_counters.h>
 #include <ydb/core/kqp/provider/yql_kikimr_results.h>
 #include <ydb/core/tx/tx_proxy/proxy.h>
 #include <ydb/public/sdk/cpp/client/ydb_proto/accessor.h>
@@ -16,6 +17,18 @@ namespace NKikimr {
 namespace NKqp {
 
 using namespace NYdb::NTable;
+
+const TString EXPECTED_EIGHTSHARD_VALUE1 = R"(
+[
+    [[1];[101u];["Value1"]];
+    [[2];[201u];["Value1"]];
+    [[3];[301u];["Value1"]];
+    [[1];[401u];["Value1"]];
+    [[2];[501u];["Value1"]];
+    [[3];[601u];["Value1"]];
+    [[1];[701u];["Value1"]];
+    [[2];[801u];["Value1"]]
+])";
 
 SIMPLE_UDF(TTestFilter, bool(i64)) {
     Y_UNUSED(valueBuilder);
@@ -407,7 +420,7 @@ void TKikimrRunner::Initialize(const TKikimrSettings& settings) {
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_YQL, NActors::NLog::PRI_INFO);
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::TX_DATASHARD, NActors::NLog::PRI_TRACE);
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::TX_COORDINATOR, NActors::NLog::PRI_DEBUG);
-    // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_COMPUTE, NActors::NLog::PRI_DEBUG);
+    // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_COMPUTE, tors::NLog::PRI_DEBUG);
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_TASKS_RUNNER, NActors::NLog::PRI_DEBUG);
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_EXECUTER, NActors::NLog::PRI_TRACE);
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::TX_PROXY_SCHEME_CACHE, NActors::NLog::PRI_DEBUG);
@@ -575,11 +588,11 @@ void PrintResultSet(const NYdb::TResultSet& resultSet, NYson::TYsonWriter& write
 }
 
 bool IsTimeoutError(NYdb::EStatus status) {
-    return status == NYdb::EStatus::CLIENT_DEADLINE_EXCEEDED || status == NYdb::EStatus::TIMEOUT;
+    return status == NYdb::EStatus::CLIENT_DEADLINE_EXCEEDED || status == NYdb::EStatus::TIMEOUT || status == NYdb::EStatus::CANCELLED;
 }
 
 template<typename TIterator>
-TString StreamResultToYsonImpl(TIterator& it, TVector<TString>* profiles, bool throwOnTimeout = false) {
+TString StreamResultToYsonImpl(TIterator& it, TVector<TString>* profiles, bool throwOnTimeout = false, const NYdb::EStatus& opStatus = NYdb::EStatus::SUCCESS) {
     TStringStream out;
     NYson::TYsonWriter writer(&out, NYson::EYsonFormat::Text, ::NYson::EYsonType::Node, true);
     writer.OnBeginList();
@@ -589,6 +602,10 @@ TString StreamResultToYsonImpl(TIterator& it, TVector<TString>* profiles, bool t
     for (;;) {
         auto streamPart = it.ReadNext().GetValueSync();
         if (!streamPart.IsSuccess()) {
+            if (opStatus != NYdb::EStatus::SUCCESS) {
+                UNIT_ASSERT_VALUES_EQUAL_C(streamPart.GetStatus(), opStatus, streamPart.GetIssues().ToString());
+                break;
+            }
             if (throwOnTimeout && IsTimeoutError(streamPart.GetStatus())) {
                 throw TStreamReadError(streamPart.GetStatus());
             }
@@ -610,11 +627,11 @@ TString StreamResultToYsonImpl(TIterator& it, TVector<TString>* profiles, bool t
     return out.Str();
 }
 
-TString StreamResultToYson(NYdb::NTable::TScanQueryPartIterator& it, bool throwOnTimeout) {
-    return StreamResultToYsonImpl(it, nullptr, throwOnTimeout);
+TString StreamResultToYson(NYdb::NTable::TScanQueryPartIterator& it, bool throwOnTimeout, const NYdb::EStatus& opStatus) {
+    return StreamResultToYsonImpl(it, nullptr, throwOnTimeout, opStatus);
 }
 
-TString StreamResultToYson(NYdb::NTable::TTablePartIterator& it, bool throwOnTimeout) {
+TString StreamResultToYson(NYdb::NTable::TTablePartIterator& it, bool throwOnTimeout, const NYdb::EStatus& opStatus) {
     TStringStream out;
     NYson::TYsonWriter writer(&out, NYson::EYsonFormat::Text, ::NYson::EYsonType::Node, true);
     writer.OnBeginList();
@@ -624,6 +641,10 @@ TString StreamResultToYson(NYdb::NTable::TTablePartIterator& it, bool throwOnTim
     for (;;) {
         auto streamPart = it.ReadNext().GetValueSync();
         if (!streamPart.IsSuccess()) {
+            if (opStatus != NYdb::EStatus::SUCCESS) {
+                UNIT_ASSERT_VALUES_EQUAL_C(streamPart.GetStatus(), opStatus, streamPart.GetIssues().ToString());
+                 break;
+            }
             if (throwOnTimeout && IsTimeoutError(streamPart.GetStatus())) {
                 throw TStreamReadError(streamPart.GetStatus());
             }
@@ -642,7 +663,7 @@ TString StreamResultToYson(NYdb::NTable::TTablePartIterator& it, bool throwOnTim
     return out.Str();
 }
 
-TString StreamResultToYson(NYdb::NScripting::TYqlResultPartIterator& it, bool throwOnTimeout) {
+TString StreamResultToYson(NYdb::NScripting::TYqlResultPartIterator& it, bool throwOnTimeout, const NYdb::EStatus& opStatus) {
     TStringStream out;
     NYson::TYsonWriter writer(&out, NYson::EYsonFormat::Text, ::NYson::EYsonType::Node, true);
     writer.OnBeginList();
@@ -654,6 +675,10 @@ TString StreamResultToYson(NYdb::NScripting::TYqlResultPartIterator& it, bool th
     for (;;) {
         auto streamPart = it.ReadNext().GetValueSync();
         if (!streamPart.IsSuccess()) {
+            if (opStatus != NYdb::EStatus::SUCCESS) {
+                UNIT_ASSERT_VALUES_EQUAL_C(streamPart.GetStatus(), opStatus, streamPart.GetIssues().ToString());
+                break;
+            }
             if (throwOnTimeout && IsTimeoutError(streamPart.GetStatus())) {
                 throw TStreamReadError(streamPart.GetStatus());
             }
@@ -757,6 +782,20 @@ TString ReadTablePartToYson(NYdb::NTable::TSession session, const TString& table
         UNIT_ASSERT_C(false, "Status: " << streamPart.GetStatus());
     }
     return NYdb::FormatResultSetYson(streamPart.ExtractPart());
+}
+
+bool ValidatePlanNodeIds(const NJson::TJsonValue& plan) {
+    ui32 planNodeId = 0;
+    ui32 count = 0;
+
+    do {
+        count = CountPlanNodesByKv(plan, "PlanNodeId", std::to_string(++planNodeId));
+        if (count > 1) {
+            return false;
+        }
+    } while (count > 0);
+
+    return true;
 }
 
 ui32 CountPlanNodesByKv(const NJson::TJsonValue& plan, const TString& key, const TString& value) {
@@ -892,7 +931,7 @@ std::vector<NJson::TJsonValue> FindPlanStages(const NJson::TJsonValue& plan) {
     return stages;
 }
 
-void CreateSampleTablesWithIndex(TSession& session) {
+void CreateSampleTablesWithIndex(TSession& session, bool populateTables) {
     auto res = session.ExecuteSchemeQuery(R"(
         --!syntax_v1
         CREATE TABLE `/Root/SecondaryKeys` (
@@ -922,6 +961,9 @@ void CreateSampleTablesWithIndex(TSession& session) {
 
     )").GetValueSync();
     UNIT_ASSERT_C(res.IsSuccess(), res.GetIssues().ToString());
+
+    if (!populateTables)
+        return;
 
     auto result = session.ExecuteDataQuery(R"(
 
@@ -1045,6 +1087,16 @@ TVector<ui64> GetTableShards(Tests::TServer::TPtr server,
                                 const TString &path) {
     return GetTableShards(server.Get(), sender, path);
  }
+
+void WaitForZeroSessions(const NKqp::TKqpCounters& counters) {
+    int count = 60;
+    while (counters.GetActiveSessionActors()->Val() != 0 && count) {
+        count--;
+        Sleep(TDuration::Seconds(1));
+    }
+
+    UNIT_ASSERT_C(count, "Unable to wait for proper active session count, it looks like cancelation doesn`t work");
+}
 
 } // namspace NKqp
 } // namespace NKikimr

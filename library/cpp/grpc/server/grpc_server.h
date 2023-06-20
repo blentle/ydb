@@ -286,7 +286,7 @@ public:
         }
 
         return TShutdownGuard(this);
-    };
+    }
 
     bool IsUnsafeToShutdown() const override {
         return AtomicGet(GuardCount_) > 0;
@@ -386,6 +386,8 @@ public:
     void Stop();
     ui16 GetPort() const;
     TString GetHost() const;
+
+    const TVector<IGRpcServicePtr>& GetServices() const;
 
 private:
     using IThreadRef = TAutoPtr<IThreadFactory::IThread>;

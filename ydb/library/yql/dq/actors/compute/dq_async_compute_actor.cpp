@@ -33,7 +33,7 @@ public:
 
     static constexpr bool HasAsyncTaskRunner = true;
 
-    TDqAsyncComputeActor(const TActorId& executerId, const TTxId& txId, NDqProto::TDqTask&& task,
+    TDqAsyncComputeActor(const TActorId& executerId, const TTxId& txId, NDqProto::TDqTask* task,
         IDqAsyncIoFactory::TPtr asyncIoFactory,
         const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
         const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits,
@@ -41,7 +41,7 @@ public:
         const ::NMonitoring::TDynamicCounterPtr& taskCounters,
         const TActorId& quoterServiceActorId,
         bool ownCounters)
-        : TBase(executerId, txId, std::move(task), std::move(asyncIoFactory), functionRegistry, settings, memoryLimits, /* ownMemoryQuota = */ false, false, taskCounters)
+        : TBase(executerId, txId, task, std::move(asyncIoFactory), functionRegistry, settings, memoryLimits, /* ownMemoryQuota = */ false, false, taskCounters)
         , TaskRunnerActorFactory(taskRunnerActorFactory)
         , ReadyToCheckpointFlag(false)
         , SentStatsRequest(false)
@@ -59,7 +59,7 @@ public:
 
         TLogFunc logger;
         if (IsDebugLogEnabled(actorSystem)) {
-            logger = [actorSystem, txId = GetTxId(), taskId = GetTask().GetId()] (const TString& message) {
+            logger = [actorSystem, txId = GetTxId(), taskId = Task.GetId()] (const TString& message) {
                 LOG_DEBUG_S(*actorSystem, NKikimrServices::KQP_COMPUTE, "TxId: " << txId
                     << ", task: " << taskId << ": " << message);
             };
@@ -73,7 +73,7 @@ public:
             }
         }
         std::tie(TaskRunnerActor, actor) = TaskRunnerActorFactory->Create(
-            this, GetTxId(), GetTask().GetId(), std::move(inputWithDisabledCheckpointing), InitMemoryQuota());
+            this, GetTxId(), Task.GetId(), std::move(inputWithDisabledCheckpointing), InitMemoryQuota());
         TaskRunnerActorId = RegisterWithSameMailbox(actor);
 
         TDqTaskRunnerMemoryLimits limits;
@@ -87,7 +87,7 @@ public:
 
         Send(TaskRunnerActorId,
             new NTaskRunnerActor::TEvTaskRunnerCreate(
-                GetTask(), limits, execCtx));
+                Task.GetSerializedTask(), limits, execCtx));
 
         CA_LOG_D("Use CPU quota: " << UseCpuQuota() << ". Rate limiter resource: { \"" << Task.GetRateLimiter() << "\", \"" << Task.GetRateLimiterResource() << "\" }");
     }
@@ -221,12 +221,9 @@ private:
 
         outputChannel.PopStarted = true;
         ProcessOutputsState.Inflight++;
+        UpdateBlocked(outputChannel, toSend);
         if (toSend <= 0) {
-            if (Y_UNLIKELY(outputChannel.Stats)) {
-                outputChannel.Stats->BlockedByCapacity++;
-            }
-            CA_LOG(peerState.PeerFreeSpace == peerState.PrevPeerFreeSpace ? NActors::NLog::PRI_TRACE : NActors::NLog::PRI_DEBUG,
-                "Can not drain channel because it is blocked by capacity. ChannelId: " << channelId
+            CA_LOG_T("Can not drain channel because it is blocked by capacity. ChannelId: " << channelId
                 << ". To send: " << toSend
                 << ". Free space: " << peerState.PeerFreeSpace
                 << ". Inflight: " << peerState.InFlightBytes
@@ -292,7 +289,7 @@ private:
         DoExecute();
     }
 
-    void AsyncInputPush(NKikimr::NMiniKQL::TUnboxedValueVector&& batch, TAsyncInputInfoBase& source, i64 space, bool finished) override {
+    void AsyncInputPush(NKikimr::NMiniKQL::TUnboxedValueBatch&& batch, TAsyncInputInfoBase& source, i64 space, bool finished) override {
         ProcessSourcesState.Inflight++;
         source.PushStarted = true;
         source.Finished = finished;
@@ -323,7 +320,7 @@ private:
             WatermarkTakeInputChannelDataRequests[*watermark]++;
         }
 
-        DqComputeActorMetrics.ReportInputChannelWatermark(
+        MetricsReporter.ReportInputChannelWatermark(
             channelData.GetChannelId(),
             channelData.GetData().GetRows(),
             watermark);
@@ -381,7 +378,7 @@ private:
             return Nothing();
         }
 
-        DqComputeActorMetrics.ReportInjectedToTaskRunnerWatermark(pendingWatermark);
+        MetricsReporter.ReportInjectedToTaskRunnerWatermark(pendingWatermark);
 
         return pendingWatermark;
     }
@@ -694,7 +691,7 @@ private:
     }
 
     void SinkSend(ui64 index,
-                  NKikimr::NMiniKQL::TUnboxedValueVector&& batch,
+                  NKikimr::NMiniKQL::TUnboxedValueBatch&& batch,
                   TMaybe<NDqProto::TCheckpoint>&& checkpoint,
                   i64 size,
                   i64 checkpointSize,
@@ -723,7 +720,7 @@ private:
 
         {
             auto guard = BindAllocator();
-            NKikimr::NMiniKQL::TUnboxedValueVector data = std::move(batch);
+            NKikimr::NMiniKQL::TUnboxedValueBatch data = std::move(batch);
             sinkInfo.AsyncOutput->SendData(std::move(data), size, std::move(checkpoint), finished);
         }
 
@@ -944,7 +941,7 @@ private:
 };
 
 
-IActor* CreateDqAsyncComputeActor(const TActorId& executerId, const TTxId& txId, NYql::NDqProto::TDqTask&& task,
+IActor* CreateDqAsyncComputeActor(const TActorId& executerId, const TTxId& txId, NYql::NDqProto::TDqTask* task,
     IDqAsyncIoFactory::TPtr asyncIoFactory,
     const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
     const TComputeRuntimeSettings& settings, const TComputeMemoryLimits& memoryLimits,
@@ -953,7 +950,7 @@ IActor* CreateDqAsyncComputeActor(const TActorId& executerId, const TTxId& txId,
     const TActorId& quoterServiceActorId,
     bool ownCounters)
 {
-    return new TDqAsyncComputeActor(executerId, txId, std::move(task), std::move(asyncIoFactory),
+    return new TDqAsyncComputeActor(executerId, txId, task, std::move(asyncIoFactory),
         functionRegistry, settings, memoryLimits, taskRunnerActorFactory, taskCounters, quoterServiceActorId, ownCounters);
 }
 

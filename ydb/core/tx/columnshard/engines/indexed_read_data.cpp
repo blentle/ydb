@@ -119,11 +119,11 @@ void TIndexedReadData::AddBlobForFetch(const TBlobRange& range, NIndexedReader::
     if (batch.GetFetchedInfo().GetFilter()) {
         Counters.PostFilterBytes->Add(range.Size);
         ReadMetadata->ReadStats->DataAdditionalBytes += range.Size;
-        FetchBlobsQueue.emplace_front(range);
+        FetchBlobsQueue.emplace_front(batch.GetGranule(), range);
     } else {
         Counters.FilterBytes->Add(range.Size);
         ReadMetadata->ReadStats->DataFilterBytes += range.Size;
-        FetchBlobsQueue.emplace_back(range);
+        FetchBlobsQueue.emplace_back(batch.GetGranule(), range);
     }
 }
 
@@ -139,12 +139,12 @@ void TIndexedReadData::InitRead(ui32 inputBatch) {
     Y_VERIFY(!GranulesContext);
     GranulesContext = std::make_unique<NIndexedReader::TGranulesFillingContext>(ReadMetadata, *this, OnePhaseReadMode);
     ui64 portionsBytes = 0;
-    for (auto& portionInfo : ReadMetadata->SelectInfo->Portions) {
+    for (auto& portionInfo : ReadMetadata->SelectInfo->GetPortionsOrdered(ReadMetadata->IsDescSorted())) {
         portionsBytes += portionInfo.BlobsBytes();
         Y_VERIFY_S(portionInfo.Records.size(), "ReadMeatadata: " << *ReadMetadata);
 
-        NIndexedReader::TGranule& granule = GranulesContext->UpsertGranule(portionInfo.Records[0].Granule);
-        granule.AddBatch(portionInfo);
+        NIndexedReader::TGranule::TPtr granule = GranulesContext->UpsertGranule(portionInfo.Records[0].Granule);
+        granule->RegisterBatchForFetching(portionInfo);
     }
     GranulesContext->PrepareForStart();
 
@@ -232,10 +232,12 @@ std::vector<TPartialReadResult> TIndexedReadData::GetReadyResults(const int64_t 
 
             auto outNotIndexed = marksGranules.SliceIntoGranules(mergedBatch, indexInfo);
             GranulesContext->DrainNotIndexedBatches(&outNotIndexed);
-            Y_VERIFY(outNotIndexed.size() <= 1);
             if (outNotIndexed.size() == 1) {
-                auto it = outNotIndexed.find(0);
-                Y_VERIFY(it != outNotIndexed.end());
+                auto it = outNotIndexed.begin();
+                if (it->first) {
+                    AFL_ERROR(NKikimrServices::TX_COLUMNSHARD_SCAN)("incorrect_granule_id", it->first);
+                    Y_FAIL();
+                }
                 NotIndexedOutscopeBatch = it->second;
             }
         } else {
@@ -249,8 +251,8 @@ std::vector<TPartialReadResult> TIndexedReadData::GetReadyResults(const int64_t 
 
     // Extract ready to out granules: ready granules that are not blocked by other (not ready) granules
     Y_VERIFY(GranulesContext);
-    const bool requireResult = !GranulesContext->IsInProgress(); // not indexed or the last indexed read (even if it's empty)
     auto out = MakeResult(ReadyToOut(), maxRowsInBatch);
+    const bool requireResult = GranulesContext->IsFinished(); // not indexed or the last indexed read (even if it's empty)
     if (requireResult && out.empty()) {
         out.push_back(TPartialReadResult{
             .ResultBatch = NArrow::MakeEmptyBatch(ReadMetadata->GetResultSchema())
@@ -265,7 +267,7 @@ std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> TIndexedReadData::
     Y_VERIFY(GranulesContext);
 
     auto& indexInfo = ReadMetadata->GetIndexInfo();
-    std::vector<NIndexedReader::TGranule*> ready = GranulesContext->DetachReadyInOrder();
+    std::vector<NIndexedReader::TGranule::TPtr> ready = GranulesContext->DetachReadyInOrder();
     std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> out;
     out.reserve(ready.size() + 1);
 
@@ -288,13 +290,8 @@ std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> TIndexedReadData::
                 Y_VERIFY(batch->num_rows());
                 Y_VERIFY_DEBUG(NArrow::IsSorted(batch, SortReplaceDescription->ReplaceKey));
             }
-#if 1 // optimization
             auto deduped = SpecialMergeSorted(inGranule, indexInfo, SortReplaceDescription, granule->GetBatchesToDedup());
             out.emplace_back(std::move(deduped));
-#else
-            out.push_back({});
-            out.back().emplace_back(CombineSortedBatches(inGranule, SortReplaceDescription));
-#endif
         } else {
             out.emplace_back(std::move(inGranule));
         }
@@ -433,12 +430,11 @@ TIndexedReadData::MakeResult(std::vector<std::vector<std::shared_ptr<arrow::Reco
             });
         }
     }
-
-    if (ReadMetadata->Program) {
+    
+    if (ReadMetadata->GetProgram().HasProgram()) {
         MergeTooSmallBatches(out);
-
         for (auto& result : out) {
-            auto status = ApplyProgram(result.ResultBatch, *ReadMetadata->Program, NArrow::GetCustomExecContext());
+            auto status = ReadMetadata->GetProgram().ApplyProgram(result.ResultBatch);
             if (!status.ok()) {
                 result.ErrorString = status.message();
             }
@@ -447,15 +443,25 @@ TIndexedReadData::MakeResult(std::vector<std::vector<std::shared_ptr<arrow::Reco
     return out;
 }
 
-TIndexedReadData::TIndexedReadData(NOlap::TReadMetadata::TConstPtr readMetadata, TFetchBlobsQueue& fetchBlobsQueue,
+TIndexedReadData::TIndexedReadData(NOlap::TReadMetadata::TConstPtr readMetadata,
     const bool internalRead, const NColumnShard::TScanCounters& counters, NColumnShard::TDataTasksProcessorContainer tasksProcessor)
     : Counters(counters)
     , TasksProcessor(tasksProcessor)
-    , FetchBlobsQueue(fetchBlobsQueue)
     , ReadMetadata(readMetadata)
     , OnePhaseReadMode(internalRead)
 {
     Y_VERIFY(ReadMetadata->SelectInfo);
+}
+
+bool TIndexedReadData::IsFinished() const {
+    Y_VERIFY(GranulesContext);
+    return NotIndexed.empty() && FetchBlobsQueue.empty() && GranulesContext->IsFinished();
+}
+
+void TIndexedReadData::Abort() {
+    Y_VERIFY(GranulesContext);
+    FetchBlobsQueue.Stop();
+    GranulesContext->Abort();
 }
 
 }

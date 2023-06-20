@@ -2,6 +2,8 @@ package NYql;
 option java_package = "ru.yandex.yql.proto";
 
 import "ydb/library/yql/protos/clickhouse.proto";
+import "ydb/library/yql/providers/generic/connector/api/common/data_source.proto";
+import "ydb/library/yql/providers/generic/connector/api/common/endpoint.proto";
 
 
 /////////////////////////////// common ///////////////////////////////
@@ -17,6 +19,7 @@ message TActivationPercentage {
     repeated string IncludeUsers = 3;
     repeated string ExcludeUsers = 4;
     optional bool ExcludeRobots = 5 [default = true];
+    repeated string Tags = 6;
 }
 
 message TAttr {
@@ -482,10 +485,12 @@ message TDqGatewayConfig {
 
     repeated TAttr DefaultSettings = 102;
 
-    optional uint32 WithHiddenPercentage = 5 [default = 0];
-    repeated TDefaultAutoByHourPercentage WithHiddenByHour = 6;
-    repeated string NoWithHiddenForUsers = 7;
-    repeated string WithHiddenForUsers = 8;
+    optional uint32 WithHiddenPercentage = 5 [default = 0];     // Depricated. TODO: remove
+    repeated TDefaultAutoByHourPercentage WithHiddenByHour = 6; // Depricated. TODO: remove
+    repeated string NoWithHiddenForUsers = 7;                   // Depricated. TODO: remove
+    repeated string WithHiddenForUsers = 8;                     // Depricated. TODO: remove
+
+    optional TActivationPercentage HiddenActivation = 9;
 }
 
 /////////////////////////////// Yql Core ///////////////////////////////
@@ -530,6 +535,34 @@ message TDbToolConfig {
 }
 
 
+/////////// Generic gateway for the external data sources ////////////
+
+message TGenericClusterConfig {
+    // Cluster name
+    required string Name = 1;
+
+    // Data source kind
+    required NYql.Connector.API.DataSourceKind Kind = 2;
+
+    // Location represents the network address of a data source instance we want to connect
+    oneof Location {
+        // Endpoint must be used for on-premise deployments.
+        NYql.Connector.API.Endpoint Endpoint = 3;
+        // DatabaseID must be used when the data source is deployed in cloud.
+        // Data source FQDN and port will be resolved by MDB service.
+        string DatabaseID = 4;
+    }
+
+    required NYql.Connector.API.Credentials Credentials = 5;
+}
+
+message TGenericGatewayConfig {
+    // TODO: replace with map<DataSourceKind, Endpoint>
+    required string Endpoint = 1;
+    reserved 2;
+    repeated TGenericClusterConfig ClusterMapping = 3;
+}
+
 /////////////////////////////// Root ///////////////////////////////
 
 message TGatewaysConfig {
@@ -553,4 +586,5 @@ message TGatewaysConfig {
     optional THttpGatewayConfig HttpGateway = 18;
     optional TYtOrmGatewayConfig YtOrm = 19;
     optional TDbToolConfig DbTool = 20;
+    optional TGenericGatewayConfig Generic = 21;
 }

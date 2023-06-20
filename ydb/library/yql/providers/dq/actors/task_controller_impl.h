@@ -66,7 +66,11 @@ public:
         , Settings(settings)
         , ServiceCounters(serviceCounters, "task_controller")
         , PingPeriod(pingPeriod)
-        , AggrPeriod(aggrPeriod)
+        , AggrPeriod(
+            settings->AggregateStatsByStage.Get().GetOrElse(TDqSettings::TDefault::AggregateStatsByStage)
+            ? aggrPeriod
+            : TDuration::Zero()
+        )
         , Issues(CreateDefaultTimeProvider())
     {
         if (Settings) {
@@ -291,9 +295,9 @@ private:
                         auto& counter = *ServiceCounters.PublicCounters->GetNamedCounter("name", publicCounterName, isDeriv);
                         if (name == "MultiHop_LateThrownEventsCount") {
                             // the only incremental sensor from TaskRunner
-                            counter += v.Count;
+                            counter += v.Sum;
                         } else {
-                            counter = v.Count;
+                            counter = v.Sum;
                         }
                     }
                 }
@@ -333,33 +337,40 @@ private:
         YQL_ENSURE(x.GetTasks().size() == 1);
         auto& s = x.GetTasks(0);
         ui64 taskId = s.GetTaskId();
+        ui64 stageId = s.GetStageId();
 
 #define ADD_COUNTER(name) \
         if (stats.Get ## name()) { \
             TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, #name), stats.Get ## name ()); \
         }
 
-        std::map<TString, TString> labels = {
-            {"Task", ToString(taskId)}
+        std::map<TString, TString> commonLabels = {
+            {"Task", ToString(taskId)},
+            {"Stage", ToString(stageId)}
         };
+
+        auto labels = commonLabels;
 
         auto& stats = s;
         // basic stats
         ADD_COUNTER(CpuTimeUs)
         ADD_COUNTER(ComputeCpuTimeUs)
         ADD_COUNTER(SourceCpuTimeUs)
-        ADD_COUNTER(PendingInputTimeUs)
-        ADD_COUNTER(PendingOutputTimeUs)
-        ADD_COUNTER(FinishTimeUs)
+        ADD_COUNTER(FirstRowTimeMs)
+        ADD_COUNTER(FinishTimeMs)
         ADD_COUNTER(InputRows)
         ADD_COUNTER(InputBytes)
         ADD_COUNTER(OutputRows)
         ADD_COUNTER(OutputBytes)
+        ADD_COUNTER(StartTimeMs)
 
         // profile stats
         ADD_COUNTER(BuildCpuTimeUs)
         ADD_COUNTER(WaitTimeUs)
         ADD_COUNTER(WaitOutputTimeUs)
+        ADD_COUNTER(PendingInputTimeUs)
+        ADD_COUNTER(PendingOutputTimeUs)
+        ADD_COUNTER(FinishTimeUs)
 
         for (const auto& ingress : s.GetIngress()) {
             TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "Ingress" + ingress.GetName() + "Bytes"), ingress.GetBytes());
@@ -399,10 +410,9 @@ private:
 //        }
 
         for (const auto& stats : s.GetInputChannels()) {
-            std::map<TString, TString> labels = {
-                {"Task", ToString(taskId)},
-                {"InputChannel", ToString(stats.GetChannelId())}
-            };
+            auto labels = commonLabels;
+            labels["InputChannel"] = ToString(stats.GetChannelId());
+            labels["SrcStageId"] = ToString(stats.GetSrcStageId());
 
             ADD_COUNTER(Chunks);
             ADD_COUNTER(Bytes);
@@ -411,16 +421,27 @@ private:
             ADD_COUNTER(MaxMemoryUsage);
             ADD_COUNTER(DeserializationTimeUs);
 
+            ADD_COUNTER(IdleTimeUs);
+            ADD_COUNTER(WaitTimeUs);
+            ADD_COUNTER(FirstMessageMs);
+            ADD_COUNTER(LastMessageMs);
+
+            if (stats.GetFirstMessageMs() && stats.GetLastMessageMs()) {
+                TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "ActiveTimeUs"),
+                    (   TInstant::MilliSeconds(stats.GetLastMessageMs()) -
+                        TInstant::MilliSeconds(stats.GetFirstMessageMs()) ).MicroSeconds()
+                );
+            }
+
 //            if (stats.GetFinishTs() >= stats.GetStartTs()) {
 //                TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "Total"), stats.GetFinishTs() - stats.GetStartTs());
 //            }
         }
 
         for (const auto& stats : s.GetOutputChannels()) {
-            std::map<TString, TString> labels = {
-                {"Task", ToString(taskId)},
-                {"OutputChannel", ToString(stats.GetChannelId())}
-            };
+            auto labels = commonLabels;
+            labels["OutputChannel"] = ToString(stats.GetChannelId());
+            labels["DstStageId"] = ToString(stats.GetDstStageId());
 
             ADD_COUNTER(Chunks)
             ADD_COUNTER(Bytes);
@@ -435,16 +456,25 @@ private:
             ADD_COUNTER(SpilledRows);
             ADD_COUNTER(SpilledBlobs);
 
+            ADD_COUNTER(BlockedTimeUs);
+            ADD_COUNTER(FirstMessageMs);
+            ADD_COUNTER(LastMessageMs);
+
+            if (stats.GetFirstMessageMs() && stats.GetLastMessageMs()) {
+                TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "ActiveTimeUs"),
+                    (   TInstant::MilliSeconds(stats.GetLastMessageMs()) -
+                        TInstant::MilliSeconds(stats.GetFirstMessageMs()) ).MicroSeconds()
+                );
+            }
+
 //            if (stats.GetFinishTs() >= stats.GetStartTs()) {
 //                TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "Total"), stats.GetFinishTs() - stats.GetStartTs());
 //            }
         }
 
         for (const auto& stats : s.GetSources()) {
-            std::map<TString, TString> labels = {
-                {"Task", ToString(taskId)},
-                {"Source", ToString(stats.GetInputIndex())}
-            };
+            auto labels = commonLabels;
+            labels["Source"] = ToString(stats.GetInputIndex());
 
             ADD_COUNTER(Chunks);
             ADD_COUNTER(Bytes);
@@ -461,10 +491,8 @@ private:
         }
 
         for (const auto& stats : s.GetSinks()) {
-            std::map<TString, TString> labels = {
-                {"Task", ToString(taskId)},
-                {"Sink", ToString(stats.GetOutputIndex())}
-            };
+            auto labels = commonLabels;
+            labels["Sink"] = ToString(stats.GetOutputIndex());
 
             ADD_COUNTER(Chunks)
             ADD_COUNTER(Bytes);
@@ -507,7 +535,7 @@ public:
 
         TaskStat.AddCounters(ev->Get()->Record);
 
-        const auto& tasks = ev->Get()->Record.GetTask();
+        auto& tasks = *ev->Get()->Record.MutableTask();
         const auto& actorIds = ev->Get()->Record.GetActorId();
         Y_VERIFY(tasks.size() == actorIds.size());
 
@@ -515,8 +543,8 @@ public:
 
         for (int i = 0; i < static_cast<int>(tasks.size()); ++i) {
             auto actorId = ActorIdFromProto(actorIds[i]);
-            auto& task = tasks[i];
-            Tasks.emplace_back(task, actorId);
+            NYql::NDqProto::TDqTask& task = tasks[i];
+            Tasks.emplace_back(NDq::TDqTaskSettings(&task), actorId);
             ActorIds.emplace(task.GetId(), actorId);
             TaskIds.emplace(actorId, task.GetId());
             Yql::DqsProto::TTaskMeta taskMeta;
@@ -534,6 +562,14 @@ public:
         if (AggrPeriod) {
             Schedule(AggrPeriod, new TEvents::TEvWakeup(AGGR_TIMER_TAG));
         }
+    }
+
+    const NDq::TDqTaskSettings GetTask(size_t idx) const {
+        return Tasks.at(idx).first;
+    }
+
+    int GetTasksSize() const {
+        return Tasks.size();
     }
 
 private:
@@ -634,7 +670,7 @@ private:
 
 
     bool ChannelsUpdated = false;
-    TVector<std::pair<NDqProto::TDqTask, TActorId>> Tasks;
+    TVector<std::pair<NDq::TDqTaskSettings, TActorId>> Tasks;
     THashSet<ui64> FinishedTasks;
     THashMap<ui64, TInstant> Executing;
     THashMap<ui64, TActorId> ActorIds;

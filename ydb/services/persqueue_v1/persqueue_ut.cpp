@@ -780,12 +780,14 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         Ydb::Topic::StreamReadMessage::FromClient req;
         Ydb::Topic::StreamReadMessage::FromServer resp;
 
-        NACLib::TDiffACL acl;
+        NYdb::NScheme::TSchemeClient schemeClient(*driver);
+        auto modifyPermissionsSettings = NYdb::NScheme::TModifyPermissionsSettings();
+
+        TVector<std::pair<TString, TVector<TString>>> permissions;
         for (ui32 i = 0; i < 10; ++i) {
-            acl.AddAccess(NACLib::EAccessType::Allow, NACLib::SelectRow, "test_user_" + ToString(i) + "@" + BUILTIN_ACL_DOMAIN);
+            permissions.push_back({"test_user_" + ToString(i) + "@" + BUILTIN_ACL_DOMAIN, {"ydb.generic.read"}});
         }
-        server.Server->AnnoyingClient->ModifyACL("/Root/PQ", "acc/topic1", acl.SerializeAsString());
-        WaitACLModification();
+        server.ModifyTopicACL("/Root/PQ/rt3.dc1--acc--topic1", permissions);
 
         for (ui32 i = 0; i < 10; ++i) {
             resp.Clear();
@@ -1865,8 +1867,8 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
             UNIT_ASSERT(status.ok());
         }
 
-        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "abacaba", 1, "valuevaluevalue1", "", ETransport::GRpc);
-        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "abacaba", 2, "valuevaluevalue1", "", ETransport::GRpc);
+        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "abacaba", 1, "valuevaluevalue1", "");
+        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "abacaba", 2, "valuevaluevalue1", "");
     }
 
     Y_UNIT_TEST(WriteExistingBigValue) {
@@ -1890,10 +1892,10 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         server.EnableLogs({ NKikimrServices::PERSQUEUE });
 
         // empty data and sourceId
-        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "", 1, "", "", ETransport::MsgBus, NMsgBusProxy::MSTATUS_ERROR);
-        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "a", 1, "", "", ETransport::MsgBus, NMsgBusProxy::MSTATUS_ERROR);
-        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "", 1, "a", "", ETransport::MsgBus, NMsgBusProxy::MSTATUS_ERROR);
-        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "a", 1, "a", "", ETransport::MsgBus, NMsgBusProxy::MSTATUS_OK);
+        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "", 1, "", "", NMsgBusProxy::MSTATUS_ERROR);
+        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "a", 1, "", "", NMsgBusProxy::MSTATUS_ERROR);
+        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "", 1, "a", "", NMsgBusProxy::MSTATUS_ERROR);
+        server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 1, "a", 1, "a", "", NMsgBusProxy::MSTATUS_OK);
     }
 
 
@@ -1906,7 +1908,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
 
         server.AnnoyingClient->WriteToPQ(
                 DEFAULT_TOPIC_NAME, 100500, "abacaba", 1, "valuevaluevalue1", "",
-                ETransport::MsgBus, NMsgBusProxy::MSTATUS_ERROR, NMsgBusProxy::MSTATUS_ERROR
+                NMsgBusProxy::MSTATUS_ERROR, NMsgBusProxy::MSTATUS_ERROR
         );
     }
 
@@ -1917,7 +1919,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
 
         server.AnnoyingClient->WriteToPQ(
                 DEFAULT_TOPIC_NAME + "000", 1, "abacaba", 1, "valuevaluevalue1", "",
-                ETransport::MsgBus, NMsgBusProxy::MSTATUS_ERROR, NMsgBusProxy::MSTATUS_ERROR
+                NMsgBusProxy::MSTATUS_ERROR, NMsgBusProxy::MSTATUS_ERROR
         );
     }
 
@@ -1946,7 +1948,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
 
         server.AnnoyingClient->WriteToPQ(
                 DEFAULT_TOPIC_NAME, 5, "abacaba", 1, "valuevaluevalue1", "",
-                ETransport::MsgBus, NMsgBusProxy::MSTATUS_ERROR,  NMsgBusProxy::MSTATUS_ERROR
+                NMsgBusProxy::MSTATUS_ERROR,  NMsgBusProxy::MSTATUS_ERROR
         );
 
         server.EnableLogs({ NKikimrServices::FLAT_TX_SCHEMESHARD,
@@ -1958,7 +1960,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         server.AnnoyingClient->WriteToPQ(DEFAULT_TOPIC_NAME, 5, "abacaba", 1, "valuevaluevalue1");
         server.AnnoyingClient->WriteToPQ(
                 DEFAULT_TOPIC_NAME, 15, "abacaba", 1, "valuevaluevalue1", "",
-                ETransport::MsgBus, NMsgBusProxy::MSTATUS_ERROR,  NMsgBusProxy::MSTATUS_ERROR
+                NMsgBusProxy::MSTATUS_ERROR,  NMsgBusProxy::MSTATUS_ERROR
         );
 
         server.AnnoyingClient->AlterTopic(DEFAULT_TOPIC_NAME, 20);
@@ -1990,7 +1992,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
 
 
     Y_UNIT_TEST(BigRead) {
-        NPersQueue::TTestServer server(PQSettings(0).SetDomainName("Root"));
+        NPersQueue::TTestServer server(PQSettings(0).SetDomainName("Root").SetGrpcMaxMessageSize(24_MB));
         server.AnnoyingClient->CreateTopic(DEFAULT_TOPIC_NAME, 1, 8_MB, 86400, 20000000, "user", 2000000);
 
         server.EnableLogs({ NKikimrServices::FLAT_TX_SCHEMESHARD, NKikimrServices::PERSQUEUE });
@@ -1999,7 +2001,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         for (ui32 i = 0; i < 32; ++i)
             server.AnnoyingClient->WriteToPQ({DEFAULT_TOPIC_NAME, 0, "source1", i}, value);
 
-        // trying to read small PQ messages in a big messagebus event
+        // trying to read small PQ messages in a big gRPC event
         auto info = server.AnnoyingClient->ReadFromPQ({DEFAULT_TOPIC_NAME, 0, 0, 32, "user"}, 23, "", NMsgBusProxy::MSTATUS_OK); //will read 21mb
         UNIT_ASSERT_VALUES_EQUAL(info.BlobsFromDisk, 0);
         UNIT_ASSERT_VALUES_EQUAL(info.BlobsFromCache, 4);
@@ -2016,7 +2018,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
 
     // expects that L2 size is 32Mb
     Y_UNIT_TEST(Cache) {
-        NPersQueue::TTestServer server(PQSettings(0).SetDomainName("Root"));
+        NPersQueue::TTestServer server(PQSettings(0).SetDomainName("Root").SetGrpcMaxMessageSize(18_MB));
         server.AnnoyingClient->CreateTopic(DEFAULT_TOPIC_NAME, 1, 8_MB, 86400);
 
         server.EnableLogs({ NKikimrServices::FLAT_TX_SCHEMESHARD, NKikimrServices::PERSQUEUE });
@@ -2047,7 +2049,7 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
     }
 
     Y_UNIT_TEST(CacheHead) {
-        NPersQueue::TTestServer server(PQSettings(0).SetDomainName("Root"));
+        NPersQueue::TTestServer server(PQSettings(0).SetDomainName("Root").SetGrpcMaxMessageSize(16_MB));
         server.AnnoyingClient->CreateTopic(DEFAULT_TOPIC_NAME, 1, 6_MB, 86400);
 
         server.EnableLogs({ NKikimrServices::FLAT_TX_SCHEMESHARD, NKikimrServices::PERSQUEUE });
@@ -2298,15 +2300,14 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         writer.Write(SHORT_TOPIC_NAME, {"valuevaluevalue1"}, true, TString()); // Fail if user set empty token
         writer.Write(SHORT_TOPIC_NAME, {"valuevaluevalue1"}, true, "topic1@" BUILTIN_ACL_DOMAIN);
 
-        NACLib::TDiffACL acl;
-        acl.AddAccess(NACLib::EAccessType::Allow, NACLib::UpdateRow, "topic1@" BUILTIN_ACL_DOMAIN);
-        server.AnnoyingClient->ModifyACL("/Root/PQ", DEFAULT_TOPIC_NAME, acl.SerializeAsString());
-        WaitACLModification();
+        auto driver = server.AnnoyingClient->GetDriver();
+
+
+        ModifyTopicACL(driver, "/Root/PQ/" + DEFAULT_TOPIC_NAME, {{"topic1@" BUILTIN_ACL_DOMAIN, {"ydb.generic.write"}}});
+
 
         writer2.Write(SHORT_TOPIC_NAME, {"valuevaluevalue1"}, false, "topic1@" BUILTIN_ACL_DOMAIN);
         writer2.Write(SHORT_TOPIC_NAME, {"valuevaluevalue1"}, true, "invalid_ticket");
-
-        auto driver = server.AnnoyingClient->GetDriver();
 
 
         for (ui32 i = 0; i < 2; ++i) {
@@ -2383,14 +2384,12 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
 
         server.CleverServer->GetRuntime()->GetAppData().PQConfig.SetRequireCredentialsInNewProtocol(true);
 
-        NACLib::TDiffACL acl;
-        acl.AddAccess(NACLib::EAccessType::Allow, NACLib::SelectRow, "1@" BUILTIN_ACL_DOMAIN);
-        acl.AddAccess(NACLib::EAccessType::Allow, NACLib::SelectRow, "2@" BUILTIN_ACL_DOMAIN);
-        acl.AddAccess(NACLib::EAccessType::Allow, NACLib::SelectRow, "user1@" BUILTIN_ACL_DOMAIN);
-        acl.AddAccess(NACLib::EAccessType::Allow, NACLib::SelectRow, "user2@" BUILTIN_ACL_DOMAIN);
-        server.AnnoyingClient->ModifyACL("/Root/PQ", topic2, acl.SerializeAsString());
-        WaitACLModification();
+        auto driver = server.AnnoyingClient->GetDriver();
 
+        ModifyTopicACL(driver, "/Root/PQ/" + topic2, {{"1@" BUILTIN_ACL_DOMAIN, {"ydb.generic.read"}},
+                                                      {"2@" BUILTIN_ACL_DOMAIN, {"ydb.generic.read"}},
+                                                      {"user1@" BUILTIN_ACL_DOMAIN, {"ydb.generic.read"}},
+                                                      {"user2@" BUILTIN_ACL_DOMAIN, {"ydb.generic.read"}}});
         auto ticket1 = "1@" BUILTIN_ACL_DOMAIN;
         auto ticket2 = "2@" BUILTIN_ACL_DOMAIN;
 
@@ -2406,10 +2405,8 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         writer.Read(shortTopic2Name, "user5", ticket1, true, false, true);
         writer.Read(shortTopic2Name, "user5", ticket2, true, false, true);
 
-        acl.Clear();
-        acl.AddAccess(NACLib::EAccessType::Allow, NACLib::SelectRow, "user3@" BUILTIN_ACL_DOMAIN);
-        server.AnnoyingClient->ModifyACL("/Root/PQ", topic2, acl.SerializeAsString());
-        WaitACLModification();
+        ModifyTopicACL(driver, "/Root/PQ/" + topic2, {{"user3@" BUILTIN_ACL_DOMAIN, {"ydb.generic.read"}}});
+
 
         Cerr << "==== Writer - read\n";
         writer.Read(shortTopic2Name, "user1", "user3@" BUILTIN_ACL_DOMAIN, false, true, true);
@@ -4153,14 +4150,16 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
         setup.GetPQConfig().SetClustersUpdateTimeoutSec(0);
         setup.GetPQConfig().SetRemoteClusterEnabledDelaySec(0);
         setup.GetPQConfig().SetCloseClientSessionWithEnabledRemotePreferredClusterDelaySec(0);
+
         auto sessionWithNoPreferredCluster = setup.InitWriteSession(GenerateSessionSetupWithPreferredCluster(TString()));
         auto sessionWithLocalPreffedCluster = setup.InitWriteSession(GenerateSessionSetupWithPreferredCluster(setup.GetLocalCluster()));
-        auto sessionWithRemotePrefferedCluster = setup.InitWriteSession(GenerateSessionSetupWithPreferredCluster(setup.GetRemoteCluster()));
+        auto sessionWithRemotePrefferedCluster = setup.InitWriteSession(GenerateSessionSetupWithPreferredCluster(setup.GetRemoteCluster()), true);
+
         grpc::ClientContext context;
         auto sessionWithNoInitialization = setup.GetPersQueueService()->StreamingWrite(&context);
 
         log << TLOG_INFO << "Wait for session with remote preferred cluster to die";
-        AssertStreamingSessionDead(sessionWithRemotePrefferedCluster.first, Ydb::StatusIds::ABORTED, Ydb::PersQueue::ErrorCode::PREFERRED_CLUSTER_MISMATCHED);
+        AssertStreamingSessionDead(sessionWithRemotePrefferedCluster.Stream, Ydb::StatusIds::ABORTED, Ydb::PersQueue::ErrorCode::PREFERRED_CLUSTER_MISMATCHED, sessionWithRemotePrefferedCluster.FirstMessage);
         AssertStreamingSessionAlive(sessionWithNoPreferredCluster.first);
         AssertStreamingSessionAlive(sessionWithLocalPreffedCluster.first);
 
@@ -6187,6 +6186,116 @@ Y_UNIT_TEST_SUITE(TPersQueueTest) {
             UNIT_ASSERT((partId == 1) || (partId == 3));
             releasesGot.erase(partId);
         }
+    }
+
+    THolder<NYdb::TDriver> SetupTestAndGetDriver(
+            NPersQueue::TTestServer& server, const TString& topicName, ui64 partsCount = 1
+    ) {
+        NYdb::TDriverConfig driverCfg;
+        driverCfg.SetEndpoint(TStringBuilder() << "localhost:" << server.GrpcPort);
+        auto driver = MakeHolder<NYdb::TDriver>(driverCfg);
+
+        server.EnableLogs({ NKikimrServices::PQ_READ_PROXY, NKikimrServices::PQ_WRITE_PROXY});
+        server.EnableLogs({ NKikimrServices::KQP_PROXY}, NActors::NLog::PRI_EMERG);
+
+        server.AnnoyingClient->CreateTopic(topicName, partsCount);
+        auto topicClient = NYdb::NTopic::TTopicClient(*driver);
+        auto alterSettings = NYdb::NTopic::TAlterTopicSettings();
+        alterSettings.BeginAddConsumer("debug");
+        auto alterRes = topicClient.AlterTopic(TString("/Root/PQ/") + topicName, alterSettings).GetValueSync();
+        UNIT_ASSERT(alterRes.IsSuccess());
+        return std::move(driver);
+    }
+
+    Y_UNIT_TEST(MessageMetadata) {
+        return; //No supported;
+        NPersQueue::TTestServer server;
+        server.CleverServer->GetRuntime()->GetAppData().FeatureFlags.SetEnableTopicMessageMeta(true);
+        TString topicFullName = "rt3.dc1--topic1";
+        auto driver = SetupTestAndGetDriver(server, topicFullName);
+
+        auto topicClient = NYdb::NTopic::TTopicClient(*driver);
+
+        NYdb::NTopic::TWriteSessionSettings wSettings {topicFullName, "srcId", "srcId"};
+        auto writer = topicClient.CreateSimpleBlockingWriteSession(wSettings);
+        std::unordered_map<TString, TString> metadata = {{"key1", "val1"}, {"key2", "val2"}};
+/*        writer->Write("Somedata", Nothing(), Nothing(), TDuration::Max(), metadata);
+        metadata = {{"key3", "val3"}};
+        writer->Write("Somedata2", Nothing(), Nothing(), TDuration::Max(), metadata);
+        writer->Write("Somedata3");
+*/
+        writer->Close();
+        NYdb::NTopic::TReadSessionSettings rSettings;
+        rSettings.ConsumerName("debug").AppendTopics({topicFullName});
+        auto readSession = topicClient.CreateReadSession(rSettings);
+
+        auto ev = readSession->GetEvent(true);
+        UNIT_ASSERT(ev.Defined());
+        auto spsEv = std::get_if<NYdb::NTopic::TReadSessionEvent::TStartPartitionSessionEvent>(&*ev);
+        UNIT_ASSERT(spsEv);
+        spsEv->Confirm();
+        ev = readSession->GetEvent(true);
+        auto dataEv = std::get_if<NYdb::NTopic::TReadSessionEvent::TDataReceivedEvent>(&*ev);
+        UNIT_ASSERT(dataEv);
+        const auto& messages = dataEv->GetMessages();
+        UNIT_ASSERT_VALUES_EQUAL(messages.size(), 3);
+        auto metadataSizeExpected = 2;
+        for (const auto& msg : dataEv->GetMessages()) {
+            auto meta = msg.GetMessageMeta();
+            UNIT_ASSERT_VALUES_EQUAL(meta->Fields.size(), metadataSizeExpected);
+            metadataSizeExpected--;
+        }
+    }
+
+    Y_UNIT_TEST(DisableDeduplication) {
+        NPersQueue::TTestServer server;
+        TString topicFullName = "rt3.dc1--topic1";
+        auto driver = SetupTestAndGetDriver(server, topicFullName, 3);
+
+        auto topicClient = NYdb::NTopic::TTopicClient(*driver);
+        NYdb::NTopic::TWriteSessionSettings wSettings;
+        wSettings.Path(topicFullName).DeduplicationEnabled(false);
+
+        TVector<std::shared_ptr<NYdb::NTopic::ISimpleBlockingWriteSession>> writers;
+        for (auto i = 0u; i < 3; i++) {
+            auto writer = topicClient.CreateSimpleBlockingWriteSession(wSettings);
+            for (auto j = 0u; j < 3; j++) {
+                writer->Write(TString("MyData") + ToString(i) + ToString(j));
+            }
+            writers.push_back(writer);
+        }
+
+        for (auto& w : writers) {
+            w->Close();
+        }
+        NYdb::NTopic::TReadSessionSettings rSettings;
+        rSettings.ConsumerName("debug").AppendTopics({topicFullName});
+        auto readSession = topicClient.CreateReadSession(rSettings);
+
+        THashSet<ui64> partitions;
+        ui64 totalMessages = 0;
+        Cerr << "Start reads\n";
+        while(totalMessages < 9) {
+            auto ev = readSession->GetEvent(true);
+            UNIT_ASSERT(ev.Defined());
+
+            auto spsEv = std::get_if<NYdb::NTopic::TReadSessionEvent::TStartPartitionSessionEvent>(&*ev);
+            if (spsEv) {
+                spsEv->Confirm();
+                Cerr << "Got start stream event\n";
+                continue;
+            }
+            auto dataEv = std::get_if<NYdb::NTopic::TReadSessionEvent::TDataReceivedEvent>(&*ev);
+            UNIT_ASSERT(dataEv);
+            const auto& messages = dataEv->GetMessages();
+            totalMessages += messages.size();
+            Cerr << "Got data event with total " << messages.size() << " messages, current total messages: " << totalMessages << Endl;
+            for (const auto& msg: dataEv->GetMessages()) {
+                auto session = msg.GetPartitionSession();
+                partitions.insert(session->GetPartitionId());
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(partitions.size(), 3);
     }
 
     Y_UNIT_TEST(LOGBROKER_7820) {

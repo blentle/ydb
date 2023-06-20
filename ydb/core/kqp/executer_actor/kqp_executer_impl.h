@@ -121,6 +121,7 @@ public:
         , ExecuterRetriesConfig(executerRetriesConfig)
     {
         TasksGraph.GetMeta().Snapshot = IKqpGateway::TKqpSnapshot(Request.Snapshot.Step, Request.Snapshot.TxId);
+        TasksGraph.GetMeta().Arena = MakeIntrusive<NActors::TProtoArenaHolder>();
         ResponseEv = std::make_unique<TEvKqpExecuter::TEvTxResponse>(Request.TxAlloc);
         ResponseEv->Orbit = std::move(Request.Orbit);
         Stats = std::make_unique<TQueryExecutionStats>(Request.StatsMode, &TasksGraph,
@@ -723,34 +724,45 @@ protected:
 
         const auto& snapshot = GetSnapshot();
 
-        auto addPartiton = [&](TMaybe<ui64> shardId, const TShardInfo& shardInfo, TMaybe<ui64> maxInFlightShards = Nothing()) {
+        auto addPartiton = [&](
+            ui64 taskLocation,
+            TMaybe<ui64> shardId,
+            const TShardInfo& shardInfo,
+            TMaybe<ui64> maxInFlightShards = Nothing())
+        {
             YQL_ENSURE(!shardInfo.KeyWriteRanges);
 
             auto& task = TasksGraph.AddTask(stageInfo);
             task.Meta.ExecuterId = this->SelfId();
-            if (shardId) {
-                if (auto ptr = ShardIdToNodeId.FindPtr(*shardId)) {
-                    task.Meta.NodeId = *ptr;
-                } else {
-                    task.Meta.ShardId = *shardId;
-                }
+            if (auto ptr = ShardIdToNodeId.FindPtr(taskLocation)) {
+                task.Meta.NodeId = *ptr;
+            } else {
+                task.Meta.ShardId = taskLocation;
             }
 
-            NKikimrTxDataShard::TKqpReadRangesSourceSettings settings;
-            FillTableMeta(stageInfo, settings.MutableTable());
+            const auto& stageSource = stage.GetSources(0);
+            auto& input = task.Inputs[stageSource.GetInputIndex()];
+            input.SourceType = NYql::KqpReadRangesSourceName;
+            input.ConnectionInfo = NYql::NDq::TSourceInput{};
+
+            // allocating source settings
+            
+            input.Meta.SourceSettings = TasksGraph.GetMeta().Allocate<NKikimrTxDataShard::TKqpReadRangesSourceSettings>();
+            NKikimrTxDataShard::TKqpReadRangesSourceSettings* settings = input.Meta.SourceSettings;
+            FillTableMeta(stageInfo, settings->MutableTable());
 
             for (auto& keyColumn : keyTypes) {
                 auto columnType = NScheme::ProtoColumnTypeFromTypeInfoMod(keyColumn, "");
                 if (columnType.TypeInfo) {
-                    *settings.AddKeyColumnTypeInfos() = *columnType.TypeInfo;
+                    *settings->AddKeyColumnTypeInfos() = *columnType.TypeInfo;
                 } else {
-                    *settings.AddKeyColumnTypeInfos() = NKikimrProto::TTypeInfo();
+                    *settings->AddKeyColumnTypeInfos() = NKikimrProto::TTypeInfo();
                 }
-                settings.AddKeyColumnTypes(static_cast<ui32>(keyColumn.GetTypeId()));
+                settings->AddKeyColumnTypes(static_cast<ui32>(keyColumn.GetTypeId()));
             }
 
             for (auto& column : columns) {
-                auto* protoColumn = settings.AddColumns();
+                auto* protoColumn = settings->AddColumns();
                 protoColumn->SetId(column.Id);
                 auto columnType = NScheme::ProtoColumnTypeFromTypeInfoMod(column.Type, column.TypeMod);
                 protoColumn->SetType(columnType.TypeId);
@@ -761,26 +773,26 @@ protected:
             }
 
             if (AppData()->FeatureFlags.GetEnableArrowFormatAtDatashard()) {
-                settings.SetDataFormat(NKikimrTxDataShard::EScanDataFormat::ARROW);
+                settings->SetDataFormat(NKikimrTxDataShard::EScanDataFormat::ARROW);
             } else {
-                settings.SetDataFormat(NKikimrTxDataShard::EScanDataFormat::CELLVEC);
+                settings->SetDataFormat(NKikimrTxDataShard::EScanDataFormat::CELLVEC);
             }
 
             if (snapshot.IsValid()) {
-                settings.MutableSnapshot()->SetStep(snapshot.Step);
-                settings.MutableSnapshot()->SetTxId(snapshot.TxId);
+                settings->MutableSnapshot()->SetStep(snapshot.Step);
+                settings->MutableSnapshot()->SetTxId(snapshot.TxId);
             }
 
-            shardInfo.KeyReadRanges->SerializeTo(&settings);
-            settings.SetReverse(source.GetReverse());
-            settings.SetSorted(source.GetSorted());
+            shardInfo.KeyReadRanges->SerializeTo(settings);
+            settings->SetReverse(source.GetReverse());
+            settings->SetSorted(source.GetSorted());
 
             if (maxInFlightShards) {
-                settings.SetMaxInFlightShards(*maxInFlightShards);
+                settings->SetMaxInFlightShards(*maxInFlightShards);
             }
 
             if (shardId) {
-                settings.SetShardIdHint(*shardId);
+                settings->SetShardIdHint(*shardId);
                 if (Stats) {
                     Stats->AffectedShards.insert(*shardId);
                 }
@@ -788,35 +800,27 @@ protected:
 
             ui64 itemsLimit = ExtractItemsLimit(stageInfo, source.GetItemsLimit(), Request.TxAlloc->HolderFactory,
                 Request.TxAlloc->TypeEnv);
-            settings.SetItemsLimit(itemsLimit);
+            settings->SetItemsLimit(itemsLimit);
 
             auto self = static_cast<TDerived*>(this)->SelfId();
             if (lockTxId) {
-                settings.SetLockTxId(*lockTxId);
-                settings.SetLockNodeId(self.NodeId());
+                settings->SetLockTxId(*lockTxId);
+                settings->SetLockNodeId(self.NodeId());
             }
-
-            const auto& stageSource = stage.GetSources(0);
-            auto& input = task.Inputs[stageSource.GetInputIndex()];
-            auto& taskSourceSettings = input.SourceSettings;
-            input.ConnectionInfo = NYql::NDq::TSourceInput{};
-            taskSourceSettings.ConstructInPlace();
-            taskSourceSettings->PackFrom(settings);
-            input.SourceType = NYql::KqpReadRangesSourceName;
         };
 
-        if (source.GetSequentialAccessHint()) {
-            auto shardInfo = MakeFakePartition(GetTableKeys(), source, stageInfo, HolderFactory(), TypeEnv());
+        if (source.GetSequentialInFlightShards()) {
+            auto [startShard, shardInfo] = MakeVirtualTablePartition(GetTableKeys(), source, stageInfo, HolderFactory(), TypeEnv());
             if (shardInfo.KeyReadRanges) {
-                addPartiton({}, shardInfo, source.GetSequentialAccessHint());
-                return {};
+                addPartiton(startShard, {}, shardInfo, source.GetSequentialInFlightShards());
+                return Nothing();
             } else {
                 return 0;
             }
         } else {
             THashMap<ui64, TShardInfo> partitions = PrunePartitions(GetTableKeys(), source, stageInfo, HolderFactory(), TypeEnv());
             for (auto& [shardId, shardInfo] : partitions) {
-                addPartiton(shardId, shardInfo, {});
+                addPartiton(shardId, shardId, shardInfo, {});
             }
             return partitions.size();
         }
@@ -946,8 +950,8 @@ protected:
     template <class TCollection>
     bool ValidateTaskSize(const TCollection& tasks) {
         for (const auto& task : tasks) {
-            if (ui32 size = task.ByteSize(); size > MaxTaskSize) {
-                LOG_E("Abort execution. Task #" << task.GetId() << " size is too big: " << size << " > " << MaxTaskSize);
+            if (ui32 size = task->ByteSize(); size > MaxTaskSize) {
+                LOG_E("Abort execution. Task #" << task->GetId() << " size is too big: " << size << " > " << MaxTaskSize);
                 ReplyErrorAndDie(Ydb::StatusIds::ABORTED,
                     MakeIssue(NKikimrIssues::TIssuesIds::SHARD_PROGRAM_SIZE_EXCEEDED, TStringBuilder() <<
                         "Datashard program size limit exceeded (" << size << " > " << MaxTaskSize << ")"));
@@ -1109,7 +1113,7 @@ private:
 
 IActor* CreateKqpDataExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
     const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, TKqpRequestCounters::TPtr counters, bool streamResult,
-    const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig, NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory);
+    const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig, NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory, const TActorId& creator);
 
 IActor* CreateKqpScanExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
     const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, TKqpRequestCounters::TPtr counters,

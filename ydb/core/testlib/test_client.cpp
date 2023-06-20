@@ -4,6 +4,7 @@
 #include <ydb/core/base/path.h>
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/hive.h>
+#include <ydb/core/viewer/viewer.h>
 #include <ydb/public/lib/base/msgbus.h>
 #include <ydb/core/grpc_services/grpc_request_proxy.h>
 #include <ydb/services/auth/grpc_service.h>
@@ -97,7 +98,7 @@
 #include <ydb/services/ext_index/service/executor.h>
 #include <ydb/core/tx/conveyor/service/service.h>
 #include <ydb/core/tx/conveyor/usage/service.h>
-#include <ydb/library/folder_service/mock/mock_folder_service.h>
+#include <ydb/library/folder_service/mock/mock_folder_service_adapter.h>
 
 #include <ydb/core/client/server/msgbus_server_tracer.h>
 
@@ -237,7 +238,7 @@ namespace Tests {
         });
 
         const bool mockDisk = (StaticNodes() + DynamicNodes()) == 1 && Settings->EnableMockOnSingleNode;
-        SetupTabletServices(*Runtime, &app, mockDisk, Settings->CustomDiskParams, Settings->CacheParams);
+        SetupTabletServices(*Runtime, &app, mockDisk, Settings->CustomDiskParams, Settings->CacheParams, Settings->EnableForceFollowers);
 
         // WARNING: must be careful about modifying app data after actor system starts
 
@@ -291,6 +292,8 @@ namespace Tests {
         auto grpcService = new NGRpcProxy::TGRpcService();
 
         auto system(Runtime->GetAnyNodeActorSystem());
+
+        Cerr << "TServer::EnableGrpc on GrpcPort " << options.Port << ", node " << system->NodeId << Endl;
 
         const size_t proxyCount = Max(ui32{1}, Settings->AppConfig.GetGRpcConfig().GetGRpcProxyCount());
         TVector<TActorId> grpcRequestProxies;
@@ -821,6 +824,8 @@ namespace Tests {
                 IActor* proxy = BusServer->CreateProxy();
                 TActorId proxyId = Runtime->Register(proxy, nodeIdx, Runtime->GetAppData(nodeIdx).SystemPoolId, TMailboxType::Revolving, 0);
                 Runtime->RegisterService(NMsgBusProxy::CreateMsgBusProxyId(), proxyId, nodeIdx);
+
+                Cerr << "NMsgBusProxy registered on Port " << Settings->Port << " GrpsPort " << Settings->GrpcPort << Endl;
             }
 
             {
@@ -996,11 +1001,21 @@ namespace Tests {
                 "TestTenant",
                 nullptr, // MakeIntrusive<NPq::NConfigurationManager::TConnections>(),
                 YqSharedResources,
-                NKikimr::NFolderService::CreateMockFolderServiceActor,
+                NKikimr::NFolderService::CreateMockFolderServiceAdapterActor,
                 /*IcPort = */0,
                 {}
                 );
             NFq::InitTest(Runtime.Get(), port, Settings->GrpcPort, YqSharedResources);
+        }
+        {
+            using namespace NViewer;
+            if (Settings->KikimrRunConfig) {
+                IActor* viewer = CreateViewer(*Settings->KikimrRunConfig);
+                SetupPQVirtualHandlers(dynamic_cast<IViewer*>(viewer));
+                SetupDBVirtualHandlers(dynamic_cast<IViewer*>(viewer));
+                TActorId viewerId = Runtime->Register(viewer, nodeIdx);
+                Runtime->RegisterService(MakeViewerID(nodeIdx), viewerId, nodeIdx);
+            }
         }
     }
 
@@ -1063,6 +1078,11 @@ namespace Tests {
         return *Driver;
     }
 
+    const NGrpc::TGRpcServer& TServer::GetGRpcServer() const {
+        Y_VERIFY(GRpcServer);
+        return *GRpcServer;
+    }
+
     TServer::~TServer() {
         if (GRpcServer) {
             GRpcServer->Stop();
@@ -1105,6 +1125,8 @@ namespace Tests {
         ClientConfig.BusSessionConfig.NumRetries = 10;
         Client.reset(new NMsgBusProxy::TMsgBusClient(ClientConfig));
         Client->Init();
+
+        Cerr << "TClient is connected to server " << ClientConfig.Ip << ":" << ClientConfig.Port << Endl;
     }
 
     const NMsgBusProxy::TMsgBusClientConfig& TClient::GetClientConfig() const {
@@ -1182,10 +1204,13 @@ namespace Tests {
 
     void TClient::WaitRootIsUp(const TString& root) {
         while (true) {
+            Cerr << "WaitRootIsUp '" << root << "'..." << Endl;
+
             TAutoPtr<NMsgBusProxy::TBusResponse> resp = Ls(root);
             UNIT_ASSERT(resp);
 
             if (resp->Record.GetStatus() == NMsgBusProxy::MSTATUS_OK && resp->Record.GetSchemeStatus() == NKikimrScheme::StatusSuccess) {
+                Cerr << "WaitRootIsUp '" << root << "' success." << Endl;
                 break;
             }
         }
@@ -1211,7 +1236,7 @@ namespace Tests {
         SendAndWaitCompletion(request, reply);
 
 #ifndef NDEBUG
-        Cout << PrintResult<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
+        Cout << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
 #endif
         return reply;
     }
@@ -1328,7 +1353,7 @@ namespace Tests {
         TAutoPtr<NBus::TBusMessage> reply;
         NBus::EMessageStatus msgStatus = SendAndWaitCompletion(request, reply);
 #ifndef NDEBUG
-        Cout << PrintResult<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
+        Cout << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
 #endif
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
         const NKikimrClient::TResponse &response = dynamic_cast<NMsgBusProxy::TBusResponse *>(reply.Get())->Record;
@@ -1345,7 +1370,7 @@ namespace Tests {
         TAutoPtr<NBus::TBusMessage> reply;
         NBus::EMessageStatus msgStatus = SendAndWaitCompletion(request, reply);
 #ifndef NDEBUG
-        Cout << PrintResult<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
+        Cout << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
 #endif
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
         const NKikimrClient::TResponse &response = dynamic_cast<NMsgBusProxy::TBusResponse *>(reply.Get())->Record;
@@ -1811,7 +1836,7 @@ namespace Tests {
         TAutoPtr<NBus::TBusMessage> reply;
         auto msgStatus = WaitCompletion(descr.GetCreateTxId(), descr.GetSchemeshardId(), descr.GetPathId(), reply, timeout);
 #ifndef NDEBUG
-        Cout << PrintResult<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
+        Cout << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
 #endif
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
         const NKikimrClient::TResponse &response = dynamic_cast<NMsgBusProxy::TBusResponse *>(reply.Get())->Record;
@@ -1819,15 +1844,17 @@ namespace Tests {
     }
 
     TAutoPtr<NMsgBusProxy::TBusResponse> TClient::LsImpl(const TString& path) {
+        Cerr << "TClient::Ls request: " << path << Endl;
+
         TAutoPtr<NMsgBusProxy::TBusSchemeDescribe> request(new NMsgBusProxy::TBusSchemeDescribe());
         request->Record.SetPath(path);
         request->Record.MutableOptions()->SetShowPrivateTable(true);
         TAutoPtr<NBus::TBusMessage> reply;
         NBus::EMessageStatus msgStatus = SendWhenReady(request, reply);
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
-#ifndef NDEBUG
-        Cerr << "TClient::Ls: " << PrintResult<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
-#endif
+
+        Cerr << "TClient::Ls response: " << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
+
         return dynamic_cast<NMsgBusProxy::TBusResponse*>(reply.Release());
     }
 
@@ -1981,7 +2008,7 @@ namespace Tests {
         NBus::EMessageStatus msgStatus = SendWhenReady(readRequest, reply);
 
 #ifndef NDEBUG
-        Cerr << PrintResult<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
+        Cerr << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
 #endif
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
         const NKikimrClient::TResponse &response = dynamic_cast<NMsgBusProxy::TBusResponse *>(reply.Get())->Record;
@@ -2012,7 +2039,7 @@ namespace Tests {
         NBus::EMessageStatus msgStatus = SendWhenReady(deleteRequest, replyDelete);
 
 #ifndef NDEBUG
-        Cout << PrintResult<NMsgBusProxy::TBusResponse>(replyDelete.Get()) << Endl;
+        Cout << PrintToString<NMsgBusProxy::TBusResponse>(replyDelete.Get()) << Endl;
 #endif
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
         const NKikimrClient::TResponse &responseDelete = dynamic_cast<NMsgBusProxy::TBusResponse *>(replyDelete.Get())->Record;

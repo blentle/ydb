@@ -12,9 +12,10 @@ namespace NKikimr::NOlap::NIndexedReader {
 class TGranulesFillingContext;
 
 class TGranule {
+public:
+    using TPtr = std::shared_ptr<TGranule>;
 private:
     ui64 GranuleId = 0;
-    YDB_READONLY(ui64, GranuleIdx, 0);
 
     bool NotIndexedBatchReadyFlag = false;
     std::shared_ptr<arrow::RecordBatch> NotIndexedBatch;
@@ -28,13 +29,16 @@ private:
     std::set<ui32> GranuleBatchNumbers;
     TGranulesFillingContext* Owner = nullptr;
     THashSet<const void*> BatchesToDedup;
-
+    ui64 BlobsDataSize = 0;
     void CheckReady();
 public:
-    TGranule(const ui64 granuleId, const ui64 granuleIdx, TGranulesFillingContext& owner)
+    TGranule(const ui64 granuleId, TGranulesFillingContext& owner)
         : GranuleId(granuleId)
-        , GranuleIdx(granuleIdx)
         , Owner(&owner) {
+    }
+
+    ui64 GetBlobsDataSize() const noexcept {
+        return BlobsDataSize;
     }
 
     ui64 GetGranuleId() const noexcept {
@@ -111,7 +115,7 @@ public:
             if (!From && !item.From) {
                 return false;
             } else if (From && item.From) {
-                return From->Compare(*item.From) < 0;
+                return From->Compare(*item.From) == std::partial_ordering::less;
             } else if (!From) {
                 return true;
             } else {
@@ -124,8 +128,9 @@ public:
 
     const std::set<ui32>& GetEarlyFilterColumns() const;
     void OnBatchReady(const TBatch& batchInfo, std::shared_ptr<arrow::RecordBatch> batch);
+    void OnBlobReady(const TBlobRange& range) noexcept;
     bool OnFilterReady(TBatch& batchInfo);
-    TBatch& AddBatch(const TPortionInfo& portionInfo);
+    TBatch& RegisterBatchForFetching(const TPortionInfo& portionInfo);
     void AddBlobForFetch(const TBlobRange& range, NIndexedReader::TBatch& batch) const;
 
 };

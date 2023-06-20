@@ -209,6 +209,8 @@ public:
 
     // Enable virtual timestamps
     TChangefeedDescription& WithVirtualTimestamps();
+    // Enable resolved timestamps
+    TChangefeedDescription& WithResolvedTimestamps(const TDuration& interval);
     // Customise retention period of underlying topic (24h by default).
     TChangefeedDescription& WithRetentionPeriod(const TDuration& value);
     // Initial scan will output the current state of the table first
@@ -225,6 +227,7 @@ public:
     EChangefeedFormat GetFormat() const;
     EChangefeedState GetState() const;
     bool GetVirtualTimestamps() const;
+    const std::optional<TDuration>& GetResolvedTimestamps() const;
     bool GetInitialScan() const;
     const THashMap<TString, TString>& GetAttributes() const;
     const TString& GetAwsRegion() const;
@@ -246,6 +249,7 @@ private:
     EChangefeedFormat Format_;
     EChangefeedState State_ = EChangefeedState::Unknown;
     bool VirtualTimestamps_ = false;
+    std::optional<TDuration> ResolvedTimestamps_;
     std::optional<TDuration> RetentionPeriod_;
     bool InitialScan_ = false;
     THashMap<TString, TString> Attributes_;
@@ -465,6 +469,7 @@ public:
     TVector<TIndexDescription> GetIndexDescriptions() const;
     TVector<TChangefeedDescription> GetChangefeedDescriptions() const;
     TMaybe<TTtlSettings> GetTtlSettings() const;
+    TMaybe<TString> GetTiering() const;
 
     // Deprecated. Use GetEntry() of TDescribeTableResult instead
     const TString& GetOwner() const;
@@ -844,8 +849,8 @@ class TDescribeTableResult;
 class TBeginTransactionResult;
 class TCommitTransactionResult;
 class TKeepAliveResult;
-class TSessionPoolImpl;
 class TBulkUpsertResult;
+class TReadRowsResult;
 class TScanQueryPartIterator;
 
 using TAsyncCreateSessionResult = NThreading::TFuture<TCreateSessionResult>;
@@ -858,6 +863,7 @@ using TAsyncCommitTransactionResult = NThreading::TFuture<TCommitTransactionResu
 using TAsyncTablePartIterator = NThreading::TFuture<TTablePartIterator>;
 using TAsyncKeepAliveResult = NThreading::TFuture<TKeepAliveResult>;
 using TAsyncBulkUpsertResult = NThreading::TFuture<TBulkUpsertResult>;
+using TAsyncReadRowsResult = NThreading::TFuture<TReadRowsResult>;
 using TAsyncScanQueryPartIterator = NThreading::TFuture<TScanQueryPartIterator>;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -959,6 +965,9 @@ struct TBulkUpsertSettings : public TOperationRequestSettings<TBulkUpsertSetting
     FLUENT_SETTING_DEFAULT(TString, FormatSettings, "");
 };
 
+struct TReadRowsSettings : public TOperationRequestSettings<TReadRowsSettings> {
+};
+
 struct TStreamExecScanQuerySettings : public TRequestSettings<TStreamExecScanQuerySettings> {
     // Return query plan without actual query execution
     FLUENT_SETTING_DEFAULT(bool, Explain, false);
@@ -968,6 +977,7 @@ struct TStreamExecScanQuerySettings : public TRequestSettings<TStreamExecScanQue
 };
 
 class TSession;
+class TSessionPool;
 struct TRetryState;
 
 enum class EDataFormat {
@@ -978,7 +988,7 @@ enum class EDataFormat {
 class TTableClient {
     friend class TSession;
     friend class TTransaction;
-    friend class TSessionPoolImpl;
+    friend class TSessionPool;
     friend class TRetryOperationContext;
 
 public:
@@ -1055,6 +1065,9 @@ public:
         const TBulkUpsertSettings& settings = TBulkUpsertSettings());
     TAsyncBulkUpsertResult BulkUpsert(const TString& table, EDataFormat format,
         const TString& data, const TString& schema = {}, const TBulkUpsertSettings& settings = TBulkUpsertSettings());
+
+    TAsyncReadRowsResult ReadRows(const TString& table, TValue&& keys,
+        const TReadRowsSettings& settings = TReadRowsSettings());
 
     TAsyncScanQueryPartIterator StreamExecuteScanQuery(const TString& query,
         const TStreamExecScanQuerySettings& settings = TStreamExecScanQuerySettings());
@@ -1566,7 +1579,7 @@ class TSession {
     friend class TTableClient;
     friend class TDataQuery;
     friend class TTransaction;
-    friend class TSessionPoolImpl;
+    friend class TSessionPool;
 
 public:
     //! The following methods perform corresponding calls.
@@ -1634,7 +1647,7 @@ public:
 
     class TImpl;
 private:
-    TSession(std::shared_ptr<TTableClient::TImpl> client, const TString& sessionId, const TString& endpointId);
+    TSession(std::shared_ptr<TTableClient::TImpl> client, const TString& sessionId, const TString& endpointId, bool isOwnedBySessionPool);
     TSession(std::shared_ptr<TTableClient::TImpl> client, std::shared_ptr<TSession::TImpl> SessionImpl_);
 
     std::shared_ptr<TTableClient::TImpl> Client_;
@@ -1964,6 +1977,17 @@ private:
 class TBulkUpsertResult : public TStatus {
 public:
     explicit TBulkUpsertResult(TStatus&& status);
+};
+
+class TReadRowsResult : public TStatus {
+    TResultSet ResultSet;
+
+  public:
+    explicit TReadRowsResult(TStatus&& status, TResultSet&& resultSet);
+
+    TResultSet GetResultSet() {
+        return std::move(ResultSet);
+    }
 };
 
 } // namespace NTable

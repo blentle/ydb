@@ -127,11 +127,14 @@ public:
         const TIntrusiveConstPtr<NACLib::TUserToken>& userToken,
         TKqpRequestCounters::TPtr counters, bool streamResult,
         const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig,
-        NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory)
+        NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory,
+        const TActorId& creator)
         : TBase(std::move(request), database, userToken, counters, executerRetriesConfig, TWilsonKqp::DataExecuter, "DataExecuter")
         , AsyncIoFactory(std::move(asyncIoFactory))
         , StreamResult(streamResult)
     {
+        Target = creator;
+
         YQL_ENSURE(Request.IsolationLevel != NKikimrKqp::ISOLATION_LEVEL_UNDEFINED);
 
         if (Request.AcquireLocksTxId || Request.ValidateLocks || Request.EraseLocks) {
@@ -172,6 +175,31 @@ public:
             }
             LOG_D(sb);
         }
+    }
+
+    bool ForceAcquireSnapshot() const {
+        const bool forceSnapshot = (
+            ReadOnlyTx &&
+            !ImmediateTx &&
+            !HasPersistentChannels &&
+            (!Database.empty() || AppData()->EnableMvccSnapshotWithLegacyDomainRoot) &&
+            AppData()->FeatureFlags.GetEnableMvccSnapshotReads()
+        );
+
+        return forceSnapshot;
+    }
+
+    bool GetUseFollowers() const {
+        return (
+            // first, we must specify read stale flag.
+            Request.IsolationLevel == NKikimrKqp::ISOLATION_LEVEL_READ_STALE &&
+            // next, if snapshot is already defined, so in this case followers are not allowed.
+            !GetSnapshot().IsValid() &&
+            // ensure that followers are allowed only for read only transactions.
+            ReadOnlyTx &&
+            // if we are forced to acquire snapshot by some reason, so we cannot use followers.
+            !ForceAcquireSnapshot()
+        );
     }
 
     void Finalize() {
@@ -273,6 +301,10 @@ public:
     }
 
 private:
+    bool IsCancelAfterAllowed(const TEvKqp::TEvAbortExecution::TPtr& ev) const {
+        return ReadOnlyTx || ev->Get()->Record.GetStatusCode() != NYql::NDqProto::StatusIds::CANCELLED;
+    }
+
     TString CurrentStateFuncName() const override {
         const auto& func = CurrentStateFunc();
         if (func == &TThis::PrepareState) {
@@ -514,8 +546,12 @@ private:
     }
 
     void HandlePrepare(TEvKqp::TEvAbortExecution::TPtr& ev) {
-        CancelProposal(0);
-        TBase::HandleAbortExecution(ev);
+        if (IsCancelAfterAllowed(ev)) {
+            CancelProposal(0);
+            TBase::HandleAbortExecution(ev);
+        } else {
+            LOG_D("Got TEvAbortExecution from : " << ev->Sender << " but cancelation is not alowed");
+        }
     }
 
     void CancelProposal(ui64 exceptShardId) {
@@ -917,10 +953,14 @@ private:
     }
 
     void HandleExecute(TEvKqp::TEvAbortExecution::TPtr& ev) {
-        if (ImmediateTx) {
-            CancelProposal(0);
+        if (IsCancelAfterAllowed(ev)) {
+            if (ImmediateTx) {
+                CancelProposal(0);
+            }
+            TBase::HandleAbortExecution(ev);
+        } else {
+            LOG_D("Got TEvAbortExecution from : " << ev->Sender << " but cancelation is not alowed");
         }
-        TBase::HandleAbortExecution(ev);
     }
 
     void HandleExecute(TEvColumnShard::TEvProposeTransactionResult::TPtr& ev) {
@@ -1116,7 +1156,7 @@ private:
 
         LOG_I("Reattach to shard " << tabletId);
 
-        Send(MakePipePeNodeCacheID(UseFollowers), new TEvPipeCache::TEvForward(
+        Send(MakePipePeNodeCacheID(false), new TEvPipeCache::TEvForward(
             new TEvDataShard::TEvProposeTransactionAttach(tabletId, TxId),
             tabletId, /* subscribe */ true), 0, ++shardState->ReattachState.Cookie);
     }
@@ -1487,7 +1527,7 @@ private:
         TShardState shardState;
         shardState.State = ImmediateTx ? TShardState::EState::Executing : TShardState::EState::Preparing;
         shardState.DatashardState.ConstructInPlace();
-        shardState.DatashardState->Follower = UseFollowers;
+        shardState.DatashardState->Follower = GetUseFollowers();
 
         if (Deadline) {
             TDuration timeout = *Deadline - TAppData::TimeProvider->Now();
@@ -1567,7 +1607,7 @@ private:
 
         LOG_D("ExecuteDatashardTransaction traceId.verbosity: " << std::to_string(traceId.GetVerbosity()));
 
-        Send(MakePipePeNodeCacheID(UseFollowers), new TEvPipeCache::TEvForward(ev.release(), shardId, true), 0, 0, std::move(traceId));
+        Send(MakePipePeNodeCacheID(GetUseFollowers()), new TEvPipeCache::TEvForward(ev.release(), shardId, true), 0, 0, std::move(traceId));
 
         auto result = ShardStates.emplace(shardId, std::move(shardState));
         YQL_ENSURE(result.second);
@@ -1575,7 +1615,7 @@ private:
 
     void ExecuteDataComputeTask(ui64 taskId, bool shareMailbox) {
         auto& task = TasksGraph.GetTask(taskId);
-        auto taskDesc = SerializeTaskToProto(TasksGraph, task);
+        NYql::NDqProto::TDqTask* taskDesc = ArenaSerializeTaskToProto(TasksGraph, task);
 
         TComputeRuntimeSettings settings;
         if (Deadline) {
@@ -1592,15 +1632,15 @@ private:
         limits.MkqlLightProgramMemoryLimit = Request.MkqlMemoryLimit > 0 ? std::min(500_MB, Request.MkqlMemoryLimit) : 500_MB;
         limits.MkqlHeavyProgramMemoryLimit = Request.MkqlMemoryLimit > 0 ? std::min(2_GB, Request.MkqlMemoryLimit) : 2_GB;
 
-        auto& taskOpts = taskDesc.GetProgram().GetSettings();
+        auto& taskOpts = taskDesc->GetProgram().GetSettings();
         auto limit = taskOpts.GetHasMapJoin() /* || opts.GetHasSort()*/
             ? limits.MkqlHeavyProgramMemoryLimit
             : limits.MkqlLightProgramMemoryLimit;
 
         limits.MemoryQuotaManager = std::make_shared<TGuaranteeQuotaManager>(limit, limit);
 
-        auto computeActor = CreateKqpComputeActor(SelfId(), TxId, std::move(taskDesc), AsyncIoFactory,
-            AppData()->FunctionRegistry, settings, limits);
+        auto computeActor = CreateKqpComputeActor(SelfId(), TxId, taskDesc, AsyncIoFactory,
+            AppData()->FunctionRegistry, settings, limits, NWilson::TTraceId(), TasksGraph.GetMeta().GetArenaIntrusivePtr());
 
         auto computeActorId = shareMailbox ? RegisterWithSameMailbox(computeActor) : Register(computeActor);
         task.ComputeActorId = computeActorId;
@@ -1697,7 +1737,7 @@ private:
             return;
         }
 
-        THashMap<ui64, TVector<NDqProto::TDqTask>> datashardTasks;  // shardId -> [task]
+        THashMap<ui64, TVector<NDqProto::TDqTask*>> datashardTasks;  // shardId -> [task]
         THashMap<ui64, TVector<ui64>> remoteComputeTasks;  // shardId -> [task]
         TVector<ui64> computeTasks;
 
@@ -1708,8 +1748,8 @@ private:
         for (auto& task : TasksGraph.GetTasks()) {
             auto& stageInfo = TasksGraph.GetStageInfo(task.StageId);
             if (task.Meta.ShardId && (task.Meta.Reads || task.Meta.Writes)) {
-                auto protoTask = SerializeTaskToProto(TasksGraph, task);
-                datashardTasks[task.Meta.ShardId].emplace_back(std::move(protoTask));
+                NYql::NDqProto::TDqTask* protoTask = ArenaSerializeTaskToProto(TasksGraph, task);
+                datashardTasks[task.Meta.ShardId].emplace_back(protoTask);
             } else if (stageInfo.Meta.IsSysView()) {
                 computeTasks.emplace_back(task.Id);
             } else {
@@ -1762,17 +1802,9 @@ private:
         // Single-shard transactions are always immediate
         ImmediateTx = (datashardTxs.size() + Request.TopicOperations.GetSize() + readActors) <= 1 && !UnknownAffectedShardCount;
 
-        if (ImmediateTx) {
-            // Transaction cannot be both immediate and volatile
-            YQL_ENSURE(!VolatileTx);
-        }
-
         switch (Request.IsolationLevel) {
             // OnlineRO with AllowInconsistentReads = true
             case NKikimrKqp::ISOLATION_LEVEL_READ_UNCOMMITTED:
-            // StaleRO transactions always execute as immediate
-            // (legacy behavior, for compatibility with current execution engine)
-            case NKikimrKqp::ISOLATION_LEVEL_READ_STALE:
                 YQL_ENSURE(ReadOnlyTx);
                 YQL_ENSURE(!VolatileTx);
                 ImmediateTx = true;
@@ -1780,6 +1812,11 @@ private:
 
             default:
                 break;
+        }
+
+        if (ImmediateTx) {
+            // Transaction cannot be both immediate and volatile
+            YQL_ENSURE(!VolatileTx);
         }
 
         if ((ReadOnlyTx || Request.UseImmediateEffects) && GetSnapshot().IsValid()) {
@@ -1790,13 +1827,15 @@ private:
         }
 
         ComputeTasks = std::move(computeTasks);
-        DatashardTxs = std::move(datashardTxs);
         TopicTxs = std::move(topicTxs);
+        DatashardTxs = std::move(datashardTxs);
         RemoteComputeTasks = std::move(remoteComputeTasks);
 
         if (prepareTasksSpan) {
             prepareTasksSpan.End();
         }
+
+        TasksGraph.GetMeta().UseFollowers = GetUseFollowers();
 
         if (RemoteComputeTasks) {
             TSet<ui64> shardIds;
@@ -1804,7 +1843,8 @@ private:
                 shardIds.insert(shardId);
             }
 
-            auto kqpShardsResolver = CreateKqpShardsResolver(SelfId(), TxId, std::move(shardIds));
+            auto kqpShardsResolver = CreateKqpShardsResolver(
+                SelfId(), TxId, TasksGraph.GetMeta().UseFollowers, std::move(shardIds));
             RegisterWithSameMailbox(kqpShardsResolver);
             Become(&TKqpDataExecuter::WaitResolveState);
         } else {
@@ -1823,14 +1863,7 @@ private:
     }
 
     void OnShardsResolve() {
-        const bool forceSnapshot = (
-                ReadOnlyTx &&
-                !ImmediateTx &&
-                !HasPersistentChannels &&
-                (!Database.empty() || AppData()->EnableMvccSnapshotWithLegacyDomainRoot) &&
-                AppData()->FeatureFlags.GetEnableMvccSnapshotReads());
-
-        if (forceSnapshot) {
+        if (ForceAcquireSnapshot()) {
             YQL_ENSURE(!VolatileTx);
             auto longTxService = NLongTxService::MakeLongTxServiceID(SelfId().NodeId());
             Send(longTxService, new NLongTxService::TEvLongTxService::TEvAcquireReadSnapshot(Database));
@@ -1877,25 +1910,10 @@ private:
         ContinueExecute();
     }
 
-    using TDatashardTxs = THashMap<ui64, NKikimrTxDataShard::TKqpTransaction>;
+    using TDatashardTxs = THashMap<ui64, NKikimrTxDataShard::TKqpTransaction*>;
     using TTopicTabletTxs = THashMap<ui64, NKikimrPQ::TDataTransaction>;
 
     void ContinueExecute() {
-        UseFollowers = Request.IsolationLevel == NKikimrKqp::ISOLATION_LEVEL_READ_STALE;
-
-        if (!ImmediateTx) {
-            // Followers only allowed for single shard transactions.
-            // (legacy behaviour, for compatibility with current execution engine)
-            UseFollowers = false;
-        }
-        if (GetSnapshot().IsValid()) {
-            // TODO: KIKIMR-11912
-            UseFollowers = false;
-        }
-        if (UseFollowers) {
-            YQL_ENSURE(ReadOnlyTx);
-        }
-
         if (Stats) {
             //Stats->AffectedShards = datashardTxs.size();
             Stats->DatashardStats.reserve(DatashardTxs.size());
@@ -1923,14 +1941,24 @@ private:
         }
     }
 
-    TDatashardTxs BuildDatashardTxs(const THashMap<ui64, TVector<NDqProto::TDqTask>>& datashardTasks,
+    TDatashardTxs BuildDatashardTxs(THashMap<ui64, TVector<NDqProto::TDqTask*>>& datashardTasks,
                                     TTopicTabletTxs& topicTxs) {
         TDatashardTxs datashardTxs;
 
+        std::vector<ui64> affectedShardsSet;
+        affectedShardsSet.reserve(datashardTasks.size());
+
         for (auto& [shardId, tasks]: datashardTasks) {
-            auto& dsTxs = datashardTxs[shardId];
+            auto [it, success] = datashardTxs.emplace(
+                shardId,
+                TasksGraph.GetMeta().Allocate<NKikimrTxDataShard::TKqpTransaction>());
+
+            YQL_ENSURE(success, "unexpected duplicates in datashard transactions");
+            affectedShardsSet.emplace_back(shardId);
+            NKikimrTxDataShard::TKqpTransaction* dsTxs = it->second;
+            dsTxs->MutableTasks()->Reserve(tasks.size());
             for (auto& task: tasks) {
-                dsTxs.AddTasks()->CopyFrom(task);
+                dsTxs->AddTasks()->Swap(task);
             }
         }
 
@@ -1953,7 +1981,7 @@ private:
             // TODO: add support in the future
             topicTxs.empty() &&
             // We only want to use volatile transactions for multiple shards
-            (datashardTasks.size() + topicTxs.size()) > 1 &&
+            (affectedShardsSet.size() + topicTxs.size()) > 1 &&
             // We cannot use volatile transactions with persistent channels
             // Note: currently persistent channels are never used
             !HasPersistentChannels);
@@ -1979,16 +2007,14 @@ private:
 
             auto locksOp = needCommit
                 ? NKikimrTxDataShard::TKqpLocks::Commit
-                : (Request.ValidateLocks
-                        ? NKikimrTxDataShard::TKqpLocks::Validate
-                        : NKikimrTxDataShard::TKqpLocks::Rollback);
+                : NKikimrTxDataShard::TKqpLocks::Rollback;
 
             absl::flat_hash_set<ui64> sendingShardsSet;
             absl::flat_hash_set<ui64> receivingShardsSet;
 
             // Gather shards that need to send/receive readsets (shards with effects)
             if (needCommit) {
-                for (auto& [shardId, _] : datashardTasks) {
+                for (auto& shardId: affectedShardsSet) {
                     if (ShardsWithEffects.contains(shardId)) {
                         // Volatile transactions may abort effects, so they send readsets
                         if (VolatileTx) {
@@ -2010,11 +2036,21 @@ private:
 
             // Gather locks that need to be committed or erased
             for (auto& [shardId, locksList] : locksMap) {
-                auto& tx = datashardTxs[shardId];
-                tx.MutableLocks()->SetOp(locksOp);
+                NKikimrTxDataShard::TKqpTransaction* tx = nullptr;
+                auto it = datashardTxs.find(shardId);
+                if (it != datashardTxs.end()) {
+                    tx = it->second;
+                } else {
+                    auto [eIt, success] = datashardTxs.emplace(
+                        shardId,
+                        TasksGraph.GetMeta().Allocate<NKikimrTxDataShard::TKqpTransaction>());
+                    tx = eIt->second;
+                }
+
+                tx->MutableLocks()->SetOp(locksOp);
 
                 if (!locksList.empty()) {
-                    auto* protoLocks = tx.MutableLocks()->MutableLocks();
+                    auto* protoLocks = tx->MutableLocks()->MutableLocks();
                     protoLocks->Reserve(locksList.size());
                     bool hasWrites = false;
                     for (auto& lock : locksList) {
@@ -2044,18 +2080,15 @@ private:
                 std::sort(receivingShards.begin(), receivingShards.end());
 
                 for (auto& [shardId, shardTx] : datashardTxs) {
-                    shardTx.MutableLocks()->SetOp(locksOp);
-                    *shardTx.MutableLocks()->MutableSendingShards() = sendingShards;
-                    *shardTx.MutableLocks()->MutableReceivingShards() = receivingShards;
+                    shardTx->MutableLocks()->SetOp(locksOp);
+                    *shardTx->MutableLocks()->MutableSendingShards() = sendingShards;
+                    *shardTx->MutableLocks()->MutableReceivingShards() = receivingShards;
                 }
 
                 for (auto& [_, tx] : topicTxs) {
                     switch (locksOp) {
                     case NKikimrTxDataShard::TKqpLocks::Commit:
                         tx.SetOp(NKikimrPQ::TDataTransaction::Commit);
-                        break;
-                    case NKikimrTxDataShard::TKqpLocks::Validate:
-                        tx.SetOp(NKikimrPQ::TDataTransaction::Validate);
                         break;
                     case NKikimrTxDataShard::TKqpLocks::Rollback:
                         tx.SetOp(NKikimrPQ::TDataTransaction::Rollback);
@@ -2073,7 +2106,7 @@ private:
         if (useGenericReadSets) {
             // Make sure datashards use generic readsets
             for (auto& pr : datashardTxs) {
-                pr.second.SetUseGenericReadSets(true);
+                pr.second->SetUseGenericReadSets(true);
             }
         }
 
@@ -2131,9 +2164,9 @@ private:
 
         // then start data tasks with known actor ids of compute tasks
         for (auto& [shardId, shardTx] : DatashardTxs) {
-            shardTx.SetType(NKikimrTxDataShard::KQP_TX_TYPE_DATA);
+            shardTx->SetType(NKikimrTxDataShard::KQP_TX_TYPE_DATA);
             std::optional<bool> isOlap;
-            for (auto& protoTask : *shardTx.MutableTasks()) {
+            for (auto& protoTask : *shardTx->MutableTasks()) {
                 ui64 taskId = protoTask.GetId();
                 auto& task = TasksGraph.GetTask(taskId);
                 auto& stageInfo = TasksGraph.GetStageInfo(task.StageId);
@@ -2178,7 +2211,7 @@ private:
                 LOG_D("datashard task: " << taskId << ", proto: " << protoTask.ShortDebugString());
             }
 
-            ExecuteDatashardTransaction(shardId, shardTx, LockTxId, isOlap.value_or(false));
+            ExecuteDatashardTransaction(shardId, *shardTx, LockTxId, isOlap.value_or(false));
         }
 
         ExecuteTopicTabletTransactions(TopicTxs);
@@ -2194,7 +2227,7 @@ private:
             << ", volatile: " << VolatileTx
             << ", immediate: " << ImmediateTx
             << ", pending compute tasks" << PendingComputeTasks.size()
-            << ", useFollowers: " << UseFollowers);
+            << ", useFollowers: " << GetUseFollowers());
 
         LOG_T("Updating channels after the creation of compute actors");
         THashMap<TActorId, THashSet<ui64>> updates;
@@ -2235,7 +2268,7 @@ private:
             LOG_D("Executing KQP transaction on topic tablet: " << tabletId
                   << ", lockTxId: " << lockTxId);
 
-            Send(MakePipePeNodeCacheID(UseFollowers),
+            Send(MakePipePeNodeCacheID(false),
                  new TEvPipeCache::TEvForward(ev.release(), tabletId, true),
                  0,
                  0,
@@ -2245,7 +2278,7 @@ private:
             state.State =
                 ImmediateTx ? TShardState::EState::Executing : TShardState::EState::Preparing;
             state.DatashardState.ConstructInPlace();
-            state.DatashardState->Follower = UseFollowers;
+            state.DatashardState->Follower = false;
 
             state.DatashardState->ShardReadLocks = Request.TopicOperations.TabletHasReadOperations(tabletId);
 
@@ -2264,7 +2297,7 @@ private:
 
         Send(MakePipePeNodeCacheID(false), new TEvPipeCache::TEvUnlink(0));
 
-        if (UseFollowers) {
+        if (GetUseFollowers()) {
             Send(MakePipePeNodeCacheID(true), new TEvPipeCache::TEvUnlink(0));
         }
 
@@ -2329,7 +2362,6 @@ private:
     bool ReadOnlyTx = true;
     bool VolatileTx = false;
     bool ImmediateTx = false;
-    bool UseFollowers = false;
     bool TxPlanned = false;
     bool LocksBroken = false;
 
@@ -2356,9 +2388,9 @@ private:
 } // namespace
 
 IActor* CreateKqpDataExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database, const TIntrusiveConstPtr<NACLib::TUserToken>& userToken,
-    TKqpRequestCounters::TPtr counters, bool streamResult, const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig, NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory)
+    TKqpRequestCounters::TPtr counters, bool streamResult, const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig, NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory, const TActorId& creator)
 {
-    return new TKqpDataExecuter(std::move(request), database, userToken, counters, streamResult, executerRetriesConfig, std::move(asyncIoFactory));
+    return new TKqpDataExecuter(std::move(request), database, userToken, counters, streamResult, executerRetriesConfig, std::move(asyncIoFactory), creator);
 }
 
 } // namespace NKqp

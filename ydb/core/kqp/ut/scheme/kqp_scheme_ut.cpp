@@ -1,6 +1,7 @@
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
 #include <ydb/core/formats/arrow/arrow_helpers.h>
 #include <ydb/core/tx/tx_proxy/proxy.h>
+#include <ydb/core/tx/columnshard/columnshard_ut_common.h>
 #include <ydb/public/sdk/cpp/client/ydb_proto/accessor.h>
 #include <ydb/public/sdk/cpp/client/ydb_scheme/scheme.h>
 #include <ydb/public/sdk/cpp/client/ydb_topic/topic.h>
@@ -1561,6 +1562,45 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         CreateTableWithTtlSettings(true);
     }
 
+    void CreateTableWithTtlOnIntColumn(TValueSinceUnixEpochModeSettings::EUnit unit) {
+        TKikimrRunner kikimr;
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+        TString tableName = "/Root/TableWithTtlSettings";
+
+        auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            CREATE TABLE `)" << tableName << R"(` (
+                Key Uint64,
+                IntColumn Uint64,
+                PRIMARY KEY (Key)
+            ) WITH (
+                TTL = Interval("P1D") ON IntColumn AS )" << unit << R"(
+            ))";
+        {
+            auto result = session.ExecuteSchemeQuery(query).ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        }
+        {
+            auto result = session.DescribeTable(tableName).ExtractValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+            UNIT_ASSERT_VALUES_EQUAL(result.GetTableDescription().GetTtlSettings()->GetValueSinceUnixEpoch().GetColumnUnit(), unit);
+        }
+    }
+
+    Y_UNIT_TEST(CreateTableWithTtlOnIntColumn) {
+        const auto cases = TVector<TValueSinceUnixEpochModeSettings::EUnit>{
+            TValueSinceUnixEpochModeSettings::EUnit::Seconds,
+            TValueSinceUnixEpochModeSettings::EUnit::MilliSeconds,
+            TValueSinceUnixEpochModeSettings::EUnit::MicroSeconds,
+            TValueSinceUnixEpochModeSettings::EUnit::NanoSeconds,
+        };
+
+        for (auto unit : cases) {
+            CreateTableWithTtlOnIntColumn(unit);
+        }
+    }
+
     void CreateTableWithUniformPartitions(bool compat) {
         TKikimrRunner kikimr;
         auto db = kikimr.GetTableClient();
@@ -2311,6 +2351,496 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         }
     }
 
+    struct ExpectedPermissions {
+        TString Path;
+        THashMap<TString, TVector<TString>> Permissions;
+    };
+
+    void CheckPermissions(TSession& session, TVector<ExpectedPermissions>&& expectedPermissionsValues) {
+        for (auto& value : expectedPermissionsValues) {
+            TDescribeTableResult describe = session.DescribeTable(value.Path).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL(describe.GetStatus(), EStatus::SUCCESS);
+            auto tableDesc = describe.GetTableDescription();
+            const auto& permissions = tableDesc.GetPermissions();
+
+            THashMap<TString, TVector<TString>> describePermissions;
+            for (const auto& permission : permissions) {
+                auto& permissionNames = describePermissions[permission.Subject];
+                permissionNames.insert(permissionNames.end(), permission.PermissionNames.begin(), permission.PermissionNames.end());
+            }
+
+            auto& expectedPermissions = value.Permissions;
+            UNIT_ASSERT_VALUES_EQUAL_C(expectedPermissions.size(), describePermissions.size(), "Number of user names does not equal on path: " + value.Path);
+            for (auto& item : expectedPermissions) {
+                auto& expectedPermissionNames = item.second;
+                auto& describedPermissionNames = describePermissions[item.first];
+                UNIT_ASSERT_VALUES_EQUAL_C(expectedPermissionNames.size(), describedPermissionNames.size(), "Number of permissions for " + item.first + " does not equal on path: " + value.Path);
+                sort(expectedPermissionNames.begin(), expectedPermissionNames.end());
+                sort(describedPermissionNames.begin(), describedPermissionNames.end());
+                UNIT_ASSERT_VALUES_EQUAL_C(expectedPermissionNames, describedPermissionNames, "Permissions are not equal on path: " + value.Path);
+            }
+        }
+    }
+
+    Y_UNIT_TEST(ModifyPermissions) {
+        TKikimrRunner kikimr;
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            CREATE TABLE `)" << "/Root/table1" << R"(` (
+                Key Uint64,
+                Value String,
+                PRIMARY KEY (Key)
+            );)";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+            query.clear();
+            query << R"(
+            --!syntax_v1
+            CREATE TABLE `)" << "/Root/table2" << R"(` (
+                Key Uint64,
+                Value String,
+                PRIMARY KEY (Key)
+            );)";
+            result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT CONNECT ON `/Root` TO user1;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {.Path = "/Root",
+                                                .Permissions = {
+                                                            {"user1", {"ydb.database.connect"}}
+                                                            }
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {}
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            REVOKE "ydb.database.connect" ON `/Root` FROM user1;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {}
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {}
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT MODIFY TABLES, 'ydb.tables.read' ON `/Root/table1`, `/Root/table2` TO user2;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {}
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            REVOKE SELECT TABLES, "ydb.tables.modify", ON `/Root/table2` FROM user2;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {}
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT "ydb.generic.read", LIST, "ydb.generic.write", USE LEGACY ON `/Root` TO user3, user4, user5;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {
+                                                    {"user3", {"ydb.generic.read", "ydb.generic.list", "ydb.generic.write", "ydb.generic.use_legacy"}},
+                                                    {"user4", {"ydb.generic.read", "ydb.generic.list", "ydb.generic.write", "ydb.generic.use_legacy"}},
+                                                    {"user5", {"ydb.generic.read", "ydb.generic.list", "ydb.generic.write", "ydb.generic.use_legacy"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            REVOKE "ydb.generic.use_legacy", SELECT, "ydb.generic.list", INSERT ON `/Root` FROM user4, user3;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {
+                                                    {"user5", {"ydb.generic.read", "ydb.generic.list", "ydb.generic.write", "ydb.generic.use_legacy"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT ALL ON `/Root` TO user6;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {
+                                                    {"user5", {"ydb.generic.read", "ydb.generic.list", "ydb.generic.write", "ydb.generic.use_legacy"}},
+                                                    {"user6", {"ydb.generic.full"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            REVOKE ALL PRIVILEGES ON `/Root` FROM user6;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {
+                                                    {"user5", {"ydb.generic.read", "ydb.generic.list", "ydb.generic.write", "ydb.generic.use_legacy"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT "ydb.generic.use", "ydb.generic.manage" ON `/Root` TO user7 WITH GRANT OPTION;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {
+                                                    {"user5", {"ydb.generic.read", "ydb.generic.list", "ydb.generic.write", "ydb.generic.use_legacy"}},
+                                                    {"user7", {"ydb.generic.use", "ydb.generic.manage", "ydb.access.grant"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            REVOKE GRANT OPTION FOR USE, MANAGE ON `/Root` FROM user7;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {
+                                                    {"user5", {"ydb.generic.read", "ydb.generic.list", "ydb.generic.write", "ydb.generic.use_legacy"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT USE LEGACY, FULL LEGACY, FULL, CREATE, DROP, GRANT,
+                  SELECT ROW, UPDATE ROW, ERASE ROW, SELECT ATTRIBUTES,
+                  MODIFY ATTRIBUTES, CREATE DIRECTORY, CREATE TABLE, CREATE QUEUE,
+                  REMOVE SCHEMA, DESCRIBE SCHEMA, ALTER SCHEMA ON `/Root` TO user8;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {
+                                                    {"user5", {"ydb.generic.read", "ydb.generic.list", "ydb.generic.write", "ydb.generic.use_legacy"}},
+                                                    {"user8", {"ydb.generic.use_legacy", "ydb.generic.full_legacy", "ydb.generic.full",
+                                                                   "ydb.database.create", "ydb.database.drop", "ydb.access.grant", "ydb.granular.select_row",
+                                                                   "ydb.granular.update_row", "ydb.granular.erase_row", "ydb.granular.read_attributes",
+                                                                  "ydb.granular.write_attributes", "ydb.granular.create_directory", "ydb.granular.create_table",
+                                                                  "ydb.granular.create_queue", "ydb.granular.remove_schema", "ydb.granular.describe_schema", "ydb.granular.alter_schema"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            REVOKE "ydb.granular.write_attributes", "ydb.granular.create_directory", "ydb.granular.create_table", "ydb.granular.create_queue",
+                   "ydb.granular.select_row", "ydb.granular.update_row", "ydb.granular.erase_row", "ydb.granular.read_attributes",
+                   "ydb.generic.use_legacy", "ydb.generic.full_legacy", "ydb.generic.full", "ydb.database.create", "ydb.database.drop", "ydb.access.grant",
+                   "ydb.granular.remove_schema", "ydb.granular.describe_schema", "ydb.granular.alter_schema" ON `/Root` FROM user8;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {
+                                                    {"user5", {"ydb.generic.read", "ydb.generic.list", "ydb.generic.write", "ydb.generic.use_legacy"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                            });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            REVOKE LIST, INSERT ON `/Root` FROM user9, user4, user5;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {{"user5", {"ydb.generic.read", "ydb.generic.use_legacy"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {
+                                                    {"user2", {"ydb.tables.read", "ydb.tables.modify"}}
+                                                }
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            REVOKE ALL ON `/Root`, `/Root/table1` FROM user9, user4, user5, user2;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            CheckPermissions(session, {
+                                            {
+                                                .Path = "/Root",
+                                                .Permissions = {}
+                                            },
+                                            {
+                                                .Path = "/Root/table1",
+                                                .Permissions = {}
+                                            },
+                                            {
+                                                .Path = "/Root/table2",
+                                                .Permissions = {}
+                                            }
+                                        });
+        }
+    }
+
+    Y_UNIT_TEST(ModifyUnknownPermissions) {
+        TKikimrRunner kikimr;
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT ROW SELECT ON `/Root` TO user1;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::GENERIC_ERROR, result.GetIssues().ToString());
+            UNIT_ASSERT_STRING_CONTAINS(result.GetIssues().ToString(), "Unexpected token 'ROW'");
+            CheckPermissions(session, {{.Path = "/Root", .Permissions = {}}});
+        }
+
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT `ydb.database.connect` ON `/Root` TO user1;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::GENERIC_ERROR, result.GetIssues().ToString());
+            UNIT_ASSERT_STRING_CONTAINS(result.GetIssues().ToString(), "Unexpected token '`ydb.database.connect`'");
+            CheckPermissions(session, {{.Path = "/Root", .Permissions = {}}});
+        }
+
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT CONNECT, READ ON `/Root` TO user1;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::GENERIC_ERROR, result.GetIssues().ToString());
+            UNIT_ASSERT_STRING_CONTAINS(result.GetIssues().ToString(), "Unexpected token 'READ'");
+            CheckPermissions(session, {{.Path = "/Root", .Permissions = {}}});
+        }
+
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT "" ON `/Root` TO user1;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::GENERIC_ERROR, result.GetIssues().ToString());
+            UNIT_ASSERT_STRING_CONTAINS(result.GetIssues().ToString(), "Unknown permission name: ");
+            CheckPermissions(session, {{.Path = "/Root", .Permissions = {}}});
+        }
+    }
+
+    Y_UNIT_TEST(ModifyPermissionsByIncorrectPathes) {
+        TKikimrRunner kikimr;
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+        {
+            auto query = TStringBuilder() << R"(
+            --!syntax_v1
+            GRANT CONNECT, LIST ON `/Root`, `/UnknownPath` TO user1;
+            )";
+            auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::GENERIC_ERROR, result.GetIssues().ToString());
+            UNIT_ASSERT_STRING_CONTAINS(result.GetIssues().ToString(), "Path does not exist");
+            UNIT_ASSERT_STRING_CONTAINS(result.GetIssues().ToString(), "Error for the path: /UnknownPath");
+            CheckPermissions(session, {{.Path = "/Root", .Permissions = {{"user1", {"ydb.database.connect", "ydb.generic.list"}}}}});
+        }
+    }
+
     Y_UNIT_TEST(CreateUserWithoutPassword) {
         TKikimrRunner kikimr;
         auto db = kikimr.GetTableClient();
@@ -2635,7 +3165,9 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
     }
 
     void AddChangefeed(EChangefeedMode mode, EChangefeedFormat format) {
-        TKikimrRunner kikimr(TKikimrSettings().SetPQConfig(DefaultPQConfig()));
+        TKikimrRunner kikimr(TKikimrSettings()
+            .SetPQConfig(DefaultPQConfig())
+            .SetEnableChangefeedDynamoDBStreamsFormat(true));
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
@@ -2748,7 +3280,9 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
     }
 
     Y_UNIT_TEST(AddChangefeedNegative) {
-        TKikimrRunner kikimr(TKikimrSettings().SetPQConfig(DefaultPQConfig()));
+        TKikimrRunner kikimr(TKikimrSettings()
+            .SetPQConfig(DefaultPQConfig())
+            .SetEnableChangefeedDynamoDBStreamsFormat(true));
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
@@ -2839,7 +3373,9 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
     }
 
     Y_UNIT_TEST(ChangefeedAwsRegion) {
-        TKikimrRunner kikimr(TKikimrSettings().SetPQConfig(DefaultPQConfig()));
+        TKikimrRunner kikimr(TKikimrSettings()
+            .SetPQConfig(DefaultPQConfig())
+            .SetEnableChangefeedDynamoDBStreamsFormat(true));
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
 
@@ -3515,12 +4051,30 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
             );)";
         auto result = session.ExecuteSchemeQuery(query).GetValueSync();
         UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+#if 0 // TODO
+        { // describe table
+            auto desc = session.DescribeTable(tableName).ExtractValueSync();
+            UNIT_ASSERT_C(desc.IsSuccess(), desc.GetIssues().ToString());
 
+            auto tiering = desc.GetTableDescription().GetTiering();
+            UNIT_ASSERT(tiering);
+            UNIT_ASSERT_VALUES_EQUAL(*tiering, "tiering1");
+        }
+#endif
         auto query2 = TStringBuilder() << R"(
             --!syntax_v1
             ALTER TABLE `)" << tableName << R"(` SET(TIERING = 'tiering2');)";
         result = session.ExecuteSchemeQuery(query2).GetValueSync();
         UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        { // describe table
+            auto desc = session.DescribeTable(tableName).ExtractValueSync();
+            UNIT_ASSERT_C(desc.IsSuccess(), desc.GetIssues().ToString());
+
+            auto tiering = desc.GetTableDescription().GetTiering();
+            UNIT_ASSERT(tiering);
+            UNIT_ASSERT_VALUES_EQUAL(*tiering, "tiering2");
+        }
 
         auto query3 = TStringBuilder() << R"(
             --!syntax_v1
@@ -3528,11 +4082,28 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         result = session.ExecuteSchemeQuery(query3).GetValueSync();
         UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
 
+        { // describe table
+            auto desc = session.DescribeTable(tableName).ExtractValueSync();
+            UNIT_ASSERT_C(desc.IsSuccess(), desc.GetIssues().ToString());
+
+            auto tiering = desc.GetTableDescription().GetTiering();
+            UNIT_ASSERT(!tiering);
+        }
+
         auto query4 = TStringBuilder() << R"(
             --!syntax_v1
             ALTER TABLE `)" << tableName << R"(` SET (TIERING = 'tiering1');)";
         result = session.ExecuteSchemeQuery(query4).GetValueSync();
         UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        { // describe table
+            auto desc = session.DescribeTable(tableName).ExtractValueSync();
+            UNIT_ASSERT_C(desc.IsSuccess(), desc.GetIssues().ToString());
+
+            auto tiering = desc.GetTableDescription().GetTiering();
+            UNIT_ASSERT(tiering);
+            UNIT_ASSERT_VALUES_EQUAL(*tiering, "tiering1");
+        }
 
         auto query5 = TStringBuilder() << R"(
             --!syntax_v1
@@ -4130,7 +4701,7 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
     }
 }
 
-Y_UNIT_TEST_SUITE(KqpOlapScheme) {
+namespace {
     class TTestHelper {
     public:
         class TColumnSchema {
@@ -4141,64 +4712,13 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
             TString BuildQuery() const {
                 auto str = TStringBuilder() << Name << " " << NScheme::GetTypeName(Type);
                 if (!NullableFlag) {
-                    str << " NOT NULL"; 
+                    str << " NOT NULL";
                 }
                 return str;
             }
         };
 
-        class TUpdatesBuilder {
-            std::vector<std::unique_ptr<arrow::ArrayBuilder>> Builders;
-            std::shared_ptr<arrow::Schema> Schema;
-            ui32 RowsCount = 0;
-        public:
-            class TRowBuilder {
-                TUpdatesBuilder& Owner;
-                YDB_READONLY(ui32, Index, 0);
-            public:
-                TRowBuilder(ui32 index, TUpdatesBuilder& owner)
-                    : Owner(owner)
-                    , Index(index)
-                {}
-
-                template <class T>
-                TRowBuilder Add(const T& data) {
-                    Y_VERIFY(Index < Owner.Builders.size());
-                    auto dataScalar = arrow::MakeScalar(data);
-                    auto res = Owner.Builders[Index]->AppendScalar(*dataScalar);
-                    return TRowBuilder(Index + 1, Owner);
-                }
-
-                TRowBuilder AddNull() {
-                    Y_VERIFY(Index < Owner.Builders.size());
-                    auto res = Owner.Builders[Index]->AppendNull();
-                    return TRowBuilder(Index + 1, Owner);
-                }
-            };
-
-            TUpdatesBuilder(std::shared_ptr<arrow::Schema> schema)
-                : Schema(schema)
-            {
-                Builders = NArrow::MakeBuilders(schema);
-                Y_VERIFY(Builders.size() == schema->fields().size());
-            }
-
-            TRowBuilder AddRow() {
-                ++RowsCount;
-                return TRowBuilder(0, *this);
-            }
-
-            std::shared_ptr<arrow::RecordBatch> BuildArrow() {
-                TVector<std::shared_ptr<arrow::Array>> columns;
-                columns.reserve(Builders.size());
-                for (auto&& builder : Builders) {
-                    auto arrayDataRes = builder->Finish();
-                    Y_VERIFY(arrayDataRes.ok());
-                    columns.push_back(*arrayDataRes);
-                }
-                return arrow::RecordBatch::Make(Schema, RowsCount, columns);
-            }
-        };
+        using TUpdatesBuilder = NColumnShard::TTableUpdatesBuilder;
 
         class TColumnTableBase {
             YDB_ACCESSOR_DEF(TString, Name);
@@ -4268,15 +4788,15 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
                 case NScheme::NTypeIds::Yson:
                     return arrow::field(name, arrow::binary());
                 case NScheme::NTypeIds::Date:
-                    return arrow::field(name, arrow::uint16()); 
+                    return arrow::field(name, arrow::uint16());
                 case NScheme::NTypeIds::Datetime:
                     return arrow::field(name, arrow::uint32());
                 case NScheme::NTypeIds::Timestamp:
                     return arrow::field(name, arrow::timestamp(arrow::TimeUnit::TimeUnit::MICRO));
                 case NScheme::NTypeIds::Interval:
-                    return arrow::field(name, arrow::duration(arrow::TimeUnit::TimeUnit::MICRO)); 
+                    return arrow::field(name, arrow::duration(arrow::TimeUnit::TimeUnit::MICRO));
                 case NScheme::NTypeIds::JsonDocument:
-                    return arrow::field(name, arrow::binary());  
+                    return arrow::field(name, arrow::binary());
                 }
                 return nullptr;
             }
@@ -4310,6 +4830,10 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
             , Session(TableClient.CreateSession().GetValueSync().GetSession())
         {}
 
+        TKikimrRunner& GetKikimr() {
+            return Kikimr;
+        }
+
         NYdb::NTable::TSession& GetSession() {
             return Session;
         }
@@ -4340,11 +4864,23 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
             UNIT_ASSERT_VALUES_EQUAL_C(resCommitTx.Status().GetStatus(), EStatus::SUCCESS, resCommitTx.Status().GetIssues().ToString());
         }
 
-        void ReadData(const TString& query, const TString& expected) {
+        void BulkUpsert(const TColumnTable& table, TTestHelper::TUpdatesBuilder& updates, const Ydb::StatusIds_StatusCode& opStatus = Ydb::StatusIds::SUCCESS) {
+            Y_UNUSED(opStatus);
+            NKikimr::Tests::NCS::THelper helper(Kikimr.GetTestServer());
+            auto batch = updates.BuildArrow();
+            helper.SendDataViaActorSystem(table.GetName(), batch, opStatus);
+        }
+
+        void ReadData(const TString& query, const TString& expected, const EStatus opStatus = EStatus::SUCCESS) {
             auto it = TableClient.StreamExecuteScanQuery(query).GetValueSync();
-            UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
-            TString result = StreamResultToYson(it);
-            UNIT_ASSERT_NO_DIFF(ReformatYson(result), ReformatYson(expected));
+            UNIT_ASSERT_VALUES_EQUAL_C(it.GetStatus(), opStatus, it.GetIssues().ToString());
+            const TString result = StreamResultToYson(it, false, opStatus);
+            Cerr << "STATUS: " << opStatus << Endl <<
+                "QUERY: " << query << Endl <<
+                result << " vs " << expected << Endl;
+            if (opStatus == EStatus::SUCCESS) {
+                UNIT_ASSERT_NO_DIFF(ReformatYson(result), ReformatYson(expected));
+            }
         }
 
         void RebootTablets(const TString& tableName) {
@@ -4362,6 +4898,30 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
             }
         }
     };
+}
+
+Y_UNIT_TEST_SUITE(KqpOlapScheme) {
+
+    void EnableDebugLogging(NActors::TTestActorRuntime * runtime) {
+        //runtime->SetLogPriority(NKikimrServices::FLAT_TX_SCHEMESHARD, NActors::NLog::PRI_DEBUG);
+        //runtime->SetLogPriority(NKikimrServices::TX_PROXY_SCHEME_CACHE, NActors::NLog::PRI_DEBUG);
+        // runtime->SetLogPriority(NKikimrServices::SCHEME_BOARD_REPLICA, NActors::NLog::PRI_DEBUG);
+        // runtime->SetLogPriority(NKikimrServices::TX_PROXY, NActors::NLog::PRI_DEBUG);
+        // runtime->SetLogPriority(NKikimrServices::KQP_EXECUTER, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::KQP_COMPUTE, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::KQP_GATEWAY, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::KQP_RESOURCE_MANAGER, NActors::NLog::PRI_DEBUG);
+        //runtime->SetLogPriority(NKikimrServices::LONG_TX_SERVICE, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::TX_COLUMNSHARD, NActors::NLog::PRI_TRACE);
+        runtime->SetLogPriority(NKikimrServices::TX_COLUMNSHARD_SCAN, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::TX_CONVEYOR, NActors::NLog::PRI_DEBUG);
+        runtime->SetLogPriority(NKikimrServices::METADATA_PROVIDER, NActors::NLog::PRI_DEBUG);
+        //runtime->SetLogPriority(NKikimrServices::GRPC_SERVER, NActors::NLog::PRI_DEBUG);
+    }
+
+    void EnableDebugLogging(TKikimrRunner& kikimr) {
+        EnableDebugLogging(kikimr.GetTestServer().GetRuntime());
+    }
 
     Y_UNIT_TEST(AddColumn) {
         TKikimrSettings runnerSettings;
@@ -4373,12 +4933,11 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
             TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
             TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
         };
-        
         TTestHelper::TColumnTable testTable;
 
         testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
         testHelper.CreateTable(testTable);
-       
+
         {
             TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
             tableInserter.AddRow().Add(1).Add("test_res_1").AddNull();
@@ -4404,11 +4963,11 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
             auto columns = description.GetTableColumns();
             UNIT_ASSERT_VALUES_EQUAL(columns.size(), 4);
         }
-    
+
         testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=1", "[[1;#;#;[\"test_res_1\"]]]");
         testHelper.ReadData("SELECT new_column FROM `/Root/ColumnTableTest` WHERE id=1", "[[#]]");
         testHelper.ReadData("SELECT resource_id FROM `/Root/ColumnTableTest` WHERE id=1", "[[[\"test_res_1\"]]]");
-
+        EnableDebugLogging(testHelper.GetKikimr());
         {
             TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
             tableInserter.AddRow().Add(3).Add("test_res_3").Add(123).Add<uint64_t>(200);
@@ -4416,6 +4975,7 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
         }
 
         testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=3", "[[3;[123];[200u];[\"test_res_3\"]]]");
+        testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE new_column=200", "[[3;[123];[200u];[\"test_res_3\"]]]");
         testHelper.ReadData("SELECT new_column FROM `/Root/ColumnTableTest` WHERE id=3", "[[[200u]]]");
         testHelper.ReadData("SELECT resource_id FROM `/Root/ColumnTableTest` WHERE id=3", "[[[\"test_res_3\"]]]");
         testHelper.ReadData("SELECT new_column FROM `/Root/ColumnTableTest`", "[[#];[#];[[200u]]]");
@@ -4431,7 +4991,7 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
             TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
             TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
         };
-        
+
         TTestHelper::TColumnTable testTable;
 
         testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
@@ -4448,6 +5008,34 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
         }
     }
 
+    Y_UNIT_TEST(AddColumnOldSchemeBulkUpsert) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        TTestHelper testHelper(runnerSettings);
+
+        TVector<TTestHelper::TColumnSchema> schema = {
+            TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int32).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
+            TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
+        };
+
+        TTestHelper::TColumnTable testTable;
+
+        testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTable);
+        {
+            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "` ADD COLUMN new_column Uint64;";
+            auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::SUCCESS, alterResult.GetIssues().ToString());
+        }
+        {
+            TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
+            tableInserter.AddRow().Add(1).Add("test_res_1").AddNull();
+            testHelper.BulkUpsert(testTable, tableInserter);
+        }
+        testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=1", "[[1;#;#;[\"test_res_1\"]]]");
+    }
+
     Y_UNIT_TEST(AddColumnOnSchemeChange) {
         TKikimrSettings runnerSettings;
         runnerSettings.WithSampleTables = false;
@@ -4458,12 +5046,12 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
             TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
             TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
         };
-        
+
         TTestHelper::TColumnTable testTable;
 
         testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
         testHelper.CreateTable(testTable);
-       
+
         {
             TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
             tableInserter.AddRow().Add(1).Add("test_res_1").AddNull();
@@ -4485,7 +5073,6 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
             TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
             TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
         };
-        
         TTestHelper::TColumnTableStore testTableStore;
 
         testTableStore.SetName("/Root/TableStoreTest").SetPrimaryKey({"id"}).SetSchema(schema);
@@ -4493,7 +5080,7 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
         TTestHelper::TColumnTable testTable;
         testTable.SetName("/Root/TableStoreTest/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
         testHelper.CreateTable(testTable);
-        
+
         {
             TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
             tableInserter.AddRow().Add(1).Add("test_res_1").AddNull();
@@ -4505,8 +5092,8 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
 
         {
             schema.push_back(TTestHelper::TColumnSchema().SetName("new_column").SetType(NScheme::NTypeIds::Uint64));
-            auto alterQuery = TStringBuilder() << "ALTER OBJECT `" << testTableStore.GetName() << "` (TYPE TABLESTORE) SET (ACTION=NEW_COLUMN, NAME=new_column, TYPE=Uint64);";
-            
+            auto alterQuery = TStringBuilder() << "ALTER TABLESTORE `" << testTableStore.GetName() << "` ADD COLUMN new_column Uint64;";
+              
             auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
             UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::SUCCESS, alterResult.GetIssues().ToString());
         }
@@ -4520,7 +5107,7 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
             auto columns = description.GetTableColumns();
             UNIT_ASSERT_VALUES_EQUAL(columns.size(), 4);
         }
-      
+
         testHelper.ReadData("SELECT * FROM `/Root/TableStoreTest/ColumnTableTest` WHERE id=1", "[[1;#;#;[\"test_res_1\"]]]");
         testHelper.ReadData("SELECT new_column FROM `/Root/TableStoreTest/ColumnTableTest` WHERE id=1", "[[#]]");
         testHelper.ReadData("SELECT resource_id FROM `/Root/TableStoreTest/ColumnTableTest` WHERE id=1", "[[[\"test_res_1\"]]]");
@@ -4544,7 +5131,183 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
         TKikimrSettings runnerSettings;
         runnerSettings.WithSampleTables = false;
         TTestHelper testHelper(runnerSettings);
-        
+
+        TVector<TTestHelper::TColumnSchema> schema = {
+            TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int32).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
+            TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
+        };
+        TTestHelper::TColumnTable testTable;
+        testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTable);
+
+        {
+            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "`ADD COLUMN new_column Uint64 NOT NULL;";
+            auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::SCHEME_ERROR, alterResult.GetIssues().ToString());
+        }
+    }
+
+    Y_UNIT_TEST(DropColumn) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        TTestHelper testHelper(runnerSettings);
+
+        TVector<TTestHelper::TColumnSchema> schema = {
+            TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int32).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
+            TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
+        };
+
+        TTestHelper::TColumnTable testTable;
+        testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTable);
+
+        {
+            TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
+            tableInserter.AddRow().Add(1).Add("test_res_1").AddNull();
+            tableInserter.AddRow().Add(2).Add("test_res_2").Add(123);
+            testHelper.InsertData(testTable, tableInserter);
+        }
+        testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=1", "[[1;#;[\"test_res_1\"]]]");
+        {
+            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "`DROP COLUMN resource_id;";
+            auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::SUCCESS, alterResult.GetIssues().ToString());
+        }
+        testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=1", "[[1;#]]");
+        testHelper.ReadData("SELECT resource_id FROM `/Root/ColumnTableTest` ", "[[];[]]", EStatus::GENERIC_ERROR);
+        {
+            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "`DROP COLUMN level;";
+            auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::SUCCESS, alterResult.GetIssues().ToString());
+        }
+        testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` ", "[[1];[2]]");
+    }
+
+    Y_UNIT_TEST(DropColumnOnSchemeChange) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        TTestHelper testHelper(runnerSettings);
+
+        TVector<TTestHelper::TColumnSchema> schema = {
+            TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int32).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
+            TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
+        };
+
+        TTestHelper::TColumnTable testTable;
+        testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTable);
+
+        {
+            TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
+            tableInserter.AddRow().Add(1).Add("test_res_1").AddNull();
+            testHelper.InsertData(testTable, tableInserter, [&testTable, &testHelper]() {
+                auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "`DROP COLUMN resource_id;";
+                auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            });
+        }
+        testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=1", "[[1;#]]");
+    }
+
+    Y_UNIT_TEST(DropColumnOldScheme) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        TTestHelper testHelper(runnerSettings);
+
+        TVector<TTestHelper::TColumnSchema> schema = {
+            TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int32).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
+            TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
+        };
+
+        TTestHelper::TColumnTable testTable;
+
+        testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTable);
+        {
+            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "`DROP COLUMN resource_id;";
+            auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::SUCCESS, alterResult.GetIssues().ToString());
+        }
+        {
+            TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
+            tableInserter.AddRow().Add(1).Add("test_res_1").AddNull();
+            testHelper.InsertData(testTable, tableInserter, {}, EStatus::SUCCESS);
+        }
+     //   testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=1", "[[1;#]]");
+    }
+
+    Y_UNIT_TEST(DropColumnOldSchemeBulkUpsert) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        TTestHelper testHelper(runnerSettings);
+
+        TVector<TTestHelper::TColumnSchema> schema = {
+            TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int32).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
+            TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
+        };
+
+        TTestHelper::TColumnTable testTable;
+
+        testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTable);
+        {
+            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "`DROP COLUMN resource_id;";
+            auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::SUCCESS, alterResult.GetIssues().ToString());
+        }
+        {
+            TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
+            tableInserter.AddRow().Add(1).Add("test_res_1").AddNull();
+            testHelper.BulkUpsert(testTable, tableInserter, Ydb::StatusIds::SCHEME_ERROR);
+        }
+    }
+
+    Y_UNIT_TEST(DropColumnAfterAdd) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        TTestHelper testHelper(runnerSettings);
+
+        TVector<TTestHelper::TColumnSchema> schema = {
+            TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int32).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
+            TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
+        };
+
+        TTestHelper::TColumnTable testTable;
+        testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTable);
+
+        {
+            TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
+            tableInserter.AddRow().Add(1).Add("test_res_1").AddNull();
+            tableInserter.AddRow().Add(2).Add("test_res_2").Add(123);
+            testHelper.InsertData(testTable, tableInserter);
+        }
+        testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=1", "[[1;#;[\"test_res_1\"]]]");
+        {
+            schema.push_back(TTestHelper::TColumnSchema().SetName("new_column").SetType(NScheme::NTypeIds::Uint64));
+            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "` ADD COLUMN new_column Uint64;";
+            auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::SUCCESS, alterResult.GetIssues().ToString());
+        }
+        testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=1", "[[1;#;#;[\"test_res_1\"]]]");
+        {
+            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "`DROP COLUMN new_column;";
+            auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::SUCCESS, alterResult.GetIssues().ToString());
+        }
+        testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=1", "[[1;#;[\"test_res_1\"]]]");
+    }
+
+    Y_UNIT_TEST(DropColumnErrors) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        TTestHelper testHelper(runnerSettings);
+
         TVector<TTestHelper::TColumnSchema> schema = {
             TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int32).SetNullable(false),
             TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
@@ -4556,11 +5319,95 @@ Y_UNIT_TEST_SUITE(KqpOlapScheme) {
         testHelper.CreateTable(testTable);
 
         {
-            schema.push_back(TTestHelper::TColumnSchema().SetName("new_column").SetType(NScheme::NTypeIds::Uint64).SetNullable(false));
-            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "`ADD COLUMN new_column Uint64 NOT NULL;";
+            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "`DROP COLUMN unknown_column;";
             auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
-            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::SCHEME_ERROR, alterResult.GetIssues().ToString());
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::GENERIC_ERROR, alterResult.GetIssues().ToString());
         }
+
+        {
+            auto alterQuery = TStringBuilder() << "ALTER TABLE `" << testTable.GetName() << "`DROP COLUMN id;";
+            auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::GENERIC_ERROR, alterResult.GetIssues().ToString());
+        }
+    }
+
+    Y_UNIT_TEST(DropColumnTableStoreErrors) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        TTestHelper testHelper(runnerSettings);
+
+        TVector<TTestHelper::TColumnSchema> schema = {
+            TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int32).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("resource_id").SetType(NScheme::NTypeIds::Utf8),
+            TTestHelper::TColumnSchema().SetName("level").SetType(NScheme::NTypeIds::Int32)
+        };
+        TTestHelper::TColumnTableStore testTableStore;
+
+        testTableStore.SetName("/Root/TableStoreTest").SetPrimaryKey({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTableStore);
+        TTestHelper::TColumnTable testTable;
+        testTable.SetName("/Root/TableStoreTest/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTable);
+
+        {
+            auto alterQuery = TStringBuilder() << "ALTER TABLESTORE `" << testTableStore.GetName() << "`DROP COLUMN id;";
+            auto alterResult = testHelper.GetSession().ExecuteSchemeQuery(alterQuery).GetValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(alterResult.GetStatus(), EStatus::GENERIC_ERROR, alterResult.GetIssues().ToString());
+        }
+    }
+}
+
+Y_UNIT_TEST_SUITE(KqpOlapTypes) {
+
+    Y_UNIT_TEST(Timestamp) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        
+        TTestHelper testHelper(runnerSettings);
+
+        TVector<TTestHelper::TColumnSchema> schema = {
+            TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int64).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("timestamp").SetType(NScheme::NTypeIds::Timestamp).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("ui64_type").SetType(NScheme::NTypeIds::Uint64).SetNullable(false)
+        };
+
+        TTestHelper::TColumnTable testTable;
+        testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTable);
+
+        auto ts = TInstant::Now();
+        {
+            TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
+            tableInserter.AddRow().Add(1).Add(ts.MicroSeconds()).Add(ts.MicroSeconds());
+            testHelper.BulkUpsert(testTable, tableInserter);
+        }
+        testHelper.ReadData("SELECT * FROM `/Root/ColumnTableTest` WHERE id=1", TStringBuilder() << "[[1;" << ts.MicroSeconds() << "u;" << ts.MicroSeconds() << "u]]");
+    }
+
+    Y_UNIT_TEST(TimestampCmpErr) {
+        TKikimrSettings runnerSettings;
+        runnerSettings.WithSampleTables = false;
+        
+        TTestHelper testHelper(runnerSettings);
+
+        TVector<TTestHelper::TColumnSchema> schema = {
+            TTestHelper::TColumnSchema().SetName("id").SetType(NScheme::NTypeIds::Int64).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("timestamp").SetType(NScheme::NTypeIds::Timestamp).SetNullable(false),
+            TTestHelper::TColumnSchema().SetName("timestamp_max").SetType(NScheme::NTypeIds::Timestamp).SetNullable(false)
+        };
+
+        TTestHelper::TColumnTable testTable;
+        testTable.SetName("/Root/ColumnTableTest").SetPrimaryKey({"id"}).SetSharding({"id"}).SetSchema(schema);
+        testHelper.CreateTable(testTable);
+
+        auto ts = TInstant::Max();
+        auto now = TInstant::Now();
+        {
+            TTestHelper::TUpdatesBuilder tableInserter(testTable.GetArrowSchema(schema));
+            tableInserter.AddRow().Add(1).Add(ts.MicroSeconds()).Add(now.MicroSeconds());
+            testHelper.BulkUpsert(testTable, tableInserter);
+        }
+        testHelper.ReadData("SELECT timestamp < timestamp_max FROM `/Root/ColumnTableTest` WHERE id=1", "[[\%false]]");
     }
 }
 

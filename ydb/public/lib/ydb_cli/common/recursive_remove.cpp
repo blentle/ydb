@@ -1,4 +1,5 @@
 #include "interactive.h"
+#include "progress_bar.h"
 #include "recursive_remove.h"
 
 #include <ydb/public/lib/ydb_cli/common/recursive_list.h>
@@ -71,7 +72,7 @@ template <typename TClient, typename TSettings>
 using TRemoveFunc = TStatus(*)(TClient&, const TString&, const TSettings&);
 
 template <typename TClient, typename TSettings>
-TStatus Remove(TRemoveFunc<TClient, TSettings> func, TClient* client, const TSchemeEntry& entry,
+TStatus Remove(TRemoveFunc<TClient, TSettings> func, TSchemeClient& schemeClient, TClient* client, const TSchemeEntry& entry,
         ERecursiveRemovePrompt prompt, const TRemoveDirectorySettings& settings)
 {
     if (!client) {
@@ -80,7 +81,12 @@ TStatus Remove(TRemoveFunc<TClient, TSettings> func, TClient* client, const TSch
     }
 
     if (Prompt(prompt, entry.Name, entry.Type, false)) {
-        return func(*client, entry.Name, TSettings(settings));
+        auto status = func(*client, entry.Name, TSettings(settings));
+        if (status.GetStatus() == EStatus::SCHEME_ERROR && schemeClient.DescribePath(entry.Name).ExtractValueSync().GetStatus() == EStatus::SCHEME_ERROR) {
+            Cerr << "WARNING: Couldn't delete path: \'" << entry.Name << "\'. It was probably already deleted in another process" << Endl;
+            return TStatus(EStatus::SUCCESS, {});
+        }
+        return status;
     } else {
         return TStatus(EStatus::SUCCESS, {});
     }
@@ -106,32 +112,33 @@ TStatus RemoveDirectoryRecursive(
         }
     }
 
+    TProgressBar bar(recursiveListResult.Entries.size());
     // output order is: Root, Recursive(children)...
     // we need to reverse it to delete recursively
     for (auto it = recursiveListResult.Entries.rbegin(); it != recursiveListResult.Entries.rend(); ++it) {
         const auto& entry = *it;
         switch (entry.Type) {
             case ESchemeEntryType::Directory:
-                if (auto result = Remove(&RemoveDirectory, &schemeClient, entry, prompt, settings); !result.IsSuccess()) {
+                if (auto result = Remove(&RemoveDirectory, schemeClient, &schemeClient, entry, prompt, settings); !result.IsSuccess()) {
                     return result;
                 }
                 break;
 
             case ESchemeEntryType::ColumnStore:
-                if (auto result = Remove(&RemoveColumnStore, tableClient, entry, prompt, settings); !result.IsSuccess()) {
+                if (auto result = Remove(&RemoveColumnStore, schemeClient, tableClient, entry, prompt, settings); !result.IsSuccess()) {
                     return result;
                 }
                 break;
 
             case ESchemeEntryType::ColumnTable:
             case ESchemeEntryType::Table:
-                if (auto result = Remove(&RemoveTable, tableClient, entry, prompt, settings); !result.IsSuccess()) {
+                if (auto result = Remove(&RemoveTable, schemeClient, tableClient, entry, prompt, settings); !result.IsSuccess()) {
                     return result;
                 }
                 break;
 
             case ESchemeEntryType::Topic:
-                if (auto result = Remove(&RemoveTopic, topicClient, entry, prompt, settings); !result.IsSuccess()) {
+                if (auto result = Remove(&RemoveTopic, schemeClient, topicClient, entry, prompt, settings); !result.IsSuccess()) {
                     return result;
                 }
                 break;
@@ -140,6 +147,7 @@ TStatus RemoveDirectoryRecursive(
                 return TStatus(EStatus::UNSUPPORTED, MakeIssues(TStringBuilder()
                     << "Unsupported entry type: " << entry.Type));
         }
+        bar.AddProgress(1);
     }
 
     return TStatus(EStatus::SUCCESS, {});

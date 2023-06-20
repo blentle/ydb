@@ -17,7 +17,6 @@
 #include <ydb/core/protos/config_units.pb.h>
 #include <ydb/core/protos/counters_cms.pb.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
-#include <ydb/public/api/protos/draft/ydb_maintenance.pb.h>
 
 #include <library/cpp/actors/core/actor.h>
 #include <library/cpp/actors/core/hfunc.h>
@@ -111,7 +110,6 @@ namespace {
 bool TCms::CheckPermissionRequest(const TPermissionRequest &request,
                                   TPermissionResponse &response,
                                   TPermissionRequest &scheduled,
-                                  ui64 requestOrder,
                                   const TActorContext &ctx)
 {
     static THashMap<EStatusCode, ui32> CodesRate = BuildCodesRateMap({
@@ -168,7 +166,6 @@ bool TCms::CheckPermissionRequest(const TPermissionRequest &request,
         opts.TenantPolicy = request.GetTenantPolicy();
         opts.AvailabilityMode = request.GetAvailabilityMode();
         opts.PartialPermissionAllowed = allowPartial;
-        opts.Order = requestOrder;
 
         TErrorInfo error;
 
@@ -338,7 +335,7 @@ bool TCms::CheckAction(const TAction &action,
         case TAction::SHUTDOWN_HOST:
             return CheckActionShutdownHost(action, opts, error, ctx);
         case TAction::REPLACE_DEVICES:
-            return CheckActionReplaceDevices(action, opts, error);
+            return CheckActionReplaceDevices(action, opts.PermissionDuration, error);
         case TAction::START_SERVICES:
         case TAction::STOP_SERVICES:
         case TAction::ADD_HOST:
@@ -545,10 +542,9 @@ bool TCms::CheckSysTabletsNode(const TActionOptions &opts,
     }
 
     for (auto &tabletType : ClusterInfo->NodeToTabletTypes[node.NodeId]) {
-        auto reason = ClusterInfo->SysNodesCheckers[tabletType]->TryToLockNode(node.NodeId, opts.AvailabilityMode, 0, opts.Order);
-        if (reason != Ydb::Maintenance::ActionState::ACTION_REASON_OK) {
+        if (!ClusterInfo->SysNodesCheckers[tabletType]->TryToLockNode(node.NodeId, opts.AvailabilityMode)) {
             error.Code = TStatus::DISALLOW_TEMP;
-            error.Reason = ClusterInfo->SysNodesCheckers[tabletType]->ReadableReason(node.NodeId, opts.AvailabilityMode, reason);
+            error.Reason = ClusterInfo->SysNodesCheckers[tabletType]->ReadableReason(node.NodeId, opts.AvailabilityMode);
             error.Deadline = TActivationContext::Now() + State->Config.DefaultRetryTime;
             return false;
         }
@@ -565,27 +561,24 @@ bool TCms::TryToLockNode(const TAction& action,
     TDuration duration = TDuration::MicroSeconds(action.GetDuration());
     duration += opts.PermissionDuration;
 
-    auto clusterReason = ClusterInfo->ClusterNodes->TryToLockNode(node.NodeId, opts.AvailabilityMode, 0, opts.Order);
-    if (clusterReason != Ydb::Maintenance::ActionState::ACTION_REASON_OK)
+    if (!ClusterInfo->ClusterNodes->TryToLockNode(node.NodeId, opts.AvailabilityMode))
     {
         error.Code = TStatus::DISALLOW_TEMP;
-        error.Reason = ClusterInfo->ClusterNodes->ReadableReason(node.NodeId, opts.AvailabilityMode, clusterReason);
+        error.Reason = ClusterInfo->ClusterNodes->ReadableReason(node.NodeId, opts.AvailabilityMode);
         error.Deadline = TActivationContext::Now() + State->Config.DefaultRetryTime;
 
         return false;
     }
 
     if (node.Tenant
-        && opts.TenantPolicy != NONE) {
-        auto tenantReason = ClusterInfo->TenantNodesChecker[node.Tenant]->TryToLockNode(node.NodeId, opts.AvailabilityMode, 0, opts.Order);
+        && opts.TenantPolicy != NONE
+        && !ClusterInfo->TenantNodesChecker[node.Tenant]->TryToLockNode(node.NodeId, opts.AvailabilityMode))
+    {
+        error.Code = TStatus::DISALLOW_TEMP;
+        error.Reason = ClusterInfo->TenantNodesChecker[node.Tenant]->ReadableReason(node.NodeId, opts.AvailabilityMode);
+        error.Deadline = TActivationContext::Now() + State->Config.DefaultRetryTime;
 
-        if (tenantReason != Ydb::Maintenance::ActionState::ACTION_REASON_OK) {
-            error.Code = TStatus::DISALLOW_TEMP;
-            error.Reason = ClusterInfo->TenantNodesChecker[node.Tenant]->ReadableReason(node.NodeId, opts.AvailabilityMode, tenantReason);
-            error.Deadline = TActivationContext::Now() + State->Config.DefaultRetryTime;
-
-            return false;
-        }
+        return false;
     }
 
     return true;
@@ -664,37 +657,35 @@ bool TCms::TryToLockVDisk(const TActionOptions& opts,
             return false;
         }
 
-        ui32 tempLocksCount = 0;
-        for (auto& vdiskId : group.VDisks) {
-            if (vdisk.VDiskId == vdiskId)
-                continue;
+        auto counters = CreateErasureCounter(ClusterInfo->BSGroup(groupId).Erasure.GetErasure(), vdisk, groupId);
+        counters->CountGroupState(ClusterInfo, State->Config.DefaultRetryTime, duration, error);
 
-            if (!ClusterInfo->VDisk(vdiskId).TempLocks.empty()
-                || !ClusterInfo->Node(ClusterInfo->VDisk(vdiskId).NodeId).TempLocks.empty()
-                || !ClusterInfo->PDisk(ClusterInfo->VDisk(vdiskId).PDiskId).TempLocks.empty()) {
-                tempLocksCount += 1;
+        switch (opts.AvailabilityMode) {
+        case MODE_MAX_AVAILABILITY:
+            if (!counters->CheckForMaxAvailability(error, defaultDeadline, opts.PartialPermissionAllowed)) {
+                return false;
             }
-        }
-
-        if (opts.PartialPermissionAllowed && tempLocksCount == 1) {
-            error.Code = TStatus::DISALLOW_TEMP;
-            error.Reason = "You cannot get two or more disks from the same group at the same time";
-            error.Deadline = defaultDeadline;
-            return false;
-        }
-
-        auto result = group.GroupChecker->TryToLockVDisk(vdisk.VDiskId, opts.AvailabilityMode, 0, opts.Order);
-        bool resultIsOk = result == Ydb::Maintenance::ActionState::ACTION_REASON_OK;
-
-        if (!resultIsOk && !opts.PartialPermissionAllowed && tempLocksCount > 0) {
-            error.Code = TStatus::DISALLOW;
-            error.Reason = "Request is incorrect. You will never get a permissions. Try with PartialPermissionAllowed";
-            return false;
-        }
-
-        if (!resultIsOk) {
-            error.Code = TStatus::DISALLOW_TEMP;
-            error.Reason = group.GroupChecker->ReadableReason(vdisk.VDiskId, opts.AvailabilityMode, result);
+            break;
+        case MODE_KEEP_AVAILABLE:
+            if (!counters->CheckForKeepAvailability(ClusterInfo, error, defaultDeadline, opts.PartialPermissionAllowed)) {
+                return false;
+            }
+            break;
+        case MODE_FORCE_RESTART:
+            if ( counters->GroupAlreadyHasLockedDisks() && opts.PartialPermissionAllowed) {
+                error.Code = TStatus::DISALLOW_TEMP;
+                error.Reason = "You cannot get two or more disks from the same group at the same time"
+                               " without specifying the PartialPermissionAllowed parameter";
+                error.Deadline = defaultDeadline;
+                return false;
+            }
+            // Any number of down disks is OK for this mode.
+            break;
+        default:
+            error.Code = TStatus::WRONG_REQUEST;
+            error.Reason = Sprintf("Unknown availability mode: %s (%" PRIu32 ")",
+                                   EAvailabilityMode_Name(opts.AvailabilityMode).data(),
+                                   static_cast<ui32>(opts.AvailabilityMode));
             error.Deadline = defaultDeadline;
             return false;
         }
@@ -755,6 +746,20 @@ bool TCms::CheckActionReplaceDevices(const TAction &action,
 void TCms::AcceptPermissions(TPermissionResponse &resp, const TString &requestId,
                              const TString &owner, const TActorContext &ctx, bool check)
 {
+    auto acceptTaskPermission = [](auto &tasks, auto &requests, const TString &requestId, const TString &permissionId) {
+        auto reqIt = requests.find(requestId);
+        if (reqIt == requests.end()) {
+            return;
+        }
+
+        auto taskIt = tasks.find(reqIt->second);
+        if (taskIt == tasks.end()) {
+            return;
+        }
+
+        taskIt->second.Permissions.insert(permissionId);
+    };
+
     for (size_t i = 0; i < resp.PermissionsSize(); ++i) {
         auto &permission = *resp.MutablePermissions(i);
         permission.SetId(owner + "-p-" + ToString(State->NextPermissionId++));
@@ -762,23 +767,12 @@ void TCms::AcceptPermissions(TPermissionResponse &resp, const TString &requestId
         LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::CMS, "Accepting permission");
         ClusterInfo->AddLocks(permission, requestId, owner, &ctx);
 
-        if (!check || owner != WALLE_CMS_USER) {
+        if (!check) {
             continue;
         }
 
-        auto reqIt = State->WalleRequests.find(requestId);
-        if (reqIt == State->WalleRequests.end()) {
-            LOG_ERROR_S(ctx, NKikimrServices::CMS, "Cannot add permission to unknown wall-e request " << requestId);
-            continue;
-        }
-
-        auto taskIt = State->WalleTasks.find(reqIt->second);
-        if (taskIt == State->WalleTasks.end()) {
-            LOG_ERROR_S(ctx, NKikimrServices::CMS, "Cannot add permission to unknown wall-e task" << reqIt->second);
-            continue;
-        }
-
-        taskIt->second.Permissions.insert(permission.GetId());
+        acceptTaskPermission(State->WalleTasks, State->WalleRequests, requestId, permission.GetId());
+        acceptTaskPermission(State->MaintenanceTasks, State->MaintenanceRequests, requestId, permission.GetId());
     }
 }
 
@@ -910,7 +904,7 @@ void TCms::CleanupWalleTasks(const TActorContext &ctx)
     if (!permissionsToRemove.empty())
         Execute(CreateTxRemovePermissions(permissionsToRemove, nullptr, nullptr), ctx);
 
-    RemoveEmptyWalleTasks(ctx);
+    RemoveEmptyTasks(ctx);
 
     WalleCleanupTimerCookieHolder.Reset(ISchedulerCookie::Make2Way());
     CreateLongTimer(ctx, State->Config.DefaultWalleCleanupPeriod,
@@ -919,10 +913,10 @@ void TCms::CleanupWalleTasks(const TActorContext &ctx)
                     WalleCleanupTimerCookieHolder.Get());
 }
 
-void TCms::RemoveEmptyWalleTasks(const TActorContext &ctx)
+TVector<TString> TCms::FindEmptyTasks(const THashMap<TString, TTaskInfo> &tasks, const TActorContext &ctx)
 {
     TVector<TString> tasksToRemove;
-    for (const auto &entry : State->WalleTasks) {
+    for (const auto &entry : tasks) {
         const auto &task = entry.second;
         if (!State->ScheduledRequests.contains(task.RequestId) && task.Permissions.empty()) {
             LOG_DEBUG(ctx, NKikimrServices::CMS, "Found empty task %s", task.TaskId.data());
@@ -930,8 +924,15 @@ void TCms::RemoveEmptyWalleTasks(const TActorContext &ctx)
         }
     }
 
-    for (auto &id : tasksToRemove)
+    return tasksToRemove;
+}
+
+void TCms::RemoveEmptyTasks(const TActorContext &ctx)
+{
+    for (auto &id : FindEmptyTasks(State->WalleTasks, ctx))
         Execute(CreateTxRemoveWalleTask(id), ctx);
+    for (auto &id : FindEmptyTasks(State->MaintenanceTasks, ctx))
+        Execute(CreateTxRemoveMaintenanceTask(id), ctx);
 }
 
 void TCms::Cleanup(const TActorContext &ctx)
@@ -1237,6 +1238,13 @@ void TCms::CheckAndEnqueueRequest(TEvCms::TEvPermissionRequest::TPtr &ev, const 
     if (!rec.GetUser()) {
         return ReplyWithError<TEvCms::TEvPermissionResponse>(
             ev, TStatus::WRONG_REQUEST, "Missing user in request", ctx);
+    }
+
+    if (rec.HasMaintenanceTaskId()) {
+        if (State->MaintenanceTasks.contains(rec.GetMaintenanceTaskId())) {
+            return ReplyWithError<TEvCms::TEvPermissionResponse>(
+                ev, TStatus::WRONG_REQUEST, "Maintenance task already exists", ctx);
+        }
     }
 
     EnqueueRequest(ev.Release(), ctx);
@@ -1559,9 +1567,13 @@ void TCms::Handle(TEvCms::TEvPermissionRequest::TPtr &ev,
         }
     }
 
-    LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::CMS, "Next request Id: " << State->NextRequestId);
-
-    bool ok = CheckPermissionRequest(rec, resp->Record, scheduled.Request, State->NextRequestId, ctx);
+    ClusterInfo->LogManager.PushRollbackPoint();
+    for (const auto &scheduled_request : State->ScheduledRequests) {
+            for (auto &action : scheduled_request.second.Request.GetActions())
+                ClusterInfo->LogManager.ApplyAction(action, ClusterInfo);
+    }
+    bool ok = CheckPermissionRequest(rec, resp->Record, scheduled.Request, ctx);
+    ClusterInfo->LogManager.RollbackOperations();
 
     // Schedule request if required.
     if (rec.GetDryRun()) {
@@ -1579,7 +1591,7 @@ void TCms::Handle(TEvCms::TEvPermissionRequest::TPtr &ev,
 
             copy = new TRequestInfo(scheduled);
             State->ScheduledRequests.emplace(reqId, std::move(scheduled));
-        } else if (user == WALLE_CMS_USER) {
+        } else if (user == WALLE_CMS_USER || rec.HasMaintenanceTaskId()) {
             scheduled.Owner = user;
             scheduled.RequestId = reqId;
 
@@ -1589,8 +1601,13 @@ void TCms::Handle(TEvCms::TEvPermissionRequest::TPtr &ev,
         if (ok)
             AcceptPermissions(resp->Record, reqId, user, ctx);
 
+        TMaybe<TString> maintenanceTaskId;
+        if (rec.HasMaintenanceTaskId()) {
+            maintenanceTaskId.ConstructInPlace(rec.GetMaintenanceTaskId());
+        }
+
         auto handle = new IEventHandle(ev->Sender, SelfId(), resp.Release(), 0, ev->Cookie);
-        Execute(CreateTxStorePermissions(std::move(ev->Release()), handle, user, std::move(copy)), ctx);
+        Execute(CreateTxStorePermissions(std::move(ev->Release()), handle, user, std::move(copy), maintenanceTaskId), ctx);
     }
 
     TabletCounters->Percentile()[COUNTER_LATENCY_PERMISSION_REQUEST].IncrementFor((TInstant::Now() - requestStartTime).MilliSeconds());
@@ -1621,12 +1638,20 @@ void TCms::Handle(TEvCms::TEvCheckRequest::TPtr &ev, const TActorContext &ctx)
 
     auto requestStartTime = TInstant::Now();
 
+    ClusterInfo->LogManager.PushRollbackPoint();
+    for (const auto &scheduled_request : State->ScheduledRequests) {
+        if (scheduled_request.second.Order < request.Order) {
+            for (auto &action : scheduled_request.second.Request.GetActions())
+                ClusterInfo->LogManager.ApplyAction(action, ClusterInfo);
+        }
+    }
     // Deactivate locks of this and later requests to
     // avoid false conflicts.
     ClusterInfo->DeactivateScheduledLocks(request.Order);
     request.Request.SetAvailabilityMode(rec.GetAvailabilityMode());
-    bool ok = CheckPermissionRequest(request.Request, resp->Record, scheduled.Request, request.Order, ctx);
+    bool ok = CheckPermissionRequest(request.Request, resp->Record, scheduled.Request, ctx);
     ClusterInfo->ReactivateScheduledLocks();
+    ClusterInfo->LogManager.RollbackOperations();
 
     // Schedule request if required.
     if (rec.GetDryRun()) {

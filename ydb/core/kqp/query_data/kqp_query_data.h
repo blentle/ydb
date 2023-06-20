@@ -80,7 +80,7 @@ struct TKqpExecuterTxResult {
     NKikimr::NMiniKQL::TType* MkqlItemType;
     const TVector<ui32>* ColumnOrder = nullptr;
     ui32 QueryResultIndex = 0;
-    NKikimr::NMiniKQL::TUnboxedValueVector Rows;
+    NKikimr::NMiniKQL::TUnboxedValueBatch Rows;
 
     explicit TKqpExecuterTxResult(
         bool isStream,
@@ -217,7 +217,7 @@ public:
     void AddTxResults(ui32 txIndex, TVector<TKqpExecuterTxResult>&& results);
     void AddTxHolders(TVector<TKqpPhyTxHolder::TConstPtr>&& holders);
 
-    void AddShardParam(ui64 shardId, const TString& name, NKikimr::NMiniKQL::TType* type, NKikimr::NMiniKQL::TUnboxedValueVector&& value);
+    bool AddShardParam(ui64 shardId, const TString& name, NKikimr::NMiniKQL::TType* type, NKikimr::NMiniKQL::TUnboxedValueVector&& value);
     void ClearPrunedParams();
     NYql::NDqProto::TData GetShardParam(ui64 shardId, const TString& name);
 

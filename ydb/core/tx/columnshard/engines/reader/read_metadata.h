@@ -6,6 +6,7 @@
 #include <ydb/core/tx/columnshard/counters.h>
 #include <ydb/core/tx/columnshard/columnshard__scan.h>
 #include <ydb/core/tx/columnshard/columnshard_common.h>
+#include <ydb/core/tx/columnshard/engines/insert_table/insert_table.h>
 #include <ydb/core/tx/columnshard/engines/predicate/predicate.h>
 #include <ydb/core/tx/columnshard/engines/column_engine.h>
 #include <ydb/core/scheme_types/scheme_type_info.h>
@@ -77,6 +78,7 @@ public:
 private:
     const ESorting Sorting = ESorting::ASC; // Sorting inside returned batches
     std::optional<TPKRangesFilter> PKRangesFilter;
+    TProgramContainer Program;
 public:
     using TConstPtr = std::shared_ptr<const TReadMetadataBase>;
 
@@ -91,16 +93,15 @@ public:
         return *PKRangesFilter;
     }
 
-    TReadMetadataBase(const ESorting sorting)
+    TReadMetadataBase(const ESorting sorting, const TProgramContainer& ssaProgram)
         : Sorting(sorting)
+        , Program(ssaProgram)
     {
-
     }
     virtual ~TReadMetadataBase() = default;
 
     std::shared_ptr<NOlap::TPredicate> LessPredicate;
     std::shared_ptr<NOlap::TPredicate> GreaterPredicate;
-    std::shared_ptr<NSsa::TProgram> Program;
     std::shared_ptr<const THashSet<TUnifiedBlobId>> ExternBlobs;
     ui64 Limit{0}; // TODO
 
@@ -122,6 +123,10 @@ public:
         meta.Dump(out);
         return out;
     }
+
+    const TProgramContainer& GetProgram() const {
+        return Program;
+    }
 };
 
 // Holds all metadata that is needed to perform read/scan
@@ -133,6 +138,9 @@ private:
     std::shared_ptr<ISnapshotSchema> ResultIndexSchema;
     std::vector<ui32> AllColumns;
     std::vector<ui32> ResultColumnsIds;
+    std::shared_ptr<NIndexedReader::IOrderPolicy> DoBuildSortingPolicy() const;
+    mutable std::map<TSnapshot, ISnapshotSchema::TPtr> SchemasByVersionCache;
+    mutable ISnapshotSchema::TPtr EmptyVersionSchemaCache;
 public:
     using TConstPtr = std::shared_ptr<const TReadMetadata>;
 
@@ -147,8 +155,8 @@ public:
 
     std::shared_ptr<NIndexedReader::IOrderPolicy> BuildSortingPolicy() const;
 
-    TReadMetadata(const TVersionedIndex& info, const TSnapshot& snapshot, const ESorting sorting)
-        : TBase(sorting)
+    TReadMetadata(const TVersionedIndex& info, const TSnapshot& snapshot, const ESorting sorting, const TProgramContainer& ssaProgram)
+        : TBase(sorting, ssaProgram)
         , IndexVersions(info)
         , Snapshot(snapshot)
         , ResultIndexSchema(info.GetSchema(Snapshot))
@@ -171,9 +179,17 @@ public:
     
     ISnapshotSchema::TPtr GetLoadSchema(const std::optional<TSnapshot>& version = {}) const {
         if (!version) {
-            return make_shared<TFilteredSnapshotSchema>(ResultIndexSchema, AllColumns);
+            if (!EmptyVersionSchemaCache) {
+                EmptyVersionSchemaCache = make_shared<TFilteredSnapshotSchema>(ResultIndexSchema, AllColumns);
+            }
+            return EmptyVersionSchemaCache;
         }
-        return make_shared<TFilteredSnapshotSchema>(IndexVersions.GetSchema(*version), AllColumns);
+        auto schemaOriginal = IndexVersions.GetSchema(*version);
+        auto it = SchemasByVersionCache.find(schemaOriginal->GetSnapshot());
+        if (it == SchemasByVersionCache.end()) {
+            it = SchemasByVersionCache.emplace(schemaOriginal->GetSnapshot(), make_shared<TFilteredSnapshotSchema>(schemaOriginal, AllColumns)).first;
+        }
+        return it->second;
     }
 
     std::shared_ptr<arrow::Schema> GetBlobSchema(const TSnapshot& version) const {
@@ -251,7 +267,7 @@ public:
             << " index records: " << NumIndexedRecords()
             << " index blobs: " << NumIndexedBlobs()
             << " committed blobs: " << CommittedBlobs.size()
-            << " with program steps: " << (Program ? Program->Steps.size() : 0)
+      //      << " with program steps: " << (Program ? Program->Steps.size() : 0)
             << " at snapshot: " << Snapshot.GetPlanStep() << ":" << Snapshot.GetTxId();
         TBase::Dump(out);
         if (SelectInfo) {
@@ -276,8 +292,8 @@ public:
     std::vector<ui32> ResultColumnIds;
     THashMap<ui64, std::shared_ptr<NOlap::TColumnEngineStats>> IndexStats;
 
-    explicit TReadStatsMetadata(ui64 tabletId, const ESorting sorting)
-        : TBase(sorting)
+    explicit TReadStatsMetadata(ui64 tabletId, const ESorting sorting, const TProgramContainer& ssaProgram)
+        : TBase(sorting, ssaProgram)
         , TabletId(tabletId)
     {}
 

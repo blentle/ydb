@@ -23,12 +23,14 @@ namespace NKikimr::NBsController {
         bool Success;
         EGroupRepairOperation Operation;
         TString ErrorReason;
+        ui64 ConfigTxSeqNo;
 
-        TEvReassignerDone(TGroupId groupId, bool success, EGroupRepairOperation operation, TString errorReason = "")
+        TEvReassignerDone(TGroupId groupId, bool success, EGroupRepairOperation operation, ui64 configTxSeqNo, TString errorReason = "")
             : GroupId(groupId)
             , Success(success)
             , Operation(operation)
             , ErrorReason(errorReason)
+            , ConfigTxSeqNo(configTxSeqNo)
         {}
     };
 
@@ -103,7 +105,7 @@ namespace NKikimr::NBsController {
 
             bool diskIsOk = false;
             if (record.GetStatus() == NKikimrProto::RACE) {
-                return Finish(false, "Race occured"); // group reconfigured while we were querying it
+                return Finish(false, 0, "Race occured"); // group reconfigured while we were querying it
             } else if (record.GetStatus() == NKikimrProto::OK) {
                 diskIsOk = record.GetJoinedGroup() && record.GetReplicated();
             }
@@ -133,12 +135,12 @@ namespace NKikimr::NBsController {
             auto& checker = Topology->GetQuorumChecker();
             if (!checker.CheckFailModelForGroup(FailedGroupDisks)) {
                 STLOG(PRI_DEBUG, BS_SELFHEAL, BSSH06, "Reassigner ProcessResult quorum checker failed", (GroupId, GroupId));
-                return Finish(false, "Reassigner ProcessResult quorum checker failed"); // this change will render group unusable
+                return Finish(false, 0, "Reassigner ProcessResult quorum checker failed"); // this change will render group unusable
             }
 
             if (!VDiskToReplace && FailedGroupDisks) {
                 STLOG(PRI_DEBUG, BS_SELFHEAL, BSSH10, "Cannot sanitize group with non-operational disks", (GroupId, GroupId));
-                return Finish(false, "Cannot sanitize group with non-operational disks");
+                return Finish(false, 0, "Cannot sanitize group with non-operational disks");
             }
 
             auto ev = MakeHolder<TEvBlobStorage::TEvControllerConfigRequest>();
@@ -167,29 +169,31 @@ namespace NKikimr::NBsController {
             if (!record.GetResponse().GetSuccess()) {
                 STLOG(PRI_WARN, BS_SELFHEAL, BSSH07, "Reassigner ReassignGroupDisk request failed", (GroupId, GroupId),
                     (VDiskToReplace, VDiskToReplace), (Response, record));
-                Finish(false, record.GetResponse().GetErrorDescription());
+                Finish(false, 0, record.GetResponse().GetErrorDescription());
             } else {
+                ui64 configTxSeqNo = record.GetResponse().GetConfigTxSeqNo();
+                Y_VERIFY_DEBUG(configTxSeqNo != 0);
                 TString items = "none";
                 for (const auto& item : record.GetResponse().GetStatus(0).GetReassignedItem()) {
                     items = TStringBuilder() << VDiskIDFromVDiskID(item.GetVDiskId()) << ": "
                         << TVSlotId(item.GetFrom()) << " -> " << TVSlotId(item.GetTo());
                 }
-                STLOG(PRI_INFO, BS_SELFHEAL, BSSH09, "Reassigner succeeded", (GroupId, GroupId), (Items, items));
-                Finish(true);
+                STLOG(PRI_INFO, BS_SELFHEAL, BSSH09, "Reassigner succeeded", (GroupId, GroupId), (Items, items), (ConfigTxSeqNo, configTxSeqNo));
+                Finish(true, configTxSeqNo);
             }
         }
 
-        void Finish(bool success, TString errorReason = "") {
+        void Finish(bool success, ui64 configTxSeqNo, TString errorReason = "") {
             STLOG(PRI_DEBUG, BS_SELFHEAL, BSSH08, "Reassigner finished", (GroupId, GroupId), (Success, success));
             auto operation = VDiskToReplace ? EGroupRepairOperation::SelfHeal : EGroupRepairOperation::GroupLayoutSanitizer;
-            Send(SelfHealId, new TEvReassignerDone(GroupId, success, operation, errorReason));
+            Send(SelfHealId, new TEvReassignerDone(GroupId, success, operation, configTxSeqNo, errorReason));
             PassAway();
         }
 
         void HandleWakeup() {
             // actually it is watchdog timer for VDisk status query
             if (PendingVDisks) {
-                Finish(false, "VDisk status query timer expired");
+                Finish(false, 0, "VDisk status query timer expired");
             }
         }
 
@@ -232,6 +236,9 @@ namespace NKikimr::NBsController {
 
             bool LayoutValid = true;
             TString LayoutError;
+
+            ui64 ResponseConfigTxSeqNo = 0;
+            ui64 UpdateConfigTxSeqNo = 0;
 
             TGroupRecord(TGroupId groupId) : GroupId(groupId) {}
         };
@@ -324,6 +331,7 @@ namespace NKikimr::NBsController {
                             std::get<1>(descr), std::get<2>(descr), std::get<3>(descr), true);
                     }
                     g.Topology = topology;
+                    g.UpdateConfigTxSeqNo = ev->Get()->ConfigTxSeqNo;
                 } else {
                     // find the group to delete
                     const auto it = Groups.find(groupId);
@@ -363,6 +371,15 @@ namespace NKikimr::NBsController {
                     }
                 }
             }
+            for (auto& [vdiskId, isReady] : ev->Get()->VDiskIsReadyUpdate) {
+                if (const auto it = Groups.find(vdiskId.GroupID); it != Groups.end()) {
+                    auto& group = it->second;
+                    if (const auto it = group.Content.VDisks.find(vdiskId); it != group.Content.VDisks.end() &&
+                            vdiskId.GroupGeneration == it->first.GroupGeneration) {
+                        it->second.IsReady = isReady;
+                    }
+                }
+            }
             CheckGroups();
         }
 
@@ -374,6 +391,10 @@ namespace NKikimr::NBsController {
             for (TGroupRecord& group : GroupsWithFaultyDisks) {
                 if (group.ReassignerActorId || now < group.NextRetryTimestamp) {
                     continue; // we are already running reassigner for this group
+                }
+
+                if (group.UpdateConfigTxSeqNo < group.ResponseConfigTxSeqNo) {
+                    continue; // response from bsc was received before selfheal info update
                 }
 
                 // check if it is possible to move anything out
@@ -388,9 +409,13 @@ namespace NKikimr::NBsController {
             if (GroupLayoutSanitizerEnabled) {
                 for (auto it = GroupsWithInvalidLayout.begin(); it != GroupsWithInvalidLayout.end(); ) {
                     TGroupRecord& group = *it++;
+                    if (group.UpdateConfigTxSeqNo < group.ResponseConfigTxSeqNo) {
+                        continue; // response from bsc was received before selfheal info update
+                    }
+
                     bool allDisksAreFullyOperational = true;
                     for (const auto& [vdiskId, vdisk] : group.Content.VDisks) {
-                        if (vdisk.Bad || vdisk.Faulty || vdisk.VDiskStatus != NKikimrBlobStorage::EVDiskStatus::READY) {
+                        if (vdisk.Bad || vdisk.Faulty || !vdisk.IsReady) {
                             // don't sanitize groups with non-operational or replicating disks
                             allDisksAreFullyOperational = false;
                             break;
@@ -524,6 +549,7 @@ namespace NKikimr::NBsController {
                 if (ev->Get()->Success) {
                     group.NextRetryTimestamp = now;
                     group.RetryTimeout = MinRetryTimeout;
+                    group.ResponseConfigTxSeqNo = ev->Get()->ConfigTxSeqNo;
                     if (ev->Get()->Operation == EGroupRepairOperation::GroupLayoutSanitizer) {
                         ADD_RECORD_WITH_TIMESTAMP_TO_OPERATION_LOG(GroupLayoutSanitizerOperationLog,
                                 "Sanitizing succeeded GroupId# " << group.GroupId);
@@ -876,6 +902,7 @@ namespace NKikimr::NBsController {
                     slot->PDisk->BadInTermsOfSelfHeal(),
                     slot->PDisk->Decommitted(),
                     slot->OnlyPhantomsRemain,
+                    slot->IsReady,
                     slot->Status,
                 };
             }
@@ -904,6 +931,7 @@ namespace NKikimr::NBsController {
                         slot->SetStatus(m.GetStatus(), mono, now, m.GetOnlyPhantomsRemain());
                         if (slot->IsReady != wasReady) {
                             ScrubState.UpdateVDiskState(slot);
+                            ev->VDiskIsReadyUpdate.emplace_back(vdiskId, slot->IsReady);
                             if (wasReady) {
                                 NotReadyVSlotIds.insert(slot->VSlotId);
                             }

@@ -4,24 +4,27 @@
 #include "index_info.h"
 #include "portion_info.h"
 #include "db_wrapper.h"
-#include "insert_table.h"
 #include "columns_table.h"
+#include "compaction_info.h"
 #include "granules_table.h"
 #include "predicate/filter.h"
+#include "insert_table/data.h"
 
 #include <ydb/core/formats/arrow/replace_key.h>
 #include <ydb/core/tx/columnshard/blob.h>
+#include <ydb/core/tx/columnshard/common/reverse_accessor.h>
 
 namespace NKikimr::NOlap {
 
 struct TPredicate;
 
 struct TCompactionLimits {
-    static constexpr const ui32 MIN_GOOD_BLOB_SIZE = 256 * 1024; // some BlobStorage constant
-    static constexpr const ui32 MAX_BLOB_SIZE = 8 * 1024 * 1024; // some BlobStorage constant
+    static constexpr const ui64 MIN_GOOD_BLOB_SIZE = 256 * 1024; // some BlobStorage constant
+    static constexpr const ui64 MAX_BLOB_SIZE = 8 * 1024 * 1024; // some BlobStorage constant
     static constexpr const ui64 EVICT_HOT_PORTION_BYTES = 1 * 1024 * 1024;
     static constexpr const ui64 DEFAULT_EVICTION_BYTES = 64 * 1024 * 1024;
     static constexpr const ui64 MAX_BLOBS_TO_DELETE = 10000;
+    static constexpr const ui64 OVERLOAD_INSERT_TABLE_SIZE_BY_PATH_ID = 1024 * MAX_BLOB_SIZE;
 
     ui32 GoodBlobSize{MIN_GOOD_BLOB_SIZE};
     ui32 GranuleBlobSplitSize{MAX_BLOB_SIZE};
@@ -102,6 +105,7 @@ public:
     static NArrow::TReplaceKey DeserializeComposite(const TString& key, const std::shared_ptr<arrow::Schema>& schema);
 
     static NArrow::TReplaceKey MinBorder(const std::shared_ptr<arrow::Schema>& schema);
+    static NArrow::TReplaceKey ExtendBorder(const NArrow::TReplaceKey& key, const std::shared_ptr<arrow::Schema>& schema);
 
     std::string ToString() const;
 
@@ -111,24 +115,6 @@ private:
     NArrow::TReplaceKey Border;
 
     static std::shared_ptr<arrow::Scalar> MinScalar(const std::shared_ptr<arrow::DataType>& type);
-};
-
-struct TCompactionInfo {
-    TSet<ui64> Granules;
-    bool InGranule{false};
-
-    bool Empty() const { return Granules.empty(); }
-    bool Good() const { return Granules.size() == 1; }
-
-    friend IOutputStream& operator << (IOutputStream& out, const TCompactionInfo& info) {
-        if (info.Good() == 1) {
-            ui64 granule = *info.Granules.begin();
-            out << (info.InGranule ? "in granule" : "split granule") << " compaction of granule " << granule;
-        } else {
-            out << "wrong compaction of " << info.Granules.size() << " granules";
-        }
-        return out;
-    }
 };
 
 struct TPortionEvictionFeatures {
@@ -194,7 +180,7 @@ public:
                 return "insert";
             case COMPACTION:
                 return CompactionInfo
-                    ? (CompactionInfo->InGranule ? "compaction in granule" : "compaction split granule" )
+                    ? (CompactionInfo->InGranule() ? "compaction in granule" : "compaction split granule" )
                     : "compaction";
             case CLEANUP:
                 return "cleanup";
@@ -268,20 +254,12 @@ struct TSelectInfo {
     std::vector<TGranuleRecord> Granules; // ordered by key (ascending)
     std::vector<TPortionInfo> Portions;
 
-    std::vector<ui64> GranulesOrder(bool rev = false) const {
-        size_t size = Granules.size();
-        std::vector<ui64> order(size);
-        if (rev) {
-            size_t pos = size - 1;
-            for (size_t i = 0; i < size; ++i, --pos) {
-                order[i] = Granules[pos].Granule;
-            }
-        } else {
-            for (size_t i = 0; i < size; ++i) {
-                order[i] = Granules[i].Granule;
-            }
-        }
-        return order;
+    NColumnShard::TContainerAccessorWithDirection<std::vector<TPortionInfo>> GetPortionsOrdered(const bool reverse) const {
+        return NColumnShard::TContainerAccessorWithDirection<std::vector<TPortionInfo>>(Portions, reverse);
+    }
+
+    NColumnShard::TContainerAccessorWithDirection<std::vector<TGranuleRecord>> GetGranulesOrdered(bool reverse = false) const {
+        return NColumnShard::TContainerAccessorWithDirection<std::vector<TGranuleRecord>>(Granules, reverse);
     }
 
     size_t NumRecords() const {
@@ -330,13 +308,77 @@ struct TSelectInfo {
     }
 };
 
-struct TColumnEngineStats {
-    struct TPortionsStats {
-        i64 Portions{};
-        i64 Blobs{};
-        i64 Rows{};
-        i64 Bytes{};
-        i64 RawBytes{};
+class TColumnEngineStats {
+private:
+    static constexpr const ui64 NUM_KINDS = 5;
+    static_assert(NUM_KINDS == NOlap::TPortionMeta::EVICTED, "NUM_KINDS must match NOlap::TPortionMeta::EProduced enum");
+public:
+    class TPortionsStats {
+    private:
+        template <class T>
+        T SumVerifiedPositive(const T v1, const T v2) const {
+            T result = v1 + v2;
+            Y_VERIFY(result >= 0);
+            return result;
+        }
+    public:
+
+        i64 Portions = 0;
+        i64 Blobs = 0;
+        i64 Rows = 0;
+        i64 Bytes = 0;
+        i64 RawBytes = 0;
+        THashMap<ui32, size_t> BytesByColumn;
+        THashMap<ui32, size_t> RawBytesByColumn;
+
+        TString DebugString() const {
+            return TStringBuilder() << "portions=" << Portions << ";blobs=" << Blobs << ";rows=" << Rows << ";bytes=" << Bytes << ";raw_bytes=" << RawBytes << ";";
+        }
+
+        TPortionsStats operator+(const TPortionsStats& item) const {
+            TPortionsStats result = *this;
+            return result += item;
+        }
+
+        TPortionsStats operator*(const i32 kff) const {
+            TPortionsStats result;
+            result.Portions = kff * Portions;
+            result.Blobs = kff * Blobs;
+            result.Rows = kff * Rows;
+            result.Bytes = kff * Bytes;
+            result.RawBytes = kff * RawBytes;
+
+            for (auto&& i : BytesByColumn) {
+                result.BytesByColumn[i.first] = kff * i.second;
+            }
+
+            for (auto&& i : RawBytesByColumn) {
+                result.RawBytesByColumn[i.first] = kff * i.second;
+            }
+            return result;
+        }
+
+        TPortionsStats& operator-=(const TPortionsStats& item) {
+            return *this += item * -1;
+        }
+
+        TPortionsStats& operator+=(const TPortionsStats& item) {
+            Portions = SumVerifiedPositive(Portions, item.Portions);
+            Blobs = SumVerifiedPositive(Blobs, item.Blobs);
+            Rows = SumVerifiedPositive(Rows, item.Rows);
+            Bytes = SumVerifiedPositive(Bytes, item.Bytes);
+            RawBytes = SumVerifiedPositive(RawBytes, item.RawBytes);
+            for (auto&& i : item.BytesByColumn) {
+                auto& v = BytesByColumn[i.first];
+                v = SumVerifiedPositive(v, i.second);
+            }
+
+            for (auto&& i : item.RawBytesByColumn) {
+                auto& v = RawBytesByColumn[i.first];
+                v = SumVerifiedPositive(v, i.second);
+            }
+            return *this;
+        }
     };
 
     i64 Tables{};
@@ -345,27 +387,129 @@ struct TColumnEngineStats {
     i64 OverloadedGranules{};
     i64 ColumnRecords{};
     i64 ColumnMetadataBytes{};
-    TPortionsStats Inserted{};
-    TPortionsStats Compacted{};
-    TPortionsStats SplitCompacted{};
-    TPortionsStats Inactive{};
-    TPortionsStats Evicted{};
+    THashMap<TPortionMeta::EProduced, TPortionsStats> StatsByType;
 
-    TPortionsStats Active() const {
-        return TPortionsStats {
-            .Portions = ActivePortions(),
-            .Blobs = ActiveBlobs(),
-            .Rows = ActiveRows(),
-            .Bytes = ActiveBytes(),
-            .RawBytes = ActiveRawBytes()
-        };
+    std::vector<ui32> GetKinds() const {
+        std::vector<ui32> result;
+        for (auto&& i : GetEnumAllValues<NOlap::TPortionMeta::EProduced>()) {
+            if (i == NOlap::TPortionMeta::UNSPECIFIED) {
+                continue;
+            }
+            result.emplace_back(i);
+        }
+        return result;
     }
 
-    i64 ActivePortions() const { return Inserted.Portions + Compacted.Portions + SplitCompacted.Portions; }
-    i64 ActiveBlobs() const { return Inserted.Blobs + Compacted.Blobs + SplitCompacted.Blobs; }
-    i64 ActiveRows() const { return Inserted.Rows + Compacted.Rows + SplitCompacted.Rows; }
-    i64 ActiveBytes() const { return Inserted.Bytes + Compacted.Bytes + SplitCompacted.Bytes; }
-    i64 ActiveRawBytes() const { return Inserted.RawBytes + Compacted.RawBytes + SplitCompacted.RawBytes; }
+    template <class T, class TAccessor>
+    std::vector<T> GetValues(const TAccessor accessor) const {
+        std::vector<T> result;
+        for (auto&& i : GetEnumAllValues<NOlap::TPortionMeta::EProduced>()) {
+            if (i == NOlap::TPortionMeta::UNSPECIFIED) {
+                continue;
+            }
+            result.emplace_back(accessor(GetStats(i)));
+        }
+        return result;
+    }
+
+    template <class T, class TAccessor>
+    T GetValuesSum(const TAccessor accessor) const {
+        T result = 0;
+        for (auto&& i : GetEnumAllValues<NOlap::TPortionMeta::EProduced>()) {
+            if (i == NOlap::TPortionMeta::UNSPECIFIED) {
+                continue;
+            }
+            result += accessor(GetStats(i));
+        }
+        return result;
+    }
+
+    static ui32 GetRecordsCount() {
+        return NUM_KINDS;
+    }
+
+    ui64 GetPortionsCount() const {
+        const auto accessor = [](const TPortionsStats& stats) {
+            return stats.Portions;
+        };
+        return GetValuesSum<ui64>(accessor);
+    }
+
+    template <class T>
+    std::vector<T> GetConstValues(const T constValue) const {
+        const auto accessor = [constValue](const TPortionsStats& /*stats*/) {
+            return constValue;
+        };
+        return GetValues<T>(accessor);
+    }
+
+    std::vector<uint64_t> GetRowsValues() const {
+        const auto accessor = [](const TPortionsStats& stats) {
+            return stats.Rows;
+        };
+        return GetValues<uint64_t>(accessor);
+    }
+
+    std::vector<uint64_t> GetBytesValues() const {
+        const auto accessor = [](const TPortionsStats& stats) {
+            return stats.Bytes;
+        };
+        return GetValues<uint64_t>(accessor);
+    }
+
+    std::vector<uint64_t> GetRawBytesValues() const {
+        const auto accessor = [](const TPortionsStats& stats) {
+            return stats.RawBytes;
+        };
+        return GetValues<uint64_t>(accessor);
+    }
+
+    std::vector<uint64_t> GetPortionsValues() const {
+        const auto accessor = [](const TPortionsStats& stats) {
+            return stats.Portions;
+        };
+        return GetValues<uint64_t>(accessor);
+    }
+
+    std::vector<uint64_t> GetBlobsValues() const {
+        const auto accessor = [](const TPortionsStats& stats) {
+            return stats.Blobs;
+        };
+        return GetValues<uint64_t>(accessor);
+    }
+
+    const TPortionsStats& GetStats(const TPortionMeta::EProduced type) const {
+        auto it = StatsByType.find(type);
+        if (it == StatsByType.end()) {
+            return Default<TPortionsStats>();
+        } else {
+            return it->second;
+        }
+    }
+
+    const TPortionsStats& GetInsertedStats() const {
+        return GetStats(TPortionMeta::EProduced::INSERTED);
+    }
+
+    const TPortionsStats& GetCompactedStats() const {
+        return GetStats(TPortionMeta::EProduced::COMPACTED);
+    }
+
+    const TPortionsStats& GetSplitCompactedStats() const {
+        return GetStats(TPortionMeta::EProduced::SPLIT_COMPACTED);
+    }
+
+    const TPortionsStats& GetInactiveStats() const {
+        return GetStats(TPortionMeta::EProduced::INACTIVE);
+    }
+
+    const TPortionsStats& GetEvictedStats() const {
+        return GetStats(TPortionMeta::EProduced::EVICTED);
+    }
+
+    TPortionsStats Active() const {
+        return GetInsertedStats() + GetCompactedStats() + GetSplitCompactedStats();
+    }
 
     void Clear() {
         *this = {};
@@ -416,18 +560,20 @@ public:
     virtual const std::shared_ptr<arrow::Schema>& GetReplaceKey() const { return GetIndexInfo().GetReplaceKey(); }
     virtual const std::shared_ptr<arrow::Schema>& GetSortingKey() const { return GetIndexInfo().GetSortingKey(); }
     virtual const std::shared_ptr<arrow::Schema>& GetIndexKey() const { return GetIndexInfo().GetIndexKey(); }
-    virtual const THashSet<ui64>* GetOverloadedGranules(ui64 /*pathId*/) const { return nullptr; }
-    virtual bool HasOverloadedGranules() const { return false; }
+    virtual const THashSet<ui64>* GetOverloadedGranules(const ui64 pathId) const = 0;
+    bool HasOverloadedGranules(const ui64 pathId) const {
+        return GetOverloadedGranules(pathId) != nullptr;
+    }
 
     virtual TString SerializeMark(const NArrow::TReplaceKey& key) const = 0;
-    virtual NArrow::TReplaceKey DeserializeMark(const TString& key) const = 0;
+    virtual NArrow::TReplaceKey DeserializeMark(const TString& key, std::optional<ui32> markNumKeys) const = 0;
 
     virtual bool Load(IDbWrapper& db, THashSet<TUnifiedBlobId>& lostBlobs, const THashSet<ui64>& pathsToDrop = {}) = 0;
 
     virtual std::shared_ptr<TSelectInfo> Select(ui64 pathId, TSnapshot snapshot,
                                                 const THashSet<ui32>& columnIds,
                                                 const TPKRangesFilter& pkRangesFilter) const = 0;
-    virtual std::unique_ptr<TCompactionInfo> Compact(const TCompactionLimits& limits, ui64& lastCompactedGranule) = 0;
+    virtual std::unique_ptr<TCompactionInfo> Compact(const TCompactionLimits& limits) = 0;
     virtual std::shared_ptr<TColumnEngineChanges> StartInsert(const TCompactionLimits& limits, std::vector<TInsertedData>&& dataToIndex) = 0;
     virtual std::shared_ptr<TColumnEngineChanges> StartCompaction(std::unique_ptr<TCompactionInfo>&& compactionInfo,
                                                                   const TSnapshot& outdatedSnapshot, const TCompactionLimits& limits) = 0;
@@ -435,7 +581,7 @@ public:
                                                                ui32 maxRecords) = 0;
     virtual std::shared_ptr<TColumnEngineChanges> StartTtl(const THashMap<ui64, TTiering>& pathEviction, const std::shared_ptr<arrow::Schema>& schema,
                                                            ui64 maxBytesToEvict = TCompactionLimits::DEFAULT_EVICTION_BYTES) = 0;
-    virtual bool ApplyChanges(IDbWrapper& db, std::shared_ptr<TColumnEngineChanges> changes, const TSnapshot& snapshot) = 0;
+    virtual bool ApplyChanges(IDbWrapper& db, std::shared_ptr<TColumnEngineChanges> changes, const TSnapshot& snapshot) noexcept = 0;
     virtual void FreeLocks(std::shared_ptr<TColumnEngineChanges> changes) = 0;
     virtual void UpdateDefaultSchema(const TSnapshot& snapshot, TIndexInfo&& info) = 0;
     //virtual void UpdateTableSchema(ui64 pathId, const TSnapshot& snapshot, TIndexInfo&& info) = 0; // TODO

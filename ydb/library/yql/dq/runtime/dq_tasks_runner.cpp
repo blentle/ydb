@@ -163,6 +163,10 @@ NUdf::TUnboxedValue DqBuildInputValue(const NDqProto::TTaskInput& inputDesc, con
 IDqOutputConsumer::TPtr DqBuildOutputConsumer(const NDqProto::TTaskOutput& outputDesc, const NMiniKQL::TType* type,
     const NMiniKQL::TTypeEnvironment& typeEnv, TVector<IDqOutput::TPtr>&& outputs)
 {
+    TMaybe<ui32> outputWidth;
+    if (type->IsMulti()) {
+        outputWidth = static_cast<const NMiniKQL::TMultiType*>(type)->GetElementsCount();
+    }
     auto guard = typeEnv.BindAllocator();
     switch (outputDesc.GetTypeCase()) {
         case NDqProto::TTaskOutput::kSink:
@@ -186,11 +190,11 @@ IDqOutputConsumer::TPtr DqBuildOutputConsumer(const NDqProto::TTaskOutput& outpu
             }
 
             return CreateOutputHashPartitionConsumer(std::move(outputs), std::move(keyColumnTypes),
-                std::move(keyColumnIndices));
+                std::move(keyColumnIndices), outputWidth);
         }
 
         case NDqProto::TTaskOutput::kBroadcast: {
-            return CreateOutputBroadcastConsumer(std::move(outputs));
+            return CreateOutputBroadcastConsumer(std::move(outputs), outputWidth);
         }
 
         case NDqProto::TTaskOutput::kRangePartition: {
@@ -309,7 +313,7 @@ public:
         return opts;
     }
 
-    std::shared_ptr<TPatternCacheEntry> CreateComputationPattern(const NDqProto::TDqTask& task, const TString& rawProgram, bool forCache, bool& canBeCached) {
+    std::shared_ptr<TPatternCacheEntry> CreateComputationPattern(const TDqTaskSettings& task, const TString& rawProgram, bool forCache, bool& canBeCached) {
         canBeCached = true;
         auto entry = TComputationPatternLRUCache::CreateCacheEntry(UseSeparatePatternAlloc());
         auto& patternAlloc = UseSeparatePatternAlloc() ? entry->Alloc : Alloc();
@@ -417,7 +421,7 @@ public:
         return entry;
     }
 
-    std::shared_ptr<TPatternCacheEntry> BuildTask(const NDqProto::TDqTask& task, const TDqTaskRunnerParameterProvider& parameterProvider) {
+    std::shared_ptr<TPatternCacheEntry> BuildTask(const TDqTaskSettings& task) {
         LOG(TStringBuilder() << "Build task: " << TaskId);
         auto startTime = TInstant::Now();
 
@@ -469,17 +473,7 @@ public:
                 std::string_view name = entry->ParamsStruct->GetMemberName(i);
                 TType* type = entry->ParamsStruct->GetMemberType(i);
 
-                if (parameterProvider && parameterProvider(name, type, TypeEnv(), graphHolderFactory, structMembers[i])) {
-#ifndef NDEBUG
-                    YQL_ENSURE(!task.GetParameters().contains(name), "param: " << name);
-#endif
-                } else {
-                    auto it = task.GetParameters().find(name);
-                    YQL_ENSURE(it != task.GetParameters().end());
-
-                    auto guard = TypeEnv().BindAllocator();
-                    TDqDataSerializer::DeserializeParam(it->second, type, graphHolderFactory, structMembers[i]);
-                }
+                task.GetParameterValue(name, type, TypeEnv(), graphHolderFactory, structMembers[i]);
 
                 {
                     auto guard = TypeEnv().BindAllocator();
@@ -504,11 +498,11 @@ public:
         return entry;
     }
 
-    void Prepare(const NDqProto::TDqTask& task, const TDqTaskRunnerMemoryLimits& memoryLimits,
-        const IDqTaskRunnerExecutionContext& execCtx, const TDqTaskRunnerParameterProvider& parameterProvider) override
+    void Prepare(const TDqTaskSettings& task, const TDqTaskRunnerMemoryLimits& memoryLimits,
+        const IDqTaskRunnerExecutionContext& execCtx) override
     {
         TaskId = task.GetId();
-        auto entry = BuildTask(task, parameterProvider);
+        auto entry = BuildTask(task);
 
         LOG(TStringBuilder() << "Prepare task: " << TaskId);
         auto startTime = TInstant::Now();
@@ -647,8 +641,7 @@ public:
                         settings.ChannelStorage = execCtx.CreateChannelStorage(channelId);
                     }
 
-                    auto outputChannel = CreateDqOutputChannel(channelId, *taskOutputType, typeEnv,
-                        holderFactory, settings, LogFunc);
+                    auto outputChannel = CreateDqOutputChannel(channelId, *taskOutputType, holderFactory, settings, LogFunc);
 
                     auto ret = AllocatedHolder->OutputChannels.emplace(channelId, outputChannel);
                     YQL_ENSURE(ret.second, "task: " << TaskId << ", duplicated output channelId: " << channelId);
@@ -676,6 +669,9 @@ public:
             AllocatedHolder->Output = nullptr;
         } else if (outputConsumers.size() == 1) {
             AllocatedHolder->Output = std::move(outputConsumers[0]);
+            if (entry->OutputItemTypes[0]->IsMulti()) {
+                AllocatedHolder->OutputWideType = static_cast<TMultiType*>(entry->OutputItemTypes[0]);
+            }
         } else {
             auto guard = BindAllocator();
             AllocatedHolder->Output = CreateOutputMultiConsumer(std::move(outputConsumers));
@@ -899,6 +895,12 @@ private:
                 return ERunStatus::PendingOutput;
             }
         }
+
+        TUnboxedValueVector wideBuffer;
+        const bool isWide = AllocatedHolder->OutputWideType != nullptr;
+        if (isWide) {
+            wideBuffer.resize(AllocatedHolder->OutputWideType->GetElementsCount());
+        }
         while (!AllocatedHolder->Output->IsFull()) {
             if (Y_UNLIKELY(CollectProfileStats)) {
                 auto now = TInstant::Now();
@@ -907,11 +909,20 @@ private:
             }
 
             NUdf::TUnboxedValue value;
-            auto fetchStatus = AllocatedHolder->ResultStream.Fetch(value);
+            NUdf::EFetchStatus fetchStatus;
+            if (isWide) {
+                fetchStatus = AllocatedHolder->ResultStream.WideFetch(wideBuffer.data(), wideBuffer.size());
+            } else {
+                fetchStatus = AllocatedHolder->ResultStream.Fetch(value);
+            }
 
             switch (fetchStatus) {
                 case NUdf::EFetchStatus::Ok: {
-                    AllocatedHolder->Output->Consume(std::move(value));
+                    if (isWide) {
+                        AllocatedHolder->Output->WideConsume(wideBuffer.data(), wideBuffer.size());
+                    } else {
+                        AllocatedHolder->Output->Consume(std::move(value));
+                    }
                     break;
                 }
                 case NUdf::EFetchStatus::Finish: {
@@ -975,6 +986,7 @@ private:
         THashMap<ui64, TOutputTransformInfo> OutputTransforms; // Output index -> Transform
 
         IDqOutputConsumer::TPtr Output;
+        TMultiType* OutputWideType = nullptr;
         NUdf::TUnboxedValue ResultStream;
     };
 

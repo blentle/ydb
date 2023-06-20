@@ -3,6 +3,7 @@
 #include <util/generic/hash.h>
 #include <util/generic/hash_set.h>
 #include <util/generic/map.h>
+#include <util/generic/vector.h>
 
 namespace google::protobuf {
     class Arena;
@@ -65,8 +66,7 @@ namespace NSQLTranslation {
         THashSet<TString> Libraries;
         THashSet<TString> Flags;
 
-        THashMap<TString, TTableBindingSettings> PrivateBindings;
-        THashMap<TString, TTableBindingSettings> ScopedBindings;
+        THashMap<TString, TTableBindingSettings> Bindings;
 
         // each (name, type) entry in this map is equivalent to
         // DECLARE $name AS type;
@@ -91,6 +91,8 @@ namespace NSQLTranslation {
         ISqlFeaturePolicy::TPtr DqDefaultAuto;
         bool AssumeYdbOnClusterWithSlash;
         TString DynamicClusterProvider;
+
+        TVector<ui32> PgParameterTypeOids;
     };
 
     bool ParseTranslationSettings(const TString& query, NSQLTranslation::TTranslationSettings& settings, NYql::TIssues& issues);

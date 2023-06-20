@@ -11,6 +11,8 @@
 #include <ydb/library/yql/core/peephole_opt/yql_opt_peephole_physical.h>
 #include <ydb/library/yql/providers/result/expr_nodes/yql_res_expr_nodes.h>
 
+#include <ydb/core/ydb_convert/ydb_convert.h>
+
 #include <ydb/public/sdk/cpp/client/ydb_proto/accessor.h>
 #include <ydb/public/api/protos/ydb_topic.pb.h>
 
@@ -48,6 +50,42 @@ namespace {
         astNode.Ptr()->SetTypeAnn(ctx.MakeType<TUnitExprType>());
 
         exec.Ptr()->ChildRef(TKiExecDataQuery::idx_Ast) = astNode.Ptr();
+    }
+
+    TModifyPermissionsSettings ParsePermissionsSettings(TKiModifyPermissions modifyPermissions) {
+        TModifyPermissionsSettings permissionsSettings;
+
+        TString action = modifyPermissions.Action().StringValue();
+        if (action == "grant") {
+            permissionsSettings.Action = TModifyPermissionsSettings::EAction::Grant;
+        } else if (action == "revoke") {
+            permissionsSettings.Action = TModifyPermissionsSettings::EAction::Revoke;
+        }
+
+        for (auto atom : modifyPermissions.Permissions()) {
+            const TString permission = atom.Cast<TCoAtom>().StringValue();
+            if (permission == "all_privileges") {
+                if (permissionsSettings.Action == TModifyPermissionsSettings::EAction::Grant) {
+                    permissionsSettings.Permissions.insert("ydb.generic.full");
+                } else if (permissionsSettings.Action == TModifyPermissionsSettings::EAction::Revoke) {
+                    permissionsSettings.Permissions.clear();
+                    permissionsSettings.IsPermissionsClear = true;
+                    break;
+                }
+                continue;
+            }
+            permissionsSettings.Permissions.insert(NKikimr::ConvertShortYdbPermissionNameToFullYdbPermissionName(permission));
+        }
+
+        THashSet<TString> pathesMap;
+        for (auto atom : modifyPermissions.Pathes()) {
+            permissionsSettings.Pathes.insert(atom.Cast<TCoAtom>().StringValue());
+        }
+
+        for (auto atom : modifyPermissions.Roles()) {
+            permissionsSettings.Roles.insert(atom.Cast<TCoAtom>().StringValue());
+        }
+        return permissionsSettings;
     }
 
     TCreateUserSettings ParseCreateUserSettings(TKiCreateUser createUser) {
@@ -688,6 +726,17 @@ public:
     }
 };
 
+class TUpsertObjectTransformer: public TObjectModifierTransformer<TKiUpsertObject, TUpsertObjectSettings> {
+private:
+    using TBase = TObjectModifierTransformer<TKiUpsertObject, TUpsertObjectSettings>;
+protected:
+    virtual TFuture<IKikimrGateway::TGenericResult> DoExecute(const TString& cluster, const TUpsertObjectSettings& settings) override {
+        return GetGateway()->UpsertObject(cluster, settings);
+    }
+public:
+    using TBase::TBase;
+};
+
 class TCreateObjectTransformer: public TObjectModifierTransformer<TKiCreateObject, TCreateObjectSettings> {
 private:
     using TBase = TObjectModifierTransformer<TKiCreateObject, TCreateObjectSettings>;
@@ -1310,6 +1359,21 @@ public:
                                     );
 
                                     add_changefeed->set_virtual_timestamps(FromString<bool>(to_lower(value)));
+                                } else if (name == "resolved_timestamps") {
+                                    YQL_ENSURE(setting.Value().Maybe<TCoInterval>());
+                                    const auto value = FromString<i64>(
+                                        setting.Value().Cast<TCoInterval>().Literal().Value()
+                                    );
+
+                                    if (value <= 0) {
+                                        ctx.AddError(TIssue(ctx.GetPosition(setting.Name().Pos()),
+                                            TStringBuilder() << name << " must be positive"));
+                                        return SyncError();
+                                    }
+
+                                    const auto interval = TDuration::FromValue(value);
+                                    auto& resolvedTimestamps = *add_changefeed->mutable_resolved_timestamps_interval();
+                                    resolvedTimestamps.set_seconds(interval.Seconds());
                                 } else if (name == "retention_period") {
                                     YQL_ENSURE(setting.Value().Maybe<TCoInterval>());
                                     const auto value = FromString<i64>(
@@ -1520,6 +1584,30 @@ public:
             return SyncOk();
         }
 
+        if (auto maybeGrantPermissions = TMaybeNode<TKiModifyPermissions>(input)) {
+            if (!EnsureNotPrepare("MODIFY PERMISSIONS", input->Pos(), SessionCtx->Query(), ctx)) {
+                return SyncError();
+            }
+
+            auto requireStatus = RequireChild(*input, 0);
+            if (requireStatus.Level != TStatus::Ok) {
+                return SyncStatus(requireStatus);
+            }
+
+            auto cluster = TString(maybeGrantPermissions.Cast().DataSink().Cluster());
+            TModifyPermissionsSettings settings = ParsePermissionsSettings(maybeGrantPermissions.Cast());
+
+            bool prepareOnly = SessionCtx->Query().PrepareOnly;
+            auto future = prepareOnly ? CreateDummySuccess() : Gateway->ModifyPermissions(cluster, settings);
+
+            return WrapFuture(future,
+                [](const IKikimrGateway::TGenericResult& res, const TExprNode::TPtr& input, TExprContext& ctx) {
+                Y_UNUSED(res);
+                auto resultNode = ctx.NewWorld(input->Pos());
+                return resultNode;
+            }, "Executing MODIFY PERMISSIONS");
+        }
+
         if (auto maybeCreateUser = TMaybeNode<TKiCreateUser>(input)) {
             if (!EnsureNotPrepare("CREATE USER", input->Pos(), SessionCtx->Query(), ctx)) {
                 return SyncError();
@@ -1592,10 +1680,14 @@ public:
             }, "Executing DROP USER");
         }
 
+        if (auto kiObject = TMaybeNode<TKiUpsertObject>(input)) {
+            return TUpsertObjectTransformer("UPSERT OBJECT", Gateway, SessionCtx).Execute(kiObject.Cast(), input, ctx);
+        }
+
         if (auto kiObject = TMaybeNode<TKiCreateObject>(input)) {
             return kiObject.Cast().TypeId() == "EXTERNAL_DATA_SOURCE"
-                    ? TCreateExternalDataSourceTransformer("CREATE EXTERNAL DATA SOURCE", Gateway, SessionCtx).Execute(kiObject.Cast(), input, ctx)
-                    : TCreateObjectTransformer("CREATE OBJECT", Gateway, SessionCtx).Execute(kiObject.Cast(), input, ctx);
+                ? TCreateExternalDataSourceTransformer("CREATE EXTERNAL DATA SOURCE", Gateway, SessionCtx).Execute(kiObject.Cast(), input, ctx)
+                : TCreateObjectTransformer("CREATE OBJECT", Gateway, SessionCtx).Execute(kiObject.Cast(), input, ctx);
         }
 
         if (auto kiObject = TMaybeNode<TKiAlterObject>(input)) {

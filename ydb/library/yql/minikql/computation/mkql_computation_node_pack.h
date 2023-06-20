@@ -8,6 +8,7 @@
 #include <ydb/library/yql/public/udf/udf_value.h>
 
 #include <library/cpp/enumbitset/enumbitset.h>
+#include <library/cpp/actors/util/rope.h>
 
 #include <util/stream/output.h>
 #include <util/generic/buffer.h>
@@ -72,30 +73,34 @@ class TValuePackerTransport {
 public:
     using TSelf = TValuePackerTransport<Fast>;
 
-    explicit TValuePackerTransport(const TType *type);
+    explicit TValuePackerTransport(const TType* type);
     // for compatibility with TValuePackerGeneric - stable packing is not supported
-    TValuePackerTransport(bool stable, const TType *type);
+    TValuePackerTransport(bool stable, const TType* type);
 
-    // incremental packing - works only for List<T> type
+    // AddItem()/UnpackBatch() will perform incremental packing - type T is processed as list item type. Will produce List<T> layout
     TSelf& AddItem(const NUdf::TUnboxedValuePod& value);
+    TSelf& AddWideItem(const NUdf::TUnboxedValuePod* values, ui32 count);
     size_t PackedSizeEstimate() const {
-        return Buffer_.Size() + Buffer_.ReservedHeaderSize();
+        return Buffer_ ? (Buffer_->Size() + Buffer_->ReservedHeaderSize()) : 0;
     }
     void Clear();
-    const TPagedBuffer& Finish();
-    TPagedBuffer FinishAndPull();
+    TPagedBuffer::TPtr Finish();
 
-    // reference is valid till the next call to Pack()
-    const TPagedBuffer& Pack(const NUdf::TUnboxedValuePod& value) const;
+    // Pack()/Unpack() will pack/unpack single value of type T
+    TPagedBuffer::TPtr Pack(const NUdf::TUnboxedValuePod& value) const;
     NUdf::TUnboxedValue Unpack(TStringBuf buf, const THolderFactory& holderFactory) const;
-    void UnpackBatch(TStringBuf buf, const THolderFactory& holderFactory, TUnboxedValueVector& result) const;
+    NUdf::TUnboxedValue Unpack(TRope&& buf, const THolderFactory& holderFactory) const;
+    void UnpackBatch(TStringBuf buf, const THolderFactory& holderFactory, TUnboxedValueBatch& result) const;
+    void UnpackBatch(TRope&& buf, const THolderFactory& holderFactory, TUnboxedValueBatch& result) const;
 private:
-    void BuildMeta(bool addItemCount) const;
+    void BuildMeta(TPagedBuffer::TPtr& buffer, bool addItemCount) const;
+    void StartPack();
 
     const TType* const Type_;
     ui64 ItemCount_ = 0;
-    mutable TPagedBuffer Buffer_;
+    TPagedBuffer::TPtr Buffer_;
     mutable NDetails::TPackerState State_;
+    mutable NDetails::TPackerState IncrementalState_;
 };
 
 using TValuePacker = TValuePackerGeneric<false>;

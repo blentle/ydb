@@ -3,6 +3,7 @@
 #include "key.h"
 
 #include <util/datetime/base.h>
+#include <util/generic/size_literals.h>
 #include <util/generic/maybe.h>
 #include <util/generic/vector.h>
 
@@ -10,9 +11,6 @@
 
 namespace NKikimr {
 namespace NPQ {
-
-
-void CheckBlob(const TKey& key, const TString& blob);
 
 struct TPartData {
     ui16 PartNo;
@@ -92,11 +90,13 @@ struct TClientBlob {
 
     static const ui32 OVERHEAD = sizeof(ui32)/*totalSize*/ + sizeof(ui64)/*SeqNo*/ + sizeof(ui16) /*SourceId*/ + sizeof(ui64) /*WriteTimestamp*/ + sizeof(ui64) /*CreateTimestamp*/;
 
-    void Serialize(TBuffer& buffer) const;
+    void SerializeTo(TBuffer& buffer) const;
     static TClientBlob Deserialize(const char *data, ui32 size);
 
+    static void CheckBlob(const TKey& key, const TString& blob); 
 };
 
+static constexpr const ui32 MAX_BLOB_SIZE = 8_MB;
 
 //TBatch represents several clientBlobs. Can be in unpacked state(TVector<TClientBlob> blobs)
 //or packed(PackedData)
@@ -112,14 +112,17 @@ struct TBatch {
     TVector<TClientBlob> Blobs;
     TVector<ui32> InternalPartsPos;
     NKikimrPQ::TBatchHeader Header;
-    TString PackedData;
+    TBuffer PackedData;
     TBatch()
         : Packed(false)
-    {}
+    {
+        PackedData.Reserve(8_MB);
+    }
 
     TBatch(const ui64 offset, const ui16 partNo, const TVector<TClientBlob>& blobs)
         : Packed(false)
     {
+        PackedData.Reserve(8_MB);
         Header.SetOffset(offset);
         Header.SetPartNo(partNo);
         Header.SetUnpackedSize(0);
@@ -133,6 +136,7 @@ struct TBatch {
     TBatch(const ui64 offset, const ui16 partNo, const std::deque<TClientBlob>& blobs)
         : Packed(false)
     {
+        PackedData.Reserve(8_MB);
         Header.SetOffset(offset);
         Header.SetPartNo(partNo);
         Header.SetUnpackedSize(0);
@@ -189,7 +193,7 @@ struct TBatch {
     void UnpackToType0(TVector<TClientBlob> *result);
     void UnpackToType1(TVector<TClientBlob> *result);
 
-    TString Serialize();
+    void SerializeTo(TString& res) const;
 
     ui32 FindPos(const ui64 offset, const ui16 partNo) const;
 
@@ -198,19 +202,22 @@ struct TBatch {
 class TBlobIterator {
 public:
     TBlobIterator(const TKey& key, const TString& blob);
+
     //return true is there is batch
     bool IsValid();
     //get next batch and return false if there is no next batch
     bool Next();
 
-    const TBatch& GetBatch();
+    TBatch GetBatch();
 private:
-    void ParseBatch(bool isFirst);
+    void ParseBatch();
+
+    NKikimrPQ::TBatchHeader Header;
 
     const TKey& Key;
     const char *Data;
     const char *End;
-    TBatch Batch;
+
     ui64 Offset;
     ui32 Count;
     ui16 InternalPartsCount;
@@ -260,8 +267,7 @@ public:
     TPartitionedBlob(const ui32 partition, const ui64 offset, const TString& sourceId, const ui64 seqNo,
                      const ui16 totalParts, const ui32 totalSize, THead& head, THead& newHead, bool headCleared, bool needCompactHead, const ui32 maxBlobSize);
 
-
-    std::pair<TKey, TString> Add(TClientBlob&& blob);
+    std::optional<std::pair<TKey, TString>> Add(TClientBlob&& blob);
 
     bool IsInited() const { return !SourceId.empty(); }
 

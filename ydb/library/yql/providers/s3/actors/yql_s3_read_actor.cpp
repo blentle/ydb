@@ -3,6 +3,7 @@
 #include <ydb/library/yql/udfs/common/clickhouse/client/src/DataTypes/DataTypeArray.h>
 #include <ydb/library/yql/udfs/common/clickhouse/client/src/DataTypes/DataTypeDate.h>
 #include <ydb/library/yql/udfs/common/clickhouse/client/src/DataTypes/DataTypeDateTime64.h>
+#include <ydb/library/yql/udfs/common/clickhouse/client/src/DataTypes/DataTypesDecimal.h>
 #include <ydb/library/yql/udfs/common/clickhouse/client/src/DataTypes/DataTypeEnum.h>
 #include <ydb/library/yql/udfs/common/clickhouse/client/src/DataTypes/DataTypeFactory.h>
 #include <ydb/library/yql/udfs/common/clickhouse/client/src/DataTypes/DataTypeInterval.h>
@@ -38,6 +39,7 @@
 
 #include <ydb/core/protos/services.pb.h>
 
+#include <ydb/library/yql/core/yql_expr_type_annotation.h>
 #include <ydb/library/yql/minikql/mkql_string_util.h>
 #include <ydb/library/yql/minikql/computation/mkql_computation_node_impl.h>
 #include <ydb/library/yql/minikql/mkql_program_builder.h>
@@ -52,6 +54,7 @@
 #include <ydb/library/yql/public/udf/arrow/block_reader.h>
 #include <ydb/library/yql/public/udf/arrow/util.h>
 #include <ydb/library/yql/utils/yql_panic.h>
+#include <ydb/library/yql/parser/pg_wrapper/interface/arrow.h>
 
 #include <ydb/library/yql/providers/s3/common/util.h>
 #include <ydb/library/yql/providers/s3/compressors/factory.h>
@@ -835,10 +838,9 @@ private:
         }
     }
 
-    i64 GetAsyncInputData(TUnboxedValueVector& buffer, TMaybe<TInstant>&, bool& finished, i64 freeSpace) final {
+    i64 GetAsyncInputData(TUnboxedValueBatch& buffer, TMaybe<TInstant>&, bool& finished, i64 freeSpace) final {
         i64 total = 0LL;
         if (!Blocks.empty()) {
-            buffer.reserve(buffer.size() + Blocks.size());
             do {
                 auto& content = std::get<IHTTPGateway::TContent>(Blocks.front());
                 const auto size = content.size();
@@ -1085,8 +1087,6 @@ void DownloadStart(const TRetryStuff::TPtr& retryStuff, TActorSystem* actorSyste
         inflightCounter);
 }
 
-using TColumnConverter = std::function<std::shared_ptr<arrow::Array>(const std::shared_ptr<arrow::Array>&)>;
-
 template <bool isOptional>
 std::shared_ptr<arrow::Array> ArrowDate32AsYqlDate(const std::shared_ptr<arrow::DataType>& targetType, const std::shared_ptr<arrow::Array>& value) {
     ::NYql::NUdf::TFixedSizeArrayBuilder<ui16, isOptional> builder(NKikimr::NMiniKQL::TTypeInfoHelper(), targetType, *arrow::system_memory_pool(), value->length());
@@ -1112,6 +1112,17 @@ std::shared_ptr<arrow::Array> ArrowDate32AsYqlDate(const std::shared_ptr<arrow::
 }
 
 TColumnConverter BuildColumnConverter(const std::string& columnName, const std::shared_ptr<arrow::DataType>& originalType, const std::shared_ptr<arrow::DataType>& targetType, TType* yqlType) {
+    if (yqlType->IsPg()) {
+        auto pgType = AS_TYPE(TPgType, yqlType);
+        auto conv = BuildPgColumnConverter(originalType, pgType);
+        if (!conv) {
+            ythrow yexception() << "Arrow type: " << originalType->ToString() <<
+                " of field: " << columnName << " isn't compatible to PG type: " << NPg::LookupType(pgType->GetTypeId()).Name;
+        }
+
+        return conv;
+    }
+
 if (originalType->id() == arrow::Type::DATE32) {
         // TODO: support more than 1 optional level
         bool isOptional = false;
@@ -2450,7 +2461,7 @@ private:
         LOG_D("TS3StreamReadActor", "Memory usage. Ready blocks: " << Blocks.size() << ". Ready blocks total size: " << blocksTotalSize);
     }
 
-    i64 GetAsyncInputData(TUnboxedValueVector& output, TMaybe<TInstant>&, bool& finished, i64 free) final {
+    i64 GetAsyncInputData(TUnboxedValueBatch& output, TMaybe<TInstant>&, bool& finished, i64 free) final {
         ReportMemoryUsage();
 
         i64 total = 0LL;
@@ -2791,6 +2802,11 @@ NDB::DataTypePtr MetaToClickHouse(const TType* type, NSerialization::TSerializat
                 return std::make_shared<NDB::DataTypeUUID>();
             case NUdf::EDataSlot::Interval:
                 return NSerialization::GetInterval(unit);
+            case NUdf::EDataSlot::Decimal: {
+                const auto decimalType = static_cast<const TDataDecimalType*>(type);
+                auto [precision, scale] = decimalType->GetParams();
+                return std::make_shared<const NDB::DataTypeDecimal<NDB::Decimal128>>(precision, scale);
+            }
             default:
                 throw yexception() << "Unsupported data slot in MetaToClickHouse: " << slot;
             }
@@ -2910,13 +2926,12 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
         if (readSpec->Arrow) {
             fileSizeLimit = cfg.BlockFileSizeLimit;
             arrow::SchemaBuilder builder;
-            const TStringBuf blockLengthColumn("_yql_block_length"sv);
-            auto extraStructType = static_cast<TStructType*>(pb->NewStructType(structType, blockLengthColumn,
+            auto extraStructType = static_cast<TStructType*>(pb->NewStructType(structType, BlockLengthColumnName,
                 pb->NewBlockType(pb->NewDataType(NUdf::EDataSlot::Uint64), TBlockType::EShape::Scalar)));
 
             for (ui32 i = 0U; i < extraStructType->GetMembersCount(); ++i) {
                 TStringBuf memberName = extraStructType->GetMemberName(i);
-                if (memberName == blockLengthColumn) {
+                if (memberName == BlockLengthColumnName) {
                     readSpec->BlockLengthPosition = i;
                     continue;
                 }

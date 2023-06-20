@@ -7,10 +7,14 @@ class TNonSorting: public IOrderPolicy {
 private:
     using TBase = IOrderPolicy;
 protected:
+    virtual TString DoDebugString() const override {
+        return TStringBuilder() << "type=NonSorting;";
+    }
+
     virtual void DoFill(TGranulesFillingContext& /*context*/) override {
     }
 
-    virtual std::vector<TGranule*> DoDetachReadyGranules(THashMap<ui64, NIndexedReader::TGranule*>& granulesToOut) override;
+    virtual std::vector<TGranule::TPtr> DoDetachReadyGranules(TResultController& granulesToOut) override;
 public:
     TNonSorting(TReadMetadata::TConstPtr readMetadata)
         :TBase(readMetadata)

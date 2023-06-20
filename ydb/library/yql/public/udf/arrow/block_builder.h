@@ -506,10 +506,18 @@ public:
 
         if constexpr (PgString == EPgStringType::CString) {
             static_assert(Nullable);
-            DoAdd(TBlockItem(PgBuilder->AsCStringBuffer(value)));
+            auto buf = PgBuilder->AsCStringBuffer(value);
+            auto prevCtx = GetMemoryContext(buf.Data());
+            ZeroMemoryContext((char*)buf.Data());
+            DoAdd(TBlockItem(TStringRef(buf.Data() - sizeof(void*), buf.Size() + sizeof(void*))));
+            SetMemoryContext((char*)buf.Data(), prevCtx);
         } else if constexpr (PgString == EPgStringType::Text) {
             static_assert(Nullable);
-            DoAdd(TBlockItem(PgBuilder->AsTextBuffer(value)));
+            auto buf = PgBuilder->AsTextBuffer(value);
+            auto prevCtx = GetMemoryContext(buf.Data());
+            ZeroMemoryContext((char*)buf.Data());
+            DoAdd(TBlockItem(TStringRef(buf.Data() - sizeof(void*), buf.Size() + sizeof(void*))));
+            SetMemoryContext((char*)buf.Data(), prevCtx);
         } else {
             DoAdd(TBlockItem(value.AsStringRef()));
         }
@@ -1112,8 +1120,10 @@ inline std::unique_ptr<TArrayBuilderBase> MakeArrayBuilderImpl(
         case NUdf::EDataSlot::Double:
             return std::make_unique<TFixedSizeArrayBuilder<double, Nullable>>(typeInfoHelper, type, pool, maxLen);
         case NUdf::EDataSlot::String:
+        case NUdf::EDataSlot::Yson:
             return std::make_unique<TStringArrayBuilder<arrow::BinaryType, Nullable>>(typeInfoHelper, type, pool, maxLen);
         case NUdf::EDataSlot::Utf8:
+        case NUdf::EDataSlot::Json:
             return std::make_unique<TStringArrayBuilder<arrow::StringType, Nullable>>(typeInfoHelper, type, pool, maxLen);
         default:
             Y_ENSURE(false, "Unsupported data slot");
@@ -1168,6 +1178,11 @@ inline std::unique_ptr<TArrayBuilderBase> MakeArrayBuilderBase(
             if (!nexOpt) {
                 break;
             }
+        }
+
+        if (TPgTypeInspector(typeInfoHelper, currentType)) {
+            previousType = currentType;
+            ++nestLevel;
         }
 
         auto builder = MakeArrayBuilderBase(typeInfoHelper, previousType, pool, maxBlockLength, pgBuilder);

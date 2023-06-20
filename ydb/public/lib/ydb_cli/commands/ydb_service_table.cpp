@@ -4,6 +4,7 @@
 #include <ydb/public/lib/ydb_cli/common/pretty_table.h>
 #include <ydb/public/lib/ydb_cli/common/print_operation.h>
 #include <ydb/public/lib/ydb_cli/common/query_stats.h>
+#include <ydb/public/lib/ydb_cli/common/interactive.h>
 #include <ydb/public/sdk/cpp/client/ydb_proto/accessor.h>
 
 #include <library/cpp/json/json_prettifier.h>
@@ -464,10 +465,9 @@ int TCommandExecuteQuery::ExecuteDataQuery(TConfig& config) {
                     return static_cast<TStatus>(result.GetValue());
                 });
             };
-            auto retryResult = client.RetryOperation(std::move(operation));
-            retryResult.GetValueSync();
+            auto status = client.RetryOperation(std::move(operation)).GetValueSync();
+            ThrowOnError(status);
             auto result = asyncResult.GetValueSync();
-            ThrowOnError(result);
             PrintDataQueryResponse(result);
         }
     } else {
@@ -484,10 +484,9 @@ int TCommandExecuteQuery::ExecuteDataQuery(TConfig& config) {
                 return static_cast<TStatus>(result.GetValue());
             });
         };
-        auto retryResult = client.RetryOperation(std::move(operation));
-        retryResult.GetValueSync();
+        auto status = client.RetryOperation(std::move(operation)).GetValueSync();
+        ThrowOnError(status);
         auto result = asyncResult.GetValueSync();
-        ThrowOnError(result);
         PrintDataQueryResponse(result);
     }
     return EXIT_SUCCESS;
@@ -548,10 +547,9 @@ int TCommandExecuteQuery::ExecuteScanQuery(TConfig& config) {
                     return static_cast<TStatus>(result.GetValue());
                 });
             };
-            auto retryResult = client.RetryOperation(std::move(operation));
-            retryResult.GetValueSync();
+            auto status = client.RetryOperation(std::move(operation)).GetValueSync();
+            ThrowOnError(status);
             auto result = asyncResult.GetValueSync();
-            ThrowOnError(result);
             if (!PrintScanQueryResponse(result)) {
                 return EXIT_FAILURE;
             }
@@ -569,10 +567,9 @@ int TCommandExecuteQuery::ExecuteScanQuery(TConfig& config) {
                 return static_cast<TStatus>(result.GetValue());
             });
         };
-        auto retryResult = client.RetryOperation(std::move(operation));
-        retryResult.GetValueSync();
+        auto status = client.RetryOperation(std::move(operation)).GetValueSync();
+        ThrowOnError(status);
         auto result = asyncResult.GetValueSync();
-        ThrowOnError(result);
         if (!PrintScanQueryResponse(result)) {
             return EXIT_FAILURE;
         }

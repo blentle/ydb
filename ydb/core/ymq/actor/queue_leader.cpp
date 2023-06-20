@@ -117,6 +117,8 @@ void TQueueLeader::BecomeWorking() {
     for (auto&& [reqIdAndShard, reqInfo] : ChangeMessageVisibilityRequests_) {
         ProcessChangeMessageVisibilityBatch(reqInfo);
     }
+
+    Send(MakeSqsServiceID(SelfId().NodeId()), new TSqsEvents::TEvLeaderStarted());
 }
 
 STATEFN(TQueueLeader::StateInit) {
@@ -134,6 +136,7 @@ STATEFN(TQueueLeader::StateInit) {
         hFunc(TSqsEvents::TEvGetRuntimeQueueAttributes, HandleGetRuntimeQueueAttributesWhileIniting); // from get queue attributes action actor
         hFunc(TSqsEvents::TEvDeadLetterQueueNotification, HandleDeadLetterQueueNotification); // service periodically notifies active dead letter queues
         hFunc(TSqsEvents::TEvForceReloadState, HandleForceReloadState);
+        hFunc(TSqsEvents::TEvReloadStateRequest, HandleReloadStateRequest);
 
         // internal
         hFunc(TSqsEvents::TEvQueueId, HandleQueueId); // discover dlq id and version
@@ -159,6 +162,7 @@ STATEFN(TQueueLeader::StateWorking) {
         hFunc(TSqsEvents::TEvGetRuntimeQueueAttributes, HandleGetRuntimeQueueAttributesWhileWorking); // from get queue attributes action actor
         hFunc(TSqsEvents::TEvDeadLetterQueueNotification, HandleDeadLetterQueueNotification); // service periodically notifies active dead letter queues
         hFunc(TSqsEvents::TEvForceReloadState, HandleForceReloadState);
+        hFunc(TSqsEvents::TEvReloadStateRequest, HandleReloadStateRequest);
 
         // internal
         hFunc(TSqsEvents::TEvQueueId, HandleQueueId); // discover dlq id and version
@@ -173,6 +177,10 @@ STATEFN(TQueueLeader::StateWorking) {
 
 void TQueueLeader::PassAway() {
     LOG_SQS_INFO("Queue " << TLogQueueName(UserName_, QueueName_) << " leader is dying");
+
+    if (CurrentStateFunc() != &TThis::StateWorking) {
+        Send(MakeSqsServiceID(SelfId().NodeId()), new TSqsEvents::TEvLeaderStarted());  
+    }
 
     for (auto& req : GetConfigurationRequests_) {
         AnswerFailed(req);
@@ -214,6 +222,7 @@ void TQueueLeader::HandleWakeup(TEvWakeup::TPtr& ev) {
         break;
     }
     case UPDATE_MESSAGES_METRICS_TAG: {
+        CheckStillDLQ();
         PlanningRetentionWakeup();
         ReportOldestTimestampMetricsIfReady();
         ReportMessagesCountMetricsIfReady();
@@ -230,6 +239,11 @@ void TQueueLeader::HandleWakeup(TEvWakeup::TPtr& ev) {
 }
 
 
+void TQueueLeader::HandleReloadStateRequest(TSqsEvents::TEvReloadStateRequest::TPtr& ev) {
+    ReloadStateRequestedFromNodes.insert(ev->Sender.NodeId());
+    ForceReloadState();
+}
+
 void TQueueLeader::HandleForceReloadState(TSqsEvents::TEvForceReloadState::TPtr& ev) {
     if (!UseCPUOptimization) {
         return;
@@ -238,11 +252,15 @@ void TQueueLeader::HandleForceReloadState(TSqsEvents::TEvForceReloadState::TPtr&
     if (nextTryAfter != TDuration::Max()) {
         Schedule(nextTryAfter, new TSqsEvents::TEvForceReloadState(GetNextReloadStateWaitPeriod(nextTryAfter)));
     }
+    ForceReloadState();
+}
 
-    if (UpdateStateRequestInProcess) {
+void TQueueLeader::ForceReloadState() {
+    if (UpdateStateRequestStartedAt) {
         LOG_SQS_DEBUG("Update state request already in process for queue " << TLogQueueName(UserName_, QueueName_));
         return;
     }
+    UpdateStateRequestStartedAt = TActivationContext::Now();
     LOG_SQS_DEBUG("Start update state request for queue " << TLogQueueName(UserName_, QueueName_));
     TExecutorBuilder(SelfId(), "")
         .User(UserName_)
@@ -264,8 +282,7 @@ void TQueueLeader::HandleForceReloadState(TSqsEvents::TEvForceReloadState::TPtr&
 
 void TQueueLeader::HandleState(const TSqsEvents::TEvExecuted::TRecord& reply) {
     LOG_SQS_DEBUG("Handle state for " << TLogQueueName(UserName_, QueueName_));
-    Y_VERIFY(!UpdateStateRequestInProcess);
-    UpdateStateRequestInProcess = false;
+    Y_VERIFY(UpdateStateRequestStartedAt != TInstant::Zero());
 
     if (reply.GetStatus() == TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ExecComplete) {
         using NKikimr::NClient::TValue;
@@ -295,10 +312,24 @@ void TQueueLeader::HandleState(const TSqsEvents::TEvExecuted::TRecord& reply) {
             }
 
             shardInfo.MessagesCountWasGot = true;
+            ProcessGetRuntimeQueueAttributes(shard);
+            for (auto nodeId : ReloadStateRequestedFromNodes) {
+                Send(
+                    MakeSqsProxyServiceID(nodeId),
+                    new TSqsEvents::TEvReloadStateResponse(
+                        UserName_,
+                        QueueName_,
+                        UpdateStateRequestStartedAt
+                    )
+                );
+            }
+            ReloadStateRequestedFromNodes.clear();
         }
     } else {
         LOG_SQS_ERROR("Failed to update state for " << TLogQueueName(UserName_, QueueName_) << ": " << reply);
     }
+
+    UpdateStateRequestStartedAt = TInstant::Zero();
 }
 
 void TQueueLeader::HandleGetConfigurationWhileIniting(TSqsEvents::TEvGetConfiguration::TPtr& ev) {
@@ -753,6 +784,7 @@ void TQueueLeader::OnFifoMessagesReadSuccess(const NKikimr::NClient::TValue& val
                 RequestOldestTimestampMetrics(0);
             }
         }
+        SendReloadStateRequestToDLQ();
     }
 
     reqInfo.Answer->Messages.resize(list.Size());
@@ -938,6 +970,14 @@ void TQueueLeader::OnLoadStdMessageResult(const TString& requestId, const ui64 o
     }
 }
 
+void TQueueLeader::SendReloadStateRequestToDLQ() {
+    if (DlqInfo_) {
+        Send(MakeSqsProxyServiceID(SelfId().NodeId()), new TSqsEvents::TEvReloadStateRequest(UserName_, DlqInfo_->QueueId));
+    } else {
+        LOG_SQS_ERROR("Leader for " << TLogQueueName(UserName_, QueueName_) << " don't know about dlq, but messages moved");
+    }
+}
+
 void TQueueLeader::OnLoadStdMessagesBatchSuccess(const NKikimr::NClient::TValue& value, ui64 shard, TShardInfo& shardInfo, TIntrusivePtr<TLoadBatch> batch) {
     const NKikimr::NClient::TValue list(value["result"]);
     Y_VERIFY(list.Size() == batch->Size());
@@ -946,6 +986,7 @@ void TQueueLeader::OnLoadStdMessagesBatchSuccess(const NKikimr::NClient::TValue&
         ADD_COUNTER(Counters_, MessagesMovedToDLQ, movedMessagesCount);
 
         SetMessagesCount(shard, value["newMessagesCount"]);
+        SendReloadStateRequestToDLQ();
     }
 
     THashMap<ui64, const TLoadBatchEntry*> offset2entry;
@@ -1619,7 +1660,7 @@ void TQueueLeader::HandlePurgeQueue(TSqsEvents::TEvPurgeQueue::TPtr& ev) {
     Send(PurgeActor_, MakeHolder<TSqsEvents::TEvPurgeQueue>(*ev->Get()));
 }
 
-void TQueueLeader::StartGatheringMetrics() {
+void TQueueLeader::CheckStillDLQ() {
     if (!IsFifoQueue_ && (TActivationContext::Now() - LatestDlqNotificationTs_ >= TDuration::MilliSeconds(Cfg().GetDlqNotificationGracePeriodMs()))) {
         if (IsDlqQueue_) {
             LOG_SQS_INFO("Stopped periodic message counting for queue " << TLogQueueName(UserName_, QueueName_)
@@ -1628,7 +1669,10 @@ void TQueueLeader::StartGatheringMetrics() {
 
         IsDlqQueue_ = false;
     }
-    
+}
+
+
+void TQueueLeader::StartGatheringMetrics() {
     if (UseCPUOptimization) {
         return;
     }
@@ -2330,19 +2374,7 @@ void TQueueLeader::HandleGetRuntimeQueueAttributesWhileWorking(TSqsEvents::TEvGe
 
 void TQueueLeader::HandleDeadLetterQueueNotification(TSqsEvents::TEvDeadLetterQueueNotification::TPtr&) {
     LatestDlqNotificationTs_ = TActivationContext::Now();
-
-    if (!IsDlqQueue_) {
-        bool enablePeriodicMessagesCounting = UseCPUOptimization || !IsFifoQueue_; // we need to start the process only once
-
-        IsDlqQueue_ = true;
-        UseCPUOptimization = false;
-
-        if (enablePeriodicMessagesCounting) {
-            LOG_SQS_INFO("Started periodic message counting for queue " << TLogQueueName(UserName_, QueueName_)
-                                                                    << ". Latest dlq notification was at " << LatestDlqNotificationTs_);
-            StartGatheringMetrics();
-        }
-    }
+    IsDlqQueue_ = true;
 }
 
 void TQueueLeader::ProcessGetRuntimeQueueAttributes(TGetRuntimeQueueAttributesRequestProcessing& reqInfo) {

@@ -444,6 +444,7 @@ public:
     bool ResolveTabletChannels(ui32 profileId, const TPathId domainId, TChannelsBindings& channelsBinding) const;
     bool ResolveRtmrChannels(const TPathId domainId, TChannelsBindings& channelsBinding) const;
     bool ResolveSolomonChannels(ui32 profileId, const TPathId domainId, TChannelsBindings& channelsBinding) const;
+    bool ResolveSolomonChannels(const NKikimrSchemeOp::TKeyValueStorageConfig &config, const TPathId domainId, TChannelsBindings& channelsBinding) const;
     bool ResolvePqChannels(ui32 profileId, const TPathId domainId, TChannelsBindings& channelsBinding) const;
     bool ResolveChannelsByPoolKinds(
         const TVector<TStringBuf>& channelPoolKinds,
@@ -1248,6 +1249,7 @@ public:
     void ChangeDiskSpaceTablesDataBytes(i64 delta) override;
     void ChangeDiskSpaceTablesIndexBytes(i64 delta) override;
     void ChangeDiskSpaceTablesTotalBytes(i64 delta) override;
+    void ChangeDiskSpaceTopicsTotalBytes(ui64 value) override;
     void ChangeDiskSpaceQuotaExceeded(i64 delta) override;
     void ChangeDiskSpaceHardQuotaBytes(i64 delta) override;
     void ChangeDiskSpaceSoftQuotaBytes(i64 delta) override;

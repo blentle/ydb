@@ -31,6 +31,7 @@ public:
         {"DateStyle", "ISO"},
         {"IntervalStyle", "postgres"},
         {"integer_datetimes", "on"},
+        {"server_version", "14.5 (ydb stable-23-3)"},
     };
     TSocketBuffer BufferOutput;
     TActorId DatabaseProxy;
@@ -374,7 +375,7 @@ protected:
 
     void HandleMessage(const TPGQuery* message) {
         SyncSequenceNumber = IncomingSequenceNumber;
-        Send(DatabaseProxy, new TEvPGEvents::TEvQuery(MakePGMessageCopy(message)), 0, IncomingSequenceNumber++);
+        Send(DatabaseProxy, new TEvPGEvents::TEvQuery(MakePGMessageCopy(message), TransactionStatus), 0, IncomingSequenceNumber++);
     }
 
     void HandleMessage(const TPGParse* message) {
@@ -398,7 +399,7 @@ protected:
     }
 
     void HandleMessage(const TPGExecute* message) {
-        Send(DatabaseProxy, new TEvPGEvents::TEvExecute(MakePGMessageCopy(message)), 0, IncomingSequenceNumber++);
+        Send(DatabaseProxy, new TEvPGEvents::TEvExecute(MakePGMessageCopy(message), TransactionStatus), 0, IncomingSequenceNumber++);
     }
 
     void HandleMessage(const TPGClose* message) {
@@ -477,7 +478,6 @@ protected:
                 if (ev->Get()->EmptyQuery) {
                     SendMessage(TPGEmptyQueryResponse());
                 } else {
-                    TString tag = ev->Get()->Tag ? ev->Get()->Tag : "OK";
                     if (!ev->Get()->DataFields.empty()) { // rowDescription
                         TPGStreamOutput<TPGRowDescription> rowDescription;
                         rowDescription << uint16_t(ev->Get()->DataFields.size()); // number of fields
@@ -504,7 +504,9 @@ protected:
                             SendStream(dataRow);
                         }
                     }
-                    { // commandComplete
+                    if (ev->Get()->CommandCompleted) {
+                        // commandComplete
+                        TString tag = ev->Get()->Tag ? ev->Get()->Tag : "OK";
                         TPGStreamOutput<TPGCommandComplete> commandComplete;
                         commandComplete << tag << '\0';
                         SendStream(commandComplete);
@@ -519,7 +521,9 @@ protected:
                 errorResponse << '\0';
                 SendStream(errorResponse);
             }
-            BecomeReadyForQuery();
+            if (ev->Get()->CommandCompleted) {
+                BecomeReadyForQuery();
+            }
         } else {
             PostponeEvent(ev);
         }
@@ -527,32 +531,42 @@ protected:
 
     void HandleConnected(TEvPGEvents::TEvDescribeResponse::TPtr& ev) {
         if (IsEventExpected(ev)) {
-            { // parameterDescription
-                TPGStreamOutput<TPGParameterDescription> parameterDescription;
-                parameterDescription << uint16_t(ev->Get()->ParameterTypes.size()); // number of fields
-                for (auto type : ev->Get()->ParameterTypes) {
-                    parameterDescription << type;
+            if (ev->Get()->ErrorFields.empty()) {
+                { // parameterDescription
+                    TPGStreamOutput<TPGParameterDescription> parameterDescription;
+                    parameterDescription << uint16_t(ev->Get()->ParameterTypes.size()); // number of fields
+                    for (auto type : ev->Get()->ParameterTypes) {
+                        parameterDescription << type;
+                    }
+                    SendStream(parameterDescription);
                 }
-                SendStream(parameterDescription);
-            }
-            if (ev->Get()->DataFields.size() > 0) {
-                // rowDescription
-                TPGStreamOutput<TPGRowDescription> rowDescription;
-                rowDescription << uint16_t(ev->Get()->DataFields.size()); // number of fields
-                for (const auto& field : ev->Get()->DataFields) {
-                    rowDescription
-                        << TStringBuf(field.Name) << '\0'
-                        << uint32_t(field.TableId)
-                        << uint16_t(field.ColumnId)
-                        << uint32_t(field.DataType)
-                        << uint16_t(field.DataTypeSize)
-                        << uint32_t(0xffffffff) // type modifier
-                        << uint16_t(0)          // format text
-                        ;
+                if (ev->Get()->DataFields.size() > 0) {
+                    // rowDescription
+                    TPGStreamOutput<TPGRowDescription> rowDescription;
+                    rowDescription << uint16_t(ev->Get()->DataFields.size()); // number of fields
+                    for (const auto& field : ev->Get()->DataFields) {
+                        rowDescription
+                            << TStringBuf(field.Name) << '\0'
+                            << uint32_t(field.TableId)
+                            << uint16_t(field.ColumnId)
+                            << uint32_t(field.DataType)
+                            << uint16_t(field.DataTypeSize)
+                            << uint32_t(0xffffffff) // type modifier
+                            << uint16_t(0)          // format text
+                            ;
+                    }
+                    SendStream(rowDescription);
+                } else {
+                    SendMessage(TPGNoData());
                 }
-                SendStream(rowDescription);
             } else {
-                SendMessage(TPGNoData());
+                // error response
+                TPGStreamOutput<TPGErrorResponse> errorResponse;
+                for (const auto& field : ev->Get()->ErrorFields) {
+                    errorResponse << field.first << field.second << '\0';
+                }
+                errorResponse << '\0';
+                SendStream(errorResponse);
             }
             ++OutgoingSequenceNumber;
             BecomeReadyForQuery();
@@ -563,6 +577,9 @@ protected:
 
     void HandleConnected(TEvPGEvents::TEvExecuteResponse::TPtr& ev) {
         if (IsEventExpected(ev)) {
+            if (ev->Get()->TransactionStatus) {
+                TransactionStatus = ev->Get()->TransactionStatus;
+            }
             if (ev->Get()->ErrorFields.empty()) {
                 if (ev->Get()->EmptyQuery) {
                     SendMessage(TPGEmptyQueryResponse());
@@ -578,7 +595,9 @@ protected:
                             SendStream(dataRow);
                         }
                     }
-                    { // commandComplete
+                    if (ev->Get()->CommandCompleted) {
+                        // commandComplete
+                        TString tag = ev->Get()->Tag ? ev->Get()->Tag : "OK";
                         TPGStreamOutput<TPGCommandComplete> commandComplete;
                         commandComplete << tag << '\0';
                         SendStream(commandComplete);
@@ -593,8 +612,10 @@ protected:
                 errorResponse << '\0';
                 SendStream(errorResponse);
             }
-            ++OutgoingSequenceNumber;
-            BecomeReadyForQuery();
+            if (ev->Get()->CommandCompleted) {
+                ++OutgoingSequenceNumber;
+                BecomeReadyForQuery();
+            }
         } else {
             PostponeEvent(ev);
         }

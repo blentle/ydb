@@ -11,7 +11,8 @@ using namespace NKikimr::NMiniKQL;
 template <typename F>
 void TestOne(F&& f) {
     TExprContext ctx;
-    auto functionRegistry = CreateFunctionRegistry(CreateBuiltinRegistry());
+    auto functionRegistry = CreateFunctionRegistry(CreateBuiltinRegistry())->Clone();
+    FillStaticModules(*functionRegistry);
     auto nodeFactory = GetBuiltinFactory();
     TKernelRequestBuilder b(*functionRegistry);
     auto index = f(b, ctx);
@@ -79,6 +80,64 @@ Y_UNIT_TEST_SUITE(TKernelRegistryTest) {
             auto blockInt32Type = ctx.template MakeType<TBlockExprType>(ctx.template MakeType<TDataExprType>(EDataSlot::Int32));
             auto blockOptInt32Type = ctx.template MakeType<TBlockExprType>(ctx.template MakeType<TOptionalExprType>(ctx.template MakeType<TDataExprType>(EDataSlot::Int32)));
             return b.AddBinaryOp(TKernelRequestBuilder::EBinaryOp::Div, blockInt32Type, blockInt32Type, blockOptInt32Type);
+        });
+    }
+
+    Y_UNIT_TEST(TestStartsWith) {
+        TestOne([](auto& b,auto& ctx) {
+            auto blockStringType = ctx.template MakeType<TBlockExprType>(ctx.template MakeType<TDataExprType>(EDataSlot::String));
+            auto blockOptBoolType = ctx.template MakeType<TBlockExprType>(ctx.template MakeType<TOptionalExprType>(ctx.template MakeType<TDataExprType>(EDataSlot::Bool)));
+            return b.AddBinaryOp(TKernelRequestBuilder::EBinaryOp::StartsWith, blockStringType, blockStringType, blockOptBoolType);
+        });
+    }
+
+    Y_UNIT_TEST(TestEndsWith) {
+        TestOne([](auto& b,auto& ctx) {
+            auto blockStringType = ctx.template MakeType<TBlockExprType>(ctx.template MakeType<TDataExprType>(EDataSlot::String));
+            auto blockOptBoolType = ctx.template MakeType<TBlockExprType>(ctx.template MakeType<TOptionalExprType>(ctx.template MakeType<TDataExprType>(EDataSlot::Bool)));
+            return b.AddBinaryOp(TKernelRequestBuilder::EBinaryOp::EndsWith, blockStringType, blockStringType, blockOptBoolType);
+        });
+    }
+
+    Y_UNIT_TEST(TestStringContains) {
+        TestOne([](auto& b,auto& ctx) {
+            auto blockStringType = ctx.template MakeType<TBlockExprType>(ctx.template MakeType<TDataExprType>(EDataSlot::String));
+            auto blockOptBoolType = ctx.template MakeType<TBlockExprType>(ctx.template MakeType<TOptionalExprType>(ctx.template MakeType<TDataExprType>(EDataSlot::Bool)));
+            return b.AddBinaryOp(TKernelRequestBuilder::EBinaryOp::StringContains, blockStringType, blockStringType, blockOptBoolType);
+        });
+    }
+
+    Y_UNIT_TEST(TestUdf) {
+        TestOne([](auto& b,auto& ctx) {
+            auto blockOptStringType = ctx.template MakeType<TBlockExprType>(
+                ctx.template MakeType<TOptionalExprType>(
+                ctx.template MakeType<TDataExprType>(EDataSlot::String)));
+            return b.Udf("Url.GetHost", false, { blockOptStringType }, blockOptStringType) ;
+        });
+    }
+
+    Y_UNIT_TEST(TestJsonExists) {
+        TestOne([](auto& b,auto& ctx) {
+            auto blockOptJsonType = ctx.template MakeType<TBlockExprType>(
+                ctx.template MakeType<TOptionalExprType>(
+                ctx.template MakeType<TDataExprType>(EDataSlot::Json)));
+            auto scalarUtf8Type = ctx.template MakeType<TScalarExprType>(
+                ctx.template MakeType<TDataExprType>(EDataSlot::Utf8));
+            auto blockOptBoolType = ctx.template MakeType<TBlockExprType>(
+                ctx.template MakeType<TOptionalExprType>(
+                ctx.template MakeType<TDataExprType>(EDataSlot::Bool)));
+            return b.JsonExists(blockOptJsonType, scalarUtf8Type, blockOptBoolType);
+        });
+
+        TestOne([](auto& b,auto& ctx) {
+            auto blockJsonType = ctx.template MakeType<TBlockExprType>(
+                ctx.template MakeType<TDataExprType>(EDataSlot::Json));
+            auto scalarUtf8Type = ctx.template MakeType<TScalarExprType>(
+                ctx.template MakeType<TDataExprType>(EDataSlot::Utf8));
+            auto blockOptBoolType = ctx.template MakeType<TBlockExprType>(
+                ctx.template MakeType<TOptionalExprType>(
+                ctx.template MakeType<TDataExprType>(EDataSlot::Bool)));
+            return b.JsonExists(blockJsonType, scalarUtf8Type, blockOptBoolType);
         });
     }
 }

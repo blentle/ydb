@@ -228,7 +228,8 @@ struct TEvColumnShard {
         }
     };
 
-    struct TEvWrite : public TEventPB<TEvWrite, NKikimrTxColumnShard::TEvWrite, TEvColumnShard::EvWrite> {
+    struct TEvWrite : public TEventPB<TEvWrite, NKikimrTxColumnShard::TEvWrite, TEvColumnShard::EvWrite>
+                    , public NColumnShard::TPutStatus {
         TEvWrite() = default;
 
         TEvWrite(const TActorId& source, ui64 metaShard, ui64 writeId, ui64 tableId,
@@ -258,18 +259,20 @@ struct TEvColumnShard {
             Record.MutableMeta()->SetSchema(arrowSchema);
         }
 
+        void SetArrowData(const TString& arrowSchema, const TString& arrowData) {
+            Record.MutableMeta()->SetFormat(NKikimrTxColumnShard::FORMAT_ARROW);
+            Record.MutableMeta()->SetSchema(arrowSchema);
+            Record.SetData(arrowData);
+        }
+
         TActorId GetSource() const {
             return ActorIdFromProto(Record.GetSource());
         }
 
-        NKikimrProto::EReplyStatus PutStatus = NKikimrProto::UNKNOWN;
         NColumnShard::TUnifiedBlobId BlobId;
         std::shared_ptr<arrow::RecordBatch> WrittenBatch;
         NColumnShard::TBlobBatch BlobBatch;
         NColumnShard::TUsage ResourceUsage;
-        TVector<ui32> YellowMoveChannels;
-        TVector<ui32> YellowStopChannels;
-        ui64 MaxSmallBlobSize;
     };
 
     struct TEvWriteResult : public TEventPB<TEvWriteResult, NKikimrTxColumnShard::TEvWriteResult,
@@ -283,6 +286,11 @@ struct TEvColumnShard {
             Record.SetTableId(tableId);
             Record.SetDedupId(dedupId);
             Record.SetStatus(status);
+        }
+
+        Ydb::StatusIds::StatusCode GetYdbStatus() const  {
+            const auto status = (NKikimrTxColumnShard::EResultStatus)Record.GetStatus();
+            return NColumnShard::ConvertToYdbStatus(status);
         }
     };
 

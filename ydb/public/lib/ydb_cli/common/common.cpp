@@ -90,17 +90,6 @@ TString ReadFromFile(TString& filePath, const TString& fileName, bool allowEmpty
     }
 }
 
-size_t TermWidth() {
-#ifdef _unix_
-    struct winsize ws;
-    if (!ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws)) {
-        return ws.ws_col;
-    }
-#endif
-
-    return Max<size_t>();
-}
-
 TString InputPassword() {
     // Disable echoing characters and enable per-symbol input handling
 #if defined(_unix_)

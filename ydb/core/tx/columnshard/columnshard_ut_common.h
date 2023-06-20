@@ -77,6 +77,30 @@ struct TTestSchema {
             TtlColumn = columnName;
             return *this;
         }
+
+        static NKikimrSchemeOp::TS3Settings FakeS3() {
+            const TString bucket = "tiering-test-01";
+
+            NKikimrSchemeOp::TS3Settings s3Config;
+            s3Config.SetScheme(NKikimrSchemeOp::TS3Settings::HTTP);
+            s3Config.SetVerifySSL(false);
+            s3Config.SetBucket(bucket);
+//#define S3_TEST_USAGE
+#ifdef S3_TEST_USAGE
+            s3Config.SetEndpoint("storage.cloud-preprod.yandex.net");
+            s3Config.SetAccessKey("...");
+            s3Config.SetSecretKey("...");
+            s3Config.SetProxyHost("localhost");
+            s3Config.SetProxyPort(8080);
+            s3Config.SetProxyScheme(NKikimrSchemeOp::TS3Settings::HTTP);
+#else
+            s3Config.SetEndpoint("fake");
+#endif
+            s3Config.SetRequestTimeoutMs(10000);
+            s3Config.SetHttpRequestTimeoutMs(10000);
+            s3Config.SetConnectionTimeoutMs(10000);
+            return s3Config;
+        }
     };
 
     struct TTableSpecials : public TStorageTier {
@@ -388,10 +412,11 @@ bool ProposeSchemaTx(TTestBasicRuntime& runtime, TActorId& sender, const TString
 void ProvideTieringSnapshot(TTestBasicRuntime& runtime, TActorId& sender, NMetadata::NFetcher::ISnapshot::TPtr snapshot);
 void PlanSchemaTx(TTestBasicRuntime& runtime, TActorId& sender, NOlap::TSnapshot snap);
 bool WriteData(TTestBasicRuntime& runtime, TActorId& sender, ui64 metaShard, ui64 writeId, ui64 tableId,
-               const TString& data, std::shared_ptr<arrow::Schema> schema = {});
+               const TString& data, std::shared_ptr<arrow::Schema> schema = {}, bool waitResult = true);
 std::optional<ui64> WriteData(TTestBasicRuntime& runtime, TActorId& sender, const NLongTxService::TLongTxId& longTxId,
                               ui64 tableId, const TString& dedupId, const TString& data,
                               std::shared_ptr<arrow::Schema> schema = {});
+ui32 WaitWriteResult(TTestBasicRuntime& runtime, ui64 metaShard);
 void ScanIndexStats(TTestBasicRuntime& runtime, TActorId& sender, const std::vector<ui64>& pathIds,
                     NOlap::TSnapshot snap, ui64 scanId = 0);
 void ProposeCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 metaShard, ui64 txId, const std::vector<ui64>& writeIds);
@@ -416,4 +441,90 @@ TString MakeTestBlob(std::pair<ui64, ui64> range, const std::vector<std::pair<TS
 TSerializedTableRange MakeTestRange(std::pair<ui64, ui64> range, bool inclusiveFrom, bool inclusiveTo,
                                     const std::vector<std::pair<TString, NScheme::TTypeInfo>>& columns);
 
+
+}
+
+namespace NKikimr::NColumnShard {
+    class TTableUpdatesBuilder {
+        std::vector<std::unique_ptr<arrow::ArrayBuilder>> Builders;
+        std::shared_ptr<arrow::Schema> Schema;
+        ui32 RowsCount = 0;
+    public:
+        class TRowBuilder {
+            TTableUpdatesBuilder& Owner;
+            YDB_READONLY(ui32, Index, 0);
+        public:
+            TRowBuilder(ui32 index, TTableUpdatesBuilder& owner)
+                : Owner(owner)
+                , Index(index)
+            {}
+
+            TRowBuilder Add(const char* data) {
+                return Add<std::string>(data);
+            }
+
+            template <class TData>
+            TRowBuilder Add(const TData& data) {
+                Y_VERIFY(Index < Owner.Builders.size());
+                auto& builder = Owner.Builders[Index];
+                auto type = builder->type();
+                
+                NArrow::SwitchType(type->id(), [&](const auto& t) {
+                    using TWrap = std::decay_t<decltype(t)>;
+                    using T = typename TWrap::T;
+                    using TBuilder = typename arrow::TypeTraits<typename TWrap::T>::BuilderType;
+
+                    auto& typedBuilder = static_cast<TBuilder&>(*builder);
+                    if constexpr (std::is_arithmetic<TData>::value) {
+                        if constexpr (arrow::has_c_type<T>::value) {
+                            using CType = typename T::c_type;
+                            Y_VERIFY(typedBuilder.Append((CType)data).ok());
+                            return true;
+                        }
+                    }
+                    if constexpr (std::is_same<TData, std::string>::value) {
+                        if constexpr (arrow::has_string_view<T>::value && arrow::is_parameter_free_type<T>::value) {
+                            Y_VERIFY(typedBuilder.Append(data.data(), data.size()).ok());
+                            return true;
+                        }
+                    }
+                    Y_FAIL("Unknown type combination");
+                    return false;
+                });
+                return TRowBuilder(Index + 1, Owner);
+            }
+
+            TRowBuilder AddNull() {
+                Y_VERIFY(Index < Owner.Builders.size());
+                auto res = Owner.Builders[Index]->AppendNull();
+                return TRowBuilder(Index + 1, Owner);
+            }
+        };
+
+        TTableUpdatesBuilder(std::shared_ptr<arrow::Schema> schema)
+            : Schema(schema)
+        {
+            Builders = NArrow::MakeBuilders(schema);
+            Y_VERIFY(Builders.size() == schema->fields().size());
+        }
+
+        TRowBuilder AddRow() {
+            ++RowsCount;
+            return TRowBuilder(0, *this);
+        }
+
+        std::shared_ptr<arrow::RecordBatch> BuildArrow() {
+            TVector<std::shared_ptr<arrow::Array>> columns;
+            columns.reserve(Builders.size());
+            for (auto&& builder : Builders) {
+                auto arrayDataRes = builder->Finish();
+                Y_VERIFY(arrayDataRes.ok());
+                columns.push_back(*arrayDataRes);
+            }
+            return arrow::RecordBatch::Make(Schema, RowsCount, columns);
+        }
+    };
+
+    NOlap::TIndexInfo BuildTableInfo(const std::vector<std::pair<TString, NScheme::TTypeInfo>>& ydbSchema,
+                         const std::vector<std::pair<TString, NScheme::TTypeInfo>>& key);
 }

@@ -47,11 +47,7 @@ struct TLimits {
     TControlWrapper MaxInsertBytes;
     TControlWrapper InsertTableSize;
 
-    TLimits()
-        : MinInsertBytes(MIN_BYTES_TO_INSERT, 1, 2 * MAX_BYTES_TO_INSERT)
-        , MaxInsertBytes(MAX_BYTES_TO_INSERT, 0, 2 * MAX_BYTES_TO_INSERT)
-        , InsertTableSize(MIN_SMALL_BLOBS_TO_INSERT, 0, 1000)
-    {}
+    TLimits();
 
     void RegisterControls(TControlBoard& icb) {
         icb.RegisterSharedControl(MinInsertBytes, "ColumnShardControls.MinBytesToIndex");
@@ -102,10 +98,12 @@ struct TCompactionLimits {
 struct TUsage {
     ui64 CPUExecTime{};
     ui64 Network{};
+    ui64 SourceMemorySize{};
 
     void Add(const TUsage& other) {
         CPUExecTime += other.CPUExecTime;
         Network += other.Network;
+        SourceMemorySize += other.SourceMemorySize;
     }
 };
 
@@ -138,6 +136,38 @@ public:
     ui32 GetGroup(const TLogoBlobID& blobId) const override {
         return TabletInfo->GroupFor(blobId.Channel(), blobId.Generation());
     }
+};
+
+class TPutStatus {
+public:
+    NKikimrProto::EReplyStatus GetPutStatus() const {
+        return PutStatus;
+    }
+
+    void SetPutStatus(NKikimrProto::EReplyStatus status) {
+        PutStatus = status;
+    }
+
+    void SetPutStatus(NKikimrProto::EReplyStatus status,
+                    THashSet<ui32>&& yellowMoveChannels, THashSet<ui32>&& yellowStopChannels) {
+        PutStatus = status;
+        YellowMoveChannels = std::move(yellowMoveChannels);
+        YellowStopChannels = std::move(yellowStopChannels);
+    }
+
+    template <typename T>
+    void OnYellowChannels(T* executor) {
+        if (YellowMoveChannels.size() || YellowStopChannels.size()) {
+            executor->OnYellowChannels(
+                TVector<ui32>(YellowMoveChannels.begin(), YellowMoveChannels.end()),
+                TVector<ui32>(YellowStopChannels.begin(), YellowStopChannels.end()));
+        }
+    }
+
+private:
+    NKikimrProto::EReplyStatus PutStatus = NKikimrProto::UNKNOWN;
+    THashSet<ui32> YellowMoveChannels;
+    THashSet<ui32> YellowStopChannels;
 };
 
 }

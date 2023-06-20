@@ -282,9 +282,12 @@ bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, TField
     return usedFields.size() < inputStructType->GetSize();
 }
 
-template bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, TSet<TStringBuf>& usedFields, const TParentsMap& parentsMap, bool allowDependsOn);
-template bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, TSet<TString>& usedFields, const TParentsMap& parentsMap, bool allowDependsOn);
-template bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, std::map<std::string_view, TExprNode::TPtr>& usedFields, const TParentsMap& parentsMap, bool allowDependsOn);
+template bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, TSet<TStringBuf>& usedFields, const TParentsMap& parentsMap,
+                            bool allowDependsOn);
+template bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, TSet<TString>& usedFields, const TParentsMap& parentsMap,
+                            bool allowDependsOn);
+template bool HaveFieldsSubset(const TExprNode::TPtr& start, const TExprNode& arg, std::map<std::string_view, TExprNode::TPtr>& usedFields,
+                            const TParentsMap& parentsMap, bool allowDependsOn);
 
 TExprNode::TPtr AddMembersUsedInside(const TExprNode::TPtr& start, const TExprNode& arg, TExprNode::TPtr&& members, const TParentsMap& parentsMap, TExprContext& ctx) {
     if (!members || !start || &arg == start.Get()) {
@@ -1339,7 +1342,7 @@ TExprNode::TPtr OptimizeExists(const TExprNode::TPtr& node, TExprContext& ctx)  
         return MakeBool<false>(node->Pos(), ctx);
     }
 
-    if (node->Head().IsCallable("Just")) {
+    if (node->Head().IsCallable({"Just", "PgConst"})) {
         YQL_CLOG(DEBUG, Core) << node->Content() << " over " << node->Head().Content();
         return MakeBool<true>(node->Pos(), ctx);
     }

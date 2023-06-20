@@ -49,7 +49,7 @@ void PackBlob(const char* data, size_t size, TBuf& buf) {
 }
 
 template <bool Fast, typename T>
-T UnpackData(TStringBuf& buf) {
+T UnpackData(TChunkedInputBuffer& buf) {
     static_assert(std::is_arithmetic_v<T>);
     T res;
     if constexpr (Fast || sizeof(T) == 1 || std::is_floating_point_v<T>) {
@@ -71,11 +71,12 @@ T UnpackData(TStringBuf& buf) {
     return res;
 }
 
-NUdf::TUnboxedValuePod UnpackString(TStringBuf& buf, ui32 size) {
-    MKQL_ENSURE(size <= buf.size(), "Bad packed data. Buffer too small");
-    const char* ptr = buf.data();
-    buf.Skip(size);
-    return MakeString(NUdf::TStringRef(ptr, size));
+NUdf::TUnboxedValuePod UnpackString(TChunkedInputBuffer& buf, ui32 size) {
+    auto res = MakeStringNotFilled(size, 0);
+    NYql::NUdf::TMutableStringRef ref = res.AsStringRef();
+    Y_VERIFY_DEBUG(size == ref.Size());
+    buf.CopyTo(ref.Data(), size);
+    return res;
 }
 
 template<typename TBuf>
@@ -142,23 +143,21 @@ private:
 };
 
 template<bool Fast>
-std::pair<ui32, bool> SkipEmbeddedLength(TStringBuf& buf) {
+std::pair<ui32, bool> SkipEmbeddedLength(TChunkedInputBuffer& buf, size_t totalBufSize) {
     if constexpr (Fast) {
         Y_FAIL("Should not be called");
     }
     ui32 length = 0;
     bool emptySingleOptional = false;
-    if (buf.size() > 8) {
-        length = ReadUnaligned<ui32>(buf.data());
-        MKQL_ENSURE(length + 4 == buf.size(), "Bad packed data. Invalid embedded size");
-        buf.Skip(4);
+    if (totalBufSize > 8) {
+        length = GetRawData<ui32>(buf);
+        MKQL_ENSURE(length + 4 == totalBufSize, "Bad packed data. Invalid embedded size");
     } else {
-        length = *buf.data();
+        length = GetRawData<ui8>(buf);
         MKQL_ENSURE(length & 1, "Bad packed data. Invalid embedded size");
         emptySingleOptional = 0 != (length & 0x10);
         length = (length & 0x0f) >> 1;
-        MKQL_ENSURE(length + 1 == buf.size(), "Bad packed data. Invalid embedded size");
-        buf.Skip(1);
+        MKQL_ENSURE(length + 1 == totalBufSize, "Bad packed data. Invalid embedded size");
     }
     return {length, emptySingleOptional};
 }
@@ -216,15 +215,28 @@ bool HasOptionalFields(const TType* type) {
         return HasOptionalFields(taggedType->GetBaseType());
     }
 
+    case TType::EKind::Multi: {
+        auto multiType = static_cast<const TMultiType*>(type);
+        for (ui32 index = 0; index < multiType->GetElementsCount(); ++index) {
+            if (HasOptionalFields(multiType->GetElementType(index))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     default:
         THROW yexception() << "Unsupported type: " << type->GetKindAsStr();
     }
 }
 
-TPackProperties ScanTypeProperties(const TType* type) {
+TPackProperties ScanTypeProperties(const TType* type, bool assumeList) {
     TPackProperties props;
     if (HasOptionalFields(type)) {
         props.Set(EPackProps::UseOptionalMask);
+    }
+    if (assumeList) {
+        return props;
     }
     if (type->GetKind() == TType::EKind::Optional) {
         type = static_cast<const TOptionalType*>(type)->GetItemType();
@@ -254,7 +266,7 @@ TPackProperties ScanTypeProperties(const TType* type) {
 }
 
 template<bool Fast>
-NUdf::TUnboxedValue UnpackFromContigousBuffer(const TType* type, TStringBuf& buf, ui32 topLength,
+NUdf::TUnboxedValue UnpackFromChunkedBuffer(const TType* type, TChunkedInputBuffer& buf, ui32 topLength,
     const THolderFactory& holderFactory, TPackerState& s)
 {
     switch (type->GetKind()) {
@@ -350,7 +362,7 @@ NUdf::TUnboxedValue UnpackFromContigousBuffer(const TType* type, TStringBuf& buf
         }
 
         if (present) {
-            return UnpackFromContigousBuffer<Fast>(optionalType->GetItemType(), buf, topLength, holderFactory, s).Release().MakeOptional();
+            return UnpackFromChunkedBuffer<Fast>(optionalType->GetItemType(), buf, topLength, holderFactory, s).Release().MakeOptional();
         } else {
             return NUdf::TUnboxedValuePod();
         }
@@ -388,7 +400,7 @@ NUdf::TUnboxedValue UnpackFromContigousBuffer(const TType* type, TStringBuf& buf
 
         TTemporaryUnboxedValueVector tmp;
         for (ui64 i = 0; i < len; ++i) {
-            tmp.emplace_back(UnpackFromContigousBuffer<Fast>(itemType, buf, topLength, holderFactory, s));
+            tmp.emplace_back(UnpackFromChunkedBuffer<Fast>(itemType, buf, topLength, holderFactory, s));
         }
 
         NUdf::TUnboxedValue *items = nullptr;
@@ -406,7 +418,7 @@ NUdf::TUnboxedValue UnpackFromContigousBuffer(const TType* type, TStringBuf& buf
         auto res = holderFactory.CreateDirectArrayHolder(structType->GetMembersCount(), itemsPtr);
         for (ui32 index = 0; index < structType->GetMembersCount(); ++index) {
             auto memberType = structType->GetMemberType(index);
-            itemsPtr[index] = UnpackFromContigousBuffer<Fast>(memberType, buf, topLength, holderFactory, s);
+            itemsPtr[index] = UnpackFromChunkedBuffer<Fast>(memberType, buf, topLength, holderFactory, s);
         }
         return std::move(res);
     }
@@ -417,7 +429,7 @@ NUdf::TUnboxedValue UnpackFromContigousBuffer(const TType* type, TStringBuf& buf
         auto res = holderFactory.CreateDirectArrayHolder(tupleType->GetElementsCount(), itemsPtr);
         for (ui32 index = 0; index < tupleType->GetElementsCount(); ++index) {
             auto elementType = tupleType->GetElementType(index);
-            itemsPtr[index] = UnpackFromContigousBuffer<Fast>(elementType, buf, topLength, holderFactory, s);
+            itemsPtr[index] = UnpackFromChunkedBuffer<Fast>(elementType, buf, topLength, holderFactory, s);
         }
         return std::move(res);
     }
@@ -436,8 +448,8 @@ NUdf::TUnboxedValue UnpackFromContigousBuffer(const TType* type, TStringBuf& buf
         }
 
         for (ui64 i = 0; i < len; ++i) {
-            auto key = UnpackFromContigousBuffer<Fast>(keyType, buf, topLength, holderFactory, s);
-            auto payload = UnpackFromContigousBuffer<Fast>(payloadType, buf, topLength, holderFactory, s);
+            auto key = UnpackFromChunkedBuffer<Fast>(keyType, buf, topLength, holderFactory, s);
+            auto payload = UnpackFromChunkedBuffer<Fast>(payloadType, buf, topLength, holderFactory, s);
             dictBuilder->Add(std::move(key), std::move(payload));
         }
         return dictBuilder->Build();
@@ -461,12 +473,12 @@ NUdf::TUnboxedValue UnpackFromContigousBuffer(const TType* type, TStringBuf& buf
             MKQL_ENSURE(variantIndex < static_cast<TTupleType*>(innerType)->GetElementsCount(), "Bad variant index: " << variantIndex);
             innerType = static_cast<TTupleType*>(innerType)->GetElementType(variantIndex);
         }
-        return holderFactory.CreateVariantHolder(UnpackFromContigousBuffer<Fast>(innerType, buf, topLength, holderFactory, s).Release(), variantIndex);
+        return holderFactory.CreateVariantHolder(UnpackFromChunkedBuffer<Fast>(innerType, buf, topLength, holderFactory, s).Release(), variantIndex);
     }
 
     case TType::EKind::Tagged: {
         auto taggedType = static_cast<const TTaggedType*>(type);
-        return UnpackFromContigousBuffer<Fast>(taggedType->GetBaseType(), buf, topLength, holderFactory, s);
+        return UnpackFromChunkedBuffer<Fast>(taggedType->GetBaseType(), buf, topLength, holderFactory, s);
     }
 
     default:
@@ -475,15 +487,15 @@ NUdf::TUnboxedValue UnpackFromContigousBuffer(const TType* type, TStringBuf& buf
 }
 
 template<bool Fast>
-NUdf::TUnboxedValue DoUnpack(const TType* type, TStringBuf buf, const THolderFactory& holderFactory, TPackerState& s) {
+NUdf::TUnboxedValue DoUnpack(const TType* type, TChunkedInputBuffer& buf, size_t totalBufSize, const THolderFactory& holderFactory, TPackerState& s) {
     if constexpr (Fast) {
         NUdf::TUnboxedValue res;
-        res = UnpackFromContigousBuffer<Fast>(type, buf, 0, holderFactory, s);
-        MKQL_ENSURE(buf.empty(), "Bad packed data. Not fully data read");
+        res = UnpackFromChunkedBuffer<Fast>(type, buf, 0, holderFactory, s);
+        MKQL_ENSURE(buf.IsEmpty(), "Bad packed data - partial data read");
         return res;
     }
 
-    auto pair = SkipEmbeddedLength<Fast>(buf);
+    auto pair = SkipEmbeddedLength<Fast>(buf, totalBufSize);
     ui32 length = pair.first;
     bool emptySingleOptional = pair.second;
 
@@ -499,14 +511,54 @@ NUdf::TUnboxedValue DoUnpack(const TType* type, TStringBuf buf, const THolderFac
         res = s.TopStruct.NewArray(holderFactory, structType->GetMembersCount(), items);
         for (ui32 index = 0; index < structType->GetMembersCount(); ++index) {
             auto memberType = structType->GetMemberType(index);
-            *items++ = UnpackFromContigousBuffer<Fast>(memberType, buf, length, holderFactory, s);
+            *items++ = UnpackFromChunkedBuffer<Fast>(memberType, buf, length, holderFactory, s);
         }
     } else {
-        res = UnpackFromContigousBuffer<Fast>(type, buf, length, holderFactory, s);
+        res = UnpackFromChunkedBuffer<Fast>(type, buf, length, holderFactory, s);
     }
 
-    MKQL_ENSURE(buf.empty(), "Bad packed data. Not fully data read");
+    MKQL_ENSURE(buf.IsEmpty(), "Bad packed data - partial data read");
     return res;
+}
+
+template<bool Fast>
+void DoUnpackBatch(const TType* type, TChunkedInputBuffer& buf, size_t totalSize, const THolderFactory& holderFactory, TPackerState& s, TUnboxedValueBatch& result) {
+    ui64 len;
+    ui32 topLength;
+    const TType* itemType = type;
+    if constexpr (!Fast) {
+        auto pair = SkipEmbeddedLength<Fast>(buf, totalSize);
+        topLength = pair.first;
+        bool emptySingleOptional = pair.second;
+
+        if (s.Properties.Test(EPackProps::UseOptionalMask)) {
+            s.OptionalUsageMask.Reset(buf);
+        }
+
+        MKQL_ENSURE(!s.Properties.Test(EPackProps::SingleOptional) || !emptySingleOptional, "Unexpected header settings");
+        len = NDetails::UnpackUInt64(buf);
+    } else {
+        topLength = 0;
+        len = NDetails::GetRawData<ui64>(buf);
+    }
+
+    if (type->IsMulti()) {
+        auto multiType = static_cast<const TMultiType*>(type);
+        const ui32 width = multiType->GetElementsCount();
+        Y_VERIFY_DEBUG(result.IsWide());
+        Y_VERIFY_DEBUG(result.Width() == width);
+        for (ui64 i = 0; i < len; ++i) {
+            result.PushRow([&](ui32 j) {
+                return UnpackFromChunkedBuffer<Fast>(multiType->GetElementType(j), buf, topLength, holderFactory, s);
+            });
+        }
+    } else {
+        Y_VERIFY_DEBUG(!result.IsWide());
+        for (ui64 i = 0; i < len; ++i) {
+            result.emplace_back(UnpackFromChunkedBuffer<Fast>(itemType, buf, topLength, holderFactory, s));
+        }
+    }
+    MKQL_ENSURE(buf.IsEmpty(), "Bad packed data - partial data read");
 }
 
 template<bool Fast, bool Stable, typename TBuf>
@@ -808,14 +860,15 @@ template<bool Fast>
 TValuePackerGeneric<Fast>::TValuePackerGeneric(bool stable, const TType* type)
     : Stable_(stable)
     , Type_(type)
-    , State_(ScanTypeProperties(Type_))
+    , State_(ScanTypeProperties(Type_, false))
 {
     MKQL_ENSURE(!Fast || !Stable_, "Stable mode is not supported");
 }
 
 template<bool Fast>
 NUdf::TUnboxedValue TValuePackerGeneric<Fast>::Unpack(TStringBuf buf, const THolderFactory& holderFactory) const {
-    return DoUnpack<Fast>(Type_, buf, holderFactory, State_);
+    TChunkedInputBuffer chunked(buf);
+    return DoUnpack<Fast>(Type_, chunked, buf.size(), holderFactory, State_);
 }
 
 template<bool Fast>
@@ -886,7 +939,8 @@ TStringBuf TValuePackerGeneric<Fast>::Pack(const NUdf::TUnboxedValuePod& value) 
 template<bool Fast>
 TValuePackerTransport<Fast>::TValuePackerTransport(bool stable, const TType* type)
     : Type_(type)
-    , State_(ScanTypeProperties(Type_))
+    , State_(ScanTypeProperties(Type_, false))
+    , IncrementalState_(ScanTypeProperties(Type_, true))
 {
     MKQL_ENSURE(!stable, "Stable packing is not supported");
 }
@@ -894,113 +948,122 @@ TValuePackerTransport<Fast>::TValuePackerTransport(bool stable, const TType* typ
 template<bool Fast>
 TValuePackerTransport<Fast>::TValuePackerTransport(const TType* type)
     : Type_(type)
-    , State_(ScanTypeProperties(Type_))
+    , State_(ScanTypeProperties(Type_, false))
+    , IncrementalState_(ScanTypeProperties(Type_, true))
 {
 }
 
 template<bool Fast>
 NUdf::TUnboxedValue TValuePackerTransport<Fast>::Unpack(TStringBuf buf, const THolderFactory& holderFactory) const {
-    return DoUnpack<Fast>(Type_, buf, holderFactory, State_);
+    TChunkedInputBuffer chunked(buf);
+    return DoUnpack<Fast>(Type_, chunked, buf.size(), holderFactory, State_);
 }
 
 template<bool Fast>
-void TValuePackerTransport<Fast>::UnpackBatch(TStringBuf buf, const THolderFactory& holderFactory, TUnboxedValueVector& result) const {
-    MKQL_ENSURE(Type_->IsList(), "UnpackBatch() requires list type");
-
-    auto& s = State_;
-    ui64 len;
-    ui32 topLength;
-    const TType* itemType = static_cast<const TListType*>(Type_)->GetItemType();
-    if constexpr (!Fast) {
-        auto pair = SkipEmbeddedLength<Fast>(buf);
-        topLength = pair.first;
-        bool emptySingleOptional = pair.second;
-
-        if (s.Properties.Test(EPackProps::UseOptionalMask)) {
-            s.OptionalUsageMask.Reset(buf);
-        }
-
-        MKQL_ENSURE(!s.Properties.Test(EPackProps::SingleOptional) || !emptySingleOptional, "Unexpected header settings");
-        len = NDetails::UnpackUInt64(buf);
-    } else {
-        topLength = 0;
-        len = NDetails::GetRawData<ui64>(buf);
-    }
-
-    result.reserve(len + result.size());
-    for (ui64 i = 0; i < len; ++i) {
-        result.emplace_back(UnpackFromContigousBuffer<Fast>(itemType, buf, topLength, holderFactory, s));
-    }
-    MKQL_ENSURE(buf.empty(), "Bad packed data. Not fully data read");
+NUdf::TUnboxedValue TValuePackerTransport<Fast>::Unpack(TRope&& buf, const THolderFactory& holderFactory) const {
+    const size_t totalSize = buf.GetSize();
+    TChunkedInputBuffer chunked(std::move(buf));
+    return DoUnpack<Fast>(Type_, chunked, totalSize, holderFactory, State_);
 }
 
 template<bool Fast>
-const TPagedBuffer& TValuePackerTransport<Fast>::Pack(const NUdf::TUnboxedValuePod& value) const {
+void TValuePackerTransport<Fast>::UnpackBatch(TStringBuf buf, const THolderFactory& holderFactory, TUnboxedValueBatch& result) const {
+    TChunkedInputBuffer chunked(buf);
+    DoUnpackBatch<Fast>(Type_, chunked, buf.size(), holderFactory, IncrementalState_, result);
+}
+
+template<bool Fast>
+void TValuePackerTransport<Fast>::UnpackBatch(TRope&& buf, const THolderFactory& holderFactory, TUnboxedValueBatch& result) const {
+    const size_t totalSize = buf.GetSize();
+    TChunkedInputBuffer chunked(std::move(buf));
+    DoUnpackBatch<Fast>(Type_, chunked, totalSize, holderFactory, IncrementalState_, result);
+}
+
+template<bool Fast>
+TPagedBuffer::TPtr TValuePackerTransport<Fast>::Pack(const NUdf::TUnboxedValuePod& value) const {
     MKQL_ENSURE(ItemCount_ == 0, "Can not mix Pack() and AddItem() calls");
-    Buffer_.Clear();
+    TPagedBuffer::TPtr result = std::make_shared<TPagedBuffer>();
     if constexpr (Fast) {
-        PackImpl<Fast, false>(Type_, Buffer_, value, State_);
+        PackImpl<Fast, false>(Type_, *result, value, State_);
     } else {
         State_.OptionalUsageMask.Reset();
-        Buffer_.ReserveHeader(sizeof(ui32) + State_.OptionalMaskReserve);
-        PackImpl<Fast, false>(Type_, Buffer_, value, State_);
-        BuildMeta(false);
+        result->ReserveHeader(sizeof(ui32) + State_.OptionalMaskReserve);
+        PackImpl<Fast, false>(Type_, *result, value, State_);
+        BuildMeta(result, false);
     }
-    return Buffer_;
+    return result;
+}
+
+template<bool Fast>
+void TValuePackerTransport<Fast>::StartPack() {
+    Buffer_ = std::make_shared<TPagedBuffer>();
+    if constexpr (Fast) {
+        // reserve place for list item count
+        Buffer_->ReserveHeader(sizeof(ItemCount_));
+    } else {
+        IncrementalState_.OptionalUsageMask.Reset();
+        Buffer_->ReserveHeader(sizeof(ui32) + State_.OptionalMaskReserve + MAX_PACKED64_SIZE);
+    }
 }
 
 template<bool Fast>
 TValuePackerTransport<Fast>& TValuePackerTransport<Fast>::AddItem(const NUdf::TUnboxedValuePod& value) {
-    MKQL_ENSURE(Type_->IsList(), "AddItem() is only supported for list types");
-    const TType* itemType = static_cast<const TListType*>(Type_)->GetItemType();
+    Y_VERIFY_DEBUG(!Type_->IsMulti());
+    const TType* itemType = Type_;
     if (!ItemCount_) {
-        Buffer_.Clear();
-        if constexpr (Fast) {
-            // reserve place for list item count
-            Buffer_.ReserveHeader(sizeof(ItemCount_));
-        } else {
-            State_.OptionalUsageMask.Reset();
-            Buffer_.ReserveHeader(sizeof(ui32) + State_.OptionalMaskReserve + MAX_PACKED64_SIZE);
-        }
+        StartPack();
     }
 
-    PackImpl<Fast, false>(itemType, Buffer_, value, State_);
+    PackImpl<Fast, false>(itemType, *Buffer_, value, IncrementalState_);
+    ++ItemCount_;
+    return *this;
+}
+
+template<bool Fast>
+TValuePackerTransport<Fast>& TValuePackerTransport<Fast>::AddWideItem(const NUdf::TUnboxedValuePod* values, ui32 width) {
+    Y_VERIFY_DEBUG(Type_->IsMulti());
+    Y_VERIFY_DEBUG(static_cast<const TMultiType*>(Type_)->GetElementsCount() == width);
+    const TMultiType* itemType = static_cast<const TMultiType*>(Type_);
+    if (!ItemCount_) {
+        StartPack();
+    }
+
+    for (ui32 i = 0; i < width; ++i) {
+        PackImpl<Fast, false>(itemType->GetElementType(i), *Buffer_, values[i], IncrementalState_);
+    }
     ++ItemCount_;
     return *this;
 }
 
 template<bool Fast>
 void TValuePackerTransport<Fast>::Clear() {
-    Buffer_.Clear();
+    Buffer_.reset();
     ItemCount_ = 0;
 }
 
 template<bool Fast>
-const TPagedBuffer& TValuePackerTransport<Fast>::Finish() {
-    MKQL_ENSURE(Type_->IsList(), "Finish() is only supported for list types");
+TPagedBuffer::TPtr TValuePackerTransport<Fast>::Finish() {
+    if (!ItemCount_) {
+        StartPack();
+    }
     if constexpr (Fast) {
-        char* dst = Buffer_.Header(sizeof(ItemCount_));
+        char* dst = Buffer_->Header(sizeof(ItemCount_));
         Y_VERIFY_DEBUG(dst);
         std::memcpy(dst, &ItemCount_, sizeof(ItemCount_));
     } else {
-        BuildMeta(true);
+        BuildMeta(Buffer_, true);
     }
-    ItemCount_ = 0;
-    return Buffer_;
+    TPagedBuffer::TPtr result = std::move(Buffer_);
+    Clear();
+    return result;
 }
 
 template<bool Fast>
-TPagedBuffer TValuePackerTransport<Fast>::FinishAndPull() {
-    Finish();
-    return std::move(Buffer_);
-}
-
-template<bool Fast>
-void TValuePackerTransport<Fast>::BuildMeta(bool addItemCount) const {
+void TValuePackerTransport<Fast>::BuildMeta(TPagedBuffer::TPtr& buffer, bool addItemCount) const {
     const size_t itemCountSize = addItemCount ? GetPack64Length(ItemCount_) : 0;
-    const size_t packedSize = Buffer_.Size() + itemCountSize;
+    const size_t packedSize = buffer->Size() + itemCountSize;
 
-    auto& s = State_;
+    auto& s = addItemCount ? IncrementalState_ : State_;
 
     const bool useMask = s.Properties.Test(EPackProps::UseOptionalMask);
     const size_t maskSize = useMask ? s.OptionalUsageMask.CalcSerializedSize() : 0;
@@ -1010,7 +1073,7 @@ void TValuePackerTransport<Fast>::BuildMeta(bool addItemCount) const {
 
     size_t metaSize = (fullLen > 7 ? sizeof(ui32) : sizeof(ui8)) + maskSize;
 
-    if (char* header = Buffer_.Header(metaSize + itemCountSize)) {
+    if (char* header = buffer->Header(metaSize + itemCountSize)) {
         TFixedSizeBuffer buf(header, metaSize + itemCountSize);
         SerializeMeta(buf, useMask, s.OptionalUsageMask, fullLen, s.Properties.Test(EPackProps::SingleOptional));
         if (addItemCount) {
@@ -1028,17 +1091,17 @@ void TValuePackerTransport<Fast>::BuildMeta(bool addItemCount) const {
     } else {
         s.OptionalMaskReserve = maskSize;
 
-        TPagedBuffer resultBuffer;
-        SerializeMeta(resultBuffer, useMask, s.OptionalUsageMask, fullLen, s.Properties.Test(EPackProps::SingleOptional));
+        TPagedBuffer::TPtr resultBuffer = std::make_shared<TPagedBuffer>();
+        SerializeMeta(*resultBuffer, useMask, s.OptionalUsageMask, fullLen, s.Properties.Test(EPackProps::SingleOptional));
         if (addItemCount) {
-            PackData<Fast>(ItemCount_, resultBuffer);
+            PackData<Fast>(ItemCount_, *resultBuffer);
         }
 
-        Buffer_.ForEachPage([&resultBuffer](const char* data, size_t len) {
-            resultBuffer.Append(data, len);
+        buffer->ForEachPage([&resultBuffer](const char* data, size_t len) {
+            resultBuffer->Append(data, len);
         });
 
-        Buffer_ = std::move(resultBuffer);
+        buffer = std::move(resultBuffer);
     }
 }
 
