@@ -2,6 +2,7 @@ LIBRARY()
 
 SRCS(
     kqp_explain_prepared.cpp
+    kqp_gateway_proxy.cpp
     kqp_host.cpp
     kqp_runner.cpp
     kqp_transform.cpp
@@ -14,9 +15,8 @@ PEERDIR(
     ydb/core/kqp/opt
     ydb/core/kqp/provider
     ydb/core/tx/long_tx_service/public
-    ydb/library/yql/ast
     ydb/library/yql/core/services
-    ydb/library/yql/minikql/invoke_builtins
+    ydb/library/yql/minikql/invoke_builtins/llvm
     ydb/library/yql/sql
     ydb/library/yql/core
     ydb/library/yql/providers/common/codec

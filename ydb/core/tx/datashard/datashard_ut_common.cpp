@@ -1087,6 +1087,11 @@ static ui64 RunSchemeTx(
 
     runtime.Send(new IEventHandle(MakeTxProxyID(), sender, request.Release()), 0, viaActorSystem);
     auto ev = runtime.GrabEdgeEventRethrow<TEvTxUserProxy::TEvProposeTransactionStatus>(sender);
+
+    for (auto i : ev->Get()->Record.GetIssues()) {
+        Cerr << "Issue: " << i.AsJSON() << Endl;
+    }
+
     UNIT_ASSERT_VALUES_EQUAL(ev->Get()->Record.GetStatus(), expectedStatus);
 
     return ev->Get()->Record.GetTxId();
@@ -1104,7 +1109,7 @@ void CreateShardedTable(
 
     auto& tx = *request->Record.MutableTransaction()->MutableModifyScheme();
     NKikimrSchemeOp::TTableDescription* desc = nullptr;
-    if (opts.Indexes_) {
+    if (opts.Indexes_ || opts.Sequences_) {
         tx.SetOperationType(NKikimrSchemeOp::ESchemeOpCreateIndexedTable);
         desc = tx.MutableCreateIndexedTable()->MutableTableDescription();
     } else {
@@ -1115,6 +1120,8 @@ void CreateShardedTable(
     UNIT_ASSERT(desc);
     desc->SetName(name);
 
+    std::vector<TString> defaultFromSequences;
+
     for (const auto& column : opts.Columns_) {
         auto col = desc->AddColumns();
         col->SetName(column.Name);
@@ -1123,6 +1130,22 @@ void CreateShardedTable(
         if (column.IsKey) {
             desc->AddKeyColumnNames(column.Name);
         }
+        col->SetFamilyName(column.Family);
+        if (column.DefaultFromSequence) {
+            col->SetDefaultFromSequence(column.DefaultFromSequence);
+            defaultFromSequences.emplace_back(column.DefaultFromSequence);
+        }
+    }
+
+    for (const auto& family : opts.Families_) {
+        auto fam = desc->MutablePartitionConfig()->AddColumnFamilies();
+        if (family.Name) fam->SetName(family.Name);
+        if (family.LogPoolKind) fam->MutableStorageConfig()->MutableLog()->SetPreferredPoolKind(family.LogPoolKind);
+        if (family.SysLogPoolKind) fam->MutableStorageConfig()->MutableSysLog()->SetPreferredPoolKind(family.SysLogPoolKind);
+        if (family.DataPoolKind) fam->MutableStorageConfig()->MutableData()->SetPreferredPoolKind(family.DataPoolKind);
+        if (family.ExternalPoolKind) fam->MutableStorageConfig()->MutableExternal()->SetPreferredPoolKind(family.ExternalPoolKind);
+        if (family.DataThreshold) fam->MutableStorageConfig()->SetDataThreshold(family.DataThreshold);
+        if (family.ExternalThreshold) fam->MutableStorageConfig()->SetExternalThreshold(family.ExternalThreshold);
     }
 
     for (const auto& index : opts.Indexes_) {
@@ -1145,6 +1168,11 @@ void CreateShardedTable(
         attr->SetValue(v);
     }
 
+    for(const TString& name: defaultFromSequences) {
+        auto seq = tx.MutableCreateIndexedTable()->MutableSequenceDescription()->Add();
+        seq->SetName(name);
+    }
+    
     desc->SetUniformPartitionsCount(opts.Shards_);
 
     if (!opts.EnableOutOfOrder_)
@@ -1637,6 +1665,9 @@ ui64 AsyncAlterAddStream(
     desc.MutableStreamDescription()->SetMode(streamDesc.Mode);
     desc.MutableStreamDescription()->SetFormat(streamDesc.Format);
     desc.MutableStreamDescription()->SetVirtualTimestamps(streamDesc.VirtualTimestamps);
+    if (streamDesc.ResolvedTimestamps) {
+        desc.MutableStreamDescription()->SetResolvedTimestampsIntervalMs(streamDesc.ResolvedTimestamps->MilliSeconds());
+    }
     if (streamDesc.InitialState) {
         desc.MutableStreamDescription()->SetState(*streamDesc.InitialState);
     }

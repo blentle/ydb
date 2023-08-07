@@ -137,7 +137,7 @@ namespace NMonitoring {
     //  | vptr | RefsCount | BucketsCount | Bound1 | Value1 |   ...   | BoundN | ValueN |
     //  +------+-----------+--------------+--------+--------+-       -+--------+--------+
     //
-    class TExplicitHistogramSnapshot: public IHistogramSnapshot, private TNonCopyable {
+    class alignas(TBucketValue) TExplicitHistogramSnapshot: public IHistogramSnapshot, private TNonCopyable {
     public:
         static TIntrusivePtr<TExplicitHistogramSnapshot> New(ui32 bucketsCount) {
             size_t bucketsSize = bucketsCount * sizeof(TBucket);
@@ -203,7 +203,7 @@ namespace NMonitoring {
     static_assert(alignof(TExplicitHistogramSnapshot) == alignof(TBucket),
                   "mismatched alingments of THistogramSnapshot and TBucket");
 
-    IHistogramSnapshotPtr ExplicitHistogramSnapshot(TConstArrayRef<TBucketBound> bounds, TConstArrayRef<TBucketValue> values);
+    IHistogramSnapshotPtr ExplicitHistogramSnapshot(TConstArrayRef<TBucketBound> bounds, TConstArrayRef<TBucketValue> values, bool shrinkBuckets = false);
 
 } // namespace NMonitoring
 

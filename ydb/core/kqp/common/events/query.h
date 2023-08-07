@@ -5,7 +5,7 @@
 #include <ydb/core/grpc_services/cancelation/cancelation_event.h>
 #include <ydb/core/grpc_services/cancelation/cancelation.h>
 
-#include <ydb/public/api/protos/draft/ydb_query.pb.h>
+#include <ydb/public/api/protos/ydb_query.pb.h>
 #include <ydb/library/aclib/aclib.h>
 #include <library/cpp/actors/core/event_pb.h>
 #include <library/cpp/actors/core/event_local.h>
@@ -113,10 +113,6 @@ public:
 
     const TString& GetQuery() const {
         return RequestCtx ? YqlText : Record.GetRequest().GetQuery();
-    }
-
-    const ::NKikimrMiniKQL::TParams& GetParameters() const {
-        return Record.GetRequest().GetParameters();
     }
 
     const ::Ydb::Table::TransactionControl& GetTxControl() const {
@@ -229,7 +225,6 @@ public:
             return ParametersSize;
         }
 
-        ParametersSize += Record.GetRequest().GetParameters().ByteSizeLong();
         for (const auto& [name, param] : GetYdbParameters()) {
             ParametersSize += name.size();
             ParametersSize += param.ByteSizeLong();

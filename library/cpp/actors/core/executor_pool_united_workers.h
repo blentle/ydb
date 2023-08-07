@@ -4,6 +4,7 @@
 #include "balancer.h"
 #include "scheduler_queue.h"
 
+#include <library/cpp/actors/actor_type/indexes.h>
 #include <library/cpp/actors/util/cpu_load_log.h>
 #include <library/cpp/actors/util/datetime.h>
 #include <util/generic/noncopyable.h>
@@ -17,7 +18,7 @@ namespace NActors {
         struct TPool;
         struct TCpu;
 
-        size_t WorkerCount;
+        i16 WorkerCount;
         TArrayHolder<TWorker> Workers; // indexed by WorkerId
         size_t PoolCount;
         TArrayHolder<TPool> Pools;  // indexed by PoolId, so may include not used (not united) pools
@@ -31,7 +32,7 @@ namespace NActors {
 
         volatile bool StopFlag = false;
         TMinusOneCpuEstimator<1024> MinusOneCpuEstimator;
-
+        const ui32 ActorSystemIndex = NActors::TActorTypeOperator::GetActorSystemIndex();
     public:
         TUnitedWorkers(
             const TUnitedWorkersConfig& config,

@@ -10,6 +10,7 @@
 #include <ydb/core/kqp/provider/yql_kikimr_gateway.h>
 #include <ydb/core/kqp/provider/yql_kikimr_settings.h>
 #include <ydb/core/tx/long_tx_service/public/lock_handle.h>
+#include <ydb/core/ydb_convert/table_profiles.h>
 #include <ydb/library/accessor/accessor.h>
 #include <ydb/library/yql/ast/yql_expr.h>
 #include <ydb/library/yql/dq/common/dq_value.h>
@@ -60,6 +61,12 @@ struct TModuleResolverState : public TThrRefBase {
 
 void ApplyServiceConfig(NYql::TKikimrConfiguration& kqpConfig, const NKikimrConfig::TTableServiceConfig& serviceConfig);
 
+enum class ELocksOp {
+    Unspecified = 0,
+    Commit,
+    Rollback
+};
+
 class IKqpGateway : public NYql::IKikimrGateway {
 public:
     struct TPhysicalTxData : private TMoveOnly {
@@ -107,6 +114,10 @@ public:
         NKikimrIssues::TStatusIds::EStatusCode Status =  NKikimrIssues::TStatusIds::UNKNOWN;
     };
 
+    struct TKqpTableProfilesResult : public IKqpGateway::TGenericResult {
+        TTableProfiles Profiles;
+    };
+
     struct TExecPhysicalRequest : private TMoveOnly {
     public:
 
@@ -119,8 +130,7 @@ public:
         TVector<TPhysicalTxData> Transactions;
         TMap<ui64, TVector<NKikimrTxDataShard::TLock>> DataShardLocks;
         NKikimr::NKqp::TTxAllocatorState::TPtr TxAlloc;
-        bool ValidateLocks = false;
-        bool EraseLocks = false;
+        ELocksOp LocksOp = ELocksOp::Unspecified;
         TMaybe<ui64> AcquireLocksTxId;
         TDuration Timeout;
         TMaybe<TDuration> CancelAfter;
@@ -153,7 +163,14 @@ public:
     };
 
 public:
+    virtual TString GetDatabase() = 0;
+
+    /* Scheme */
+    virtual NThreading::TFuture<TKqpTableProfilesResult> GetTableProfiles() = 0;
+    virtual NThreading::TFuture<TGenericResult> ModifyScheme(NKikimrSchemeOp::TModifyScheme&& modifyScheme) = 0;
+
     /* Compute */
+    using NYql::IKikimrGateway::ExecuteLiteral;
     virtual NThreading::TFuture<TExecPhysicalResult> ExecuteLiteral(TExecPhysicalRequest&& request,
         TQueryData::TPtr params, ui32 txIndex) = 0;
 
@@ -181,6 +198,9 @@ public:
 TIntrusivePtr<IKqpGateway> CreateKikimrIcGateway(const TString& cluster, const TString& database,
     std::shared_ptr<IKqpGateway::IKqpTableMetadataLoader>&& metadataLoader, NActors::TActorSystem* actorSystem,
     ui32 nodeId, TKqpRequestCounters::TPtr counters);
+
+bool SplitTablePath(const TString& tableName, const TString& database, std::pair<TString, TString>& pathPair,
+    TString& error, bool createDir);
 
 } // namespace NKikimr::NKqp
 

@@ -6,19 +6,17 @@ namespace NKikimr {
 // TBlobState
 //
 
-void TBlobState::TState::AddResponseData(ui32 fullSize, ui32 shift, TString &data) {
+void TBlobState::TState::AddResponseData(ui32 fullSize, ui32 shift, TRope&& data) {
+    const ui32 size = data.size();
     // Add the data to the Data buffer
-    Y_VERIFY(data.size());
-    Y_VERIFY(shift + data.size() <= fullSize);
-    Data.Write(shift, data.data(), data.size());
-    // Mark the interval as present in the Data buffer
-    Here.Add(shift, shift + data.size());
+    Y_VERIFY(size);
+    Y_VERIFY(shift < fullSize && size <= fullSize - shift);
+    Data.Write(shift, std::move(data));
 }
 
-void TBlobState::TState::AddPartToPut(TRope &data) {
-    Y_VERIFY(data.size());
-    Data.SetMonolith(data);
-    Here.Assign(0, data.size());
+void TBlobState::TState::AddPartToPut(TRope&& partData) {
+    Y_VERIFY(partData);
+    Data.SetMonolith(std::move(partData));
 }
 
 
@@ -41,14 +39,13 @@ void TBlobState::Init(const TLogoBlobID &id, const TBlobStorageGroupInfo &info) 
 void TBlobState::AddNeeded(ui64 begin, ui64 size) {
     Y_VERIFY(bool(Id));
     Whole.Needed.Add(begin, begin + size);
-    Whole.NotHere.Add(begin, begin + size);
     IsChanged = true;
 }
 
-void TBlobState::AddPartToPut(ui32 partIdx, TRope &partData) {
+void TBlobState::AddPartToPut(ui32 partIdx, TRope&& partData) {
     Y_VERIFY(bool(Id));
     Y_VERIFY(partIdx < Parts.size());
-    Parts[partIdx].AddPartToPut(partData);
+    Parts[partIdx].AddPartToPut(std::move(partData));
     IsChanged = true;
 }
 
@@ -60,55 +57,47 @@ void TBlobState::MarkBlobReadyToPut(ui8 blobIdx) {
 }
 
 bool TBlobState::Restore(const TBlobStorageGroupInfo &info) {
-    TIntervalVec<i32> fullBlobInterval(0, Id.BlobSize());
-    if (fullBlobInterval.IsSubsetOf(Whole.Here)) {
+    const TIntervalVec<i32> fullBlobInterval(0, Id.BlobSize());
+    const TIntervalSet<i32> here = Whole.Here();
+    Y_VERIFY_DEBUG((here - fullBlobInterval).IsEmpty()); // ensure no excessive data outsize blob's boundaries
+    if (fullBlobInterval.IsSubsetOf(here)) { // we already have 'whole' part, no need for restoration
         return true;
     }
 
-    const ui32 parts = info.Type.TotalPartCount();
+    TStackVec<TRope, TypicalPartsInBlob> parts(info.Type.TotalPartCount());
     ui32 partsPresent = 0;
-    for (ui32 i = 0; i < parts; ++i) {
+    for (ui32 i = 0; i < parts.size(); ++i) {
         if (const ui32 partSize = info.Type.PartSize(TLogoBlobID(Id, i + 1))) {
-            if (TIntervalVec<i32>(0, partSize).IsSubsetOf(Parts[i].Here)) {
-                ++partsPresent;
+            const TIntervalVec<i32> fullPartInterval(0, partSize);
+            const TIntervalSet<i32> partHere = Parts[i].Here();
+            Y_VERIFY_DEBUG((partHere - fullPartInterval).IsEmpty()); // ensure no excessive part data outside boundaries
+            if (fullPartInterval.IsSubsetOf(partHere)) {
+                parts[i] = Parts[i].Data.Read(0, partSize);
+                if (++partsPresent >= info.Type.MinimalRestorablePartCount()) {
+                    TRope whole;
+                    ErasureRestore((TErasureType::ECrcMode)Id.CrcMode(), info.Type, Id.BlobSize(), &whole, parts, 0, 0, false);
+                    Y_VERIFY(whole.size() == Id.BlobSize());
+                    Whole.Data.SetMonolith(std::move(whole));
+                    Y_VERIFY_DEBUG(Whole.Here() == fullBlobInterval);
+                    return true;
+                }
             }
         }
     }
-    if (partsPresent < info.Type.MinimalRestorablePartCount()) {
-        return false;
-    }
 
-    TDataPartSet partSet;
-    partSet.Parts.resize(parts);
-    for (ui32 i = 0; i < parts; ++i) {
-        if (const ui32 partSize = info.Type.PartSize(TLogoBlobID(Id, i + 1))) {
-            if (TIntervalVec<i32>(0, partSize).IsSubsetOf(Parts[i].Here)) {
-                partSet.PartsMask |= (1 << i);
-                TRope data(MakeIntrusive<TRopeSharedDataBackend>(TSharedData::Uninitialized(partSize)));
-                Parts[i].Data.Read(0, data.UnsafeGetContiguousSpanMut().data(), partSize);
-                partSet.Parts[i].ReferenceTo(data);
-            }
-        }
-    }
-    partSet.FullDataSize = Id.BlobSize();
-
-    TRope whole;
-    info.Type.RestoreData((TErasureType::ECrcMode)Id.CrcMode(), partSet, whole, false, true, false);
-    Whole.Data.Write(0, whole.GetContiguousSpan().data(), Id.BlobSize());
-    Whole.Here.Add(fullBlobInterval);
-    Whole.NotHere.Subtract(fullBlobInterval);
-    return true;
+    return false;
 }
 
 void TBlobState::AddResponseData(const TBlobStorageGroupInfo &info, const TLogoBlobID &id, ui32 orderNumber,
-        ui32 shift, TString &data, bool keep, bool doNotKeep) {
+        ui32 shift, TRope&& data, bool keep, bool doNotKeep) {
     // Add actual data to Parts
     Y_VERIFY(id.PartId() != 0);
     ui32 partIdx = id.PartId() - 1;
     Y_VERIFY(partIdx < Parts.size());
     const ui32 partSize = info.Type.PartSize(id);
+    const ui32 dataSize = data.size();
     if (partSize) {
-        Parts[partIdx].AddResponseData(partSize, shift, data);
+        Parts[partIdx].AddResponseData(partSize, shift, std::move(data));
     }
     IsChanged = true;
     // Mark part as present for the disk
@@ -122,7 +111,7 @@ void TBlobState::AddResponseData(const TBlobStorageGroupInfo &info, const TLogoB
             //Cerr << Endl << "present diskIdx# " << diskIdx << " partIdx# " << partIdx << Endl << Endl;
             diskPart.Situation = ESituation::Present;
             if (partSize) {
-                TIntervalVec<i32> responseInterval(shift, shift + data.size());
+                TIntervalVec<i32> responseInterval(shift, shift + dataSize);
                 diskPart.Requested.Subtract(responseInterval);
             }
             break;
@@ -313,7 +302,7 @@ TString TBlobState::TDiskPart::ToString() const {
 TString TBlobState::TState::ToString() const {
     TStringStream str;
     str << "{Data# " << Data.Print();
-    str << " Here# " << Here.ToString();
+    str << " Here# " << Here().ToString();
     str << "}";
     return str.Str();
 }
@@ -321,9 +310,9 @@ TString TBlobState::TState::ToString() const {
 TString TBlobState::TWholeState::ToString() const {
     TStringStream str;
     str << "{Data# " << Data.Print();
-    str << " Here# " << Here.ToString();
+    str << " Here# " << Here().ToString();
     str << " Needed# " << Needed.ToString();
-    str << " NotHere# " << NotHere.ToString();
+    str << " NotHere# " << NotHere().ToString();
     str << "}";
     return str.Str();
 }
@@ -381,11 +370,13 @@ void TBlackboard::AddNeeded(const TLogoBlobID &id, ui32 inShift, ui32 inSize) {
     }
 }
 
-void TBlackboard::AddPartToPut(const TLogoBlobID &id, ui32 partIdx, TRope &partData) {
+void TBlackboard::AddPartToPut(const TLogoBlobID &id, ui32 partIdx, TRope&& partData) {
     Y_VERIFY(bool(id));
     Y_VERIFY(id.PartId() == 0);
     Y_VERIFY(id.BlobSize() != 0);
-    (*this)[id].AddPartToPut(partIdx, partData);
+    Y_VERIFY(partData.size() == Info->Type.PartSize(TLogoBlobID(id, partIdx + 1)),
+        "partData# %zu partSize# %" PRIu64, partData.size(), Info->Type.PartSize(TLogoBlobID(id, partIdx + 1)));
+    (*this)[id].AddPartToPut(partIdx, std::move(partData));
 }
 
 void TBlackboard::MarkBlobReadyToPut(const TLogoBlobID &id, ui8 blobIdx) {
@@ -423,11 +414,11 @@ void TBlackboard::AddPutOkResponse(const TLogoBlobID &id, ui32 orderNumber) {
     state.AddPutOkResponse(*Info, id, orderNumber);
 }
 
-void TBlackboard::AddResponseData(const TLogoBlobID &id, ui32 orderNumber, ui32 shift, TString &data, bool keep, bool doNotKeep) {
+void TBlackboard::AddResponseData(const TLogoBlobID &id, ui32 orderNumber, ui32 shift, TRope&& data, bool keep, bool doNotKeep) {
     Y_VERIFY(bool(id));
     Y_VERIFY(id.PartId() != 0);
     TBlobState &state = GetState(id);
-    state.AddResponseData(*Info, id, orderNumber, shift, data, keep, doNotKeep);
+    state.AddResponseData(*Info, id, orderNumber, shift, std::move(data), keep, doNotKeep);
 }
 
 void TBlackboard::AddNoDataResponse(const TLogoBlobID &id, ui32 orderNumber) {

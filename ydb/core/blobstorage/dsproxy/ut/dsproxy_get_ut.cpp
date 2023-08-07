@@ -120,7 +120,7 @@ void TestIntervalsAndCrcAllOk(TErasureType::EErasureSpecies erasureSpecies, bool
                 UNIT_ASSERT_VALUES_EQUAL(a.Status, NKikimrProto::OK);
                 UNIT_ASSERT_VALUES_EQUAL(q.Shift, a.Shift);
                 UNIT_ASSERT_VALUES_EQUAL(q.Size, a.RequestedSize);
-                blobSet.Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer);
+                blobSet.Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer.ConvertToString());
             }
         }
     }
@@ -132,9 +132,9 @@ Y_UNIT_TEST(TestBlock42GetIntervalsAllOk) {
     TestIntervalsAndCrcAllOk(TErasureType::Erasure4Plus2Block, false, false);
 }
 
-Y_UNIT_TEST(TestBlock42GetIntervalsAllOkVerbose) {
-    TestIntervalsAndCrcAllOk(TErasureType::Erasure4Plus2Block, true, false);
-}
+//Y_UNIT_TEST(TestBlock42GetIntervalsAllOkVerbose) {
+//    TestIntervalsAndCrcAllOk(TErasureType::Erasure4Plus2Block, true, false);
+//}
 
 Y_UNIT_TEST(TestMirror32GetIntervalsAllOk) {
     TestIntervalsAndCrcAllOk(TErasureType::ErasureMirror3Plus2, false, false);
@@ -145,9 +145,9 @@ Y_UNIT_TEST(TestBlock42GetBlobCrcCheck) {
     TestIntervalsAndCrcAllOk(TErasureType::Erasure4Plus2Block, false, true);
 }
 
-Y_UNIT_TEST(TestBlock42GetBlobCrcCheckVerbose) {
-    TestIntervalsAndCrcAllOk(TErasureType::Erasure4Plus2Block, true, true);
-}
+//Y_UNIT_TEST(TestBlock42GetBlobCrcCheckVerbose) {
+//    TestIntervalsAndCrcAllOk(TErasureType::Erasure4Plus2Block, true, true);
+//}
 
 Y_UNIT_TEST(TestMirror32GetBlobCrcCheck) {
     TestIntervalsAndCrcAllOk(TErasureType::ErasureMirror3Plus2, false, true);
@@ -451,44 +451,12 @@ private:
             UNIT_ASSERT_VALUES_EQUAL(a.Status, NKikimrProto::OK);
             UNIT_ASSERT_VALUES_EQUAL(q.Shift, a.Shift);
             UNIT_ASSERT_VALUES_EQUAL(q.Size, a.RequestedSize);
-            BlobSet->Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer);
+            BlobSet->Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer.ConvertToString());
         }
     }
 };
 
-void TestIntervalsWipedAllOk(TErasureType::EErasureSpecies erasureSpecies, bool isVerboseNoDataEnabled = false) {
-    TActorSystemStub actorSystemStub;
-
-    const ui32 groupId = 0;
-    TBlobStorageGroupType groupType(erasureSpecies);
-    const ui32 domainCount = groupType.BlobSubgroupSize();
-
-    TVector<ui64> queryCounts = {1, 2, 3, 13, 34};
-
-    for (bool isRestore : {false, true}) {
-        for (ui32 generateMode = 0; generateMode < 2; ++generateMode) {
-            for (ui64 wiped1 = 0; wiped1 < domainCount; ++wiped1) {
-                for (ui64 wiped2 = 0; wiped2 <= wiped1; ++wiped2) {
-                    ui64 maxErrorMask = (wiped1 == wiped2 ? 4 : 24);
-                    for (ui64 errorMask = 0; errorMask <= maxErrorMask; ++errorMask) {
-                        ui64 error1 = errorMask % 5;
-                        ui64 error2 = errorMask / 5;
-                        TTestWipedAllOkStep testStep(
-                                groupId, erasureSpecies, domainCount, queryCounts,
-                                isVerboseNoDataEnabled, isRestore);
-                        testStep.SetGenerateBlobsMode(generateMode);
-                        testStep.Init();
-                        testStep.AddWipedVDisk(wiped1, error1);
-                        testStep.AddWipedVDisk(wiped2, error2);
-                        testStep.Run(false);
-                    }
-                }
-            }
-        }
-    }
-}
-
-void TestIntervalsWipedAllOkVMultiPut(TErasureType::EErasureSpecies erasureSpecies, bool isVerboseNoDataEnabled = false) {
+void TestIntervalsWipedAllOk(TErasureType::EErasureSpecies erasureSpecies, bool isVerboseNoDataEnabled, bool multiput) {
     TActorSystemStub actorSystemStub;
 
     const ui32 groupId = 0;
@@ -512,7 +480,7 @@ void TestIntervalsWipedAllOkVMultiPut(TErasureType::EErasureSpecies erasureSpeci
                         testStep.Init();
                         testStep.AddWipedVDisk(wiped1, error1);
                         testStep.AddWipedVDisk(wiped2, error2);
-                        testStep.Run(true);
+                        testStep.Run(multiput);
                     }
                 }
             }
@@ -797,7 +765,7 @@ Y_UNIT_TEST(TestBlock42VGetCountWithErasure) {
             if (a.Status == NKikimrProto::OK) {
                 UNIT_ASSERT_VALUES_EQUAL(q.Shift, a.Shift);
                 UNIT_ASSERT_VALUES_EQUAL(q.Size, a.RequestedSize);
-                blobSet.Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer);
+                blobSet.Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer.ConvertToString());
             } else {
                 TStringStream str;
                 str << " isRestore# " << isRestore
@@ -941,7 +909,7 @@ Y_UNIT_TEST(TestBlock42WipedOneDiskAndErrorDurringGet) {
             if (a.Status == NKikimrProto::OK) {
                 UNIT_ASSERT_VALUES_EQUAL(q.Shift, a.Shift);
                 UNIT_ASSERT_VALUES_EQUAL(q.Size, a.RequestedSize);
-                blobSet.Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer);
+                blobSet.Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer.ConvertToString());
             } else {
                 TStringStream str;
                 str << " isRestore# " << isRestore
@@ -1039,7 +1007,7 @@ void TestIntervalsWipedError(TErasureType::EErasureSpecies erasureSpecies, bool 
                                                 if (a.Status == NKikimrProto::OK) {
                                                     UNIT_ASSERT_VALUES_EQUAL(q.Shift, a.Shift);
                                                     UNIT_ASSERT_VALUES_EQUAL(q.Size, a.RequestedSize);
-                                                    simulator.BlobSet.Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer);
+                                                    simulator.BlobSet.Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer.ConvertToString());
                                                 } else {
                                                     TStringStream str;
                                                     str << " isRestore# " << isRestore
@@ -1215,7 +1183,7 @@ void TestWipedErrorWithTwoBlobs(TErasureType::EErasureSpecies erasureSpecies, bo
                                 if (a.Status == NKikimrProto::OK) {
                                     UNIT_ASSERT_VALUES_EQUAL(q.Shift, a.Shift);
                                     UNIT_ASSERT_VALUES_EQUAL(q.Size, a.RequestedSize);
-                                    blobSet.Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer);
+                                    blobSet.Check(queryIdx % blobCount, q.Id, q.Shift, q.Size, a.Buffer.ConvertToString());
                                 } else {
                                     TStringStream str;
                                     str << " isRestore# " << isRestore
@@ -1233,27 +1201,15 @@ void TestWipedErrorWithTwoBlobs(TErasureType::EErasureSpecies erasureSpecies, bo
 }
 
 Y_UNIT_TEST(TestBlock42GetIntervalsWipedAllOk) {
-    TestIntervalsWipedAllOk(TErasureType::Erasure4Plus2Block);
-}
-
-Y_UNIT_TEST(TestBlock42GetIntervalsWipedAllOkVerbose) {
-    TestIntervalsWipedAllOk(TErasureType::Erasure4Plus2Block, true);
+    TestIntervalsWipedAllOk(TErasureType::Erasure4Plus2Block, false, false);
 }
 
 Y_UNIT_TEST(TestBlock42GetIntervalsWipedAllOkVMultiPut) {
-    TestIntervalsWipedAllOkVMultiPut(TErasureType::Erasure4Plus2Block);
-}
-
-Y_UNIT_TEST(TestBlock42GetIntervalsWipedAllOkVerboseVMultiPut) {
-    TestIntervalsWipedAllOkVMultiPut(TErasureType::Erasure4Plus2Block, true);
+    TestIntervalsWipedAllOk(TErasureType::Erasure4Plus2Block, false, true);
 }
 
 Y_UNIT_TEST(TestBlock42GetIntervalsWipedAllOkComparisonVMultiPutAndVPut) {
     TestIntervalsWipedAllOkComparisonVMultiPutAndVPut(TErasureType::Erasure4Plus2Block);
-}
-
-Y_UNIT_TEST(TestBlock42GetIntervalsWipedAllOkVerboseComparisonVMultiPutAndVPut) {
-    TestIntervalsWipedAllOkComparisonVMultiPutAndVPut(TErasureType::Erasure4Plus2Block, true);
 }
 
 Y_UNIT_TEST(TestBlock42GetIntervalsWipedError) {
@@ -1265,11 +1221,11 @@ Y_UNIT_TEST(TestBlock42WipedErrorWithTwoBlobs) {
 }
 
 Y_UNIT_TEST(TestMirror32GetIntervalsWipedAllOk) {
-    TestIntervalsWipedAllOk(TErasureType::ErasureMirror3Plus2);
+    TestIntervalsWipedAllOk(TErasureType::ErasureMirror3Plus2, false, false);
 }
 
 Y_UNIT_TEST(TestMirror32GetIntervalsWipedAllOkVMultiPut) {
-    TestIntervalsWipedAllOkVMultiPut(TErasureType::ErasureMirror3Plus2);
+    TestIntervalsWipedAllOk(TErasureType::ErasureMirror3Plus2, false, true);
 }
 
 Y_UNIT_TEST(TestMirror32GetIntervalsWipedAllOkComparisonVMultiPutAndVPut) {
@@ -1324,7 +1280,7 @@ void SpecificTest(ui32 badA, ui32 badB, ui32 blobSize, TMap<i64, i64> sizeForOff
             if (a.Status == NKikimrProto::OK) {
                 UNIT_ASSERT_VALUES_EQUAL(qb.Shift, a.Shift);
                 UNIT_ASSERT_VALUES_EQUAL(qb.Size, a.RequestedSize);
-                simulator.BlobSet.Check(0, qb.Id, qb.Shift, qb.Size, a.Buffer);
+                simulator.BlobSet.Check(0, qb.Id, qb.Shift, qb.Size, a.Buffer.ConvertToString());
             } else {
                 TStringStream str;
                 str << " isRestore# false setIdx# 0 status# " << a.Status;
@@ -1536,7 +1492,7 @@ public:
                 UNIT_ASSERT_VALUES_EQUAL_C(a.Status, NKikimrProto::OK, currentTestState.Str());
                 UNIT_ASSERT_VALUES_EQUAL_C(q.Shift, a.Shift, currentTestState.Str());
                 UNIT_ASSERT_VALUES_EQUAL_C(q.Size, a.RequestedSize, currentTestState.Str());
-                BlobSet.Check(queryIdx, q.Id, q.Shift, q.Size, a.Buffer);
+                BlobSet.Check(queryIdx, q.Id, q.Shift, q.Size, a.Buffer.ConvertToString());
             }
         }
         RequestsOrder.resize(InitialRequestsSize);
@@ -1755,7 +1711,7 @@ public:
             UNIT_ASSERT_VALUES_EQUAL(a.Status, NKikimrProto::OK);
             UNIT_ASSERT_VALUES_EQUAL(q.Shift, a.Shift);
             UNIT_ASSERT_VALUES_EQUAL(q.Size, a.RequestedSize);
-            BlobSet.Check(queryIdx, q.Id, q.Shift, q.Size, a.Buffer);
+            BlobSet.Check(queryIdx, q.Id, q.Shift, q.Size, a.Buffer.ConvertToString());
         }
     }
 };

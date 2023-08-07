@@ -258,11 +258,7 @@ private:
             return result;
         }
 
-        int64_t result = std::numeric_limits<int64_t>::max();
-        for (auto& data : tree.Payload) {
-            result = std::min(result, data->length);
-        }
-
+        int64_t result = tree.Payload.front()->length;
         Y_VERIFY(result > 0);
         return static_cast<size_t>(result);
     }
@@ -1121,6 +1117,7 @@ inline std::unique_ptr<TArrayBuilderBase> MakeArrayBuilderImpl(
             return std::make_unique<TFixedSizeArrayBuilder<double, Nullable>>(typeInfoHelper, type, pool, maxLen);
         case NUdf::EDataSlot::String:
         case NUdf::EDataSlot::Yson:
+        case NUdf::EDataSlot::JsonDocument:
             return std::make_unique<TStringArrayBuilder<arrow::BinaryType, Nullable>>(typeInfoHelper, type, pool, maxLen);
         case NUdf::EDataSlot::Utf8:
         case NUdf::EDataSlot::Json:

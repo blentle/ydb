@@ -2,8 +2,8 @@
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 #include <library/cpp/actors/core/hfunc.h>
 #include <library/cpp/actors/core/log.h>
-#include <library/cpp/actors/wilson/protos/service.pb.h>
-#include <library/cpp/actors/wilson/protos/service.grpc.pb.h>
+#include <opentelemetry/proto/collector/trace/v1/trace_service.pb.h>
+#include <opentelemetry/proto/collector/trace/v1/trace_service.grpc.pb.h>
 #include <util/stream/file.h>
 #include <util/string/hex.h>
 #include <grpc++/grpc++.h>
@@ -24,6 +24,7 @@ namespace NWilson {
             TString Host;
             ui16 Port;
             TString RootCA;
+            TString ServiceName;
 
             std::shared_ptr<grpc::Channel> Channel;
             std::unique_ptr<NServiceProto::TraceService::Stub> Stub;
@@ -50,10 +51,11 @@ namespace NWilson {
             bool WakeupScheduled = false;
 
         public:
-            TWilsonUploader(TString host, ui16 port, TString rootCA)
+            TWilsonUploader(TString host, ui16 port, TString rootCA, TString serviceName)
                 : Host(std::move(host))
                 , Port(std::move(port))
                 , RootCA(std::move(rootCA))
+                , ServiceName(std::move(serviceName))
             {}
 
             ~TWilsonUploader() {
@@ -116,6 +118,9 @@ namespace NWilson {
 
                 NServiceProto::ExportTraceServiceRequest request;
                 auto *rspan = request.add_resource_spans();
+                auto *serviceNameAttr = rspan->mutable_resource()->add_attributes();
+                serviceNameAttr->set_key("service.name");
+                serviceNameAttr->mutable_value()->set_string_value(ServiceName);
                 auto *sspan = rspan->add_scope_spans();
 
                 NextSendTimestamp = now;
@@ -181,8 +186,8 @@ namespace NWilson {
 
     } // anonymous
 
-    IActor *CreateWilsonUploader(TString host, ui16 port, TString rootCA) {
-        return new TWilsonUploader(std::move(host), port, std::move(rootCA));
+    IActor *CreateWilsonUploader(TString host, ui16 port, TString rootCA, TString serviceName) {
+        return new TWilsonUploader(std::move(host), port, std::move(rootCA), std::move(serviceName));
     }
 
 } // NWilson

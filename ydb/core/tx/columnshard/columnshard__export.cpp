@@ -10,8 +10,9 @@ class TTxExportFinish: public TTransactionBase<TColumnShard> {
 public:
     TTxExportFinish(TColumnShard* self, TEvPrivate::TEvExport::TPtr& ev)
         : TBase(self)
-        , Ev(ev) {
-    }
+        , Ev(ev)
+        , TabletTxNo(++Self->TabletTxCounter)
+    {}
 
     bool Execute(TTransactionContext& txc, const TActorContext& ctx) override;
     void Complete(const TActorContext& ctx) override;
@@ -19,13 +20,22 @@ public:
 
 private:
     TEvPrivate::TEvExport::TPtr Ev;
-    THashSet<NOlap::TEvictedBlob> BlobsToForget;
+    const ui32 TabletTxNo;
+    THashMap<TString, THashSet<NOlap::TEvictedBlob>> BlobsToForget;
+
+    TStringBuilder TxPrefix() const {
+        return TStringBuilder() << "TxExportFinish[" << ToString(TabletTxNo) << "] ";
+    }
+
+    TString TxSuffix() const {
+        return TStringBuilder() << " at tablet " << Self->TabletID();
+    }
 };
 
 
 bool TTxExportFinish::Execute(TTransactionContext& txc, const TActorContext&) {
     Y_VERIFY(Ev);
-    LOG_S_DEBUG("TTxExportFinish.Execute at tablet " << Self->TabletID());
+    LOG_S_DEBUG(TxPrefix() << "execute" << TxSuffix());
 
     txc.DB.NoMoreReadsForTx();
     //NIceDb::TNiceDb db(txc.DB);
@@ -47,14 +57,8 @@ bool TTxExportFinish::Execute(TTransactionContext& txc, const TActorContext&) {
                 continue; // not exported
             }
 
-#if 0 // TODO: SELF_CACHED logic
-            NOlap::TEvictedBlob evict{
-                .State = EEvictState::SELF_CACHED,
-                .Blob = blobId,
-                .ExternBlob = externId
-            };
-            Self->BlobManager->UpdateOneToOne(std::move(evict), blobManagerDb, dropped);
-#else
+            // TODO: SELF_CACHED logic
+
             NOlap::TEvictedBlob evict{
                 .State = EEvictState::EXTERN,
                 .Blob = blobId,
@@ -64,24 +68,21 @@ bool TTxExportFinish::Execute(TTransactionContext& txc, const TActorContext&) {
 
             // Delayed erase of evicted blob. Blob could be already deleted.
             if (present && !dropped) {
-                LOG_S_NOTICE("Blob exported '" << blobId.ToStringNew() << "' at tablet " << Self->TabletID());
+                LOG_S_INFO(TxPrefix() << "Blob exported '" << blobId << "'" << TxSuffix());
                 Self->BlobManager->DeleteBlob(blobId, blobManagerDb);
                 Self->IncCounter(COUNTER_BLOBS_ERASED);
                 Self->IncCounter(COUNTER_BYTES_ERASED, blobId.BlobSize());
             } else if (present && dropped) {
-                LOG_S_NOTICE("Stale blob exported '" << blobId.ToStringNew() << "' at tablet " << Self->TabletID());
+                LOG_S_INFO(TxPrefix() << "Stale blob exported '" << blobId << "'" << TxSuffix());
 
                 TEvictMetadata meta;
                 evict = Self->BlobManager->GetDropped(blobId, meta);
                 Y_VERIFY(evict.State == EEvictState::EXTERN);
 
-                BlobsToForget.emplace(std::move(evict));
+                BlobsToForget[meta.GetTierName()].emplace(std::move(evict));
             } else {
-                LOG_S_ERROR("Unknown blob exported '" << blobId.ToStringNew() << "' at tablet " << Self->TabletID());
+                LOG_S_ERROR(TxPrefix() << "Unknown blob exported '" << blobId << "'" << TxSuffix());
             }
-
-            // TODO: delete not present in S3 for sure (avoid race between export and forget)
-#endif
         }
     }
 
@@ -96,33 +97,25 @@ bool TTxExportFinish::Execute(TTransactionContext& txc, const TActorContext&) {
 
 void TTxExportFinish::Complete(const TActorContext& ctx) {
     Y_VERIFY(Ev);
-    LOG_S_DEBUG("TTxExportFinish.Complete at tablet " << Self->TabletID());
+    LOG_S_DEBUG(TxPrefix() << "complete" << TxSuffix());
 
     if (!BlobsToForget.empty()) {
         Self->ForgetBlobs(ctx, BlobsToForget);
     }
-
-    Y_VERIFY(Self->ActiveEvictions, "Unexpected active evictions count at tablet %lu", Self->TabletID());
-    --Self->ActiveEvictions;
 }
 
 
 void TColumnShard::Handle(TEvPrivate::TEvExport::TPtr& ev, const TActorContext& ctx) {
     auto& msg = *ev->Get();
     auto status = msg.Status;
+    Y_VERIFY(status != NKikimrProto::UNKNOWN);
 
-    Y_VERIFY(ActiveEvictions, "Unexpected active evictions count at tablet %lu", TabletID());
     ui64 exportNo = msg.ExportNo;
     auto& tierName = msg.TierName;
-    ui64 pathId = msg.PathId;
 
-    if (status == NKikimrProto::UNKNOWN) {
-        LOG_S_DEBUG("Export (write): id " << exportNo << " tier '" << tierName << "' at tablet " << TabletID());
-        ExportBlobs(ctx, exportNo, tierName, pathId, std::move(msg.Blobs));
-    } else if (status == NKikimrProto::ERROR && msg.Blobs.empty()) {
+    if (status == NKikimrProto::ERROR && msg.Blobs.empty()) {
         LOG_S_WARN("Export (fail): id " << exportNo << " tier '" << tierName << "' error: "
             << ev->Get()->SerializeErrorsToString() << "' at tablet " << TabletID());
-        --ActiveEvictions;
     } else {
         // There's no atomicity needed here. Allow partial export
         if (status == NKikimrProto::ERROR) {

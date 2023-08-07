@@ -3,7 +3,7 @@
 #include <library/cpp/actors/core/actor.h>
 #include <library/cpp/actors/core/event_local.h>
 #include <library/cpp/actors/core/events.h>
-#include <library/cpp/actors/wilson/protos/trace.pb.h>
+#include <opentelemetry/proto/trace/v1/trace.pb.h>
 
 namespace NWilson {
 
@@ -19,6 +19,6 @@ namespace NWilson {
         return NActors::TActorId(0, TStringBuf("WilsonUpload", 12));
     }
 
-    NActors::IActor *CreateWilsonUploader(TString host, ui16 port, TString rootCA);
+    NActors::IActor *CreateWilsonUploader(TString host, ui16 port, TString rootCA, TString serviceName);
 
 } // NWilson

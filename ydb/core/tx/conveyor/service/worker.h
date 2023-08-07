@@ -4,7 +4,7 @@
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 #include <ydb/library/accessor/accessor.h>
 #include <ydb/core/tx/conveyor/usage/abstract.h>
-#include <ydb/core/protos/services.pb.h>
+#include <ydb/library/services/services.pb.h>
 #include <ydb/library/conclusion/result.h>
 #include <library/cpp/actors/core/log.h>
 #include <library/cpp/actors/core/hfunc.h>
@@ -15,10 +15,24 @@ class TWorkerTask {
 private:
     YDB_READONLY_DEF(ITask::TPtr, Task);
     YDB_READONLY_DEF(NActors::TActorId, OwnerId);
+    YDB_READONLY(TMonotonic, CreateInstant, TMonotonic::Now());
+    YDB_READONLY_DEF(std::shared_ptr<TTaskSignals>, TaskSignals);
+    std::optional<TMonotonic> StartInstant;
 public:
-    TWorkerTask(ITask::TPtr task, const NActors::TActorId& ownerId)
+    void OnBeforeStart() {
+        StartInstant = TMonotonic::Now();
+    }
+
+    TMonotonic GetStartInstant() const {
+        Y_VERIFY(!!StartInstant);
+        return *StartInstant;
+    }
+
+    TWorkerTask(ITask::TPtr task, const NActors::TActorId& ownerId, std::shared_ptr<TTaskSignals> taskSignals)
         : Task(task)
-        , OwnerId(ownerId) {
+        , OwnerId(ownerId)
+        , TaskSignals(taskSignals)
+    {
         Y_VERIFY(task);
     }
 
@@ -56,16 +70,19 @@ struct TEvInternal {
         public TConclusion<ITask::TPtr> {
     private:
         using TBase = TConclusion<ITask::TPtr>;
+        YDB_READONLY_DEF(TMonotonic, StartInstant);
         YDB_READONLY_DEF(NActors::TActorId, OwnerId);
     public:
-        TEvTaskProcessedResult(const NActors::TActorId& ownerId, const TString& errorMessage)
+        TEvTaskProcessedResult(const TWorkerTask& originalTask, const TString& errorMessage)
             : TBase(TConclusionStatus::Fail(errorMessage))
-            , OwnerId(ownerId) {
+            , StartInstant(originalTask.GetStartInstant())
+            , OwnerId(originalTask.GetOwnerId()) {
 
         }
-        TEvTaskProcessedResult(const NActors::TActorId& ownerId, ITask::TPtr result)
+        TEvTaskProcessedResult(const TWorkerTask& originalTask, ITask::TPtr result)
             : TBase(result)
-            , OwnerId(ownerId) {
+            , StartInstant(originalTask.GetStartInstant())
+            , OwnerId(originalTask.GetOwnerId()) {
 
         }
     };
@@ -88,6 +105,12 @@ public:
 
     void Bootstrap() {
         Become(&TWorker::StateMain);
+    }
+
+    TWorker(const TString& conveyorName)
+        : TBase("CONVEYOR::" + conveyorName + "::WORKER")
+    {
+
     }
 };
 

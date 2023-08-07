@@ -159,14 +159,14 @@ public:
             << " StatusCode: " << NYql::NDqProto::StatusIds_StatusCode_Name(state.GetStatusCode());
 
         if (state.HasStats() && TryAddStatsFromExtra(state.GetStats())) {
-            if (ServiceCounters.Counters && !AggrPeriod) {
+            if (Settings->ExportStats.Get().GetOrElse(TDqSettings::TDefault::ExportStats) && ServiceCounters.Counters && !AggrPeriod) {
                 ExportStats(TaskStat, taskId);
                 TrySendNonFinalStat();
             }
         } else if (state.HasStats() && state.GetStats().GetTasks().size()) {
             YQL_CLOG(TRACE, ProviderDq) << " " << SelfId() << " AddStats " << taskId;
             AddStats(state.GetStats());
-            if (ServiceCounters.Counters && !AggrPeriod) {
+            if (Settings->ExportStats.Get().GetOrElse(TDqSettings::TDefault::ExportStats) && ServiceCounters.Counters && !AggrPeriod) {
                 ExportStats(TaskStat, taskId);
                 TrySendNonFinalStat();
             }
@@ -229,7 +229,7 @@ public:
             break;
         case AGGR_TIMER_TAG:
             if (AggrPeriod) {
-                if (ServiceCounters.Counters) {
+                if (Settings->ExportStats.Get().GetOrElse(TDqSettings::TDefault::ExportStats) && ServiceCounters.Counters) {
                     ExportStats(AggregateQueryStatsByStage(TaskStat, Stages), 0);
                 }
                 SendNonFinalStat();
@@ -337,7 +337,7 @@ private:
         YQL_ENSURE(x.GetTasks().size() == 1);
         auto& s = x.GetTasks(0);
         ui64 taskId = s.GetTaskId();
-        ui64 stageId = s.GetStageId();
+        ui64 stageId = Stages.Value(taskId, s.GetStageId());
 
 #define ADD_COUNTER(name) \
         if (stats.Get ## name()) { \
@@ -409,67 +409,62 @@ private:
 //            TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "Total"), stats.GetFinishTs() - stats.GetStartTs());
 //        }
 
-        for (const auto& stats : s.GetInputChannels()) {
-            auto labels = commonLabels;
-            labels["InputChannel"] = ToString(stats.GetChannelId());
-            labels["SrcStageId"] = ToString(stats.GetSrcStageId());
+        if (Settings->EnableChannelStats.Get().GetOrElse(TDqSettings::TDefault::EnableChannelStats))
+        {
+            for (const auto& stats : s.GetInputChannels()) {
+                auto labels = commonLabels;
+                labels["InputChannel"] = ToString(stats.GetChannelId());
+                labels["SrcStageId"] = ToString(stats.GetSrcStageId());
 
-            ADD_COUNTER(Chunks);
-            ADD_COUNTER(Bytes);
-            ADD_COUNTER(RowsIn);
-            ADD_COUNTER(RowsOut);
-            ADD_COUNTER(MaxMemoryUsage);
-            ADD_COUNTER(DeserializationTimeUs);
+                ADD_COUNTER(Chunks);
+                ADD_COUNTER(Bytes);
+                ADD_COUNTER(RowsIn);
+                ADD_COUNTER(RowsOut);
+                ADD_COUNTER(MaxMemoryUsage);
+                ADD_COUNTER(DeserializationTimeUs);
 
-            ADD_COUNTER(IdleTimeUs);
-            ADD_COUNTER(WaitTimeUs);
-            ADD_COUNTER(FirstMessageMs);
-            ADD_COUNTER(LastMessageMs);
+                ADD_COUNTER(IdleTimeUs);
+                ADD_COUNTER(WaitTimeUs);
+                ADD_COUNTER(FirstMessageMs);
+                ADD_COUNTER(LastMessageMs);
 
-            if (stats.GetFirstMessageMs() && stats.GetLastMessageMs()) {
-                TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "ActiveTimeUs"),
-                    (   TInstant::MilliSeconds(stats.GetLastMessageMs()) -
-                        TInstant::MilliSeconds(stats.GetFirstMessageMs()) ).MicroSeconds()
-                );
+                if (stats.GetFirstMessageMs() && stats.GetLastMessageMs()) {
+                    TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "ActiveTimeUs"),
+                        (   TInstant::MilliSeconds(stats.GetLastMessageMs()) -
+                            TInstant::MilliSeconds(stats.GetFirstMessageMs()) ).MicroSeconds()
+                    );
+                }
             }
 
-//            if (stats.GetFinishTs() >= stats.GetStartTs()) {
-//                TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "Total"), stats.GetFinishTs() - stats.GetStartTs());
-//            }
-        }
+            for (const auto& stats : s.GetOutputChannels()) {
+                auto labels = commonLabels;
+                labels["OutputChannel"] = ToString(stats.GetChannelId());
+                labels["DstStageId"] = ToString(stats.GetDstStageId());
 
-        for (const auto& stats : s.GetOutputChannels()) {
-            auto labels = commonLabels;
-            labels["OutputChannel"] = ToString(stats.GetChannelId());
-            labels["DstStageId"] = ToString(stats.GetDstStageId());
+                ADD_COUNTER(Chunks)
+                ADD_COUNTER(Bytes);
+                ADD_COUNTER(RowsIn);
+                ADD_COUNTER(RowsOut);
+                ADD_COUNTER(MaxMemoryUsage);
 
-            ADD_COUNTER(Chunks)
-            ADD_COUNTER(Bytes);
-            ADD_COUNTER(RowsIn);
-            ADD_COUNTER(RowsOut);
-            ADD_COUNTER(MaxMemoryUsage);
+                ADD_COUNTER(SerializationTimeUs);
+                ADD_COUNTER(BlockedByCapacity);
 
-            ADD_COUNTER(SerializationTimeUs);
-            ADD_COUNTER(BlockedByCapacity);
+                ADD_COUNTER(SpilledBytes);
+                ADD_COUNTER(SpilledRows);
+                ADD_COUNTER(SpilledBlobs);
 
-            ADD_COUNTER(SpilledBytes);
-            ADD_COUNTER(SpilledRows);
-            ADD_COUNTER(SpilledBlobs);
+                ADD_COUNTER(BlockedTimeUs);
+                ADD_COUNTER(FirstMessageMs);
+                ADD_COUNTER(LastMessageMs);
 
-            ADD_COUNTER(BlockedTimeUs);
-            ADD_COUNTER(FirstMessageMs);
-            ADD_COUNTER(LastMessageMs);
-
-            if (stats.GetFirstMessageMs() && stats.GetLastMessageMs()) {
-                TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "ActiveTimeUs"),
-                    (   TInstant::MilliSeconds(stats.GetLastMessageMs()) -
-                        TInstant::MilliSeconds(stats.GetFirstMessageMs()) ).MicroSeconds()
-                );
+                if (stats.GetFirstMessageMs() && stats.GetLastMessageMs()) {
+                    TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "ActiveTimeUs"),
+                        (   TInstant::MilliSeconds(stats.GetLastMessageMs()) -
+                            TInstant::MilliSeconds(stats.GetFirstMessageMs()) ).MicroSeconds()
+                    );
+                }
             }
-
-//            if (stats.GetFinishTs() >= stats.GetStartTs()) {
-//                TaskStat.SetCounter(TaskStat.GetCounterName("TaskRunner", labels, "Total"), stats.GetFinishTs() - stats.GetStartTs());
-//            }
         }
 
         for (const auto& stats : s.GetSources()) {
@@ -543,8 +538,7 @@ public:
 
         for (int i = 0; i < static_cast<int>(tasks.size()); ++i) {
             auto actorId = ActorIdFromProto(actorIds[i]);
-            NYql::NDqProto::TDqTask& task = tasks[i];
-            Tasks.emplace_back(NDq::TDqTaskSettings(&task), actorId);
+            const auto& task = Tasks.emplace_back(NDq::TDqTaskSettings(&tasks[i]), actorId).first;
             ActorIds.emplace(task.GetId(), actorId);
             TaskIds.emplace(actorId, task.GetId());
             Yql::DqsProto::TTaskMeta taskMeta;
@@ -646,7 +640,7 @@ public:
 
 private:
     void Finish() {
-        if (ServiceCounters.Counters && AggrPeriod) {
+        if (Settings->ExportStats.Get().GetOrElse(TDqSettings::TDefault::ExportStats) && ServiceCounters.Counters && AggrPeriod) {
             ExportStats(AggregateQueryStatsByStage(TaskStat, Stages), 0); // force metrics upload on Finish when Aggregated
         }
         Send(ExecuterId, new TEvGraphFinished());

@@ -184,13 +184,13 @@ private:
 
                 const auto& listResult = it->second.GetValue();
                 if (listResult.index() == 1) {
-                    const auto& issues = std::get<TIssues>(listResult);
+                    const auto& error = std::get<NS3Lister::TListError>(listResult);
                     YQL_CLOG(INFO, ProviderS3)
                         << "Discovery " << req.S3Request.Url << req.S3Request.Pattern
-                        << " error " << issues.ToString();
+                        << " error " << error.Issues.ToString();
                     std::for_each(
-                        issues.begin(),
-                        issues.end(),
+                        error.Issues.begin(),
+                        error.Issues.end(),
                         std::bind(
                             &TExprContext::AddError, std::ref(ctx), std::placeholders::_1));
                     return TStatus::Error;
@@ -326,9 +326,15 @@ private:
 
                 const NS3Lister::TListResult& listResult = it->second.GetValue();
                 if (listResult.index() == 1) {
-                    const auto& issues = std::get<TIssues>(listResult);
-                    YQL_CLOG(INFO, ProviderS3) << "Discovery " << req.S3Request.Url << req.S3Request.Pattern << " error " << issues.ToString();
-                    std::for_each(issues.begin(), issues.end(), std::bind(&TExprContext::AddError, std::ref(ctx), std::placeholders::_1));
+                    const auto& error = std::get<NS3Lister::TListError>(listResult);
+                    YQL_CLOG(INFO, ProviderS3)
+                        << "Discovery " << req.S3Request.Url << req.S3Request.Pattern
+                        << " error " << error.Issues.ToString();
+                    std::for_each(
+                        error.Issues.begin(),
+                        error.Issues.end(),
+                        std::bind(
+                            &TExprContext::AddError, std::ref(ctx), std::placeholders::_1));
                     return TStatus::Error;
                 }
 
@@ -581,7 +587,7 @@ private:
         if (!s3ParseSettingsBase.Paths().Empty()) {
             resultSetLimitPerPath /= s3ParseSettingsBase.Paths().Size();
         }
-        
+
         for (auto path : s3ParseSettingsBase.Paths()) {
             NS3Details::TPathList directories;
             NS3Details::UnpackPathsList(path.Data().Literal().Value(), FromString<bool>(path.IsText().Literal().Value()), directories);
@@ -607,7 +613,7 @@ private:
                             State_->Configuration->UseConcurrentDirectoryLister.Get().GetOrElse(
                                 State_->Configuration->AllowConcurrentListings),
                         .MaxResultSet = resultSetLimitPerPath});
-            
+
 
                 RequestsByNode_[source.Raw()].push_back(req);
                 PendingRequests_[req] = future;
@@ -749,7 +755,7 @@ private:
                 .S3Request{.Url = url, .Token = tokenStr},
                 .FilePattern = effectiveFilePattern,
                 .Options{
-                    .IsConcurrentListing = isConcurrentListingEnabled, 
+                    .IsConcurrentListing = isConcurrentListingEnabled,
                     .MaxResultSet = std::max(State_->Configuration->MaxDiscoveryFilesPerQuery, State_->Configuration->MaxDirectoriesAndFilesPerQuery)
                 }};
 

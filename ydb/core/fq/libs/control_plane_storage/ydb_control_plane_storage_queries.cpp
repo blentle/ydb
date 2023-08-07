@@ -37,6 +37,8 @@ FederatedQuery::IamAuth::IdentityCase GetIamAuth(const FederatedQuery::Connectio
             return setting.data_streams().auth().identity_case();
         case FederatedQuery::ConnectionSetting::kMonitoring:
             return setting.monitoring().auth().identity_case();
+        case FederatedQuery::ConnectionSetting::kPostgresqlCluster:
+            return setting.postgresql_cluster().auth().identity_case();
         case FederatedQuery::ConnectionSetting::CONNECTION_NOT_SET:
             return FederatedQuery::IamAuth::IDENTITY_NOT_SET;
     }
@@ -52,6 +54,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvCreateQuery
     const TEvControlPlaneStorage::TEvCreateQueryRequest& event = *ev->Get();
     const TString cloudId = event.CloudId;
     const FederatedQuery::CreateQueryRequest& request = event.Request;
+    const FederatedQuery::Internal::ComputeDatabaseInternal& computeDatabase = event.ComputeDatabase;
     ui64 resultLimit = 0;
     if (event.Quotas) {
         if (auto it = event.Quotas->find(QUOTA_QUERY_RESULT_LIMIT); it != event.Quotas->end()) {
@@ -81,7 +84,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvCreateQuery
     const TString token = event.Token;
     TPermissions permissions = Config->Proto.GetEnablePermissions()
                                 ? event.Permissions
-                                : TPermissions{TPermissions::QUERY_INVOKE | TPermissions::CONNECTIONS_USE | TPermissions::BINDINGS_USE | TPermissions::MANAGE_PUBLIC};
+                                : TPermissions{TPermissions::QUERY_INVOKE | TPermissions::MANAGE_PUBLIC};
     if (IsSuperUser(user)) {
         permissions.SetAll();
     }
@@ -212,9 +215,9 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvCreateQuery
 
         if (request.execute_mode() != FederatedQuery::SAVE) {
             // TODO: move to run actor priority selection
-
+            *queryInternal.mutable_compute_connection() = computeDatabase.connection();
             TSet<TString> disabledConnections;
-            for (const auto& connection: GetEntities<FederatedQuery::Connection>(resultSets[resultSets.size() - 2], CONNECTION_COLUMN_NAME)) {
+            for (const auto& connection: GetEntities<FederatedQuery::Connection>(resultSets[resultSets.size() - 2], CONNECTION_COLUMN_NAME, Config->Proto.GetIgnorePrivateSources())) {
                 if (!Config->AvailableConnections.contains(connection.content().setting().connection_case())) {
                     disabledConnections.insert(connection.meta().id());
                     continue;
@@ -227,32 +230,28 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvCreateQuery
             }
 
             TSet<TString> connectionIds;
-            if (permissions.Check(TPermissions::CONNECTIONS_USE)) {
-                auto connections = GetEntitiesWithVisibilityPriority<FederatedQuery::Connection>(resultSets[resultSets.size() - 2], CONNECTION_COLUMN_NAME);
-                for (const auto& [_, connection]: connections) {
-                    if (disabledConnections.contains(connection.meta().id())) {
-                        continue;
-                    }
-                    *queryInternal.add_connection() = connection;
-                    connectionIds.insert(connection.meta().id());
+            auto connections = GetEntitiesWithVisibilityPriority<FederatedQuery::Connection>(resultSets[resultSets.size() - 2], CONNECTION_COLUMN_NAME, Config->Proto.GetIgnorePrivateSources());
+            for (const auto& [_, connection]: connections) {
+                if (disabledConnections.contains(connection.meta().id())) {
+                    continue;
                 }
+                *queryInternal.add_connection() = connection;
+                connectionIds.insert(connection.meta().id());
             }
 
-            if (permissions.Check(TPermissions::BINDINGS_USE)) {
-                auto bindings = GetEntitiesWithVisibilityPriority<FederatedQuery::Binding>(resultSets[resultSets.size() - 1], BINDING_COLUMN_NAME);
-                for (const auto& [_, binding]: bindings) {
-                    if (!Config->AvailableBindings.contains(binding.content().setting().binding_case())) {
-                        continue;
-                    }
+            auto bindings = GetEntitiesWithVisibilityPriority<FederatedQuery::Binding>(resultSets[resultSets.size() - 1], BINDING_COLUMN_NAME, Config->Proto.GetIgnorePrivateSources());
+            for (const auto& [_, binding]: bindings) {
+                if (!Config->AvailableBindings.contains(binding.content().setting().binding_case())) {
+                    continue;
+                }
 
-                    if (disabledConnections.contains(binding.content().connection_id())) {
-                        continue;
-                    }
+                if (disabledConnections.contains(binding.content().connection_id())) {
+                    continue;
+                }
 
-                    *queryInternal.add_binding() = binding;
-                    if (!connectionIds.contains(binding.content().connection_id())) {
-                        ythrow TCodeLineException(TIssuesIds::BAD_REQUEST) << "Unable to resolve connection for binding " << binding.meta().id() << ", name " << binding.content().name() << ", connection id " << binding.content().connection_id();
-                    }
+                *queryInternal.add_binding() = binding;
+                if (!connectionIds.contains(binding.content().connection_id())) {
+                    ythrow TCodeLineException(TIssuesIds::BAD_REQUEST) << "Unable to resolve connection for binding " << binding.meta().id() << ", name " << binding.content().name() << ", connection id " << binding.content().connection_id();
                 }
             }
         }
@@ -734,11 +733,12 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvModifyQuery
     const TString token = event.Token;
     TPermissions permissions = Config->Proto.GetEnablePermissions()
                             ? event.Permissions
-                            : TPermissions{TPermissions::QUERY_INVOKE | TPermissions::CONNECTIONS_USE | TPermissions::BINDINGS_USE | TPermissions::MANAGE_PUBLIC};
+                            : TPermissions{TPermissions::QUERY_INVOKE | TPermissions::MANAGE_PUBLIC};
     if (IsSuperUser(user)) {
         permissions.SetAll();
     }
     FederatedQuery::ModifyQueryRequest& request = event.Request;
+    FederatedQuery::Internal::ComputeDatabaseInternal& computeDatabase = event.ComputeDatabase;
     const TString queryId = request.query_id();
     const int byteSize = request.ByteSize();
     const int64_t previousRevision = request.previous_revision();
@@ -877,10 +877,11 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvModifyQuery
             internal.clear_binding();
             internal.clear_connection();
             internal.clear_resources();
+            *internal.mutable_compute_connection() = computeDatabase.connection();
 
             // TODO: move to run actor priority selection
             TSet<TString> disabledConnections;
-            for (const auto& connection: GetEntities<FederatedQuery::Connection>(resultSets[resultSets.size() - 3], CONNECTION_COLUMN_NAME)) {
+            for (const auto& connection: GetEntities<FederatedQuery::Connection>(resultSets[resultSets.size() - 3], CONNECTION_COLUMN_NAME, Config->Proto.GetIgnorePrivateSources())) {
                 if (!Config->AvailableConnections.contains(connection.content().setting().connection_case())) {
                     disabledConnections.insert(connection.meta().id());
                     continue;
@@ -893,32 +894,28 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvModifyQuery
             }
 
             TSet<TString> connectionIds;
-            if (permissions.Check(TPermissions::CONNECTIONS_USE)) {
-                auto connections = GetEntitiesWithVisibilityPriority<FederatedQuery::Connection>(resultSets[resultSets.size() - 3], CONNECTION_COLUMN_NAME);
-                for (const auto& [_, connection]: connections) {
-                    if (disabledConnections.contains(connection.meta().id())) {
-                        continue;
-                    }
-                    *internal.add_connection() = connection;
-                    connectionIds.insert(connection.meta().id());
+            auto connections = GetEntitiesWithVisibilityPriority<FederatedQuery::Connection>(resultSets[resultSets.size() - 3], CONNECTION_COLUMN_NAME, Config->Proto.GetIgnorePrivateSources());
+            for (const auto& [_, connection]: connections) {
+                if (disabledConnections.contains(connection.meta().id())) {
+                    continue;
                 }
+                *internal.add_connection() = connection;
+                connectionIds.insert(connection.meta().id());
             }
 
-            if (permissions.Check(TPermissions::BINDINGS_USE)) {
-                auto bindings = GetEntitiesWithVisibilityPriority<FederatedQuery::Binding>(resultSets[resultSets.size() - 2], BINDING_COLUMN_NAME);
-                for (const auto& [_, binding]: bindings) {
-                    if (!Config->AvailableBindings.contains(binding.content().setting().binding_case())) {
-                        continue;
-                    }
+            auto bindings = GetEntitiesWithVisibilityPriority<FederatedQuery::Binding>(resultSets[resultSets.size() - 2], BINDING_COLUMN_NAME, Config->Proto.GetIgnorePrivateSources());
+            for (const auto& [_, binding]: bindings) {
+                if (!Config->AvailableBindings.contains(binding.content().setting().binding_case())) {
+                    continue;
+                }
 
-                    if (disabledConnections.contains(binding.content().connection_id())) {
-                        continue;
-                    }
+                if (disabledConnections.contains(binding.content().connection_id())) {
+                    continue;
+                }
 
-                    *internal.add_binding() = binding;
-                    if (!connectionIds.contains(binding.content().connection_id())) {
-                        ythrow TCodeLineException(TIssuesIds::BAD_REQUEST) << "Unable to resolve connection for binding " << binding.meta().id() << ", name " << binding.content().name() << ", connection id " << binding.content().connection_id();
-                    }
+                *internal.add_binding() = binding;
+                if (!connectionIds.contains(binding.content().connection_id())) {
+                    ythrow TCodeLineException(TIssuesIds::BAD_REQUEST) << "Unable to resolve connection for binding " << binding.meta().id() << ", name " << binding.content().name() << ", connection id " << binding.content().connection_id();
                 }
             }
         }

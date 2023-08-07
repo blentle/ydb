@@ -162,7 +162,7 @@ struct TKiExecDataQuerySettings {
 TAutoPtr<IGraphTransformer> CreateKiSourceTypeAnnotationTransformer(TIntrusivePtr<TKikimrSessionContext> sessionCtx,
     TTypeAnnotationContext& types);
 TAutoPtr<IGraphTransformer> CreateKiSinkTypeAnnotationTransformer(TIntrusivePtr<IKikimrGateway> gateway,
-    TIntrusivePtr<TKikimrSessionContext> sessionCtx);
+    TIntrusivePtr<TKikimrSessionContext> sessionCtx, TTypeAnnotationContext& types);
 TAutoPtr<IGraphTransformer> CreateKiLogicalOptProposalTransformer(TIntrusivePtr<TKikimrSessionContext> sessionCtx,
     TTypeAnnotationContext& types);
 TAutoPtr<IGraphTransformer> CreateKiPhysicalOptProposalTransformer(TIntrusivePtr<TKikimrSessionContext> sessionCtx);
@@ -175,7 +175,8 @@ TAutoPtr<IGraphTransformer> CreateKiSinkIntentDeterminationTransformer(TIntrusiv
 
 TAutoPtr<IGraphTransformer> CreateKiSourceCallableExecutionTransformer(
     TIntrusivePtr<IKikimrGateway> gateway,
-    TIntrusivePtr<TKikimrSessionContext> sessionCtx);
+    TIntrusivePtr<TKikimrSessionContext> sessionCtx,
+    TTypeAnnotationContext& types);
 
 TAutoPtr<IGraphTransformer> CreateKiSinkCallableExecutionTransformer(
     TIntrusivePtr<IKikimrGateway> gateway,
@@ -201,7 +202,8 @@ void TableDescriptionToTableInfo(const TKikimrTableDescription& desc, TYdbOperat
     TVector<NKqpProto::TKqpTableInfo>& infos);
 
 // Optimizer rules
-TExprNode::TPtr KiBuildQuery(NNodes::TExprBase node, TExprContext& ctx, TIntrusivePtr<TKikimrTablesData> tablesData, TTypeAnnotationContext& types);
+TExprNode::TPtr KiBuildQuery(NNodes::TExprBase node, TExprContext& ctx, TIntrusivePtr<TKikimrTablesData> tablesData,
+    TTypeAnnotationContext& types, bool sequentialResults);
 TExprNode::TPtr KiBuildResult(NNodes::TExprBase node,  const TString& cluster, TExprContext& ctx);
 
 const THashSet<TStringBuf>& KikimrDataSourceFunctions();
@@ -217,5 +219,7 @@ const TMap<TString, NKikimr::NUdf::EDataSlot>& KikimrSystemColumns();
 bool IsKikimrSystemColumn(const TStringBuf columnName);
 
 bool ValidateTableHasIndex(TKikimrTableMetadataPtr metadata, TExprContext& ctx, const TPositionHandle& pos);
+
+TExprNode::TPtr BuildExternalTableSettings(TPositionHandle pos, TExprContext& ctx, const TMap<TString, NYql::TKikimrColumnMetadata>& columns, const NKikimr::NExternalSource::IExternalSource::TPtr& source, const TString& content);
 
 } // namespace NYql

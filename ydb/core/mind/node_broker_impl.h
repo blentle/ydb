@@ -25,6 +25,18 @@ using NConsole::TEvConsole;
 using NConsole::ITxExecutor;
 using NConsole::TTxProcessor;
 
+class INodeBrokerHooks {
+protected:
+    ~INodeBrokerHooks() = default;
+
+public:
+    virtual void OnActivateExecutor(ui64 tabletId);
+
+public:
+    static INodeBrokerHooks* Get();
+    static void Set(INodeBrokerHooks* hooks);
+};
+
 class TNodeBroker : public TActor<TNodeBroker>
                   , public TTabletExecutedFlat
                   , public ITxExecutor {
@@ -132,7 +144,7 @@ private:
     void OnDetach(const TActorContext &ctx) override;
     void OnTabletDead(TEvTablet::TEvTabletDead::TPtr &ev,
                       const TActorContext &ctx) override;
-    void Enqueue(TAutoPtr<IEventHandle> &ev) override;
+    void DefaultSignalTabletActive(const TActorContext &ctx) override;
     bool OnRenderAppHtmlPage(NMon::TEvRemoteHttpInfo::TPtr ev,
                              const TActorContext &ctx) override;
     void Cleanup(const TActorContext &ctx);
@@ -166,11 +178,11 @@ private:
         switch (ev->GetTypeRewrite()) {
             HFuncTraced(TEvConsole::TEvConfigNotificationRequest, Handle);
             HFuncTraced(TEvConsole::TEvReplaceConfigSubscriptionsResponse, Handle);
-            HFuncTraced(TEvents::TEvPoisonPill, Handle);
             HFuncTraced(TEvNodeBroker::TEvListNodes, Handle);
             HFuncTraced(TEvNodeBroker::TEvResolveNode, Handle);
             HFuncTraced(TEvNodeBroker::TEvRegistrationRequest, Handle);
             HFuncTraced(TEvNodeBroker::TEvExtendLeaseRequest, Handle);
+            HFuncTraced(TEvNodeBroker::TEvCompactTables, Handle);
             HFuncTraced(TEvNodeBroker::TEvGetConfigRequest, Handle);
             HFuncTraced(TEvNodeBroker::TEvSetConfigRequest, Handle);
             HFuncTraced(TEvPrivate::TEvUpdateEpoch, Handle);
@@ -216,7 +228,6 @@ private:
     void ProcessDelayedListNodesRequests();
 
     void ScheduleEpochUpdate(const TActorContext &ctx);
-    void ProcessEnqueuedEvents(const TActorContext &ctx);
     void FillNodeInfo(const TNodeInfo &node,
                       NKikimrNodeBroker::TNodeInfo &info) const;
 
@@ -269,8 +280,6 @@ private:
                 const TActorContext &ctx);
     void Handle(TEvConsole::TEvReplaceConfigSubscriptionsResponse::TPtr &ev,
                 const TActorContext &ctx);
-    void Handle(TEvents::TEvPoisonPill::TPtr &ev,
-                const TActorContext &ctx);
     void Handle(TEvNodeBroker::TEvListNodes::TPtr &ev,
                 const TActorContext &ctx);
     void Handle(TEvNodeBroker::TEvResolveNode::TPtr &ev,
@@ -278,6 +287,8 @@ private:
     void Handle(TEvNodeBroker::TEvRegistrationRequest::TPtr &ev,
                 const TActorContext &ctx);
     void Handle(TEvNodeBroker::TEvExtendLeaseRequest::TPtr &ev,
+                const TActorContext &ctx);
+    void Handle(TEvNodeBroker::TEvCompactTables::TPtr &ev,
                 const TActorContext &ctx);
     void Handle(TEvNodeBroker::TEvGetConfigRequest::TPtr &ev,
                 const TActorContext &ctx);
@@ -306,7 +317,6 @@ private:
     ui64 ConfigSubscriptionId;
 
     // Events collected during initialization phase.
-    TVector<TAutoPtr<IEventHandle>> EnqueuedEvents;
     TMultiMap<ui64, TEvNodeBroker::TEvListNodes::TPtr> DelayedListNodesRequests;
     // Transactions queue.
     TTxProcessor::TPtr TxProcessor;

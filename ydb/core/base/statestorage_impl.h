@@ -1,5 +1,5 @@
 #pragma once
-#include "pathid.h"
+#include "ydb/core/scheme/scheme_pathid.h"
 #include "statestorage.h"
 
 namespace NKikimr {
@@ -173,6 +173,14 @@ struct TEvStateStorage::TEvListStateStorageResult : public TEventLocal<TEvListSt
 
     TEvListStateStorageResult(const TIntrusiveConstPtr<TStateStorageInfo> &info)
         : Info(info)
+    {}
+};
+
+struct TEvStateStorage::TEvPublishActorGone : public TEventLocal<TEvPublishActorGone, EvPublishActorGone> {
+    TActorId Replica;
+
+    TEvPublishActorGone(const TActorId& replica)
+        : Replica(replica)
     {}
 };
 

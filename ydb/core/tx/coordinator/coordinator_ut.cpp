@@ -1,9 +1,14 @@
 #include "coordinator_impl.h"
+#include "coordinator_hooks.h"
+#include <ydb/core/grpc_services/local_rpc/local_rpc.h>
 #include <ydb/core/testlib/tablet_helpers.h>
 #include <ydb/core/testlib/test_client.h>
+#include <ydb/public/api/grpc/ydb_cms_v1.grpc.pb.h>
+#include <ydb/public/api/grpc/ydb_operation_v1.grpc.pb.h>
 #include <library/cpp/testing/unittest/registar.h>
+#include <library/cpp/threading/future/async.h>
 
-namespace NKikimr::NTxCoordinator::NTest {
+namespace NKikimr::NFlatTxCoordinator::NTest {
 
     using namespace Tests;
 
@@ -27,9 +32,9 @@ namespace NKikimr::NTxCoordinator::NTest {
             ui64 lastMediatorStep = 0;
             auto observeMediatorSteps = [&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) -> auto {
                 switch (ev->GetTypeRewrite()) {
-                    case TEvTxCoordinator::TEvMediatorQueueStep::EventType: {
-                        auto* msg = ev->Get<TEvTxCoordinator::TEvMediatorQueueStep>();
-                        ui64 step = msg->Step->Step;
+                    case TEvMediatorQueueStep::EventType: {
+                        auto* msg = ev->Get<TEvMediatorQueueStep>();
+                        ui64 step = msg->Steps.back().Step;
                         lastMediatorStep = Max(lastMediatorStep, step);
                         break;
                     }
@@ -320,6 +325,208 @@ namespace NKikimr::NTxCoordinator::NTest {
             runtime.SimulateSleep(TDuration::Seconds(2));
             UNIT_ASSERT(events1.size() == 0);
             UNIT_ASSERT(events2.size() == 0);
+        }
+
+        Y_UNIT_TEST(RestoreDomainConfiguration) {
+            struct TCoordinatorHooks : public ICoordinatorHooks {
+                bool AllowPersistConfig_ = false;
+                std::vector<std::pair<ui64, ui64>> PersistConfig_;
+
+                bool PersistConfig(ui64 tabletId, const NKikimrSubDomains::TProcessingParams& config) override {
+                    PersistConfig_.emplace_back(tabletId, config.GetVersion());
+                    return AllowPersistConfig_;
+                }
+            } hooks;
+            TCoordinatorHooksGuard hooksGuard(hooks);
+
+            TPortManager pm;
+            TServerSettings serverSettings(pm.GetPort(2134));
+            serverSettings.SetDomainName("Root")
+                .SetNodeCount(1)
+                .SetUseRealThreads(false);
+
+            Tests::TServer::TPtr server = new TServer(serverSettings);
+
+            auto &runtime = *server->GetRuntime();
+            runtime.SetLogPriority(NKikimrServices::TX_COORDINATOR, NActors::NLog::PRI_DEBUG);
+
+            auto sender = runtime.AllocateEdgeActor();
+            ui64 coordinatorId = ChangeStateStorage(Coordinator, server->GetSettings().Domain);
+            runtime.SimulateSleep(TDuration::Seconds(1));
+            UNIT_ASSERT_C(hooks.PersistConfig_.size() > 0,
+                "Coordinators didn't even try to persist configs");
+
+            Cerr << "Rebooting coordinator to restore config" << Endl;
+            hooks.AllowPersistConfig_ = true;
+            hooks.PersistConfig_.clear();
+            RebootTablet(runtime, coordinatorId, sender);
+            runtime.SimulateSleep(TDuration::Seconds(1));
+
+            UNIT_ASSERT_C(hooks.PersistConfig_.size() == 1,
+                "Unexpected number of PersistConfig events: " << hooks.PersistConfig_.size());
+            UNIT_ASSERT_VALUES_EQUAL(hooks.PersistConfig_[0].first, coordinatorId);
+            UNIT_ASSERT_VALUES_EQUAL(hooks.PersistConfig_[0].second, 0u);
+
+            Cerr << "Rebooting coordinator a second time" << Endl;
+            hooks.PersistConfig_.clear();
+            RebootTablet(runtime, coordinatorId, sender);
+            runtime.SimulateSleep(TDuration::Seconds(1));
+
+            UNIT_ASSERT_C(hooks.PersistConfig_.empty(), "Unexpected PersistConfig attempt");
+        }
+
+        using TEvCreateDatabaseRequest = NKikimr::NGRpcService::TGrpcRequestOperationCall<
+            Ydb::Cms::CreateDatabaseRequest,
+            Ydb::Cms::CreateDatabaseResponse>;
+
+        Y_UNIT_TEST(RestoreTenantConfiguration) {
+            struct TCoordinatorHooks : public ICoordinatorHooks {
+                bool AllowPersistConfig_ = true;
+                std::unordered_map<ui64, NKikimrSubDomains::TProcessingParams> PersistConfig_;
+
+                bool PersistConfig(ui64 tabletId, const NKikimrSubDomains::TProcessingParams& config) override {
+                    PersistConfig_[tabletId] = config;
+                    return AllowPersistConfig_;
+                }
+            } hooks;
+            TCoordinatorHooksGuard hooksGuard(hooks);
+
+            TPortManager pm;
+            TServerSettings serverSettings(pm.GetPort(2134));
+            serverSettings.SetDomainName("Root")
+                .SetNodeCount(1)
+                .SetDynamicNodeCount(4)
+                .SetUseRealThreads(false)
+                .AddStoragePoolType("ssd");
+
+            Tests::TServer::TPtr server = new TServer(serverSettings);
+
+            auto& runtime = *server->GetRuntime();
+            runtime.SetLogPriority(NKikimrServices::CMS_TENANTS, NActors::NLog::PRI_DEBUG);
+            runtime.SetLogPriority(NKikimrServices::TX_COORDINATOR, NActors::NLog::PRI_DEBUG);
+            auto sender = runtime.AllocateEdgeActor();
+
+            Tests::TTenants tenants(server);
+
+            runtime.SimulateSleep(TDuration::Seconds(1));
+            UNIT_ASSERT_C(hooks.PersistConfig_.size() > 0, "Expected root coordinators to persist configs");
+
+            hooks.AllowPersistConfig_ = false;
+            hooks.PersistConfig_.clear();
+
+            auto createDatabase = [&]() {
+                Ydb::Cms::CreateDatabaseRequest request;
+                request.set_path("/Root/db1");
+                auto* resources = request.mutable_resources();
+                auto* storage = resources->add_storage_units();
+                storage->set_unit_kind("ssd");
+                storage->set_count(1);
+                Cerr << (TStringBuilder() << "Sending CreateDatabase request" << Endl);
+                auto future = NRpcService::DoLocalRpc<TEvCreateDatabaseRequest>(
+                    std::move(request), "", "", runtime.GetActorSystem(0));
+                auto response = runtime.WaitFuture(std::move(future));
+                Cerr << (TStringBuilder() << "Got CreateDatabase response:\n" << response.DebugString());
+                return response;
+            };
+
+            // NOTE: local rpc forces sync mode
+            auto createDatabaseResponse = createDatabase();
+            UNIT_ASSERT(createDatabaseResponse.operation().ready());
+            UNIT_ASSERT_VALUES_EQUAL(createDatabaseResponse.operation().status(), Ydb::StatusIds::SUCCESS);
+
+            // runtime.SimulateSleep(TDuration::Seconds(1));
+            UNIT_ASSERT_C(hooks.PersistConfig_.empty(), "Unexpected PersistConfig without a running tenant");
+
+            Cerr << (TStringBuilder() << "Starting a database tenant" << Endl);
+            tenants.Run("/Root/db1", 1);
+
+            runtime.SimulateSleep(TDuration::Seconds(1));
+            UNIT_ASSERT_C(hooks.PersistConfig_.size() > 0, "Expected coordinators to attempt to persist configs");
+            std::vector<ui64> coordinators;
+            for (auto& pr : hooks.PersistConfig_) {
+                UNIT_ASSERT_C(pr.second.GetVersion() == 2,
+                    "Expected tenant coordinator to have a version 2 config:\n" << pr.second.DebugString());
+                coordinators.push_back(pr.first);
+            }
+
+            Cerr << (TStringBuilder() << "Rebooting coordinators to restore configs" << Endl);
+            hooks.AllowPersistConfig_ = true;
+            hooks.PersistConfig_.clear();
+            for (ui64 coordinatorId : coordinators) {
+                RebootTablet(runtime, coordinatorId, sender);
+            }
+
+            runtime.SimulateSleep(TDuration::MilliSeconds(50));
+            UNIT_ASSERT_C(hooks.PersistConfig_.size() == coordinators.size(), "Expected all coordinators to persist restored config");
+            for (auto& pr : hooks.PersistConfig_) {
+                UNIT_ASSERT_C(pr.second.GetVersion() == 2,
+                    "Expected tenant coordinator to restore a version 2 config:\n" << pr.second.DebugString());
+            }
+
+            // runtime.SetLogPriority(NKikimrServices::TABLET_MAIN, NActors::NLog::PRI_DEBUG);
+            Cerr << (TStringBuilder() << "Rebooting coordinators a second time" << Endl);
+            hooks.PersistConfig_.clear();
+            for (ui64 coordinatorId : coordinators) {
+                Cerr << (TStringBuilder() << TInstant::Now() << " Rebooting coordinator " << coordinatorId << Endl);
+                RebootTablet(runtime, coordinatorId, sender);
+            }
+            Cerr << (TStringBuilder() << TInstant::Now() << " Finished rebooting coordinators a second time" << Endl);
+
+            runtime.SimulateSleep(TDuration::MilliSeconds(50));
+            UNIT_ASSERT_C(hooks.PersistConfig_.empty(), "Unexpected persist attempt after a second reboot");
+        }
+
+        Y_UNIT_TEST(LastEmptyStepResent) {
+            TPortManager pm;
+            TServerSettings serverSettings(pm.GetPort(2134));
+            serverSettings.SetDomainName("Root")
+                .SetNodeCount(1)
+                .SetUseRealThreads(false);
+
+            Tests::TServer::TPtr server = new TServer(serverSettings);
+
+            auto &runtime = *server->GetRuntime();
+            runtime.SetLogPriority(NKikimrServices::TX_COORDINATOR, NActors::NLog::PRI_DEBUG);
+
+            auto sender = runtime.AllocateEdgeActor();
+            ui64 mediatorId = ChangeStateStorage(Mediator, server->GetSettings().Domain);
+            runtime.SimulateSleep(TDuration::Seconds(1));
+
+            std::vector<ui64> emptySteps;
+            auto stepsObserver = [&](auto&, auto& ev) {
+                switch (ev->GetTypeRewrite()) {
+                    case TEvTxCoordinator::TEvCoordinatorStep::EventType: {
+                        auto* msg = ev->template Get<TEvTxCoordinator::TEvCoordinatorStep>();
+                        ui64 step = msg->Record.GetStep();
+                        bool empty = msg->Record.TransactionsSize() == 0;
+                        Cerr << "... observed " << step << ": " << (empty ? "empty" : "not empty") << Endl;
+                        if (empty) {
+                            emptySteps.push_back(step);
+                        }
+                        break;
+                    }
+                }
+                return TTestActorRuntime::EEventAction::PROCESS;
+            };
+            auto prevObserverFunc = runtime.SetObserverFunc(stepsObserver);
+
+            runtime.SimulateSleep(TDuration::Seconds(10));
+            UNIT_ASSERT_C(emptySteps.size() > 1, "Expected multiple empty steps, not " << emptySteps.size());
+            ui64 lastObserved = emptySteps.back();
+            emptySteps.clear();
+
+            RebootTablet(runtime, mediatorId, sender);
+            if (emptySteps.empty()) {
+                Cerr << "... waiting for empty steps" << Endl;
+                TDispatchOptions options;
+                options.CustomFinalCondition = [&]() {
+                    return !emptySteps.empty();
+                };
+                runtime.DispatchEvents(options);
+            }
+            UNIT_ASSERT_C(!emptySteps.empty(), "Expected at least one empty step");
+            UNIT_ASSERT_C(emptySteps.front() == lastObserved,
+                "Expected to observe " << lastObserved << " empty step, not " << emptySteps.front());
         }
 
     } // Y_UNIT_TEST_SUITE(Coordinator)

@@ -12,6 +12,8 @@ PEERDIR(
     contrib/libs/grpc
     ydb/core/formats/arrow/serializer
     ydb/library/yql/ast
+    ydb/library/yql/dq/actors/protos
+    ydb/library/yql/providers/common/proto
     ydb/library/yql/providers/generic/connector/api/common
     ydb/library/yql/providers/generic/connector/api/service
     ydb/library/yql/public/issue

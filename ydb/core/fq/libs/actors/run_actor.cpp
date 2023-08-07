@@ -22,6 +22,7 @@
 #include <ydb/library/yql/providers/dq/provider/yql_dq_gateway.h>
 #include <ydb/library/yql/providers/dq/provider/yql_dq_provider.h>
 #include <ydb/library/yql/providers/dq/provider/exec/yql_dq_exectransformer.h>
+#include <ydb/library/yql/providers/generic/provider/yql_generic_provider.h>
 #include <ydb/library/yql/dq/integration/transform/yql_dq_task_transform.h>
 #include <ydb/library/yql/providers/pq/gateway/native/yql_pq_gateway.h>
 #include <ydb/library/yql/providers/pq/provider/yql_pq_provider.h>
@@ -29,7 +30,6 @@
 #include <ydb/library/yql/providers/pq/task_meta/task_meta.h>
 #include <ydb/library/yql/providers/s3/provider/yql_s3_provider.h>
 #include <ydb/library/yql/providers/ydb/provider/yql_ydb_provider.h>
-#include <ydb/library/yql/providers/clickhouse/provider/yql_clickhouse_provider.h>
 #include <ydb/library/yql/providers/solomon/gateway/yql_solomon_gateway.h>
 #include <ydb/library/yql/providers/solomon/provider/yql_solomon_provider.h>
 #include <ydb/library/yql/providers/s3/actors/yql_s3_applicator_actor.h>
@@ -46,7 +46,7 @@
 #include <ydb/library/yql/public/issue/protos/issue_message.pb.h>
 
 #include <ydb/library/mkql_proto/mkql_proto.h>
-#include <ydb/core/protos/services.pb.h>
+#include <ydb/library/services/services.pb.h>
 
 #include <ydb/core/fq/libs/actors/nodes_manager.h>
 #include <ydb/core/fq/libs/checkpoint_storage/storage_service.h>
@@ -59,6 +59,7 @@
 #include <ydb/core/fq/libs/control_plane_storage/events/events.h>
 #include <ydb/core/fq/libs/control_plane_storage/util.h>
 #include <ydb/core/fq/libs/db_id_async_resolver_impl/db_async_resolver_impl.h>
+#include <ydb/core/fq/libs/db_id_async_resolver_impl/mdb_host_transformer.h>
 #include <ydb/core/fq/libs/gateway/empty_gateway.h>
 #include <ydb/core/fq/libs/private_client/events.h>
 #include <ydb/core/fq/libs/private_client/private_client.h>
@@ -1558,6 +1559,8 @@ private:
         apply("WatermarksGranularityMs", "1000");
         apply("WatermarksLateArrivalDelayMs", "5000");
         apply("WatermarksIdlePartitions", "true");
+        apply("EnableChannelStats", "true");
+        apply("ExportStats", "true");
 
         switch (Params.QueryType) {
         case FederatedQuery::QueryContent::STREAMING: {
@@ -1824,8 +1827,14 @@ private:
             clusters);
 
         TVector<TDataProviderInitializer> dataProvidersInit;
-        const std::shared_ptr<IDatabaseAsyncResolver> dbResolver = std::make_shared<TDatabaseAsyncResolverImpl>(NActors::TActivationContext::ActorSystem(), Params.DatabaseResolver,
-            Params.Config.GetCommon().GetYdbMvpCloudEndpoint(), Params.Config.GetCommon().GetMdbGateway(), Params.Config.GetCommon().GetMdbTransformHost(), Params.QueryId);
+        const std::shared_ptr<IDatabaseAsyncResolver> dbResolver = std::make_shared<TDatabaseAsyncResolverImpl>(
+            NActors::TActivationContext::ActorSystem(),
+            Params.DatabaseResolver,
+            Params.Config.GetCommon().GetYdbMvpCloudEndpoint(),
+            Params.Config.GetCommon().GetMdbGateway(),
+            NFq::MakeTMdbHostTransformerGeneric(),
+            // Params.Config.GetCommon().GetMdbTransformHost(),
+            Params.QueryId);
         {
             // TBD: move init to better place
             QueryStateUpdateRequest.set_scope(Params.Scope.ToString());
@@ -1835,15 +1844,15 @@ private:
         }
 
         {
-            dataProvidersInit.push_back(GetYdbDataProviderInitializer(Params.YqSharedResources->UserSpaceYdbDriver, Params.CredentialsFactory, dbResolver));
+           dataProvidersInit.push_back(GetYdbDataProviderInitializer(Params.YqSharedResources->UserSpaceYdbDriver, Params.CredentialsFactory, dbResolver));
         }
 
         {
-            dataProvidersInit.push_back(GetClickHouseDataProviderInitializer(Params.S3Gateway, dbResolver));
+           dataProvidersInit.push_back(GetGenericDataProviderInitializer(Params.ConnectorClient, dbResolver));
         }
 
         {
-            dataProvidersInit.push_back(GetS3DataProviderInitializer(Params.S3Gateway, Params.CredentialsFactory,
+           dataProvidersInit.push_back(GetS3DataProviderInitializer(Params.S3Gateway, Params.CredentialsFactory,
                 Params.Config.GetReadActorsFactoryConfig().GetS3ReadActorFactoryConfig().GetAllowLocalFiles()));
         }
 
@@ -2031,6 +2040,9 @@ private:
                     break;
                 case FederatedQuery::ConnectionSetting::kMonitoring:
                     html << "MONITORING";
+                    break;
+                case FederatedQuery::ConnectionSetting::kPostgresqlCluster:
+                    html << "POSTGRESQL";
                     break;
                 default:
                     html << "UNDEFINED";

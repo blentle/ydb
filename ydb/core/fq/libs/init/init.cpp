@@ -1,15 +1,14 @@
 #include "init.h"
 
-#include <ydb/core/fq/libs/control_plane_storage/control_plane_storage.h>
-#include <ydb/core/fq/libs/test_connection/test_connection.h>
-
 #include <ydb/core/fq/libs/audit/yq_audit_service.h>
 #include <ydb/core/fq/libs/checkpoint_storage/storage_service.h>
+#include <ydb/core/fq/libs/checkpoint_storage/storage_service.h>
 #include <ydb/core/fq/libs/cloud_audit/yq_cloud_audit_service.h>
+#include <ydb/core/fq/libs/compute/ydb/control_plane/compute_database_control_plane_service.h>
 #include <ydb/core/fq/libs/control_plane_config/control_plane_config.h>
 #include <ydb/core/fq/libs/control_plane_proxy/control_plane_proxy.h>
+#include <ydb/core/fq/libs/control_plane_storage/control_plane_storage.h>
 #include <ydb/core/fq/libs/health/health.h>
-#include <ydb/core/fq/libs/checkpoint_storage/storage_service.h>
 #include <ydb/core/fq/libs/private_client/internal_service.h>
 #include <ydb/core/fq/libs/private_client/loopback_service.h>
 #include <ydb/core/fq/libs/quota_manager/quota_manager.h>
@@ -19,6 +18,8 @@
 #include <ydb/core/fq/libs/rate_limiter/events/data_plane.h>
 #include <ydb/core/fq/libs/rate_limiter/quoter_service/quoter_service.h>
 #include <ydb/core/fq/libs/shared_resources/shared_resources.h>
+#include <ydb/core/fq/libs/test_connection/test_connection.h>
+
 #include <ydb/library/folder_service/folder_service.h>
 #include <ydb/library/yql/providers/common/metrics/service_counters.h>
 
@@ -36,10 +37,10 @@
 #include <ydb/library/yql/providers/common/comp_nodes/yql_factory.h>
 #include <ydb/library/yql/providers/dq/task_runner/tasks_runner_local.h>
 #include <ydb/library/yql/providers/dq/worker_manager/local_worker_manager.h>
+#include <ydb/library/yql/providers/generic/actors/yql_generic_source_factory.h>
 #include <ydb/library/yql/providers/s3/actors/yql_s3_sink_factory.h>
 #include <ydb/library/yql/providers/s3/actors/yql_s3_source_factory.h>
 #include <ydb/library/yql/providers/s3/proto/retry_config.pb.h>
-#include <ydb/library/yql/providers/clickhouse/actors/yql_ch_source_factory.h>
 #include <ydb/library/yql/providers/pq/async_io/dq_pq_read_actor.h>
 #include <ydb/library/yql/providers/pq/async_io/dq_pq_write_actor.h>
 #include <ydb/library/yql/providers/solomon/async_io/dq_solomon_write_actor.h>
@@ -95,10 +96,34 @@ void Init(
         );
     }
 
+    NFq::TSigner::TPtr signer;
+    if (protoConfig.GetTokenAccessor().GetHmacSecretFile()) {
+        signer = ::NFq::CreateSignerFromFile(protoConfig.GetTokenAccessor().GetHmacSecretFile());
+    }
+
     if (protoConfig.GetControlPlaneProxy().GetEnabled()) {
-        auto controlPlaneProxy = NFq::CreateControlPlaneProxyActor(protoConfig.GetControlPlaneProxy(),
-            yqCounters->GetSubgroup("subsystem", "ControlPlaneProxy"), protoConfig.GetQuotasManager().GetEnabled());
+        auto controlPlaneProxy = NFq::CreateControlPlaneProxyActor(
+            protoConfig.GetControlPlaneProxy(),
+            protoConfig.GetControlPlaneStorage(),
+            protoConfig.GetCompute(),
+            protoConfig.GetCommon(),
+            protoConfig.GetGateways().GetS3(),
+            signer,
+            yqSharedResources,
+            NKikimr::CreateYdbCredentialsProviderFactory,
+            yqCounters->GetSubgroup("subsystem", "ControlPlaneProxy"),
+            protoConfig.GetQuotasManager().GetEnabled());
         actorRegistrator(NFq::ControlPlaneProxyActorId(), controlPlaneProxy);
+    }
+
+    if (protoConfig.GetCompute().GetYdb().GetEnable() && protoConfig.GetCompute().GetYdb().GetControlPlane().GetEnable()) {
+        auto computeDatabaseService = NFq::CreateComputeDatabaseControlPlaneServiceActor(protoConfig.GetCompute(), 
+                                                                                         NKikimr::CreateYdbCredentialsProviderFactory, 
+                                                                                         protoConfig.GetCommon(), 
+                                                                                         signer, 
+                                                                                         yqSharedResources, 
+                                                                                         yqCounters->GetSubgroup("subsystem", "DatabaseControlPlane"));
+        actorRegistrator(NFq::ComputeDatabaseControlPlaneServiceActorId(), computeDatabaseService.release());
     }
 
     if (protoConfig.GetRateLimiter().GetControlPlaneEnabled()) {
@@ -146,9 +171,12 @@ void Init(
     auto asyncIoFactory = MakeIntrusive<NYql::NDq::TDqAsyncIoFactory>();
 
     NYql::ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory;
+
     const auto httpGateway = NYql::IHTTPGateway::Make(
         &protoConfig.GetGateways().GetHttpGateway(),
         yqCounters->GetSubgroup("subcomponent", "http_gateway"));
+
+    const auto connectorClient = NYql::NConnector::MakeClientGRPC(protoConfig.GetGateways().GetConnector());
 
     if (protoConfig.GetTokenAccessor().GetEnabled()) {
         const auto& tokenAccessorConfig = protoConfig.GetTokenAccessor();
@@ -195,7 +223,7 @@ void Init(
             yqCounters->GetSubgroup("subsystem", "S3ReadActor"));
         RegisterS3WriteActorFactory(*asyncIoFactory, credentialsFactory,
             httpGateway, s3HttpRetryPolicy);
-        RegisterClickHouseReadActorFactory(*asyncIoFactory, credentialsFactory, httpGateway);
+        RegisterGenericReadActorFactory(*asyncIoFactory, credentialsFactory, connectorClient);
 
         RegisterDqPqWriteActorFactory(*asyncIoFactory, yqSharedResources->UserSpaceYdbDriver, credentialsFactory);
         RegisterDQSolomonWriteActorFactory(*asyncIoFactory, credentialsFactory);
@@ -279,7 +307,7 @@ void Init(
                 protoConfig.GetControlPlaneStorage(),
                 protoConfig.GetGateways().GetS3(),
                 protoConfig.GetCommon(),
-                protoConfig.GetTokenAccessor(),
+                signer,
                 yqSharedResources,
                 credentialsFactory,
                 pqCmConnections,
@@ -301,6 +329,7 @@ void Init(
             serviceCounters,
             credentialsFactory,
             httpGateway,
+            connectorClient,
             std::move(pqCmConnections),
             clientCounters,
             tenant,
@@ -316,7 +345,7 @@ void Init(
             TAppData::TimeProvider,
             TAppData::RandomProvider,
             serviceCounters.Counters,
-            protoConfig.GetTokenAccessor());
+            signer);
 
         actorRegistrator(MakeYqPrivateProxyId(), proxyPrivate);
     }

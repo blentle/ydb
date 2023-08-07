@@ -1,6 +1,7 @@
 #include "read_metadata.h"
 #include "order_control/default.h"
 #include "order_control/pk_with_limit.h"
+#include "order_control/not_sorted.h"
 #include <ydb/core/tx/columnshard/hooks/abstract/abstract.h>
 #include <ydb/core/tx/columnshard/columnshard__index_scan.h>
 #include <ydb/core/tx/columnshard/columnshard__stats_scan.h>
@@ -9,11 +10,9 @@
 namespace NKikimr::NOlap {
 
 TDataStorageAccessor::TDataStorageAccessor(const std::unique_ptr<NOlap::TInsertTable>& insertTable,
-                                const std::unique_ptr<NOlap::IColumnEngine>& index,
-                                const NColumnShard::TBatchCache& batchCache)
+                                const std::unique_ptr<NOlap::IColumnEngine>& index)
     : InsertTable(insertTable)
     , Index(index)
-    , BatchCache(batchCache)
 {}
 
 std::shared_ptr<NOlap::TSelectInfo> TDataStorageAccessor::Select(const NOlap::TReadDescription& readDescription, const THashSet<ui32>& columnIds) const {
@@ -30,12 +29,8 @@ std::vector<NOlap::TCommittedBlob> TDataStorageAccessor::GetCommitedBlobs(const 
     return std::move(InsertTable->Read(readDescription.PathId, readDescription.GetSnapshot()));
 }
 
-std::shared_ptr<arrow::RecordBatch> TDataStorageAccessor::GetCachedBatch(const TUnifiedBlobId& blobId) const {
-    return BatchCache.Get(blobId);
-}
-
-std::unique_ptr<NColumnShard::TScanIteratorBase> TReadMetadata::StartScan(NColumnShard::TDataTasksProcessorContainer tasksProcessor, const NColumnShard::TScanCounters& scanCounters) const {
-    return std::make_unique<NColumnShard::TColumnShardScanIterator>(this->shared_from_this(), tasksProcessor, scanCounters);
+std::unique_ptr<NColumnShard::TScanIteratorBase> TReadMetadata::StartScan(const NOlap::TReadContext& readContext) const {
+    return std::make_unique<NColumnShard::TColumnShardScanIterator>(this->shared_from_this(), readContext);
 }
 
 bool TReadMetadata::Init(const TReadDescription& readDescription, const TDataStorageAccessor& dataAccessor, std::string& error) {
@@ -91,12 +86,7 @@ bool TReadMetadata::Init(const TReadDescription& readDescription, const TDataSto
     }
 
     CommittedBlobs = dataAccessor.GetCommitedBlobs(readDescription);
-    for (auto& cmt : CommittedBlobs) {
-        if (auto batch = dataAccessor.GetCachedBatch(cmt.GetBlobId())) {
-            CommittedBatches.emplace(cmt.GetBlobId(), batch);
-        }
-    }
-    
+
     THashSet<ui32> columnIds;
     for (auto& columnId : AllColumns) {
         columnIds.insert(columnId);
@@ -176,7 +166,7 @@ std::vector<std::pair<TString, NScheme::TTypeInfo>> TReadStatsMetadata::GetKeyYq
     return NOlap::GetColumns(NColumnShard::PrimaryIndexStatsSchema, NColumnShard::PrimaryIndexStatsSchema.KeyColumns);
 }
 
-std::unique_ptr<NColumnShard::TScanIteratorBase> TReadStatsMetadata::StartScan(NColumnShard::TDataTasksProcessorContainer /*tasksProcessor*/, const NColumnShard::TScanCounters& /*scanCounters*/) const {
+std::unique_ptr<NColumnShard::TScanIteratorBase> TReadStatsMetadata::StartScan(const NOlap::TReadContext& /*readContext*/) const {
     return std::make_unique<NColumnShard::TStatsIterator>(this->shared_from_this());
 }
 
@@ -219,8 +209,10 @@ NIndexedReader::IOrderPolicy::TPtr TReadMetadata::DoBuildSortingPolicy() const {
             return std::make_shared<NIndexedReader::TAnySorting>(this->shared_from_this());
         }
         return std::make_shared<NIndexedReader::TPKSortingWithLimit>(this->shared_from_this());
-    } else {
+    } else if (IsSorted()) {
         return std::make_shared<NIndexedReader::TAnySorting>(this->shared_from_this());
+    } else {
+        return std::make_shared<NIndexedReader::TNonSorting>(this->shared_from_this());
     }
 }
 

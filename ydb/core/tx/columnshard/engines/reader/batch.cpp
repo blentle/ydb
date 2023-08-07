@@ -3,22 +3,26 @@
 #include "filter_assembler.h"
 #include "postfilter_assembler.h"
 #include <ydb/core/tx/columnshard/engines/indexed_read_data.h>
+#include <ydb/core/tx/columnshard/engines/scheme/filtered_scheme.h>
 
 namespace NKikimr::NOlap::NIndexedReader {
 
-TBatch::TBatch(const TBatchAddress& address, TGranule& owner, const TPortionInfo& portionInfo)
+TBatch::TBatch(const TBatchAddress& address, TGranule& owner, const TPortionInfo& portionInfo, const ui64 predictedBatchSize)
     : BatchAddress(address)
-    , Portion(portionInfo.Records[0].Portion)
+    , Portion(portionInfo.GetPortion())
     , Granule(owner.GetGranuleId())
+    , PredictedBatchSize(predictedBatchSize)
     , Owner(&owner)
-    , PortionInfo(&portionInfo) {
+    , PortionInfo(&portionInfo)
+{
+    Y_VERIFY(Granule == PortionInfo->GetGranule());
     Y_VERIFY(portionInfo.Records.size());
 
     if (portionInfo.CanIntersectOthers()) {
-        AFL_DEBUG(NKikimrServices::KQP_COMPUTE)("event", "intersect_portion");
+        ACFL_TRACE("event", "intersect_portion");
         Owner->SetDuplicationsAvailable(true);
         if (portionInfo.CanHaveDups()) {
-            AFL_DEBUG(NKikimrServices::KQP_COMPUTE)("event", "dup_portion");
+            ACFL_TRACE("event", "dup_portion");
             DuplicationsAvailableFlag = true;
         }
     }
@@ -29,7 +33,7 @@ NColumnShard::IDataTasksProcessor::ITask::TPtr TBatch::AssembleTask(NColumnShard
     Y_VERIFY(PortionInfo->Produced());
     Y_VERIFY(!FetchedInfo.GetFilteredBatch());
 
-    auto blobSchema = readMetadata->GetLoadSchema(PortionInfo->GetSnapshot());
+    auto blobSchema = readMetadata->GetLoadSchema(PortionInfo->GetMinSnapshot());
     auto readSchema = readMetadata->GetLoadSchema(readMetadata->GetSnapshot());
     ISnapshotSchema::TPtr resultSchema;
     if (CurrentColumnIds) {
@@ -68,9 +72,7 @@ ui64 TBatch::GetFetchBytes(const std::set<ui32>& columnIds) {
         if (!columnIds.contains(rec.ColumnId)) {
             continue;
         }
-        Y_VERIFY(rec.Portion == Portion);
         Y_VERIFY(rec.Valid());
-        Y_VERIFY(Granule == rec.Granule);
         result += rec.BlobRange.Size;
     }
     return result;
@@ -98,9 +100,7 @@ void TBatch::ResetNoFilter(const std::set<ui32>& columnIds) {
         }
         Y_VERIFY(WaitIndexed.emplace(rec.BlobRange).second);
         Owner->AddBlobForFetch(rec.BlobRange, *this);
-        Y_VERIFY(rec.Portion == Portion);
         Y_VERIFY(rec.Valid());
-        Y_VERIFY(Granule == rec.Granule);
         WaitingBytes += rec.BlobRange.Size;
     }
 }
@@ -115,8 +115,6 @@ void TBatch::ResetWithFilter(const std::set<ui32>& columnIds) {
         }
         orderedObjects[rec.ColumnId][rec.Chunk] = &rec;
         Y_VERIFY(rec.Valid());
-        Y_VERIFY(Portion == rec.Portion);
-        Y_VERIFY(Granule == rec.Granule);
     }
 
     for (auto&& columnInfo : orderedObjects) {
@@ -142,6 +140,7 @@ void TBatch::ResetWithFilter(const std::set<ui32>& columnIds) {
             }
         }
     }
+    CheckReadyForAssemble();
 }
 
 bool TBatch::InitFilter(std::shared_ptr<NArrow::TColumnFilter> filter, std::shared_ptr<arrow::RecordBatch> filterBatch,
@@ -165,6 +164,7 @@ bool TBatch::AddIndexedReady(const TBlobRange& bRange, const TString& blobData) 
     FetchedBytes += bRange.Size;
     Data.emplace(bRange, TPortionInfo::TAssembleBlobInfo(blobData));
     Owner->OnBlobReady(bRange);
+    CheckReadyForAssemble();
     return true;
 }
 
@@ -209,6 +209,18 @@ void TBatch::GetPKBorders(const bool reverse, const TIndexInfo& indexInfo, std::
         from = *FirstPK;
         to = *LastPK;
     }
+}
+
+bool TBatch::CheckReadyForAssemble() {
+    if (IsFetchingReady()) {
+        auto& context = Owner->GetOwner();
+        auto processor = context.GetTasksProcessor();
+        if (auto assembleBatchTask = AssembleTask(processor.GetObject(), context.GetReadMetadata())) {
+            processor.Add(context, assembleBatchTask);
+        }
+        return true;
+    }
+    return false;
 }
 
 }

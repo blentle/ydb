@@ -40,7 +40,7 @@ SRCS(
     defs.h
     event.cpp
     event.h
-    event_load.h
+    event_load.cpp
     event_local.h
     event_pb.cpp
     event_pb.h
@@ -104,6 +104,7 @@ GENERATE_ENUM_SERIALIZATION(actor.h)
 GENERATE_ENUM_SERIALIZATION(log_iface.h)
 
 PEERDIR(
+    library/cpp/actors/actor_type
     library/cpp/actors/memory_log
     library/cpp/actors/prof
     library/cpp/actors/protos

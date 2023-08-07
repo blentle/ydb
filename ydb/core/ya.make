@@ -23,7 +23,7 @@ RECURSE(
     health_check
     http_proxy
     io_formats
-    kafkaproxy
+    kafka_proxy
     kesus
     keyvalue
     kqp
@@ -40,9 +40,11 @@ RECURSE(
     protos
     public_http
     quoter
+    raw_socket
     scheme
     scheme_types
     security
+    statistics
     sys_view
     tablet
     tablet_flat

@@ -7,10 +7,12 @@
 #include <ydb/library/yql/core/yql_expr_optimize.h>
 #include <ydb/library/yql/core/yql_expr_type_annotation.h>
 #include <ydb/library/yql/core/yql_opt_utils.h>
+#include <ydb/library/yql/dq/integration/yql_dq_integration.h>
 #include <ydb/library/yql/parser/pg_wrapper/interface/type_desc.h>
 #include <ydb/library/yql/providers/common/provider/yql_provider.h>
 #include <ydb/library/yql/providers/dq/provider/yql_dq_datasource_type_ann.h>
 
+#include <library/cpp/containers/absl_flat_hash/flat_hash_set.h>
 #include <util/generic/is_in.h>
 
 namespace NYql {
@@ -291,9 +293,10 @@ class TKiSinkTypeAnnotationTransformer : public TKiSinkVisitorTransformer
 {
 public:
     TKiSinkTypeAnnotationTransformer(TIntrusivePtr<IKikimrGateway> gateway,
-        TIntrusivePtr<TKikimrSessionContext> sessionCtx)
+        TIntrusivePtr<TKikimrSessionContext> sessionCtx, TTypeAnnotationContext& types)
         : Gateway(gateway)
-        , SessionCtx(sessionCtx) {}
+        , SessionCtx(sessionCtx)
+        , Types(types) {}
 
 private:
     virtual TStatus HandleWriteTable(TKiWriteTable node, TExprContext& ctx) override {
@@ -375,41 +378,59 @@ private:
             return TStatus::Error;
         }
 
+        THashSet<TString> autoincrementColumns;
         for (auto& keyColumnName : table->Metadata->KeyColumnNames) {
-            if (!rowType->FindItem(keyColumnName)) {
+            const auto& columnInfo = table->Metadata->Columns.at(keyColumnName);
+            if (rowType->FindItem(keyColumnName)) {
+                continue;
+            }
+
+            if (!columnInfo.IsAutoIncrement())  {
                 ctx.AddError(YqlIssue(pos, TIssuesIds::KIKIMR_PRECONDITION_FAILED, TStringBuilder()
                     << "Missing key column in input: " << keyColumnName
                     << " for table: " << table->Metadata->Name));
                 return TStatus::Error;
             }
+
+            autoincrementColumns.emplace(keyColumnName);
         }
 
         auto op = GetTableOp(node);
         if (op == TYdbOperation::InsertAbort || op == TYdbOperation::InsertRevert ||
             op == TYdbOperation::Upsert || op == TYdbOperation::Replace) {
             for (const auto& [name, meta] : table->Metadata->Columns) {
-                if (meta.NotNull && !rowType->FindItem(name)) {
-                    ctx.AddError(YqlIssue(pos, TIssuesIds::KIKIMR_NO_COLUMN_DEFAULT_VALUE, TStringBuilder()
-                        << "Missing not null column in input: " << name
-                        << ". All not null columns should be initialized"));
-                    return TStatus::Error;
-                }
+                if (meta.NotNull) {
+                    if (!rowType->FindItem(name) && !meta.IsAutoIncrement()) {
+                        ctx.AddError(YqlIssue(pos, TIssuesIds::KIKIMR_NO_COLUMN_DEFAULT_VALUE, TStringBuilder()
+                            << "Missing not null column in input: " << name
+                            << ". All not null columns should be initialized"));
+                        return TStatus::Error;
+                    }
 
-                if (meta.NotNull && rowType->FindItemType(name)->HasOptionalOrNull()) {
-                    ctx.AddError(YqlIssue(pos, TIssuesIds::KIKIMR_BAD_COLUMN_TYPE, TStringBuilder()
-                        << "Can't set NULL or optional value to not null column: " << name
-                        << ". All not null columns should be initialized"));
-                    return TStatus::Error;
+                    const auto* itemType = rowType->FindItemType(name);
+                    if (itemType && itemType->GetKind() == ETypeAnnotationKind::Pg) {
+                        //no type-level notnull check for pg types.
+                        continue;
+                    }
+
+                    if (itemType && itemType->HasOptionalOrNull()) {
+                        ctx.AddError(YqlIssue(pos, TIssuesIds::KIKIMR_BAD_COLUMN_TYPE, TStringBuilder()
+                            << "Can't set NULL or optional value to not null column: " << name
+                            << ". All not null columns should be initialized"));
+                        return TStatus::Error;
+                    }
                 }
             }
         } else if (op == TYdbOperation::UpdateOn) {
             for (const auto& item : rowType->GetItems()) {
                 auto column = table->Metadata->Columns.FindPtr(TString(item->GetName()));
                 YQL_ENSURE(column);
-                if (column->NotNull && item->HasOptionalOrNull()) {
-                    ctx.AddError(YqlIssue(pos, TIssuesIds::KIKIMR_BAD_COLUMN_TYPE, TStringBuilder()
-                        << "Can't set NULL or optional value to not null column: " << column->Name));
-                    return TStatus::Error;
+                if (item->GetItemType()->GetKind() != ETypeAnnotationKind::Pg) {
+                    if (column->NotNull && item->HasOptionalOrNull()) {
+                        ctx.AddError(YqlIssue(pos, TIssuesIds::KIKIMR_BAD_COLUMN_TYPE, TStringBuilder()
+                            << "Can't set NULL or optional value to not null column: " << column->Name));
+                        return TStatus::Error;
+                    }
                 }
             }
         }
@@ -421,12 +442,23 @@ private:
                 columns.push_back(ctx.NewAtom(node.Pos(), item->GetName()));
             }
 
+            TExprNode::TListType autoincrementColumnsList;
+            for(auto& autoincrement: autoincrementColumns) {
+                autoincrementColumnsList.push_back(ctx.NewAtom(node.Pos(), autoincrement));
+            }
+
             node.Ptr()->ChildRef(TKiWriteTable::idx_Settings) = Build<TCoNameValueTupleList>(ctx, node.Pos())
                 .Add(node.Settings())
                 .Add()
                     .Name().Build("input_columns")
                     .Value<TCoAtomList>()
                         .Add(columns)
+                        .Build()
+                    .Build()
+                .Add()
+                    .Name().Build("autoincrement_columns")
+                    .Value<TCoAtomList>()
+                        .Add(autoincrementColumnsList)
                         .Build()
                     .Build()
                 .Done()
@@ -504,6 +536,10 @@ private:
                 return TStatus::Error;
             }
             if (column->NotNull && item->HasOptionalOrNull()) {
+                if (item->GetItemType()->GetKind() == ETypeAnnotationKind::Pg) {
+                    //no type-level notnull check for pg types.
+                    continue;
+                }
                 ctx.AddError(YqlIssue(ctx.GetPosition(node.Pos()), TIssuesIds::KIKIMR_BAD_COLUMN_TYPE, TStringBuilder()
                     << "Can't set NULL or optional value to not null column: " << column->Name));
                 return TStatus::Error;
@@ -588,6 +624,11 @@ virtual TStatus HandleCreateTable(TKiCreateTable create, TExprContext& ctx) over
             notNullColumns.emplace(column.Value());
         }
 
+        THashSet<TString> serialColumns;
+        for(const auto& column : create.SerialColumns()) {
+            serialColumns.emplace(column.Value());
+        }
+
         for (auto item : create.Columns()) {
             auto columnTuple = item.Cast<TExprList>();
             auto nameNode = columnTuple.Item(0).Cast<TCoAtom>();
@@ -604,24 +645,18 @@ virtual TStatus HandleCreateTable(TKiCreateTable create, TExprContext& ctx) over
 
             bool notNull;
             if (actualType->GetKind() == ETypeAnnotationKind::Pg) {
-                if (notNullColumns.contains(columnName)) {
-                    if (std::find(meta->KeyColumnNames.begin(), meta->KeyColumnNames.end(), columnName) == meta->KeyColumnNames.end()) {
-                        ctx.AddError(TIssue(ctx.GetPosition(create.NotNullColumns().Pos()), TStringBuilder()
-                            << "notnull option for pg column " << columnName << " is forbidden"));
-                        return TStatus::Error;
-                    } else {
-                        //TODO: KIKIMR-17471
-                        //Right now YDB ignores the constraint native Postgres enforces
-                        //on primary key values; it should be used very carefully.
-                        ctx.AddWarning(TIssue(ctx.GetPosition(create.NotNullColumns().Pos()), TStringBuilder()
-                            << "notnull option for primary key column " << columnName << " will be ignored"));
-                    }
-                }
-                //TODO: set notnull for pg types
-                notNull = false;
+                notNull = notNullColumns.contains(columnName);
             } else {
                 notNull = !isOptional;
             }
+
+            auto scIt = serialColumns.find(columnName);
+            bool isSerial = false;
+            if (scIt != serialColumns.end()) {
+                // notNull = true;
+                isSerial = true;
+            }
+
             if (actualType->GetKind() != ETypeAnnotationKind::Data
                 && actualType->GetKind() != ETypeAnnotationKind::Pg
             ) {
@@ -640,6 +675,10 @@ virtual TStatus HandleCreateTable(TKiCreateTable create, TExprContext& ctx) over
             TKikimrColumnMetadata columnMeta;
             columnMeta.Name = columnName;
             columnMeta.Type = GetColumnTypeName(actualType);
+            if (isSerial) {
+                columnMeta.DefaultFromSequence = "_serial_column_" + columnMeta.Name;
+            }
+
             if (actualType->GetKind() == ETypeAnnotationKind::Pg) {
                 auto pgTypeId = actualType->Cast<TPgExprType>()->GetId();
                 columnMeta.TypeInfo = NKikimr::NScheme::TTypeInfo(
@@ -873,6 +912,10 @@ virtual TStatus HandleCreateTable(TKiCreateTable create, TExprContext& ctx) over
                         if (columnName == key) {
                             auto typeNode = columnTuple.Item(1);
                             auto keyType = typeNode.Ref().GetTypeAnn()->Cast<TTypeExprType>()->GetType();
+                            YQL_ENSURE(
+                                keyType->GetKind() != ETypeAnnotationKind::Pg,
+                                "pg types are not supported for partition at keys"
+                            );
                             if (keyType->HasOptional()) {
                                 keyType = keyType->Cast<TOptionalExprType>()->GetItemType();
                             }
@@ -1460,9 +1503,28 @@ virtual TStatus HandleCreateTable(TKiCreateTable create, TExprContext& ctx) over
             }
 
             if (!KikimrSupportedEffects().contains(effect.CallableName())) {
-                ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
-                    << "Unsupported Kikimr data query effect: " << effect.CallableName()));
-                return TStatus::Error;
+                bool supported = false;
+                if (effect.Ref().ChildrenSize() > 1) {
+                    TExprBase dataSinkArg(effect.Ref().Child(1));
+                    if (auto maybeDataSink = dataSinkArg.Maybe<TCoDataSink>()) {
+                        TStringBuf dataSinkCategory = maybeDataSink.Cast().Category();
+                        auto dataSinkProviderIt = Types.DataSinkMap.find(dataSinkCategory);
+                        if (dataSinkProviderIt != Types.DataSinkMap.end()) {
+                            if (auto* dqIntegration = dataSinkProviderIt->second->GetDqIntegration()) {
+                                auto canWrite = dqIntegration->CanWrite(*effect.Raw(), ctx);
+                                if (canWrite) {
+                                    supported = *canWrite; // if false, we will exit this function a few lines later
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!supported) {
+                    ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder()
+                        << "Unsupported Kikimr data query effect: " << effect.CallableName()));
+                    return TStatus::Error;
+                }
             }
         }
 
@@ -1558,6 +1620,7 @@ virtual TStatus HandleCreateTable(TKiCreateTable create, TExprContext& ctx) over
 private:
     TIntrusivePtr<IKikimrGateway> Gateway;
     TIntrusivePtr<TKikimrSessionContext> SessionCtx;
+    TTypeAnnotationContext& Types;
 };
 
 } // namespace
@@ -1569,9 +1632,9 @@ TAutoPtr<IGraphTransformer> CreateKiSourceTypeAnnotationTransformer(TIntrusivePt
 }
 
 TAutoPtr<IGraphTransformer> CreateKiSinkTypeAnnotationTransformer(TIntrusivePtr<IKikimrGateway> gateway,
-    TIntrusivePtr<TKikimrSessionContext> sessionCtx)
+    TIntrusivePtr<TKikimrSessionContext> sessionCtx, TTypeAnnotationContext& types)
 {
-    return new TKiSinkTypeAnnotationTransformer(gateway, sessionCtx);
+    return new TKiSinkTypeAnnotationTransformer(gateway, sessionCtx, types);
 }
 
 const TTypeAnnotationNode* GetReadTableRowType(TExprContext& ctx, const TKikimrTablesData& tablesData,

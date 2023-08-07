@@ -16,6 +16,7 @@
 
 #include <util/system/hostname.h>
 
+#include <ydb/core/base/counters.h>
 #include <ydb/core/protos/mon.pb.h>
 
 #include "mon_impl.h"
@@ -208,9 +209,17 @@ public:
         }
         SendRequest();
     }
-
     void ReplyWith(NHttp::THttpOutgoingResponsePtr response) {
         Send(Event->Sender, new NHttp::TEvHttpProxy::TEvHttpOutgoingResponse(response));
+        
+        TString url(Event->Get()->Request->URL.Before('?'));
+        TString status(response->Status);
+        NMonitoring::THistogramPtr ResponseTimeHgram = NKikimr::GetServiceCounters(NKikimr::AppData()->Counters, "utils")
+            ->GetSubgroup("subsystem", "mon")
+            ->GetSubgroup("url", url)
+            ->GetSubgroup("status", status)
+            ->GetHistogram("ResponseTimeMs", NMonitoring::ExponentialHistogram(20, 2, 1));
+        ResponseTimeHgram->Collect(Event->Get()->Request->Timer.Passed() * 1000);
     }
 
     void ReplyOptionsAndPassAway() {
@@ -394,6 +403,7 @@ public:
     STATEFN(StateWork) {
         switch (ev->GetTypeRewrite()) {
             hFunc(NHttp::TEvHttpProxy::TEvHttpIncomingRequest, Handle);
+            cFunc(TEvents::TSystem::Poison, PassAway);
         }
     }
 
@@ -458,6 +468,7 @@ public:
     STATEFN(StateWork) {
         switch (ev->GetTypeRewrite()) {
             hFunc(NHttp::TEvHttpProxy::TEvHttpIncomingRequest, Handle);
+            cFunc(TEvents::TSystem::Poison, PassAway);
         }
     }
 
@@ -660,6 +671,7 @@ public:
         switch (ev->GetTypeRewrite()) {
             hFunc(NHttp::TEvHttpProxy::TEvHttpIncomingRequest, Handle);
             hFunc(TEvMon::TEvMonitoringRequest, Handle);
+            cFunc(TEvents::TSystem::Poison, PassAway);
         }
     }
 
@@ -729,7 +741,7 @@ void TAsyncHttpMon::Stop() {
     IndexMonPage->ClearPages(); // it's required to avoid loop-reference
     if (ActorSystem) {
         TGuard<TMutex> g(Mutex);
-        for (const TActorId& actorId : ActorServices) {
+        for (const auto& [path, actorId] : ActorServices) {
             ActorSystem->Send(actorId, new TEvents::TEvPoisonPill);
         }
         ActorSystem->Send(NodeProxyServiceActorId, new TEvents::TEvPoisonPill);
@@ -752,12 +764,15 @@ NMonitoring::TIndexMonPage* TAsyncHttpMon::RegisterIndexPage(const TString& path
 void TAsyncHttpMon::RegisterActorMonPage(const TActorMonPageInfo& pageInfo) {
     if (ActorSystem) {
         TActorMonPage* actorMonPage = static_cast<TActorMonPage*>(pageInfo.Page.Get());
-        auto actorId = ActorSystem->Register(
+        auto& actorId = ActorServices[pageInfo.Path];
+        if (actorId) {
+            ActorSystem->Send(new IEventHandle(TEvents::TSystem::Poison, 0, actorId, {}, nullptr, 0));
+        }
+        actorId = ActorSystem->Register(
             new THttpMonServiceLegacyActor(actorMonPage),
             TMailboxType::ReadAsFilled,
             ActorSystem->AppData<NKikimr::TAppData>()->UserPoolId);
         ActorSystem->Send(HttpProxyActorId, new NHttp::TEvHttpProxy::TEvRegisterHandler(pageInfo.Path, actorId));
-        ActorServices.push_back(actorId);
     }
 }
 

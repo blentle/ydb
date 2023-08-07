@@ -28,7 +28,9 @@ namespace NKikimr::NDataStreams::V1 {
     TString GetSerializedData(const TPutRecordsItem& item) {
         NKikimrPQClient::TDataChunk proto;
 
-        proto.SetIp(item.Ip);
+        //TODO: get ip from client, not grpc;
+        // proto.SetIp(item.Ip);
+
         proto.SetCodec(0); // NPersQueue::CODEC_RAW
         proto.SetData(item.Data);
 
@@ -225,7 +227,7 @@ namespace NKikimr::NDataStreams::V1 {
 
         void Bootstrap(const NActors::TActorContext &ctx);
         void PreparePartitionActors(const NActors::TActorContext& ctx);
-        void HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev, const TActorContext& ctx);
+        void HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev);
 
     protected:
         void Write(const TActorContext& ctx);
@@ -303,7 +305,7 @@ namespace NKikimr::NDataStreams::V1 {
     void TPutRecordsActorBase<TDerived, TProto>::SendNavigateRequest(const TActorContext& ctx) {
         auto schemeCacheRequest = std::make_unique<NSchemeCache::TSchemeCacheNavigate>();
         NSchemeCache::TSchemeCacheNavigate::TEntry entry;
-        entry.Path = NKikimr::SplitPath(this->GetTopicPath(ctx));
+        entry.Path = NKikimr::SplitPath(this->GetTopicPath());
         entry.Operation = NSchemeCache::TSchemeCacheNavigate::OpList;
         entry.SyncVersion = true;
         schemeCacheRequest->ResultSet.emplace_back(entry);
@@ -311,14 +313,14 @@ namespace NKikimr::NDataStreams::V1 {
     }
 
     template<class TDerived, class TProto>
-    void TPutRecordsActorBase<TDerived, TProto>::HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev, const TActorContext& ctx) {
-        if (TBase::ReplyIfNotTopic(ev, ctx)) {
+    void TPutRecordsActorBase<TDerived, TProto>::HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) {
+        if (TBase::ReplyIfNotTopic(ev)) {
             return;
         }
 
         const NSchemeCache::TSchemeCacheNavigate* navigate = ev->Get()->Request.Get();
         auto topicInfo = navigate->ResultSet.begin();
-        if (AppData(ctx)->PQConfig.GetRequireCredentialsInNewProtocol()) {
+        if (AppData(this->ActorContext())->PQConfig.GetRequireCredentialsInNewProtocol()) {
             NACLib::TUserToken token(this->Request_->GetSerializedToken());
             if (!topicInfo->SecurityObject->CheckAccess(NACLib::EAccessRights::UpdateRow, token)) {
                 return this->ReplyWithError(Ydb::StatusIds::UNAUTHORIZED,
@@ -326,7 +328,7 @@ namespace NKikimr::NDataStreams::V1 {
                                             TStringBuilder() << "Access for stream "
                                             << this->GetProtoRequest()->stream_name()
                                             << " is denied for subject "
-                                            << token.GetUserSID(), ctx);
+                                            << token.GetUserSID(), this->ActorContext());
             }
         }
 
@@ -334,21 +336,21 @@ namespace NKikimr::NDataStreams::V1 {
         PQGroupInfo = topicInfo->PQGroupInfo;
         SetMeteringMode(PQGroupInfo->Description.GetPQTabletConfig().GetMeteringMode());
 
-        if (!AppData(ctx)->PQConfig.GetTopicsAreFirstClassCitizen() && !PQGroupInfo->Description.GetPQTabletConfig().GetLocalDC()) {
+        if (!AppData(this->ActorContext())->PQConfig.GetTopicsAreFirstClassCitizen() && !PQGroupInfo->Description.GetPQTabletConfig().GetLocalDC()) {
 
             return this->ReplyWithError(Ydb::StatusIds::BAD_REQUEST,
                                         Ydb::PersQueue::ErrorCode::BAD_REQUEST,
                                         TStringBuilder() << "write to mirrored stream "
                                         << this->GetProtoRequest()->stream_name()
-                                        << " is forbidden", ctx);
+                                        << " is forbidden", this->ActorContext());
         }
 
 
         if (IsQuotaRequired()) {
             const auto ru = 1 + CalcRuConsumption(GetPayloadSize());
-            Y_VERIFY(MaybeRequestQuota(ru, EWakeupTag::RlAllowed, ctx));
+            Y_VERIFY(MaybeRequestQuota(ru, EWakeupTag::RlAllowed, this->ActorContext()));
         } else {
-            Write(ctx);
+            Write(this->ActorContext());
         }
     }
 
@@ -367,7 +369,7 @@ namespace NKikimr::NDataStreams::V1 {
             if (items[part].empty()) continue;
             PartitionToActor[part].ActorId = ctx.Register(
                 new TDatastreamsPartitionActor(ctx.SelfID, partition.GetTabletId(), part,
-                                               this->GetTopicPath(ctx), std::move(items[part]),
+                                               this->GetTopicPath(), std::move(items[part]),
                                                ShouldBeCharged));
         }
         this->CheckFinish(ctx);
@@ -516,10 +518,11 @@ namespace NKikimr::NDataStreams::V1 {
             if (putRecordsResult.records(0).error_code() == "ProvisionedThroughputExceededException"
                 || putRecordsResult.records(0).error_code() == "ThrottlingException")
             {
-                return ReplyWithResult(Ydb::StatusIds::OVERLOADED, ctx);
+                return ReplyWithError(Ydb::StatusIds::OVERLOADED, Ydb::PersQueue::ErrorCode::OVERLOAD, putRecordsResult.records(0).error_message(), ctx);
             }
             //TODO: other codes - access denied and so on
-            return ReplyWithResult(Ydb::StatusIds::INTERNAL_ERROR, ctx);
+            return ReplyWithError(Ydb::StatusIds::INTERNAL_ERROR, Ydb::PersQueue::ErrorCode::ERROR, putRecordsResult.records(0).error_message(), ctx);
+
         }
     }
 

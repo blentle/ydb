@@ -10,7 +10,6 @@
 #include <ydb/core/base/subdomain.h>
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/tablet_pipe.h>
-#include <ydb/core/blobstorage/base/blobstorage_events.h>
 #include <ydb/core/mind/local.h>
 #include <ydb/core/protos/counters_hive.pb.h>
 #include <ydb/core/tablet/tablet_exception.h>
@@ -72,13 +71,16 @@ enum class EFollowerStrategy : ui32 {
     Read,
 };
 
+TString EFollowerStrategyName(EFollowerStrategy value);
+
 enum class EBalancerType {
     None,
     Scatter,
     Emergency,
+    Manual,
 };
 
-TString EFollowerStrategyName(EFollowerStrategy value);
+TString EBalancerTypeName(EBalancerType value);
 
 struct ISubActor {
     virtual void Cleanup() = 0;

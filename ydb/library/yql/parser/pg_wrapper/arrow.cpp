@@ -8,6 +8,7 @@
 #include <arrow/compute/cast.h>
 #include <arrow/array.h>
 #include <arrow/array/builder_binary.h>
+#include <util/system/mutex.h>
 
 extern "C" {
 #include "utils/date.h"
@@ -25,6 +26,7 @@ struct TExecs {
         return *Singleton<TExecs>();
     }
 
+    TExecs();
     THashMap<Oid, TExecFunc> Table;
 };
 
@@ -38,20 +40,18 @@ TExecFunc FindExec(Oid oid) {
     return it->second;
 }
 
-void RegisterExec(Oid oid, TExecFunc func) {
-    auto& table = TExecs::Instance().Table;
-    table[oid] = func;
-}
-
 bool HasPgKernel(ui32 procOid) {
     return FindExec(procOid) != nullptr;
 }
 
-void RegisterPgKernels() {
+TExecs::TExecs()
+{
+#define RegisterExec(oid, func) Table[oid] = func
 #include "pg_kernels_register.0.inc"
 #include "pg_kernels_register.1.inc"
 #include "pg_kernels_register.2.inc"
 #include "pg_kernels_register.3.inc"
+#undef RegisterExec
 }
 
 const NPg::TAggregateDesc& ResolveAggregation(const TString& name, NKikimr::NMiniKQL::TTupleType* tupleType, const std::vector<ui32>& argsColumns, NKikimr::NMiniKQL::TType* returnType) {
@@ -212,7 +212,7 @@ TColumnConverter BuildPgColumnConverter(const std::shared_ptr<arrow::DataType>& 
             return {};
         }
 
-        return [primaryType, originalType, isCString = targetType->GetTypeId() == CSTRINGOID](const std::shared_ptr<arrow::Array>& value) {
+        return [primaryType, originalType, isCString = NPg::LookupType(targetType->GetTypeId()).TypeLen == -2](const std::shared_ptr<arrow::Array>& value) {
             auto res = originalType->Equals(*primaryType) ? value : ARROW_RESULT(arrow::compute::Cast(*value, primaryType));
             if (isCString) {
                 return PgConvertString<true>(res);

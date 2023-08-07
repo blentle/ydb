@@ -23,6 +23,7 @@
 #include "flat_abi_evol.h"
 #include "probes.h"
 #include "shared_sausagecache.h"
+#include "shared_cache_memtable.h"
 #include "util_fmt_desc.h"
 
 #include <ydb/core/base/appdata.h>
@@ -32,7 +33,7 @@
 #include <ydb/core/control/immediate_control_board_impl.h>
 #include <ydb/core/scheme/scheme_type_registry.h>
 #include <ydb/core/tablet/tablet_counters_aggregator.h>
-#include <ydb/core/util/yverify_stream.h>
+#include <ydb/library/yverify_stream/yverify_stream.h>
 
 #include <library/cpp/monlib/service/pages/templates.h>
 #include <library/cpp/actors/core/hfunc.h>
@@ -55,6 +56,36 @@ struct TCompactionChangesCtx {
         : Proto(proto)
         , Results(results)
     { }
+};
+
+class TSharedPageCacheMemTableObserver : public NSharedCache::ISharedPageCacheMemTableObserver {
+public:
+    TSharedPageCacheMemTableObserver(TActorSystem* actorSystem, TActorId owner)
+        : ActorSystem(actorSystem)
+        , Owner(owner)
+        , SharedCacheId(MakeSharedPageCacheId())
+    {}
+
+    void Register(ui32 table) override {
+        Send(new NSharedCache::TEvMemTableRegister(table));
+    }
+    
+    void Unregister(ui32 table) override {
+        Send(new NSharedCache::TEvMemTableUnregister(table));
+    }
+
+    void CompactionComplete(TIntrusivePtr<NSharedCache::ISharedPageCacheMemTableRegistration> registration) override {
+        Send(new NSharedCache::TEvMemTableCompacted(std::move(registration)));
+    }
+
+private:
+    void Send(IEventBase* ev) {
+        ActorSystem->Send(new IEventHandle(SharedCacheId, Owner, ev));
+    }
+
+    TActorSystem* ActorSystem;
+    const TActorId Owner;
+    const TActorId SharedCacheId;
 };
 
 TTableSnapshotContext::TTableSnapshotContext() = default;
@@ -145,8 +176,7 @@ void TExecutor::Broken() {
 
 void TExecutor::RecreatePageCollectionsCache() noexcept
 {
-    TCacheCacheConfig cacheConfig(Scheme().Executor.CacheSize, CounterCacheFresh, CounterCacheStaging, CounterCacheWarm);
-    PrivatePageCache = MakeHolder<TPrivatePageCache>(cacheConfig);
+    PrivatePageCache = MakeHolder<TPrivatePageCache>();
 
     Stats->PacksMetaBytes = 0;
 
@@ -324,10 +354,6 @@ void TExecutor::ActivateFollower(const TActorContext &ctx) {
 
     Y_VERIFY(!CompactionLogic);
 
-    CounterCacheFresh = new NMonitoring::TCounterForPtr;
-    CounterCacheStaging = new NMonitoring::TCounterForPtr;
-    CounterCacheWarm = new NMonitoring::TCounterForPtr;
-
     ResourceMetrics = MakeHolder<NMetrics::TResourceMetrics>(Owner->TabletID(), FollowerId, Launcher);
 
     PendingBlobQueue.Config.TabletID = Owner->TabletID();
@@ -372,13 +398,10 @@ void TExecutor::Active(const TActorContext &ctx) {
 
     CommitManager->Start(this, Owner->Tablet(), &Step0, Counters.Get());
 
-    CompactionLogic = THolder<TCompactionLogic>(new TCompactionLogic(Logger.Get(), Broker.Get(), this, loadedState->Comp,
+    auto sharedPageCacheMemTableObserver = MakeHolder<TSharedPageCacheMemTableObserver>(NActors::TActivationContext::ActorSystem(), SelfId());
+    CompactionLogic = THolder<TCompactionLogic>(new TCompactionLogic(std::move(sharedPageCacheMemTableObserver), Logger.Get(), Broker.Get(), this, loadedState->Comp,
                                                                      Sprintf("tablet-%" PRIu64, Owner->TabletID())));
     LogicRedo->InstallCounters(Counters.Get(), nullptr);
-
-    CounterCacheFresh = new NMonitoring::TCounterForPtr;
-    CounterCacheStaging = new NMonitoring::TCounterForPtr;
-    CounterCacheWarm = new NMonitoring::TCounterForPtr;
 
     ResourceMetrics = MakeHolder<NMetrics::TResourceMetrics>(Owner->TabletID(), 0, Launcher);
 
@@ -1888,7 +1911,6 @@ void TExecutor::CommitTransactionLog(TAutoPtr<TSeat> seat, TPageCollectionTxEnv 
 
         if (auto alter = std::move(change->Scheme)) {
             LogicAlter->WriteLog(*commit, std::move(alter));
-            PrivatePageCache->UpdateCacheSize(Scheme().Executor.CacheSize);
             auto reflectResult = CompactionLogic->ReflectSchemeChanges();
 
             ReadResourceProfile();
@@ -3399,9 +3421,6 @@ void TExecutor::UpdateCounters(const TActorContext &ctx) {
                 Counters->Simple()[TExecutorCounters::DB_INDEX_BYTES].Set(dbCounters.Parts.IndexBytes);
                 Counters->Simple()[TExecutorCounters::DB_OTHER_BYTES].Set(dbCounters.Parts.OtherBytes);
                 Counters->Simple()[TExecutorCounters::DB_BYKEY_BYTES].Set(dbCounters.Parts.ByKeyBytes);
-                Counters->Simple()[TExecutorCounters::CACHE_FRESH_SIZE].Set(CounterCacheFresh->Val());
-                Counters->Simple()[TExecutorCounters::CACHE_STAGING_SIZE].Set(CounterCacheStaging->Val());
-                Counters->Simple()[TExecutorCounters::CACHE_WARM_SIZE].Set(CounterCacheWarm->Val());
                 Counters->Simple()[TExecutorCounters::USED_TABLET_MEMORY].Set(UsedTabletMemory);
             }
 
@@ -3692,6 +3711,22 @@ bool TExecutor::CompactTables() {
     }
 }
 
+void TExecutor::Handle(NSharedCache::TEvMemTableRegistered::TPtr &ev) {
+    const auto *msg = ev->Get();
+
+    if (CompactionLogic) {
+        CompactionLogic->ProvideSharedPageCacheMemTableRegistration(msg->Table, std::move(msg->Registration));
+    }
+}
+
+void TExecutor::Handle(NSharedCache::TEvMemTableCompact::TPtr &ev) {
+    const auto *msg = ev->Get();
+
+    if (CompactionLogic) {
+        CompactionLogic->TriggerSharedPageCacheMemTableCompaction(msg->Table, msg->ExpectedSize);
+    }
+}
+
 void TExecutor::AllowBorrowedGarbageCompaction(ui32 tableId) {
     if (CompactionLogic) {
         return CompactionLogic->AllowBorrowedGarbageCompaction(tableId);
@@ -3740,6 +3775,8 @@ STFUNC(TExecutor::StateWork) {
         HFunc(NOps::TEvScanStat, Handle);
         hFunc(NOps::TEvResult, Handle);
         HFunc(NBlockIO::TEvStat, Handle);
+        hFunc(NSharedCache::TEvMemTableRegistered, Handle);
+        hFunc(NSharedCache::TEvMemTableCompact, Handle);
     default:
         break;
     }
@@ -3944,9 +3981,6 @@ void TExecutor::RenderHtmlPage(NMon::TEvRemoteHttpInfo::TPtr &ev) const {
                 CompactionLogic->OutputHtml(str, *scheme, cgi);
 
             TAG(TH3) {str << "Page collection cache:";}
-            DIV_CLASS("row") {str << "fresh bytes: " << CounterCacheFresh->Val(); }
-            DIV_CLASS("row") {str << "staging bytes: " << CounterCacheStaging->Val(); }
-            DIV_CLASS("row") {str << "warm bytes: " << CounterCacheWarm->Val(); }
             DIV_CLASS("row") {str << "Total collections: " << PrivatePageCache->GetStats().TotalCollections; }
             DIV_CLASS("row") {str << "Total bytes in shared cache: " << PrivatePageCache->GetStats().TotalSharedBody; }
             DIV_CLASS("row") {str << "Total bytes in local cache: " << PrivatePageCache->GetStats().TotalPinnedBody; }

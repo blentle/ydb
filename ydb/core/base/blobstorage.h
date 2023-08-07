@@ -5,14 +5,14 @@
 #include "events.h"
 #include "tablet_types.h"
 #include "logoblob.h"
-#include "pathid.h"
 
+#include <ydb/core/scheme/scheme_pathid.h>
 #include <ydb/core/base/services/blobstorage_service_id.h>
 #include <ydb/core/base/blobstorage_grouptype.h>
 #include <ydb/core/protos/base.pb.h>
-#include <ydb/core/protos/blobstorage.pb.h>
-#include <ydb/core/protos/blobstorage_config.pb.h>
-#include <ydb/core/util/yverify_stream.h>
+#include <ydb/core/protos/blobstorage_base.pb.h>
+#include <ydb/core/protos/blobstorage_base3.pb.h>
+#include <ydb/library/yverify_stream/yverify_stream.h>
 
 #include <library/cpp/actors/wilson/wilson_trace.h>
 #include <library/cpp/lwtrace/shuttle.h>
@@ -1194,7 +1194,7 @@ struct TEvBlobStorage {
             TLogoBlobID Id;
             ui32 Shift;
             ui32 RequestedSize;
-            TString Buffer;
+            TRope Buffer;
             TVector<TPartMapItem> PartMap;
             bool Keep = false;
             bool DoNotKeep = false;
@@ -1245,7 +1245,7 @@ struct TEvBlobStorage {
                     str << " RequestedSize# " << response.RequestedSize;
                 }
                 if (isFull) {
-                    str << " Buffer# " << response.Buffer.Quote();
+                    str << " Buffer# " << response.Buffer.ConvertToString().Quote();
                 }
                 str << "}";
                 if (ErrorReason.size()) {

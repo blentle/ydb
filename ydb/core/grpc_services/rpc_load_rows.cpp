@@ -1,6 +1,6 @@
 #include <ydb/core/grpc_services/base/base.h>
 
-#include "rpc_common.h"
+#include "rpc_common/rpc_common.h"
 #include "service_table.h"
 
 #include <ydb/core/tx/tx_proxy/upload_rows_common_impl.h>
@@ -246,9 +246,9 @@ private:
             cost += TUpsertCost::OneRowCost(sz);
 
             // Save serialized key and value
-            TSerializedCellVec serializedKey(TSerializedCellVec::Serialize(keyCells));
+            TSerializedCellVec serializedKey(keyCells);
             TString serializedValue = TSerializedCellVec::Serialize(valueCells);
-            AllRows.emplace_back(serializedKey, serializedValue);
+            AllRows.emplace_back(std::move(serializedKey), std::move(serializedValue));
         }
 
         RuCost = TUpsertCost::CostToRu(cost);

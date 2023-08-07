@@ -4,7 +4,7 @@
 #include "runtime.h"
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/hive.h>
-#include <ydb/core/base/quoter.h>
+#include <ydb/core/quoter/public/quoter.h>
 #include <ydb/core/base/statestorage.h>
 #include <ydb/core/base/statestorage_impl.h>
 #include <ydb/core/base/tablet_pipe.h>
@@ -129,14 +129,14 @@ namespace NPDisk {
 
     void SetupSharedPageCache(TTestActorRuntime& runtime, ui32 nodeIndex, NFake::TCaches caches)
     {
-        auto pageCollectionCacheConfig = MakeIntrusive<TSharedPageCacheConfig>();
+        auto pageCollectionCacheConfig = MakeHolder<TSharedPageCacheConfig>();
         pageCollectionCacheConfig->CacheConfig = new TCacheCacheConfig(caches.Shared, nullptr, nullptr, nullptr);
         pageCollectionCacheConfig->TotalAsyncQueueInFlyLimit = caches.AsyncQueue;
         pageCollectionCacheConfig->TotalScanQueueInFlyLimit = caches.ScanQueue;
 
         runtime.AddLocalService(MakeSharedPageCacheId(0),
             TActorSetupCmd(
-                CreateSharedPageCache(pageCollectionCacheConfig.Get()),
+                CreateSharedPageCache(std::move(pageCollectionCacheConfig), runtime.GetMemObserver(nodeIndex)),
                 TMailboxType::ReadAsFilled,
                 0),
             nodeIndex);

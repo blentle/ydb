@@ -15,8 +15,6 @@ using TSecondaryIndexes = TVector<std::pair<
 TSecondaryIndexes BuildSecondaryIndexVector(const NYql::TKikimrTableDescription& table, NYql::TPositionHandle pos,
     NYql::TExprContext& ctx, const THashSet<TStringBuf>* filter = nullptr);
 
-NYql::TExprNode::TPtr MakeMessage(TStringBuf message, NYql::TPositionHandle pos, NYql::TExprContext& ctx);
-
 struct TCondenseInputResult {
     NYql::NNodes::TExprBase Stream;
     TVector<NYql::NNodes::TExprBase> StageInputs;
@@ -34,7 +32,7 @@ TMaybe<TCondenseInputResult> CondenseInputToDictByPk(const NYql::NNodes::TExprBa
 
 NYql::NNodes::TMaybeNode<NYql::NNodes::TDqPhyPrecompute> PrecomputeTableLookupDict(
     const NYql::NNodes::TDqPhyPrecompute& lookupKeys, const NYql::TKikimrTableDescription& table,
-    const THashSet<TString>& dataColumns, const TSecondaryIndexes& indexes, NYql::TPositionHandle pos,
+    const THashSet<TString>& dataColumns, const THashSet<TString>& keyColumns, NYql::TPositionHandle pos,
     NYql::TExprContext& ctx);
 
 NYql::NNodes::TCoLambda MakeTableKeySelector(const NYql::TKikimrTableDescription& table, NYql::TPositionHandle pos,
@@ -59,6 +57,3 @@ NYql::NNodes::TMaybeNode<NYql::NNodes::TExprList> KqpPhyUpsertIndexEffectsImpl(T
     const NYql::TKikimrTableDescription& table, NYql::TPositionHandle pos, NYql::TExprContext& ctx);
 
 } // NKikimr::NKqp::NOpt
-
-
-

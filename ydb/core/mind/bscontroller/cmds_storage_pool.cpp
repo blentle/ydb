@@ -155,7 +155,15 @@ namespace NKikimr::NBsController {
         }
 
         auto &storagePools = StoragePools.Unshare();
-        storagePools[id] = std::move(storagePool);
+        if (const auto [spIt, inserted] = storagePools.try_emplace(id, std::move(storagePool)); !inserted) {
+            TStoragePoolInfo& cur = spIt->second;
+            if (cur.SchemeshardId != storagePool.SchemeshardId || cur.PathItemId != storagePool.PathItemId) {
+                for (auto it = r.first; it != r.second; ++it) {
+                    GroupContentChanged.insert(it->second);
+                }
+            }
+            cur = std::move(storagePool); // update existing storage pool
+        }
         Fit.PoolsAndGroups.emplace(id, std::nullopt);
     }
 
@@ -209,7 +217,7 @@ namespace NKikimr::NBsController {
                 for (const TVSlotInfo *vslot : groupInfo->VDisksInGroup) {
                     DestroyVSlot(vslot->VSlotId);
                 }
-                Groups.DeleteExistingEntry(groupId);
+                DeleteExistingGroup(groupId);
             } else {
                 throw TExError() << "GroupId# " << groupId << " not found";
             }
@@ -445,6 +453,7 @@ namespace NKikimr::NBsController {
         settings->AddEnableGroupLayoutSanitizer(Self.GroupLayoutSanitizerEnabled);
         // TODO:
         // settings->AddSerialManagementStage(Self.SerialManagementStage);
+        settings->AddAllowMultipleRealmsOccupation(Self.AllowMultipleRealmsOccupation);
     }
 
     void TBlobStorageController::TConfigState::ExecuteStep(const NKikimrBlobStorage::TQueryBaseConfig& cmd, TStatus& status) {
@@ -652,7 +661,7 @@ namespace NKikimr::NBsController {
         vslot->Mood = TMood::Wipe;
         vslot->Status = NKikimrBlobStorage::EVDiskStatus::INIT_PENDING;
         vslot->IsReady = false;
-        group->MoodChanged = true;
+        GroupFailureModelChanged.insert(group->ID);
         group->CalculateGroupStatus();
     }
 

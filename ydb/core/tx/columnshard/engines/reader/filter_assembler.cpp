@@ -1,5 +1,6 @@
 #include "filter_assembler.h"
 #include <ydb/core/tx/columnshard/engines/filter.h>
+#include <ydb/core/tx/columnshard/hooks/abstract/abstract.h>
 
 namespace NKikimr::NOlap::NIndexedReader {
 
@@ -16,7 +17,7 @@ bool TAssembleFilter::DoExecuteImpl() {
     OriginalCount = batch->num_rows();
     Filter = std::make_shared<NArrow::TColumnFilter>(NOlap::FilterPortion(batch, *ReadMetadata));
     if (!Filter->Apply(batch)) {
-        AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD_SCAN)("event", "skip_data")("original_count", OriginalCount);
+        AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD_SCAN)("event", "skip_data")("original_count", OriginalCount)("columns_count", FilterColumnIds.size());
         FilteredBatch = nullptr;
         return true;
     }
@@ -25,9 +26,12 @@ bool TAssembleFilter::DoExecuteImpl() {
         if (AllowEarlyFilter) {
             Filter = std::make_shared<NArrow::TColumnFilter>(Filter->CombineSequentialAnd(*earlyFilter));
             if (!earlyFilter->Apply(batch)) {
-                AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD_SCAN)("event", "skip_data")("original_count", OriginalCount);
+                NYDBTest::TControllers::GetColumnShardController()->OnAfterFilterAssembling(batch);
+                AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD_SCAN)("event", "skip_data")("original_count", OriginalCount)("columns_count", FilterColumnIds.size());;
                 FilteredBatch = nullptr;
                 return true;
+            } else {
+                NYDBTest::TControllers::GetColumnShardController()->OnAfterFilterAssembling(batch);
             }
         } else if (BatchesOrderPolicy->NeedNotAppliedEarlyFilter()) {
             EarlyFilter = earlyFilter;

@@ -6,7 +6,7 @@
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/path.h>
 #include <ydb/core/base/tablet_pipe.h>
-#include <ydb/core/base/kikimr_issue.h>
+#include <ydb/library/ydb_issue/issue_helpers.h>
 #include <ydb/core/cms/console/configs_dispatcher.h>
 #include <ydb/core/engine/mkql_proto.h>
 #include <ydb/core/kqp/common/kqp.h>
@@ -23,6 +23,7 @@
 #include <ydb/core/ydb_convert/ydb_convert.h>
 #include <ydb/library/aclib/aclib.h>
 #include <ydb/public/lib/base/msgbus_status.h>
+#include <ydb/public/sdk/cpp/client/ydb_params/params.h>
 #include <ydb/public/api/protos/ydb_topic.pb.h>
 #include <ydb/services/metadata/abstract/kqp_common.h>
 #include <ydb/services/persqueue_v1/rpc_calls.h>
@@ -504,25 +505,27 @@ private:
         TResult result;
         if (response->GetStatus() == Ydb::StatusIds::SUCCESS) {
             result.SetSuccess();
-        }
-        for (auto& issue : response->GetIssues()) {
-            result.AddIssue(NYql::IssueFromMessage(issue));
+            result.ExecuterResult.Swap(response->MutableResult());
+            {
+                auto g = Parameters->TypeEnv().BindAllocator();
+
+                auto& txResults = ev->GetTxResults();
+                result.Results.reserve(txResults.size());
+                for(auto& tx : txResults) {
+                    result.Results.emplace_back(tx.GetMkql());
+                }
+                Parameters->AddTxHolders(std::move(ev->GetTxHolders()));
+
+                if (!txResults.empty()) {
+                    Parameters->AddTxResults(TxIndex, std::move(txResults));
+                }
+            }
+        } else {
+            for (auto& issue : response->GetIssues()) {
+                result.AddIssue(NYql::IssueFromMessage(issue));
+            }
         }
 
-        result.ExecuterResult.Swap(response->MutableResult());
-        {
-            auto g = Parameters->TypeEnv().BindAllocator();
-            auto& txResults = ev->GetTxResults();
-            result.Results.reserve(txResults.size());
-            for(auto& tx : txResults) {
-                result.Results.emplace_back(tx.GetMkql());
-            }
-            Parameters->AddTxHolders(std::move(ev->GetTxHolders()));
-
-            if (!txResults.empty()) {
-                Parameters->AddTxResults(TxIndex, std::move(txResults));
-            }
-        }
         Promise.SetValue(std::move(result));
         this->PassAway();
     }
@@ -602,6 +605,10 @@ public:
         return Cluster;
     }
 
+    TString GetDatabase() override {
+        return Database;
+    }
+
     TMaybe<TString> GetSetting(const TString& cluster, const TString& name) override {
         Y_UNUSED(cluster);
         Y_UNUSED(name);
@@ -679,124 +686,67 @@ public:
         }
     }
 
+    TFuture<TKqpTableProfilesResult> GetTableProfiles() override {
+        using TConfigRequest = NConsole::TEvConfigsDispatcher::TEvGetConfigRequest;
+        using TConfigResponse = NConsole::TEvConfigsDispatcher::TEvGetConfigResponse;
+
+        ui32 configKind = (ui32)NKikimrConsole::TConfigItem::TableProfilesConfigItem;
+        auto ev = MakeHolder<TConfigRequest>(configKind);
+
+        auto profilesPromise = NewPromise<TKqpTableProfilesResult>();
+
+        auto configsDispatcherId = NConsole::MakeConfigsDispatcherID(NodeId);
+        auto configFuture = SendActorRequest<TConfigRequest, TConfigResponse, TAppConfigResult>(
+            configsDispatcherId,
+            ev.Release(),
+            [](TPromise<TAppConfigResult> promise, TConfigResponse&& response) mutable {
+                TAppConfigResult result;
+                result.SetSuccess();
+                result.Config = response.Config;
+                promise.SetValue(result);
+            });
+
+        configFuture.Subscribe([profilesPromise](const TFuture<TAppConfigResult>& future) mutable {
+            auto configResult = future.GetValue();
+            if (!configResult.Success()) {
+                profilesPromise.SetValue(ResultFromIssues<TKqpTableProfilesResult>(configResult.Status(),
+                    configResult.Issues()));
+                return;
+            }
+
+            TKqpTableProfilesResult result;
+            result.SetSuccess();
+            result.Profiles.Load(configResult.Config->GetTableProfilesConfig());
+
+            profilesPromise.SetValue(std::move(result));
+        });
+
+        return profilesPromise.GetFuture();
+    }
+
     TFuture<TGenericResult> CreateTable(NYql::TKikimrTableMetadataPtr metadata, bool createDir) override {
+        Y_UNUSED(metadata);
+        Y_UNUSED(createDir);
+        return NotImplemented<TGenericResult>();
+    }
+
+    TFuture<TGenericResult> ModifyScheme(NKikimrSchemeOp::TModifyScheme&& modifyScheme) override {
         using TRequest = TEvTxUserProxy::TEvProposeTransaction;
 
-        try {
-            if (!CheckCluster(metadata->Cluster)) {
-                return InvalidCluster<TGenericResult>(metadata->Cluster);
-            }
-
-            std::pair<TString, TString> pathPair;
-            {
-                TString error;
-                if (!GetPathPair(metadata->Name, pathPair, error, createDir)) {
-                    return MakeFuture(ResultFromError<TGenericResult>(error));
-                }
-            }
-
-            using TConfigRequest = NConsole::TEvConfigsDispatcher::TEvGetConfigRequest;
-            using TConfigResponse = NConsole::TEvConfigsDispatcher::TEvGetConfigResponse;
-
-            ui32 configKind = (ui32)NKikimrConsole::TConfigItem::TableProfilesConfigItem;
-            auto ev = MakeHolder<TConfigRequest>(configKind);
-
-            auto configsDispatcherId = NConsole::MakeConfigsDispatcherID(NodeId);
-            auto configFuture = SendActorRequest<TConfigRequest, TConfigResponse, TAppConfigResult>(
-                configsDispatcherId,
-                ev.Release(),
-                [](TPromise<TAppConfigResult> promise, TConfigResponse&& response) mutable {
-                    TAppConfigResult result;
-                    result.SetSuccess();
-                    result.Config = response.Config;
-                    promise.SetValue(result);
-                });
-
-            auto tablePromise = NewPromise<TGenericResult>();
-
-            configFuture.Subscribe([this, metadata, tablePromise, pathPair]
-                (const TFuture<TAppConfigResult>& future) mutable {
-                    auto configResult = future.GetValue();
-                    if (!configResult.Success()) {
-                        tablePromise.SetValue(configResult);
-                        return;
-                    }
-
-                    TTableProfiles profiles;
-                    profiles.Load(configResult.Config->GetTableProfilesConfig());
-
-                    auto ev = MakeHolder<TRequest>();
-                    ev->Record.SetDatabaseName(Database);
-                    if (UserToken) {
-                        ev->Record.SetUserToken(UserToken->GetSerializedToken());
-                    }
-                    auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
-                    schemeTx.SetWorkingDir(pathPair.first);
-                    NKikimrSchemeOp::TTableDescription* tableDesc = nullptr;
-                    if (!metadata->Indexes.empty()) {
-                        schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpCreateIndexedTable);
-                        tableDesc = schemeTx.MutableCreateIndexedTable()->MutableTableDescription();
-                        for (const auto& index : metadata->Indexes) {
-                            auto indexDesc = schemeTx.MutableCreateIndexedTable()->AddIndexDescription();
-                            indexDesc->SetName(index.Name);
-                            switch (index.Type) {
-                                case NYql::TIndexDescription::EType::GlobalSync:
-                                    indexDesc->SetType(NKikimrSchemeOp::EIndexType::EIndexTypeGlobal);
-                                    break;
-                                case NYql::TIndexDescription::EType::GlobalAsync:
-                                    indexDesc->SetType(NKikimrSchemeOp::EIndexType::EIndexTypeGlobalAsync);
-                                    break;
-                            }
-
-                            indexDesc->SetState(static_cast<::NKikimrSchemeOp::EIndexState>(index.State));
-                            for (const auto& col : index.KeyColumns) {
-                                indexDesc->AddKeyColumnNames(col);
-                            }
-                            for (const auto& col : index.DataColumns) {
-                                indexDesc->AddDataColumnNames(col);
-                            }
-                        }
-                        FillCreateTableColumnDesc(*tableDesc, pathPair.second, metadata);
-                    } else {
-                        schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpCreateTable);
-                        tableDesc = schemeTx.MutableCreateTable();
-                        FillCreateTableColumnDesc(*tableDesc, pathPair.second, metadata);
-                    }
-
-                    Ydb::StatusIds::StatusCode code;
-                    TString error;
-                    TList<TString> warnings;
-
-                    if (!FillCreateTableDesc(metadata, *tableDesc, profiles, code, error, warnings)) {
-                        IKqpGateway::TGenericResult errResult;
-                        errResult.AddIssue(NYql::TIssue(error));
-                        errResult.SetStatus(NYql::YqlStatusFromYdbStatus(code));
-                        tablePromise.SetValue(errResult);
-                        return;
-                    }
-
-                    SendSchemeRequest(ev.Release()).Apply(
-                        [tablePromise, warnings{std::move(warnings)}](const TFuture<TGenericResult>& future) mutable {
-                            if (warnings.size()) {
-                                auto result = future.GetValue();
-                                for (const auto& warning : warnings) {
-                                    result.AddIssue(
-                                        NYql::TIssue(warning)
-                                        .SetCode(NKikimrIssues::TIssuesIds::WARNING, NYql::TSeverityIds::S_WARNING)
-                                    );
-                                    tablePromise.SetValue(result);
-                                }
-                            } else {
-                                tablePromise.SetValue(future.GetValue());
-                            }
-                        });
-                });
-
-            return tablePromise.GetFuture();
+        auto ev = MakeHolder<TRequest>();
+        ev->Record.SetDatabaseName(Database);
+        if (UserToken) {
+            ev->Record.SetUserToken(UserToken->GetSerializedToken());
         }
-        catch (yexception& e) {
-            return MakeFuture(ResultFromException<TGenericResult>(e));
-        }
+        ev->Record.MutableTransaction()->MutableModifyScheme()->Swap(&modifyScheme);
+
+        auto tablePromise = NewPromise<TGenericResult>();
+        SendSchemeRequest(ev.Release()).Apply(
+            [tablePromise](const TFuture<TGenericResult>& future) mutable {
+                tablePromise.SetValue(future.GetValue());
+            });
+
+        return tablePromise.GetFuture();
     }
 
     TFuture<TGenericResult> CreateColumnTable(NYql::TKikimrTableMetadataPtr metadata, bool createDir) override {
@@ -1347,84 +1297,6 @@ public:
         }
     }
 
-    TFuture<TGenericResult> CreateExternalDataSource(const TString& cluster,
-                                                     const NYql::TCreateExternalDataSourceSettings& settings,
-                                                     bool createDir) override {
-        using TRequest = TEvTxUserProxy::TEvProposeTransaction;
-
-        try {
-            if (!CheckCluster(cluster)) {
-                return InvalidCluster<TGenericResult>(cluster);
-            }
-
-            std::pair<TString, TString> pathPair;
-            {
-                TString error;
-                if (!GetPathPair(settings.ExternalDataSource, pathPair, error, createDir)) {
-                    return MakeFuture(ResultFromError<TGenericResult>(error));
-                }
-            }
-
-            auto ev = MakeHolder<TRequest>();
-            ev->Record.SetDatabaseName(Database);
-            if (UserToken) {
-                ev->Record.SetUserToken(UserToken->GetSerializedToken());
-            }
-            auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
-            schemeTx.SetWorkingDir(pathPair.first);
-            schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpCreateExternalDataSource);
-
-            NKikimrSchemeOp::TExternalDataSourceDescription& dataSourceDesc = *schemeTx.MutableCreateExternalDataSource();
-            FillCreateExternalDataSourceDesc(dataSourceDesc, pathPair.second, settings);
-            return SendSchemeRequest(ev.Release(), true);
-        }
-        catch (yexception& e) {
-            return MakeFuture(ResultFromException<TGenericResult>(e));
-        }
-    }
-
-    TFuture<TGenericResult> AlterExternalDataSource(const TString& cluster,
-                                                    const NYql::TAlterExternalDataSourceSettings& settings) override {
-        Y_UNUSED(cluster, settings);
-        return MakeErrorFuture<TGenericResult>(std::make_exception_ptr(yexception() << "The alter is not supported for the external data source"));
-    }
-
-    TFuture<TGenericResult> DropExternalDataSource(const TString& cluster,
-                                                   const NYql::TDropExternalDataSourceSettings& settings) override {
-        using TRequest = TEvTxUserProxy::TEvProposeTransaction;
-
-        try {
-            if (!CheckCluster(cluster)) {
-                return InvalidCluster<TGenericResult>(cluster);
-            }
-
-            std::pair<TString, TString> pathPair;
-            {
-                TString error;
-                if (!GetPathPair(settings.ExternalDataSource, pathPair, error, false)) {
-                    return MakeFuture(ResultFromError<TGenericResult>(error));
-                }
-            }
-
-            auto ev = MakeHolder<TRequest>();
-            ev->Record.SetDatabaseName(Database);
-            if (UserToken) {
-                ev->Record.SetUserToken(UserToken->GetSerializedToken());
-            }
-
-            auto& schemeTx = *ev->Record.MutableTransaction()->MutableModifyScheme();
-            schemeTx.SetWorkingDir(pathPair.first);
-            schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpDropExternalDataSource);
-
-            NKikimrSchemeOp::TDrop& drop = *schemeTx.MutableDrop();
-            drop.SetName(pathPair.second);
-            return SendSchemeRequest(ev.Release());
-        }
-        catch (yexception& e) {
-            return MakeFuture(ResultFromException<TGenericResult>(e));
-        }
-    }
-
     TFuture<TGenericResult> AlterUser(const TString& cluster, const NYql::TAlterUserSettings& settings) override {
         using TRequest = TEvTxUserProxy::TEvProposeTransaction;
 
@@ -1558,6 +1430,7 @@ public:
                     context.SetUserToken(*GetUserToken());
                 }
                 context.SetDatabase(Owner.Database);
+                context.SetActorSystem(Owner.ActorSystem);
                 return DoExecute(cBehaviour, settings, context).Apply([](const NThreading::TFuture<TYqlConclusionStatus>& f) {
                     if (f.HasValue() && !f.HasException() && f.GetValue().Ok()) {
                         TGenericResult result;
@@ -1828,6 +1701,55 @@ public:
         }
     }
 
+    TFuture<TExecuteLiteralResult> ExecuteLiteral(const TString& program, const NKikimrMiniKQL::TType& resultType, NKikimr::NKqp::TTxAllocatorState::TPtr txAlloc) override {
+        auto preparedQuery = std::make_unique<NKikimrKqp::TPreparedQuery>();
+        auto& phyQuery = *preparedQuery->MutablePhysicalQuery();
+        NKikimr::NKqp::IKqpGateway::TExecPhysicalRequest literalRequest(txAlloc);
+
+        literalRequest.NeedTxId = false;
+        literalRequest.MaxAffectedShards = 0;
+        literalRequest.TotalReadSizeLimitBytes = 0;
+        literalRequest.MkqlMemoryLimit = 100_MB;
+
+        auto& transaction = *phyQuery.AddTransactions();
+        transaction.SetType(NKqpProto::TKqpPhyTx::TYPE_COMPUTE);
+
+        auto& stage = *transaction.AddStages();
+        auto& stageProgram = *stage.MutableProgram();
+        stageProgram.SetRuntimeVersion(NYql::NDqProto::RUNTIME_VERSION_YQL_1_0);
+        stageProgram.SetRaw(program);
+        stage.SetOutputsCount(1);
+
+        auto& taskResult = *transaction.AddResults();
+        *taskResult.MutableItemType() = resultType;
+        auto& taskConnection = *taskResult.MutableConnection();
+        taskConnection.SetStageIndex(0);
+
+        NKikimr::NKqp::TPreparedQueryHolder queryHolder(preparedQuery.release(), txAlloc->HolderFactory.GetFunctionRegistry());
+
+        NKikimr::NKqp::TQueryData::TPtr params = std::make_shared<NKikimr::NKqp::TQueryData>(txAlloc);
+
+        literalRequest.Transactions.emplace_back(queryHolder.GetPhyTx(0), params);
+
+        return ExecuteLiteral(std::move(literalRequest), params, 0).Apply([](const auto& future) {
+            const auto& result = future.GetValue();
+
+            TExecuteLiteralResult literalResult;
+
+            if (result.Success()) {
+                YQL_ENSURE(result.Results.size() == 1);
+                literalResult.SetSuccess();
+                literalResult.Result = result.Results[0];
+            } else {
+                literalResult.SetStatus(result.Status());
+                literalResult.AddIssues(result.Issues());
+            }
+
+            return literalResult;
+        });
+    }
+
+
     TFuture<TExecPhysicalResult> ExecuteLiteral(TExecPhysicalRequest&& request, TQueryData::TPtr params, ui32 txIndex) override {
         YQL_ENSURE(!request.Transactions.empty());
         YQL_ENSURE(request.DataShardLocks.empty());
@@ -1876,7 +1798,7 @@ public:
         ev->Record.MutableRequest()->SetKeepSession(false);
         ev->Record.MutableRequest()->SetCollectStats(settings.CollectStats);
 
-        FillParameters(params, *ev->Record.MutableRequest()->MutableParameters());
+        FillParameters(params, ev->Record.MutableRequest()->MutableYdbParameters());
 
         return SendKqpScanQueryRequest(ev.Release(), rowsLimit,
             [] (TPromise<TQueryResult> promise, TResponse&& responseEv) {
@@ -1908,7 +1830,7 @@ public:
         ev->Record.MutableRequest()->SetKeepSession(false);
         ev->Record.MutableRequest()->SetCollectStats(settings.CollectStats);
 
-        FillParameters(std::move(params), *ev->Record.MutableRequest()->MutableParameters());
+        FillParameters(std::move(params), ev->Record.MutableRequest()->MutableYdbParameters());
 
         auto& txControl = *ev->Record.MutableRequest()->MutableTxControl();
         txControl.mutable_begin_tx()->CopyFrom(txSettings);
@@ -1949,7 +1871,7 @@ public:
         );
 
         // TODO: Rewrite CollectParameters at kqp_host
-        FillParameters(std::move(params), *ev->Record.MutableRequest()->MutableParameters());
+        FillParameters(std::move(params), ev->Record.MutableRequest()->MutableYdbParameters());
 
         return SendKqpScanQueryStreamRequest(ev.Release(), target,
             [](TPromise<TQueryResult> promise, TResponse&& responseEv) {
@@ -2007,7 +1929,7 @@ public:
         ev->Record.MutableRequest()->SetKeepSession(false);
         ev->Record.MutableRequest()->SetCollectStats(settings.CollectStats);
 
-        FillParameters(std::move(params), *ev->Record.MutableRequest()->MutableParameters());
+        FillParameters(std::move(params), ev->Record.MutableRequest()->MutableYdbParameters());
 
         auto& txControl = *ev->Record.MutableRequest()->MutableTxControl();
         txControl.mutable_begin_tx()->CopyFrom(txSettings);
@@ -2190,13 +2112,10 @@ private:
         return false;
     }
 
-    bool GetPathPair(const TString& tableName, std::pair<TString, TString>& pathPair, TString& error,
-        bool createDir) {
-        if (createDir) {
-            return TrySplitPathByDb(tableName, Database, pathPair, error);
-        } else {
-            return TrySplitTablePath(tableName, pathPair, error);
-        }
+    bool GetPathPair(const TString& tableName, std::pair<TString, TString>& pathPair,
+        TString& error, bool createDir)
+    {
+        return SplitTablePath(tableName, Database, pathPair, error, createDir);
     }
 
 private:
@@ -2224,30 +2143,6 @@ private:
         }
 
         return result;
-    }
-
-    static void FillCreateTableColumnDesc(NKikimrSchemeOp::TTableDescription& tableDesc,
-                                          const TString& name, NYql::TKikimrTableMetadataPtr metadata)
-    {
-        tableDesc.SetName(name);
-
-        Y_ENSURE(metadata->ColumnOrder.size() == metadata->Columns.size());
-        for (const auto& name : metadata->ColumnOrder) {
-            auto columnIt = metadata->Columns.find(name);
-            Y_ENSURE(columnIt != metadata->Columns.end());
-
-            TColumnDescription& columnDesc = *tableDesc.AddColumns();
-            columnDesc.SetName(columnIt->second.Name);
-            columnDesc.SetType(columnIt->second.Type);
-            columnDesc.SetNotNull(columnIt->second.NotNull);
-            if (columnIt->second.Families) {
-                columnDesc.SetFamilyName(*columnIt->second.Families.begin());
-            }
-        }
-
-        for (TString& keyColumn : metadata->KeyColumnNames) {
-            tableDesc.AddKeyColumnNames(keyColumn);
-        }
     }
 
     template <typename T>
@@ -2298,316 +2193,13 @@ private:
         externalTableDesc.SetContent(general.SerializeAsString());
     }
 
-    static void FillCreateExternalDataSourceDesc(NKikimrSchemeOp::TExternalDataSourceDescription& externaDataSourceDesc,
-                                                 const TString& name,
-                                                 const NYql::TCreateExternalDataSourceSettings& settings)
-    {
-        externaDataSourceDesc.SetName(name);
-        externaDataSourceDesc.SetSourceType(settings.SourceType);
-        externaDataSourceDesc.SetLocation(settings.Location);
-        externaDataSourceDesc.SetInstallation(settings.Installation);
-
-        if (settings.AuthMethod == "NONE") {
-            externaDataSourceDesc.MutableAuth()->MutableNone();
-        }
-    }
-
-    static void FillParameters(TQueryData::TPtr params, NKikimrMiniKQL::TParams& output) {
+    static void FillParameters(TQueryData::TPtr params, ::google::protobuf::Map<TBasicString<char>, Ydb::TypedValue>* output) {
         if (!params) {
             return;
         }
 
-        if (params->GetParams().empty()) {
-            return;
-        }
-
-        output.MutableType()->SetKind(NKikimrMiniKQL::ETypeKind::Struct);
-        auto type = output.MutableType()->MutableStruct();
-        auto value = output.MutableValue();
-        for (auto& pair : params->GetParams()) {
-            auto typeMember = type->AddMember();
-            typeMember->SetName(pair.first);
-
-            typeMember->MutableType()->CopyFrom(pair.second.GetType());
-            value->AddStruct()->CopyFrom(pair.second.GetValue());
-        }
-    }
-
-    static bool ConvertDataSlotToYdbTypedValue(NYql::EDataSlot fromType, const TString& fromValue, Ydb::Type* toType,
-            Ydb::Value* toValue)
-    {
-        switch (fromType) {
-        case NYql::EDataSlot::Bool:
-            toType->set_type_id(Ydb::Type::BOOL);
-            toValue->set_bool_value(FromString<bool>(fromValue));
-            break;
-        case NYql::EDataSlot::Int8:
-            toType->set_type_id(Ydb::Type::INT8);
-            toValue->set_int32_value(FromString<i32>(fromValue));
-            break;
-        case NYql::EDataSlot::Uint8:
-            toType->set_type_id(Ydb::Type::UINT8);
-            toValue->set_uint32_value(FromString<ui32>(fromValue));
-            break;
-        case NYql::EDataSlot::Int16:
-            toType->set_type_id(Ydb::Type::INT16);
-            toValue->set_int32_value(FromString<i32>(fromValue));
-            break;
-        case NYql::EDataSlot::Uint16:
-            toType->set_type_id(Ydb::Type::UINT16);
-            toValue->set_uint32_value(FromString<ui32>(fromValue));
-            break;
-        case NYql::EDataSlot::Int32:
-            toType->set_type_id(Ydb::Type::INT32);
-            toValue->set_int32_value(FromString<i32>(fromValue));
-            break;
-        case NYql::EDataSlot::Uint32:
-            toType->set_type_id(Ydb::Type::UINT32);
-            toValue->set_uint32_value(FromString<ui32>(fromValue));
-            break;
-        case NYql::EDataSlot::Int64:
-            toType->set_type_id(Ydb::Type::INT64);
-            toValue->set_int64_value(FromString<i64>(fromValue));
-            break;
-        case NYql::EDataSlot::Uint64:
-            toType->set_type_id(Ydb::Type::UINT64);
-            toValue->set_uint64_value(FromString<ui64>(fromValue));
-            break;
-        case NYql::EDataSlot::Float:
-            toType->set_type_id(Ydb::Type::FLOAT);
-            toValue->set_float_value(FromString<float>(fromValue));
-            break;
-        case NYql::EDataSlot::Double:
-            toType->set_type_id(Ydb::Type::DOUBLE);
-            toValue->set_double_value(FromString<double>(fromValue));
-            break;
-        case NYql::EDataSlot::Json:
-            toType->set_type_id(Ydb::Type::JSON);
-            toValue->set_text_value(fromValue);
-            break;
-        case NYql::EDataSlot::String:
-            toType->set_type_id(Ydb::Type::STRING);
-            toValue->set_bytes_value(fromValue);
-            break;
-        case NYql::EDataSlot::Utf8:
-            toType->set_type_id(Ydb::Type::UTF8);
-            toValue->set_text_value(fromValue);
-            break;
-        case NYql::EDataSlot::Date:
-            toType->set_type_id(Ydb::Type::DATE);
-            toValue->set_uint32_value(FromString<ui32>(fromValue));
-            break;
-        case NYql::EDataSlot::Datetime:
-            toType->set_type_id(Ydb::Type::DATETIME);
-            toValue->set_uint32_value(FromString<ui32>(fromValue));
-            break;
-        case NYql::EDataSlot::Timestamp:
-            toType->set_type_id(Ydb::Type::TIMESTAMP);
-            toValue->set_uint64_value(FromString<ui64>(fromValue));
-            break;
-        case NYql::EDataSlot::Interval:
-            toType->set_type_id(Ydb::Type::INTERVAL);
-            toValue->set_int64_value(FromString<i64>(fromValue));
-            break;
-        default:
-            return false;
-        }
-        return true;
-    }
-
-    // Convert TKikimrTableMetadata struct to public API proto
-    static bool ConvertCreateTableSettingsToProto(NYql::TKikimrTableMetadataPtr metadata,
-            Ydb::Table::CreateTableRequest& proto, Ydb::StatusIds::StatusCode& code, TString& error)
-    {
-        for (const auto& family : metadata->ColumnFamilies) {
-            auto* familyProto = proto.add_column_families();
-            familyProto->set_name(family.Name);
-            if (family.Data) {
-                familyProto->mutable_data()->set_media(family.Data.GetRef());
-            }
-            if (family.Compression) {
-                if (to_lower(family.Compression.GetRef()) == "off") {
-                    familyProto->set_compression(Ydb::Table::ColumnFamily::COMPRESSION_NONE);
-                } else if (to_lower(family.Compression.GetRef()) == "lz4") {
-                    familyProto->set_compression(Ydb::Table::ColumnFamily::COMPRESSION_LZ4);
-                } else {
-                    code = Ydb::StatusIds::BAD_REQUEST;
-                    error = TStringBuilder() << "Unknown compression '" << family.Compression.GetRef() << "' for a column family";
-                    return false;
-                }
-            }
-        }
-
-        if (metadata->TableSettings.CompactionPolicy) {
-            proto.set_compaction_policy(metadata->TableSettings.CompactionPolicy.GetRef());
-        }
-
-        if (metadata->TableSettings.PartitionBy) {
-            if (metadata->TableSettings.PartitionBy.size() > metadata->KeyColumnNames.size()) {
-                code = Ydb::StatusIds::BAD_REQUEST;
-                error = "\"Partition by\" contains more columns than primary key does";
-                return false;
-            } else if (metadata->TableSettings.PartitionBy.size() == metadata->KeyColumnNames.size()) {
-                for (size_t i = 0; i < metadata->TableSettings.PartitionBy.size(); ++i) {
-                    if (metadata->TableSettings.PartitionBy[i] != metadata->KeyColumnNames[i]) {
-                        code = Ydb::StatusIds::BAD_REQUEST;
-                        error = "\"Partition by\" doesn't match primary key";
-                        return false;
-                    }
-                }
-            } else {
-                code = Ydb::StatusIds::UNSUPPORTED;
-                error = "\"Partition by\" is not supported yet";
-                return false;
-            }
-        }
-
-        if (metadata->TableSettings.AutoPartitioningBySize) {
-            auto& partitioningSettings = *proto.mutable_partitioning_settings();
-            TString value = to_lower(metadata->TableSettings.AutoPartitioningBySize.GetRef());
-            if (value == "enabled") {
-                partitioningSettings.set_partitioning_by_size(Ydb::FeatureFlag::ENABLED);
-            } else if (value == "disabled") {
-                partitioningSettings.set_partitioning_by_size(Ydb::FeatureFlag::DISABLED);
-            } else {
-                code = Ydb::StatusIds::BAD_REQUEST;
-                error = TStringBuilder() << "Unknown feature flag '"
-                    << metadata->TableSettings.AutoPartitioningBySize.GetRef()
-                    << "' for auto partitioning by size";
-                return false;
-            }
-        }
-
-        if (metadata->TableSettings.PartitionSizeMb) {
-            auto& partitioningSettings = *proto.mutable_partitioning_settings();
-            partitioningSettings.set_partition_size_mb(metadata->TableSettings.PartitionSizeMb.GetRef());
-        }
-
-        if (metadata->TableSettings.AutoPartitioningByLoad) {
-            auto& partitioningSettings = *proto.mutable_partitioning_settings();
-            TString value = to_lower(metadata->TableSettings.AutoPartitioningByLoad.GetRef());
-            if (value == "enabled") {
-                partitioningSettings.set_partitioning_by_load(Ydb::FeatureFlag::ENABLED);
-            } else if (value == "disabled") {
-                partitioningSettings.set_partitioning_by_load(Ydb::FeatureFlag::DISABLED);
-            } else {
-                code = Ydb::StatusIds::BAD_REQUEST;
-                error = TStringBuilder() << "Unknown feature flag '"
-                    << metadata->TableSettings.AutoPartitioningByLoad.GetRef()
-                    << "' for auto partitioning by load";
-                return false;
-            }
-        }
-
-        if (metadata->TableSettings.MinPartitions) {
-            auto& partitioningSettings = *proto.mutable_partitioning_settings();
-            partitioningSettings.set_min_partitions_count(metadata->TableSettings.MinPartitions.GetRef());
-        }
-
-        if (metadata->TableSettings.MaxPartitions) {
-            auto& partitioningSettings = *proto.mutable_partitioning_settings();
-            partitioningSettings.set_max_partitions_count(metadata->TableSettings.MaxPartitions.GetRef());
-        }
-
-        if (metadata->TableSettings.UniformPartitions) {
-            if (metadata->TableSettings.PartitionAtKeys) {
-                code = Ydb::StatusIds::BAD_REQUEST;
-                error = TStringBuilder() << "Uniform partitions and partitions at keys settings are mutually exclusive."
-                    << " Use either one of them.";
-                return false;
-            }
-            proto.set_uniform_partitions(metadata->TableSettings.UniformPartitions.GetRef());
-        }
-
-        if (metadata->TableSettings.PartitionAtKeys) {
-            auto* borders = proto.mutable_partition_at_keys();
-            for (const auto& splitPoint : metadata->TableSettings.PartitionAtKeys) {
-                auto* border = borders->Addsplit_points();
-                auto &keyType = *border->mutable_type()->mutable_tuple_type();
-                for (const auto& key : splitPoint) {
-                    auto* type = keyType.add_elements()->mutable_optional_type()->mutable_item();
-                    auto* value = border->mutable_value()->add_items();
-                    if (!ConvertDataSlotToYdbTypedValue(key.first, key.second, type, value)) {
-                        code = Ydb::StatusIds::BAD_REQUEST;
-                        error = TStringBuilder() << "Unsupported type for PartitionAtKeys: '"
-                            << key.first << "'";
-                        return false;
-                    }
-                }
-            }
-        }
-
-        if (metadata->TableSettings.KeyBloomFilter) {
-            TString value = to_lower(metadata->TableSettings.KeyBloomFilter.GetRef());
-            if (value == "enabled") {
-                proto.set_key_bloom_filter(Ydb::FeatureFlag::ENABLED);
-            } else if (value == "disabled") {
-                proto.set_key_bloom_filter(Ydb::FeatureFlag::DISABLED);
-            } else {
-                code = Ydb::StatusIds::BAD_REQUEST;
-                error = TStringBuilder() << "Unknown feature flag '"
-                    << metadata->TableSettings.KeyBloomFilter.GetRef()
-                    << "' for key bloom filter";
-                return false;
-            }
-        }
-
-        if (metadata->TableSettings.ReadReplicasSettings) {
-            if (!NYql::ConvertReadReplicasSettingsToProto(metadata->TableSettings.ReadReplicasSettings.GetRef(),
-                    *proto.mutable_read_replicas_settings(), code, error)) {
-                return false;
-            }
-        }
-
-        if (const auto& ttl = metadata->TableSettings.TtlSettings) {
-            if (ttl.IsSet()) {
-                ConvertTtlSettingsToProto(ttl.GetValueSet(), *proto.mutable_ttl_settings());
-            } else {
-                code = Ydb::StatusIds::BAD_REQUEST;
-                error = "Can't reset TTL settings";
-                return false;
-            }
-        }
-
-        if (const auto& tiering = metadata->TableSettings.Tiering) {
-            if (tiering.IsSet()) {
-                proto.set_tiering(tiering.GetValueSet());
-            } else {
-                code = Ydb::StatusIds::BAD_REQUEST;
-                error = "Can't reset TIERING";
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    static bool FillCreateTableDesc(NYql::TKikimrTableMetadataPtr metadata,
-        NKikimrSchemeOp::TTableDescription& tableDesc, const TTableProfiles& profiles,
-        Ydb::StatusIds::StatusCode& code, TString& error, TList<TString>& warnings)
-    {
-        Ydb::Table::CreateTableRequest createTableProto;
-        if (!profiles.ApplyTableProfile(*createTableProto.mutable_profile(), tableDesc, code, error)
-            || !ConvertCreateTableSettingsToProto(metadata, createTableProto, code, error)) {
-            return false;
-        }
-
-        TColumnFamilyManager families(tableDesc.MutablePartitionConfig());
-
-        for (const auto& familySettings : createTableProto.column_families()) {
-            if (!families.ApplyFamilySettings(familySettings, &code, &error)) {
-                return false;
-            }
-        }
-
-        if (families.Modified && !families.ValidateColumnFamilies(&code, &error)) {
-            return false;
-        }
-
-        if (!NGRpcService::FillCreateTableSettingsDesc(tableDesc, createTableProto, profiles, code, error, warnings)) {
-            return false;
-        }
-        return true;
+        auto& paramsMap = params->GetParamsProtobuf();
+        output->insert(paramsMap.begin(), paramsMap.end());
     }
 
     static bool FillCreateColumnTableDesc(NYql::TKikimrTableMetadataPtr metadata,
@@ -2669,6 +2261,17 @@ TIntrusivePtr<IKqpGateway> CreateKikimrIcGateway(const TString& cluster, const T
     return MakeIntrusive<TKikimrIcGateway>(cluster, database, std::move(metadataLoader), actorSystem, nodeId,
         counters);
 }
+
+bool SplitTablePath(const TString& tableName, const TString& database, std::pair<TString, TString>& pathPair,
+    TString& error, bool createDir)
+{
+    if (createDir) {
+        return TrySplitPathByDb(tableName, database, pathPair, error);
+    } else {
+        return IKqpGateway::TrySplitTablePath(tableName, pathPair, error);
+    }
+}
+
 
 } // namespace NKqp
 } // namespace NKikimr

@@ -193,7 +193,8 @@ namespace {
         std::vector<std::string_view> lCheck;
         lCheck.reserve(leftKeys.size());
         for (const auto& x : leftKeys) {
-            lCheck.emplace_back(ctx.AppendString((*labels.FindInput(x.first))->FullName(x.second)));
+            for (const auto& name : (*labels.FindInput(x.first))->AllNames(x.second))
+                lCheck.emplace_back(ctx.AppendString(name));
             if (!myLeftScope.contains(x.first)) {
                 ctx.AddError(TIssue(ctx.GetPosition(joins.Pos()),
                     TStringBuilder() << "Correlation name " << x.first << " is out of scope"));
@@ -212,7 +213,8 @@ namespace {
         std::vector<std::string_view> rCheck;
         rCheck.reserve(rightKeys.size());
         for (const auto& x : rightKeys) {
-            rCheck.emplace_back(ctx.AppendString((*labels.FindInput(x.first))->FullName(x.second)));
+            for (const auto& name : (*labels.FindInput(x.first))->AllNames(x.second))
+                rCheck.emplace_back(ctx.AppendString(name));
             if (!myRightScope.contains(x.first)) {
                 ctx.AddError(TIssue(ctx.GetPosition(joins.Pos()),
                     TStringBuilder() << "Correlation name " << x.first << " is out of scope"));
@@ -337,8 +339,8 @@ namespace {
         const bool lAny = leftHints && (leftHints->contains("unique") || leftHints->contains("any"));
         const bool rAny = rightHints && (rightHints->contains("unique") || rightHints->contains("any"));
 
-        const bool lOneRow = lAny || lUnique && lUnique->HasEqualColumns(lCheck);
-        const bool rOneRow = rAny || rUnique && rUnique->HasEqualColumns(rCheck);
+        const bool lOneRow = lAny || lUnique && lUnique->ContainsCompleteSet(lCheck);
+        const bool rOneRow = rAny || rUnique && rUnique->ContainsCompleteSet(rCheck);
 
         if (unique) {
             if (singleSide) {
@@ -385,7 +387,7 @@ namespace {
 
     struct TFlattenState {
         TString Table;
-        TVector<const TTypeAnnotationNode*> AllTypes;
+        TTypeAnnotationNode::TListType AllTypes;
     };
 
     void CollectEquiJoinKeyColumnsFromLeaf(const TExprNode& columns, THashMap<TStringBuf, THashSet<TStringBuf>>& tableKeysMap) {
@@ -543,6 +545,12 @@ TString TJoinLabel::FullName(const TStringBuf& column) const {
     } else {
         return TString(column);
     }
+}
+
+TVector<TString> TJoinLabel::AllNames(const TStringBuf& column) const {
+    TVector<TString> result(Tables.size());
+    std::transform(Tables.cbegin(), Tables.cend(), result.begin(), std::bind(&FullColumnName, std::placeholders::_1, std::cref(column)));
+    return result;
 }
 
 TStringBuf TJoinLabel::ColumnName(const TStringBuf& column) const {
@@ -862,32 +870,12 @@ IGraphTransformer::TStatus EquiJoinAnnotation(
 
     if (options.Flatten) {
         for (auto& x : flattenFields) {
-            bool isOptional = true;
-            const TTypeAnnotationNode* commonType = nullptr;
-            for (auto type : x.second.AllTypes) {
-                if (type->GetKind() != ETypeAnnotationKind::Optional) {
-                    isOptional = false;
-                } else {
-                    type = type->Cast<TOptionalExprType>()->GetItemType();
-                }
-
-                if (!commonType) {
-                    commonType = type;
-                } else {
-                    auto arg1 = ctx.NewArgument(positionHandle, "a");
-                    auto arg2 = ctx.NewArgument(positionHandle, "b");
-                    if (SilentInferCommonType(arg1, *commonType, arg2, *type, ctx, commonType,
-                        TConvertFlags().Set(NConvertFlags::AllowUnsafeConvert)) == IGraphTransformer::TStatus::Error) {
-                        return IGraphTransformer::TStatus::Error;
-                    }
-                }
-            }
-
-            if (isOptional && commonType->GetKind() != ETypeAnnotationKind::Optional) {
-                commonType = ctx.MakeType<TOptionalExprType>(commonType);
-            }
-
-            resultFields.push_back(ctx.MakeType<TItemExprType>(x.first, commonType));
+            if (const auto commonType = CommonType(positionHandle, x.second.AllTypes, ctx)) {
+                const bool unwrap = ETypeAnnotationKind::Optional == commonType->GetKind() &&
+                    std::any_of(x.second.AllTypes.cbegin(), x.second.AllTypes.cend(), [](const TTypeAnnotationNode* type) { return ETypeAnnotationKind::Optional != type->GetKind(); });
+                resultFields.emplace_back(ctx.MakeType<TItemExprType>(x.first, unwrap ? commonType->Cast<TOptionalExprType>()->GetItemType() : commonType));
+            } else
+                return IGraphTransformer::TStatus::Error;
         }
     }
 

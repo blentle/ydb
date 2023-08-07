@@ -231,6 +231,11 @@ NUdf::IBlockItemComparator::TPtr MakePgItemComparator(ui32 typeId) {
     throw yexception() << "PG types are not supported";
 }
 
+NUdf::IBlockItemHasher::TPtr MakePgItemHasher(ui32 typeId) {
+    Y_UNUSED(typeId);
+    throw yexception() << "PG types are not supported";
+}
+
 void RegisterPgBlockAggs(THashMap<TString, std::unique_ptr<IBlockAggregatorFactory>>& registry) {
     Y_UNUSED(registry);
 }
@@ -241,6 +246,13 @@ void RegisterPgBlockAggs(THashMap<TString, std::unique_ptr<IBlockAggregatorFacto
 namespace NYql {
 
 arrow::Datum MakePgScalar(NKikimr::NMiniKQL::TPgType* type, const NKikimr::NUdf::TUnboxedValuePod& value, arrow::MemoryPool& pool) {
+    Y_UNUSED(type);
+    Y_UNUSED(value);
+    Y_UNUSED(pool);
+    return arrow::Datum();
+}
+
+arrow::Datum MakePgScalar(NKikimr::NMiniKQL::TPgType* type, const NUdf::TBlockItem& value, arrow::MemoryPool& pool) {
     Y_UNUSED(type);
     Y_UNUSED(value);
     Y_UNUSED(pool);
@@ -336,9 +348,6 @@ bool HasPgKernel(ui32 procOid) {
     return false;
 }
 
-void RegisterPgKernels() {
-}
-
 std::function<NKikimr::NMiniKQL::IComputationNode* (NKikimr::NMiniKQL::TCallable&,
     const NKikimr::NMiniKQL::TComputationNodeFactoryContext&)> GetPgFactory()
 {
@@ -350,6 +359,13 @@ std::function<NKikimr::NMiniKQL::IComputationNode* (NKikimr::NMiniKQL::TCallable
         Y_UNUSED(ctx);
         return nullptr;
     };
+}
+
+IOptimizer* MakePgOptimizer(const IOptimizer::TInput& input, const std::function<void(const TString&)>& log)
+{
+    Y_UNUSED(input);
+    Y_UNUSED(log);
+    ythrow yexception() << "PgJoinSearch does nothing";
 }
 
 } // NYql

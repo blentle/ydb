@@ -31,6 +31,7 @@ namespace NYdb {
 namespace NTable {
 
 using namespace NThreading;
+using namespace NSessionPool;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -262,7 +263,7 @@ class TTableDescription::TImpl {
 
         // columns
         for (const auto& col : proto.columns()) {
-            Columns_.emplace_back(col.name(), col.type(), col.family());
+            Columns_.emplace_back(col.name(), col.type(), col.family(), col.not_null());
         }
 
         // indexes
@@ -426,8 +427,8 @@ public:
         return Proto_;
     }
 
-    void AddColumn(const TString& name, const Ydb::Type& type, const TString& family) {
-        Columns_.emplace_back(name, type, family);
+    void AddColumn(const TString& name, const Ydb::Type& type, const TString& family, std::optional<bool> notNull) {
+        Columns_.emplace_back(name, type, family, notNull);
     }
 
     void SetPrimaryKeyColumns(const TVector<TString>& primaryKeyColumns) {
@@ -685,8 +686,8 @@ const TVector<TKeyRange>& TTableDescription::GetKeyRanges() const {
     return Impl_->GetKeyRanges();
 }
 
-void TTableDescription::AddColumn(const TString& name, const Ydb::Type& type, const TString& family) {
-    Impl_->AddColumn(name, type, family);
+void TTableDescription::AddColumn(const TString& name, const Ydb::Type& type, const TString& family, std::optional<bool> notNull) {
+    Impl_->AddColumn(name, type, family, notNull);
 }
 
 void TTableDescription::SetPrimaryKeyColumns(const TVector<TString>& primaryKeyColumns) {
@@ -835,6 +836,9 @@ void TTableDescription::SerializeTo(Ydb::Table::CreateTableRequest& request) con
         protoColumn.set_name(column.Name);
         protoColumn.mutable_type()->CopyFrom(TProtoAccessor::GetProto(column.Type));
         protoColumn.set_family(column.Family);
+        if (column.NotNull.has_value()) {
+            protoColumn.set_not_null(column.NotNull.value());
+        }
     }
 
     for (const auto& pk : Impl_->GetPrimaryKeyColumns()) {
@@ -1038,7 +1042,7 @@ TTableBuilder& TTableBuilder::AddNullableColumn(const TString& name, const EPrim
         .EndOptional()
         .Build();
 
-    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family);
+    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family, false);
     return *this;
 }
 
@@ -1048,7 +1052,7 @@ TTableBuilder& TTableBuilder::AddNullableColumn(const TString& name, const TDeci
             .Decimal(type)
         .EndOptional()
         .Build();
-    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family);
+    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family, false);
     return *this;
 }
 
@@ -1057,7 +1061,7 @@ TTableBuilder& TTableBuilder::AddNullableColumn(const TString& name, const TPgTy
         .Pg(type)
         .Build();
 
-    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family);
+    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family, false);
     return *this;
 }
 
@@ -1066,7 +1070,7 @@ TTableBuilder& TTableBuilder::AddNonNullableColumn(const TString& name, const EP
         .Primitive(type)
         .Build();
 
-    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family);
+    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family, true);
     return *this;
 }
 
@@ -1075,15 +1079,16 @@ TTableBuilder& TTableBuilder::AddNonNullableColumn(const TString& name, const TD
         .Decimal(type)
         .Build();
 
-    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family);
+    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family, true);
     return *this;
 }
 
 TTableBuilder& TTableBuilder::AddNonNullableColumn(const TString& name, const TPgType& type, const TString& family) {
-    throw yexception() << "It is not allowed to create NOT NULL column with pg type";
-    Y_UNUSED(name);
-    Y_UNUSED(type);
-    Y_UNUSED(family);
+    auto columnType = TTypeBuilder()
+        .Pg(type)
+        .Build();
+
+    TableDescription_.AddColumn(name, TProtoAccessor::GetProto(columnType), family, true);
     return *this;
 }
 
@@ -1662,10 +1667,10 @@ TAsyncBulkUpsertResult TTableClient::BulkUpsert(const TString& table, EDataForma
     return Impl_->BulkUpsert(table, format, data, schema, settings);
 }
 
-TAsyncReadRowsResult TTableClient::ReadRows(const TString& table, TValue&& rows,
+TAsyncReadRowsResult TTableClient::ReadRows(const TString& table, TValue&& rows, const TVector<TString>& columns,
     const TReadRowsSettings& settings)
 {
-    return Impl_->ReadRows(table, std::move(rows), settings);
+    return Impl_->ReadRows(table, std::move(rows), columns, settings);
 }
 
 TAsyncScanQueryPartIterator TTableClient::StreamExecuteScanQuery(const TString& query, const TParams& params,
@@ -2367,29 +2372,6 @@ TCommitTransactionResult::TCommitTransactionResult(TStatus&& status, const TMayb
 
 const TMaybe<TQueryStats>& TCommitTransactionResult::GetStats() const {
     return QueryStats_;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-std::function<void(TSession::TImpl*)> TSession::TImpl::GetSmartDeleter(std::shared_ptr<TTableClient::TImpl> client) {
-    return [client](TSession::TImpl* sessionImpl) {
-        switch (sessionImpl->GetState()) {
-            case TSession::TImpl::S_STANDALONE:
-            case TSession::TImpl::S_BROKEN:
-            case TSession::TImpl::S_CLOSING:
-                client->DeleteSession(sessionImpl);
-            break;
-            case TSession::TImpl::S_IDLE:
-            case TSession::TImpl::S_ACTIVE: {
-                if (!client->ReturnSession(sessionImpl)) {
-                    client->DeleteSession(sessionImpl);
-                }
-                break;
-            }
-            default:
-            break;
-        }
-    };
 }
 
 ////////////////////////////////////////////////////////////////////////////////

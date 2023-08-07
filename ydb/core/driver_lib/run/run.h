@@ -16,6 +16,7 @@
 #include <ydb/core/client/server/grpc_server.h>
 #include <ydb/core/fq/libs/shared_resources/interface/shared_resources.h>
 #include <ydb/core/kqp/common/kqp.h>
+#include <ydb/core/base/memobserver.h>
 #include <ydb/core/tablet/node_tablet_monitor.h>
 #include <ydb/core/tablet/tablet_setup.h>
 #include <ydb/core/ymq/http/http.h>
@@ -24,7 +25,7 @@
 
 namespace NKikimr {
 
-class TKikimrRunner : public virtual TThrRefBase {
+class TKikimrRunner : public virtual TThrRefBase, private IGlobalObjectStorage {
 protected:
     static TProgramShouldContinue KikimrShouldContinue;
     static void OnTerminate(int);
@@ -45,23 +46,20 @@ protected:
 
     THolder<NYdb::TDriver> YdbDriver;
 
+    std::vector<std::shared_ptr<void>> GlobalObjects;
+
     THolder<NKqp::TKqpShutdownController> KqpShutdownController;
 
     TIntrusivePtr<NInterconnect::TPollerThreads> PollerThreads;
     TAutoPtr<TAppData> AppData;
-
-    NBus::TBusQueueConfig ProxyBusQueueConfig;
-    NBus::TBusSessionConfig ProxyBusSessionConfig;
-    NBus::TBusMessageQueuePtr Bus;
-
-    TAutoPtr<NMsgBusProxy::IMessageBusServer> BusServer;
-    TIntrusivePtr<NMonitoring::TBusNgMonPage> BusMonPage;
 
     TVector<std::pair<TString, TAutoPtr<NGrpc::TGRpcServer>>> GRpcServers;
 
     TIntrusivePtr<NActors::NLog::TSettings> LogSettings;
     std::shared_ptr<TLogBackend> LogBackend;
     TAutoPtr<TActorSystem> ActorSystem;
+
+    TIntrusivePtr<TMemObserver> MemObserver;
 
     TKikimrRunner(std::shared_ptr<TModuleFactories> factories = {});
 
@@ -81,8 +79,6 @@ protected:
 
     void InitializeMonitoringLogin(const TKikimrRunConfig& runConfig);
 
-    void InitializeMessageBus(const TKikimrRunConfig& runConfig);
-
     void InitializeGRpc(const TKikimrRunConfig& runConfig);
 
     void InitializeKqpController(const TKikimrRunConfig& runConfig);
@@ -99,6 +95,9 @@ protected:
     TIntrusivePtr<TServiceInitializersList> CreateServiceInitializersList(
         const TKikimrRunConfig& runConfig,
         const TBasicKikimrServicesMask& serviceMask = {});
+
+private:
+    void AddGlobalObject(std::shared_ptr<void> object) override;
 
 public:
     static void SetSignalHandlers();

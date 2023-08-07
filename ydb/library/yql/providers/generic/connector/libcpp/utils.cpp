@@ -3,14 +3,15 @@
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
 #include <util/string/builder.h>
+#include <util/system/type_name.h>
 #include <ydb/core/formats/arrow/serializer/batch_only.h>
 #include <ydb/core/formats/arrow/serializer/full.h>
 #include <ydb/library/yql/utils/log/log.h>
 #include <ydb/library/yql/utils/yql_panic.h>
 
-namespace NYql::Connector {
+namespace NYql::NConnector {
     arrow::Status MakeConversion(const Ydb::Column columnMeta,
-                                 const NYql::Connector::API::ReadSplitsResponse_ColumnSet_Column& columnData,
+                                 const NApi::TReadSplitsResponse_TColumnSet_TColumn& columnData,
                                  std::vector<std::shared_ptr<arrow::Field>>& fields,
                                  std::vector<std::shared_ptr<arrow::Array>>& arrays) {
         const auto t = columnMeta.type().type_id();
@@ -47,12 +48,12 @@ namespace NYql::Connector {
             }
             default:
                 ythrow yexception() << "unexpected type: " << Ydb::Type_PrimitiveTypeId_Name(t) << " ("
-                                    << typeid(t).name() << ")";
+                                    << TypeName(t) << ")";
         }
         return arrow::Status::OK();
     }
 
-    std::shared_ptr<arrow::RecordBatch> ColumnSetToArrowRecordBatch(const API::ReadSplitsResponse::ColumnSet& columnSet) {
+    std::shared_ptr<arrow::RecordBatch> ColumnSetToArrowRecordBatch(const NApi::TReadSplitsResponse::TColumnSet& columnSet) {
         YQL_ENSURE(columnSet.meta_size() == columnSet.data_size(), "metadata and data size mismatch");
 
         // schema fields
@@ -86,19 +87,19 @@ namespace NYql::Connector {
         return out;
     }
 
-    std::shared_ptr<arrow::RecordBatch> APIReadSplitsResponseToArrowRecordBatch(const API::ReadSplitsResponse& response) {
+    std::shared_ptr<arrow::RecordBatch> APIReadSplitsResponseToArrowRecordBatch(const NApi::TReadSplitsResponse& response) {
         const auto t = response.payload_case();
         switch (t) {
-            case API::ReadSplitsResponse::PayloadCase::kColumnSet:
+            case NApi::TReadSplitsResponse::PayloadCase::kColumnSet:
                 return ColumnSetToArrowRecordBatch(response.column_set());
-            case API::ReadSplitsResponse::PayloadCase::kArrowIpcStreaming:
+            case NApi::TReadSplitsResponse::PayloadCase::kArrowIpcStreaming:
                 return ArrowIPCStreamingToArrowRecordBatch(response.arrow_ipc_streaming());
             default:
                 ythrow yexception() << "unexpected payload case: " << int(t);
         }
     }
 
-    Ydb::Type GetColumnTypeByName(const API::Schema& schema, const TString& name) {
+    Ydb::Type GetColumnTypeByName(const NApi::TSchema& schema, const TString& name) {
         const auto columns = schema.columns();
 
         auto res =

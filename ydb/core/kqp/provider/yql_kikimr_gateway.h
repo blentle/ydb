@@ -15,6 +15,7 @@
 #include <ydb/services/metadata/abstract/kqp_common.h>
 #include <ydb/services/metadata/manager/abstract.h>
 
+#include <ydb/core/kqp/query_data/kqp_query_data.h>
 #include <ydb/core/protos/flat_scheme_op.pb.h>
 #include <ydb/core/protos/kqp.pb.h>
 #include <ydb/core/scheme/scheme_types_proto.h>
@@ -198,17 +199,19 @@ struct TKikimrColumnMetadata {
     NKikimr::NScheme::TTypeInfo TypeInfo;
     TString TypeMod;
     TVector<TString> Families;
+    TString DefaultFromSequence;
 
     TKikimrColumnMetadata() = default;
 
     TKikimrColumnMetadata(const TString& name, ui32 id, const TString& type, bool notNull,
-        NKikimr::NScheme::TTypeInfo typeInfo = {}, const TString& typeMod = {})
+        NKikimr::NScheme::TTypeInfo typeInfo = {}, const TString& typeMod = {}, const TString& defaultFromSequence = {})
         : Name(name)
         , Id(id)
         , Type(type)
         , NotNull(notNull)
         , TypeInfo(typeInfo)
         , TypeMod(typeMod)
+        , DefaultFromSequence(defaultFromSequence)
     {}
 
     explicit TKikimrColumnMetadata(const NKikimrKqp::TKqpColumnMetadataProto* message)
@@ -217,11 +220,16 @@ struct TKikimrColumnMetadata {
         , Type(message->GetType())
         , NotNull(message->GetNotNull())
         , Families(message->GetFamily().begin(), message->GetFamily().end())
+        , DefaultFromSequence(message->GetDefaultFromSequence())
     {
         auto typeInfoMod = NKikimr::NScheme::TypeInfoModFromProtoColumnType(message->GetTypeId(),
             message->HasTypeInfo() ? &message->GetTypeInfo() : nullptr);
         TypeInfo = typeInfoMod.TypeInfo;
         TypeMod = typeInfoMod.TypeMod;
+    }
+
+    bool IsAutoIncrement() const {
+        return !DefaultFromSequence.empty();
     }
 
     void ToMessage(NKikimrKqp::TKqpColumnMetadataProto* message) const {
@@ -231,6 +239,7 @@ struct TKikimrColumnMetadata {
         message->SetNotNull(NotNull);
         auto columnType = NKikimr::NScheme::ProtoColumnTypeFromTypeInfoMod(TypeInfo, TypeMod);
         message->SetTypeId(columnType.TypeId);
+        message->SetDefaultFromSequence(DefaultFromSequence);
         if (columnType.TypeInfo) {
             *message->MutableTypeInfo() = *columnType.TypeInfo;
         }
@@ -328,6 +337,7 @@ struct TExternalSource {
     TString DataSourcePath;
     TString DataSourceLocation;
     TString DataSourceInstallation;
+    TString ServiceAccountIdSignature;
     NKikimrSchemeOp::TAuth DataSourceAuth;
 };
 
@@ -502,7 +512,7 @@ struct TModifyPermissionsSettings {
         Revoke
     };
 
-    EAction Action;
+    EAction Action = EAction::Grant;
     THashSet<TString> Permissions;
     THashSet<TString> Pathes;
     THashSet<TString> Roles;
@@ -576,22 +586,6 @@ struct TAlterExternalTableSettings {
 
 struct TDropExternalTableSettings {
     TString ExternalTable;
-};
-
-struct TCreateExternalDataSourceSettings {
-    TString ExternalDataSource;
-    TString SourceType;
-    TString Location;
-    TString Installation;
-    TString AuthMethod;
-};
-
-struct TAlterExternalDataSourceSettings {
-    TString ExternalDataSource;
-};
-
-struct TDropExternalDataSourceSettings {
-    TString ExternalDataSource;
 };
 
 struct TKikimrListPathItem {
@@ -673,6 +667,10 @@ public:
         std::shared_ptr<google::protobuf::Arena> ProtobufArenaPtr;
         TMaybe<ui16> SqlVersion;
         google::protobuf::RepeatedPtrField<NKqpProto::TResultSetMeta> ResultSetsMeta;
+    };
+
+    struct TExecuteLiteralResult : public TGenericResult {
+        NKikimrMiniKQL::TResult Result;
     };
 
     struct TLoadTableMetadataSettings {
@@ -772,13 +770,9 @@ public:
 
     virtual NThreading::TFuture<TGenericResult> DropExternalTable(const TString& cluster, const TDropExternalTableSettings& settings) = 0;
 
-    virtual NThreading::TFuture<TGenericResult> CreateExternalDataSource(const TString& cluster, const TCreateExternalDataSourceSettings& settings, bool createDir) = 0;
-
-    virtual NThreading::TFuture<TGenericResult> AlterExternalDataSource(const TString& cluster, const TAlterExternalDataSourceSettings& settings) = 0;
-
-    virtual NThreading::TFuture<TGenericResult> DropExternalDataSource(const TString& cluster, const TDropExternalDataSourceSettings& settings) = 0;
-
     virtual TVector<TString> GetCollectedSchemeData() = 0;
+
+    virtual NThreading::TFuture<TExecuteLiteralResult> ExecuteLiteral(const TString& program, const NKikimrMiniKQL::TType& resultType, NKikimr::NKqp::TTxAllocatorState::TPtr txAlloc) = 0;
 
 public:
     using TCreateDirFunc = std::function<void(const TString&, const TString&, NThreading::TPromise<TGenericResult>)>;

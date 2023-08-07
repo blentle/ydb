@@ -141,6 +141,7 @@ namespace NActors {
             nodeAppData->FeatureFlags = app0->FeatureFlags;
             nodeAppData->CompactionConfig = app0->CompactionConfig;
             nodeAppData->HiveConfig = app0->HiveConfig;
+            nodeAppData->HiveConfig.SetWarmUpBootWaitingPeriod(10);
             nodeAppData->SchemeShardConfig = app0->SchemeShardConfig;
             nodeAppData->DataShardConfig = app0->DataShardConfig;
             nodeAppData->ColumnShardConfig = app0->ColumnShardConfig;
@@ -188,8 +189,7 @@ namespace NActors {
         return MonPorts[nodeIndex];
     }
 
-    void TTestActorRuntime::InitActorSystemSetup(TActorSystemSetup& setup) {
-        setup.MaxActivityType = GetActivityTypeCount();
+    void TTestActorRuntime::InitActorSystemSetup(TActorSystemSetup& /*setup*/) {
     }
 
     NKikimr::TAppData& TTestActorRuntime::GetAppData(ui32 nodeIndex) {

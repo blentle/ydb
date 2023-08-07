@@ -12,7 +12,7 @@
 #include <ydb/core/base/tablet_resolver.h>
 #include <ydb/core/tablet/resource_broker.h>
 #include <ydb/core/tablet_flat/shared_sausagecache.h>
-#include <ydb/core/protos/services.pb.h>
+#include <ydb/library/services/services.pb.h>
 #include <library/cpp/time_provider/time_provider.h>
 
 #include <ydb/core/tablet_flat/test/libs/rows/tool.h>
@@ -163,7 +163,7 @@ namespace NFake {
             { /*_ Resource broker service, used for generic scans */
                 using namespace NResourceBroker;
 
-                auto *actor = CreateResourceBrokerActor(MakeDefaultConfig(),  Env.GetDynamicCounters(0));
+                auto *actor = CreateResourceBrokerActor(MakeDefaultConfig(), Env.GetDynamicCounters());
 
                 AddService(MakeResourceBrokerID(), actor, EMail::Revolving);
             }
@@ -178,13 +178,14 @@ namespace NFake {
             }
 
             { /*_ Shared page collection cache service, used by executor */
-                auto egg = MakeIntrusive<TSharedPageCacheConfig>();
+                auto config = MakeHolder<TSharedPageCacheConfig>();
 
-                egg->CacheConfig = new TCacheCacheConfig(conf.Shared, nullptr, nullptr, nullptr);
-                egg->TotalAsyncQueueInFlyLimit = conf.AsyncQueue;
-                egg->TotalScanQueueInFlyLimit = conf.ScanQueue;
+                config->CacheConfig = new TCacheCacheConfig(conf.Shared, nullptr, nullptr, nullptr);
+                config->TotalAsyncQueueInFlyLimit = conf.AsyncQueue;
+                config->TotalScanQueueInFlyLimit = conf.ScanQueue;
+                config->Counters = MakeIntrusive<TSharedPageCacheCounters>(Env.GetDynamicCounters());
 
-                auto *actor =  CreateSharedPageCache(egg.Get());
+                auto *actor = CreateSharedPageCache(std::move(config), Env.GetMemObserver());
 
                 RunOn(3, MakeSharedPageCacheId(0), actor, EMail::ReadAsFilled);
             }

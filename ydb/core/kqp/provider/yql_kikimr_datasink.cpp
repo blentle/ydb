@@ -5,6 +5,8 @@
 
 #include <ydb/library/yql/core/yql_expr_optimize.h>
 
+#include <ydb/library/yql/utils/log/log.h>
+
 namespace NYql {
 namespace {
 
@@ -161,6 +163,15 @@ private:
         return TStatus::Error;
     }
 
+    static void HandleDropTable(TIntrusivePtr<TKikimrSessionContext>& ctx, const NCommon::TWriteTableSettings& settings,
+        const TKikimrKey& key, const TStringBuf& cluster)
+    {
+        auto tableType = settings.TableType.IsValid()
+            ? GetTableTypeFromString(settings.TableType.Cast())
+            : ETableType::Table; // v0, pg support
+        ctx->Tables().GetOrAddTable(TString(cluster), ctx->GetDatabase(), key.GetTablePath(), tableType);
+    }
+
     TStatus HandleWrite(TExprBase node, TExprContext& ctx) override {
         auto cluster = node.Ref().Child(1)->Child(1)->Content();
         TKikimrKey key(ctx);
@@ -180,10 +191,7 @@ private:
                 auto mode = settings.Mode.Cast();
 
                 if (mode == "drop") {
-                    auto tableType = settings.TableType.IsValid()
-                        ? GetTableTypeFromString(settings.TableType.Cast())
-                        : ETableType::Table; // v0 support
-                    SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath(), tableType);
+                    HandleDropTable(SessionCtx, settings, key, cluster);
                     return TStatus::Ok;
                 } else if (
                     mode == "upsert" ||
@@ -211,7 +219,7 @@ private:
                     SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath());
                     return TStatus::Ok;
                 } else if (mode == "delete") {
-                    if (!settings.Filter) {
+                    if (!settings.PgDelete && !settings.Filter) {
                         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), "Filter option is required for table delete."));
                         return TStatus::Error;
                     }
@@ -256,6 +264,9 @@ private:
                     }
 
                     SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath(), tableType);
+                    return TStatus::Ok;
+                } else if (mode == "drop") {
+                    HandleDropTable(SessionCtx, settings, key, cluster);
                     return TStatus::Ok;
                 }
 
@@ -331,13 +342,15 @@ public:
         TTypeAnnotationContext& types,
         TIntrusivePtr<IKikimrGateway> gateway,
         TIntrusivePtr<TKikimrSessionContext> sessionCtx,
+        const NExternalSource::IExternalSourceFactory::TPtr& externalSourceFactory,
         TIntrusivePtr<IKikimrQueryExecutor> queryExecutor)
         : FunctionRegistry(functionRegistry)
         , Types(types)
         , Gateway(gateway)
         , SessionCtx(sessionCtx)
+        , ExternalSourceFactory(externalSourceFactory)
         , IntentDeterminationTransformer(CreateKiSinkIntentDeterminationTransformer(sessionCtx))
-        , TypeAnnotationTransformer(CreateKiSinkTypeAnnotationTransformer(gateway, sessionCtx))
+        , TypeAnnotationTransformer(CreateKiSinkTypeAnnotationTransformer(gateway, sessionCtx, types))
         , LogicalOptProposalTransformer(CreateKiLogicalOptProposalTransformer(sessionCtx, types))
         , PhysicalOptProposalTransformer(CreateKiPhysicalOptProposalTransformer(sessionCtx))
         , CallableExecutionTransformer(CreateKiSinkCallableExecutionTransformer(gateway, sessionCtx, queryExecutor))
@@ -470,6 +483,74 @@ public:
         return false;
     }
 
+    static TExprNode::TPtr MakeKiDropTable(const TExprNode::TPtr& node, const NCommon::TWriteTableSettings& settings,
+        const TKikimrKey& key, TExprContext& ctx)
+    {
+        YQL_ENSURE(!settings.Columns);
+        auto tableType = settings.TableType.IsValid()
+            ? settings.TableType.Cast()
+            : Build<TCoAtom>(ctx, node->Pos()).Value("table").Done(); // v0, pg support
+        return Build<TKiDropTable>(ctx, node->Pos())
+            .World(node->Child(0))
+            .DataSink(node->Child(1))
+            .Table().Build(key.GetTablePath())
+            .Settings(settings.Other)
+            .TableType(tableType)
+            .Done()
+            .Ptr();
+    }
+
+    TExprNode::TPtr RewriteIOExternal(const TKikimrKey& key, const TExprNode::TPtr& node, TExprContext& ctx) {
+        TKiDataSink dataSink(node->ChildPtr(1));
+        auto& tableDesc = SessionCtx->Tables().GetTable(TString{dataSink.Cluster()}, key.GetTablePath());
+        if (!tableDesc.Metadata || tableDesc.Metadata->Kind != EKikimrTableKind::External) {
+            return nullptr;
+        }
+
+        if (tableDesc.Metadata->ExternalSource.SourceType != ESourceType::ExternalDataSource && tableDesc.Metadata->ExternalSource.SourceType != ESourceType::ExternalTable) {
+            YQL_CVLOG(NLog::ELevel::ERROR, NLog::EComponent::ProviderKikimr) << "Skip RewriteIO for external entity: unknown entity type: " << (int)tableDesc.Metadata->ExternalSource.SourceType;
+            return nullptr;
+        }
+
+        ctx.Step.Repeat(TExprStep::DiscoveryIO)
+                .Repeat(TExprStep::Epochs)
+                .Repeat(TExprStep::Intents)
+                .Repeat(TExprStep::LoadTablesMetadata)
+                .Repeat(TExprStep::RewriteIO);
+
+        const auto& externalSource = ExternalSourceFactory->GetOrCreate(tableDesc.Metadata->ExternalSource.Type);
+        if (tableDesc.Metadata->ExternalSource.SourceType == ESourceType::ExternalDataSource) {
+            auto writeArgs = node->ChildrenList();
+            writeArgs[1] = Build<TCoDataSink>(ctx, node->Pos())
+                            .Category(ctx.NewAtom(node->Pos(), externalSource->GetName()))
+                            .FreeArgs()
+                                .Add(writeArgs[1]->ChildrenList()[1])
+                            .Build()
+                            .Done().Ptr();
+            return ctx.ChangeChildren(*node, std::move(writeArgs));
+        } else { // tableDesc.Metadata->ExternalSource.SourceType == ESourceType::ExternalTable
+            TExprNode::TPtr path = ctx.NewCallable(node->Pos(), "String", { ctx.NewAtom(node->Pos(), tableDesc.Metadata->ExternalSource.TableLocation) });
+            auto table = ctx.NewList(node->Pos(), {ctx.NewAtom(node->Pos(), "table"), path});
+            auto keyNode = ctx.NewCallable(node->Pos(), "Key", {table});
+            auto r = Build<TCoWrite>(ctx, node->Pos())
+                .World(node->Child(0))
+                .DataSink()
+                    .Category(ctx.NewAtom(node->Pos(), externalSource->GetName()))
+                    .FreeArgs()
+                        .Add(ctx.NewAtom(node->Pos(), tableDesc.Metadata->ExternalSource.DataSourcePath))
+                        .Build()
+                    .Build()
+                .FreeArgs()
+                    .Add(keyNode)
+                    .Add(node->Child(3))
+                    .Add(BuildExternalTableSettings(node->Pos(), ctx, tableDesc.Metadata->Columns, externalSource, tableDesc.Metadata->ExternalSource.TableContent))
+                .Build()
+                .Done().Ptr();
+            return r;
+        }
+        return nullptr;
+    }
+
     TExprNode::TPtr RewriteIO(const TExprNode::TPtr& node, TExprContext& ctx) override {
         YQL_ENSURE(node->IsCallable(WriteName), "Expected Write!, got: " << node->Content());
 
@@ -478,23 +559,15 @@ public:
 
         switch (key.GetKeyType()) {
             case TKikimrKey::Type::Table: {
+                if (TExprNode::TPtr resultNode = RewriteIOExternal(key, node, ctx)) {
+                    return resultNode;
+                }
+
                 NCommon::TWriteTableSettings settings = NCommon::ParseWriteTableSettings(TExprList(node->Child(4)), ctx);
                 YQL_ENSURE(settings.Mode);
                 auto mode = settings.Mode.Cast();
-
                 if (mode == "drop") {
-                    YQL_ENSURE(!settings.Columns);
-                    auto tableType = settings.TableType.IsValid()
-                        ? settings.TableType.Cast()
-                        : Build<TCoAtom>(ctx, node->Pos()).Value("table").Done(); // v0 support
-                    return Build<TKiDropTable>(ctx, node->Pos())
-                        .World(node->Child(0))
-                        .DataSink(node->Child(1))
-                        .Table().Build(key.GetTablePath())
-                        .Settings(settings.Other)
-                        .TableType(tableType)
-                        .Done()
-                        .Ptr();
+                    return MakeKiDropTable(node, settings, key, ctx);
                 } else if (mode == "update") {
                     YQL_ENSURE(settings.Filter);
                     YQL_ENSURE(settings.Update);
@@ -507,14 +580,28 @@ public:
                         .Done()
                         .Ptr();
                 } else if (mode == "delete") {
-                    YQL_ENSURE(settings.Filter);
-                    return Build<TKiDeleteTable>(ctx, node->Pos())
-                        .World(node->Child(0))
-                        .DataSink(node->Child(1))
-                        .Table().Build(key.GetTablePath())
-                        .Filter(settings.Filter.Cast())
-                        .Done()
-                        .Ptr();
+                    YQL_ENSURE(settings.Filter || settings.PgDelete);
+                    if (settings.Filter) {
+                        return Build<TKiDeleteTable>(ctx, node->Pos())
+                            .World(node->Child(0))
+                            .DataSink(node->Child(1))
+                            .Table().Build(key.GetTablePath())
+                            .Filter(settings.Filter.Cast())
+                            .Done()
+                            .Ptr();
+                    } else {
+                        return Build<TKiWriteTable>(ctx, node->Pos())
+                            .World(node->Child(0))
+                            .DataSink(node->Child(1))
+                            .Table().Build(key.GetTablePath())
+                            .Input(settings.PgDelete.Cast())
+                            .Mode()
+                                .Value("delete_on")
+                            .Build()
+                            .Settings(settings.Other)
+                            .Done()
+                            .Ptr();
+                    }
                 } else {
                     return Build<TKiWriteTable>(ctx, node->Pos())
                         .World(node->Child(0))
@@ -557,6 +644,10 @@ public:
                         settings.NotNullColumns = Build<TCoAtomList>(ctx, node->Pos()).Done();
                     }
 
+                    if (!settings.SerialColumns.IsValid()) {
+                        settings.SerialColumns = Build<TCoAtomList>(ctx, node->Pos()).Done();
+                    }
+
                     return Build<TKiCreateTable>(ctx, node->Pos())
                         .World(node->Child(0))
                         .DataSink(node->Child(1))
@@ -564,6 +655,7 @@ public:
                         .Columns(settings.Columns.Cast())
                         .PrimaryKey(settings.PrimaryKey.Cast())
                         .NotNullColumns(settings.NotNullColumns.Cast())
+                        .SerialColumns(settings.SerialColumns.Cast())
                         .Settings(settings.Other)
                         .Indexes(settings.Indexes.Cast())
                         .Changefeeds(settings.Changefeeds.Cast())
@@ -592,6 +684,9 @@ public:
                         .TableType(tableType)
                         .Done()
                         .Ptr();
+
+                 } else if (mode == "drop") {
+                    return MakeKiDropTable(node, settings, key, ctx);
                 } else {
                     YQL_ENSURE(false, "unknown TableScheme mode \"" << TString(mode) << "\"");
                 }
@@ -801,6 +896,7 @@ private:
     const TTypeAnnotationContext& Types;
     TIntrusivePtr<IKikimrGateway> Gateway;
     TIntrusivePtr<TKikimrSessionContext> SessionCtx;
+    NExternalSource::IExternalSourceFactory::TPtr ExternalSourceFactory;
 
     TAutoPtr<IGraphTransformer> IntentDeterminationTransformer;
     TAutoPtr<IGraphTransformer> TypeAnnotationTransformer;
@@ -934,9 +1030,10 @@ TIntrusivePtr<IDataProvider> CreateKikimrDataSink(
     TTypeAnnotationContext& types,
     TIntrusivePtr<IKikimrGateway> gateway,
     TIntrusivePtr<TKikimrSessionContext> sessionCtx,
+    const NExternalSource::IExternalSourceFactory::TPtr& externalSourceFactory,
     TIntrusivePtr<IKikimrQueryExecutor> queryExecutor)
 {
-    return new TKikimrDataSink(functionRegistry, types, gateway, sessionCtx, queryExecutor);
+    return new TKikimrDataSink(functionRegistry, types, gateway, sessionCtx, externalSourceFactory, queryExecutor);
 }
 
 TAutoPtr<IGraphTransformer> CreateKiSinkIntentDeterminationTransformer(

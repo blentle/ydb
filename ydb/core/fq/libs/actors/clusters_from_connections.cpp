@@ -1,6 +1,7 @@
 #include "clusters_from_connections.h"
 
 #include <ydb/library/yql/providers/common/provider/yql_provider_names.h>
+#include <ydb/library/yql/providers/generic/connector/api/common/data_source.pb.h>
 #include <ydb/library/yql/utils/url_builder.h>
 
 #include <util/generic/hash.h>
@@ -86,6 +87,23 @@ void FillSolomonClusterConfig(NYql::TSolomonClusterConfig& clusterConfig,
     FillClusterAuth(clusterConfig, monitoring.auth(), authToken, accountIdSignatures);
 }
 
+template <typename TConnection>
+void FillGenericClusterConfig(
+    NYql::TGenericClusterConfig& clusterCfg,
+    const TConnection& connection,
+    const TString& connectionName,
+    NConnector::NApi::EDataSourceKind dataSourceKind,
+    const TString& authToken,
+    const THashMap<TString, TString>& accountIdSignatures
+){
+        clusterCfg.SetKind(dataSourceKind);
+        clusterCfg.SetName(connectionName);
+        clusterCfg.SetDatabaseId(connection.database_id());
+        clusterCfg.mutable_credentials()->mutable_basic()->set_username(connection.login());
+        clusterCfg.mutable_credentials()->mutable_basic()->set_password(connection.password());
+        FillClusterAuth(clusterCfg, connection.auth(), authToken, accountIdSignatures);
+}
+
 } //namespace
 
 NYql::TPqClusterConfig CreatePqClusterConfig(const TString& name,
@@ -151,16 +169,14 @@ void AddClustersFromConnections(
             break;
         }
         case FederatedQuery::ConnectionSetting::kClickhouseCluster: {
-            const auto& ch = conn.content().setting().clickhouse_cluster();
-            auto* clusterCfg = gatewaysConfig.MutableClickHouse()->AddClusterMapping();
-            clusterCfg->SetName(connectionName);
-            clusterCfg->SetId(ch.database_id());
-            if (ch.host())
-                clusterCfg->SetCluster(ch.host());
-            clusterCfg->SetNativeHostPort(9440);
-            clusterCfg->SetNativeSecure(true);
-            clusterCfg->SetCHToken(TStringBuilder() << "basic#" << ch.login() << "#" << ch.password());
-            clusters.emplace(connectionName, ClickHouseProviderName);
+            FillGenericClusterConfig(
+                *gatewaysConfig.MutableGeneric()->AddClusterMapping(),
+                conn.content().setting().clickhouse_cluster(),
+                connectionName,
+                NYql::NConnector::NApi::EDataSourceKind::CLICKHOUSE,
+                authToken,
+                accountIdSignatures);
+            clusters.emplace(connectionName, GenericProviderName);
             break;
         }
         case FederatedQuery::ConnectionSetting::kObjectStorage: {
@@ -182,6 +198,17 @@ void AddClustersFromConnections(
             auto* clusterCfg = gatewaysConfig.MutableSolomon()->AddClusterMapping();
             FillSolomonClusterConfig(*clusterCfg, connectionName, authToken, monitoringEndpoint, accountIdSignatures, monitoring);
             clusters.emplace(connectionName, SolomonProviderName);
+            break;
+        }
+        case FederatedQuery::ConnectionSetting::kPostgresqlCluster: {
+            FillGenericClusterConfig(
+                *gatewaysConfig.MutableGeneric()->AddClusterMapping(),
+                conn.content().setting().postgresql_cluster(),
+                connectionName,
+                NYql::NConnector::NApi::EDataSourceKind::POSTGRESQL,
+                authToken,
+                accountIdSignatures);
+            clusters.emplace(connectionName, GenericProviderName);
             break;
         }
 

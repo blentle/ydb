@@ -7,6 +7,9 @@
 
 #include <ydb/core/protos/flat_scheme_op.pb.h>
 #include <ydb/core/wrappers/s3_wrapper.h>
+#include <ydb/core/wrappers/s3_storage_config.h>
+
+#include <contrib/libs/aws-sdk-cpp/aws-cpp-sdk-core/include/aws/core/utils/threading/Executor.h>
 
 namespace NKikimr::NColumnShard {
 
@@ -35,9 +38,9 @@ public:
         return Event->Blobs;
     }
 
-    TUnifiedBlobId AddExported(const TUnifiedBlobId& srcBlob, const ui64 pathId) {
-        Event->SrcToDstBlobs[srcBlob] = srcBlob.MakeS3BlobId(pathId);
-        return Event->SrcToDstBlobs[srcBlob];
+    TString GetS3Key(const TUnifiedBlobId& srcBlob) const {
+        Y_VERIFY(Event->SrcToDstBlobs.contains(srcBlob));
+        return Event->SrcToDstBlobs.find(srcBlob)->second.GetS3Key();
     }
 
     bool ExtractionFinished() const {
@@ -52,6 +55,18 @@ public:
         auto node = KeysToWrite.extract(key);
         return node.mapped();
     }
+
+    void RemoveBlobs(const THashSet<TUnifiedBlobId>& blobIds) {
+        for (auto& blobId : blobIds) {
+            Event->Blobs.erase(blobId);
+            Event->SrcToDstBlobs.erase(blobId);
+        }
+    }
+
+    bool IsNotFinished(const TString& key) const {
+        return KeysToWrite.contains(key);
+    }
+
 private:
     std::unordered_map<TString, TUnifiedBlobId> KeysToWrite;
 };
@@ -105,6 +120,11 @@ public:
         }
 
         ExternalStorageConfig = NWrappers::IExternalStorageConfig::Construct(msg.Settings);
+        if (auto* s3Config = dynamic_cast<NWrappers::NExternalStorage::TS3ExternalStorageConfig*>(ExternalStorageConfig.get())) {
+            static constexpr ui32 MAX_THREADS = 10;
+            Aws::Client::ClientConfiguration& awsConfig = s3Config->ConfigRef();
+            awsConfig.executor = Aws::MakeShared<Aws::Utils::Threading::PooledThreadExecutor>("cs-s3", MAX_THREADS);
+        }
         if (ExternalStorageActorId) {
             Send(ExternalStorageActorId, new TEvents::TEvPoisonPill);
             ExternalStorageActorId = {};
@@ -125,53 +145,93 @@ public:
         Exports[exportNo] = TS3Export(ev->Release());
         auto& ex = Exports[exportNo];
 
+        THashSet<TUnifiedBlobId> retryes;
         for (auto& [blobId, blobData] : ex.Blobs()) {
-            TString key = ex.AddExported(blobId, msg.PathId).GetS3Key();
-            Y_VERIFY(!ExportingKeys.count(key)); // TODO: allow reexport?
+            const TString key = ex.GetS3Key(blobId);
+            Y_VERIFY(!key.empty());
 
-            ex.RegisterKey(key, blobId);
-            ExportingKeys[key] = exportNo;
+            if (ExportingKeys.contains(key)) {
+                retryes.insert(blobId);
+                auto strBlobId = blobId.ToStringNew();
 
-            SendPutObjectIfNotExists(key, std::move(blobData));
+                const auto& prevExport = Exports[ExportingKeys[key]];
+                if (prevExport.IsNotFinished(key)) {
+                    LOG_S_INFO("[S3] Retry export blob '" << strBlobId << "' at tablet " << TabletId);
+                } else {
+                    LOG_S_INFO("[S3] Avoid export retry for blob '" << strBlobId << "' at tablet " << TabletId);
+                    blobData = {};
+                }
+            } else {
+                ex.RegisterKey(key, blobId);
+                ExportingKeys[key] = exportNo;
+            }
+
+            if (!blobData.empty()) {
+                SendPutObjectIfNotExists(key, std::move(blobData));
+            }
+        }
+
+        ex.RemoveBlobs(retryes);
+        if (ex.ExtractionFinished()) {
+            Exports.erase(exportNo);
+            LOG_S_DEBUG("[S3] Empty export " << exportNo << " at tablet " << TabletId);
         }
     }
 
     void Handle(TEvPrivate::TEvForget::TPtr& ev) {
-        // It's possible to get several forgets for the same blob (remove + cleanup)
-        for (auto& evict : ev->Get()->Evicted) {
-            if (evict.ExternBlob.IsS3Blob()) {
-                const TString& key = evict.ExternBlob.GetS3Key();
-                if (ForgettingKeys.count(key)) {
-                    LOG_S_NOTICE("[S3] Ignore forget '" << evict.Blob.ToStringNew() << "' at tablet " << TabletId);
-                    return; // TODO: return an error?
-                }
-            }
-        }
-
         ui64 forgetNo = ++ForgetNo;
-
         Forgets[forgetNo] = TS3Forget(ev->Release());
         auto& forget = Forgets[forgetNo];
 
-        for (auto& evict : forget.Event->Evicted) {
+        auto& eventEvicted = forget.Event->Evicted;
+        Y_VERIFY(!eventEvicted.empty());
+
+        std::vector<NOlap::TEvictedBlob> newEvicted;
+        newEvicted.reserve(eventEvicted.size());
+
+        static constexpr ui32 DELETE_PORTION = 1000;
+        std::vector<TString> keys;
+        keys.reserve(DELETE_PORTION);
+
+        for (auto&& evict : eventEvicted) {
             if (!evict.ExternBlob.IsS3Blob()) {
-                LOG_S_ERROR("[S3] Forget not exported '" << evict.Blob.ToStringNew() << "' at tablet " << TabletId);
+                LOG_S_ERROR("[S3] Forget not exported '" << evict.Blob << "' at tablet " << TabletId);
                 continue;
             }
 
-            const TString& key = evict.ExternBlob.GetS3Key();
-            Y_VERIFY(!ForgettingKeys.count(key));
+            const TString key = evict.ExternBlob.GetS3Key();
 
-            forget.KeysToDelete.emplace(key);
-            ForgettingKeys[key] = forgetNo;
-            SendDeleteObject(key);
+            if (ForgettingKeys.contains(key)) {
+                auto strBlobId = evict.Blob.ToStringNew();
+                LOG_S_INFO("[S3] Retry forget blob '" << strBlobId << "' at tablet " << TabletId);
+            } else {
+                newEvicted.emplace_back(std::move(evict));
+                forget.KeysToDelete.emplace(key);
+                ForgettingKeys[key] = forgetNo;
+            }
+
+            keys.push_back(key);
+            if (keys.size() == DELETE_PORTION) {
+                SendDeleteObjects(keys);
+                keys.clear();
+            }
+        }
+        if (keys.size()) {
+            SendDeleteObjects(keys);
+            keys.clear();
+        }
+
+        eventEvicted.swap(newEvicted);
+        if (eventEvicted.empty()) {
+            Forgets.erase(forgetNo);
+            LOG_S_DEBUG("[S3] Empty forget " << forgetNo << " at tablet " << TabletId);
         }
     }
 
     void Handle(TEvPrivate::TEvGetExported::TPtr& ev) {
         auto& evict = ev->Get()->Evicted;
         if (!evict.ExternBlob.IsS3Blob()) {
-            LOG_S_ERROR("[S3] Get not exported '" << evict.Blob.ToStringNew() << "' at tablet " << TabletId);
+            LOG_S_ERROR("[S3] Get not exported '" << evict.Blob << "' at tablet " << TabletId);
             return;
         }
 
@@ -207,7 +267,9 @@ public:
 
         const TString key = *msg.Key;
 
-        LOG_S_DEBUG("[S3] PutObjectResponse '" << key << "' at tablet " << TabletId);
+        LOG_S_NOTICE("[S3] PutObjectResponse '" << key << "' "
+            << (resultOutcome.IsSuccess() ? "OK" : resultOutcome.GetError().GetMessage()) << " at tablet " << TabletId);
+
         KeyFinished(key, hasError, errStr);
     }
 
@@ -241,10 +303,9 @@ public:
         const auto& resultOutcome = msg.Result;
 
         if (!resultOutcome.IsSuccess()) {
-            KeyFinished(context->GetKey(), true, LogError("CheckObjectExistsResponse", resultOutcome.GetError(), context->GetKey()));
-        } else if (!msg.IsExists()) {
             SendPutObject(context->GetKey(), std::move(context->DetachData()));
         } else {
+            // TODO: check CRC
             KeyFinished(context->GetKey(), false, "");
         }
     }
@@ -255,7 +316,7 @@ public:
         auto& msg = *ev->Get();
         const auto& resultOutcome = msg.Result;
 
-        TString errStr;
+        std::optional<TString> errStr;
         if (!resultOutcome.IsSuccess()) {
             errStr = LogError("DeleteObjectResponse", resultOutcome.GetError(), msg.Key);
         }
@@ -265,12 +326,12 @@ public:
             return;
         }
 
-        TString key = *msg.Key;
+        ForgetObject(*msg.Key, errStr);
+    }
 
-        LOG_S_DEBUG("[S3] DeleteObjectResponse '" << key << "' at tablet " << TabletId);
-
+    void ForgetObject(const TString& key, const std::optional<TString>& errStr) {
         if (!ForgettingKeys.count(key)) {
-            LOG_S_DEBUG("[S3] DeleteObjectResponse for unknown key '" << key << "' at tablet " << TabletId);
+            LOG_S_INFO("[S3] DeleteObject(s)Response for unknown key '" << key << "' at tablet " << TabletId);
             return;
         }
 
@@ -278,22 +339,47 @@ public:
         ForgettingKeys.erase(key);
 
         if (!Forgets.count(forgetNo)) {
-            LOG_S_DEBUG("[S3] DeleteObjectResponse for unknown forget with key '" << key << "' at tablet " << TabletId);
+            LOG_S_INFO("[S3] DeleteObject(s)Response for unknown forget with key '" << key << "' at tablet " << TabletId);
             return;
         }
+
+        LOG_S_NOTICE("[S3] DeleteObject(s)Response '" << key << "' "
+            << (errStr ? *errStr : "OK") << " at tablet " << TabletId);
 
         auto& forget = Forgets[forgetNo];
         forget.KeysToDelete.erase(key);
 
-        if (!errStr.empty()) {
+        if (errStr) {
             forget.Event->Status = NKikimrProto::ERROR;
-            forget.Event->ErrorStr = errStr;
+            forget.Event->ErrorStr = *errStr;
             Send(ShardActor, forget.Event.release());
             Forgets.erase(forgetNo);
         } else if (forget.KeysToDelete.empty()) {
             forget.Event->Status = NKikimrProto::OK;
             Send(ShardActor, forget.Event.release());
             Forgets.erase(forgetNo);
+        }
+    }
+
+    void Handle(TEvExternalStorage::TEvDeleteObjectsResponse::TPtr& ev) {
+        Y_VERIFY(Initialized());
+
+        auto& msg = *ev->Get();
+        const auto& resultOutcome = msg.Result;
+        const auto& objsDeleted = resultOutcome.GetResult().GetDeleted();
+
+        std::optional<TString> errStr;
+        if (!resultOutcome.IsSuccess()) {
+            errStr = LogError("DeleteObjectsResponse", resultOutcome.GetError(), objsDeleted);
+        }
+
+        if (objsDeleted.empty()) {
+            LOG_S_ERROR("[S3] no keys in DeleteObjectsResponse at tablet " << TabletId);
+            return;
+        }
+
+        for (const auto& obj : objsDeleted) {
+            ForgetObject(TString(obj.GetKey()), errStr);
         }
     }
 
@@ -330,7 +416,7 @@ public:
             auto result = std::make_unique<TEvColumnShard::TEvReadBlobRangesResult>(TabletId);
 
             for (const auto& blobRange : ev->BlobRanges) {
-                if (data.size() < blobRange.Offset + blobRange.Size) {
+                if (status != NKikimrProto::ERROR && data.size() < blobRange.Offset + blobRange.Size) {
                     LOG_S_ERROR("GetObjectResponse '" << *key << "', data size: " << data.size()
                         << " is too small for blob range {" << blobRange.Offset << "," << blobRange.Size << "}"
                         << " at tablet " << TabletId);
@@ -355,28 +441,30 @@ public:
     }
 
     void KeyFinished(const TString& key, const bool hasError, const TString& errStr) {
-        ui64 exportNo = 0;
-        {
-            auto itExportKey = ExportingKeys.find(key);
-            if (itExportKey == ExportingKeys.end()) {
-                LOG_S_DEBUG("[S3] KeyFinished for unknown key '" << key << "' at tablet " << TabletId);
-                return;
-            }
-            exportNo = itExportKey->second;
-            ExportingKeys.erase(itExportKey);
+        auto itExportKey = ExportingKeys.find(key);
+        if (itExportKey == ExportingKeys.end()) {
+            LOG_S_INFO("[S3] KeyFinished for unknown key '" << key << "' at tablet " << TabletId);
+            return;
         }
+        ui64 exportNo = itExportKey->second;
+
         auto it = Exports.find(exportNo);
         if (it == Exports.end()) {
-            LOG_S_DEBUG("[S3] KeyFinished for unknown export with key '" << key << "' at tablet " << TabletId);
+            LOG_S_INFO("[S3] KeyFinished for unknown export with key '" << key << "' at tablet " << TabletId);
             return;
         }
 
+        LOG_S_DEBUG("[S3] KeyFinished for key '" << key << "' at tablet " << TabletId);
         auto& ex = it->second;
         TUnifiedBlobId blobId = ex.FinishKey(key);
 
         ex.Event->AddResult(blobId, key, hasError, errStr);
 
         if (ex.ExtractionFinished()) {
+            for (auto& [blobId, _] : ex.Blobs()) {
+                ExportingKeys.erase(ex.GetS3Key(blobId));
+            }
+
             Y_VERIFY(ex.Event->Finished());
             Send(ShardActor, ex.Event.release());
             Exports.erase(exportNo);
@@ -405,6 +493,7 @@ private:
             cFunc(TEvents::TEvPoisonPill::EventType, PassAway);
             hFunc(TEvExternalStorage::TEvPutObjectResponse, Handle);
             hFunc(TEvExternalStorage::TEvDeleteObjectResponse, Handle);
+            hFunc(TEvExternalStorage::TEvDeleteObjectsResponse, Handle);
             hFunc(TEvExternalStorage::TEvGetObjectResponse, Handle);
             hFunc(TEvExternalStorage::TEvCheckObjectExistsResponse, Handle);
 
@@ -441,10 +530,10 @@ private:
     }
 
     void SendPutObjectIfNotExists(const TString& key, TString&& data) {
-        auto request = Aws::S3::Model::ListObjectsRequest()
-            .WithPrefix(key);
+        auto request = Aws::S3::Model::HeadObjectRequest()
+            .WithKey(key);
 
-        LOG_S_DEBUG("[S3] PutObjectIfNotExists->ListObjectsRequest key '" << key << "' at tablet " << TabletId);
+        LOG_S_DEBUG("[S3] PutObjectIfNotExists->HeadObjectRequest key '" << key << "' at tablet " << TabletId);
         std::shared_ptr<TEvCheckObjectExistsRequestContext> context = std::make_shared<TEvCheckObjectExistsRequestContext>(key, std::move(data));
         Send(ExternalStorageActorId, new TEvExternalStorage::TEvCheckObjectExistsRequest(request, context));
     }
@@ -474,17 +563,49 @@ private:
         Send(ExternalStorageActorId, new TEvExternalStorage::TEvDeleteObjectRequest(request));
     }
 
+    void SendDeleteObjects(const std::vector<TString>& keys) const {
+        Aws::Vector<Aws::S3::Model::ObjectIdentifier> awsKeys;
+        awsKeys.reserve(keys.size());
+        for (const auto& key : keys) {
+            awsKeys.emplace_back(Aws::S3::Model::ObjectIdentifier().WithKey(key));
+        }
+        Y_VERIFY(awsKeys.size());
+
+        auto request = Aws::S3::Model::DeleteObjectsRequest()
+            .WithDelete(Aws::S3::Model::Delete().WithObjects(std::move(awsKeys)));
+
+        Send(ExternalStorageActorId, new TEvExternalStorage::TEvDeleteObjectsRequest(request));
+    }
+
     TString LogError(const TString& responseType, const Aws::S3::S3Error& error,
                      const std::optional<TString>& key) const {
-        TString errStr = TString(error.GetExceptionName()) + " " + error.GetMessage();
+        TString errStr = /*TString(error.GetExceptionName()) + " " +*/ TString(error.GetMessage());
 
-        LOG_S_NOTICE("[S3] Error in " << responseType << " for key '" << (key ? *key : TString())
-            << "' at tablet " << TabletId << ": " << errStr);
+        LOG_S_NOTICE("[S3] Error in " << responseType << " for key '" << (key ? *key : TString()) << ": " << errStr
+            << "' at tablet " << TabletId);
 
         if (errStr.empty() && !key) {
             errStr = responseType + " with no key";
         }
         return errStr;
+    }
+
+    TString LogError(const TString& responseType, const Aws::S3::S3Error& error,
+                     const Aws::Vector<Aws::S3::Model::DeletedObject>& objs) const {
+        TString errStr = /*TString(error.GetExceptionName()) + " " +*/ TString(error.GetMessage());
+
+        LOG_S_NOTICE("[S3] Error in " << responseType << " for " << ToString(objs) << ": " << errStr
+            << " at tablet " << TabletId);
+        return errStr;
+    }
+
+    static TString ToString(const Aws::Vector<Aws::S3::Model::DeletedObject>& objs) {
+        TStringBuilder ss;
+        ss << "keys";
+        for (auto& obj : objs) {
+            ss << " '" << obj.GetKey() << "'";
+        }
+        return ss;
     }
 };
 

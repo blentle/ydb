@@ -49,7 +49,8 @@ using parse_options = parse_options_t<char>;
        || defined(__amd64) || defined(__aarch64__) || defined(_M_ARM64) \
        || defined(__MINGW64__)                                          \
        || defined(__s390x__)                                            \
-       || (defined(__ppc64__) || defined(__PPC64__) || defined(__ppc64le__) || defined(__PPC64LE__)) )
+       || (defined(__ppc64__) || defined(__PPC64__) || defined(__ppc64le__) || defined(__PPC64LE__)) \
+       || defined(__loongarch64) )
 #define FASTFLOAT_64BIT 1
 #elif (defined(__i386) || defined(__i386__) || defined(_M_IX86)   \
      || defined(__arm__) || defined(_M_ARM) || defined(__ppc__)   \
@@ -87,6 +88,8 @@ using parse_options = parse_options_t<char>;
 #include <machine/endian.h>
 #elif defined(sun) || defined(__sun)
 #include <sys/byteorder.h>
+#elif defined(__MVS__)
+#include <sys/endian.h>
 #else
 #ifdef __has_include
 #if __has_include(<endian.h>)
@@ -112,6 +115,38 @@ using parse_options = parse_options_t<char>;
 #endif
 #endif
 
+#if defined(__SSE2__) || \
+  (defined(FASTFLOAT_VISUAL_STUDIO) && \
+    (defined(_M_AMD64) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP == 2)))
+#define FASTFLOAT_SSE2 1
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define FASTFLOAT_NEON 1
+#endif
+
+#if defined(FASTFLOAT_SSE2) || defined(FASTFLOAT_ARM64)
+#define FASTFLOAT_HAS_SIMD 1
+#endif
+
+#if defined(__GNUC__)
+// disable -Wcast-align=strict (GCC only)
+#define FASTFLOAT_SIMD_DISABLE_WARNINGS \
+  _Pragma("GCC diagnostic push") \
+  _Pragma("GCC diagnostic ignored \"-Wcast-align\"")
+#else
+#define FASTFLOAT_SIMD_DISABLE_WARNINGS
+#endif
+
+#if defined(__GNUC__)
+#define FASTFLOAT_SIMD_RESTORE_WARNINGS \
+  _Pragma("GCC diagnostic pop")
+#else
+#define FASTFLOAT_SIMD_RESTORE_WARNINGS
+#endif
+
+
+
 #ifdef FASTFLOAT_VISUAL_STUDIO
 #define fastfloat_really_inline __forceinline
 #else
@@ -128,6 +163,9 @@ using parse_options = parse_options_t<char>;
 
 // rust style `try!()` macro, or `?` operator
 #define FASTFLOAT_TRY(x) { if (!(x)) return false; }
+
+#define FASTFLOAT_ENABLE_IF(...) typename std::enable_if<(__VA_ARGS__), int>::type = 0
+
 
 namespace fast_float {
 
@@ -534,10 +572,10 @@ template <> inline constexpr binary_format<double>::equiv_uint
 template<typename T>
 fastfloat_really_inline FASTFLOAT_CONSTEXPR20
 void to_float(bool negative, adjusted_mantissa am, T &value) {
-  using uint = typename binary_format<T>::equiv_uint;
-  uint word = (uint)am.mantissa;
-  word |= uint(am.power2) << binary_format<T>::mantissa_explicit_bits();
-  word |= uint(negative) << binary_format<T>::sign_index();
+  using fastfloat_uint = typename binary_format<T>::equiv_uint;
+  fastfloat_uint word = (fastfloat_uint)am.mantissa;
+  word |= fastfloat_uint(am.power2) << binary_format<T>::mantissa_explicit_bits();
+  word |= fastfloat_uint(negative) << binary_format<T>::sign_index();
 #if FASTFLOAT_HAS_BIT_CAST
   value = std::bit_cast<T>(word);
 #else

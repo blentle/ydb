@@ -8,6 +8,7 @@ TRunActorParams::TRunActorParams(
     TYqSharedResources::TPtr yqSharedResources,
     const NKikimr::TYdbCredentialsProviderFactory& credentialsProviderFactory,
     NYql::IHTTPGateway::TPtr s3Gateway,
+    NYql::NConnector::IClient::TPtr connectorClient,
     const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
     TIntrusivePtr<IRandomProvider> randomProvider,
     NYql::IModuleResolver::TPtr& moduleResolver,
@@ -51,11 +52,14 @@ TRunActorParams::TRunActorParams(
     const TString& jobId,
     const Fq::Private::TaskResources& resources,
     const TString& executionId,
-    const TString& operationId
+    const TString& operationId,
+    const NFq::NConfig::TYdbStorageConfig& computeConnection,
+    TDuration resultTtl
     )
     : YqSharedResources(yqSharedResources)
     , CredentialsProviderFactory(credentialsProviderFactory)
     , S3Gateway(s3Gateway)
+    , ConnectorClient(connectorClient)
     , FunctionRegistry(functionRegistry)
     , RandomProvider(randomProvider)
     , ModuleResolver(moduleResolver)
@@ -100,6 +104,8 @@ TRunActorParams::TRunActorParams(
     , Resources(resources)
     , ExecutionId(executionId)
     , OperationId(operationId, true)
+    , ComputeConnection(computeConnection)
+    , ResultTtl(resultTtl)
     {
     }
 
@@ -123,6 +129,8 @@ IOutputStream& operator<<(IOutputStream& out, const TRunActorParams& params) {
                 << " Resource.TopicConsumers: " << params.Resources.topic_consumers().size()
                 << " ExecutionId: " << params.ExecutionId
                 << " OperationId: " << (params.OperationId.GetKind() != Ydb::TOperationId::UNUSED ? ProtoToString(params.OperationId) : "<empty>")
+                << " ComputeConnection: " << params.ComputeConnection.ShortDebugString()
+                << " ResultTtl: " << params.ResultTtl
                 << " }";
 }
 

@@ -4,6 +4,7 @@ SRCS(
     actors_factory.cpp
     executer_actor.cpp
     finalizer_actor.cpp
+    initializer_actor.cpp
     resources_cleaner_actor.cpp
     result_writer_actor.cpp
     status_tracker_actor.cpp
@@ -35,3 +36,9 @@ PEERDIR(
 YQL_LAST_ABI_VERSION()
 
 END()
+
+RECURSE(
+    control_plane
+    events
+    synchronization_service
+)

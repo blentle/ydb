@@ -385,6 +385,7 @@ std::unique_ptr<typename TTraits::TResult> MakeBlockReaderImpl(const ITypeInfoHe
             return MakeFixedSizeBlockReaderImpl<TTraits, double>(isOptional);
         case NUdf::EDataSlot::String:
         case NUdf::EDataSlot::Yson:
+        case NUdf::EDataSlot::JsonDocument:
             return MakeStringBlockReaderImpl<TTraits, arrow::BinaryType>(isOptional);
         case NUdf::EDataSlot::Utf8:
         case NUdf::EDataSlot::Json:
@@ -448,7 +449,7 @@ inline void UpdateBlockItemSerializeProps(const ITypeInfoHelper& typeInfoHelper,
     if (typePg) {
         auto desc = typeInfoHelper.FindPgTypeDescription(typePg.GetTypeId());
         if (desc->PassByValue) {
-            *props.MaxSize += desc->Typelen;
+            *props.MaxSize += 1 + 8;
         } else {
             props.MaxSize = {};
             props.IsFixed = false;

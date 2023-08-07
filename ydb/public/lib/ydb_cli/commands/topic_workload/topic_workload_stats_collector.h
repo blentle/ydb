@@ -14,7 +14,7 @@ namespace NYdb {
                 size_t producerCount, size_t consumerCount,
                 bool quiet, bool printTimestamp,
                 ui32 windowDurationSec, ui32 totalDurationSec, ui32 warmupSec,
-                ui8 Percentile,
+                double Percentile,
                 std::shared_ptr<std::atomic_bool> errorFlag);
 
             void PrintWindowStatsLoop();
@@ -30,7 +30,15 @@ namespace NYdb {
             ui64 GetTotalWriteMessages() const;
 
         private:
-            void CollectThreadEvents(ui32 windowIt);
+            template<class T>
+            using TEventQueues = std::vector<THolder<TAutoLockFreeQueue<T>>>;
+
+            void CollectThreadEvents();
+            template<class T>
+            void CollectThreadEvents(TEventQueues<T>& queues);
+
+            template<class T>
+            void AddEvent(size_t index, TEventQueues<T>& queues, const T& event);
 
             void PrintWindowStats(ui32 windowIt);
             void PrintStats(TMaybe<ui32> windowIt) const;
@@ -38,23 +46,25 @@ namespace NYdb {
             size_t WriterCount;
             size_t ReaderCount;
 
-            std::vector<THolder<TAutoLockFreeQueue<TTopicWorkloadStats::WriterEvent>>> WriterEventQueues;
-            std::vector<THolder<TAutoLockFreeQueue<TTopicWorkloadStats::ReaderEvent>>> ReaderEventQueues;
-            std::vector<THolder<TAutoLockFreeQueue<TTopicWorkloadStats::LagEvent>>> LagEventQueues;
+            TEventQueues<TTopicWorkloadStats::WriterEvent> WriterEventQueues;
+            TEventQueues<TTopicWorkloadStats::ReaderEvent> ReaderEventQueues;
+            TEventQueues<TTopicWorkloadStats::LagEvent> LagEventQueues;
 
             bool Quiet;
             bool PrintTimestamp;
 
-            double WindowDurationSec;
-            double TotalDurationSec;
+            double WindowSec;
+            double TotalSec;
             double WarmupSec;
 
-            ui8 Percentile;
+            double Percentile;
 
             std::shared_ptr<std::atomic_bool> ErrorFlag;
 
             THolder<TTopicWorkloadStats> WindowStats;
             TTopicWorkloadStats TotalStats;
+
+            TInstant WarmupTime;
         };
     }
 }

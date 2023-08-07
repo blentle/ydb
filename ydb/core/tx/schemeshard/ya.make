@@ -196,7 +196,6 @@ SRCS(
     schemeshard_tables_storage.cpp
     schemeshard_types.cpp
     schemeshard_types.h
-    schemeshard_ui64id.cpp
     schemeshard_user_attr_limits.h
     schemeshard_utils.cpp
     schemeshard_utils.h
@@ -253,6 +252,7 @@ PEERDIR(
     ydb/core/persqueue/writer
     ydb/core/protos
     ydb/core/scheme
+    ydb/core/statistics
     ydb/core/sys_view/partition_stats
     ydb/core/tablet
     ydb/core/tablet_flat

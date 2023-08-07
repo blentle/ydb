@@ -28,6 +28,7 @@ SRCS(
     ydb_olapstore_ut.cpp
     ydb_monitoring_ut.cpp
     cert_gen.cpp
+    ydb_query_ut.cpp
 )
 
 PEERDIR(
@@ -53,6 +54,7 @@ PEERDIR(
     ydb/public/sdk/cpp/client/ydb_scheme
     ydb/public/sdk/cpp/client/ydb_monitoring
     ydb/services/ydb
+    ydb/services/ydb/ut_helpers
 )
 
 YQL_LAST_ABI_VERSION()

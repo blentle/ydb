@@ -2,7 +2,7 @@
 
 #include <library/cpp/actors/core/actor.h>
 #include <library/cpp/actors/core/actorsystem.h>
-#include <library/cpp/actors/wilson/protos/trace.pb.h>
+#include <opentelemetry/proto/trace/v1/trace.pb.h>
 #include <util/generic/hash.h>
 #include <util/datetime/cputimer.h>
 
@@ -43,8 +43,8 @@ namespace NWilson {
         AUTO_END = 1,
     };
 
-    Y_DECLARE_FLAGS(TFlags, EFlags)
-    Y_DECLARE_OPERATORS_FOR_FLAGS(TFlags)
+    Y_DECLARE_FLAGS(TFlags, EFlags);
+    Y_DECLARE_OPERATORS_FOR_FLAGS(TFlags);
 
     class TSpan {
         struct TData {

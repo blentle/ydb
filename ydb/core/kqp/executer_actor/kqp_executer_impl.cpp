@@ -23,22 +23,27 @@ void TEvKqpExecuter::TEvTxResponse::InitTxResult(const TKqpPhyTxHolder::TConstPt
         const auto& result = tx->GetResults(i);
         const auto& resultMeta = tx->GetTxResultsMeta()[i];
 
+        TMaybe<ui32> queryResultIndex;
+        if (result.HasQueryResultIndex()) {
+            queryResultIndex = result.GetQueryResultIndex();
+        }
+
         TxResults.emplace_back(result.GetIsStream(), resultMeta.MkqlItemType, &resultMeta.ColumnOrder,
-            result.GetQueryResultIndex());
+            queryResultIndex);
     }
 }
 
-void TEvKqpExecuter::TEvTxResponse::TakeResult(ui32 idx, const NYql::NDqProto::TData& rows) {
+void TEvKqpExecuter::TEvTxResponse::TakeResult(ui32 idx, NDq::TDqSerializedBatch&& rows) {
     YQL_ENSURE(idx < TxResults.size());
-    ResultRowsCount += rows.GetRows();
-    ResultRowsBytes += rows.GetRaw().size();
+    ResultRowsCount += rows.RowCount();
+    ResultRowsBytes += rows.Size();
     auto guard = AllocState->TypeEnv.BindAllocator();
     auto& result = TxResults[idx];
-    if (rows.GetRows() || !result.IsStream) {
+    if (rows.RowCount() || !result.IsStream) {
         NDq::TDqDataSerializer dataSerializer(
             AllocState->TypeEnv, AllocState->HolderFactory,
-            static_cast<NDqProto::EDataTransportVersion>(rows.GetTransportVersion()));
-        dataSerializer.Deserialize(rows, result.MkqlItemType, result.Rows);
+            static_cast<NDqProto::EDataTransportVersion>(rows.Proto.GetTransportVersion()));
+        dataSerializer.Deserialize(std::move(rows), result.MkqlItemType, result.Rows);
     }
 }
 
@@ -50,7 +55,7 @@ TEvKqpExecuter::TEvTxResponse::~TEvTxResponse() {
     }
 }
 
-void TEvKqpExecuter::TEvTxResponse::TakeResult(ui32 idx, NKikimr::NMiniKQL::TUnboxedValueVector& rows) {
+void TEvKqpExecuter::TEvTxResponse::TakeResult(ui32 idx, NKikimr::NMiniKQL::TUnboxedValueVector&& rows) {
     YQL_ENSURE(idx < TxResults.size());
     ResultRowsCount += rows.size();
     auto& txResult = TxResults[idx];
@@ -63,7 +68,7 @@ void TEvKqpExecuter::TEvTxResponse::TakeResult(ui32 idx, NKikimr::NMiniKQL::TUnb
         emptyVector.swap(rows);
     }
 
-    serializer.Deserialize(buffer, txResult.MkqlItemType, txResult.Rows);
+    serializer.Deserialize(std::move(buffer), txResult.MkqlItemType, txResult.Rows);
 }
 
 TActorId ReportToRl(ui64 ru, const TString& database, const TString& userToken,
@@ -96,7 +101,7 @@ IActor* CreateKqpExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TSt
 {
     if (request.Transactions.empty()) {
         // commit-only or rollback-only data transaction
-        YQL_ENSURE(request.EraseLocks);
+        YQL_ENSURE(request.LocksOp == ELocksOp::Commit || request.LocksOp == ELocksOp::Rollback);
         return CreateKqpDataExecuter(std::move(request), database, userToken, counters, false, executerRetriesConfig, std::move(asyncIoFactory), creator);
     }
 

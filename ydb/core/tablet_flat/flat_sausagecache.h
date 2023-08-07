@@ -48,12 +48,12 @@ public:
             LoadStateRequestedAsync,
         };
 
-        ui64 LoadState : 2;
-        ui64 Sticky : 1;
-        ui64 SharedPending : 1;
-        ui64 : 4; // padding
-        const ui64 Size : 24;
-        const ui64 Id : 32;
+        ui32 LoadState : 2;
+        ui32 Sticky : 1;
+        ui32 SharedPending : 1;
+        
+        const ui32 Id;
+        const size_t Size;
 
         TInfo* const Info;
         TIntrusivePtr<TPrivatePageCachePinPad> PinPad;
@@ -61,7 +61,7 @@ public:
         TSharedPageRef SharedBody;
         TSharedData PinnedBody;
 
-        TPage(ui32 size, ui32 pageId, TInfo* info);
+        TPage(size_t size, ui32 pageId, TInfo* info);
 
         TPage(const TPage&) = delete;
         TPage(TPage&&) = delete;
@@ -136,8 +136,6 @@ public:
     };
 
 public:
-    TPrivatePageCache(const TCacheCacheConfig &cacheConfig);
-
     void RegisterPageCollection(TIntrusivePtr<TInfo> info);
     TPage::TWaitQueuePtr ForgetPageCollection(TLogoBlobID id);
 
@@ -166,7 +164,6 @@ public:
     void UpdateSharedBody(TInfo *collectionInfo, ui32 pageId, TSharedPageRef shared);
     void DropSharedBody(TInfo *collectionInfo, ui32 pageId);
 
-    void UpdateCacheSize(ui64 cacheSize);
     TPage::TWaitQueuePtr ProvideBlock(NSharedCache::TEvResult::TLoaded&& loaded, TInfo *collectionInfo);
     THashMap<TLogoBlobID, TIntrusivePtr<TInfo>> DetachPrivatePageCache();
     THashMap<TLogoBlobID, THashMap<ui32, TSharedData>> GetPrepareSharedTouched();

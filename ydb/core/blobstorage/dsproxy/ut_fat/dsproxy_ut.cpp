@@ -19,7 +19,7 @@
 
 #include <ydb/core/protos/blobstorage_pdisk_config.pb.h>
 #include <ydb/core/protos/blobstorage_vdisk_config.pb.h>
-#include <ydb/core/protos/services.pb.h>
+#include <ydb/library/services/services.pb.h>
 
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 #include <library/cpp/actors/core/event_local.h>
@@ -454,8 +454,8 @@ protected:
                 VERBOSE_COUT("  response[" << i <<"]: " << StatusToString(response.Status));
                 if (response.Status == NKikimrProto::OK) {
                     //TODO: Process response.Id (should be same logoblobid as in request)
-                    LastResponse.Data[i] = response.Buffer;
-                    VERBOSE_COUT(" shift: " << response.Shift << " data: " << response.Buffer.c_str());
+                    LastResponse.Data[i] = response.Buffer.ConvertToString();
+                    VERBOSE_COUT(" shift: " << response.Shift << " data: " << response.Buffer.ConvertToString());
                 }
             }
         }
@@ -530,8 +530,8 @@ protected:
                     << " Status: " << StatusToString(replyStatus));
 
                 if (replyStatus == NKikimrProto::OK) {
-                    LastResponse.Data[i] = result.GetBuffer();
-                    VERBOSE_COUT(" data: " << result.GetBuffer());
+                    LastResponse.Data[i] = ev->Get()->GetBlobData(result).ConvertToString();
+                    VERBOSE_COUT(" data: " << LastResponse.Data[i]);
                 }
             }
         }
@@ -4106,7 +4106,7 @@ public:
 
         NActors::TActorId loggerActorId = NActors::TActorId(setup->NodeId, "logger");
         TIntrusivePtr<NActors::NLog::TSettings> logSettings(
-            new NActors::NLog::TSettings(loggerActorId, NKikimrServices::LOGGER,
+            new NActors::NLog::TSettings(loggerActorId, NActorsServices::LOGGER,
                 IsVerbose ? NLog::PRI_ERROR : NLog::PRI_CRIT,
                 IsVerbose ? NLog::PRI_ERROR : NLog::PRI_CRIT,
                 0));

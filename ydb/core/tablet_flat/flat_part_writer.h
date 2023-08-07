@@ -328,7 +328,7 @@ namespace NTable {
 
             if (NextSliceFirstRowId == Max<TRowId>()) {
                 NextSliceFirstRowId = Groups[0].Data.GetLastRowId();
-                NextSliceFirstKey = TSerializedCellVec(TSerializedCellVec::Serialize(KeyState.Key));
+                NextSliceFirstKey = TSerializedCellVec(KeyState.Key);
             }
         }
 
@@ -696,7 +696,7 @@ namespace NTable {
                     TCellDefaults object for expanding defaults.
                  */
 
-                Y_VERIFY(dataPage->Records, "Invalid EPage::DataPage blob");
+                Y_VERIFY(dataPage->Count, "Invalid EPage::DataPage blob");
 
                 if (groupId.IsMain()) {
                     Y_VERIFY_DEBUG(NextSliceFirstRowId != Max<TRowId>());
@@ -729,10 +729,10 @@ namespace NTable {
                 if (groupId.IsMain() && (NextSliceForce || Phase == 1 || Current.Bytes - LastSliceBytes >= SliceSize)) {
                     NextSliceForce = false;
 
-                    TRowId lastRowId = dataPage.BaseRow() + dataPage->Records - 1;
-                    InitKey(dataPage->Record(dataPage->Records - 1), groupId);
+                    TRowId lastRowId = dataPage.BaseRow() + dataPage->Count - 1;
+                    InitKey(dataPage->Record(dataPage->Count - 1), groupId);
 
-                    SaveSlice(lastRowId, TSerializedCellVec(TSerializedCellVec::Serialize(Key)));
+                    SaveSlice(lastRowId, TSerializedCellVec(Key));
 
                     if (Phase == 1) {
                         Y_VERIFY_DEBUG(g.Index.CalcSize(Key) == g.LastKeyIndexSize);
@@ -829,14 +829,16 @@ namespace NTable {
             if (!force && out.size() + (page.size() >> 3) > page.size()) {
                 return { }; /* Compressed page is almost the same in size */
             } else {
-                std::copy(page.begin(), page.begin() + 16, out.mutable_begin());
+                auto label = ReadUnaligned<NPage::TLabel>(page.begin());
 
-                auto *label = TDeref<NPage::TLabel>::At(out.mutable_begin(), 0);
-                label->SetSize(out.size());
+                Y_VERIFY(label.IsExtended(), "Expected an extended label");
 
-                *TDeref<ui8>::At(label + 1, 0) = ui8(ECodec::LZ4);
+                auto ext = ReadUnaligned<NPage::TLabelExt>(page.begin() + 8);
 
-                Y_VERIFY(label->Format & 0x8000, "Unexpected label version");
+                ext.Codec = ECodec::LZ4;
+
+                WriteUnaligned<NPage::TLabel>(out.mutable_begin(), NPage::TLabel::Encode(label.Type, label.Format, out.size()));
+                WriteUnaligned<NPage::TLabelExt>(out.mutable_begin() + 8, ext);
 
                 NSan::CheckMemIsInitialized(out.data(), out.size());
 

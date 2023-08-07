@@ -51,10 +51,8 @@ struct TPermissions {
         VIEW_AST = 0x4,
         MANAGE_PUBLIC = 0x8,
         MANAGE_PRIVATE = 0x10,
-        CONNECTIONS_USE = 0x40,
-        BINDINGS_USE = 0x80,
-        QUERY_INVOKE = 0x100,
-        VIEW_QUERY_TEXT = 0x400
+        QUERY_INVOKE = 0x40,
+        VIEW_QUERY_TEXT = 0x80
     };
 
 private:
@@ -166,6 +164,12 @@ struct TEvControlPlaneStorage {
         EvDeleteRateLimiterResourceRequest,
         EvDeleteRateLimiterResourceResponse,
         EvDbRequestResult, // private // internal_events.h
+        EvCreateDatabaseRequest,
+        EvCreateDatabaseResponse,
+        EvDescribeDatabaseRequest,
+        EvDescribeDatabaseResponse,
+        EvModifyDatabaseRequest,
+        EvModifyDatabaseResponse,
         EvEnd,
     };
 
@@ -182,7 +186,8 @@ struct TEvControlPlaneStorage {
                                       const TString& cloudId,
                                       TPermissions permissions,
                                       TMaybe<TQuotaMap> quotas,
-                                      TTenantInfo::TPtr tenantInfo)
+                                      TTenantInfo::TPtr tenantInfo,
+                                      const FederatedQuery::Internal::ComputeDatabaseInternal& computeDatabase)
             : Scope(scope)
             , Request(request)
             , User(user)
@@ -191,6 +196,7 @@ struct TEvControlPlaneStorage {
             , Permissions(permissions)
             , Quotas(std::move(quotas))
             , TenantInfo(tenantInfo)
+            , ComputeDatabase(computeDatabase)
         {
         }
 
@@ -211,6 +217,7 @@ struct TEvControlPlaneStorage {
         TPermissions Permissions;
         TMaybe<TQuotaMap> Quotas;
         TTenantInfo::TPtr TenantInfo;
+        FederatedQuery::Internal::ComputeDatabaseInternal ComputeDatabase;
     };
 
     template<typename TDerived, typename ProtoMessage, ui32 EventType>
@@ -611,6 +618,132 @@ struct TEvControlPlaneStorage {
 
         using TProto = Fq::Private::DeleteRateLimiterResourceResult;
         TProto Record;
+        NYql::TIssues Issues;
+        TDebugInfoPtr DebugInfo;
+    };
+
+    struct TEvCreateDatabaseRequest : NActors::TEventLocal<TEvCreateDatabaseRequest, EvCreateDatabaseRequest> {
+        TEvCreateDatabaseRequest() = default;
+
+        explicit TEvCreateDatabaseRequest(const TString& cloudId, const TString& scope, const FederatedQuery::Internal::ComputeDatabaseInternal& record)
+            : CloudId(cloudId)
+            , Scope(scope)
+            , Record(record)
+        {}
+
+        size_t GetByteSize() const {
+            return sizeof(*this)
+                    + CloudId.Size()
+                    + Scope.Size()
+                    + Record.ByteSizeLong();
+        }
+
+        TString CloudId;
+        TString Scope;
+        FederatedQuery::Internal::ComputeDatabaseInternal Record;
+    };
+
+    struct TEvCreateDatabaseResponse : NActors::TEventLocal<TEvCreateDatabaseResponse, EvCreateDatabaseResponse> {
+        static constexpr bool Auditable = false;
+
+        explicit TEvCreateDatabaseResponse()
+        {}
+
+        explicit TEvCreateDatabaseResponse(const NYql::TIssues& issues)
+            : Issues(issues)
+        {}
+
+        size_t GetByteSize() const {
+            return sizeof(*this)
+                    + GetIssuesByteSize(Issues)
+                    + GetDebugInfoByteSize(DebugInfo);
+        }
+
+        NYql::TIssues Issues;
+        TDebugInfoPtr DebugInfo;
+    };
+
+    struct TEvDescribeDatabaseRequest : NActors::TEventLocal<TEvDescribeDatabaseRequest, EvDescribeDatabaseRequest> {
+
+        TEvDescribeDatabaseRequest() = default;
+
+        explicit TEvDescribeDatabaseRequest(const TString& cloudId, const TString& scope)
+            : CloudId(cloudId)
+            , Scope(scope)
+        {}
+
+        size_t GetByteSize() const {
+            return sizeof(*this)
+                    + Request.ByteSizeLong()
+                    + CloudId.Size()
+                    + Scope.Size();
+        }
+
+        google::protobuf::Empty Request;
+        TString CloudId;
+        TString Scope;
+    };
+
+    struct TEvDescribeDatabaseResponse : NActors::TEventLocal<TEvDescribeDatabaseResponse, EvDescribeDatabaseResponse> {
+        static constexpr bool Auditable = false;
+
+        explicit TEvDescribeDatabaseResponse(const FederatedQuery::Internal::ComputeDatabaseInternal& record)
+            : Record(record)
+        {}
+
+        explicit TEvDescribeDatabaseResponse(
+            const NYql::TIssues& issues
+            )
+            : Issues(issues)
+        {}
+
+        size_t GetByteSize() const {
+            return sizeof(*this)
+                    + Record.ByteSizeLong()
+                    + GetIssuesByteSize(Issues)
+                    + GetDebugInfoByteSize(DebugInfo);
+        }
+
+        FederatedQuery::Internal::ComputeDatabaseInternal Record;
+        NYql::TIssues Issues;
+        TDebugInfoPtr DebugInfo;
+    };
+
+    struct TEvModifyDatabaseRequest : NActors::TEventLocal<TEvModifyDatabaseRequest, EvModifyDatabaseRequest> {
+        TEvModifyDatabaseRequest() = default;
+
+        explicit TEvModifyDatabaseRequest(const TString& cloudId, const TString& scope)
+            : CloudId(cloudId)
+            , Scope(scope)
+        {}
+
+        size_t GetByteSize() const {
+            return sizeof(*this)
+                    + CloudId.Size()
+                    + Scope.Size();
+        }
+
+        TString CloudId;
+        TString Scope;
+        TMaybe<bool> Synchronized;
+    };
+
+    struct TEvModifyDatabaseResponse : NActors::TEventLocal<TEvModifyDatabaseResponse, EvModifyDatabaseResponse> {
+        static constexpr bool Auditable = false;
+
+        explicit TEvModifyDatabaseResponse()
+        {}
+
+        explicit TEvModifyDatabaseResponse(const NYql::TIssues& issues)
+            : Issues(issues)
+        {}
+
+        size_t GetByteSize() const {
+            return sizeof(*this)
+                    + GetIssuesByteSize(Issues)
+                    + GetDebugInfoByteSize(DebugInfo);
+        }
+
         NYql::TIssues Issues;
         TDebugInfoPtr DebugInfo;
     };

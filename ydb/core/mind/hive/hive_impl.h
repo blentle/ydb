@@ -31,6 +31,7 @@
 
 #include <library/cpp/actors/core/interconnect.h>
 #include <library/cpp/actors/core/hfunc.h>
+#include <library/cpp/containers/ring_buffer/ring_buffer.h>
 
 #include <util/generic/queue.h>
 #include <util/random/random.h>
@@ -138,11 +139,13 @@ TString GetTimes(ui64 times, const TString& zero = "0.00%");
 TString GetConditionalGreyString(const TString& str, bool condition);
 TString GetConditionalBoldString(const TString& str, bool condition);
 TString GetConditionalRedString(const TString& str, bool condition);
+TString GetColoredValue(double val, double maxVal);
 TString GetDataCenterName(ui64 dataCenterId);
 TString LongToShortTabletName(const TString& longTabletName);
 TString GetLocationString(const NActors::TNodeLocation& location);
 void MakeTabletTypeSet(std::vector<TTabletTypes::EType>& list);
 bool IsValidTabletType(TTabletTypes::EType type);
+TString GetBalancerProgressText(i32 balancerProgress, EBalancerType balancerType);
 
 class THive : public TActor<THive>, public TTabletExecutedFlat, public THiveSharedSettings {
 public:
@@ -192,6 +195,7 @@ protected:
     friend class TTxMonEvent_ResumeTablet;
     friend class TTxMonEvent_InitMigration;
     friend class TTxMonEvent_QueryMigration;
+    friend class TTxMonEvent_RebalanceFromScratch;
     friend class TTxKillNode;
     friend class TTxLoadEverything;
     friend class TTxRestartTablet;
@@ -217,6 +221,7 @@ protected:
     friend class TTxSwitchDrainOff;
     friend class TTxTabletOwnersReply;
     friend class TTxRequestTabletOwners;
+    friend class TTxUpdateTabletsObject;
 
     friend class TDeleteTabletActor;
 
@@ -274,6 +279,7 @@ protected:
     ITransaction* CreateSwitchDrainOff(TNodeId nodeId, TDrainSettings settings, NKikimrProto::EReplyStatus status, ui32 movements);
     ITransaction* CreateTabletOwnersReply(TEvHive::TEvTabletOwnersReply::TPtr event);
     ITransaction* CreateRequestTabletOwners(TEvHive::TEvRequestTabletOwners::TPtr event);
+    ITransaction* CreateUpdateTabletsObject(TEvHive::TEvUpdateTabletsObject::TPtr event);
 
 public:
     TDomainsView DomainsView;
@@ -314,8 +320,8 @@ protected:
         NKikimrTabletBase::TMetrics Metrics;
         ui64 Counter = 0;
 
-        void IncreaseCount() {
-            ++Counter;
+        void IncreaseCount(ui64 value = 1) {
+            Counter += value;
         }
 
         void DecreaseCount() {
@@ -417,6 +423,22 @@ protected:
     // normalized to be sorted list of unique values
     std::vector<TTabletTypes::EType> BalancerIgnoreTabletTypes; // built from CurrentConfig
 
+    struct TTabletMoveInfo {
+        TInstant Timestamp;
+        TFullTabletId Tablet;
+        TNodeId From;
+        TNodeId To;
+
+        TString ToHTML() {
+            TStringBuilder str;
+            str << "<tr><td>" << Timestamp << "</td><td>" << Tablet
+                << "</td><td>" << From << "&rarr;" << To << "</td><tr>";
+            return str;
+        }
+    };
+
+    TStaticRingBuffer<TTabletMoveInfo, 5> TabletMoveHistory;
+
     // to be removed later
     bool TabletOwnersSynced = false;
     // to be removed later
@@ -443,7 +465,6 @@ protected:
     void Handle(TEvLocal::TEvTabletStatus::TPtr&);
     void Handle(TEvLocal::TEvRegisterNode::TPtr&);
     void Handle(TEvBlobStorage::TEvControllerSelectGroupsResult::TPtr&);
-    void Handle(TEvents::TEvPoisonPill::TPtr&);
     void Handle(TEvTabletPipe::TEvClientConnected::TPtr&);
     void Handle(TEvTabletPipe::TEvClientDestroyed::TPtr&);
     void Handle(TEvTabletPipe::TEvServerConnected::TPtr&);
@@ -504,6 +525,7 @@ protected:
     void Handle(NSysView::TEvSysView::TEvGetTabletsRequest::TPtr& ev);
     void Handle(TEvHive::TEvRequestTabletOwners::TPtr& ev);
     void Handle(TEvHive::TEvTabletOwnersReply::TPtr& ev);
+    void Handle(TEvHive::TEvUpdateTabletsObject::TPtr& ev);
     void Handle(TEvPrivate::TEvProcessIncomingEvent::TPtr& ev);
 
 protected:
@@ -589,6 +611,8 @@ public:
     void UpdateCounterTabletsAlive(i64 tabletsAliveDiff);
     void UpdateCounterBootQueueSize(ui64 bootQueueSize);
     void UpdateCounterEventQueueSize(i64 eventQueueSizeDiff);
+    void UpdateCounterNodesConnected(i64 nodesConnectedDiff);
+    void RecordTabletMove(const TTabletMoveInfo& info);
     bool DomainHasNodes(const TSubDomainKey &domainKey) const;
     void ProcessBootQueue();
     void ProcessWaitQueue();

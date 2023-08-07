@@ -20,6 +20,7 @@ SRCS(
     counters.cpp
     counters.h
     defs.h
+    domain.cpp
     domain.h
     event_filter.cpp
     event_filter.h
@@ -28,20 +29,16 @@ SRCS(
     group_stat.h
     hive.h
     interconnect_channels.h
-    kikimr_issue.cpp
-    kikimr_issue.h
     localdb.cpp
     localdb.h
     location.h
     logoblob.cpp
     logoblob.h
+    memobserver.h
     nameservice.h
     path.cpp
-    pathid.cpp
     pool_stats_collector.cpp
     pool_stats_collector.h
-    quoter.cpp
-    quoter.h
     resource_profile.h
     row_version.cpp
     row_version.h
@@ -79,7 +76,6 @@ SRCS(
     tx_processing.cpp
     user_registry.h
     blobstorage_grouptype.cpp
-    wilson.h
 )
 
 PEERDIR(
@@ -99,20 +95,16 @@ PEERDIR(
     ydb/core/erasure
     ydb/core/protos
     ydb/core/protos/out
+    ydb/core/scheme
     ydb/library/aclib
     ydb/library/login
     ydb/library/pdisk_io
     ydb/library/pretty_types_print/protobuf
+    ydb/library/ydb_issue
     ydb/public/api/protos/out
     ydb/library/yql/minikql
     library/cpp/deprecated/atomic
 )
-
-RESOURCE(
-    ydb/core/base/kikimr_issue.txt kikimr_issue.txt
-)
-
-GENERATE_ENUM_SERIALIZATION(quoter.h)
 
 END()
 

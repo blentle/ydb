@@ -224,7 +224,7 @@ namespace NKikimr {
 
         public:
             static constexpr EActivityType ActorActivityType() {
-                return ACTORLIB_STATS;
+                return EActivityType::ACTORLIB_STATS;
             }
 
             TMemStatsCollector(TDuration interval, std::unique_ptr<IAllocStats> allocStats)
@@ -297,9 +297,11 @@ namespace NKikimr {
         return AllocState->GetAllocatedMemoryEstimate();
     }
 
-    TMemoryUsage TAllocState::GetMemoryUsage() {
+    std::optional<TMemoryUsage> TAllocState::TryGetMemoryUsage() {
         NActors::TProcStat procStat;
-        procStat.Fill(getpid());
+        if (!procStat.Fill(getpid())) {
+            return { };
+        }
         return TMemoryUsage {
             .AnonRss = procStat.AnonRss,
             .CGroupLimit = procStat.CGroupMemLim

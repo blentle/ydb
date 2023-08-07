@@ -133,10 +133,8 @@ void TGetImpl::PrepareReply(NKikimrProto::EReplyStatus status, TString errorReas
                 ui32 size = query.Size ? Min(query.Size, query.Id.BlobSize() - shift) : query.Id.BlobSize() - shift;
 
                 if (!PhantomCheck) {
-                    TString data = TString::Uninitialized(size);
-                    char *dataBuffer = data.Detach();
-                    blobState.Whole.Data.Read(shift, dataBuffer, size);
-                    Decrypt(dataBuffer, dataBuffer, shift, size, query.Id, *Info);
+                    TRope data = blobState.Whole.Data.Read(shift, size);
+                    DecryptInplace(data, 0, shift, size, query.Id, *Info);
                     outResponse.Buffer = std::move(data);
                     Y_VERIFY(outResponse.Buffer, "%s empty response buffer", RequestPrefix.data());
                     ReplyBytes += outResponse.Buffer.size();
@@ -206,10 +204,12 @@ TString TGetImpl::DumpFullState() const {
     str << Endl;
     str << " ReportDetailedPartMap# " << ReportDetailedPartMap;
     str << Endl;
-    str << " ForceBlockTabletId# " << ForceBlockTabletData->Id;
-    str << Endl;
-    str << " ForceBlockTabletGeneration# " << ForceBlockTabletData->Generation;
-    str << Endl;
+    if (ForceBlockTabletData) {
+        str << " ForceBlockTabletId# " << ForceBlockTabletData->Id;
+        str << Endl;
+        str << " ForceBlockTabletGeneration# " << ForceBlockTabletData->Generation;
+        str << Endl;
+    }
 
     str << " ReplyBytes# " << ReplyBytes;
     str << Endl;
@@ -326,6 +326,8 @@ void TGetImpl::PrepareVPuts(TLogContext &logCtx,
                 const TDiskPutRequest &put = requests.PutsToSend[idx];
                 ui64 cookie = TBlobCookie(diskOrderNumber, put.BlobIdx, put.Id.PartId(),
                         VPutRequests);
+                Y_VERIFY_DEBUG(Info->Type.GetErasure() != TBlobStorageGroupType::ErasureMirror3of4 ||
+                    put.Id.PartId() != 3 || put.Buffer.IsEmpty());
                 auto vPut = std::make_unique<TEvBlobStorage::TEvVPut>(put.Id, put.Buffer, vDiskId, true, &cookie,
                     Deadline, Blackboard.PutHandleClass);
                 R_LOG_DEBUG_SX(logCtx, "BPG15", "Send put to orderNumber# " << diskOrderNumber << " idx# " << idx

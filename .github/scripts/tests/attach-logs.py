@@ -17,6 +17,8 @@ fn_shard_part_re = re.compile(r"-\d+$")
 def make_filename(n, *parts):
     fn = f'{"-".join(parts)}'
 
+    fn = re.sub(r"[^\w_-]", "", fn)
+
     if n > 0:
         fn = f"{fn}-{n}"
 
@@ -118,6 +120,7 @@ def attach_to_unittests(ctest_log: CTestLog, unit_path):
             continue
 
         fn = f"_{shard}_not_found.xml"
+        print(f"create {fn}")
         testcases = [create_error_testcase(t.shard.name, t.classname, t.method, t.fn, t.url) for t in extra_logs]
 
         testsuite = create_error_testsuite(testcases)

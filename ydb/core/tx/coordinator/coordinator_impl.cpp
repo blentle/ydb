@@ -1,11 +1,12 @@
 #include "coordinator_impl.h"
+#include "coordinator_state.h"
 #include <ydb/core/engine/minikql/flat_local_tx_factory.h>
 #include <ydb/core/tablet/tablet_counters_protobuf.h>
 #include <ydb/core/tablet/tablet_counters_aggregator.h>
 #include <library/cpp/actors/core/log.h>
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/counters.h>
-#include <ydb/core/protos/services.pb.h>
+#include <ydb/library/services/services.pb.h>
 #include <ydb/core/tx/tx.h>
 
 #include <library/cpp/actors/interconnect/interconnect.h>
@@ -13,7 +14,11 @@
 namespace NKikimr {
 namespace NFlatTxCoordinator {
 
-static constexpr TDuration MaxEmptyPlanDelay = TDuration::Seconds(1);
+// When we need to plan a step far in the future don't schedule timer for more
+// that this timeout. This is useful when coordinator starts on a node with
+// incorrect wallclock time lagging in the past, and we expect eventual
+// intervention where time actually jumps forward.
+static constexpr TDuration MaxPlanTickDelay = TDuration::Seconds(30);
 
 static void SendTransactionStatus(const TActorId &proxy, TEvTxProxy::TEvProposeTransactionStatus::EStatus status,
         ui64 txid, ui64 stepId, const TActorContext &ctx, ui64 tabletId) {
@@ -22,7 +27,7 @@ static void SendTransactionStatus(const TActorId &proxy, TEvTxProxy::TEvProposeT
     ctx.Send(proxy, new TEvTxProxy::TEvProposeTransactionStatus(status, txid, stepId));
 }
 
-static TAutoPtr<TTransactionProposal> MakeTransactionProposal(TEvTxProxy::TEvProposeTransaction::TPtr &ev, ::NMonitoring::TDynamicCounters::TCounterPtr &counter) {
+static TTransactionProposal MakeTransactionProposal(TEvTxProxy::TEvProposeTransaction::TPtr &ev, ::NMonitoring::TDynamicCounters::TCounterPtr &counter) {
     const TActorId &sender = ev->Sender;
     const NKikimrTx::TEvProposeTransaction &record = ev->Get()->Record;
 
@@ -32,11 +37,11 @@ static TAutoPtr<TTransactionProposal> MakeTransactionProposal(TEvTxProxy::TEvPro
     const ui64 maxStep = txrec.HasMaxStep() ? txrec.GetMaxStep() : Max<ui64>();
     const bool ignoreLowDiskSpace = txrec.GetIgnoreLowDiskSpace();
 
-    TAutoPtr<TTransactionProposal> proposal(new TTransactionProposal(sender, txId, minStep, maxStep, ignoreLowDiskSpace));
-    proposal->AffectedSet.resize(txrec.AffectedSetSize());
+    TTransactionProposal proposal(sender, txId, minStep, maxStep, ignoreLowDiskSpace);
+    proposal.AffectedSet.resize(txrec.AffectedSetSize());
     for (ui32 i = 0, e = txrec.AffectedSetSize(); i != e; ++i) {
         const auto &x = txrec.GetAffectedSet(i);
-        auto &s = proposal->AffectedSet[i];
+        auto &s = proposal.AffectedSet[i];
         s.TabletId = x.GetTabletId();
 
         Y_ASSERT(x.GetFlags() > 0 && x.GetFlags() <= 3);
@@ -47,13 +52,12 @@ static TAutoPtr<TTransactionProposal> MakeTransactionProposal(TEvTxProxy::TEvPro
     return proposal;
 }
 
-const ui32 TTxCoordinator::Schema::CurrentVersion = 1;
-
 TTxCoordinator::TTxCoordinator(TTabletStorageInfo *info, const TActorId &tablet)
     : TActor(&TThis::StateInit)
     , TTabletExecutedFlat(info, tablet, new NMiniKQL::TMiniKQLFactory)
     , EnableLeaderLeases(1, 0, 1)
     , MinLeaderLeaseDurationUs(250000, 1000, 5000000)
+    , VolatilePlanLeaseMs(250, 0, 10000)
 #ifdef COORDINATOR_LOG_TO_FILE
     , DebugName(Sprintf("/tmp/coordinator_db_log_%" PRIu64 ".%" PRIi32 ".%" PRIu64 ".gz", TabletID(), getpid(), tablet.LocalId()))
     , DebugLogFile(DebugName)
@@ -65,10 +69,6 @@ TTxCoordinator::TTxCoordinator(TTabletStorageInfo *info, const TActorId &tablet)
     Cerr << "Coordinator LOG will be dumped to " << DebugName << Endl;
 #endif
 
-    Config.PlanAhead = 50;
-    Config.Resolution = 1250;
-    Config.RapidSlotFlushSize = 1000; // todo: something meaningful
-
     MonCounters.CurrentTxInFly = 0;
     TabletCountersPtr.Reset(new TProtobufTabletCounters<
         ESimpleCounters_descriptor,
@@ -79,32 +79,72 @@ TTxCoordinator::TTxCoordinator(TTabletStorageInfo *info, const TActorId &tablet)
     TabletCounters = TabletCountersPtr.Get();
 }
 
-void TTxCoordinator::PlanTx(TAutoPtr<TTransactionProposal> &proposal, const TActorContext &ctx) {
-    proposal->AcceptMoment = ctx.Now();
+TTxCoordinator::~TTxCoordinator() {
+    if (auto* state = std::exchange(CoordinatorStateActor, nullptr)) {
+        state->OnTabletDestroyed();
+    }
+}
+
+void TTxCoordinator::Die(const TActorContext &ctx) {
+    UnsubscribeFromSiblings();
+
+    if (ReadStepSubscriptionManager) {
+        ctx.Send(ReadStepSubscriptionManager, new TEvents::TEvPoison);
+        ReadStepSubscriptionManager = { };
+    }
+
+    if (RestoreProcessingParamsActor) {
+        ctx.Send(RestoreProcessingParamsActor, new TEvents::TEvPoison);
+        RestoreProcessingParamsActor = { };
+    }
+
+    if (RestoreStateActorId) {
+        ctx.Send(RestoreStateActorId, new TEvents::TEvPoison);
+        RestoreStateActorId = { };
+    }
+
+    for (TMediatorsIndex::iterator it = Mediators.begin(), end = Mediators.end(); it != end; ++it) {
+        TMediator &x = it->second;
+        ctx.Send(x.QueueActor, new TEvents::TEvPoisonPill());
+    }
+    Mediators.clear();
+
+    if (MonCounters.CurrentTxInFly && MonCounters.TxInFly)
+        *MonCounters.TxInFly -= MonCounters.CurrentTxInFly;
+
+    if (auto* state = std::exchange(CoordinatorStateActor, nullptr)) {
+        state->OnTabletDead();
+    }
+
+    return TActor::Die(ctx);
+}
+
+void TTxCoordinator::PlanTx(TTransactionProposal &&proposal, const TActorContext &ctx) {
+    proposal.AcceptMoment = ctx.Now();
     MonCounters.PlanTxCalls->Inc();
 
-    if (proposal->MaxStep <= VolatileState.LastPlanned) {
+    if (proposal.MaxStep <= VolatileState.LastPlanned) {
         MonCounters.PlanTxOutdated->Inc();
-        return SendTransactionStatus(proposal->Proxy
+        return SendTransactionStatus(proposal.Proxy
                                      , TEvTxProxy::TEvProposeTransactionStatus::EStatus::StatusOutdated
-                                     , proposal->TxId, 0, ctx, TabletID());
+                                     , proposal.TxId, 0, ctx, TabletID());
     }
 
     if (Stopping) {
-        return SendTransactionStatus(proposal->Proxy,
+        return SendTransactionStatus(proposal.Proxy,
                 TEvTxProxy::TEvProposeTransactionStatus::EStatus::StatusRestarting,
-                proposal->TxId, 0, ctx, TabletID());
+                proposal.TxId, 0, ctx, TabletID());
     }
 
-    bool forRapidExecution = (proposal->MinStep <= VolatileState.LastPlanned);
+    bool forRapidExecution = (proposal.MinStep <= VolatileState.LastPlanned);
     ui64 planStep = 0;
 
     // cycle for flow control
-    for (ui64 cstep = (proposal->MinStep + Config.Resolution - 1) / Config.Resolution * Config.Resolution; /*no-op*/;cstep += Config.Resolution) {
-        if (cstep >= proposal->MaxStep) {
+    for (ui64 cstep = (proposal.MinStep + Config.Resolution - 1) / Config.Resolution * Config.Resolution; /*no-op*/;cstep += Config.Resolution) {
+        if (cstep >= proposal.MaxStep) {
             MonCounters.PlanTxOutdated->Inc();
-            return SendTransactionStatus(proposal->Proxy,
-                TEvTxProxy::TEvProposeTransactionStatus::EStatus::StatusOutdated, proposal->TxId, 0, ctx, TabletID());
+            return SendTransactionStatus(proposal.Proxy,
+                TEvTxProxy::TEvProposeTransactionStatus::EStatus::StatusOutdated, proposal.TxId, 0, ctx, TabletID());
         }
 
         if (forRapidExecution) {
@@ -119,84 +159,202 @@ void TTxCoordinator::PlanTx(TAutoPtr<TTransactionProposal> &proposal, const TAct
     }
 
     MonCounters.PlanTxAccepted->Inc();
-    SendTransactionStatus(proposal->Proxy, TEvTxProxy::TEvProposeTransactionStatus::EStatus::StatusAccepted,
-        proposal->TxId, planStep, ctx, TabletID());
+    SendTransactionStatus(proposal.Proxy, TEvTxProxy::TEvProposeTransactionStatus::EStatus::StatusAccepted,
+        proposal.TxId, planStep, ctx, TabletID());
 
     if (forRapidExecution) {
         TQueueType::TSlot &rapidSlot = VolatileState.Queue.RapidSlot;
-        rapidSlot.Queue->Push(proposal.Release());
-        ++rapidSlot.QueueSize;
+        rapidSlot.push_back(std::move(proposal));
 
-        if (rapidSlot.QueueSize >= Config.RapidSlotFlushSize && !VolatileState.Queue.RapidFreeze) {
-            TVector<TQueueType::TSlot> slots;
-            slots.push_back(rapidSlot);
-            rapidSlot = TQueueType::TSlot();
-            VolatileState.LastPlanned = planStep;
-            VolatileState.Queue.RapidFreeze = true;
-
-            NotifyUpdatedLastStep();
-            Execute(CreateTxPlanStep(planStep, slots, true), ctx);
+        if (rapidSlot.size() >= Config.RapidSlotFlushSize) {
+            SchedulePlanTickExact(planStep);
         }
+
+        // We may be sleeping at reduced resolution, try to wake up sooner
+        SchedulePlanTickAligned(planStep);
     } else {
         TQueueType::TSlot &planSlot = VolatileState.Queue.LowSlot(planStep);
-        planSlot.Queue->Push(proposal.Release());
-        ++planSlot.QueueSize;
-    }
+        planSlot.push_back(std::move(proposal));
 
+        // We may be sleeping at reduced resolution, try to wake up sooner
+        SchedulePlanTickExact(planStep);
+    }
 }
 
 void TTxCoordinator::Handle(TEvTxProxy::TEvProposeTransaction::TPtr &ev, const TActorContext &ctx) {
-    TAutoPtr<TTransactionProposal> proposal = MakeTransactionProposal(ev, MonCounters.TxIn);
-    LOG_DEBUG_S(ctx, NKikimrServices::TX_COORDINATOR, "tablet# " << TabletID() << " txid# " << proposal->TxId
+    TTransactionProposal proposal = MakeTransactionProposal(ev, MonCounters.TxIn);
+    LOG_DEBUG_S(ctx, NKikimrServices::TX_COORDINATOR, "tablet# " << TabletID() << " txid# " << proposal.TxId
         << " HANDLE EvProposeTransaction marker# C0");
-    PlanTx(proposal, ctx);
+    PlanTx(std::move(proposal), ctx);
 }
 
 void TTxCoordinator::HandleEnqueue(TEvTxProxy::TEvProposeTransaction::TPtr &ev, const TActorContext &ctx) {
     TryInitMonCounters(ctx);
 
-    TAutoPtr<TTransactionProposal> proposal = MakeTransactionProposal(ev, MonCounters.TxIn);
-    LOG_DEBUG_S(ctx, NKikimrServices::TX_COORDINATOR, "tablet# " << TabletID() << " txid# " << proposal->TxId
+    TTransactionProposal proposal = MakeTransactionProposal(ev, MonCounters.TxIn);
+    LOG_DEBUG_S(ctx, NKikimrServices::TX_COORDINATOR, "tablet# " << TabletID() << " txid# " << proposal.TxId
         << " HANDLE Enqueue EvProposeTransaction");
 
     if (Y_UNLIKELY(Stopping)) {
-        return SendTransactionStatus(proposal->Proxy,
+        return SendTransactionStatus(proposal.Proxy,
                 TEvTxProxy::TEvProposeTransactionStatus::EStatus::StatusRestarting,
-                proposal->TxId, 0, ctx, TabletID());
+                proposal.TxId, 0, ctx, TabletID());
     }
 
     if (!VolatileState.Queue.Unsorted)
-        VolatileState.Queue.Unsorted.Reset(new TQueueType::TQ());
+        VolatileState.Queue.Unsorted.emplace();
 
-    VolatileState.Queue.Unsorted->Push(proposal.Release());
+    VolatileState.Queue.Unsorted->push_back(std::move(proposal));
+}
+
+bool TTxCoordinator::AllowReducedPlanResolution() const {
+    return (
+        !VolatileState.Queue.Unsorted &&
+        VolatileState.LastEmptyStep &&
+        VolatileState.LastEmptyStep == VolatileState.LastPlanned &&
+        VolatileState.LastAcquired < VolatileState.LastEmptyStep &&
+        Config.Coordinators.size() > 0 &&
+        SiblingsConfirmed == Siblings.size());
+}
+
+void TTxCoordinator::SchedulePlanTick() {
+    const ui64 resolution = Config.Resolution;
+    const TInstant now = TAppData::TimeProvider->Now();
+    const TMonotonic monotonic = AppData()->MonotonicTimeProvider->Now();
+
+    // Step corresponding to current time
+    ui64 current = now.MilliSeconds();
+
+    // Next minimum step we would like to have
+    ui64 next = (VolatileState.LastPlanned + 1 + resolution - 1) / resolution * resolution;
+
+    if (AllowReducedPlanResolution()) {
+        // We want to tick with reduced resolution when all siblings are confirmed
+        ui64 reduced = (VolatileState.LastPlanned + 1 + Config.ReducedResolution - 1) / Config.ReducedResolution * Config.ReducedResolution;
+        // Include transactions waiting in the queue, so we don't sleep for seconds when the next tx is in 10ms
+        ui64 minWaiting = (VolatileState.Queue.MinLowSlot() + resolution - 1) / resolution * resolution;
+        if (minWaiting && minWaiting < reduced) {
+            reduced = minWaiting;
+        }
+        if (next < reduced) {
+            next = reduced;
+        }
+    }
+
+    if (!PendingSiblingSteps.empty()) {
+        auto it = PendingSiblingSteps.begin();
+        if (*it < next) {
+            next = *it;
+        }
+    }
+
+    // Adjust to the closest step that snaps to the resolution grid
+    if (next < current) {
+        current = current / resolution * resolution;
+        if (next < current) {
+            next = current;
+        }
+    }
+
+    // Avoid scheduling more events if another is already pending
+    if (!PendingPlanTicks.empty() && PendingPlanTicks.front() <= next) {
+        return;
+    }
+
+    // Calculate a delay until we can plan the desired next step
+    TDuration delay = Min(TInstant::MilliSeconds(next) - now, MaxPlanTickDelay);
+
+    // Schedule using an absolute deadline so we don't wake up early due to stale timer
+    LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_COORDINATOR,
+        "Coordinator# " << TabletID() << " scheduling step " << next << " in " << delay << " at " << (monotonic + delay));
+    if (delay > TDuration::Zero()) {
+        Schedule(monotonic + delay, new TEvPrivate::TEvPlanTick(next));
+    } else {
+        Send(SelfId(), new TEvPrivate::TEvPlanTick(next));
+    }
+    PendingPlanTicks.push_front(next);
+}
+
+void TTxCoordinator::SchedulePlanTickExact(ui64 next) {
+    if (next <= VolatileState.LastPlanned) {
+        return;
+    }
+
+    if (!PendingPlanTicks.empty() && PendingPlanTicks.front() <= next) {
+        return;
+    }
+
+    const TInstant now = TAppData::TimeProvider->Now();
+    const TMonotonic monotonic = AppData()->MonotonicTimeProvider->Now();
+
+    TDuration delay = Min(TInstant::MilliSeconds(next) - now, MaxPlanTickDelay);
+
+    LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_COORDINATOR,
+        "Coordinator# " << TabletID() << " scheduling step " << next << " in " << delay << " at " << (monotonic + delay));
+    if (delay > TDuration::Zero()) {
+        Schedule(monotonic + delay, new TEvPrivate::TEvPlanTick(next));
+    } else {
+        Send(SelfId(), new TEvPrivate::TEvPlanTick(next));
+    }
+    PendingPlanTicks.push_front(next);
+}
+
+void TTxCoordinator::SchedulePlanTickAligned(ui64 next) {
+    if (next <= VolatileState.LastPlanned) {
+        return;
+    }
+
+    if (!PendingPlanTicks.empty() && PendingPlanTicks.front() <= next) {
+        return;
+    }
+
+    const ui64 resolution = Config.Resolution;
+    SchedulePlanTickExact((next + resolution - 1) / resolution * resolution);
 }
 
 void TTxCoordinator::Handle(TEvPrivate::TEvPlanTick::TPtr &ev, const TActorContext &ctx) {
-    Y_UNUSED(ev);
     //LOG_DEBUG_S(ctx, NKikimrServices::TX_COORDINATOR, "tablet# " << TabletID() << " HANDLE EvPlanTick LastPlanned " << VolatileState.LastPlanned);
 
-    if (VolatileState.Queue.Unsorted) {
-        while (TAutoPtr<TTransactionProposal> x = VolatileState.Queue.Unsorted->Pop())
-            PlanTx(x, ctx);
-        VolatileState.Queue.Unsorted.Destroy();
+    ui64 next = ev->Get()->Step;
+    while (!PendingPlanTicks.empty() && PendingPlanTicks.front() <= next) {
+        PendingPlanTicks.pop_front();
     }
 
-    // do work
+    if (VolatileState.Queue.Unsorted) {
+        while (!VolatileState.Queue.Unsorted->empty()) {
+            auto& proposal = VolatileState.Queue.Unsorted->front();
+            PlanTx(std::move(proposal), ctx);
+            VolatileState.Queue.Unsorted->pop_front();
+        }
+        VolatileState.Queue.Unsorted.reset();
+    }
+
     const ui64 resolution = Config.Resolution;
-    const ui64 now = TAppData::TimeProvider->Now().MilliSeconds();
-    const ui64 dirty = now + Config.PlanAhead;
-    const ui64 next = (dirty + resolution - 1) / resolution * resolution;
+    const TInstant now = TAppData::TimeProvider->Now();
+
+    // Check the step corresponding to current time
+    ui64 current = now.MilliSeconds();
+    if (current < next) {
+        // We cannot plan this yet, schedule some other step
+        return SchedulePlanTick();
+    }
+
+    // Snap to grid and prefer planning current time instead of some past
+    current = current / resolution * resolution;
+    if (next < current) {
+        next = current;
+    }
 
     if (next <= VolatileState.LastPlanned) {
-        return SchedulePlanTick(ctx);
+        // This step has already been planned, schedule the next time
+        return SchedulePlanTick();
     }
 
-    TVector<TQueueType::TSlot> slots;
-    slots.reserve(1000);
+    std::deque<TQueueType::TSlot> slots;
 
-    if (VolatileState.Queue.RapidSlot.QueueSize) {
-        slots.push_back(VolatileState.Queue.RapidSlot);
-        VolatileState.Queue.RapidSlot = TQueueType::TSlot();
+    if (!VolatileState.Queue.RapidSlot.empty()) {
+        slots.push_back(std::move(VolatileState.Queue.RapidSlot));
+        VolatileState.Queue.RapidSlot.clear();
     }
 
     while (!VolatileState.Queue.Low.empty()) {
@@ -204,73 +362,59 @@ void TTxCoordinator::Handle(TEvPrivate::TEvPlanTick::TPtr &ev, const TActorConte
         if (frontIt->first > next)
             break;
 
-        if (frontIt->second.QueueSize)
-            slots.push_back(frontIt->second);
+        if (!frontIt->second.empty()) {
+            slots.push_back(std::move(frontIt->second));
+        }
 
         VolatileState.Queue.Low.erase(frontIt);
     }
 
-    VolatileState.LastPlanned = next;
-    SchedulePlanTick(ctx);
-
-    // Check if we have an empty step
     if (slots.empty()) {
-        auto monotonic = ctx.Monotonic();
-        if (VolatileState.LastEmptyPlanAt &&
-            VolatileState.LastAcquired < VolatileState.LastEmptyStep &&
-            Config.Coordinators.size() == 1 &&
-            (monotonic - VolatileState.LastEmptyPlanAt) < MaxEmptyPlanDelay)
-        {
-            // Avoid empty plan steps more than once a second for a lonely coordinator
-            return;
-        }
         VolatileState.LastEmptyStep = next;
-        VolatileState.LastEmptyPlanAt = monotonic;
-    } else {
-        VolatileState.LastEmptyStep = 0;
-        VolatileState.LastEmptyPlanAt = { };
     }
+    VolatileState.LastPlanned = next;
 
     NotifyUpdatedLastStep();
-    Execute(CreateTxPlanStep(next, slots, false), ctx);
+    Execute(CreateTxPlanStep(next, std::move(slots)), ctx);
+    SchedulePlanTick();
 }
 
-void TTxCoordinator::Handle(TEvTxCoordinator::TEvMediatorQueueConfirmations::TPtr &ev, const TActorContext &ctx) {
-    TEvTxCoordinator::TEvMediatorQueueConfirmations *msg = ev->Get();
+void TTxCoordinator::Handle(TEvMediatorQueueConfirmations::TPtr &ev, const TActorContext &ctx) {
+    TEvMediatorQueueConfirmations *msg = ev->Get();
     LOG_DEBUG_S(ctx, NKikimrServices::TX_COORDINATOR, "tablet# " << TabletID()
         << " HANDLE EvMediatorQueueConfirmations MediatorId# " << msg->Confirmations->MediatorId);
-    Execute(CreateTxMediatorConfirmations(msg->Confirmations), ctx);
+    Execute(CreateTxMediatorConfirmations(std::move(msg->Confirmations)), ctx);
 }
 
-void TTxCoordinator::Handle(TEvTxCoordinator::TEvMediatorQueueStop::TPtr &ev, const TActorContext &ctx) {
-    const TEvTxCoordinator::TEvMediatorQueueStop *msg = ev->Get();
+void TTxCoordinator::Handle(TEvMediatorQueueStop::TPtr &ev, const TActorContext &ctx) {
+    const TEvMediatorQueueStop *msg = ev->Get();
     LOG_DEBUG_S(ctx, NKikimrServices::TX_COORDINATOR, "tablet# " << TabletID()
         << " HANDLE EvMediatorQueueStop MediatorId# " << msg->MediatorId);
     TMediator &mediator = Mediator(msg->MediatorId, ctx);
-    mediator.PushUpdates = false;
-    mediator.GenCookie = Max<ui64>();
-    mediator.Queue.Destroy();
+    mediator.Active = false;
 }
 
-void TTxCoordinator::Handle(TEvTxCoordinator::TEvMediatorQueueRestart::TPtr &ev, const TActorContext &ctx) {
-    const TEvTxCoordinator::TEvMediatorQueueRestart *msg = ev->Get();
+void TTxCoordinator::Handle(TEvMediatorQueueRestart::TPtr &ev, const TActorContext &ctx) {
+    const TEvMediatorQueueRestart *msg = ev->Get();
     LOG_NOTICE_S(ctx, NKikimrServices::TX_COORDINATOR, "tablet# " << TabletID()
         << " HANDLE EvMediatorQueueRestart MediatorId# " << msg->MediatorId);
 
     TMediator &mediator = Mediator(msg->MediatorId, ctx);
-    mediator.PushUpdates = false;
-    mediator.GenCookie = msg->GenCookie;
-    mediator.Queue.Reset(new TMediator::TStepQueue());
-    Execute(CreateTxRestartMediatorQueue(msg->MediatorId, msg->GenCookie), ctx);
+    mediator.Active = true;
+    SendMediatorStep(mediator, ctx);
 }
 
-void TTxCoordinator::Handle(TEvTxCoordinator::TEvCoordinatorConfirmPlan::TPtr &ev, const TActorContext &ctx) {
-    TAutoPtr<TCoordinatorStepConfirmations> confirmations = ev->Get()->Confirmations;
-    while (TAutoPtr<TCoordinatorStepConfirmations::TEntry> x = confirmations->Queue->Pop()) {
-        LOG_DEBUG_S(ctx, NKikimrServices::TX_COORDINATOR, "tablet# " << TabletID() << " txid# " << x->TxId
-            << " stepId# " << x->Step << " Status# " << x->Status
-            << " SEND EvProposeTransactionStatus to# " << x->ProxyId.ToString() << " Proxy");
-        ctx.Send(x->ProxyId, new TEvTxProxy::TEvProposeTransactionStatus(x->Status, x->TxId, x->Step));
+void TTxCoordinator::SendStepConfirmations(TCoordinatorStepConfirmations &confirmations, const TActorContext &ctx) {
+    while (!confirmations.Queue.empty()) {
+        auto &x = confirmations.Queue.front();
+        LOG_DEBUG_S(ctx, NKikimrServices::TX_COORDINATOR, "tablet# " << TabletID() << " txid# " << x.TxId
+            << " stepId# " << x.Step << " Status# " << x.Status
+            << " SEND EvProposeTransactionStatus to# " << x.ProxyId.ToString() << " Proxy");
+        ctx.Send(x.ProxyId, new TEvTxProxy::TEvProposeTransactionStatus(x.Status, x.TxId, x.Step));
+        if (VolatileState.LastConfirmedStep < x.Step) {
+            VolatileState.LastConfirmedStep = x.Step;
+        }
+        confirmations.Queue.pop_front();
     }
 }
 
@@ -304,11 +448,6 @@ void TTxCoordinator::Handle(TEvSubDomain::TEvConfigure::TPtr &ev, const TActorCo
                 << " HANDLE TEvConfigure Version# " << record.GetVersion());
 
     DoConfiguration(*ev->Get(), ctx, ev->Sender);
-}
-
-void TTxCoordinator::Handle(TEvents::TEvPoisonPill::TPtr&, const TActorContext& ctx) {
-    Become(&TThis::StateBroken);
-    ctx.Send(Tablet(), new TEvents::TEvPoisonPill);
 }
 
 void TTxCoordinator::Handle(TEvTabletPipe::TEvServerConnected::TPtr& ev, const TActorContext&) {
@@ -348,6 +487,7 @@ void TTxCoordinator::IcbRegister() {
     if (!IcbRegistered) {
         AppData()->Icb->RegisterSharedControl(EnableLeaderLeases, "CoordinatorControls.EnableLeaderLeases");
         AppData()->Icb->RegisterSharedControl(MinLeaderLeaseDurationUs, "CoordinatorControls.MinLeaderLeaseDurationUs");
+        AppData()->Icb->RegisterSharedControl(VolatilePlanLeaseMs, "CoordinatorControls.VolatilePlanLeaseMs");
         IcbRegistered = true;
     }
 }
@@ -401,30 +541,40 @@ void TTxCoordinator::TryInitMonCounters(const TActorContext &ctx) {
 }
 
 void TTxCoordinator::SendMediatorStep(TMediator &mediator, const TActorContext &ctx) {
-    while (TMediatorStep *step = mediator.Queue->Head()) {
-        if (!step->Confirmed)
-            return;
+    if (!mediator.Active) {
+        // We don't want to update LastSentStep when mediators are not empty
+        return;
+    }
 
-        TAutoPtr<TMediatorStep> extracted = mediator.Queue->Pop();
-        for (const auto& tx: extracted->Transactions) {
+    std::unique_ptr<TEvMediatorQueueStep> msg;
+    while (!mediator.Queue.empty()) {
+        auto it = mediator.Queue.begin();
+        if (!it->Confirmed) {
+            break;
+        }
+
+        for (const auto& tx: it->Transactions) {
             LOG_DEBUG_S(ctx, NKikimrServices::TX_COORDINATOR, "Send from# " << TabletID()
-                << " to mediator# " << extracted->MediatorId << ", step# " << extracted->Step
+                << " to mediator# " << it->MediatorId << ", step# " << it->Step
                 << ", txid# " << tx.TxId << " marker# C2");
         }
 
-        if (VolatileState.LastSentStep < extracted->Step) {
-            VolatileState.LastSentStep = extracted->Step;
+        if (VolatileState.LastSentStep < it->Step) {
+            VolatileState.LastSentStep = it->Step;
             if (ReadStepSubscriptionManager) {
                 ctx.Send(ReadStepSubscriptionManager, new TEvPrivate::TEvReadStepUpdated(VolatileState.LastSentStep));
             }
         }
-        ctx.Send(mediator.QueueActor, new TEvTxCoordinator::TEvMediatorQueueStep(mediator.GenCookie, extracted));
-    }
-}
 
-void TTxCoordinator::SchedulePlanTick(const TActorContext &ctx) {
-    const ui64 planResolution = Config.Resolution;
-    ctx.Schedule(TDuration::MilliSeconds(planResolution), new TEvPrivate::TEvPlanTick());
+        if (!msg) {
+            msg.reset(new TEvMediatorQueueStep());
+        }
+        msg->SpliceStep(mediator.Queue, it);
+    }
+
+    if (msg) {
+        ctx.Send(mediator.QueueActor, msg.release());
+    }
 }
 
 bool TTxCoordinator::OnRenderAppHtmlPage(NMon::TEvRemoteHttpInfo::TPtr ev, const TActorContext &ctx) {
@@ -468,22 +618,24 @@ void TTxCoordinator::OnTabletStop(TEvTablet::TEvTabletStop::TPtr &ev, const TAct
 
 void TTxCoordinator::OnStopGuardStarting(const TActorContext &ctx) {
     auto processQueue = [&](auto &queue) {
-        while (TAutoPtr<TTransactionProposal> proposal = queue.Pop()) {
-            SendTransactionStatus(proposal->Proxy,
+        while (!queue.empty()) {
+            auto& proposal = queue.front();
+            SendTransactionStatus(proposal.Proxy,
                     TEvTxProxy::TEvProposeTransactionStatus::EStatus::StatusRestarting,
-                    proposal->TxId, 0, ctx, TabletID());
+                    proposal.TxId, 0, ctx, TabletID());
+            queue.pop_front();
         }
     };
 
     if (VolatileState.Queue.Unsorted) {
         processQueue(*VolatileState.Queue.Unsorted);
-        VolatileState.Queue.Unsorted.Destroy();
+        VolatileState.Queue.Unsorted.reset();
     }
 
-    processQueue(*VolatileState.Queue.RapidSlot.Queue);
+    processQueue(VolatileState.Queue.RapidSlot);
 
     for (auto &kv : VolatileState.Queue.Low) {
-        processQueue(*kv.second.Queue);
+        processQueue(kv.second);
     }
     VolatileState.Queue.Low.clear();
 }
@@ -493,10 +645,5 @@ void TTxCoordinator::OnStopGuardComplete(const TActorContext &ctx) {
     ctx.Send(Tablet(), new TEvTablet::TEvTabletStopped());
 }
 
-}
-
-IActor* CreateFlatTxCoordinator(const TActorId &tablet, TTabletStorageInfo *info) {
-    return new NFlatTxCoordinator::TTxCoordinator(info, tablet);
-}
-
-}
+} // namespace NFlatTxCoordinator
+} // namespace NKikimr

@@ -1,5 +1,6 @@
 #include <ydb/core/tx/schemeshard/ut_helpers/helpers.h>
 #include <ydb/core/tx/columnshard/columnshard.h>
+#include <ydb/core/tx/columnshard/columnshard_ut_common.h>
 #include <ydb/core/formats/arrow/arrow_helpers.h>
 #include <ydb/core/formats/arrow/arrow_batch_builder.h>
 
@@ -41,100 +42,6 @@ static const TVector<std::pair<TString, TTypeInfo>> defaultYdbSchema = {
     {"timestamp", TTypeInfo(NTypeIds::Timestamp) },
     {"data", TTypeInfo(NTypeIds::Utf8) }
 };
-
-TString MakeTestBlob(std::pair<ui64, ui64> range) {
-    TString err;
-    NArrow::TArrowBatchBuilder batchBuilder(arrow::Compression::LZ4_FRAME);
-    batchBuilder.Start(defaultYdbSchema, 0, 0, err);
-
-    TString str;
-    TVector<TTypeInfo> types = {
-        TTypeInfo(NTypeIds::Timestamp),
-        TTypeInfo(NTypeIds::Utf8)
-    };
-
-    for (size_t i = range.first; i < range.second; ++i) {
-        str = ToString(i);
-
-        TVector<TCell> cells;
-        cells.push_back(TCell::Make<ui64>(i));
-        cells.push_back(TCell(str.data(), str.size()));
-
-        NKikimr::TDbTupleRef unused;
-        batchBuilder.AddRow(unused, NKikimr::TDbTupleRef(types.data(), cells.data(), 2));
-    }
-
-    auto batch = batchBuilder.FlushBatch(true);
-    UNIT_ASSERT(batch);
-    auto status = batch->ValidateFull();
-    UNIT_ASSERT(status.ok());
-
-    return batchBuilder.Finish();
-}
-
-static constexpr ui64 txInitiator = 42; // 0 means LongTx, we need another value here
-
-void WriteData(TTestBasicRuntime& runtime, TActorId sender, ui64 tabletId, ui64 pathId, ui64 writeId, TString data) {
-    const TString dedupId = ToString(writeId);
-
-    auto evWrite = std::make_unique<TEvColumnShard::TEvWrite>(sender, txInitiator, writeId, pathId, dedupId, data, 1);
-
-    ForwardToTablet(runtime, tabletId, sender, evWrite.release());
-    TAutoPtr<IEventHandle> handle;
-    auto event = runtime.GrabEdgeEvent<TEvColumnShard::TEvWriteResult>(handle);
-    UNIT_ASSERT(event);
-
-    auto& resWrite = Proto(event);
-    UNIT_ASSERT_EQUAL(resWrite.GetOrigin(), tabletId);
-    UNIT_ASSERT_EQUAL(resWrite.GetTxInitiator(), txInitiator);
-    UNIT_ASSERT_EQUAL(resWrite.GetStatus(), NKikimrTxColumnShard::EResultStatus::SUCCESS);
-}
-
-void ProposeCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 tabletId, ui64 txId, const TVector<ui64>& writeIds) {
-    NKikimrTxColumnShard::ETransactionKind txKind = NKikimrTxColumnShard::ETransactionKind::TX_KIND_COMMIT;
-    TString txBody;
-    {
-        NKikimrTxColumnShard::TCommitTxBody proto;
-        proto.SetTxInitiator(txInitiator);
-        for (ui64 id : writeIds) {
-            proto.AddWriteIds(id);
-        }
-
-        Y_PROTOBUF_SUPPRESS_NODISCARD proto.SerializeToString(&txBody);
-    }
-
-    ForwardToTablet(runtime, tabletId, sender,
-                    new TEvColumnShard::TEvProposeTransaction(txKind, sender, txId, txBody));
-    TAutoPtr<IEventHandle> handle;
-    auto event = runtime.GrabEdgeEvent<TEvColumnShard::TEvProposeTransactionResult>(handle);
-    UNIT_ASSERT(event);
-
-    auto& res = Proto(event);
-    UNIT_ASSERT_EQUAL(res.GetTxKind(), txKind);
-    UNIT_ASSERT_EQUAL(res.GetTxId(), txId);
-    UNIT_ASSERT_EQUAL(res.GetStatus(), NKikimrTxColumnShard::EResultStatus::PREPARED);
-}
-
-void PlanCommit(TTestBasicRuntime& runtime, TActorId& sender, ui64 tabletId, ui64 planStep, const TSet<ui64>& txIds) {
-    auto plan = std::make_unique<TEvTxProcessing::TEvPlanStep>(planStep, txInitiator, tabletId);
-    for (ui64 txId : txIds) {
-        auto tx = plan->Record.AddTransactions();
-        tx->SetTxId(txId);
-        ActorIdToProto(sender, tx->MutableAckTo());
-    }
-
-    ForwardToTablet(runtime, tabletId, sender, plan.release());
-    TAutoPtr<IEventHandle> handle;
-
-    for (ui32 i = 0; i < txIds.size(); ++i) {
-        auto event = runtime.GrabEdgeEvent<TEvColumnShard::TEvProposeTransactionResult>(handle);
-        UNIT_ASSERT(event);
-
-        auto& res = Proto(event);
-        UNIT_ASSERT(txIds.count(res.GetTxId()));
-        UNIT_ASSERT_EQUAL(res.GetStatus(), NKikimrTxColumnShard::EResultStatus::SUCCESS);
-    }
-}
 
 }}
 
@@ -211,6 +118,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TString tableSchema = R"(
             Name: "ColumnTable"
+            ColumnShardCount: 1
         )";
 
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore/MyDir", tableSchema);
@@ -223,6 +131,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
         // Missing column from schema preset
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore/MyDir", R"(
             Name: "ColumnTableMissingDataColumn"
+            ColumnShardCount: 1
             Schema {
                 Columns { Name: "timestamp" Type: "Timestamp" }
                 KeyColumnNames: "timestamp"
@@ -233,6 +142,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
         // Extra column not in schema preset
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore/MyDir", R"(
             Name: "ColumnTableExtraColumn"
+            ColumnShardCount: 1
             Schema {
                 Columns { Name: "timestamp" Type: "Timestamp" }
                 Columns { Name: "data" Type: "Utf8" }
@@ -245,6 +155,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
         // Different column order
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore/MyDir", R"(
             Name: "ColumnTableDifferentColumnOrder"
+            ColumnShardCount: 1
             Schema {
                 Columns { Name: "data" Type: "Utf8" }
                 Columns { Name: "timestamp" Type: "Timestamp" }
@@ -256,6 +167,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
         // Extra key column
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore/MyDir", R"(
             Name: "ColumnTableExtraKeyColumn"
+            ColumnShardCount: 1
             Schema {
                 Columns { Name: "timestamp" Type: "Timestamp" }
                 Columns { Name: "data" Type: "Utf8" }
@@ -268,6 +180,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
         // Unknown key column
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore/MyDir", R"(
             Name: "ColumnTableUnknownKeyColumn"
+            ColumnShardCount: 1
             Schema {
                 Columns { Name: "timestamp" Type: "Timestamp" }
                 Columns { Name: "data" Type: "Utf8" }
@@ -279,6 +192,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
         // Different data column type
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore/MyDir", R"(
             Name: "ColumnTableDataColumnType"
+            ColumnShardCount: 1
             Schema {
                 Columns { Name: "timestamp" Type: "Timestamp" }
                 Columns { Name: "data" Type: "String" }
@@ -290,6 +204,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
         // Repeating preset schema should succeed
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore/MyDir", R"(
             Name: "ColumnTableExplicitSchema"
+            ColumnShardCount: 1
             Schema {
                 Columns { Name: "timestamp" Type: "Timestamp" }
                 Columns { Name: "data" Type: "Utf8" }
@@ -302,6 +217,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
         // Creating table with directories should succeed
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore", R"(
             Name: "DirA/DirB/NestedTable"
+            ColumnShardCount: 1
         )");
         env.TestWaitNotification(runtime, txId);
 
@@ -312,6 +228,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
         // Additional storage tier in schema
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore/MyDir", R"(
             Name: "TableWithTiers"
+            ColumnShardCount: 1
             Schema {
                 Columns { Name: "timestamp" Type: "Timestamp" }
                 Columns { Name: "data" Type: "Utf8" }
@@ -333,6 +250,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore", R"(
             Name: "ColumnTable"
+            ColumnShardCount: 1
             SchemaPresetName: "default"
         )");
         env.TestWaitNotification(runtime, txId);
@@ -362,6 +280,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TString tableSchema = R"(
             Name: "ColumnTable"
+            ColumnShardCount: 1
         )";
 
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore/MyDir", tableSchema);
@@ -453,6 +372,67 @@ Y_UNIT_TEST_SUITE(TOlap) {
         TestLsPathId(runtime, 4, NLs::PathStringEqual(""));
     }
 
+    Y_UNIT_TEST(CreateDropStandaloneTableDefaultSharding) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        ui64 txId = 100;
+
+        TestMkDir(runtime, ++txId, "/MyRoot", "MyDir");
+        env.TestWaitNotification(runtime, txId);
+
+        TestLs(runtime, "/MyRoot/MyDir", false, NLs::PathExist);
+
+        TestCreateColumnTable(runtime, ++txId, "/MyRoot/MyDir", defaultTableSchema);
+        env.TestWaitNotification(runtime, txId);
+
+        TestLsPathId(runtime, 3, NLs::PathStringEqual("/MyRoot/MyDir/ColumnTable"));
+
+        TestDropColumnTable(runtime, ++txId, "/MyRoot/MyDir", "ColumnTable");
+        env.TestWaitNotification(runtime, txId);
+
+        TestLs(runtime, "/MyRoot/MyDir/ColumnTable", false, NLs::PathNotExist);
+        TestLsPathId(runtime, 3, NLs::PathStringEqual(""));
+
+        TString otherSchema = R"(
+            Name: "ColumnTable"
+            Schema {
+                Columns { Name: "timestamp" Type: "Timestamp" NotNull: true }
+                Columns { Name: "some" Type: "Uint64" NotNull: true }
+                Columns { Name: "data" Type: "Utf8" NotNull: true }
+                KeyColumnNames: "some"
+                KeyColumnNames: "data"
+            }
+        )";
+
+        TestCreateColumnTable(runtime, ++txId, "/MyRoot/MyDir", otherSchema);
+        env.TestWaitNotification(runtime, txId);
+
+        auto checkFn = [&](const NKikimrScheme::TEvDescribeSchemeResult& record) {
+            UNIT_ASSERT_VALUES_EQUAL(record.GetPath(), "/MyRoot/MyDir/ColumnTable");
+
+            auto& description = record.GetPathDescription().GetColumnTableDescription();
+            UNIT_ASSERT_VALUES_EQUAL(description.GetColumnShardCount(), 64);
+
+            auto& sharding = description.GetSharding();
+            UNIT_ASSERT_VALUES_EQUAL(sharding.ColumnShardsSize(), 64);
+            UNIT_ASSERT(sharding.HasHashSharding());
+            auto& hashSharding = sharding.GetHashSharding();
+            UNIT_ASSERT_VALUES_EQUAL(hashSharding.ColumnsSize(), 2);
+            UNIT_ASSERT_EQUAL(hashSharding.GetFunction(),
+                              NKikimrSchemeOp::TColumnTableSharding::THashSharding::HASH_FUNCTION_MODULO_N);
+            UNIT_ASSERT_VALUES_EQUAL(hashSharding.GetColumns()[0], "some");
+            UNIT_ASSERT_VALUES_EQUAL(hashSharding.GetColumns()[1], "data");
+        };
+
+        TestLsPathId(runtime, 4, checkFn);
+
+        TestDropColumnTable(runtime, ++txId, "/MyRoot/MyDir", "ColumnTable");
+        env.TestWaitNotification(runtime, txId);
+
+        TestLs(runtime, "/MyRoot/MyDir/ColumnTable", false, NLs::PathNotExist);
+        TestLsPathId(runtime, 4, NLs::PathStringEqual(""));
+    }
+
     Y_UNIT_TEST(CreateTableTtl) {
         TTestBasicRuntime runtime;
         TTestEnv env(runtime);
@@ -463,6 +443,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TString tableSchema1 = R"(
             Name: "Table1"
+            ColumnShardCount: 1
             TtlSettings {
                 Enabled { ColumnName: "timestamp" ExpireAfterSeconds: 300 }
             }
@@ -479,6 +460,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TString tableSchema2 = R"(
             Name: "Table2"
+            ColumnShardCount: 1
             TtlSettings {
                 Disabled {}
             }
@@ -495,6 +477,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TString tableSchema3 = R"(
             Name: "Table3"
+            ColumnShardCount: 1
             TtlSettings {
                 UseTiering : "Tiering1"
             }
@@ -511,6 +494,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TString tableSchema4 = R"(
             Name: "Table4"
+            ColumnShardCount: 1
             TtlSettings {
                 UseTiering : "Tiering1"
             }
@@ -532,6 +516,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TString tableSchemaX = R"(
             Name: "ColumnTable"
+            ColumnShardCount: 1
             TtlSettings {
                 Enabled {
                     ExpireAfterSeconds: 300
@@ -544,6 +529,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TString tableSchema = R"(
             Name: "ColumnTable"
+            ColumnShardCount: 1
             TtlSettings {
                 Enabled {
                     ColumnName: "timestamp"
@@ -596,6 +582,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TString tableSchema = R"(
             Name: "ColumnTable"
+            ColumnShardCount: 1
             TtlSettings {
                 Enabled {
                     ColumnName: "timestamp"
@@ -679,6 +666,7 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         TString tableSchema = R"(
             Name: "ColumnTable"
+            ColumnShardCount: 1
         )";
 
         TestCreateColumnTable(runtime, ++txId, "/MyRoot/OlapStore", tableSchema);
@@ -707,27 +695,28 @@ Y_UNIT_TEST_SUITE(TOlap) {
 
         {   // Write data directly into shard
             TActorId sender = runtime.AllocateEdgeActor();
-            TString data = MakeTestBlob({0, rowsInBatch});
+            TString data = NTxUT::MakeTestBlob({0, rowsInBatch}, defaultYdbSchema);
 
             ui64 writeId = 0;
 
             TSet<ui64> txIds;
             for (ui32 i = 0; i < 10; ++i) {
-                WriteData(runtime, sender, shardId, pathId, ++writeId, data);
-                ProposeCommit(runtime, sender, shardId, ++txId, {writeId});
+                std::vector<ui64> writeIds;
+                NTxUT::WriteData(runtime, sender, shardId, ++writeId, pathId, data, defaultYdbSchema, &writeIds);
+                NTxUT::ProposeCommit(runtime, sender, shardId, ++txId, writeIds);
                 txIds.insert(txId);
             }
 
-            PlanCommit(runtime, sender, shardId, ++planStep, txIds);
+            NTxUT::PlanCommit(runtime, sender, shardId, ++planStep, txIds);
 
             // emulate timeout
             runtime.UpdateCurrentTime(TInstant::Now());
 
             // trigger periodic stats at shard (after timeout)
-            WriteData(runtime, sender, shardId, pathId, ++writeId, data);
-            ProposeCommit(runtime, sender, shardId, ++txId, {writeId});
-            txIds = {txId};
-            PlanCommit(runtime, sender, shardId, ++planStep, txIds);
+            std::vector<ui64> writeIds;
+            NTxUT::WriteData(runtime, sender, shardId, ++writeId, pathId, data, defaultYdbSchema, &writeIds);
+            NTxUT::ProposeCommit(runtime, sender, shardId, ++txId, writeIds);
+            NTxUT::PlanCommit(runtime, sender, shardId, ++planStep, {txId});
         }
 
         auto description = DescribePrivatePath(runtime, TTestTxConfig::SchemeShard, "/MyRoot/OlapStore", true, true);

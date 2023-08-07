@@ -15,7 +15,7 @@
     - Y_MSVC_INCLUDE_NEXT(stdint.h)
     - Y_MSVC_INCLUDE_NEXT(yvals.h)
 
-    - Y_UCRT_INCLUDE_NEXT(coMPlex.h)
+    - Y_UCRT_INCLUDE_NEXT(complex.h)
     - Y_UCRT_INCLUDE_NEXT(ctype.h)
     - Y_UCRT_INCLUDE_NEXT(errno.h)
     - Y_UCRT_INCLUDE_NEXT(fenv.h)
@@ -30,9 +30,34 @@
     - Y_UCRT_INCLUDE_NEXT(wchar.h)
     - Y_UCRT_INCLUDE_NEXT(wctype.h)
 
-    # BOOST_PP_INCLUDE_SELF() SHOULD be always be resolved into the same file it is included from.
-    # Hence this file was already parsed and empty resolving is equivalent to providing the actual resolution for it.
-    - BOOST_PP_INCLUDE_SELF()
+    # BOOST_PP_ITERATE() itself is defined to one of these values
+    - BOOST_PP_ITERATE():
+      - contrib/restricted/boost/preprocessor/include/boost/preprocessor/iteration/detail/iter/forward1.hpp
+      - contrib/restricted/boost/preprocessor/include/boost/preprocessor/iteration/detail/iter/forward2.hpp
+      - contrib/restricted/boost/preprocessor/include/boost/preprocessor/iteration/detail/iter/forward3.hpp
+      - contrib/restricted/boost/preprocessor/include/boost/preprocessor/iteration/detail/iter/forward4.hpp
+      - contrib/restricted/boost/preprocessor/include/boost/preprocessor/iteration/detail/iter/forward5.hpp
+
+    # BOOST_PP_INCLUDE_SELF() is defined in boost/preprocessor/iteration/detail/self.hpp
+    # It works as follows:
+    # The user defines BOOST_PP_INDIRECT_SELF containing current file name.
+    # Then it #includes BOOST_PP_INCLUDE_SELF() which indirectly includes  the file pointed by BOOST_PP_INDIRECT_SELF.
+    #
+    # Hence BOOST_PP_INDIRECT_SELF SHOULD BE already parsed and empty resolving is equivalent to providing the actual resolution for it.
+    - BOOST_PP_INCLUDE_SELF(): contrib/restricted/boost/preprocessor/include/boost/preprocessor/iteration/detail/self.hpp
+    - BOOST_PP_INDIRECT_SELF
+
+    # BOOST_PP_UPDATE_COUNTER() is defined in boost/preprocessor/slot/counter.hpp
+    # It is unclear why the author used macro include at all.
+    - BOOST_PP_UPDATE_COUNTER(): contrib/restricted/boost/preprocessor/include/boost/preprocessor/slot/detail/counter.hpp
+
+    # BOOST_PP_LOCAL_ITERATE() is defined in boost/preprocessor/iterator/local.hpp
+    # It is unclear why the author used macro include at all.
+    - BOOST_PP_LOCAL_ITERATE(): contrib/restricted/boost/preprocessor/include/boost/preprocessor/iteration/detail/local.hpp
+
+    # BOOST_PROTO_LOCAL_ITERATE() is defined in boost/proto/repeat.hpp
+    # It looks litke the macro include was chosen for the stylistic purposed and the value is not meant to be redefined
+    - BOOST_PROTO_LOCAL_ITERATE(): contrib/restricted/boost/proto/include/boost/proto/repeat.hpp
 
     # libfreetype officially insists on using macros to include its headers:
     # https://freetype.org/freetype2/docs/tutorial/step1.html#section-1
@@ -169,11 +194,6 @@
       - contrib/restricted/boost/function_types/include/boost/function_types/detail/pp_tags/cc_tag.hpp
     - BOOST_ABI_PREFIX: contrib/restricted/boost/config/include/boost/config/abi/msvc_prefix.hpp
     - BOOST_ABI_SUFFIX: contrib/restricted/boost/config/include/boost/config/abi/msvc_suffix.hpp
-    - BOOST_FT_loop: contrib/restricted/boost/function_types/include/boost/function_types/detail/pp_cc_loop/master.hpp
-    - BOOST_FT_variate_file: contrib/restricted/boost/function_types/include/boost/function_types/detail/pp_arity_loop.hpp
-    - BOOST_PP_ASSIGN_SLOT(1): contrib/restricted/boost/preprocessor/include/boost/preprocessor/slot/detail/slot1.hpp
-    - BOOST_PP_INCLUDE_SELF(): contrib/restricted/boost/preprocessor/include/boost/preprocessor/iteration/detail/self.hpp
-    - BOOST_PP_LOCAL_ITERATE(): contrib/restricted/boost/preprocessor/include/boost/preprocessor/iteration/detail/local.hpp
     - BOOST_TYPEOF_INCREMENT_REGISTRATION_GROUP(): contrib/restricted/boost/typeof/include/boost/typeof/incr_registration_group.hpp
     - BOOST_REGEX_USER_CONFIG: contrib/restricted/boost/regex/include/boost/regex/user.hpp
     - BOOST_USER_CONFIG: contrib/restricted/boost/config/include/boost/config/user.hpp
@@ -286,11 +306,49 @@
 #   boost/function_types/detail/pp_arity_loop.hpp does some extremely magical preprocessor magic
 #   which I have failed to compile and evalute.
 #
-#   Corresponding includes will not be resolved by ymake
+#   Corresponding includes might not be properly resolved by ymake
 - source_filter: "^contrib/restricted/boost/function_types"
   includes:
-    - BOOST_PP_ITERATE():
+    - BOOST_FT_AL_INCLUDE_FILE:
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/master.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/master.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/synthesize_impl/master.hpp
+    - BOOST_FT_AL_PREPROCESSED:
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/arity10_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/arity10_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/arity20_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/arity20_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/arity30_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/arity30_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/arity40_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/arity40_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/arity50_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/classifier_impl/arity50_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/arity10_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/arity10_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/arity20_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/arity20_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/arity30_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/arity30_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/arity40_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/arity40_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/arity50_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/components_impl/arity50_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/synthesize_impl/arity10_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/synthesize_impl/arity20_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/synthesize_impl/arity20_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/synthesize_impl/arity30_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/synthesize_impl/arity30_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/synthesize_impl/arity40_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/synthesize_impl/arity40_1.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/synthesize_impl/arity50_0.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/synthesize_impl/arity50_1.hpp
+    - BOOST_FT_loop:
       - contrib/restricted/boost/function_types/include/boost/function_types/detail/pp_cc_loop/master.hpp
+      - contrib/restricted/boost/function_types/include/boost/function_types/detail/pp_cc_loop/preprocessed.hpp
+    - BOOST_FT_variate_file: contrib/restricted/boost/function_types/include/boost/function_types/detail/pp_arity_loop.hpp
+    - BOOST_PP_ASSIGN_SLOT(1): contrib/restricted/boost/preprocessor/include/boost/preprocessor/slot/detail/slot1.hpp
+    - BOOST_PP_ITERATE(): contrib/restricted/boost/function_types/include/boost/function_types/detail/pp_cc_loop/master.hpp
 
 - source_filter: "^contrib/restricted/boost/functional"
   includes:
@@ -469,20 +527,15 @@
       - contrib/restricted/boost/mpl/include/boost/mpl/aux_/preprocessed/plain/times.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/aux_/preprocessed/plain/unpack_args.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/aux_/preprocessed/plain/vector_c.hpp
-    - BOOST_PP_STRINGIZE(boost/mpl/list/AUX778076_HEADER):
+    - BOOST_PP_STRINGIZE(boost/mpl/list/AUX778076_LIST_HEADER):
       - contrib/restricted/boost/mpl/include/boost/mpl/list/list0.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/list/list0_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/list/list10.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/list/list10_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/list/list20.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/list/list20_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/list/list30.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/list/list30_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/list/list40.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/list/list40_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/list/list50.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/list/list50_c.hpp
-    - BOOST_PP_STRINGIZE(boost/mpl/list/aux_/preprocessed/AUX778076_HEADER):
+    # NB: in other part of boost preprocessor this will be included as boost/mpl/../aux_/preprocessed/AUX778076_HEADER
+    - BOOST_PP_STRINGIZE(boost/mpl/list/AUX778076_HEADER):
       - contrib/restricted/boost/mpl/include/boost/mpl/list/aux_/preprocessed/plain/list10.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/list/aux_/preprocessed/plain/list10_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/list/aux_/preprocessed/plain/list20.hpp
@@ -493,7 +546,7 @@
       - contrib/restricted/boost/mpl/include/boost/mpl/list/aux_/preprocessed/plain/list40_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/list/aux_/preprocessed/plain/list50.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/list/aux_/preprocessed/plain/list50_c.hpp
-    - BOOST_PP_STRINGIZE(boost/mpl/map/AUX778076_HEADER):
+    - BOOST_PP_STRINGIZE(boost/mpl/map/AUX778076_MAP_HEADER):
       - contrib/restricted/boost/mpl/include/boost/mpl/map/map0.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/map/map10.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/map/map20.hpp
@@ -506,6 +559,13 @@
       - contrib/restricted/boost/mpl/include/boost/mpl/map/aux_/preprocessed/typeof_based/map30.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/map/aux_/preprocessed/typeof_based/map40.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/map/aux_/preprocessed/typeof_based/map50.hpp
+    - BOOST_PP_STRINGIZE(boost/mpl/set/AUX778076_SET_HEADER):
+      - contrib/restricted/boost/mpl/include/boost/mpl/set/set0.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/set/set10.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/set/set20.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/set/set30.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/set/set40.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/set/set50.hpp
     - BOOST_PP_STRINGIZE(boost/mpl/set/aux_/preprocessed/AUX778076_HEADER):
       - contrib/restricted/boost/mpl/include/boost/mpl/set/aux_/preprocessed/plain/set10.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/set/aux_/preprocessed/plain/set10_c.hpp
@@ -517,18 +577,26 @@
       - contrib/restricted/boost/mpl/include/boost/mpl/set/aux_/preprocessed/plain/set40_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/set/aux_/preprocessed/plain/set50.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/set/aux_/preprocessed/plain/set50_c.hpp
+    - BOOST_PP_STRINGIZE(boost/mpl/vector/AUX778076_DEQUE_HEADER):
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector0.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector10.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector20.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector30.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector40.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector50.hpp
     - BOOST_PP_STRINGIZE(boost/mpl/vector/AUX778076_VECTOR_HEADER):
       - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector0.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector0_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector10.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector10_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector20.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector20_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector30.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector30_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector40.hpp
-      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector40_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector50.hpp
+    - BOOST_PP_STRINGIZE(boost/mpl/vector/AUX778076_VECTOR_C_HEADER):
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector0_c.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector10_c.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector20_c.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector30_c.hpp
+      - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector40_c.hpp
       - contrib/restricted/boost/mpl/include/boost/mpl/vector/vector50_c.hpp
     - BOOST_PP_STRINGIZE(boost/mpl/vector/aux_/preprocessed/AUX778076_HEADER):
       - contrib/restricted/boost/mpl/include/boost/mpl/vector/aux_/preprocessed/typeof_based/vector10.hpp
@@ -556,8 +624,32 @@
   includes:
     - BOOST_PHOENIX_UNORDERED_MAP_HEADER: $U/unordered_map
     - BOOST_PHOENIX_UNORDERED_SET_HEADER: $U/unordered_set
+    # boost/phoenix preprocessor magic works as follows
+    # 1. Each file defines BOOST_PHOENIX_ITERATION_PARAMS as a tuple whose last element contains current file name (checked on version 1.82).
+    # 2. It includes then BOOST_PHOENIX_ITERATE() which is simplify defined to <boost/phoenix/support/detail/iterate.hpp>.
+    # 3. The latter sets BOOST_PP_ITERATION_PARAMS from BOOST_PHOENIX_ITERATION_PARAMS and calls BOOST_PP_ITERATE() macro.
+    #
+    # Hence #include BOOST_PHOENIX_ITERATION_FILE will always result in including the file already seen ymake.
+    # This is equivalent to resolving this macro include into nothing.
+    - BOOST_PHOENIX_ITERATION_FILE()
     - BOOST_PHOENIX_ITERATE(): contrib/restricted/boost/phoenix/include/boost/phoenix/support/detail/iterate.hpp
     - BOOST_PP_ITERATE(): contrib/restricted/boost/phoenix/include/boost/phoenix/support/detail/iterate.hpp
+
+- source_filter: "^contrib/restricted/boost/preprocessor"
+  includes:
+    # BOOST_PP_ASSIGN_SLOT(i) macros are defined in boost/preprocessor/slot/slot.hpp
+    - BOOST_PP_ASSIGN_SLOT(1): contrib/restricted/boost/preprocessor/include/boost/preprocessor/slot/detail/slot1.hpp
+    - BOOST_PP_ASSIGN_SLOT(2): contrib/restricted/boost/preprocessor/include/boost/preprocessor/slot/detail/slot2.hpp
+    - BOOST_PP_ASSIGN_SLOT(3): contrib/restricted/boost/preprocessor/include/boost/preprocessor/slot/detail/slot3.hpp
+    - BOOST_PP_ASSIGN_SLOT(4): contrib/restricted/boost/preprocessor/include/boost/preprocessor/slot/detail/slot4.hpp
+    - BOOST_PP_ASSIGN_SLOT(5): contrib/restricted/boost/preprocessor/include/boost/preprocessor/slot/detail/slot5.hpp
+
+    # BOOST_PP_FILENAME macros extract values from BOOST_PP_ITERATION_PARAMS, which we have already resolved in BOOST_PP_ITERATE()
+    - BOOST_PP_FILENAME_1
+    - BOOST_PP_FILENAME_2
+    - BOOST_PP_FILENAME_3
+    - BOOST_PP_FILENAME_4
+    - BOOST_PP_FILENAME_5
 
 - source_filter: "^contrib/restricted/boost/proto"
   includes:
@@ -808,18 +900,14 @@
       - contrib/libs/nvidia/thrust/thrust/system/omp/detail/execution_policy.h
       - contrib/libs/nvidia/thrust/thrust/system/tbb/detail/execution_policy.h
 
-- source_filter: "^contrib/python/mercurial"
-  includes:
-    - SHA1DC_CUSTOM_INCLUDE_SHA1_C: contrib/libs/libgit2/src/util/git2_util.h
-    - SHA1DC_CUSTOM_INCLUDE_UBC_CHECK_C: contrib/libs/libgit2/src/util/git2_util.h
-
 - source_filter: "^contrib/libs/unixodbc/libltdl"
   includes:
       - LT_CONFIG_H: $U/config.h
 
 - source_filter: "^contrib/libs/esp-idf"
   includes:
-      - MBEDTLS_CONFIG_FILE: contrib/libs/esp-idf/components/mbedtls/port/include/mbedtls/esp_config.h
+    - LWIP_HOOK_FILENAME: contrib/libs/esp-idf/components/lwip/port/esp32/include/lwip_default_hooks.h
+    - MBEDTLS_CONFIG_FILE: contrib/libs/esp-idf/components/mbedtls/port/include/mbedtls/esp_config.h
 
 - source_filter: "^contrib/libs/sparsehash/src/sparsehash"
   includes:
@@ -889,6 +977,7 @@
     - SYSTEM_PROJECT_CONFIG_INCLUDE: contrib/libs/connectedhomeip/config/standalone/SystemProjectConfig.h
     - CHIP_ADDRESS_RESOLVE_IMPL_INCLUDE_HEADER: contrib/libs/connectedhomeip/src/lib/address_resolve/AddressResolve_DefaultImpl.h
     - CONFIGURATION_HEADER: contrib/libs/connectedhomeip/src/app/util/config.h
+    - CHIP_DEVICE_PROJECT_CONFIG_INCLUDE: contrib/libs/connectedhomeip/src/platform/ESP32/CHIPDeviceProjectConfig.h
     - BLE_PLATFORM_CONFIG_INCLUDE
     - CHIP_PLATFORM_CONFIG_INCLUDE
     - INET_PLATFORM_CONFIG_INCLUDE
@@ -901,12 +990,3 @@
     - PLATFORMMANAGERIMPL_HEADER
     - THREADSTACKMANAGERIMPL_HEADER
     - BLEMANAGERIMPL_HEADER
-
-- source_filter: "^smart_devices/third_party/gecko_sdk"
-  includes:
-    - APPLICATION_MFG_TOKEN_HEADER: smart_devices/platforms/yandexmidi/zigbee/firmware/ncp/ncp-mfg-token.h
-    - APPLICATION_TOKEN_HEADER: smart_devices/platforms/yandexmidi/zigbee/firmware/ncp/ncp-token.h
-    - CONFIGURATION_HEADER: smart_devices/third_party/gecko_sdk/protocol/zigbee/app/framework/util/config.h
-    - PLATFORM_HEADER:
-      - smart_devices/third_party/gecko_sdk/platform/base/hal/micro/cortexm3/compiler/gcc.h
-      - smart_devices/third_party/gecko_sdk/platform/base/hal/micro/unix/compiler/gcc.h

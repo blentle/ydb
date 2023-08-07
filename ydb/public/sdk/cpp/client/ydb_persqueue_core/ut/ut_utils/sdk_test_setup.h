@@ -15,13 +15,18 @@ protected:
     THolder<TTempFileHandle> NetDataFile;
     THashMap<TString, NKikimr::NPersQueueTests::TPQTestClusterInfo> DataCenters;
     TString LocalDC = "dc1";
-    TTestServer Server = TTestServer(false /* don't start */);
-
-    TLog Log = TLog("cerr");
+    TTestServer Server;
+    TLog Log = CreateLogBackend("cerr", ELogPriority::TLOG_DEBUG);
+    size_t TopicPartitionsCount = 1;
 
 public:
-    SDKTestSetup(const TString& testCaseName, bool start = true)
+    SDKTestSetup(const TString& testCaseName, bool start = true,
+                 const TVector<NKikimrServices::EServiceKikimr>& logServices = TTestServer::LOGGED_SERVICES,
+                 NActors::NLog::EPriority logPriority = NActors::NLog::PRI_DEBUG,
+                 size_t topicPartitionsCount = 1)
         : TestCaseName(testCaseName)
+        , Server(false, Nothing(), logServices, logPriority)
+        , TopicPartitionsCount(topicPartitionsCount)
     {
         InitOptions();
         if (start) {
@@ -59,10 +64,8 @@ public:
         std::srand(seed);
     }
 
-    void Start(bool waitInit = true, bool addBrokenDatacenter = false, 
-            const TVector<NKikimrServices::EServiceKikimr>& logServices = TTestServer::LOGGED_SERVICES, NActors::NLog::EPriority logPriority = NActors::NLog::PRI_DEBUG) {
+    void Start(bool waitInit = true, bool addBrokenDatacenter = false) {
         Server.StartServer(false);
-        Server.EnableLogs(logServices, logPriority);
         Server.AnnoyingClient->InitRoot();
         if (DataCenters.empty()) {
             THashMap<TString, NKikimr::NPersQueueTests::TPQTestClusterInfo> dataCenters;
@@ -71,11 +74,13 @@ public:
                 dataCenters.emplace("dc2", NKikimr::NPersQueueTests::TPQTestClusterInfo{"dc2.logbroker.yandex.net", false});
             }
             Server.AnnoyingClient->InitDCs(dataCenters);
+            Server.AnnoyingClient->CheckClustersList(Server.CleverServer->GetRuntime(), true, dataCenters);
         } else {
             Server.AnnoyingClient->InitDCs(DataCenters, LocalDC);
+            Server.AnnoyingClient->CheckClustersList(Server.CleverServer->GetRuntime(), true, DataCenters);
         }
         Server.AnnoyingClient->InitSourceIds();
-        CreateTopic(GetTestTopic(), GetLocalCluster());
+        CreateTopic(GetTestTopic(), GetLocalCluster(), TopicPartitionsCount);
         if (waitInit) {
             Server.WaitInit(GetTestTopic());
         }
@@ -85,8 +90,8 @@ public:
         return "test-topic";
     }
 
-    static TString GetTestClient() {
-        return "test-reader";
+    static TString GetTestConsumer() {
+        return "shared/user";
     }
 
     static TString GetTestMessageGroupId() {
@@ -97,8 +102,24 @@ public:
         return LocalDC;
     }
 
+    TString GetTestTopicPath() const
+    {
+        return Server.ServerSettings.PQConfig.GetRoot() + "/" + ::NPersQueue::BuildFullTopicName(GetTestTopic(), LocalDC);
+    }
+
     ui16 GetGrpcPort() const {
         return Server.GrpcPort;
+    }
+
+    TSimpleSharedPtr<TPortManager> GetPortManager() {
+        return Server.PortManager;
+    }
+
+    std::unique_ptr<grpc::Server> StartGrpcService(const ui16 port, grpc::Service* service) {
+        grpc::ServerBuilder builder;
+        builder.AddListeningPort("[::]:" + ToString(port), grpc::InsecureServerCredentials()).RegisterService(service);
+        std::unique_ptr<grpc::Server> grpcServer(builder.BuildAndStart());
+        return grpcServer;
     }
 
     NGrpc::TServerOptions& GetGrpcServerOptions() {
@@ -115,6 +136,10 @@ public:
 
     TLog& GetLog() {
         return Log;
+    }
+
+    TTestServer& GetServer() {
+        return Server;
     }
 
     template <class TConsumerOrProducer>
@@ -193,6 +218,7 @@ public:
             Server.AnnoyingClient->KickNodeInHive(Server.CleverServer->GetRuntime(), i);
         }
     }
+   
     void AllowTablets() {
         for (ui32 i = 0; i < Server.CleverServer->StaticNodes() + Server.CleverServer->DynamicNodes(); i++) {
             Server.AnnoyingClient->MarkNodeInHive(Server.CleverServer->GetRuntime(), i, true);
@@ -201,12 +227,6 @@ public:
 
     void CreateTopic(const TString& topic, const TString& cluster, size_t partitionsCount = 1) {
         Server.AnnoyingClient->CreateTopic(BuildFullTopicName(topic, cluster), partitionsCount);
-    }
-
-    void KillPqrb(const TString& topic, const TString& cluster) {
-        auto describeResult = Server.AnnoyingClient->Ls(TStringBuilder() << "/Root/PQ/" << BuildFullTopicName(topic, cluster));
-        UNIT_ASSERT_C(describeResult->Record.GetPathDescription().HasPersQueueGroup(), describeResult->Record);
-        Server.AnnoyingClient->KillTablet(*Server.CleverServer, describeResult->Record.GetPathDescription().GetPersQueueGroup().GetBalancerTabletID());
     }
 };
 }

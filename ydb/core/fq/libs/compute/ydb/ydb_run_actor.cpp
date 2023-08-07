@@ -18,9 +18,9 @@
 #include <ydb/core/fq/libs/control_plane_storage/util.h>
 #include <ydb/core/fq/libs/private_client/events.h>
 #include <ydb/core/fq/libs/ydb/ydb.h>
-#include <ydb/core/protos/services.pb.h>
+#include <ydb/library/services/services.pb.h>
 #include <ydb/library/yql/public/issue/yql_issue_message.h>
-#include <ydb/public/sdk/cpp/client/draft/ydb_query/client.h>
+#include <ydb/public/sdk/cpp/client/ydb_query/client.h>
 #include <ydb/public/sdk/cpp/client/ydb_operation/operation.h>
 #include <ydb/public/sdk/cpp/client/ydb_proto/accessor.h>
 
@@ -61,15 +61,28 @@ public:
     }
 
     STRICT_STFUNC(StateFunc,
-        hFunc(TEvPrivate::TEvExecuterResponse, Handle);
-        hFunc(TEvPrivate::TEvStatusTrackerResponse, Handle);
-        hFunc(TEvPrivate::TEvResultWriterResponse, Handle);
-        hFunc(TEvPrivate::TEvResourcesCleanerResponse, Handle);
-        hFunc(TEvPrivate::TEvFinalizerResponse, Handle);
-        hFunc(TEvPrivate::TEvStopperResponse, Handle);
+        hFunc(TEvYdbCompute::TEvInitializerResponse, Handle);
+        hFunc(TEvYdbCompute::TEvExecuterResponse, Handle);
+        hFunc(TEvYdbCompute::TEvStatusTrackerResponse, Handle);
+        hFunc(TEvYdbCompute::TEvResultWriterResponse, Handle);
+        hFunc(TEvYdbCompute::TEvResourcesCleanerResponse, Handle);
+        hFunc(TEvYdbCompute::TEvFinalizerResponse, Handle);
+        hFunc(TEvYdbCompute::TEvStopperResponse, Handle);
     )
 
-    void Handle(const TEvPrivate::TEvExecuterResponse::TPtr& ev) {
+    void Handle(const TEvYdbCompute::TEvInitializerResponse::TPtr& ev) {
+        auto& response = *ev->Get();
+        if (response.Status != NYdb::EStatus::SUCCESS) {
+            LOG_I("InitializerResponse (failed). Issues: " << response.Issues.ToOneLineString());
+            ResignAndPassAway(response.Issues);
+            return;
+        }
+
+        LOG_I("InitializerResponse (success)");
+        Register(ActorFactory->CreateExecuter(SelfId(), Connector, Pinger).release());
+    }
+
+    void Handle(const TEvYdbCompute::TEvExecuterResponse::TPtr& ev) {
         auto& response = *ev->Get();
         if (!response.Success) {
             LOG_I("ExecuterResponse (failed). Issues: " << response.Issues.ToOneLineString());
@@ -82,7 +95,7 @@ public:
         Register(ActorFactory->CreateStatusTracker(SelfId(), Connector, Pinger, Params.OperationId).release());
     }
 
-    void Handle(const TEvPrivate::TEvStatusTrackerResponse::TPtr& ev) {
+    void Handle(const TEvYdbCompute::TEvStatusTrackerResponse::TPtr& ev) {
         auto& response = *ev->Get();
         if (response.Status != NYdb::EStatus::SUCCESS) {
             LOG_I("StatusTrackerResponse (failed). Status: " << response.Status << " Issues: " << response.Issues.ToOneLineString());
@@ -92,13 +105,13 @@ public:
         ExecStatus = response.ExecStatus;
         LOG_I("StatusTrackerResponse (success) " << response.Status << " ExecStatus: " << static_cast<int>(response.ExecStatus) << " Issues: " << response.Issues.ToOneLineString());
         if (response.ExecStatus == NYdb::NQuery::EExecStatus::Completed) {
-            Register(ActorFactory->CreateResultWriter(SelfId(), Connector, Pinger, Params.ExecutionId).release());
+            Register(ActorFactory->CreateResultWriter(SelfId(), Connector, Pinger, Params.OperationId).release());
         } else {
             Register(ActorFactory->CreateResourcesCleaner(SelfId(), Connector, Params.OperationId).release());
         }
     }
 
-    void Handle(const TEvPrivate::TEvResultWriterResponse::TPtr& ev) {
+    void Handle(const TEvYdbCompute::TEvResultWriterResponse::TPtr& ev) {
         auto& response = *ev->Get();
         if (response.Status != NYdb::EStatus::SUCCESS) {
             LOG_I("ResultWriterResponse (failed). Status: " << response.Status << " Issues: " << response.Issues.ToOneLineString());
@@ -109,7 +122,7 @@ public:
         Register(ActorFactory->CreateResourcesCleaner(SelfId(), Connector, Params.OperationId).release());
     }
 
-    void Handle(const TEvPrivate::TEvResourcesCleanerResponse::TPtr& ev) {
+    void Handle(const TEvYdbCompute::TEvResourcesCleanerResponse::TPtr& ev) {
         auto& response = *ev->Get();
         if (response.Status != NYdb::EStatus::SUCCESS && response.Status != NYdb::EStatus::UNSUPPORTED) {
             LOG_I("ResourcesCleanerResponse (failed). Status: " << response.Status << " Issues: " << response.Issues.ToOneLineString());
@@ -120,7 +133,7 @@ public:
         Register(ActorFactory->CreateFinalizer(SelfId(), Pinger, ExecStatus).release());
     }
 
-    void Handle(const TEvPrivate::TEvFinalizerResponse::TPtr ev) {
+    void Handle(const TEvYdbCompute::TEvFinalizerResponse::TPtr ev) {
         auto& response = *ev->Get();
         if (response.Status != NYdb::EStatus::SUCCESS) {
             LOG_I("FinalizerResponse (failed). Status: " << response.Status << " Issues: " << response.Issues.ToOneLineString());
@@ -139,7 +152,7 @@ public:
         }
     }
 
-    void Handle(const TEvPrivate::TEvStopperResponse::TPtr& ev) {
+    void Handle(const TEvYdbCompute::TEvStopperResponse::TPtr& ev) {
         auto& response = *ev->Get();
         if (response.Status != NYdb::EStatus::SUCCESS) {
             LOG_I("StopperResponse (failed). Status: " << response.Status << " Issues: " << response.Issues.ToOneLineString());
@@ -163,13 +176,13 @@ public:
             break;
         case FederatedQuery::QueryMeta::COMPLETING:
             if (Params.OperationId.GetKind() != Ydb::TOperationId::UNUSED) {
-                Register(ActorFactory->CreateResultWriter(SelfId(), Connector, Pinger, Params.ExecutionId).release());
+                Register(ActorFactory->CreateResultWriter(SelfId(), Connector, Pinger, Params.OperationId).release());
             } else {
                 Register(ActorFactory->CreateFinalizer(SelfId(), Pinger, ExecStatus).release());
             }
             break;
         case FederatedQuery::QueryMeta::STARTING:
-            Register(ActorFactory->CreateExecuter(SelfId(), Connector, Pinger).release());
+            Register(ActorFactory->CreateInitializer(SelfId(), Pinger).release());
             break;
         case FederatedQuery::QueryMeta::RUNNING:
             Register(ActorFactory->CreateStatusTracker(SelfId(), Connector, Pinger, Params.OperationId).release());

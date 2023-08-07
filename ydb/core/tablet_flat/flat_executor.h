@@ -460,10 +460,6 @@ class TExecutor
     bool HadFollowerAttached = false;
     bool NeedFollowerSnapshot = false;
 
-    TCacheCacheConfig::TCounterPtr CounterCacheFresh;
-    TCacheCacheConfig::TCounterPtr CounterCacheWarm;
-    TCacheCacheConfig::TCounterPtr CounterCacheStaging;
-
     THashMap<ui32, TIntrusivePtr<TBarrier>> InFlyCompactionGcBarriers;
     TDeque<THolder<TEvTablet::TFUpdateBody>> PostponedFollowerUpdates;
     THashMap<ui32, TVector<TIntrusivePtr<TBarrier>>> InFlySnapCollectionBarriers;
@@ -648,6 +644,9 @@ public:
     ui64 CompactMemTable(ui32 tableId) override;
     ui64 CompactTable(ui32 tableId) override;
     bool CompactTables() override;
+
+    void Handle(NSharedCache::TEvMemTableRegistered::TPtr &ev);
+    void Handle(NSharedCache::TEvMemTableCompact::TPtr &ev);
 
     void AllowBorrowedGarbageCompaction(ui32 tableId) override;
 

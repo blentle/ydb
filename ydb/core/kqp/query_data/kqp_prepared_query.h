@@ -85,6 +85,14 @@ public:
         return Proto->GetTables();
     }
 
+    const NKqpProto::TKqpSchemeOperation& GetSchemeOperation() const {
+        return Proto->GetSchemeOperation();
+    }
+
+    const google::protobuf::RepeatedPtrField<TProtoStringType>& GetSecretNames() const {
+        return Proto->GetSecretNames();
+    }
+
     TProtoStringType DebugString() const {
         return Proto->ShortDebugString();
     }

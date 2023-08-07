@@ -15,8 +15,8 @@ SRCS(
     yql_generic_provider.cpp
     yql_generic_provider.h
     yql_generic_provider_impl.h
-    yql_generic_settings.cpp
     yql_generic_settings.h
+    yql_generic_state.h
 )
 
 YQL_LAST_ABI_VERSION()
@@ -31,15 +31,14 @@ PEERDIR(
     ydb/library/yql/core/type_ann
     ydb/library/yql/dq/expr_nodes
     ydb/library/yql/dq/integration
-    ydb/library/yql/minikql
-    ydb/library/yql/minikql/comp_nodes
-    ydb/library/yql/minikql/computation
+    ydb/library/yql/minikql/comp_nodes/llvm
     ydb/library/yql/providers/common/config
     ydb/library/yql/providers/common/db_id_async_resolver
     ydb/library/yql/providers/common/dq
     ydb/library/yql/providers/common/mkql
     ydb/library/yql/providers/common/proto
     ydb/library/yql/providers/common/provider
+    ydb/library/yql/providers/common/structured_token
     ydb/library/yql/providers/common/transform
     ydb/library/yql/providers/dq/common
     ydb/library/yql/providers/dq/expr_nodes

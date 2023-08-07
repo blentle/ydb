@@ -1,6 +1,7 @@
 #include <ydb/core/scheme/scheme_tablecell.h>
 #include <ydb/core/scheme/scheme_type_registry.h>
 
+#include <library/cpp/actors/core/actorid.h>
 #include <util/string/escape.h>
 
 namespace NKikimr {
@@ -63,6 +64,188 @@ TOwnedCellVec::TInit TOwnedCellVec::Allocate(TOwnedCellVec::TCellVec cells) {
     };
 }
 
+namespace {
+
+    struct TCellHeader {
+        TCellHeader() = default;
+
+        TCellHeader(ui32 rawValue) : RawValue(rawValue) {}
+
+        TCellHeader(ui32 cellSize, bool isNull)
+            : RawValue(cellSize | (static_cast<ui32>(isNull) << 31))
+        {}
+
+        ui32 CellSize() const { return RawValue & ~(1ULL << 31); }
+
+        bool IsNull() const { return RawValue & (1ULL << 31); };
+
+        ui32 RawValue = 0;
+    };
+
+    static_assert(sizeof(TCellHeader) == sizeof(ui32));
+
+    Y_FORCE_INLINE void SerializeCellVec(TConstArrayRef<TCell> cells, TString &resultBuffer, TVector<TCell> *resultCells) {
+        resultBuffer.clear();
+        if (resultCells)
+            resultCells->clear();
+
+        if (cells.empty()) {
+            return;
+        }
+
+        size_t size = sizeof(ui16);
+        for (auto& cell : cells) {
+            size += sizeof(TCellHeader) + cell.Size();
+        }
+
+        resultBuffer.ReserveAndResize(size);
+        char* resultBufferData = resultBuffer.Detach();
+
+        ui16 cellsSize = cells.size();
+        WriteUnaligned<ui16>(resultBufferData, cellsSize);
+        resultBufferData += sizeof(cellsSize);
+
+        if (resultCells) {
+            resultCells->resize_uninitialized(cellsSize);
+        }
+
+        for (size_t i = 0; i < cellsSize; ++i) {
+            TCellHeader header(cells[i].Size(), cells[i].IsNull());
+            WriteUnaligned<ui32>(resultBufferData, header.RawValue);
+            resultBufferData += sizeof(header);
+
+            const auto & cell = cells[i];
+            if (cell.Size() > 0) {
+                cell.CopyDataInto(resultBufferData);
+            }
+
+            if (resultCells) {
+                if (cell.IsNull()) {
+                    new (resultCells->data() + i) TCell();
+                } else {
+                    new (resultCells->data() + i) TCell(resultBufferData, cell.Size());
+                }
+            }
+
+            resultBufferData += cell.Size();
+        }
+    }
+
+    Y_FORCE_INLINE bool TryDeserializeCellVec(const TString & data, TString & resultBuffer, TVector<TCell> & resultCells) {
+        resultBuffer.clear();
+        resultCells.clear();
+
+        if (data.empty())
+            return true;
+
+        const char* buf = data.data();
+        const char* bufEnd = data.data() + data.size();
+        if (Y_UNLIKELY(bufEnd - buf < static_cast<ptrdiff_t>(sizeof(ui16))))
+            return false;
+
+        ui16 cellsSize = ReadUnaligned<ui16>(buf);
+        buf += sizeof(cellsSize);
+
+        resultCells.resize_uninitialized(cellsSize);
+        TCell* resultCellsData = resultCells.data();
+
+        for (ui32 i = 0; i < cellsSize; ++i) {
+            if (Y_UNLIKELY(bufEnd - buf < static_cast<ptrdiff_t>(sizeof(TCellHeader)))) {
+                resultCells.clear();
+                return false;
+            }
+
+            TCellHeader cellHeader = ReadUnaligned<TCellHeader>(buf);
+            buf += sizeof(cellHeader);
+
+            if (Y_UNLIKELY(bufEnd - buf < static_cast<ptrdiff_t>(cellHeader.CellSize()))) {
+                resultCells.clear();
+                return false;
+            }
+
+            if (cellHeader.IsNull()) {
+                new (resultCellsData + i) TCell();
+            } else {
+                new (resultCellsData + i) TCell(buf, cellHeader.CellSize());
+            }
+
+            buf += cellHeader.CellSize();
+        }
+
+        resultBuffer = data;
+        return true;
+    }
+
+}
+
+TSerializedCellVec::TSerializedCellVec(TConstArrayRef<TCell> cells)
+{
+    SerializeCellVec(cells, Buf, &Cells);
+}
+
+void TSerializedCellVec::Serialize(TString& res, TConstArrayRef<TCell> cells) {
+    SerializeCellVec(cells, res, nullptr /*resultCells*/);
+}
+
+TString TSerializedCellVec::Serialize(TConstArrayRef<TCell> cells) {
+    TString result;
+    SerializeCellVec(cells, result, nullptr /*resultCells*/);
+
+    return result;
+}
+
+bool TSerializedCellVec::DoTryParse(const TString& data) {
+    return TryDeserializeCellVec(data, Buf, Cells);
+}
+
+TOwnedCellVecBatch::TOwnedCellVecBatch()
+    : Pool(std::make_unique<TMemoryPool>(InitialPoolSize)) {
+}
+
+size_t TOwnedCellVecBatch::Append(TConstArrayRef<TCell> cells) {
+    size_t cellsSize = cells.size();
+    if (cellsSize == 0) {
+        CellVectors.emplace_back();
+        return 0;
+    }
+
+    size_t size = sizeof(TCell) * cellsSize;
+    for (auto& cell : cells) {
+        if (!cell.IsNull() && !cell.IsInline()) {
+            const size_t cellSize = cell.Size();
+            size += AlignUp(cellSize);
+        }
+    }
+
+    char * allocatedBuffer = reinterpret_cast<char *>(Pool->Allocate(size));
+
+    TCell* ptrCell = reinterpret_cast<TCell*>(allocatedBuffer);
+    char* ptrData = reinterpret_cast<char*>(ptrCell + cellsSize);
+
+    TConstArrayRef<TCell> cellvec(ptrCell, ptrCell + cellsSize);
+
+    for (auto& cell : cells) {
+        if (cell.IsNull()) {
+            new (ptrCell) TCell();
+        } else if (cell.IsInline()) {
+            new (ptrCell) TCell(cell);
+        } else {
+            const size_t cellSize = cell.Size();
+            if (Y_LIKELY(cellSize > 0)) {
+                ::memcpy(ptrData, cell.Data(), cellSize);
+            }
+            new (ptrCell) TCell(ptrData, cellSize);
+            ptrData += AlignUp(cellSize);
+        }
+
+        ++ptrCell;
+    }
+
+    CellVectors.push_back(cellvec);
+    return size;
+}
+
+
 TString DbgPrintCell(const TCell& r, NScheme::TTypeInfo typeInfo, const NScheme::TTypeRegistry &reg) {
     auto typeId = typeInfo.GetTypeId();
     TString res;
@@ -114,7 +297,7 @@ void DbgPrintValue(TString &res, const TCell &r, NScheme::TTypeInfo typeInfo) {
             res += ToString(r.AsValue<double>());
             break;
         case NScheme::NTypeIds::ActorId:
-            res += ToString(r.AsValue<TActorId>());
+            res += ToString(r.AsValue<NActors::TActorId>());
             break;
         case NScheme::NTypeIds::Pg:
             // TODO: support pg types

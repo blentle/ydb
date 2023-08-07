@@ -243,7 +243,7 @@ public:
 };
 
 TIntrusivePtr<IKqpRunner> CreateKqpRunner(TIntrusivePtr<IKqpGateway> gateway, const TString& cluster,
-    TIntrusivePtr<NYql::TTypeAnnotationContext> typesCtx, TIntrusivePtr<NYql::TKikimrSessionContext> sessionCtx,
+    const TIntrusivePtr<NYql::TTypeAnnotationContext>& typesCtx, TIntrusivePtr<NYql::TKikimrSessionContext> sessionCtx,
     const NMiniKQL::IFunctionRegistry& funcRegistry,
     TIntrusivePtr<ITimeProvider> timeProvider, TIntrusivePtr<IRandomProvider> randomProvider);
 
@@ -256,6 +256,9 @@ TAutoPtr<NYql::IGraphTransformer> CreateKqpTypeAnnotationTransformer(const TStri
     NYql::TKikimrConfiguration::TPtr config);
 
 TAutoPtr<NYql::IGraphTransformer> CreateKqpCheckQueryTransformer();
+
+TIntrusivePtr<NYql::IKikimrGateway> CreateKqpGatewayProxy(const TIntrusivePtr<IKqpGateway>& gateway,
+    const TIntrusivePtr<NYql::TKikimrSessionContext>& sessionCtx);
 
 } // namespace NKqp
 } // namespace NKikimr

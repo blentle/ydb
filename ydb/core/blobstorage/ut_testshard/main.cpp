@@ -7,6 +7,8 @@ const ui64 NKikimr::NPDisk::YdbDefaultPDiskSequence = 0x7e5700007e570000;
 Y_UNIT_TEST_SUITE(BlobDepotWithTestShard) {
 
     Y_UNIT_TEST(PlainGroup) {
+        THPTimer timer;
+
         TEnvironmentSetup env{{}};
         env.CreateBoxAndPool();
         env.Sim(TDuration::Seconds(1));
@@ -74,6 +76,7 @@ Y_UNIT_TEST_SUITE(BlobDepotWithTestShard) {
                 auto& record = ev->Record;
                 record.SetTabletId(tabletId);
                 auto *cmd = record.MutableInitialize();
+                cmd->SetStorageServerHost("");
                 cmd->SetMaxDataBytes(1'000'000'000);
                 cmd->SetMinDataBytes(100'000'000);
                 cmd->SetMaxInFlight(2);
@@ -108,11 +111,17 @@ Y_UNIT_TEST_SUITE(BlobDepotWithTestShard) {
             }
         });
 
-        for (ui32 i = 0; i < 100; ++i) {
+        TDuration cycleTime;
+
+        while (cycleTime + TDuration::Seconds(timer.Passed()) <= TDuration::Seconds(300)) {
+            const TDuration begin = TDuration::Seconds(timer.Passed());
+
             for (IActor *actor : blobDepots) {
                 NBlobDepot::ValidateBlobDepot(actor, env.GroupOverseer);
             }
             env.Sim(TDuration::MilliSeconds(5));
+
+            cycleTime = TDuration::Seconds(timer.Passed()) - begin;
         }
     }
 

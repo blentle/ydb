@@ -8,7 +8,6 @@ PEERDIR(
     ydb/library/yql/ast
     ydb/library/yql/core
     ydb/library/yql/parser/pg_catalog
-    ydb/library/yql/parser/pg_wrapper
     ydb/library/yql/sql/settings
 )
 
@@ -18,7 +17,13 @@ ADDINCL(
 
 SRCS(
     pg_sql.cpp
+    optimizer.cpp
     utils.cpp
+)
+
+CFLAGS(
+    -Dpalloc0=yql_palloc0
+    -Dpfree=yql_pfree
 )
 
 IF (OS_WINDOWS)

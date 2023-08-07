@@ -5,8 +5,8 @@
 
 namespace NYql {
 
-    TDataProviderInitializer GetGenericDataProviderInitializer(Connector::IClient::TPtr genericClient,
-                                                               const std::shared_ptr<NYql::IDatabaseAsyncResolver> dbResolver)
+    TDataProviderInitializer GetGenericDataProviderInitializer(NConnector::IClient::TPtr genericClient,
+                                                               const std::shared_ptr<IDatabaseAsyncResolver> dbResolver)
     {
         return [genericClient, dbResolver](const TString& userName, const TString& sessionId, const TGatewaysConfig* gatewaysConfig,
                                            const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
@@ -25,9 +25,9 @@ namespace NYql {
 
             state->Types = typeCtx.Get();
             state->FunctionRegistry = functionRegistry;
-            state->DbResolver = dbResolver;
+            state->DatabaseResolver = dbResolver;
             if (gatewaysConfig) {
-                state->Configuration->Init(gatewaysConfig->GetGeneric(), state->DbResolver, state->DatabaseIds);
+                state->Configuration->Init(gatewaysConfig->GetGeneric(), state->DatabaseResolver, state->DatabaseAuth, typeCtx->Credentials);
             }
 
             TDataProviderInfo info;

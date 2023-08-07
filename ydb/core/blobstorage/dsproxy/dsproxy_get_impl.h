@@ -205,7 +205,7 @@ public:
                     replyStatus);
             }
 
-            TString resultBuffer = result.HasBuffer() ? result.GetBuffer() : TString();
+            TRope resultBuffer = ev.GetBlobData(result);
             ui32 resultShift = result.HasShift() ? result.GetShift() : 0;
 
             // Currently CRC can be checked only if blob part is fully read
@@ -222,7 +222,14 @@ public:
             if (replyStatus == NKikimrProto::OK) {
                 // TODO(cthulhu): Verify shift and response size, and cookie
                 R_LOG_DEBUG_SX(logCtx, "BPG58", "Got# OK orderNumber# " << orderNumber << " vDiskId# " << vdisk.ToString());
-                Blackboard.AddResponseData(blobId, orderNumber, resultShift, resultBuffer, result.GetKeep(), result.GetDoNotKeep());
+                resultBuffer.Compact();
+                if (resultBuffer.GetOccupiedMemorySize() > resultBuffer.size() * 2) {
+                    auto temp = TRcBuf::Uninitialized(resultBuffer.size());
+                    resultBuffer.ExtractFrontPlain(temp.GetDataMut(), temp.size());
+                    resultBuffer.Insert(resultBuffer.End(), std::move(temp));
+                }
+                Blackboard.AddResponseData(blobId, orderNumber, resultShift, std::move(resultBuffer), result.GetKeep(),
+                    result.GetDoNotKeep());
             } else if (replyStatus == NKikimrProto::NODATA) {
                 R_LOG_DEBUG_SX(logCtx, "BPG59", "Got# NODATA orderNumber# " << orderNumber
                         << " vDiskId# " << vdisk.ToString());

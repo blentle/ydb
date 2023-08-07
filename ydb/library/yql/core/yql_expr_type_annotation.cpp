@@ -110,6 +110,13 @@ IGraphTransformer::TStatus TryConvertToImpl(TExprContext& ctx, TExprNode::TPtr& 
             node = ctx.NewCallable(node->Pos(), "Nothing", { ExpandType(node->Pos(), expectedType, ctx) });
             return IGraphTransformer::TStatus::Repeat;
         }
+
+        if (sourceType.GetKind() == ETypeAnnotationKind::Pg) {
+            if (sourceType.Cast<TPgExprType>()->GetName() == "unknown") {
+                node = ctx.NewCallable(node->Pos(), "PgCast", { node, ExpandType(node->Pos(), expectedType, ctx) });
+                return IGraphTransformer::TStatus::Repeat;
+            }
+        }
     }
 
     if (expectedType.GetKind() == ETypeAnnotationKind::Optional) {
@@ -940,6 +947,10 @@ NUdf::TCastResultOptions CastResult(const TDataExprType* source, const TDataExpr
 
 template <bool Strong>
 NUdf::TCastResultOptions CastResult(const TPgExprType* source, const TPgExprType* target) {
+    if (source->GetName() == "unknown") {
+        return NUdf::ECastOptions::Complete;
+    }
+
     if (source->GetId() != target->GetId()) {
         return NUdf::ECastOptions::Impossible;
     }
@@ -1296,6 +1307,14 @@ const TDataExprType* CommonType(TPositionHandle pos, const TDataExprType* one, c
 
 const TPgExprType* CommonType(TPositionHandle pos, const TPgExprType* one, const TPgExprType* two, TExprContext& ctx) {
     if (one->GetId() == two->GetId()) {
+        return one;
+    }
+
+    if (one->GetName() == "unknown") {
+        return two;
+    }
+
+    if (two->GetName() == "unknown") {
         return one;
     }
 
@@ -2773,41 +2792,62 @@ bool EnsureWideStreamType(TPositionHandle position, const TTypeAnnotationNode& t
     return true;
 }
 
-bool EnsureWideFlowBlockType(const TExprNode& node, TTypeAnnotationNode::TListType& blockItemTypes, TExprContext& ctx, bool allowScalar) {
-    if (!EnsureWideFlowType(node, ctx)) {
+bool EnsureWideBlockType(TPositionHandle position, const TTypeAnnotationNode& type, TTypeAnnotationNode::TListType& blockItemTypes, TExprContext& ctx, bool allowScalar) {
+    if (HasError(&type, ctx)) {
         return false;
     }
 
-    auto& items = node.GetTypeAnn()->Cast<TFlowExprType>()->GetItemType()->Cast<TMultiExprType>()->GetItems();
+    if (type.GetKind() != ETypeAnnotationKind::Multi) {
+        ctx.AddError(TIssue(ctx.GetPosition(position), TStringBuilder() << "Expected wide type, but got: " << type));
+        return false;
+    }
+
+    auto& items = type.Cast<TMultiExprType>()->GetItems();
     if (items.empty()) {
-        ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), "Expected at least one column"));
-        return IGraphTransformer::TStatus::Error;
+        ctx.AddError(TIssue(ctx.GetPosition(position), "Expected at least one column"));
+        return false;
     }
 
     bool isScalar;
     for (ui32 i = 0; i < items.size(); ++i) {
-        const auto& type = items[i];
-        if (!EnsureBlockOrScalarType(node.Pos(), *type, ctx)) {
+        const auto& itemType = items[i];
+        if (!EnsureBlockOrScalarType(position, *itemType, ctx)) {
             return false;
         }
 
-        blockItemTypes.push_back(GetBlockItemType(*type, isScalar));
+        blockItemTypes.push_back(GetBlockItemType(*itemType, isScalar));
         if (!allowScalar && isScalar && (i + 1 != items.size())) {
-            ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), "Scalars are not allowed"));
+            ctx.AddError(TIssue(ctx.GetPosition(position), "Scalars are not allowed"));
             return false;
         }
     }
 
     if (!isScalar) {
-        ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), "Last column should be a scalar"));
+        ctx.AddError(TIssue(ctx.GetPosition(position), "Last column should be a scalar"));
         return false;
     }
 
-    if (!EnsureSpecificDataType(node.Pos(), *blockItemTypes.back(), EDataSlot::Uint64, ctx)) {
+    if (!EnsureSpecificDataType(position, *blockItemTypes.back(), EDataSlot::Uint64, ctx)) {
         return false;
     }
 
     return true;
+}
+
+bool EnsureWideFlowBlockType(const TExprNode& node, TTypeAnnotationNode::TListType& blockItemTypes, TExprContext& ctx, bool allowScalar) {
+    if (!EnsureWideFlowType(node, ctx)) {
+        return false;
+    }
+
+    return EnsureWideBlockType(node.Pos(), *node.GetTypeAnn()->Cast<TFlowExprType>()->GetItemType(), blockItemTypes, ctx, allowScalar);
+}
+
+bool EnsureWideStreamBlockType(const TExprNode& node, TTypeAnnotationNode::TListType& blockItemTypes, TExprContext& ctx, bool allowScalar) {
+    if (!EnsureWideStreamType(node, ctx)) {
+        return false;
+    }
+
+    return EnsureWideBlockType(node.Pos(), *node.GetTypeAnn()->Cast<TStreamExprType>()->GetItemType(), blockItemTypes, ctx, allowScalar);
 }
 
 bool EnsureOptionalType(const TExprNode& node, TExprContext& ctx) {
@@ -2938,6 +2978,13 @@ bool EnsureDictType(TPositionHandle position, const TTypeAnnotationNode& type, T
     return true;
 }
 
+bool IsVoidType(const TExprNode& node, TExprContext& ctx) {
+    if (HasError(node.GetTypeAnn(), ctx) || !node.GetTypeAnn()) {
+        return false;
+    }
+    return node.GetTypeAnn()->GetKind() == ETypeAnnotationKind::Void;
+}
+
 bool EnsureVoidType(const TExprNode& node, TExprContext& ctx) {
     if (HasError(node.GetTypeAnn(), ctx) || !node.GetTypeAnn()) {
         YQL_ENSURE(node.Type() == TExprNode::Lambda);
@@ -2945,7 +2992,7 @@ bool EnsureVoidType(const TExprNode& node, TExprContext& ctx) {
         return false;
     }
 
-    if (node.GetTypeAnn()->GetKind() != ETypeAnnotationKind::Void) {
+    if (!IsVoidType(node, ctx)) {
         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), TStringBuilder() << "Expected void type, but got: " << *node.GetTypeAnn()));
         return false;
     }
@@ -4477,7 +4524,7 @@ EDataSlot GetDateTypeByLevel(ui32 level) {
     }
 }
 
-bool IsPureIsolatedLambdaImpl(const TExprNode& lambdaBody, TNodeSet& visited) {
+bool IsPureIsolatedLambdaImpl(const TExprNode& lambdaBody, TNodeSet& visited, TSyncMap* syncList) {
     if (!visited.emplace(&lambdaBody).second) {
         return true;
     }
@@ -4486,12 +4533,24 @@ bool IsPureIsolatedLambdaImpl(const TExprNode& lambdaBody, TNodeSet& visited) {
         return true;
     }
 
+    if (syncList) {
+        if (auto right = TMaybeNode<TCoRight>(&lambdaBody)) {
+            auto cons = right.Cast().Input().Maybe<TCoCons>();
+            if (!cons) {
+                return false;
+            }
+
+            syncList->emplace(cons.Cast().World().Ptr(), syncList->size());
+            return IsPureIsolatedLambdaImpl(cons.Cast().Input().Ref(), visited, syncList);
+        }
+    }
+
     if (!lambdaBody.GetTypeAnn()->IsComposable()) {
         return false;
     }
 
     for (auto& child : lambdaBody.Children()) {
-        if (!IsPureIsolatedLambdaImpl(*child, visited)) {
+        if (!IsPureIsolatedLambdaImpl(*child, visited, syncList)) {
             return false;
         }
     }
@@ -4499,9 +4558,9 @@ bool IsPureIsolatedLambdaImpl(const TExprNode& lambdaBody, TNodeSet& visited) {
     return true;
 }
 
-bool IsPureIsolatedLambda(const TExprNode& lambdaBody) {
+bool IsPureIsolatedLambda(const TExprNode& lambdaBody, TSyncMap* syncList) {
     TNodeSet visited;
-    return IsPureIsolatedLambdaImpl(lambdaBody, visited);
+    return IsPureIsolatedLambdaImpl(lambdaBody, visited, syncList);
 }
 
 TString GetIntegralAtomValue(ui64 value, bool hasSign) {
@@ -5273,13 +5332,29 @@ bool IsSystemMember(const TStringBuf& memberName) {
     return memberName.StartsWith(TStringBuf("_yql_"));
 }
 
-template<bool Deduplicte, bool OrListsOfAtoms>
+template<bool Deduplicte, ui8 OrListsOfAtomsDepth>
 IGraphTransformer::TStatus NormalizeTupleOfAtoms(const TExprNode::TPtr& input, ui32 index, TExprNode::TPtr& output, TExprContext& ctx)
 {
     auto children = input->Child(index)->ChildrenList();
     bool needRestart = false;
 
-    if constexpr (OrListsOfAtoms) {
+    if constexpr (OrListsOfAtomsDepth == 2U) {
+        if (!EnsureTuple(*input->Child(index), ctx))
+            return IGraphTransformer::TStatus::Error;
+
+        for (auto i = 0U; i < children.size(); ++i) {
+            if (const auto item = input->Child(index)->Child(i); item->IsList()) {
+                if (1U == item->ChildrenSize() && item->Head().IsAtom()) {
+                    needRestart = true;
+                    children[i] = item->HeadPtr();
+                } else if (const auto status = NormalizeTupleOfAtoms<Deduplicte, 1U>(input->ChildPtr(index), i, children[i], ctx); IGraphTransformer::TStatus::Error == status)
+                    return status;
+                else
+                    needRestart = needRestart || IGraphTransformer::TStatus::Repeat == status;
+            } else if (!EnsureAtom(*item, ctx))
+                return IGraphTransformer::TStatus::Error;
+        }
+    } else if constexpr (OrListsOfAtomsDepth == 1U) {
         if (!EnsureTuple(*input->Child(index), ctx))
             return IGraphTransformer::TStatus::Error;
 
@@ -5297,7 +5372,24 @@ IGraphTransformer::TStatus NormalizeTupleOfAtoms(const TExprNode::TPtr& input, u
         return IGraphTransformer::TStatus::Error;
 
     const auto getKey = [](const TExprNode::TPtr& node) {
-        if constexpr (OrListsOfAtoms) {
+        if constexpr (OrListsOfAtomsDepth == 2U) {
+            using TItemType = TSmallVec<std::string_view>;
+            using TKeyType = TSmallVec<TItemType>;
+
+            if (node->IsAtom())
+                return TKeyType(1U, TItemType(1U, node->Content()));
+
+            TKeyType result(node->ChildrenSize());
+            std::transform(node->Children().cbegin(), node->Children().cend(), result.begin(), [](const TExprNode::TPtr& item) {
+                if (item->IsAtom())
+                    return TItemType(1U, item->Content());
+
+                TItemType part(item->ChildrenSize());
+                std::transform(item->Children().cbegin(), item->Children().cend(), part.begin(), [](const TExprNode::TPtr& atom) { return atom->Content(); });
+                return part;
+            });
+            return result;
+        } else if constexpr (OrListsOfAtomsDepth == 1U) {
             using TKeyType = TSmallVec<std::string_view>;
             if (node->IsAtom())
                 return TKeyType(1U, node->Content());
@@ -5308,6 +5400,7 @@ IGraphTransformer::TStatus NormalizeTupleOfAtoms(const TExprNode::TPtr& input, u
         } else
             return node->Content();
     };
+
     const auto cmp = [&getKey](const TExprNode::TPtr& a, const TExprNode::TPtr& b) { return getKey(a) < getKey(b); };
     if (std::is_sorted(children.cbegin(), children.cend(), cmp)) {
         if constexpr (Deduplicte) {
@@ -5333,9 +5426,10 @@ IGraphTransformer::TStatus NormalizeTupleOfAtoms(const TExprNode::TPtr& input, u
     return IGraphTransformer::TStatus::Ok;
 }
 
-template IGraphTransformer::TStatus NormalizeTupleOfAtoms<true, true>(const TExprNode::TPtr& input, ui32 index, TExprNode::TPtr& output, TExprContext& ctx);
-template IGraphTransformer::TStatus NormalizeTupleOfAtoms<true, false>(const TExprNode::TPtr& input, ui32 index, TExprNode::TPtr& output, TExprContext& ctx);
-template IGraphTransformer::TStatus NormalizeTupleOfAtoms<false, false>(const TExprNode::TPtr& input, ui32 index, TExprNode::TPtr& output, TExprContext& ctx);
+template IGraphTransformer::TStatus NormalizeTupleOfAtoms<true, 2U>(const TExprNode::TPtr& input, ui32 index, TExprNode::TPtr& output, TExprContext& ctx);
+template IGraphTransformer::TStatus NormalizeTupleOfAtoms<true, 1U>(const TExprNode::TPtr& input, ui32 index, TExprNode::TPtr& output, TExprContext& ctx);
+template IGraphTransformer::TStatus NormalizeTupleOfAtoms<true, 0U>(const TExprNode::TPtr& input, ui32 index, TExprNode::TPtr& output, TExprContext& ctx);
+template IGraphTransformer::TStatus NormalizeTupleOfAtoms<false, 0U>(const TExprNode::TPtr& input, ui32 index, TExprNode::TPtr& output, TExprContext& ctx);
 
 IGraphTransformer::TStatus NormalizeKeyValueTuples(const TExprNode::TPtr& input, ui32 startIndex, TExprNode::TPtr& output,
     TExprContext &ctx, bool deduplicate)
@@ -5437,6 +5531,10 @@ bool ExtractPgType(const TTypeAnnotationNode* type, ui32& pgType, bool& convertT
         return false;
     } else {
         pgType = type->Cast<TPgExprType>()->GetId();
+        if (NPg::LookupType(pgType).Name == "unknown") {
+            pgType = 0;
+        }
+
         return true;
     }
 }
@@ -5452,7 +5550,7 @@ bool HasContextFuncs(const TExprNode& input) {
             return false;
         }
 
-        if (node.IsCallable({"AggApply","AggApplyState","AggApplyManyState","AggBlockApply","AggBlockApplyState"}) && 
+        if (node.IsCallable({"AggApply","AggApplyState","AggApplyManyState","AggBlockApply","AggBlockApplyState"}) &&
             node.Head().Content().StartsWith("pg_")) {
             needCtx = true;
             return false;
@@ -5875,7 +5973,9 @@ TExprNode::TPtr ExpandPgAggregationTraits(TPositionHandle pos, const NPg::TAggre
             .Seal()
             .Build();
 
-        if (lambda->GetTypeAnn()->GetKind() == ETypeAnnotationKind::Null) {
+        if ((lambda->GetTypeAnn()->GetKind() == ETypeAnnotationKind::Null) ||
+            (lambda->GetTypeAnn()->GetKind() == ETypeAnnotationKind::Pg &&
+            lambda->GetTypeAnn()->Cast<TPgExprType>()->GetName() == "unknown")) {
             initLambda = ctx.Builder(pos)
                 .Lambda()
                     .Param("row")

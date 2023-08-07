@@ -11,9 +11,10 @@
 #include <ydb/core/kqp/compute_actor/kqp_compute_actor.h>
 #include <ydb/core/kqp/rm_service/kqp_resource_estimation.h>
 #include <ydb/core/kqp/rm_service/kqp_rm_service.h>
+#include <ydb/core/kqp/runtime/kqp_read_actor.h>
 #include <ydb/core/kqp/common/kqp_resolve.h>
 
-#include <ydb/core/base/wilson.h>
+#include <ydb/library/wilson_ids/wilson.h>
 
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 #include <library/cpp/monlib/service/pages/templates.h>
@@ -75,7 +76,7 @@ struct TMemoryQuotaManager : public NYql::NDq::TGuaranteeQuotaManager {
         , ui64 txId
         , ui64 taskId
         , ui64 limit
-        , bool instantAlloc) 
+        , bool instantAlloc)
     : NYql::NDq::TGuaranteeQuotaManager(limit, limit)
     , ResourceManager(std::move(resourceManager))
     , MemoryPool(memoryPool)
@@ -96,7 +97,7 @@ struct TMemoryQuotaManager : public NYql::NDq::TGuaranteeQuotaManager {
             return false;
         }
 
-        if (!ResourceManager->AllocateResources(TxId, TaskId, 
+        if (!ResourceManager->AllocateResources(TxId, TaskId,
                 NRm::TKqpResourcesRequest{.MemoryPool = MemoryPool, .Memory = extraSize})) {
             LOG_W("Can not allocate memory. TxId: " << TxId << ", taskId: " << TaskId << ", memory: +" << extraSize);
             return false;
@@ -106,7 +107,7 @@ struct TMemoryQuotaManager : public NYql::NDq::TGuaranteeQuotaManager {
     }
 
     void FreeExtraQuota(ui64 extraSize) override {
-        ResourceManager->FreeResources(TxId, TaskId, 
+        ResourceManager->FreeResources(TxId, TaskId,
             NRm::TKqpResourcesRequest{.MemoryPool = MemoryPool, .Memory = extraSize}
         );
     }
@@ -142,6 +143,12 @@ public:
         , AsyncIoFactory(std::move(asyncIoFactory))
     {
         Buckets = std::make_shared<TBucketArray>();
+        if (config.HasIteratorReadsRetrySettings()) {
+            SetIteratorReadsRetrySettings(config.GetIteratorReadsRetrySettings());
+        }
+        if (config.HasIteratorReadQuotaSettings()) {
+            SetIteratorReadsQuotaSettings(config.GetIteratorReadQuotaSettings());
+        }
     }
 
     void Bootstrap() {
@@ -261,10 +268,15 @@ private:
         }
     };
 
+    static constexpr double SecToUsec = 1e6;
+
     void HandleWork(TEvKqpNode::TEvStartKqpTasksRequest::TPtr& ev) {
         NWilson::TSpan sendTasksSpan(TWilsonKqp::KqpNodeSendTasks, NWilson::TTraceId(ev->TraceId), "KqpNode.SendTasks", NWilson::EFlags::AUTO_END);
 
+        NHPTimer::STime workHandlerStart = ev->SendTime;
         auto& msg = ev->Get()->Record;
+        Counters->NodeServiceStartEventDelivery->Collect(NHPTimer::GetTimePassed(&workHandlerStart) * SecToUsec);
+
         auto requester = ev->Sender;
 
         ui64 txId = msg.GetTxId();
@@ -415,9 +427,16 @@ private:
             auto& taskCtx = request.InFlyTasks[dqTask.GetId()];
             YQL_ENSURE(taskCtx.TaskId != 0);
 
-            memoryLimits.ChannelBufferSize = taskCtx.ChannelSize;
-            Y_VERIFY_DEBUG(memoryLimits.ChannelBufferSize >= Config.GetMinChannelBufferSize(),
-                "actual size: %ld, min: %ld", memoryLimits.ChannelBufferSize, Config.GetMinChannelBufferSize());
+            {
+                ui32 inputChannelsCount = 0;
+                for (auto&& i : dqTask.GetInputs()) {
+                    inputChannelsCount += i.ChannelsSize();
+                }
+                memoryLimits.ChannelBufferSize = std::max<ui32>(taskCtx.ChannelSize / std::max<ui32>(1, inputChannelsCount), Config.GetMinChannelBufferSize());
+                AFL_DEBUG(NKikimrServices::KQP_COMPUTE)("event", "channel_info")
+                    ("ch_size", taskCtx.ChannelSize)("ch_count", taskCtx.Channels)("ch_limit", memoryLimits.ChannelBufferSize)
+                    ("inputs", dqTask.InputsSize())("input_channels_count", inputChannelsCount);
+            }
 
             auto& taskOpts = dqTask.GetProgram().GetSettings();
             auto limit = taskOpts.GetHasMapJoin() /* || opts.GetHasSort()*/
@@ -496,6 +515,8 @@ private:
 
         Send(request.Executer, reply.Release(), IEventHandle::FlagTrackDelivery, txId);
 
+        Counters->NodeServiceProcessTime->Collect(NHPTimer::GetTimePassed(&workHandlerStart) * SecToUsec);
+
         bucket.NewRequest(txId, requester, std::move(request), memoryPool);
     }
 
@@ -506,11 +527,14 @@ private:
     }
 
     void HandleWork(TEvKqpNode::TEvCancelKqpTasksRequest::TPtr& ev) {
+        THPTimer timer;
         ui64 txId = ev->Get()->Record.GetTxId();
         auto& reason = ev->Get()->Record.GetReason();
 
         LOG_W("TxId: " << txId << ", terminate transaction, reason: " << reason);
         TerminateTx(txId, reason);
+
+        Counters->NodeServiceProcessCancelTime->Collect(timer.Passed() * SecToUsec);
     }
 
     void TerminateTx(ui64 txId, const TString& reason) {
@@ -578,8 +602,37 @@ private:
             LOG_I("Updated table service config: " << Config.DebugString());
         }
 
+        if (event.GetConfig().GetTableServiceConfig().HasIteratorReadsRetrySettings()) {
+            SetIteratorReadsRetrySettings(event.GetConfig().GetTableServiceConfig().GetIteratorReadsRetrySettings());
+        }
+
+        if (event.GetConfig().GetTableServiceConfig().HasIteratorReadQuotaSettings()) {
+            SetIteratorReadsQuotaSettings(event.GetConfig().GetTableServiceConfig().GetIteratorReadQuotaSettings());
+        }
+
         auto responseEv = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationResponse>(event);
         Send(ev->Sender, responseEv.Release(), IEventHandle::FlagTrackDelivery, ev->Cookie);
+    }
+
+    void SetIteratorReadsQuotaSettings(const NKikimrConfig::TTableServiceConfig::TIteratorReadQuotaSettings& settings) {
+        SetDefaultIteratorQuotaSettings(settings.GetMaxRows(), settings.GetMaxBytes());
+    }
+
+    void SetIteratorReadsRetrySettings(const NKikimrConfig::TTableServiceConfig::TIteratorReadsRetrySettings& settings) {
+        auto ptr = MakeIntrusive<NKikimr::NKqp::TIteratorReadBackoffSettings>();
+        ptr->StartRetryDelay = TDuration::MilliSeconds(settings.GetStartDelayMs());
+        ptr->MaxShardAttempts = settings.GetMaxShardRetries();
+        ptr->MaxShardResolves = settings.GetMaxShardResolves();
+        ptr->UnsertaintyRatio = settings.GetUnsertaintyRatio();
+        ptr->Multiplier = settings.GetMultiplier();
+        if (settings.GetMaxTotalRetries()) {
+            ptr->MaxTotalRetries = settings.GetMaxTotalRetries();
+        }
+        if (settings.GetIteratorResponseTimeoutMs()) {
+            ptr->ReadResponseTimeout = TDuration::MilliSeconds(settings.GetIteratorResponseTimeoutMs());
+        }
+        ptr->MaxRetryDelay = TDuration::MilliSeconds(settings.GetMaxDelayMs());
+        SetReadIteratorBackoffSettings(ptr);
     }
 
     void HandleWork(TEvents::TEvUndelivered::TPtr& ev) {

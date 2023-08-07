@@ -84,6 +84,7 @@ target_compile_options(yql-parser-pg_wrapper PRIVATE
   -Dpg_mode_mask=yql_pg_mode_mask
   -Dpg_strong_random=yql_pg_strong_random
   -Dpg_strong_random_init=yql_pg_strong_random_init
+  -DScanKeywordBareLabel=yql_ScanKeywordBareLabel
   -DScanKeywordCategories=yql_ScanKeywordCategories
   -DScanKeywords=yql_ScanKeywords
   -Dscram_ClientKey=yql_scram_ClientKey
@@ -96,7 +97,6 @@ target_compile_options(yql-parser-pg_wrapper PRIVATE
   $<IF:$<CXX_COMPILER_ID:MSVC>,,-Wno-everything>
 )
 target_include_directories(yql-parser-pg_wrapper PRIVATE
-  ${CMAKE_SOURCE_DIR}/contrib/libs/libiconv/include
   ${CMAKE_SOURCE_DIR}/contrib/libs/lz4
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/parser/pg_wrapper/postgresql/src/backend/bootstrap
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/parser/pg_wrapper/postgresql/src/backend/parser
@@ -117,8 +117,7 @@ target_link_libraries(yql-parser-pg_wrapper PUBLIC
   library-cpp-yson
   library-yql-core
   yql-minikql-arrow
-  yql-minikql-computation
-  yql-minikql-comp_nodes
+  minikql-computation-llvm
   yql-parser-pg_catalog
   providers-common-codec
   yql-public-issue
@@ -144,6 +143,7 @@ target_sources(yql-parser-pg_wrapper PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/parser/pg_wrapper/pg_kernels.2.cpp
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/parser/pg_wrapper/pg_kernels.3.cpp
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/parser/pg_wrapper/config.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/library/yql/parser/pg_wrapper/cost_mocks.cpp
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/parser/pg_wrapper/postgresql/src/port/pg_crc32c_sse42.c
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/parser/pg_wrapper/postgresql/src/port/pg_crc32c_sse42_choose.c
   ${CMAKE_SOURCE_DIR}/ydb/library/yql/parser/pg_wrapper/postgresql/src/backend/access/brin/brin.c

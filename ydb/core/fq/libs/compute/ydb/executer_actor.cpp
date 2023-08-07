@@ -6,9 +6,9 @@
 #include <ydb/core/fq/libs/compute/common/run_actor_params.h>
 #include <ydb/core/fq/libs/compute/ydb/events/events.h>
 #include <ydb/core/fq/libs/ydb/ydb.h>
-#include <ydb/core/protos/services.pb.h>
+#include <ydb/library/services/services.pb.h>
 
-#include <ydb/public/sdk/cpp/client/draft/ydb_query/client.h>
+#include <ydb/public/sdk/cpp/client/ydb_query/client.h>
 #include <ydb/public/sdk/cpp/client/ydb_operation/operation.h>
 
 #include <library/cpp/actors/core/actor.h>
@@ -77,7 +77,7 @@ public:
     }
 
     STRICT_STFUNC(StateFunc,
-        hFunc(TEvPrivate::TEvExecuteScriptResponse, Handle);
+        hFunc(TEvYdbCompute::TEvExecuteScriptResponse, Handle);
         hFunc(TEvents::TEvForwardPingResponse, Handle);
     )
 
@@ -88,22 +88,22 @@ public:
         if (ev.Get()->Get()->Success) {
             pingCounters->Ok->Inc();
             LOG_I("Information about the operation id and execution id is stored. ExecutionId: " << ExecutionId << " OperationId: " << ProtoToString(OperationId));
-            Send(Parent, new TEvPrivate::TEvExecuterResponse(OperationId, ExecutionId));
+            Send(Parent, new TEvYdbCompute::TEvExecuterResponse(OperationId, ExecutionId));
             CompleteAndPassAway();
         } else {
             pingCounters->Error->Inc();
             // Without the idempotency key, we lose the running operation here
             LOG_E("Error saving information about the operation id and execution id. ExecutionId: " << ExecutionId << " OperationId: " << ProtoToString(OperationId));
-            Send(Parent, new TEvPrivate::TEvExecuterResponse(NYql::TIssues{NYql::TIssue{TStringBuilder{} << "Error saving information about the operation id and execution id. ExecutionId: " << ExecutionId << " OperationId: " << ProtoToString(OperationId)}}));
+            Send(Parent, new TEvYdbCompute::TEvExecuterResponse(NYql::TIssues{NYql::TIssue{TStringBuilder{} << "Error saving information about the operation id and execution id. ExecutionId: " << ExecutionId << " OperationId: " << ProtoToString(OperationId)}}));
             FailedAndPassAway();
         }
     }
 
-    void Handle(const TEvPrivate::TEvExecuteScriptResponse::TPtr& ev) {
+    void Handle(const TEvYdbCompute::TEvExecuteScriptResponse::TPtr& ev) {
         const auto& response = *ev.Get()->Get();
         if (response.Status != NYdb::EStatus::SUCCESS) {
             LOG_E("Can't execute script: " << ev->Get()->Issues.ToOneLineString());
-            Send(Parent, new TEvPrivate::TEvExecuterResponse(ev->Get()->Issues));
+            Send(Parent, new TEvYdbCompute::TEvExecuterResponse(ev->Get()->Issues));
             FailedAndPassAway();
             return;
         }
@@ -114,7 +114,39 @@ public:
     }
 
     void SendExecuteScript() {
-        Register(new TRetryActor<TEvPrivate::TEvExecuteScriptRequest, TEvPrivate::TEvExecuteScriptResponse, TString, TString>(Counters.GetCounters(ERequestType::RT_EXECUTE_SCRIPT), SelfId(), Connector, Params.Sql, Params.JobId));
+        Register(new TRetryActor<TEvYdbCompute::TEvExecuteScriptRequest, TEvYdbCompute::TEvExecuteScriptResponse, TString, TString, TDuration, TDuration, Ydb::Query::Syntax, Ydb::Query::ExecMode>(Counters.GetCounters(ERequestType::RT_EXECUTE_SCRIPT), SelfId(), Connector, Params.Sql, Params.JobId, Params.ResultTtl, Params.ExecutionTtl, GetSyntax(), GetExecuteMode()));
+    }
+
+    Ydb::Query::Syntax GetSyntax() const {
+        switch (Params.QuerySyntax) {
+            case FederatedQuery::QueryContent::PG:
+                return Ydb::Query::SYNTAX_PG;
+            case FederatedQuery::QueryContent::YQL_V1:
+                return Ydb::Query::SYNTAX_YQL_V1;
+            case FederatedQuery::QueryContent::QUERY_SYNTAX_UNSPECIFIED:
+            case FederatedQuery::QueryContent_QuerySyntax_QueryContent_QuerySyntax_INT_MAX_SENTINEL_DO_NOT_USE_:
+            case FederatedQuery::QueryContent_QuerySyntax_QueryContent_QuerySyntax_INT_MIN_SENTINEL_DO_NOT_USE_:
+                return Ydb::Query::SYNTAX_UNSPECIFIED;
+        }
+    }
+
+    Ydb::Query::ExecMode GetExecuteMode() const {
+        switch (Params.ExecuteMode) {
+            case FederatedQuery::RUN:
+                return Ydb::Query::ExecMode::EXEC_MODE_EXECUTE;
+            case FederatedQuery::PARSE:
+                return Ydb::Query::ExecMode::EXEC_MODE_PARSE;
+            case FederatedQuery::VALIDATE:
+                return Ydb::Query::ExecMode::EXEC_MODE_VALIDATE;
+            case FederatedQuery::EXPLAIN:
+                return Ydb::Query::ExecMode::EXEC_MODE_EXPLAIN;
+            case FederatedQuery::EXECUTE_MODE_UNSPECIFIED:
+            case FederatedQuery::COMPILE:
+            case FederatedQuery::SAVE:
+            case FederatedQuery::ExecuteMode_INT_MAX_SENTINEL_DO_NOT_USE_:
+            case FederatedQuery::ExecuteMode_INT_MIN_SENTINEL_DO_NOT_USE_:
+                return Ydb::Query::ExecMode::EXEC_MODE_UNSPECIFIED;
+        }
     }
 
     void SendPingTask() {

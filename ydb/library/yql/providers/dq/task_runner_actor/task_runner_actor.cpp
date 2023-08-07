@@ -97,7 +97,7 @@ private:
 
         bool fallback = false;
         bool retry = false;
-        for (TStringBuf line: StringSplitter(input).SplitByString("\n").SkipEmpty()) {
+        for (TStringBuf line: StringSplitter(input).SplitByString("\n")) {
             if (line.Contains("mlockall failed")) {
                 // skip
             } else {
@@ -110,6 +110,9 @@ private:
                         fallback = true;
                     } else if (line.Contains("No such transaction")) {
                         // YQL-15542
+                        fallback = true;
+                    } else if (line.Contains("(NYT::TErrorException) Request timed out")) {
+                        // RPC reader fallback to YT
                         fallback = true;
                     } else if (line.Contains("Transaction") && line.Contains("aborted")) {
                         // YQL-15542
@@ -314,10 +317,10 @@ private:
                     maxChunks = 1;
                 }
 
-                TVector<NDqProto::TData> chunks;
+                TVector<TDqSerializedBatch> chunks;
                 NDqProto::TPopResponse response;
                 for (;maxChunks && remain > 0 && !isFinished && hasData; maxChunks--, remain -= dataSize) {
-                    NDqProto::TData data;
+                    TDqSerializedBatch data;
                     const auto lastPop = std::move(channel->Pop(data));
 
                     for (auto& metric : lastPop.GetMetric()) {
@@ -325,7 +328,7 @@ private:
                     }
 
                     hasData = lastPop.GetResult();
-                    dataSize = data.GetRaw().size();
+                    dataSize = data.Size();
                     isFinished = !hasData && channel->IsFinished();
                     response.SetResult(response.GetResult() || hasData);
                     changed = changed || hasData || (isFinished != wasFinished);

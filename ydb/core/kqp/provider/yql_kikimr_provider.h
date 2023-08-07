@@ -105,8 +105,8 @@ struct TKikimrQueryContext : TThrRefBase {
     // Operations on document API tables are performed in restricted mode by default,
     // full mode can be enabled explicitly.
     bool DocumentApiRestricted = true;
-
     bool IsInternalCall = false;
+    bool ConcurrentResults = true;
 
     std::unique_ptr<NKikimrKqp::TPreparedQuery> PreparingQuery;
     std::shared_ptr<const NKikimrKqp::TPreparedQuery> PreparedQuery;
@@ -228,8 +228,8 @@ enum class TYdbOperation : ui32 {
     ModifyPermission     = 1 << 22
 };
 
-Y_DECLARE_FLAGS(TYdbOperations, TYdbOperation)
-Y_DECLARE_OPERATORS_FOR_FLAGS(TYdbOperations)
+Y_DECLARE_FLAGS(TYdbOperations, TYdbOperation);
+Y_DECLARE_OPERATORS_FOR_FLAGS(TYdbOperations);
 
 const TYdbOperations& KikimrSchemeOps();
 const TYdbOperations& KikimrDataOps();
@@ -324,10 +324,12 @@ public:
             }
 
             if (IsIn({EKikimrQueryType::Query, EKikimrQueryType::Script}, queryType) && (newOp & KikimrSchemeOps())) {
-                TString message = TStringBuilder() << "Operation '" << newOp
-                    << "' can't be performed in query";
-                issues.AddIssue(YqlIssue(pos, TIssuesIds::KIKIMR_BAD_OPERATION, message));
-                return {false, issues};
+                if (EffectiveIsolationLevel) {
+                    TString message = TStringBuilder() << "Scheme operations can't be performed inside transaction, "
+                        << "operation: " << newOp;
+                    issues.AddIssue(YqlIssue(pos, TIssuesIds::KIKIMR_BAD_OPERATION, message));
+                    return {false, issues};
+                }
             }
 
             if (queryType == EKikimrQueryType::Ddl && (newOp & KikimrDataOps())) {
@@ -482,6 +484,7 @@ TIntrusivePtr<IDataProvider> CreateKikimrDataSink(
     TTypeAnnotationContext& types,
     TIntrusivePtr<IKikimrGateway> gateway,
     TIntrusivePtr<TKikimrSessionContext> sessionCtx,
+    const NKikimr::NExternalSource::IExternalSourceFactory::TPtr& sourceFactory,
     TIntrusivePtr<IKikimrQueryExecutor> queryExecutor);
 
 } // namespace NYql

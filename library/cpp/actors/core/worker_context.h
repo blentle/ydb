@@ -18,7 +18,7 @@
 
 namespace NActors {
     struct TWorkerContext {
-        const TWorkerId WorkerId;
+        TWorkerId WorkerId;
         const TCpuId CpuId;
         TLease Lease;
         IExecutorPool* Executor = nullptr;
@@ -30,15 +30,14 @@ namespace NActors {
         TExecutorThreadStats WorkerStats;
         TPoolId PoolId = MaxPools;
         mutable NLWTrace::TOrbit Orbit;
-        bool HasCapturedMessageBox = false;
+        bool IsNeededToWaitNextActivation = true;
         i64 HPStart = 0;
         ui32 ExecutedEvents = 0;
 
-        TWorkerContext(TWorkerId workerId, TCpuId cpuId, size_t activityVecSize)
+        TWorkerContext(TWorkerId workerId, TCpuId cpuId)
             : WorkerId(workerId)
             , CpuId(cpuId)
             , Lease(WorkerId, NeverExpire)
-            , WorkerStats(activityVecSize)
         {}
 
 #ifdef ACTORSLIB_COLLECT_EXEC_STATS

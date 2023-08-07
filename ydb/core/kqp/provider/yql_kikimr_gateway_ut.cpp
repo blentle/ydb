@@ -1,5 +1,6 @@
 #include <ydb/core/client/minikql_compile/mkql_compile_service.h>
 #include <ydb/core/client/minikql_result_lib/converter.h>
+#include <ydb/core/kqp/gateway/actors/kqp_ic_gateway_actors.h>
 #include <ydb/core/kqp/gateway/kqp_gateway.h>
 #include <ydb/core/kqp/gateway/kqp_metadata_loader.h>
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
@@ -118,135 +119,6 @@ void TestLoadTableMetadataCommon(TIntrusivePtr<IKikimrGateway> gateway) {
     UNIT_ASSERT_VALUES_EQUAL(metadata.KeyColumnNames[1], "UserSubkey");
 }
 
-void CheckPolicies(Tests::TClient& client, const TString& tableName) {
-    auto describeResult = client.Ls(tableName);
-    UNIT_ASSERT(describeResult->Record.GetPathDescription().HasTableStats());
-    const auto& desc = describeResult->Record.GetPathDescription();
-    UNIT_ASSERT_VALUES_EQUAL(desc.GetTableStats().GetPartCount(), 4);
-    for (const auto& column : desc.GetTable().GetColumns()) {
-        if (column.GetName() == "Column2") {
-            UNIT_ASSERT_VALUES_EQUAL(column.GetFamilyName(), "Family2");
-        }
-    }
-    for (const auto& family : desc.GetTable().GetPartitionConfig().GetColumnFamilies()) {
-        if (family.HasId() && family.GetId() == 0) {
-            UNIT_ASSERT_VALUES_EQUAL(static_cast<size_t>(family.GetColumnCodec()),
-                static_cast<size_t>(NKikimrSchemeOp::ColumnCodecPlain));
-        } else if (family.HasName() && family.GetName() == "Family2") {
-            UNIT_ASSERT_VALUES_EQUAL(static_cast<size_t>(family.GetColumnCodec()),
-                static_cast<size_t>(NKikimrSchemeOp::ColumnCodecLZ4));
-        }
-    }
-}
-
-struct TTestIndexSettings {
-    const bool WithDataColumns;
-};
-
-void TestCreateTableCommon(TIntrusivePtr<IKikimrGateway> gateway, Tests::TClient& client,
-        bool createFolders = true, const TMaybe<TTestIndexSettings> withIndex = Nothing(), bool withExtendedDdl = false,
-        const TMaybe<bool>& shouldCreate = Nothing()) {
-    auto metadata = MakeIntrusive<TKikimrTableMetadata>();
-
-    metadata->Cluster = TestCluster;
-    metadata->Name = "/Root/f1/f2/table";
-
-    UNIT_ASSERT(metadata->ColumnOrder.size() == metadata->Columns.size());
-
-    metadata->Columns.insert(std::make_pair("Column1", TKikimrColumnMetadata{"Column1", 0, "Uint32", false}));
-    metadata->ColumnOrder.push_back("Column1");
-
-    metadata->Columns.insert(std::make_pair("Column2", TKikimrColumnMetadata{"Column2", 0, "String", false}));
-    metadata->ColumnOrder.push_back("Column2");
-
-    if (withExtendedDdl) {
-        metadata->Columns["Column2"].Families.push_back("Family2");
-    }
-
-    metadata->KeyColumnNames.push_back("Column1");
-
-    if (withIndex) {
-        TVector<TString> dataColumns;
-        if (withIndex->WithDataColumns) {
-            metadata->Columns.insert(std::make_pair("Column3", TKikimrColumnMetadata{"Column3", 0, "String", false}));
-            metadata->ColumnOrder.push_back("Column3");
-            dataColumns.push_back("Column3");
-        }
-        TIndexDescription indexDesc{
-            TString("Column2Index"),
-            TVector<TString>{"Column2"},
-            dataColumns,
-            TIndexDescription::EType::GlobalSync,
-            TIndexDescription::EIndexState::Ready,
-            0,
-            0,
-            0
-        };
-        metadata->Indexes.push_back(indexDesc);
-    }
-
-    if (withExtendedDdl) {
-        metadata->TableSettings.AutoPartitioningBySize = "disabled";
-        metadata->TableSettings.PartitionAtKeys = {
-            {std::make_pair(EDataSlot::Uint32, "10")},
-            {std::make_pair(EDataSlot::Uint32, "100")},
-            {std::make_pair(EDataSlot::Uint32, "1000")}
-        };
-        metadata->ColumnFamilies = {
-            {"default", "test", "off"},
-            {"Family2", "test", "lz4"}
-        };
-    }
-
-    auto responseFuture = gateway->CreateTable(metadata, createFolders);
-    responseFuture.Wait();
-    auto response = responseFuture.GetValue();
-    response.Issues().PrintTo(Cerr);
-    if ((!shouldCreate && !createFolders) || (shouldCreate && !*shouldCreate)) {
-        UNIT_ASSERT(!response.Success());
-        UNIT_ASSERT(HasIssue(response.Issues(), TIssuesIds::KIKIMR_SCHEME_ERROR));
-    } else {
-        UNIT_ASSERT_C(response.Success(), response.Issues().ToString());
-
-        auto loadFuture = gateway->LoadTableMetadata(TestCluster, "/Root/f1/f2/table",
-            IKikimrGateway::TLoadTableMetadataSettings());
-        loadFuture.Wait();
-        auto loadResponse = loadFuture.GetValue();
-        UNIT_ASSERT(loadResponse.Success());
-        UNIT_ASSERT_VALUES_EQUAL(metadata->Name, loadResponse.Metadata->Name);
-        UNIT_ASSERT_VALUES_EQUAL(metadata->Indexes.size(), loadResponse.Metadata->Indexes.size());
-
-        THashMap<TString, TIndexDescription> expected;
-        for (const auto& indexDesc : metadata->Indexes) {
-            expected.insert(std::make_pair(indexDesc.Name, indexDesc));
-        }
-
-        THashMap<TString, TIndexDescription> indexResult;
-        for (const auto& indexDesc : loadResponse.Metadata->Indexes) {
-            indexResult.insert(std::make_pair(indexDesc.Name, indexDesc));
-        }
-
-        UNIT_ASSERT_VALUES_EQUAL(indexResult.size(), expected.size());
-        for (const auto& indexDescResult : indexResult) {
-            const auto expectedDesc = expected.find(indexDescResult.first);
-            UNIT_ASSERT(expectedDesc != expected.end());
-            UNIT_ASSERT_VALUES_EQUAL(expectedDesc->second.KeyColumns.size(), indexDescResult.second.KeyColumns.size());
-            UNIT_ASSERT_EQUAL(expectedDesc->second.Type, indexDescResult.second.Type);
-            for (size_t i = 0; i < indexDescResult.second.KeyColumns.size(); i++) {
-                UNIT_ASSERT_VALUES_EQUAL(indexDescResult.second.KeyColumns[i], expectedDesc->second.KeyColumns[i]);
-            }
-            UNIT_ASSERT_VALUES_EQUAL(expectedDesc->second.DataColumns.size(), indexDescResult.second.DataColumns.size());
-            for (size_t i = 0; i < indexDescResult.second.DataColumns.size(); i++) {
-                UNIT_ASSERT_VALUES_EQUAL(indexDescResult.second.DataColumns[i], expectedDesc->second.DataColumns[i]);
-            }
-        }
-
-        if (withExtendedDdl) {
-            CheckPolicies(client, metadata->Name);
-        }
-    }
-}
-
 void TestDropTableCommon(TIntrusivePtr<IKikimrGateway> gateway) {
     auto responseFuture = gateway->DropTable(TestCluster, "/Root/Test/UserTable");
     responseFuture.Wait();
@@ -263,13 +135,12 @@ void TestDropTableCommon(TIntrusivePtr<IKikimrGateway> gateway) {
 }
 
 void TestCreateExternalDataSource(TTestActorRuntime& runtime, TIntrusivePtr<IKikimrGateway> gateway, const TString& path) {
-    NYql::TCreateExternalDataSourceSettings settings;
-    settings.ExternalDataSource = path;
-    settings.SourceType = "ObjectStorage";
-    settings.AuthMethod = "NONE";
-    settings.Installation = "cloud";
-
-    auto responseFuture = gateway->CreateExternalDataSource(TestCluster, settings, true);
+    TCreateObjectSettings settings("EXTERNAL_DATA_SOURCE", path, {
+        {"source_type", "ObjectStorage"},
+        {"auth_method", "NONE"},
+        {"installation", "cloud"}
+    });
+    auto responseFuture = gateway->CreateObject(TestCluster, settings);
     responseFuture.Wait();
     auto response = responseFuture.GetValue();
     response.Issues().PrintTo(Cerr);
@@ -289,7 +160,6 @@ void TestCreateExternalDataSource(TTestActorRuntime& runtime, TIntrusivePtr<IKik
 
 void TestCreateExternalTable(TTestActorRuntime& runtime, TIntrusivePtr<IKikimrGateway> gateway, const TString& path, bool fail = false) {
     NYql::TCreateExternalTableSettings settings;
-
     settings.ExternalTable = path;
     settings.DataSourcePath = "/Root/f1/f2/external_data_source";
     settings.Location = "/";
@@ -320,7 +190,6 @@ void TestCreateExternalTable(TTestActorRuntime& runtime, TIntrusivePtr<IKikimrGa
 }
 
 void TestDropExternalTable(TTestActorRuntime& runtime, TIntrusivePtr<IKikimrGateway> gateway, const TString& path) {
-
     auto responseFuture = gateway->DropExternalTable(TestCluster, TDropExternalTableSettings{.ExternalTable=path});
     responseFuture.Wait();
     auto response = responseFuture.GetValue();
@@ -334,7 +203,8 @@ void TestDropExternalTable(TTestActorRuntime& runtime, TIntrusivePtr<IKikimrGate
 }
 
 void TestDropExternalDataSource(TTestActorRuntime& runtime, TIntrusivePtr<IKikimrGateway> gateway, const TString& path) {
-    auto responseFuture = gateway->DropExternalDataSource(TestCluster, TDropExternalDataSourceSettings{.ExternalDataSource=path});
+    TDropObjectSettings settings("EXTERNAL_DATA_SOURCE", path, {});
+    auto responseFuture = gateway->DropObject(TestCluster, settings);
     responseFuture.Wait();
     auto response = responseFuture.GetValue();
     response.Issues().PrintTo(Cerr);
@@ -362,66 +232,22 @@ Y_UNIT_TEST_SUITE(KikimrIcGateway) {
         TestLoadTableMetadataCommon(GetIcGateway(kikimr.GetTestServer()));
     }
 
-    Y_UNIT_TEST(TestCreateTable) {
-        TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
-        CreateSampleTables(kikimr);
-        TestCreateTableCommon(GetIcGateway(kikimr.GetTestServer()), kikimr.GetTestClient());
-    }
-
-    Y_UNIT_TEST(TestCreateTableWithIndex) {
-        TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
-        CreateSampleTables(kikimr);
-        TestCreateTableCommon(GetIcGateway(kikimr.GetTestServer()), kikimr.GetTestClient(), true,
-            TTestIndexSettings{false});
-    }
-
-    Y_UNIT_TEST(TestCreateTableWithCoverIndex) {
-        TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
-        CreateSampleTables(kikimr);
-        TestCreateTableCommon(GetIcGateway(kikimr.GetTestServer()), kikimr.GetTestClient(), true,
-            TTestIndexSettings{true});
-    }
-
-    Y_UNIT_TEST(TestCreateTableNoFolder) {
-        TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
-        CreateSampleTables(kikimr);
-        TestCreateTableCommon(GetIcGateway(kikimr.GetTestServer()), kikimr.GetTestClient(), false, Nothing(),
-            false, true);
-    }
-
-    Y_UNIT_TEST(TestCreateSameTable) {
-        TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
-        CreateSampleTables(kikimr);
-        TestCreateTableCommon(GetIcGateway(kikimr.GetTestServer()), kikimr.GetTestClient());
-    }
-
-    Y_UNIT_TEST(TestCreateSameTableWithIndex) {
-        TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
-        CreateSampleTables(kikimr);
-        TestCreateTableCommon(GetIcGateway(kikimr.GetTestServer()), kikimr.GetTestClient(), true,
-            TTestIndexSettings{false});
-    }
-
     Y_UNIT_TEST(TestDropTable) {
         TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
         CreateSampleTables(kikimr);
         TestDropTableCommon(GetIcGateway(kikimr.GetTestServer()));
     }
 
-    Y_UNIT_TEST(TestCreateTableWithExtendedDdl) {
-        TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
-        CreateSampleTables(kikimr);
-        TestCreateTableCommon(GetIcGateway(kikimr.GetTestServer()), kikimr.GetTestClient(), true, Nothing(), true);
-    }
-
     Y_UNIT_TEST(TestCreateExternalTable) {
         TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
+        kikimr.GetTestServer().GetRuntime()->GetAppData(0).FeatureFlags.SetEnableExternalDataSources(true);
         TestCreateExternalDataSource(*kikimr.GetTestServer().GetRuntime(), GetIcGateway(kikimr.GetTestServer()), "/Root/f1/f2/external_data_source");
         TestCreateExternalTable(*kikimr.GetTestServer().GetRuntime(), GetIcGateway(kikimr.GetTestServer()), "/Root/f1/f2/external_table");
     }
 
     Y_UNIT_TEST(TestCreateSameExternalTable) {
         TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
+        kikimr.GetTestServer().GetRuntime()->GetAppData(0).FeatureFlags.SetEnableExternalDataSources(true);
         TestCreateExternalDataSource(*kikimr.GetTestServer().GetRuntime(), GetIcGateway(kikimr.GetTestServer()), "/Root/f1/f2/external_data_source");
         TestCreateExternalTable(*kikimr.GetTestServer().GetRuntime(), GetIcGateway(kikimr.GetTestServer()), "/Root/f1/f2/external_table");
         TestCreateExternalTable(*kikimr.GetTestServer().GetRuntime(), GetIcGateway(kikimr.GetTestServer()), "/Root/f1/f2/external_table", true);
@@ -429,6 +255,7 @@ Y_UNIT_TEST_SUITE(KikimrIcGateway) {
 
     Y_UNIT_TEST(TestDropExternalTable) {
         TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
+        kikimr.GetTestServer().GetRuntime()->GetAppData(0).FeatureFlags.SetEnableExternalDataSources(true);
         TestCreateExternalDataSource(*kikimr.GetTestServer().GetRuntime(), GetIcGateway(kikimr.GetTestServer()), "/Root/f1/f2/external_data_source");
         TestCreateExternalTable(*kikimr.GetTestServer().GetRuntime(), GetIcGateway(kikimr.GetTestServer()), "/Root/f1/f2/external_table");
         TestDropExternalTable(*kikimr.GetTestServer().GetRuntime(), GetIcGateway(kikimr.GetTestServer()), "/Root/f1/f2/external_table");
@@ -436,6 +263,7 @@ Y_UNIT_TEST_SUITE(KikimrIcGateway) {
 
     Y_UNIT_TEST(TestDropExternalDataSource) {
         TKikimrRunner kikimr(NKqp::TKikimrSettings().SetWithSampleTables(false));
+        kikimr.GetTestServer().GetRuntime()->GetAppData(0).FeatureFlags.SetEnableExternalDataSources(true);
         TestCreateExternalDataSource(*kikimr.GetTestServer().GetRuntime(), GetIcGateway(kikimr.GetTestServer()), "/Root/f1/f2/external_data_source");
         TestDropExternalDataSource(*kikimr.GetTestServer().GetRuntime(), GetIcGateway(kikimr.GetTestServer()), "/Root/f1/f2/external_data_source");
     }
@@ -472,6 +300,68 @@ Y_UNIT_TEST_SUITE(KikimrIcGateway) {
         UNIT_ASSERT_VALUES_EQUAL(response.Metadata->ExternalSource.DataSourcePath, externalDataSourceName);
         UNIT_ASSERT_VALUES_EQUAL(response.Metadata->ExternalSource.DataSourceLocation, "my-bucket");
         UNIT_ASSERT_VALUES_EQUAL(response.Metadata->Columns.size(), 2);
+    }
+
+    void CreateSecretObject(const TString& secretId, const TString& secretValue, TSession& session, TTestActorRuntime* runtime) {
+        auto createSecretQuery = TStringBuilder() << "CREATE OBJECT " << secretId << " (TYPE SECRET) WITH value = `" << secretValue << "`;";
+        auto createSecretQueryResult = session.ExecuteSchemeQuery(createSecretQuery).GetValueSync();
+        UNIT_ASSERT_C(createSecretQueryResult.GetStatus() == NYdb::EStatus::SUCCESS, createSecretQueryResult.GetIssues().ToString());
+
+        TDuration maximalWaitTime = TDuration::Seconds(20);
+        TInstant start = TInstant::Now();
+        bool created = false;
+        while (!created && TInstant::Now() - start <= maximalWaitTime) {
+            auto promise = NThreading::NewPromise<TDescribeObjectResponse>();
+            runtime->Register(new TDescribeObjectActor("", secretId, promise));
+            TDescribeObjectResponse response = promise.GetFuture().GetValueSync();
+
+            if (response.Status == Ydb::StatusIds::SUCCESS) {
+                created = true;
+                break;
+            }
+            
+            Sleep(TDuration::Seconds(2));
+        }
+
+        UNIT_ASSERT_C(created, "Creating secret object timeout.\n");
+    }
+    
+    Y_UNIT_TEST(TestLoadSecretValueFromExternalDataSourceMetadata) {
+        TKikimrRunner kikimr;
+        kikimr.GetTestServer().GetRuntime()->GetAppData(0).FeatureFlags.SetEnableExternalDataSources(true);
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        TString secretId = "mySaSecretId";
+        TString secretValue = "mySaSecretValue";
+        CreateSecretObject(secretId, secretValue, session, kikimr.GetTestServer().GetRuntime());
+
+        TString externalDataSourceName = "/Root/ExternalDataSource";
+        TString externalTableName = "/Root/ExternalTable";
+        auto query = TStringBuilder() << R"(
+            CREATE EXTERNAL DATA SOURCE `)" << externalDataSourceName << R"(` WITH (
+                SOURCE_TYPE="ObjectStorage",
+                LOCATION="my-bucket",
+                AUTH_METHOD="SERVICE_ACCOUNT",
+                SERVICE_ACCOUNT_ID="",
+                SERVICE_ACCOUNT_SECRET_NAME=")" << secretId << R"("
+            );
+            CREATE EXTERNAL TABLE `)" << externalTableName << R"(` (
+                Key Uint64,
+                Value String
+            ) WITH (
+                DATA_SOURCE=")" << externalDataSourceName << R"(",
+                LOCATION="/"
+            );)";
+        auto result = session.ExecuteSchemeQuery(query).GetValueSync();
+        UNIT_ASSERT_C(result.GetStatus() == NYdb::EStatus::SUCCESS, result.GetIssues().ToString());
+
+        auto responseFuture = GetIcGateway(kikimr.GetTestServer())->LoadTableMetadata(TestCluster, externalTableName, IKikimrGateway::TLoadTableMetadataSettings());
+        responseFuture.Wait();
+
+        auto response = responseFuture.GetValue();
+        UNIT_ASSERT_C(response.Success(), response.Issues().ToOneLineString());
+        UNIT_ASSERT_VALUES_EQUAL(response.Metadata->ExternalSource.ServiceAccountIdSignature, secretValue);
     }
 }
 

@@ -37,7 +37,10 @@ struct TDqSettings {
         static constexpr double HashShuffleTasksRatio = 0.5;
         static constexpr ui32 HashShuffleMaxTasks = 24;
         static constexpr bool UseFastPickleTransport = false;
+        static constexpr bool UseOOBTransport = false;
         static constexpr bool AggregateStatsByStage = true;
+        static constexpr bool EnableChannelStats = false;
+        static constexpr bool ExportStats = false;
     };
 
     using TPtr = std::shared_ptr<TDqSettings>;
@@ -95,9 +98,13 @@ struct TDqSettings {
     NCommon::TConfSetting<ui32, false> HashShuffleMaxTasks;
 
     NCommon::TConfSetting<bool, false> UseWideChannels;
+    NCommon::TConfSetting<bool, false> UseWideBlockChannels;
     NCommon::TConfSetting<bool, false> UseFastPickleTransport;
+    NCommon::TConfSetting<bool, false> UseOOBTransport;
 
     NCommon::TConfSetting<bool, false> AggregateStatsByStage;
+    NCommon::TConfSetting<bool, false> EnableChannelStats;
+    NCommon::TConfSetting<bool, false> ExportStats;
 
     // This options will be passed to executor_actor and worker_actor
     template <typename TProtoConfig>
@@ -145,8 +152,12 @@ struct TDqSettings {
         SAVE_SETTING(HashShuffleTasksRatio);
         SAVE_SETTING(HashShuffleMaxTasks);
         SAVE_SETTING(UseWideChannels);
+        SAVE_SETTING(UseWideBlockChannels);
         SAVE_SETTING(UseFastPickleTransport);
+        SAVE_SETTING(UseOOBTransport);
         SAVE_SETTING(AggregateStatsByStage);
+        SAVE_SETTING(EnableChannelStats);
+        SAVE_SETTING(ExportStats);
 #undef SAVE_SETTING
     }
 
@@ -169,29 +180,10 @@ struct TDqConfiguration: public TDqSettings, public NCommon::TSettingDispatcher 
     TDqConfiguration();
     TDqConfiguration(const TDqConfiguration&) = delete;
 
-    template <class TProtoConfig>
-    void Init(const TProtoConfig& config, const TString& userName)
-    {
+    template <class TProtoConfig, typename TFilter>
+    void Init(const TProtoConfig& config, const TFilter& filter) {
         // Init settings from config
-        this->Dispatch(config.GetDefaultSettings(), userName);
-
-        // TODO: drop after releasing new gateways config
-        if (this->AnalyzeQuery.Get().Empty()) {
-            int percent = 0;
-
-            if ((percent = this->_AnalyzeQueryPercentage.Get().GetOrElse(0)) &&
-                RandomNumber<ui8>(100) < percent)
-            {
-                this->Dispatch(NCommon::ALL_CLUSTERS, "AnalyzeQuery", "true", TDqConfiguration::EStage::STATIC);
-            }
-
-            for (const auto& userFromConfig : config.GetDefaultAnalyzeQueryForUsers()) {
-                if (userFromConfig == userName) {
-                    this->Dispatch(NCommon::ALL_CLUSTERS, "AnalyzeQuery", "true", TDqConfiguration::EStage::STATIC);
-                    break;
-                }
-            }
-        }
+        this->Dispatch(config.GetDefaultSettings(), filter);
 
         this->FreezeDefaults();
     }

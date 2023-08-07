@@ -15,6 +15,7 @@ default:
   feature_user_and_group: true
   feature_olap_tables: true
 #  feature_logbroker: true
+  feature_topic_control_plane: true
   ydb-full-name: YDB
   ydb-short-name: YDB
   yandex-cloud: Yandex.Cloud
@@ -23,6 +24,8 @@ default:
   sf-name: Cloud Functions
   concept_secondary_index: ../../../../concepts/secondary_indexes
   concept_table: ../../../../concepts/datamodel/table
+  ydb-binaries-url: https://binaries.ydb.tech
+  ydb-stable-binary-archive: ydbd-stable-linux-amd64.tar.gz
   ydb_local_docker_image: cr.yandex/yc/yandex-docker-local-ydb
   ydb_local_docker_image_tag: latest
   managed-k8s-full-name: Yandex Managed Service for Kubernetes
@@ -31,7 +34,7 @@ default:
   objstorage-name: Object Storage
   ydb-cli: ydb
   k8s: Kubernetes
-  quickstart-path: ../../../../administration/quickstart.md#queries
+  quickstart-path: ../../../../getting_started/quickstart.md
   oss: true
   feature_not_null_for_pk: true
   ydb_non_deterministic_functions: true

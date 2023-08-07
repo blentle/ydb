@@ -44,27 +44,6 @@ using TEvBulkUpsertRequest = NGRpcService::TGrpcRequestOperationCall<Ydb::Table:
     Ydb::Table::BulkUpsertResponse>;
 
 Y_UNIT_TEST_SUITE(KqpOlap) {
-    void EnableDebugLogging(NActors::TTestActorRuntime* runtime) {
-        //runtime->SetLogPriority(NKikimrServices::FLAT_TX_SCHEMESHARD, NActors::NLog::PRI_DEBUG);
-        //runtime->SetLogPriority(NKikimrServices::TX_PROXY_SCHEME_CACHE, NActors::NLog::PRI_DEBUG);
-        // runtime->SetLogPriority(NKikimrServices::SCHEME_BOARD_REPLICA, NActors::NLog::PRI_DEBUG);
-        // runtime->SetLogPriority(NKikimrServices::TX_PROXY, NActors::NLog::PRI_DEBUG);
-        // runtime->SetLogPriority(NKikimrServices::KQP_EXECUTER, NActors::NLog::PRI_DEBUG);
-        runtime->SetLogPriority(NKikimrServices::KQP_COMPUTE, NActors::NLog::PRI_DEBUG);
-        runtime->SetLogPriority(NKikimrServices::KQP_GATEWAY, NActors::NLog::PRI_DEBUG);
-        runtime->SetLogPriority(NKikimrServices::KQP_RESOURCE_MANAGER, NActors::NLog::PRI_DEBUG);
-        //runtime->SetLogPriority(NKikimrServices::LONG_TX_SERVICE, NActors::NLog::PRI_DEBUG);
-        runtime->SetLogPriority(NKikimrServices::TX_COLUMNSHARD, NActors::NLog::PRI_TRACE);
-        runtime->SetLogPriority(NKikimrServices::TX_COLUMNSHARD_SCAN, NActors::NLog::PRI_DEBUG);
-        runtime->SetLogPriority(NKikimrServices::TX_CONVEYOR, NActors::NLog::PRI_DEBUG);
-        runtime->SetLogPriority(NKikimrServices::METADATA_PROVIDER, NActors::NLog::PRI_DEBUG);
-        //runtime->SetLogPriority(NKikimrServices::GRPC_SERVER, NActors::NLog::PRI_DEBUG);
-    }
-
-    void EnableDebugLogging(TKikimrRunner& kikimr) {
-        EnableDebugLogging(kikimr.GetTestServer().GetRuntime());
-    }
-
     void PrintValue(IOutputStream& out, const NYdb::TValue& v) {
         NYdb::TValueParser value(v);
 
@@ -763,15 +742,13 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             .SetWithSampleTables(false);
         TKikimrRunner kikimr(settings);
 
-        // EnableDebugLogging(kikimr);
-
         TLocalHelper(kikimr).CreateTestOlapTable();
 
         WriteTestData(kikimr, "/Root/olapStore/olapTable", 0, 1000000, 2);
 
         auto client = kikimr.GetTableClient();
 
-        // EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
 
         {
             auto it = client.StreamExecuteScanQuery(R"(
@@ -1361,6 +1338,38 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         CompareYson(expectedYson, ysonResult);
     }
 
+    Y_UNIT_TEST(CheckEarlyFilterOnEmptySelect) {
+        auto settings = TKikimrSettings()
+            .SetWithSampleTables(false);
+        TKikimrRunner kikimr(settings);
+
+        TLocalHelper(kikimr).CreateTestOlapTable();
+        auto csController = NYDBTest::TControllers::RegisterCSController<NYDBTest::NColumnShard::TController>();
+        ui32 rowsCount = 0;
+        {
+            ui32 i = 0;
+            const ui32 rowsPack = 20;
+            const TInstant start = Now();
+            while (!csController->HasCompactions() && Now() - start < TDuration::Seconds(100)) {
+                WriteTestData(kikimr, "/Root/olapStore/olapTable", 0, 1000000 + i * rowsPack, rowsPack);
+                ++i;
+                rowsCount += rowsPack;
+            }
+        }
+        Sleep(TDuration::Seconds(10));
+        auto tableClient = kikimr.GetTableClient();
+        auto selectQuery = TString(R"(
+            SELECT * FROM `/Root/olapStore/olapTable`
+            WHERE uid='dsfdfsd'
+            LIMIT 10;
+        )");
+
+        auto rows = ExecuteScanQuery(tableClient, selectQuery);
+        Cerr << csController->GetFilteredRecordsCount().Val() << Endl;
+        Y_VERIFY(csController->GetFilteredRecordsCount().Val() * 10 <= rowsCount);
+        UNIT_ASSERT(rows.size() == 0);
+    }
+
     Y_UNIT_TEST(ExtractRanges) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false);
@@ -1456,7 +1465,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
         TLocalHelper(kikimr).CreateTestOlapTable();
         WriteTestData(kikimr, "/Root/olapStore/olapTable", 10000, 3000000, 5);
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
 
         auto tableClient = kikimr.GetTableClient();
 
@@ -1668,7 +1677,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
         TLocalHelper(kikimr).CreateTestOlapTable();
         WriteTestData(kikimr, "/Root/olapStore/olapTable", 10000, 3000000, 5);
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
 
         auto tableClient = kikimr.GetTableClient();
 
@@ -1714,7 +1723,11 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
     }
 #endif
 
+#if SSA_RUNTIME_VERSION >= 3U
+    Y_UNIT_TEST(PredicatePushdown_LikePushedDownForStringType) {
+#else
     Y_UNIT_TEST(PredicatePushdown_LikeNotPushedDownForStringType) {
+#endif
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false);
         TKikimrRunner kikimr(settings);
@@ -1724,7 +1737,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
         TTableWithNullsHelper(kikimr).CreateTableWithNulls();
         WriteTestDataForTableWithNulls(kikimr, "/Root/tableWithNulls");
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
 
         auto tableClient = kikimr.GetTableClient();
         auto query = R"(SELECT id, binary_str FROM `/Root/tableWithNulls` WHERE binary_str LIKE "5%")";
@@ -1733,8 +1746,13 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
         auto result = CollectStreamResult(it);
         auto ast = result.QueryStats->Getquery_ast();
+#if SSA_RUNTIME_VERSION >= 3U
+        UNIT_ASSERT_C(ast.find("KqpOlapFilter") != std::string::npos,
+                        TStringBuilder() << "Predicate wasn't pushed down. Query: " << query);
+#else
         UNIT_ASSERT_C(ast.find("KqpOlapFilter") == std::string::npos,
-                        TStringBuilder() << "Predicate pushed down. Query: " << query);
+                        TStringBuilder() << "Predicate was pushed down. Query: " << query);
+#endif
     }
 
     Y_UNIT_TEST(PredicatePushdown_LikeNotPushedDownIfAnsiLikeDisabled) {
@@ -1747,7 +1765,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
         TTableWithNullsHelper(kikimr).CreateTableWithNulls();
         WriteTestDataForTableWithNulls(kikimr, "/Root/tableWithNulls");
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
 
         auto tableClient = kikimr.GetTableClient();
         auto query = R"(
@@ -1773,7 +1791,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
 
         TLocalHelper(kikimr).CreateTestOlapTable();
         WriteTestData(kikimr, "/Root/olapStore/olapTable", 10000, 3000000, 5);
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
 
         auto tableClient = kikimr.GetTableClient();
         auto query = R"(
@@ -2205,7 +2223,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         auto sender = runtime->AllocateEdgeActor();
 
         InitRoot(server, sender);
-        EnableDebugLogging(runtime);
+        Tests::NCommon::TLoggerInit(runtime).Initialize();
 
         ui32 numShards = 1;
         ui32 numIterations = 10;
@@ -2353,7 +2371,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             .SetForceColumnTablesCompositeMarks(true);
         TKikimrRunner kikimr(settings);
 
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
         TTableWithNullsHelper(kikimr).CreateTableWithNulls();
         auto tableClient = kikimr.GetTableClient();
 
@@ -3383,7 +3401,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             auto settings = TKikimrSettings()
                 .SetWithSampleTables(false);
             TKikimrRunner kikimr(settings);
-            EnableDebugLogging(kikimr);
+            Tests::NCommon::TLoggerInit(kikimr).Initialize();
             TTypedLocalHelper helper("", kikimr, "olapTable", "olapStore12");
             helper.CreateTestOlapTable();
             helper.FillPKOnly(0, 800000);
@@ -3400,7 +3418,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             auto settings = TKikimrSettings()
                 .SetWithSampleTables(false);
             TKikimrRunner kikimr(settings);
-            EnableDebugLogging(kikimr);
+            Tests::NCommon::TLoggerInit(kikimr).Initialize();
             TTypedLocalHelper helper("Utf8", kikimr);
             helper.CreateTestOlapTable();
             NArrow::NConstruction::TStringPoolFiller sPool(groupsCount, 52);
@@ -3476,7 +3494,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         auto sender = runtime->AllocateEdgeActor();
 
         InitRoot(server, sender);
-        EnableDebugLogging(runtime);
+        Tests::NCommon::TLoggerInit(runtime).Initialize();
 
         const ui32 numShards = 10;
         const ui32 numIterations = 10;
@@ -3563,7 +3581,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         auto sender = runtime->AllocateEdgeActor();
 
         InitRoot(server, sender);
-        EnableDebugLogging(runtime);
+        Tests::NCommon::TLoggerInit(runtime).Initialize();
 
         ui32 numShards = NSan::PlainOrUnderSanitizer(1000, 10);
         ui32 numIterations = NSan::PlainOrUnderSanitizer(50, 10);
@@ -3629,7 +3647,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         auto sender = runtime->AllocateEdgeActor();
 
         InitRoot(server, sender);
-        EnableDebugLogging(runtime);
+        Tests::NCommon::TLoggerInit(runtime).Initialize();
 
         const ui32 numShards = 10;
         const ui32 numIterations = 50;
@@ -3692,7 +3710,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         auto sender = runtime->AllocateEdgeActor();
 
         InitRoot(server, sender);
-        EnableDebugLogging(runtime);
+        Tests::NCommon::TLoggerInit(runtime).Initialize();
 
         ui32 numShards = NSan::PlainOrUnderSanitizer(100, 10);
         ui32 numIterations = NSan::PlainOrUnderSanitizer(100, 10);
@@ -3836,7 +3854,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         auto settings = TKikimrSettings()
             .SetWithSampleTables(false);
         TKikimrRunner kikimr(settings);
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
 
         static ui32 numKinds = 5;
 
@@ -3997,7 +4015,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             WriteTestData(kikimr, "/Root/olapStore/olapTable_3", 0, 1000000 + i*10000, 3000);
         }
 
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
 
         auto tableClient = kikimr.GetTableClient();
 
@@ -4420,7 +4438,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         Tests::TClient client(serverSettings);
 
         auto& runtime = *server->GetRuntime();
-        EnableDebugLogging(&runtime);
+        Tests::NCommon::TLoggerInit(runtime).Initialize();
 
         auto sender = runtime.AllocateEdgeActor();
         server->SetupRootStoragePools(sender);
@@ -4476,7 +4494,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         Tests::TClient client(serverSettings);
 
         auto& runtime = *server->GetRuntime();
-        EnableDebugLogging(&runtime);
+        Tests::NCommon::TLoggerInit(runtime).Initialize();
 
         auto sender = runtime.AllocateEdgeActor();
         server->SetupRootStoragePools(sender);
@@ -4784,6 +4802,57 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         return;
         TAggregationTestCase testCase;
         testCase.SetQuery(R"(
+                SELECT id, JSON_VALUE(jsonval, "$.col1" RETURNING String), JSON_VALUE(jsondoc, "$.col1") FROM `/Root/tableWithNulls`
+                WHERE JSON_VALUE(jsonval, "$.col1" RETURNING String) = "val1" AND id = 1;
+            )")
+#if SSA_RUNTIME_VERSION >= 3U
+            .AddExpectedPlanOptions("KqpOlapJsonValue")
+#else
+            .AddExpectedPlanOptions("Udf")
+#endif
+            .SetExpectedReply(R"([[1;["val1"];#]])");
+
+        TestTableWithNulls({ testCase });
+    }
+
+    Y_UNIT_TEST(Json_GetValue_ToInt) {
+        // Should be fixed after Arrow kernel implementation for JSON_VALUE
+        // https://st.yandex-team.ru/KIKIMR-17903
+        return;
+        TAggregationTestCase testCase;
+        testCase.SetQuery(R"(
+                SELECT id, JSON_VALUE(jsonval, "$.obj.obj_col2_int" RETURNING Int), JSON_VALUE(jsondoc, "$.obj.obj_col2_int" RETURNING Int) FROM `/Root/tableWithNulls`
+                WHERE JSON_VALUE(jsonval, "$.obj.obj_col2_int" RETURNING Int) = 16 AND id = 1;
+            )")
+#if SSA_RUNTIME_VERSION >= 3U
+            .AddExpectedPlanOptions("KqpOlapJsonValue")
+#else
+            .AddExpectedPlanOptions("Udf")
+#endif
+            .SetExpectedReply(R"([[1;[16];#]])");
+
+        TestTableWithNulls({ testCase });
+    }
+
+    Y_UNIT_TEST(JsonDoc_GetValue) {
+        TAggregationTestCase testCase;
+        testCase.SetQuery(R"(
+                SELECT id, JSON_VALUE(jsonval, "$.col1"), JSON_VALUE(jsondoc, "$.col1") FROM `/Root/tableWithNulls`
+                WHERE JSON_VALUE(jsondoc, "$.col1") = "val1" AND id = 6;
+            )")
+#if SSA_RUNTIME_VERSION >= 3U
+            .AddExpectedPlanOptions("KqpOlapJsonValue")
+#else
+            .AddExpectedPlanOptions("Udf")
+#endif
+            .SetExpectedReply(R"([[6;#;["val1"]]])");
+
+        TestTableWithNulls({ testCase });
+    }
+
+    Y_UNIT_TEST(JsonDoc_GetValue_ToString) {
+        TAggregationTestCase testCase;
+        testCase.SetQuery(R"(
                 SELECT id, JSON_VALUE(jsonval, "$.col1"), JSON_VALUE(jsondoc, "$.col1" RETURNING String) FROM `/Root/tableWithNulls`
                 WHERE JSON_VALUE(jsondoc, "$.col1" RETURNING String) = "val1" AND id = 6;
             )")
@@ -4793,6 +4862,22 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             .AddExpectedPlanOptions("Udf")
 #endif
             .SetExpectedReply(R"([[6;#;["val1"]]])");
+
+        TestTableWithNulls({ testCase });
+    }
+
+    Y_UNIT_TEST(JsonDoc_GetValue_ToInt) {
+        TAggregationTestCase testCase;
+        testCase.SetQuery(R"(
+                SELECT id, JSON_VALUE(jsonval, "$.obj.obj_col2_int"), JSON_VALUE(jsondoc, "$.obj.obj_col2_int" RETURNING Int) FROM `/Root/tableWithNulls`
+                WHERE JSON_VALUE(jsondoc, "$.obj.obj_col2_int" RETURNING Int) = 16 AND id = 6;
+            )")
+#if SSA_RUNTIME_VERSION >= 3U
+            .AddExpectedPlanOptions("KqpOlapJsonValue")
+#else
+            .AddExpectedPlanOptions("Udf")
+#endif
+            .SetExpectedReply(R"([[6;#;[16]]])");
 
         TestTableWithNulls({ testCase });
     }
@@ -4817,10 +4902,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
         TestTableWithNulls({ testCase });
     }
 
-    Y_UNIT_TEST(Json_Exists_JsonDocument) {
-        // Should be fixed after Arrow kernel implementation for JSON_EXISTS
-        // https://st.yandex-team.ru/KIKIMR-17903
-        return;
+    Y_UNIT_TEST(JsonDoc_Exists) {
         TAggregationTestCase testCase;
         testCase.SetQuery(R"(
                 SELECT id, JSON_EXISTS(jsonval, "$.col1"), JSON_EXISTS(jsondoc, "$.col1") FROM `/Root/tableWithNulls`
@@ -4858,7 +4940,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             .SetForceColumnTablesCompositeMarks(true);
         TKikimrRunner kikimr(settings);
 
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
         TTableWithNullsHelper(kikimr).CreateTableWithNulls();
 
         auto tableClient = kikimr.GetTableClient();
@@ -4878,7 +4960,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             .SetForceColumnTablesCompositeMarks(true);
         TKikimrRunner kikimr(settings);
 
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
         TTableWithNullsHelper(kikimr).CreateTableWithNulls();
         TLocalHelper(kikimr).CreateTestOlapTable();
 
@@ -4904,7 +4986,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             .SetForceColumnTablesCompositeMarks(true);
         TKikimrRunner kikimr(settings);
 
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
         TTableWithNullsHelper(kikimr).CreateTableWithNulls();
         TLocalHelper(kikimr).CreateTestOlapTable();
 
@@ -4927,7 +5009,7 @@ Y_UNIT_TEST_SUITE(KqpOlap) {
             .SetForceColumnTablesCompositeMarks(true);
         TKikimrRunner kikimr(settings);
 
-        EnableDebugLogging(kikimr);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
         TTableWithNullsHelper(kikimr).CreateTableWithNulls();
         TLocalHelper(kikimr).CreateTestOlapTable();
 

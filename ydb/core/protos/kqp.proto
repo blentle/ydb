@@ -2,8 +2,9 @@ package NKikimrKqp;
 option java_package = "ru.yandex.kikimr.proto";
 option cc_enable_arenas = true;
 
+import "google/protobuf/duration.proto";
 import "library/cpp/actors/protos/actors.proto";
-import "ydb/core/protos/type_info.proto";
+import "ydb/core/scheme/protos/type_info.proto";
 import "ydb/core/protos/kqp_physical.proto";
 import "ydb/core/protos/kqp_stats.proto";
 import "ydb/core/protos/query_stats.proto";
@@ -12,7 +13,7 @@ import "ydb/public/api/protos/ydb_table.proto";
 import "ydb/public/api/protos/ydb_value.proto";
 import "ydb/public/api/protos/ydb_issue_message.proto";
 import "ydb/public/api/protos/ydb_topic.proto";
-import "ydb/public/api/protos/draft/ydb_query.proto";
+import "ydb/public/api/protos/ydb_query.proto";
 import "ydb/library/mkql_proto/protos/minikql.proto";
 import "ydb/library/yql/dq/actors/protos/dq_events.proto";
 import "ydb/library/yql/dq/actors/protos/dq_stats.proto";
@@ -40,6 +41,7 @@ enum EQueryType {
 
     QUERY_TYPE_SQL_GENERIC_QUERY = 12;
     QUERY_TYPE_SQL_GENERIC_SCRIPT = 13;
+    QUERY_TYPE_SQL_GENERIC_CONCURRENT_QUERY = 14;
 };
 
 enum EQueryAction {
@@ -81,7 +83,7 @@ message TQueryRequest {
     reserved 4; // (deprecated) KqlSettings
     optional bool KeepSession = 5;
     reserved 6; // (deprecated) Cluster
-    optional NKikimrMiniKQL.TParams Parameters = 7;
+    reserved 7; // (deprecated) Parameters
     reserved 8; // (deprecated) SqlAutoCommit
     optional EQueryAction Action = 9;
     reserved 10; // (deprecated) Profile
@@ -127,6 +129,7 @@ message TKqpColumnMetadataProto {
     optional NKikimrProto.TTypeInfo TypeInfo = 7;
     repeated string Family = 5;
     optional bool NotNull = 6 [default = false];
+    optional string DefaultFromSequence = 8;
 };
 
 message TKqpTableMetadataProto {
@@ -323,6 +326,7 @@ message TEvCreateSessionResponse {
 message TPingSessionRequest {
     optional bytes SessionId = 1;
     optional uint32 TimeoutMs = 2 [default = 5000];
+    optional bool ExtIdleCheck = 3; //It disables kqp proxy idle check
 }
 
 message TEvPingSessionRequest {
@@ -332,7 +336,6 @@ message TEvPingSessionRequest {
 
 message TPingSessionResponse {
     optional Ydb.Table.KeepAliveResult.SessionStatus SessionStatus = 1;
-    optional bool WorkerIsClosing = 2 [default = false];
 }
 
 message TEvPingSessionResponse {
@@ -515,6 +518,12 @@ message TEvCancelKqpTasksRequest {
 message TEvCancelKqpTasksResponse {
 }
 
+message TResourceExchangeBoardData {
+    optional NActorsProto.TActorId Owner = 1;
+    optional bytes Ulid = 2;
+    optional NActorsProto.TActorId Publisher = 3;
+}
+
 message TKqpNodeResources {
     optional NActorsProto.TActorId ResourceManagerActorId = 2; // legacy
     optional uint32 AvailableComputeActors = 4; // legacy
@@ -578,6 +587,7 @@ message TEvRemoteScanData {
     optional TArrowBatch ArrowBatch = 10;
 
     optional bool RequestedBytesLimitReached = 11 [default = false];
+    optional uint32 AvailablePacks = 12;
 }
 
 message TEvRemoteScanDataAck {
@@ -617,7 +627,14 @@ message TKqpStreamLookupSettings {
      repeated string LookupKeyColumns = 7;
 }
 
+message TKqpSequencerSettings {
+    optional NKqpProto.TKqpPhyTableId Table = 1;
+    repeated TKqpColumnMetadataProto Columns = 2;
+    optional string Database = 3;
+}
+
 message TEvFetchScriptResultsRequest {
+    optional uint64 ResultSetIndex = 3;
     optional uint64 RowsOffset = 1;
     optional uint64 RowsLimit = 2;
 }
@@ -629,6 +646,17 @@ message TEvFetchScriptResultsResponse {
     optional Ydb.ResultSet ResultSet = 4;
 }
 
+message TResourceExchangeNodeData {
+    optional TKqpNodeResources Resources = 1;
+    optional TResourceExchangeBoardData ResourceExchangeBoardData = 2;
+    optional uint64 Round = 3;
+}
+
+message TResourceExchangeSnapshot {
+    optional bool NeedResending = 1;
+    repeated TResourceExchangeNodeData Snapshot = 2;
+}
+
 // Request that is sent to run script actor to cancel execution and write finish status to database.
 message TEvCancelScriptExecutionRequest {
 }
@@ -636,4 +664,10 @@ message TEvCancelScriptExecutionRequest {
 message TEvCancelScriptExecutionResponse {
     optional Ydb.StatusIds.StatusCode Status = 1;
     repeated Ydb.Issue.IssueMessage Issues = 2;
+}
+
+// stored in column "meta" of .metadata/script_executions table
+message TScriptExecutionOperationMeta {
+    optional google.protobuf.Duration OperationTtl = 1;
+    optional google.protobuf.Duration ResultsTtl = 2;
 }

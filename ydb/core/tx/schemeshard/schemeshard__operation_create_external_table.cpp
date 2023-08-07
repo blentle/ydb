@@ -60,23 +60,6 @@ bool Validate(const TString& sourceType, const NKikimrSchemeOp::TExternalTableDe
         && ValidateDataSourcePath(desc.GetDataSourcePath(), errStr);
 }
 
-bool IsAllowedType(ui32 typeId) {
-    if (!NScheme::NTypeIds::IsYqlType(typeId)) {
-        return false;
-    }
-
-    switch (typeId) {
-        case NYql::NProto::Bool:
-        case NYql::NProto::Interval:
-        case NYql::NProto::Decimal:
-        case NYql::NProto::DyNumber:
-            return false;
-        default:
-            break;
-    }
-    return true;
-}
-
 Ydb::Type CreateYdbType(const NScheme::TTypeInfo& typeInfo, bool notNull) {
     Ydb::Type ydbType;
     if (typeInfo.GetTypeId() == NScheme::NTypeIds::Pg) {
@@ -139,12 +122,6 @@ TExternalTableInfo::TPtr CreateExternalTable(const TString& sourceType, const NK
         auto typeName = NMiniKQL::AdaptLegacyYqlType(col.GetType());
         const NScheme::IType* type = typeRegistry->GetType(typeName);
 
-        if (!type || !IsAllowedType(type->GetTypeId())) {
-            errStr = TStringBuilder()
-                << "Type '" << col.GetType() << "' specified for column '" << colName << "' is not supported";
-            return nullptr;
-        }
-
         NScheme::TTypeInfo typeInfo;
         if (type) {
             // Only allow YQL types
@@ -171,8 +148,7 @@ TExternalTableInfo::TPtr CreateExternalTable(const TString& sourceType, const NK
         nextColumnId = colId + 1 > nextColumnId ? colId + 1 : nextColumnId;
 
         TTableInfo::TColumn& column = externalTableInfo->Columns[colId];
-        column = TTableInfo::TColumn(colName, colId, typeInfo, ""); // TODO: do we need typeMod here?
-        column.NotNull = col.GetNotNull();
+        column = TTableInfo::TColumn(colName, colId, typeInfo, "", col.GetNotNull()); // TODO: do we need typeMod here?
 
         auto& schemaColumn= *schema.add_column();
         schemaColumn.set_name(colName);

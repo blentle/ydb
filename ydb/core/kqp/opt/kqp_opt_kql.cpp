@@ -6,6 +6,8 @@
 #include <ydb/library/yql/providers/dq/common/yql_dq_settings.h>
 #include <ydb/library/yql/dq/integration/yql_dq_integration.h>
 
+#include <library/cpp/containers/absl_flat_hash/flat_hash_set.h>
+
 namespace NKikimr::NKqp::NOpt {
 
 using namespace NYql;
@@ -95,6 +97,10 @@ bool UseReadTableRanges(const TKikimrTableDescription& tableData, const TIntrusi
     }
 
     if (kqpCtx->IsDataQuery() && kqpCtx->Config->EnablePredicateExtractForDataQuery) {
+        return true;
+    }
+
+    if (kqpCtx->IsGenericQuery()) {
         return true;
     }
 
@@ -192,63 +198,140 @@ TExprBase BuildReadTableIndex(const TKiReadTable& read, const TKikimrTableDescri
     }
 }
 
-TExprBase BuildUpsertTable(const TKiWriteTable& write, const TCoAtomList& inputColumns,
-    const TKikimrTableDescription& tableData, TExprContext& ctx)
+TExprNode::TPtr GetPgNotNullColumns(
+    const TKikimrTableDescription& table,
+    TPositionHandle pos,
+    TExprContext& ctx)
 {
+    auto pgNotNullColumns = Build<TCoAtomList>(ctx, pos);
+
+    for (const auto& [column, meta] : table.Metadata->Columns) {
+        if (meta.NotNull && table.GetColumnType(column)->GetKind() == ETypeAnnotationKind::Pg) {
+            pgNotNullColumns.Add<TCoAtom>()
+                .Value(column).Build();
+        }
+    }
+    return pgNotNullColumns.Done().Ptr();
+}
+
+TExprBase BuildKqlSequencer(TExprBase& input, const TKikimrTableDescription& table,
+    const TCoAtomList& outputCols, const TCoAtomList& autoIncrement,
+    TPositionHandle pos, TExprContext& ctx)
+{
+    return Build<TKqlSequencer>(ctx, pos)
+        .Input(input.Ptr())
+        .Table(BuildTableMeta(table, pos, ctx))
+        .Columns(outputCols.Ptr())
+        .AutoIncrementColumns(autoIncrement.Ptr())
+        .InputItemType(ExpandType(pos, *input.Ref().GetTypeAnn(), ctx))
+        .Done();
+}
+
+TCoAtomList BuildUpsertInputColumns(const TCoAtomList& inputColumns,
+    const TCoAtomList& autoincrement, TPositionHandle pos, TExprContext& ctx)
+{
+    TVector<TExprNode::TPtr> result;
+    result.reserve(inputColumns.Ref().ChildrenSize() + autoincrement.Ref().ChildrenSize());
+    for(const auto& item: inputColumns) {
+        result.push_back(item.Ptr());
+    }
+
+    for(const auto& item: autoincrement) {
+        result.push_back(item.Ptr());
+    }
+
+    return Build<TCoAtomList>(ctx, pos)
+        .Add(result)
+        .Done();
+}
+
+std::pair<TExprBase, TCoAtomList> BuildWriteInput(const TKiWriteTable& write, const TKikimrTableDescription& table,
+    const TCoAtomList& inputColumns, const TCoAtomList& autoIncrement,
+    TPositionHandle pos, TExprContext& ctx)
+{
+    auto input = write.Input();
+    const bool isWriteReplace = (GetTableOp(write) == TYdbOperation::Replace);
+
+    TCoAtomList inputCols = BuildUpsertInputColumns(inputColumns, autoIncrement, pos, ctx);
+
+    if (autoIncrement.Ref().ChildrenSize() > 0) {
+        input = BuildKqlSequencer(input, table, inputCols, autoIncrement, pos, ctx);
+    }
+
+    if (isWriteReplace) {
+        std::tie(input, inputCols) = CreateRowsToReplace(input, inputColumns, table, write.Pos(), ctx);
+    }
+
+    auto baseInput = Build<TKqpWriteConstraint>(ctx, pos)
+        .Input(input)
+        .Columns(GetPgNotNullColumns(table, pos, ctx))
+        .Done();
+
+    return {baseInput, inputCols};
+}
+
+TExprBase BuildUpsertTable(const TKiWriteTable& write, const TCoAtomList& inputColumns,
+    const TCoAtomList& autoincrement,
+    const TKikimrTableDescription& table, TExprContext& ctx)
+{
+    const auto [input, columns] = BuildWriteInput(write, table, inputColumns, autoincrement, write.Pos(), ctx);
     auto effect = Build<TKqlUpsertRows>(ctx, write.Pos())
-        .Table(BuildTableMeta(tableData, write.Pos(), ctx))
-        .Input(write.Input())
-        .Columns(inputColumns)
+        .Table(BuildTableMeta(table, write.Pos(), ctx))
+        .Input(input.Ptr())
+        .Columns(columns.Ptr())
         .Done();
 
     return effect;
 }
 
 TExprBase BuildUpsertTableWithIndex(const TKiWriteTable& write, const TCoAtomList& inputColumns,
-    const TKikimrTableDescription& tableData, TExprContext& ctx)
+    const TCoAtomList& autoincrement,
+    const TKikimrTableDescription& table, TExprContext& ctx)
 {
+    const auto [input, columns] = BuildWriteInput(write, table, inputColumns, autoincrement, write.Pos(), ctx);
     auto effect = Build<TKqlUpsertRowsIndex>(ctx, write.Pos())
-        .Table(BuildTableMeta(tableData, write.Pos(), ctx))
-        .Input(write.Input())
-        .Columns(inputColumns)
+        .Table(BuildTableMeta(table, write.Pos(), ctx))
+        .Input(input.Ptr())
+        .Columns(columns.Ptr())
         .Done();
-
     return effect;
 }
 
 TExprBase BuildReplaceTable(const TKiWriteTable& write, const TCoAtomList& inputColumns,
-    const TKikimrTableDescription& tableData, TExprContext& ctx)
+    const TCoAtomList& autoincrement,
+    const TKikimrTableDescription& table, TExprContext& ctx)
 {
-    const auto [data, columns] = CreateRowsToReplace(write.Input(), inputColumns, tableData, write.Pos(), ctx);
-
+    const auto [input, columns] = BuildWriteInput(write, table, inputColumns, autoincrement, write.Pos(), ctx);
     return Build<TKqlUpsertRows>(ctx, write.Pos())
-        .Table(BuildTableMeta(tableData, write.Pos(), ctx))
-        .Input(data)
+        .Table(BuildTableMeta(table, write.Pos(), ctx))
+        .Input(input.Ptr())
         .Columns(columns)
         .Done();
 }
 
 TExprBase BuildReplaceTableWithIndex(const TKiWriteTable& write, const TCoAtomList& inputColumns,
-    const TKikimrTableDescription& tableData, TExprContext& ctx)
+    const TCoAtomList& autoincrement,
+    const TKikimrTableDescription& table, TExprContext& ctx)
 {
-    const auto [data, columns] = CreateRowsToReplace(write.Input(), inputColumns, tableData, write.Pos(), ctx);
-
+    const auto [input, columns] = BuildWriteInput(write, table, inputColumns, autoincrement, write.Pos(), ctx);
     auto effect = Build<TKqlUpsertRowsIndex>(ctx, write.Pos())
-        .Table(BuildTableMeta(tableData, write.Pos(), ctx))
-        .Input(data)
-        .Columns(columns)
+        .Table(BuildTableMeta(table, write.Pos(), ctx))
+        .Input(input.Ptr())
+        .Columns(columns.Ptr())
         .Done();
 
     return effect;
 }
 
 TExprBase BuildInsertTable(const TKiWriteTable& write, bool abort, const TCoAtomList& inputColumns,
-    const TKikimrTableDescription& tableData, TExprContext& ctx)
+    const TCoAtomList& autoincrement,
+    const TKikimrTableDescription& table, TExprContext& ctx)
 {
+    const auto [input, columns] = BuildWriteInput(write, table, inputColumns, autoincrement, write.Pos(), ctx);
     auto effect = Build<TKqlInsertRows>(ctx, write.Pos())
-        .Table(BuildTableMeta(tableData, write.Pos(), ctx))
-        .Input(write.Input())
-        .Columns(inputColumns)
+        .Table(BuildTableMeta(table, write.Pos(), ctx))
+        .Input(input.Ptr())
+        .Columns(columns)
         .OnConflict()
             .Value(abort ? "abort"sv : "revert"sv)
             .Build()
@@ -258,12 +341,14 @@ TExprBase BuildInsertTable(const TKiWriteTable& write, bool abort, const TCoAtom
 }
 
 TExprBase BuildInsertTableWithIndex(const TKiWriteTable& write, bool abort, const TCoAtomList& inputColumns,
-    const TKikimrTableDescription& tableData, TExprContext& ctx)
+    const TCoAtomList& autoincrement,
+    const TKikimrTableDescription& table, TExprContext& ctx)
 {
+    const auto [input, columns] = BuildWriteInput(write, table, inputColumns, autoincrement, write.Pos(), ctx);
     auto effect = Build<TKqlInsertRowsIndex>(ctx, write.Pos())
-        .Table(BuildTableMeta(tableData, write.Pos(), ctx))
-        .Input(write.Input())
-        .Columns(inputColumns)
+        .Table(BuildTableMeta(table, write.Pos(), ctx))
+        .Input(input.Ptr())
+        .Columns(columns.Ptr())
         .OnConflict()
             .Value(abort ? "abort"sv : "revert"sv)
             .Build()
@@ -277,7 +362,10 @@ TExprBase BuildUpdateOnTable(const TKiWriteTable& write, const TCoAtomList& inpu
 {
     return Build<TKqlUpdateRows>(ctx, write.Pos())
         .Table(BuildTableMeta(tableData, write.Pos(), ctx))
-        .Input(write.Input())
+        .Input<TKqpWriteConstraint>()
+            .Input(write.Input())
+            .Columns(GetPgNotNullColumns(tableData, write.Pos(), ctx))
+        .Build()
         .Columns(inputColumns)
         .Done();
 }
@@ -287,7 +375,10 @@ TExprBase BuildUpdateOnTableWithIndex(const TKiWriteTable& write, const TCoAtomL
 {
     return Build<TKqlUpdateRowsIndex>(ctx, write.Pos())
         .Table(BuildTableMeta(tableData, write.Pos(), ctx))
-        .Input(write.Input())
+        .Input<TKqpWriteConstraint>()
+            .Input(write.Input())
+            .Columns(GetPgNotNullColumns(tableData, write.Pos(), ctx))
+        .Build()
         .Columns(inputColumns)
         .Done();
 }
@@ -465,7 +556,10 @@ TExprBase BuildUpdateTable(const TKiUpdateTable& update, const TKikimrTableDescr
 
     return Build<TKqlUpsertRows>(ctx, update.Pos())
         .Table(BuildTableMeta(tableData, update.Pos(), ctx))
-        .Input(updatedRows)
+        .Input<TKqpWriteConstraint>()
+            .Input(updatedRows)
+            .Columns(GetPgNotNullColumns(tableData, update.Pos(), ctx))
+        .Build()
         .Columns()
             .Add(updateColumnsList)
             .Build()
@@ -495,7 +589,10 @@ TVector<TExprBase> BuildUpdateTableWithIndex(const TKiUpdateTable& update, const
 
     auto tableUpsert = Build<TKqlUpsertRows>(ctx, update.Pos())
         .Table(BuildTableMeta(tableData, update.Pos(), ctx))
-        .Input(updatedRows)
+        .Input<TKqpWriteConstraint>()
+            .Input(updatedRows)
+            .Columns(GetPgNotNullColumns(tableData, update.Pos(), ctx))
+        .Build()
         .Columns()
             .Add(updateColumnsList)
             .Build()
@@ -558,7 +655,10 @@ TVector<TExprBase> BuildUpdateTableWithIndex(const TKiUpdateTable& update, const
 
             auto indexUpsert = Build<TKqlUpsertRows>(ctx, update.Pos())
                 .Table(indexMeta)
-                .Input(indexRows)
+                .Input<TKqpWriteConstraint>()
+                    .Input(indexRows)
+                    .Columns(GetPgNotNullColumns(tableData, update.Pos(), ctx))
+                .Build()
                 .Columns()
                     .Add(indexColumnsList)
                     .Build()
@@ -611,17 +711,18 @@ TExprNode::TPtr HandleReadTable(const TKiReadTable& read, TExprContext& ctx, con
 }
 
 TExprBase WriteTableSimple(const TKiWriteTable& write, const TCoAtomList& inputColumns,
+    const TCoAtomList& autoincrement,
     const TKikimrTableDescription& tableData, TExprContext& ctx)
 {
     auto op = GetTableOp(write);
     switch (op) {
         case TYdbOperation::Upsert:
-            return BuildUpsertTable(write, inputColumns, tableData, ctx);
+            return BuildUpsertTable(write, inputColumns, autoincrement, tableData, ctx);
         case TYdbOperation::Replace:
-            return BuildReplaceTable(write, inputColumns, tableData, ctx);
+            return BuildReplaceTable(write, inputColumns, autoincrement, tableData, ctx);
         case TYdbOperation::InsertAbort:
         case TYdbOperation::InsertRevert:
-            return BuildInsertTable(write, op == TYdbOperation::InsertAbort, inputColumns, tableData, ctx);
+            return BuildInsertTable(write, op == TYdbOperation::InsertAbort, inputColumns, autoincrement, tableData, ctx);
         case TYdbOperation::UpdateOn:
             return BuildUpdateOnTable(write, inputColumns, tableData, ctx);
         case TYdbOperation::Delete:
@@ -634,17 +735,18 @@ TExprBase WriteTableSimple(const TKiWriteTable& write, const TCoAtomList& inputC
 }
 
 TExprBase WriteTableWithIndexUpdate(const TKiWriteTable& write, const TCoAtomList& inputColumns,
+    const TCoAtomList& autoincrement,
     const TKikimrTableDescription& tableData, TExprContext& ctx)
 {
     auto op = GetTableOp(write);
     switch (op) {
         case TYdbOperation::Upsert:
-            return BuildUpsertTableWithIndex(write, inputColumns, tableData, ctx);
+            return BuildUpsertTableWithIndex(write, inputColumns, autoincrement, tableData, ctx);
         case TYdbOperation::Replace:
-            return BuildReplaceTableWithIndex(write, inputColumns, tableData, ctx);
+            return BuildReplaceTableWithIndex(write, inputColumns, autoincrement, tableData, ctx);
         case TYdbOperation::InsertAbort:
         case TYdbOperation::InsertRevert:
-            return BuildInsertTableWithIndex(write, op == TYdbOperation::InsertAbort, inputColumns, tableData, ctx);
+            return BuildInsertTableWithIndex(write, op == TYdbOperation::InsertAbort, inputColumns, autoincrement, tableData, ctx);
         case TYdbOperation::UpdateOn:
             return BuildUpdateOnTableWithIndex(write, inputColumns, tableData, ctx);
         case TYdbOperation::DeleteOn:
@@ -656,17 +758,38 @@ TExprBase WriteTableWithIndexUpdate(const TKiWriteTable& write, const TCoAtomLis
     Y_UNREACHABLE();
 }
 
-TExprBase HandleWriteTable(const TKiWriteTable& write, TExprContext& ctx, const TKikimrTablesData& tablesData) {
+TVector<TExprBase> HandleWriteTable(const TKiWriteTable& write, TExprContext& ctx, const TKikimrTablesData& tablesData,
+    const TIntrusivePtr<TKqpOptimizeContext>& kqpCtx)
+{
     auto& tableData = GetTableData(tablesData, write.DataSink().Cluster(), write.Table().Value());
 
     auto inputColumnsSetting = GetSetting(write.Settings().Ref(), "input_columns");
     YQL_ENSURE(inputColumnsSetting);
     auto inputColumns = TCoNameValueTuple(inputColumnsSetting).Value().Cast<TCoAtomList>();
 
+    auto autoincrementColumnsSetting = GetSetting(write.Settings().Ref(), "autoincrement_columns");
+    YQL_ENSURE(autoincrementColumnsSetting);
+    auto autoincrementColumns = TCoNameValueTuple(autoincrementColumnsSetting).Value().Cast<TCoAtomList>();
+
+    if (autoincrementColumns.Ref().ChildrenSize() > 0 && !kqpCtx->Config->EnableSequences) {
+        const TString err = "Sequences are not supported.";
+        ctx.AddError(YqlIssue(ctx.GetPosition(write.Pos()), TIssuesIds::KIKIMR_BAD_REQUEST, err));
+        return {};
+    }
+
+    auto op = GetTableOp(write);
+    if (autoincrementColumns.Ref().ChildrenSize() > 0) {
+        if (op == TYdbOperation::UpdateOn || op == TYdbOperation::DeleteOn) {
+            const TString err = "Key columns are not specified.";
+            ctx.AddError(YqlIssue(ctx.GetPosition(write.Pos()), TIssuesIds::KIKIMR_BAD_REQUEST, err));
+            return {};
+        }
+    }
+
     if (HasIndexesToWrite(tableData)) {
-        return WriteTableWithIndexUpdate(write, inputColumns, tableData, ctx);
+        return { WriteTableWithIndexUpdate(write, inputColumns, autoincrementColumns, tableData, ctx) } ;
     } else {
-        return WriteTableSimple(write, inputColumns, tableData, ctx);
+        return { WriteTableSimple(write, inputColumns, autoincrementColumns, tableData, ctx) } ;
     }
 }
 
@@ -693,6 +816,32 @@ TVector<TExprBase> HandleDeleteTable(const TKiDeleteTable& del, TExprContext& ct
     }
 }
 
+TExprNode::TPtr HandleExternalWrite(const TCallable& effect, TExprContext& ctx, TTypeAnnotationContext& typesCtx) {
+    if (effect.Ref().ChildrenSize() <= 1) {
+        return {};
+    }
+    // As a rule data sink is a second child for all write callables
+    TExprBase dataSinkArg(effect.Ref().Child(1));
+    if (auto maybeDataSink = dataSinkArg.Maybe<TCoDataSink>()) {
+        TStringBuf dataSinkCategory = maybeDataSink.Cast().Category();
+        auto dataSinkProviderIt = typesCtx.DataSinkMap.find(dataSinkCategory);
+        if (dataSinkProviderIt != typesCtx.DataSinkMap.end()) {
+            if (auto* dqIntegration = dataSinkProviderIt->second->GetDqIntegration()) {
+                if (auto canWrite = dqIntegration->CanWrite(*effect.Raw(), ctx)) {
+                    YQL_ENSURE(*canWrite, "Erros handling write");
+                    if (auto result = dqIntegration->WrapWrite(effect.Ptr(), ctx)) {
+                        return Build<TKqlExternalEffect>(ctx, effect.Pos())
+                            .Input(result)
+                            .Done()
+                            .Ptr();
+                    }
+                }
+            }
+        }
+    }
+    return {};
+}
+
 } // namespace
 
 const TKikimrTableDescription& GetTableData(const TKikimrTablesData& tablesData,
@@ -713,17 +862,20 @@ TIntrusivePtr<TKikimrTableMetadata> GetIndexMetadata(const TKqlReadTableIndex& r
 }
 
 TMaybe<TKqlQueryList> BuildKqlQuery(TKiDataQueryBlocks dataQueryBlocks, const TKikimrTablesData& tablesData,
-    TExprContext& ctx, bool withSystemColumns, const TIntrusivePtr<TKqpOptimizeContext>& kqpCtx, NYql::TTypeAnnotationContext& typesCtx)
+    TExprContext& ctx, bool withSystemColumns, const TIntrusivePtr<TKqpOptimizeContext>& kqpCtx, TTypeAnnotationContext& typesCtx)
 {
     TVector<TKqlQuery> queryBlocks;
     queryBlocks.reserve(dataQueryBlocks.ArgCount());
-
     for (const auto& block : dataQueryBlocks) {
-        TVector <TExprBase> kqlEffects;
+        TVector<TExprBase> kqlEffects;
         for (const auto& effect : block.Effects()) {
             if (auto maybeWrite = effect.Maybe<TKiWriteTable>()) {
-                auto result = HandleWriteTable(maybeWrite.Cast(), ctx, tablesData);
-                kqlEffects.push_back(result);
+                auto result = HandleWriteTable(maybeWrite.Cast(), ctx, tablesData, kqpCtx);
+                if (result.empty()) {
+                    return {};
+                }
+
+                kqlEffects.insert(kqlEffects.end(), result.begin(), result.end());
             }
 
             if (auto maybeUpdate = effect.Maybe<TKiUpdateTable>()) {
@@ -735,9 +887,13 @@ TMaybe<TKqlQueryList> BuildKqlQuery(TKiDataQueryBlocks dataQueryBlocks, const TK
                 auto results = HandleDeleteTable(maybeDelete.Cast(), ctx, tablesData, withSystemColumns, kqpCtx);
                 kqlEffects.insert(kqlEffects.end(), results.begin(), results.end());
             }
+
+            if (TExprNode::TPtr result = HandleExternalWrite(effect, ctx, typesCtx)) {
+                kqlEffects.emplace_back(result);
+            }
         }
 
-        TVector <TKqlQueryResult> kqlResults;
+        TVector<TKqlQueryResult> kqlResults;
         kqlResults.reserve(block.Results().Size());
         for (const auto& kiResult : block.Results()) {
             kqlResults.emplace_back(
@@ -762,7 +918,7 @@ TMaybe<TKqlQueryList> BuildKqlQuery(TKiDataQueryBlocks dataQueryBlocks, const TK
         TOptimizeExprSettings optSettings(nullptr);
         optSettings.VisitChanges = true;
         auto status = OptimizeExpr(queryBlock.Ptr(), optResult,
-            [&tablesData, withSystemColumns, &kqpCtx, &typesCtx](const TExprNode::TPtr& input, TExprContext &ctx) {
+            [&tablesData, withSystemColumns, &kqpCtx, &typesCtx](const TExprNode::TPtr& input, TExprContext& ctx) {
                 auto node = TExprBase(input);
                 TExprNode::TPtr effect;
 

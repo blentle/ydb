@@ -45,9 +45,9 @@ struct TTxCoordinator::TTxAcquireReadStep : public TTransactionBase<TTxCoordinat
         // updated asynchronously, that would make sure restarted coordinators
         // would not break guarantees for older coordinators.
         NIceDb::TNiceDb db(txc.DB);
-        db.Table<Schema::State>().Key(Schema::State::AcquireReadStepLast).Update(
-            NIceDb::TUpdate<Schema::State::StateValue>(Step));
+        Schema::SaveState(db, Schema::State::AcquireReadStepLast, Step);
 
+        Self->SchedulePlanTickAligned(Step + 1);
         return true;
     }
 
@@ -114,6 +114,7 @@ void TTxCoordinator::Handle(TEvTxProxy::TEvAcquireReadStep::TPtr& ev, const TAct
         Executor()->ConfirmReadOnlyLease([this, sender, cookie, step]() {
             Send(sender, new TEvTxProxy::TEvAcquireReadStepResult(TabletID(), step), 0, cookie);
         });
+        SchedulePlanTickAligned(step + 1);
         return;
     }
 

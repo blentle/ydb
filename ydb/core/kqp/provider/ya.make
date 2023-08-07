@@ -35,6 +35,7 @@ PEERDIR(
     ydb/public/lib/scheme_types
     ydb/public/sdk/cpp/client/ydb_topic
     ydb/library/yql/core/expr_nodes
+    ydb/library/yql/core/peephole_opt
     ydb/library/yql/parser/pg_wrapper/interface
     ydb/library/yql/providers/common/codec
     ydb/library/yql/providers/common/config
@@ -45,6 +46,7 @@ PEERDIR(
     ydb/library/yql/providers/dq/expr_nodes
     ydb/library/yql/providers/result/expr_nodes
     ydb/library/yql/providers/result/provider
+    ydb/library/yql/sql/settings
 )
 
 YQL_LAST_ABI_VERSION()

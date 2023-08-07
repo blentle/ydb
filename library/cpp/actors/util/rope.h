@@ -4,6 +4,7 @@
 #include <util/generic/string.h>
 #include <util/generic/hash_set.h>
 #include <util/generic/scope.h>
+#include <util/stream/zerocopy.h>
 #include <util/stream/str.h>
 #include <util/system/sanitizers.h>
 #include <util/system/valgrind.h>
@@ -454,6 +455,10 @@ public:
         return !Size;
     }
 
+    bool empty() const {
+        return IsEmpty();
+    }
+
     operator bool() const {
         return Chain;
     }
@@ -698,10 +703,7 @@ public:
 
     // Use this method carefully -- it may significantly reduce performance when misused.
     TString ConvertToString() const {
-        // TODO(innokentii): could be microoptimized for single TString case
-        TString res = TString::Uninitialized(GetSize());
-        Begin().ExtractPlainDataAndAdvance(res.Detach(), res.size());
-        return res;
+        return ExtractUnderlyingContainerOrCopy<TString>();
     }
 
     /**
@@ -709,14 +711,14 @@ public:
      */
     template <class TResult>
     TResult ExtractUnderlyingContainerOrCopy() const {
-        if (IsContiguous() && GetSize() != 0) {
-            const auto& chunk = Begin().GetChunk();
-            return chunk.ExtractUnderlyingContainerOrCopy<TResult>();
+        if (Chain.begin() != Chain.end() && ++Chain.begin() == Chain.end()) {
+            return Chain.GetFirstChunk().ExtractUnderlyingContainerOrCopy<TResult>();
         }
 
-        TResult res = TResult::Uninitialized(GetSize());
+        const size_t size = GetSize();
+        TResult res = TResult::Uninitialized(size);
         char* data = NContiguousDataDetails::TContainerTraits<TResult>::UnsafeGetDataMut(res);
-        Begin().ExtractPlainDataAndAdvance(data, res.size());
+        Begin().ExtractPlainDataAndAdvance(data, size);
         return res;
     }
 
@@ -803,6 +805,8 @@ public:
         Compact();
         return TRcBuf(Begin().GetChunk());
     }
+
+    size_t GetOccupiedMemorySize() const;
 
     friend bool operator==(const TRope& x, const TRope& y) { return Compare(x, y) == 0; }
     friend bool operator!=(const TRope& x, const TRope& y) { return Compare(x, y) != 0; }
@@ -1078,6 +1082,40 @@ public:
 
     bool IsOnChunk() const {
         return Head != Slide;
+    }
+};
+
+class TRopeZeroCopyInput : public IZeroCopyInput {
+    TRope::TConstIterator Iter;
+    const char* Data = nullptr;
+    size_t Len = 0;
+
+private:
+    size_t DoNext(const void** ptr, size_t len) override {
+        Y_VERIFY_DEBUG(ptr);
+        if (Len == 0) {
+            if (Iter.Valid()) {
+                Data = Iter.ContiguousData();
+                Len = Iter.ContiguousSize();
+                Y_VERIFY_DEBUG(Len);
+                Y_VERIFY_DEBUG(Data);
+                ++Iter;
+            } else {
+                Data = nullptr;
+            }
+        }
+
+        size_t chunk = std::min(Len, len);
+        *ptr = Data;
+        Data += chunk;
+        Len -= chunk;
+        return chunk;
+    }
+
+public:
+    explicit TRopeZeroCopyInput(TRope::TConstIterator iter)
+        : Iter(iter)
+    {
     }
 };
 

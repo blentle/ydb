@@ -13,7 +13,8 @@ SRCS(
     blob_depot.proto
     blob_depot_config.proto
     blobstorage.proto
-    blobstorage_controller.proto
+    blobstorage_base.proto
+    blobstorage_base3.proto
     blobstorage_disk.proto
     blobstorage_disk_color.proto
     blobstorage_pdisk_config.proto
@@ -54,6 +55,7 @@ SRCS(
     database_basic_sausage_metainfo.proto
     datashard_load.proto
     drivemodel.proto
+    ev_write.proto
     export.proto
     external_sources.proto
     flat_tx_scheme.proto
@@ -63,7 +65,6 @@ SRCS(
     http_config.proto
     import.proto
     index_builder.proto
-    issue_id.proto
     kesus.proto
     kqp_physical.proto
     kqp_stats.proto
@@ -91,12 +92,12 @@ SRCS(
     scheme_type_metadata.proto
     scheme_type_operation.proto
     serverless_proxy_config.proto
-    services.proto
     shared_cache.proto
     sqs.proto
     follower_group.proto
     ssa.proto
     statestorage.proto
+    statistics.proto
     stream.proto
     subdomains.proto
     table_stats.proto
@@ -119,7 +120,6 @@ SRCS(
     tx_proxy.proto
     tx_scheme.proto
     tx_sequenceshard.proto
-    type_info.proto
     pdiskfit.proto
     pqconfig.proto
     auth.proto
@@ -140,6 +140,7 @@ GENERATE_ENUM_SERIALIZATION(datashard_load.pb.h)
 PEERDIR(
     library/cpp/actors/protos
     ydb/core/fq/libs/config/protos
+    ydb/core/scheme/protos
     ydb/library/login/protos
     ydb/library/mkql_proto/protos
     ydb/public/api/protos
@@ -148,6 +149,8 @@ PEERDIR(
     ydb/library/yql/dq/proto
     ydb/library/yql/public/issue/protos
     ydb/library/yql/public/types
+    ydb/library/services
+    ydb/library/ydb_issue/proto
 )
 
 EXCLUDE_TAGS(GO_PROTO)

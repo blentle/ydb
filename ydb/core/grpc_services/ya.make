@@ -23,9 +23,7 @@ SRCS(
     rpc_copy_tables.cpp
     rpc_export.cpp
     rpc_create_coordination_node.cpp
-    rpc_create_session.cpp
     rpc_create_table.cpp
-    rpc_delete_session.cpp
     rpc_describe_coordination_node.cpp
     rpc_describe_path.cpp
     rpc_describe_table.cpp
@@ -46,6 +44,7 @@ SRCS(
     rpc_import.cpp
     rpc_import_data.cpp
     rpc_keep_alive.cpp
+    rpc_keyvalue.cpp
     rpc_kh_describe.cpp
     rpc_kh_snapshots.cpp
     rpc_kqp_base.cpp
@@ -73,9 +72,12 @@ SRCS(
     rpc_whoami.cpp
     table_settings.cpp
 
+    rpc_common/rpc_common_kqp_session.cpp
+
     query/rpc_execute_query.cpp
     query/rpc_execute_script.cpp
     query/rpc_fetch_script_results.cpp
+    query/rpc_attach_session.cpp
     query/service_query.h
 )
 
@@ -117,8 +119,10 @@ PEERDIR(
     ydb/library/persqueue/topic_parser
     ydb/library/yql/parser/pg_wrapper/interface
     ydb/library/yql/public/types
+    ydb/library/services
     ydb/public/api/grpc/draft
     ydb/public/api/protos
+    ydb/public/lib/fq
     ydb/public/lib/operation_id
     ydb/public/sdk/cpp/client/resources
     ydb/services/ext_index/common

@@ -1,6 +1,7 @@
 #include "size_calcer.h"
 #include "switch_type.h"
 #include "arrow_helpers.h"
+#include "dictionary/conversion.h"
 #include <contrib/libs/apache/arrow/cpp/src/arrow/type.h>
 #include <util/system/yassert.h>
 
@@ -95,13 +96,52 @@ ui32 TRowSizeCalculator::GetRowBytesSize(const ui32 row) const {
     return result;
 }
 
+ui64 GetArrayDataRawSize(const std::shared_ptr<arrow::ArrayData>& data) {
+    if (!data) {
+        return 0;
+    }
+    ui64 result = 0;
+    for (auto&& i : data->buffers) {
+        if (i) {
+            result += i->capacity();
+        }
+    }
+    for (auto&& i : data->child_data) {
+        for (auto&& b : i->buffers) {
+            if (b) {
+                result += b->capacity();
+            }
+        }
+    }
+    if (data->dictionary) {
+        for (auto&& b : data->dictionary->buffers) {
+            if (b) {
+                result += b->capacity();
+            }
+        }
+    }
+    return result;
+}
+
+
 ui64 GetBatchDataSize(const std::shared_ptr<arrow::RecordBatch>& batch) {
     if (!batch) {
         return 0;
     }
     ui64 bytes = 0;
-    for (auto& column : batch->columns()) { // TODO: use column_data() instead of columns()
+    for (auto& column : batch->columns()) {
         bytes += GetArrayDataSize(column);
+    }
+    return bytes;
+}
+
+ui64 GetBatchMemorySize(const std::shared_ptr<arrow::RecordBatch>& batch) {
+    if (!batch) {
+        return 0;
+    }
+    ui64 bytes = 0;
+    for (auto& column : batch->column_data()) {
+        bytes += GetArrayDataRawSize(column);
     }
     return bytes;
 }
@@ -119,25 +159,25 @@ ui64 GetArrayDataSizeImpl<arrow::NullType>(const std::shared_ptr<arrow::Array>& 
 template <>
 ui64 GetArrayDataSizeImpl<arrow::StringType>(const std::shared_ptr<arrow::Array>& column) {
     auto typedColumn = std::static_pointer_cast<arrow::StringArray>(column);
-    return typedColumn->total_values_length();
+    return typedColumn->total_values_length() + sizeof(arrow::StringArray::offset_type) * column->length();
 }
 
 template <>
 ui64 GetArrayDataSizeImpl<arrow::LargeStringType>(const std::shared_ptr<arrow::Array>& column) {
-    auto typedColumn = std::static_pointer_cast<arrow::StringArray>(column);
-    return typedColumn->total_values_length();
+    auto typedColumn = std::static_pointer_cast<arrow::LargeStringArray>(column);
+    return typedColumn->total_values_length() + sizeof(arrow::LargeStringArray::offset_type) * column->length();
 }
 
 template <>
 ui64 GetArrayDataSizeImpl<arrow::BinaryType>(const std::shared_ptr<arrow::Array>& column) {
     auto typedColumn = std::static_pointer_cast<arrow::BinaryArray>(column);
-    return typedColumn->total_values_length();
+    return typedColumn->total_values_length() + sizeof(arrow::BinaryArray::offset_type) * column->length();
 }
 
 template <>
 ui64 GetArrayDataSizeImpl<arrow::LargeBinaryType>(const std::shared_ptr<arrow::Array>& column) {
-    auto typedColumn = std::static_pointer_cast<arrow::BinaryArray>(column);
-    return typedColumn->total_values_length();
+    auto typedColumn = std::static_pointer_cast<arrow::LargeBinaryArray>(column);
+    return typedColumn->total_values_length() + sizeof(arrow::LargeBinaryArray::offset_type) * column->length();
 }
 
 template <>
@@ -153,6 +193,10 @@ ui64 GetArrayDataSizeImpl<arrow::Decimal128Type>(const std::shared_ptr<arrow::Ar
 
 ui64 GetArrayDataSize(const std::shared_ptr<arrow::Array>& column) {
     auto type = column->type();
+    if (type->id() == arrow::Type::DICTIONARY) {
+        auto dictArray = static_pointer_cast<arrow::DictionaryArray>(column);
+        return GetDictionarySize(dictArray);
+    }
     ui64 bytes = 0;
     bool success = SwitchTypeWithNull(type->id(), [&]<typename TType>(TTypeWrapper<TType> typeHolder) {
         Y_UNUSED(typeHolder);
@@ -170,7 +214,7 @@ ui64 GetArrayDataSize(const std::shared_ptr<arrow::Array>& column) {
 }
 
 NKikimr::NArrow::TSerializedBatch TSerializedBatch::Build(std::shared_ptr<arrow::RecordBatch> batch) {
-    return TSerializedBatch(NArrow::SerializeSchema(*batch->schema()), NArrow::SerializeBatchNoCompression(batch), batch->num_rows());
+    return TSerializedBatch(NArrow::SerializeSchema(*batch->schema()), NArrow::SerializeBatchNoCompression(batch), batch->num_rows(), NArrow::GetBatchDataSize(batch));
 }
 
 bool TSerializedBatch::BuildWithLimit(std::shared_ptr<arrow::RecordBatch> batch, const ui32 sizeLimit, std::optional<TSerializedBatch>& sbL, std::optional<TSerializedBatch>& sbR, TString* errorMessage) {

@@ -44,7 +44,7 @@ namespace NUnifiedAgent::NPrivate {
         , Counters(parameters.Counters ? parameters.Counters : MakeIntrusive<TClientCounters>())
         , Log(parameters.Log)
         , MainLogger(Log, MakeFMaybe(Parameters.LogRateLimitBytes))
-        , Logger(MainLogger.Child(Sprintf("ua_%lu", Id.fetch_add(1))))
+        , Logger(MainLogger.Child(Sprintf("ua_%" PRIu64, Id.fetch_add(1))))
         , Channel(nullptr)
         , Stub(nullptr)
         , ActiveCompletionQueue(nullptr)
@@ -78,7 +78,7 @@ namespace NUnifiedAgent::NPrivate {
             ForkProtector->Unregister(*this);
         }
 
-        YLOG_INFO(Sprintf("destroyed, uri [%s]", Parameters.Uri.c_str()));
+        YLOG_DEBUG(Sprintf("destroyed, uri [%s]", Parameters.Uri.c_str()));
     }
 
     TClientSessionPtr TClient::CreateSession(const TSessionParameters& parameters) {
@@ -186,12 +186,12 @@ namespace NUnifiedAgent::NPrivate {
             return;
         }
 
-        YLOG_INFO("stopping");
+        YLOG_DEBUG("stopping");
         ActiveCompletionQueue->Stop();
         ActiveCompletionQueue = nullptr;
         Stub = nullptr;
         Channel = nullptr;
-        YLOG_INFO("stopped");
+        YLOG_DEBUG("stopped");
 
         Started = false;
     }
@@ -419,7 +419,7 @@ namespace NUnifiedAgent::NPrivate {
         // Lock must be held
 
         Y_VERIFY(!Started);
-        YLOG_INFO("starting");
+        YLOG_DEBUG("starting");
 
         Client->EnsureStarted();
 
@@ -461,7 +461,7 @@ namespace NUnifiedAgent::NPrivate {
 
         ++Client->GetCounters()->ActiveSessionsCount;
         MakeGrpcCallTimer->Set(Now());
-        YLOG_INFO(Sprintf("started, sessionId [%s]", OriginalSessionId.GetOrElse("").c_str()));
+        YLOG_DEBUG(Sprintf("started, sessionId [%s]", OriginalSessionId.GetOrElse("").c_str()));
 
         Started = true;
     }
@@ -485,15 +485,15 @@ namespace NUnifiedAgent::NPrivate {
         Close(TInstant::Zero());
         AsyncJoiner.Join().Wait();
         Client->UnregisterSession(this);
-        YLOG_INFO("destroyed");
+        YLOG_DEBUG("destroyed");
     }
 
     void TClientSession::Send(TClientMessage&& message) {
-        const auto messageSize = SizeOf(message);
+        const size_t messageSize = SizeOf(message);
         ++Counters->ReceivedMessages;
         Counters->ReceivedBytes += messageSize;
         if (messageSize > Client->GetParameters().GrpcMaxMessageSize) {
-            YLOG_ERR(Sprintf("message size [%lu] is greater than max grpc message size [%lu], message dropped",
+            YLOG_ERR(Sprintf("message size [%zu] is greater than max grpc message size [%zu], message dropped",
                               messageSize, Client->GetParameters().GrpcMaxMessageSize));
             ++Counters->DroppedMessages;
             Counters->DroppedBytes += messageSize;
@@ -521,7 +521,7 @@ namespace NUnifiedAgent::NPrivate {
 
             if (CloseRequested) {
                 g.Release();
-                YLOG_ERR(Sprintf("session is closing, message dropped, [%lu] bytes", messageSize));
+                YLOG_ERR(Sprintf("session is closing, message dropped, [%zu] bytes", messageSize));
                 --Counters->InflightMessages;
                 Counters->InflightBytes -= messageSize;
                 ++Counters->DroppedMessages;
@@ -531,7 +531,7 @@ namespace NUnifiedAgent::NPrivate {
             }
             if (InflightBytes.load() + messageSize > MaxInflightBytes) {
                 g.Release();
-                YLOG_ERR(Sprintf("max inflight of [%lu] bytes reached, [%lu] bytes dropped",
+                YLOG_ERR(Sprintf("max inflight of [%zu] bytes reached, [%zu] bytes dropped",
                     MaxInflightBytes, messageSize));
                 --Counters->InflightMessages;
                 Counters->InflightBytes -= messageSize;
@@ -554,7 +554,7 @@ namespace NUnifiedAgent::NPrivate {
     }
 
     TFuture<void> TClientSession::CloseAsync(TInstant deadline) {
-        YLOG_INFO(Sprintf("close, deadline [%s]", ToString(deadline).c_str()));
+        YLOG_DEBUG(Sprintf("close, deadline [%s]", ToString(deadline).c_str()));
         if (!ClosePromise.GetFuture().HasValue()) {
             with_lock(Lock) {
                 if (!Started) {
@@ -579,7 +579,7 @@ namespace NUnifiedAgent::NPrivate {
         }
         if (!CloseStarted) {
             CloseStarted = true;
-            YLOG_INFO("close started");
+            YLOG_DEBUG("close started");
         }
         const auto force = deadline == TInstant::Zero();
         if (force && !ForcedCloseStarted) {
@@ -803,9 +803,9 @@ namespace NUnifiedAgent::NPrivate {
             }
 
             const auto addResult = requestBuilder.TryAddMessage(queueItem, *AckSeqNo + i + 1);
-            const auto serializedLimitToLog = AgentMaxReceiveMessage.Defined() ? *AgentMaxReceiveMessage : 0;
+            const size_t serializedLimitToLog = AgentMaxReceiveMessage.Defined() ? *AgentMaxReceiveMessage : 0;
             if (addResult.LimitExceeded && target.GetDataBatch().SeqNoSize() == 0) {
-                YLOG_ERR(Sprintf("single serialized message is too large [%lu] > [%lu], dropping it",
+                YLOG_ERR(Sprintf("single serialized message is too large [%zu] > [%zu], dropping it",
                         addResult.NewSerializedRequestSize, serializedLimitToLog));
                 queueItem.Skipped = true;
                 ++Counters->DroppedMessages;
@@ -817,8 +817,8 @@ namespace NUnifiedAgent::NPrivate {
             }
             if (addResult.LimitExceeded) {
                 YLOG_DEBUG(Sprintf(
-                        "batch limit exceeded: [%lu] > [%lu] (limit for serialized batch)"
-                        "OR [%lu] > [%lu] (limit for raw batch)",
+                        "batch limit exceeded: [%zu] > [%zu] (limit for serialized batch)"
+                        "OR [%zu] > [%zu] (limit for raw batch)",
                         addResult.NewSerializedRequestSize, serializedLimitToLog,
                         addResult.NewRequestPayloadSize, Client->GetParameters().GrpcMaxMessageSize));
                 break;
@@ -834,7 +834,7 @@ namespace NUnifiedAgent::NPrivate {
             "failed to calculate size for message [%s]", target.ShortDebugString().c_str());
         GrpcInflightMessages += messagesCount;
         GrpcInflightBytes += requestBuilder.GetRequestPayloadSize();
-        YLOG_DEBUG(Sprintf("new write batch, [%lu] messages, [%lu] bytes, first seq_no [%lu], serialized size [%lu]",
+        YLOG_DEBUG(Sprintf("new write batch, [%zu] messages, [%zu] bytes, first seq_no [%" PRIu64 "], serialized size [%zu]",
                 messagesCount, requestBuilder.GetRequestPayloadSize(),
                 *target.GetDataBatch().GetSeqNo().begin(), requestBuilder.GetSerializedRequestSize()));
         ++Counters->GrpcWriteBatchRequests;
@@ -876,7 +876,7 @@ namespace NUnifiedAgent::NPrivate {
         GrpcInflightMessages -= messagesCount;
         GrpcInflightBytes -= bytesCount;
 
-        YLOG_DEBUG(Sprintf("ack [%lu], [%lu] messages, [%lu] bytes", seqNo, messagesCount, bytesCount));
+        YLOG_DEBUG(Sprintf("ack [%" PRIu64 "], [%zu] messages, [%zu] bytes", seqNo, messagesCount, bytesCount));
     }
 
     void TClientSession::OnGrpcCallInitialized(const TString& sessionId, ui64 lastSeqNo) {
@@ -888,7 +888,7 @@ namespace NUnifiedAgent::NPrivate {
         Counters->GrpcInflightBytes -= GrpcInflightBytes;
         GrpcInflightMessages = 0;
         GrpcInflightBytes = 0;
-        YLOG_INFO(Sprintf("grpc call initialized, session_id [%s], last_seq_no [%lu]",
+        YLOG_DEBUG(Sprintf("grpc call initialized, session_id [%s], last_seq_no [%" PRIu64 "]",
                           sessionId.c_str(), lastSeqNo));
     }
 
@@ -937,13 +937,13 @@ namespace NUnifiedAgent::NPrivate {
         if (!ForkInProgressLocal && WriteQueue.size() > 0) {
             const auto stats = PurgeWriteQueue();
             ++Counters->ErrorsCount;
-            YLOG_ERR(Sprintf("DoClose, dropped [%lu] messages, [%lu] bytes",
+            YLOG_ERR(Sprintf("DoClose, dropped [%zu] messages, [%zu] bytes",
                              stats.PurgedMessages, stats.PurgedBytes));
         }
         --Client->GetCounters()->ActiveSessionsCount;
         Closed = true;
         ClosePromise.SetValue();
-        YLOG_INFO("session closed");
+        YLOG_DEBUG("session closed");
     }
 
     TGrpcCall::TGrpcCall(TClientSession& session)
@@ -985,18 +985,18 @@ namespace NUnifiedAgent::NPrivate {
         ReaderWriter = client.GetStub().AsyncSession(&ClientContext,
                                                      &client.GetCompletionQueue(),
                                                      AcceptTag->Ref());
-        YLOG_INFO("AsyncSession started");
+        YLOG_DEBUG("AsyncSession started");
     }
 
     TGrpcCall::~TGrpcCall() {
-        YLOG_INFO("destroyed");
+        YLOG_DEBUG("destroyed");
     }
 
     void TGrpcCall::EnsureFinishStarted() {
         if (!FinishStarted) {
             FinishStarted = true;
             ReaderWriter->Finish(&FinishStatus, FinishTag->Ref());
-            YLOG_INFO("Finish started");
+            YLOG_DEBUG("Finish started");
         }
     }
 
@@ -1036,7 +1036,7 @@ namespace NUnifiedAgent::NPrivate {
             }
             return;
         }
-        YLOG_INFO(Sprintf("Close Initialized [%d], AcceptPending [%d], "
+        YLOG_DEBUG(Sprintf("Close Initialized [%d], AcceptPending [%d], "
                          "WritePending [%d], FinishRequested [%d], "
                          "ErrorOccured [%d]",
                          static_cast<int>(Initialized_),
@@ -1110,7 +1110,7 @@ namespace NUnifiedAgent::NPrivate {
         }
         if (!ErrorOccured && status == EIOStatus::Error && WritesBlocked) {
             Y_VERIFY(!WritePending);
-            YLOG_INFO("EndRead ReadsDone");
+            YLOG_DEBUG("EndRead ReadsDone");
             ReadsDone = true;
             if (WritesDone) {
                 EnsureFinishStarted();
@@ -1174,7 +1174,7 @@ namespace NUnifiedAgent::NPrivate {
         const auto finishStatus = status == EIOStatus::Error
             ? grpc::Status(grpc::UNKNOWN, "finish error")
             : FinishStatus;
-        YLOG(finishStatus.ok() || Cancelled || Poisoned  ? TLOG_INFO : TLOG_ERR,
+        YLOG(finishStatus.ok() || Cancelled || Poisoned  ? TLOG_DEBUG : TLOG_ERR,
             Sprintf("EndFinish, code [%s], message [%s]",
                 ToString(finishStatus.error_code()).c_str(),
                 finishStatus.error_message().c_str()),
@@ -1188,7 +1188,7 @@ namespace NUnifiedAgent::NPrivate {
     }
 
     void TGrpcCall::EndWritesDone(EIOStatus status) {
-        YLOG_INFO(Sprintf("EndWritesDone [%s]", ToString(status).c_str()));
+        YLOG_DEBUG(Sprintf("EndWritesDone [%s]", ToString(status).c_str()));
         Y_VERIFY(!WritePending && !WritesDone && WritesDonePending);
         WritesDonePending = false;
         WritesDone = true;
@@ -1203,7 +1203,7 @@ namespace NUnifiedAgent::NPrivate {
     void TGrpcCall::BeginWritesDone() {
         WritesDonePending = true;
         ReaderWriter->WritesDone(WritesDoneTag->Ref());
-        YLOG_INFO("WritesDone started");
+        YLOG_DEBUG("WritesDone started");
     }
 
     void TGrpcCall::BeginRead() {

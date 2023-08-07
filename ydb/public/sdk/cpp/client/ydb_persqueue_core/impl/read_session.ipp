@@ -1991,6 +1991,10 @@ template <bool UseMigrationProtocol>
 TVector<typename TAReadSessionEvent<UseMigrationProtocol>::TEvent>
 TReadSessionEventsQueue<UseMigrationProtocol>::GetEvents(bool block, TMaybe<size_t> maxEventsCount, size_t maxByteSize)
 {
+    if (!maxByteSize) {
+        ThrowFatalError("the maxByteSize value must be greater than 0");
+    }
+
     TVector<TReadSessionEventInfo<UseMigrationProtocol>> eventInfos;
     const size_t maxCount = maxEventsCount ? *maxEventsCount : std::numeric_limits<size_t>::max();
     TUserRetrievedEventsInfoAccumulator<UseMigrationProtocol> accumulator;
@@ -2027,6 +2031,10 @@ template <bool UseMigrationProtocol>
 TMaybe<typename TAReadSessionEvent<UseMigrationProtocol>::TEvent>
 TReadSessionEventsQueue<UseMigrationProtocol>::GetEvent(bool block, size_t maxByteSize)
 {
+    if (!maxByteSize) {
+        ThrowFatalError("the maxByteSize value must be greater than 0");
+    }
+
     TMaybe<TReadSessionEventInfo<UseMigrationProtocol>> eventInfo;
     TUserRetrievedEventsInfoAccumulator<UseMigrationProtocol> accumulator;
 
@@ -2209,13 +2217,13 @@ void TDataDecompressionInfo<UseMigrationProtocol>::BuildBatchesMeta() {
             for (const auto& [key, value] : batch.write_session_meta()) {
                 meta->Fields.emplace(key, value);
             }
-            MessagesMeta.emplace_back(TMetadataPtrVector{});
-            auto &currBatchMessagesMeta = MessagesMeta.back();
-            for (const auto &messageData: batch.message_data()) {
-                typename TAWriteSessionMeta<UseMigrationProtocol>::TPtr msgMeta = MakeIntrusive<TAWriteSessionMeta<UseMigrationProtocol>>();
-                msgMeta->Fields.reserve(messageData.message_meta_size());
-                for (const auto &[key, value]: messageData.message_meta()) {
-                    msgMeta->Fields.emplace(key, value);
+            MessagesMeta.emplace_back(TMessageMetaPtrVector{});
+            auto& currBatchMessagesMeta = MessagesMeta.back();
+            for (const auto& messageData: batch.message_data()) {
+                typename TAMessageMeta<UseMigrationProtocol>::TPtr msgMeta = MakeIntrusive<TAMessageMeta<UseMigrationProtocol>>();
+                msgMeta->Fields.reserve(messageData.metadata_items_size());
+                for (const auto& metaPair: messageData.metadata_items()) {
+                    msgMeta->Fields.emplace_back(std::make_pair(metaPair.key(), metaPair.value()));
                 }
                 currBatchMessagesMeta.emplace_back(std::move(msgMeta));
                 }
@@ -2387,7 +2395,7 @@ void TDataDecompressionEvent<UseMigrationProtocol>::TakeData(TIntrusivePtr<TPart
                                             messageData.explicit_hash());
         }
     } else {
-        const auto &messageMeta = Parent->GetMessageMeta(Batch, Message);
+        const auto& messageMeta = Parent->GetMessageMeta(Batch, Message);
         NTopic::TReadSessionEvent::TDataReceivedEvent::TMessageInformation messageInfo(
                 messageData.offset(),
                 batch.producer_id(),

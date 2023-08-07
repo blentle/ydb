@@ -330,6 +330,8 @@ message ColumnMeta {
     Type type = 2;
     // Column family name of the column
     string family = 3;
+    // Column nullability
+    optional bool not_null = 4;
 }
 
 message DateTypeColumnModeSettings {
@@ -1061,9 +1063,10 @@ message ReadRowsRequest {
     string session_id = 1;
     // Path to table to read
     string path = 2;
-    // Keys to read
+    // Keys to read. Must be a list of structs where each stuct is a key
+    // for one requested row and should contain all key columns
     TypedValue keys = 3;
-    // Output columns
+    // Output columns. If empty all columns will be requested
     repeated string columns = 4;
 }
 
@@ -1133,4 +1136,3 @@ message ExecuteScanQueryPartialResult {
     reserved 5; // query_plan
     Ydb.TableStats.QueryStats query_stats = 6;
 }
-

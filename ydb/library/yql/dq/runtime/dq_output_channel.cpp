@@ -51,7 +51,8 @@ template<bool FastPack>
 class TDqOutputChannel : public IDqOutputChannel {
 public:
     TDqOutputChannel(ui64 channelId, NMiniKQL::TType* outputType,
-        const NMiniKQL::THolderFactory& holderFactory, const TDqOutputChannelSettings& settings, const TLogFunc& logFunc)
+        const NMiniKQL::THolderFactory& holderFactory, const TDqOutputChannelSettings& settings, const TLogFunc& logFunc,
+        NDqProto::EDataTransportVersion transportVersion)
         : ChannelId(channelId)
         , OutputType(outputType)
         , BasicStats(ChannelId)
@@ -60,7 +61,7 @@ public:
         , Width(OutputType->IsMulti() ? static_cast<NMiniKQL::TMultiType*>(OutputType)->GetElementsCount() : 1u)
         , Storage(settings.ChannelStorage)
         , HolderFactory(holderFactory)
-        , TransportVersion(settings.TransportVersion)
+        , TransportVersion(transportVersion)
         , MaxStoredBytes(settings.MaxStoredBytes)
         , MaxChunkBytes(settings.MaxChunkBytes)
         , ChunkSizeLimit(settings.ChunkSizeLimit)
@@ -127,8 +128,8 @@ public:
         if (packerSize >= MaxChunkBytes) {
             Data.emplace_back();
             Data.back().Buffer = Packer.Finish();
-            BasicStats.Bytes += Data.back().Buffer->Size();
-            PackedDataSize += Data.back().Buffer->Size();
+            BasicStats.Bytes += Data.back().Buffer.size();
+            PackedDataSize += Data.back().Buffer.size();
             PackedRowCount += ChunkRowCount;
             Data.back().RowCount = ChunkRowCount;
             ChunkRowCount = 0;
@@ -137,14 +138,14 @@ public:
 
         while (Storage && PackedDataSize && PackedDataSize + packerSize > MaxStoredBytes) {
             auto& head = Data.front();
-            size_t bufSize = head.Buffer->Size();
+            size_t bufSize = head.Buffer.size();
             YQL_ENSURE(PackedDataSize >= bufSize);
 
-            TRope blob = TPagedBuffer::AsRope(head.Buffer);
-            TString header((const char*)&head.RowCount, sizeof(head.RowCount));
-            blob.Insert(blob.Begin(), TRope{header});
-            YQL_ENSURE(blob.size() == bufSize + sizeof(head.RowCount));
-            Storage->Put(NextStoredId++, std::move(blob));
+            TDqSerializedBatch data;
+            data.Proto.SetTransportVersion(TransportVersion);
+            data.Proto.SetRows(head.RowCount);
+            data.SetPayload(std::move(head.Buffer));
+            Storage->Put(NextStoredId++, SaveForSpilling(std::move(data)));
 
             PackedDataSize -= bufSize;
             PackedRowCount -= head.RowCount;
@@ -177,20 +178,19 @@ public:
     }
 
     [[nodiscard]]
-    bool Pop(NDqProto::TData& data) override {
+    bool Pop(TDqSerializedBatch& data) override {
         LOG("Pop request, rows in memory: " << GetValuesCount() << ", finished: " << Finished);
 
         if (!HasData()) {
             if (Finished) {
-                data.SetTransportVersion(TransportVersion);
-                data.SetRows(0);
-                data.ClearRaw();
+                data.Clear();
+                data.Proto.SetTransportVersion(TransportVersion);
             }
             return false;
         }
 
-        data.SetTransportVersion(TransportVersion);
-        data.ClearRaw();
+        data.Clear();
+        data.Proto.SetTransportVersion(TransportVersion);
         if (FirstStoredId < NextStoredId) {
             YQL_ENSURE(Storage);
             LOG("Loading spilled blob. BlobId: " << FirstStoredId);
@@ -200,32 +200,25 @@ public:
                 return false;
             }
             ++FirstStoredId;
-            ui64 rows;
-            YQL_ENSURE(blob.size() >= sizeof(rows));
-            std::memcpy((char*)&rows, blob.data(), sizeof(rows));
-            data.SetRows(rows);
-            data.MutableRaw()->insert(data.MutableRaw()->end(), blob.data() + sizeof(rows), blob.data() + blob.size());
-            SpilledRowCount -= rows;
+            data = LoadSpilled(std::move(blob));
+            SpilledRowCount -= data.RowCount();
         } else if (!Data.empty()) {
             auto& packed = Data.front();
-            data.SetRows(packed.RowCount);
-            data.MutableRaw()->reserve(packed.Buffer->Size());
-            packed.Buffer->CopyTo(*data.MutableRaw());
             PackedRowCount -= packed.RowCount;
-            PackedDataSize -= packed.Buffer->Size();
+            PackedDataSize -= packed.Buffer.size();
+            data.Proto.SetRows(packed.RowCount);
+            data.SetPayload(std::move(packed.Buffer));
             Data.pop_front();
         } else {
-            data.SetRows(ChunkRowCount);
-            auto buffer = Packer.Finish();
-            data.MutableRaw()->reserve(buffer->Size());
-            buffer->CopyTo(*data.MutableRaw());
+            data.Proto.SetRows(ChunkRowCount);
+            data.SetPayload(Packer.Finish());
             ChunkRowCount = 0;
         }
 
-        DLOG("Took " << data.GetRows() << " rows");
+        DLOG("Took " << data.RowCount() << " rows");
 
         BasicStats.Chunks++;
-        BasicStats.RowsOut += data.GetRows();
+        BasicStats.RowsOut += data.RowCount();
         return true;
     }
 
@@ -250,23 +243,20 @@ public:
     }
 
     [[nodiscard]]
-    bool PopAll(NDqProto::TData& data) override {
+    bool PopAll(TDqSerializedBatch& data) override {
         if (!HasData()) {
             if (Finished) {
-                data.SetTransportVersion(TransportVersion);
-                data.SetRows(0);
-                data.ClearRaw();
+                data.Clear();
+                data.Proto.SetTransportVersion(TransportVersion);
             }
             return false;
         }
 
-        data.SetTransportVersion(TransportVersion);
-        data.ClearRaw();
+        data.Clear();
+        data.Proto.SetTransportVersion(TransportVersion);
         if (SpilledRowCount == 0 && PackedRowCount == 0) {
-            data.SetRows(ChunkRowCount);
-            auto buffer = Packer.Finish();
-            data.MutableRaw()->reserve(buffer->Size());
-            buffer->CopyTo(*data.MutableRaw());
+            data.Proto.SetRows(ChunkRowCount);
+            data.SetPayload(Packer.Finish());
             ChunkRowCount = 0;
             return true;
         }
@@ -275,8 +265,8 @@ public:
         if (ChunkRowCount) {
             Data.emplace_back();
             Data.back().Buffer = Packer.Finish();
-            BasicStats.Bytes += Data.back().Buffer->Size();
-            PackedDataSize += Data.back().Buffer->Size();
+            BasicStats.Bytes += Data.back().Buffer.size();
+            PackedDataSize += Data.back().Buffer.size();
             PackedRowCount += ChunkRowCount;
             Data.back().RowCount = ChunkRowCount;
             ChunkRowCount = 0;
@@ -284,12 +274,11 @@ public:
 
         NKikimr::NMiniKQL::TUnboxedValueBatch rows(OutputType);
         for (;;) {
-            NDqProto::TData chunk;
+            TDqSerializedBatch chunk;
             if (!this->Pop(chunk)) {
                 break;
             }
-            TStringBuf buf(chunk.GetRaw());
-            Packer.UnpackBatch(buf, HolderFactory, rows);
+            Packer.UnpackBatch(chunk.PullPayload(), HolderFactory, rows);
         }
 
         if (OutputType->IsMulti()) {
@@ -302,10 +291,8 @@ public:
             });
         }
 
-        data.SetRows(rows.RowCount());
-        auto buffer = Packer.Finish();
-        data.MutableRaw()->reserve(buffer->Size());
-        buffer->CopyTo(*data.MutableRaw());
+        data.Proto.SetRows(rows.RowCount());
+        data.SetPayload(Packer.Finish());
         YQL_ENSURE(!HasData());
         return true;
     }
@@ -363,7 +350,7 @@ private:
     TLogFunc LogFunc;
 
     struct TSerializedBatch {
-        TPagedBuffer::TPtr Buffer;
+        TRope Buffer;
         ui64 RowCount = 0;
     };
     std::deque<TSerializedBatch> Data;
@@ -390,14 +377,19 @@ IDqOutputChannel::TPtr CreateDqOutputChannel(ui64 channelId, NKikimr::NMiniKQL::
     const NKikimr::NMiniKQL::THolderFactory& holderFactory,
     const TDqOutputChannelSettings& settings, const TLogFunc& logFunc)
 {
-    if (settings.TransportVersion == NDqProto::EDataTransportVersion::DATA_TRANSPORT_UV_PICKLE_1_0 ||
-        settings.TransportVersion == NDqProto::EDataTransportVersion::DATA_TRANSPORT_VERSION_UNSPECIFIED)
-    {
-        return new TDqOutputChannel<false>(channelId, outputType, holderFactory, settings, logFunc);
-    } else {
-        YQL_ENSURE(settings.TransportVersion == NDqProto::EDataTransportVersion::DATA_TRANSPORT_UV_FAST_PICKLE_1_0,
-            "Unsupported transport version " << (ui32)settings.TransportVersion);
-        return new TDqOutputChannel<true>(channelId, outputType, holderFactory, settings, logFunc);
+    auto transportVersion = settings.TransportVersion;
+    switch(transportVersion) {
+        case NDqProto::EDataTransportVersion::DATA_TRANSPORT_VERSION_UNSPECIFIED:
+            transportVersion = NDqProto::EDataTransportVersion::DATA_TRANSPORT_UV_PICKLE_1_0;
+            [[fallthrough]];
+        case NDqProto::EDataTransportVersion::DATA_TRANSPORT_UV_PICKLE_1_0:
+        case NDqProto::EDataTransportVersion::DATA_TRANSPORT_OOB_PICKLE_1_0:
+            return new TDqOutputChannel<false>(channelId, outputType, holderFactory, settings, logFunc, transportVersion);
+        case NDqProto::EDataTransportVersion::DATA_TRANSPORT_UV_FAST_PICKLE_1_0:
+        case NDqProto::EDataTransportVersion::DATA_TRANSPORT_OOB_FAST_PICKLE_1_0:
+            return new TDqOutputChannel<true>(channelId, outputType, holderFactory, settings, logFunc, transportVersion);
+        default:
+            YQL_ENSURE(false, "Unsupported transport version " << (ui32)transportVersion);
     }
 }
 

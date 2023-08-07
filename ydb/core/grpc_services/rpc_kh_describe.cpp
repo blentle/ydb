@@ -1,7 +1,7 @@
 #include "service_coordination.h"
 #include <ydb/core/grpc_services/base/base.h>
 
-#include "rpc_common.h"
+#include "rpc_common/rpc_common.h"
 #include "resolve_local_db_table.h"
 
 #include <ydb/library/aclib/aclib.h>
@@ -9,6 +9,7 @@
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
 #include <ydb/core/base/tablet_pipecache.h>
+#include <ydb/public/api/protos/ydb_clickhouse_internal.pb.h>
 
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 #include <library/cpp/actors/core/hfunc.h>
@@ -121,7 +122,7 @@ private:
     }
 
     void Handle(TEvPipeCache::TEvDeliveryProblem::TPtr& ev,  const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Got TEvDeliveryProblem, TabletId: " << ev->Get()->TabletId
+        LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, "Got TEvDeliveryProblem, TabletId: " << ev->Get()->TabletId
                 << ", NotDelivered: " << ev->Get()->NotDelivered);
         return ReplyWithError(Ydb::StatusIds::UNAVAILABLE, "Invalid table path specified", ctx);
     }
@@ -309,7 +310,7 @@ private:
             return JoinVectorIntoString(shards, ", ");
         };
 
-        LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Table ["
+        LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, "Table ["
                     << TEvKikhouseDescribeTableRequest::GetProtoRequest(Request)->path()
                     << "] shards: " << getShardsString(KeyRange->GetPartitions()));
 

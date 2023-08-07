@@ -66,6 +66,7 @@ SIMPLE_UDF(TRandString, char*(ui32)) {
 SIMPLE_MODULE(TTestUdfsModule, TTestFilter, TTestFilterTerminate, TRandString);
 NYql::NUdf::TUniquePtr<NYql::NUdf::IUdfModule> CreateJson2Module();
 NYql::NUdf::TUniquePtr<NYql::NUdf::IUdfModule> CreateRe2Module();
+NYql::NUdf::TUniquePtr<NYql::NUdf::IUdfModule> CreateStringModule();
 
 NMiniKQL::IFunctionRegistry* UdfFrFactory(const NScheme::TTypeRegistry& typeRegistry) {
     Y_UNUSED(typeRegistry);
@@ -73,6 +74,7 @@ NMiniKQL::IFunctionRegistry* UdfFrFactory(const NScheme::TTypeRegistry& typeRegi
     funcRegistry->AddModule("", "TestUdfs", new TTestUdfsModule());
     funcRegistry->AddModule("", "Json2", CreateJson2Module());
     funcRegistry->AddModule("", "Re2", CreateRe2Module());
+    funcRegistry->AddModule("", "String", CreateStringModule());
     NKikimr::NMiniKQL::FillStaticModules(*funcRegistry);
     return funcRegistry.Release();
 }
@@ -117,6 +119,11 @@ TKikimrRunner::TKikimrRunner(const TKikimrSettings& settings) {
     ServerSettings->SetFrFactory(&UdfFrFactory);
     ServerSettings->SetEnableNotNullColumns(true);
     ServerSettings->SetEnableMoveIndex(true);
+
+    if (settings.Storage) {
+        ServerSettings->SetCustomDiskParams(*settings.Storage);
+        ServerSettings->SetEnableMockOnSingleNode(false);
+    }
 
     if (settings.LogStream)
         ServerSettings->SetLogBackend(new TStreamLogBackend(settings.LogStream));
@@ -178,6 +185,10 @@ TKikimrRunner::TKikimrRunner(const TString& authToken, const TString& domainRoot
         .SetAuthToken(authToken)
         .SetDomainRoot(domainRoot)
         .SetNodeCount(nodeCount)) {}
+
+TKikimrRunner::TKikimrRunner(const NFake::TStorage& storage)
+    : TKikimrRunner(TKikimrSettings()
+        .SetStorage(storage)) {}
 
 void TKikimrRunner::CreateSampleTables() {
     Client->CreateTable("/Root", R"(
@@ -420,7 +431,7 @@ void TKikimrRunner::Initialize(const TKikimrSettings& settings) {
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_YQL, NActors::NLog::PRI_INFO);
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::TX_DATASHARD, NActors::NLog::PRI_TRACE);
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::TX_COORDINATOR, NActors::NLog::PRI_DEBUG);
-    // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_COMPUTE, tors::NLog::PRI_DEBUG);
+    // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_COMPUTE, NActors::NLog::PRI_DEBUG);
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_TASKS_RUNNER, NActors::NLog::PRI_DEBUG);
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_EXECUTER, NActors::NLog::PRI_TRACE);
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::TX_PROXY_SCHEME_CACHE, NActors::NLog::PRI_DEBUG);
@@ -440,8 +451,6 @@ void TKikimrRunner::Initialize(const TKikimrSettings& settings) {
     // Server->GetRuntime()->SetLogPriority(NKikimrServices::KQP_BLOBS_STORAGE, NActors::NLog::PRI_DEBUG);
 
     Client->InitRootScheme(settings.DomainRoot);
-
-    NKikimr::NKqp::WaitForKqpProxyInit(GetDriver());
 
     if (settings.WithSampleTables) {
         CreateSampleTables();
@@ -725,15 +734,25 @@ TCollectedStreamResult CollectStreamResultImpl(TIterator& it) {
         if constexpr (std::is_same_v<TIterator, NYdb::NTable::TScanQueryPartIterator>) {
             UNIT_ASSERT_C(streamPart.HasResultSet() || streamPart.HasQueryStats(),
                 "Unexpected empty scan query response.");
+
+            if (streamPart.HasResultSet()) {
+                auto resultSet = streamPart.ExtractResultSet();
+                PrintResultSet(resultSet, resultSetWriter);
+                res.RowsCount += resultSet.RowsCount();
+            }
         }
 
-        if (streamPart.HasResultSet()) {
-            auto resultSet = streamPart.ExtractResultSet();
-            PrintResultSet(resultSet, resultSetWriter);
-            res.RowsCount += resultSet.RowsCount();
+        if constexpr (std::is_same_v<TIterator, NYdb::NScripting::TYqlResultPartIterator>) {
+            if (streamPart.HasPartialResult()) {
+                const auto& partialResult = streamPart.GetPartialResult();
+                const auto& resultSet = partialResult.GetResultSet();
+                PrintResultSet(resultSet, resultSetWriter);
+                res.RowsCount += resultSet.RowsCount();
+            }
         }
 
-        if constexpr (std::is_same_v<TIterator, NYdb::NTable::TScanQueryPartIterator>) {
+        if constexpr (std::is_same_v<TIterator, NYdb::NTable::TScanQueryPartIterator>
+                || std::is_same_v<TIterator, NYdb::NScripting::TYqlResultPartIterator>) {
             if (streamPart.HasQueryStats() ) {
                 res.QueryStats = NYdb::TProtoAccessor::GetProto(streamPart.GetQueryStats());
 
@@ -755,9 +774,13 @@ TCollectedStreamResult CollectStreamResultImpl(TIterator& it) {
     return res;
 }
 
-TCollectedStreamResult CollectStreamResult(NYdb::NTable::TScanQueryPartIterator& it) {
+template<typename TIterator>
+TCollectedStreamResult CollectStreamResult(TIterator& it) {
     return CollectStreamResultImpl(it);
 }
+
+template TCollectedStreamResult CollectStreamResult(NYdb::NTable::TScanQueryPartIterator& it);
+template TCollectedStreamResult CollectStreamResult(NYdb::NScripting::TYqlResultPartIterator& it);
 
 TString ReadTableToYson(NYdb::NTable::TSession session, const TString& table) {
     TReadTableSettings settings;
@@ -863,6 +886,15 @@ NJson::TJsonValue FindPlanNodeByKv(const NJson::TJsonValue& plan, const TString&
 
         if (map.contains("Operators")) {
             for (const auto &node : map["Operators"].GetArraySafe()) {
+                auto op = FindPlanNodeByKv(node, key, value);
+                if (op.IsDefined()) {
+                    return op;
+                }
+            }
+        }
+
+        if (map.contains("queries")) {
+            for (const auto &node : map["queries"].GetArraySafe()) {
                 auto op = FindPlanNodeByKv(node, key, value);
                 if (op.IsDefined()) {
                     return op;
@@ -1002,25 +1034,6 @@ void CreateSampleTablesWithIndex(TSession& session, bool populateTables) {
     )", TTxControl::BeginTx().CommitTx()).GetValueSync();
 
     UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-}
-
-void WaitForKqpProxyInit(const NYdb::TDriver& driver) {
-    NYdb::NTable::TTableClient client(driver);
-
-    while (true) {
-        auto it = client.RetryOperationSync([=](TSession session) {
-            return session.ExecuteDataQuery(R"(
-                        SELECT 1;
-                    )",
-                    TTxControl::BeginTx().CommitTx()
-                ).GetValueSync();
-        });
-
-        if (it.IsSuccess()) {
-            break;
-        }
-        Sleep(TDuration::MilliSeconds(100));
-    }
 }
 
 void InitRoot(Tests::TServer::TPtr server, TActorId sender) {

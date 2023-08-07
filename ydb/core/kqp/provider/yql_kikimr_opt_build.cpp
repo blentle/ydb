@@ -70,8 +70,8 @@ enum class TPrimitiveYdbOperation : ui32 {
     Write = 1 << 1
 };
 
-Y_DECLARE_FLAGS(TPrimitiveYdbOperations, TPrimitiveYdbOperation)
-Y_DECLARE_OPERATORS_FOR_FLAGS(TPrimitiveYdbOperations)
+Y_DECLARE_FLAGS(TPrimitiveYdbOperations, TPrimitiveYdbOperation);
+Y_DECLARE_OPERATORS_FOR_FLAGS(TPrimitiveYdbOperations);
 
 struct TKiExploreTxResults {
     struct TKiQueryBlock {
@@ -81,6 +81,8 @@ struct TKiExploreTxResults {
         TVector<TKiOperation> TableOperations;
         bool HasUncommittedChangesRead = false;
     };
+
+    bool ConcurrentResults = true;
 
     THashSet<const TExprNode*> Ops;
     TVector<TExprBase> Sync;
@@ -245,6 +247,10 @@ struct TKiExploreTxResults {
             AddQueryBlock();
         }
 
+        if (!ConcurrentResults && QueryBlocks.back().Results.size() > 0) {
+            AddQueryBlock();
+        }
+
         auto& curBlock = QueryBlocks.back();
         curBlock.Results.push_back(result);
     }
@@ -322,25 +328,33 @@ bool ExploreTx(TExprBase node, TExprContext& ctx, const TKiDataSink& dataSink, T
         return result;
     }
 
-    for (const auto& dataSource : types.DataSources) {
-        if (auto* dqIntegration = dataSource->GetDqIntegration(); dqIntegration 
-        && dqIntegration->CanRead(*node.Ptr(), ctx)
-        && dqIntegration->EstimateReadSize(TDqSettings::TDefault::DataSizePerJob, TDqSettings::TDefault::MaxTasksPerStage, *node.Ptr(), ctx)) {
-            txRes.Ops.insert(node.Raw());
-            for (size_t i = 0, childrenSize = node.Raw()->ChildrenSize(); i < childrenSize; ++i) {
-                if (TExprNode::TPtr child = node.Raw()->ChildPtr(i)) {
-                    bool isWorldChild = false;
-                    if (child->IsWorld()) {
-                        isWorldChild = true;
-                    } else if (auto* typeAnn = child->GetTypeAnn(); typeAnn && typeAnn->GetKind() == ETypeAnnotationKind::World) {
-                        isWorldChild = true;
-                    }
-                    if (isWorldChild) {
-                        return ExploreTx(TExprBase(child), ctx, dataSink, txRes, tablesData, types);
+    if (node.Ref().ChildrenSize() > 1) {
+        TExprBase dataSourceArg(node.Ref().Child(1));
+        if (auto maybeDataSource = dataSourceArg.Maybe<TCoDataSource>()) {
+            TStringBuf dataSourceCategory = maybeDataSource.Cast().Category();
+            auto dataSourceProviderIt = types.DataSourceMap.find(dataSourceCategory);
+            if (dataSourceProviderIt != types.DataSourceMap.end()) {
+                if (auto* dqIntegration = dataSourceProviderIt->second->GetDqIntegration()) {
+                    if (dqIntegration->CanRead(*node.Ptr(), ctx)
+                        && dqIntegration->EstimateReadSize(
+                            TDqSettings::TDefault::DataSizePerJob,
+                            TDqSettings::TDefault::MaxTasksPerStage,
+                            *node.Ptr(),
+                            ctx))
+                    {
+                        txRes.Ops.insert(node.Raw());
+                        for (size_t i = 0, childrenSize = node.Raw()->ChildrenSize(); i < childrenSize; ++i) {
+                            if (TExprNode::TPtr child = node.Raw()->ChildPtr(i)) {
+                                auto* typeAnn = child->GetTypeAnn();
+                                if (typeAnn && typeAnn->GetKind() == ETypeAnnotationKind::World) {
+                                    return ExploreTx(TExprBase(child), ctx, dataSink, txRes, tablesData, types);
+                                }
+                            }
+                        }
+                        YQL_ENSURE(false, "Node \"" << node.Ref().Content() << "\" is expected to contain world child");
                     }
                 }
             }
-            return true;
         }
     }
 
@@ -374,6 +388,32 @@ bool ExploreTx(TExprBase node, TExprContext& ctx, const TKiDataSink& dataSink, T
 
         txRes.AddTableOperation(BuildTableOpNode(cluster, table, tableOp, write.Pos(), ctx));
         return result;
+    }
+
+    if (node.Ref().ChildrenSize() > 1) {
+        TExprBase dataSinkArg(node.Ref().Child(1));
+        if (auto maybeDataSink = dataSinkArg.Maybe<TCoDataSink>()) {
+            TStringBuf dataSinkCategory = maybeDataSink.Cast().Category();
+            auto dataSinkProviderIt = types.DataSinkMap.find(dataSinkCategory);
+            if (dataSinkProviderIt != types.DataSinkMap.end()) {
+                if (auto* dqIntegration = dataSinkProviderIt->second->GetDqIntegration()) {
+                    if (auto canWrite = dqIntegration->CanWrite(node.Ref(), ctx)) {
+                        YQL_ENSURE(*canWrite, "Errors handling write");
+                        txRes.Ops.insert(node.Raw());
+                        txRes.AddEffect(node, THashMap<TString, TPrimitiveYdbOperations>{});
+                        for (size_t i = 0, childrenSize = node.Raw()->ChildrenSize(); i < childrenSize; ++i) {
+                            if (TExprNode::TPtr child = node.Raw()->ChildPtr(i)) {
+                                auto* typeAnn = child->GetTypeAnn();
+                                if (typeAnn && typeAnn->GetKind() == ETypeAnnotationKind::World) {
+                                    return ExploreTx(TExprBase(child), ctx, dataSink, txRes, tablesData, types);
+                                }
+                            }
+                        }
+                        YQL_ENSURE(false, "Node \"" << node.Ref().Content() << "\" is expected to contain world child");
+                    }
+                }
+            }
+        }
     }
 
     if (auto maybeUpdate = node.Maybe<TKiUpdateTable>()) {
@@ -718,7 +758,8 @@ TVector<TKiDataQueryBlock> MakeKiDataQueryBlocks(TExprBase node, const TKiExplor
 
 } // namespace
 
-TExprNode::TPtr KiBuildQuery(TExprBase node, TExprContext& ctx, TIntrusivePtr<TKikimrTablesData> tablesData, TTypeAnnotationContext& types) {
+TExprNode::TPtr KiBuildQuery(TExprBase node, TExprContext& ctx, TIntrusivePtr<TKikimrTablesData> tablesData,
+    TTypeAnnotationContext& types, bool concurrentResults) {
     if (!node.Maybe<TCoCommit>().DataSink().Maybe<TKiDataSink>()) {
         return node.Ptr();
     }
@@ -728,6 +769,7 @@ TExprNode::TPtr KiBuildQuery(TExprBase node, TExprContext& ctx, TIntrusivePtr<TK
     auto kiDataSink = commit.DataSink().Cast<TKiDataSink>();
 
     TKiExploreTxResults txExplore;
+    txExplore.ConcurrentResults = concurrentResults;
     if (!ExploreTx(commit.World(), ctx, kiDataSink, txExplore, tablesData, types)) {
         return node.Ptr();
     }
@@ -793,13 +835,14 @@ TExprNode::TPtr KiBuildQuery(TExprBase node, TExprContext& ctx, TIntrusivePtr<TK
             .Done()
             .Ptr();
 
+        int resultIndex = 0;
         for (auto& block : txExplore.QueryBlocks) {
             for (size_t i = 0; i < block.Results.size(); ++i) {
                 auto result = block.Results[i].Cast<TResWriteBase>();
 
                 auto extractValue = Build<TCoNth>(ctx, node.Pos())
                     .Tuple(execRight)
-                    .Index().Build(i)
+                    .Index().Build(resultIndex)
                     .Done()
                     .Ptr();
 
@@ -818,6 +861,8 @@ TExprNode::TPtr KiBuildQuery(TExprBase node, TExprContext& ctx, TIntrusivePtr<TK
                     .DataSink<TResultDataSink>()
                         .Build()
                     .Done();
+
+                ++resultIndex;
             }
         }
     }

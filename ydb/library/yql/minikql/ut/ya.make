@@ -12,6 +12,7 @@ ELSE()
 ENDIF()
 
 SRCS(
+    aligned_page_pool_ut.cpp
     compact_hash_ut.cpp
     mkql_alloc_ut.cpp
     mkql_node_builder_ut.cpp
@@ -29,8 +30,7 @@ SRCS(
 
 PEERDIR(
     contrib/libs/apache/arrow
-    ydb/library/yql/minikql/computation
-    ydb/library/yql/minikql/invoke_builtins
+    ydb/library/yql/minikql/invoke_builtins/llvm
     ydb/library/yql/parser/pg_wrapper
     ydb/library/yql/public/udf/service/exception_policy
 )

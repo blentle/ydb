@@ -14,6 +14,7 @@ PEERDIR(
     ydb/core/fq/libs/checkpointing
     ydb/core/fq/libs/cloud_audit
     ydb/core/fq/libs/common
+    ydb/core/fq/libs/compute/ydb/control_plane
     ydb/core/fq/libs/control_plane_config
     ydb/core/fq/libs/control_plane_proxy
     ydb/core/fq/libs/control_plane_storage
@@ -29,12 +30,11 @@ PEERDIR(
     ydb/library/folder_service
     ydb/library/folder_service/proto
     ydb/library/security
-    ydb/library/yql/minikql/comp_nodes
+    ydb/library/yql/minikql/comp_nodes/llvm
     ydb/library/yql/utils/actor_log
     ydb/library/yql/dq/actors/compute
     ydb/library/yql/dq/comp_nodes
     ydb/library/yql/dq/transform
-    ydb/library/yql/providers/clickhouse/actors
     ydb/library/yql/providers/common/comp_nodes
     ydb/library/yql/providers/common/metrics
     ydb/library/yql/providers/dq/actors
@@ -43,6 +43,7 @@ PEERDIR(
     ydb/library/yql/providers/dq/task_runner
     ydb/library/yql/providers/dq/worker_manager
     ydb/library/yql/providers/dq/worker_manager/interface
+    ydb/library/yql/providers/generic/actors
     ydb/library/yql/providers/pq/async_io
     ydb/library/yql/providers/pq/cm_client
     ydb/library/yql/providers/pq/gateway/native

@@ -2,6 +2,7 @@
 #include "test_client.h"
 
 #include <ydb/core/client/flat_ut_client.h>
+#include <ydb/core/persqueue/cluster_tracker.h>
 #include <ydb/core/protos/flat_tx_scheme.pb.h>
 #include <ydb/core/mind/address_classification/net_classifier.h>
 #include <ydb/public/lib/deprecated/kicli/kicli.h>
@@ -546,6 +547,8 @@ public:
         auto channel = grpc::CreateCustomChannel(endpoint, grpc::InsecureChannelCredentials(), args);
 
         Stub = NKikimrClient::TGRpcServer::NewStub(channel);
+
+        Cerr << "PQClient connected to " << endpoint << Endl;
     }
 
     ~TFlatMsgBusPQClient() {
@@ -667,6 +670,39 @@ public:
             UPSERT INTO `/Root/PQ/Config/V2/Versions` (name, version) VALUES ("Cluster", 1);
             UPSERT INTO `/Root/PQ/Config/V2/Versions` (name, version) VALUES ("Topics", 0);
         )___");
+    }
+
+    void CheckClustersList(TTestActorRuntime* runtime, bool waitForUpdate = true, THashMap<TString, TPQTestClusterInfo> clusters = DEFAULT_CLUSTERS_LIST) {
+        UNIT_ASSERT(runtime != nullptr);
+
+        auto compareInfo = [](const TString& name, const TPQTestClusterInfo& info, const NPQ::NClusterTracker::TClustersList::TCluster& trackerInfo) {
+            UNIT_ASSERT_EQUAL(name, trackerInfo.Name);
+            UNIT_ASSERT_EQUAL(name, trackerInfo.Datacenter);
+            UNIT_ASSERT_EQUAL(info.Balancer, trackerInfo.Balancer);
+            UNIT_ASSERT_EQUAL(info.Enabled, trackerInfo.IsEnabled);
+            UNIT_ASSERT_EQUAL(info.Weight, trackerInfo.Weight);
+        };
+
+        TInstant now = TInstant::Now();
+
+
+        auto edgeActor = runtime->AllocateEdgeActor();
+        Cerr << "=== CheckClustersList. Subcribe to ClusterTracker from " << edgeActor << " \n";
+        runtime->Send(new IEventHandle(NKikimr::NPQ::NClusterTracker::MakeClusterTrackerID(), edgeActor, new NPQ::NClusterTracker::TEvClusterTracker::TEvSubscribe));
+
+        while (true) {
+            auto trackerResponse = runtime->GrabEdgeEvent<NKikimr::NPQ::NClusterTracker::TEvClusterTracker::TEvClustersUpdate>();
+
+            if (!waitForUpdate || trackerResponse->ClustersListUpdateTimestamp && trackerResponse->ClustersListUpdateTimestamp.GetRef() >= now + TDuration::Seconds(5)) {
+                for (auto& clusterInfo : trackerResponse->ClustersList->Clusters) {
+                    auto it = clusters.find(clusterInfo.Name);
+                    UNIT_ASSERT(it != clusters.end());
+                    compareInfo(it->first, it->second, clusterInfo);
+                }
+                Cerr << "=== CheckClustersList. Ok\n";
+                break;
+            }
+        }
     }
 
     void UpdateDcEnabled(const TString& name, bool enabled) {
@@ -811,7 +847,7 @@ public:
     }
 
     NKikimrClient::TResponse CallPersQueueGRPC(const NKikimrClient::TPersQueueRequest& request, ui64 maxPrintSize = 1000) {
-        Cerr << "CallPersQueueGRPC request to " << Client->GetConfig().Ip << ":" << Client->GetConfig().Port << "\n"
+        Cerr << "CallPersQueueGRPC request to localhost:" << GRpcPort << "\n"
              << PrintToString(request, maxPrintSize) << Endl;
 
         NKikimrClient::TResponse response;
@@ -844,39 +880,18 @@ public:
 
     void CreateTopicNoLegacy(const TString& name, ui32 partsCount, bool doWait = true, bool canWrite = true,
                              const TMaybe<TString>& dc = Nothing(), TVector<TString> rr = {"user"},
-                             const TMaybe<TString>& account = Nothing(), bool expectFail = false
-    ) {
-        Cerr << "CreateTopicNoLegacy: " << name << Endl;
-
-        TString path = name;
-        if (UseConfigTables && !path.StartsWith("/Root") && !account.Defined()) {
-            path = TStringBuilder() << "/Root/PQ/" << name;
-        }
-
-        auto pqClient = NYdb::NPersQueue::TPersQueueClient(*Driver);
-        auto settings = NYdb::NPersQueue::TCreateTopicSettings().PartitionsCount(partsCount).ClientWriteDisabled(!canWrite);
-        settings.FederationAccount(account);
-        TVector<NYdb::NPersQueue::TReadRuleSettings> rrSettings;
-        for (auto &user : rr) {
-            rrSettings.push_back({NYdb::NPersQueue::TReadRuleSettings{}.ConsumerName(user)});
-        }
-        settings.ReadRules(rrSettings);
-
-        Cerr << "Create topic: " << path << Endl;
-        auto res = pqClient.CreateTopic(path, settings);
-        //ToDo - hack, cannot avoid legacy compat yet as PQv1 still uses RequestProcessor from core/client/server
-        if (UseConfigTables && !expectFail) {
-            AddTopic(name, dc);
-        }
-        if (expectFail) {
-            res.Wait();
-            UNIT_ASSERT(!res.GetValue().IsSuccess());
-        } else {
-            Y_UNUSED(doWait);
-            res.Wait();
-            Cerr << "Create topic result: " << res.GetValue().IsSuccess() << " " << res.GetValue().GetIssues().ToString() << "\n";
-            UNIT_ASSERT(res.GetValue().IsSuccess());
-        }
+                             const TMaybe<TString>& account = Nothing(), bool expectFail = false)
+    {
+        CreateTopicNoLegacy({
+            .Name = name,
+            .PartsCount = partsCount,
+            .DoWait = doWait,
+            .CanWrite = canWrite,
+            .Dc = dc,
+            .ReadRules = rr,
+            .Account = account,
+            .ExpectFail = expectFail
+        });
     }
 
     void WaitTopicInit(const TString& topic) {
@@ -1362,6 +1377,53 @@ public:
         TStringBuilder query;
         query << "DECLARE $version as Int64; " << GetAlterTopicsVersionQuery();
         RunYqlDataQueryWithParams(query, params);
+    }
+
+    struct CreateTopicNoLegacyParams {
+        TString Name;
+        ui32 PartsCount;
+        bool DoWait = true;
+        bool CanWrite = true;
+        TMaybe<TString> Dc = Nothing();
+        TVector<TString> ReadRules = {"user"};
+        TMaybe<TString> Account = Nothing();
+        bool ExpectFail = false;
+        TVector<NYdb::NPersQueue::ECodec> Codecs = NYdb::NPersQueue::GetDefaultCodecs();
+    };
+
+    void CreateTopicNoLegacy(const CreateTopicNoLegacyParams& params)
+    {
+        Cerr << "CreateTopicNoLegacy: " << params.Name << Endl;
+
+        TString path = params.Name;
+        if (UseConfigTables && !path.StartsWith("/Root") && !params.Account.Defined()) {
+            path = TStringBuilder() << "/Root/PQ/" << params.Name;
+        }
+
+        auto pqClient = NYdb::NPersQueue::TPersQueueClient(*Driver);
+        auto settings = NYdb::NPersQueue::TCreateTopicSettings().PartitionsCount(params.PartsCount).ClientWriteDisabled(!params.CanWrite);
+        settings.FederationAccount(params.Account);
+        settings.SupportedCodecs(params.Codecs);
+        TVector<NYdb::NPersQueue::TReadRuleSettings> rrSettings;
+        for (auto &user : params.ReadRules) {
+            rrSettings.push_back({NYdb::NPersQueue::TReadRuleSettings{}.ConsumerName(user)});
+        }
+        settings.ReadRules(rrSettings);
+
+        Cerr << "Create topic: " << path << Endl;
+        auto res = pqClient.CreateTopic(path, settings);
+        //ToDo - hack, cannot avoid legacy compat yet as PQv1 still uses RequestProcessor from core/client/server
+        if (UseConfigTables && !params.ExpectFail) {
+            AddTopic(params.Name, params.Dc);
+        }
+        if (params.ExpectFail) {
+            res.Wait();
+            UNIT_ASSERT(!res.GetValue().IsSuccess());
+        } else {
+            res.Wait();
+            Cerr << "Create topic result: " << res.GetValue().IsSuccess() << " " << res.GetValue().GetIssues().ToString() << "\n";
+            UNIT_ASSERT(res.GetValue().IsSuccess());
+        }
     }
 };
 

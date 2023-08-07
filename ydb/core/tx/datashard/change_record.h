@@ -4,7 +4,7 @@
 
 #include <library/cpp/json/json_value.h>
 
-#include <ydb/core/base/pathid.h>
+#include <ydb/core/scheme/scheme_pathid.h>
 #include <ydb/core/scheme/scheme_tablecell.h>
 
 #include <util/generic/maybe.h>
@@ -25,6 +25,7 @@ public:
     enum class EKind: ui8 {
         AsyncIndex,
         CdcDataChange,
+        CdcHeartbeat,
     };
 
     struct TAwsJsonOptions {
@@ -55,6 +56,7 @@ public:
     i64 GetSeqNo() const;
     TString GetPartitionKey() const;
     TInstant GetApproximateCreationDateTime() const;
+    bool IsBroadcast() const;
 
     TString ToString() const;
     void Out(IOutputStream& out) const;

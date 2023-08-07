@@ -47,15 +47,15 @@ SRCS(
     testactorsys.h
     text.cpp
     text.h
-    time_series_vec.h
     token_bucket.h
     throughput_meter.h
     tuples.h
     type_alias.h
     ulid.cpp
     ulid.h
+    ui64id.cpp
+    ui64id.h
     wildcard.h
-    yverify_stream.h
 )
 
 PEERDIR(
@@ -72,6 +72,7 @@ PEERDIR(
     ydb/core/base
     ydb/core/protos
     library/cpp/deprecated/atomic
+    ydb/library/yverify_stream
 )
 
 END()

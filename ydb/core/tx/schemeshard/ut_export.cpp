@@ -186,15 +186,25 @@ namespace {
 } // anonymous
 
 Y_UNIT_TEST_SUITE(TExportToS3Tests) {
-    void RunS3(TTestBasicRuntime& runtime, const TVector<TString>& tables, const TString& request) {
+    void RunS3(TTestBasicRuntime& runtime, const TVector<TString>& tables, const TString& requestTpl) {
         TPortManager portManager;
         const ui16 port = portManager.GetPort();
 
         TS3Mock s3Mock({}, TS3Mock::TSettings(port));
         UNIT_ASSERT(s3Mock.Start());
 
+        auto request = Sprintf(requestTpl.c_str(), port);
+
         TTestEnv env(runtime);
-        Run(runtime, env, tables, Sprintf(request.c_str(), port), Ydb::StatusIds::SUCCESS, "/MyRoot", false);
+        Run(runtime, env, tables, request, Ydb::StatusIds::SUCCESS, "/MyRoot", false);
+
+        for (auto &path : GetExportTargetPaths(request)) {
+            auto canonPath = (path.StartsWith("/") || path.empty()) ? path : TString("/") + path;
+            auto it = s3Mock.GetData().find(canonPath + "/metadata.json");
+            UNIT_ASSERT(it != s3Mock.GetData().end());
+            it = s3Mock.GetData().find(canonPath + "/scheme.pb");
+            UNIT_ASSERT(it != s3Mock.GetData().end());
+        }
     }
 
     Y_UNIT_TEST(ShouldSucceedOnSingleShardTable) {
@@ -284,16 +294,6 @@ Y_UNIT_TEST_SUITE(TExportToS3Tests) {
         TTestBasicRuntime runtime;
         TTestEnv env(runtime);
 
-        TString scheme;
-        runtime.SetObserverFunc([&scheme](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) {
-            if (!scheme && ev->GetTypeRewrite() == NWrappers::NExternalStorage::EvPutObjectRequest) {
-                const auto* msg = ev->Get<NWrappers::NExternalStorage::TEvPutObjectRequest>();
-                scheme = msg->Body;
-            }
-
-            return TTestActorRuntime::EEventAction::PROCESS;
-        });
-
         const TVector<TString> tables = {R"(
             Name: "Table"
             Columns { Name: "key" Type: "Utf8" }
@@ -331,6 +331,11 @@ Y_UNIT_TEST_SUITE(TExportToS3Tests) {
             }
         )", port));
 
+        auto schemeIt = s3Mock.GetData().find("/scheme.pb");
+        UNIT_ASSERT(schemeIt != s3Mock.GetData().end());
+
+        TString scheme = schemeIt->second;
+
         UNIT_ASSERT_NO_DIFF(scheme, R"(columns {
   name: "key"
   type {
@@ -340,6 +345,7 @@ Y_UNIT_TEST_SUITE(TExportToS3Tests) {
       }
     }
   }
+  not_null: false
 }
 columns {
   name: "value"
@@ -350,6 +356,7 @@ columns {
       }
     }
   }
+  not_null: false
 }
 primary_key: "key"
 storage_settings {
@@ -1039,7 +1046,7 @@ partitioning_settings {
             });
             runtime.DispatchEvents(opts);
         }
-        
+
         THolder<IEventHandle> proposeTxResult;
         runtime.SetObserverFunc([&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) {
             if (ev->GetTypeRewrite() == TEvDataShard::EvProposeTransactionResult) {
@@ -1069,6 +1076,172 @@ partitioning_settings {
 
         env.TestWaitNotification(runtime, exportId);
         TestGetExport(runtime, exportId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+    }
+
+    Y_UNIT_TEST(ShouldSucceedOnConcurrentExport) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        ui64 txId = 100;
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Utf8" }
+            Columns { Name: "value" Type: "Utf8" }
+            KeyColumnNames: ["key"]
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+
+        TS3Mock s3Mock({}, TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TVector<THolder<IEventHandle>> copyTables;
+        auto origObserver = runtime.SetObserverFunc([&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) {
+            if (ev->GetTypeRewrite() == TEvSchemeShard::EvModifySchemeTransaction) {
+                const auto& record = ev->Get<TEvSchemeShard::TEvModifySchemeTransaction>()->Record;
+                if (record.GetTransaction(0).GetOperationType() == NKikimrSchemeOp::ESchemeOpCreateConsistentCopyTables) {
+                    copyTables.emplace_back(ev.Release());
+                    return TTestActorRuntime::EEventAction::DROP;
+                }
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        });
+        auto waitCopyTables = [&runtime, &copyTables](ui32 size) {
+            if (copyTables.size() != size) {
+                TDispatchOptions opts;
+                opts.FinalEvents.emplace_back([&copyTables, size](IEventHandle&) -> bool {
+                    return copyTables.size() == size;
+                });
+                runtime.DispatchEvents(opts);
+            }
+        };
+
+        TVector<ui64> exportIds;
+        for (ui32 i = 1; i <= 3; ++i) {
+            exportIds.push_back(++txId);
+            TestExport(runtime, exportIds[i - 1], "/MyRoot", Sprintf(R"(
+                ExportToS3Settings {
+                  endpoint: "localhost:%d"
+                  scheme: HTTP
+                  items {
+                    source_path: "/MyRoot/Table"
+                    destination_prefix: "Table%u"
+                  }
+                }
+            )", port, i));
+            waitCopyTables(i);
+        }
+
+        runtime.SetObserverFunc(origObserver);
+        for (auto& ev : copyTables) {
+            runtime.Send(ev.Release(), 0, true);
+        }
+
+        for (ui64 exportId : exportIds) {
+            env.TestWaitNotification(runtime, exportId);
+            TestGetExport(runtime, exportId, "/MyRoot", Ydb::StatusIds::SUCCESS);
+        }
+    }
+
+    Y_UNIT_TEST(ShouldSucceedOnConcurrentImport) {
+        TTestBasicRuntime runtime;
+        TTestEnv env(runtime);
+        ui64 txId = 100;
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "Table"
+            Columns { Name: "key" Type: "Utf8" }
+            Columns { Name: "value" Type: "Utf8" }
+            KeyColumnNames: ["key"]
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+
+        TS3Mock s3Mock({}, TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        // prepare backup data
+        TestExport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_path: "/MyRoot/Table"
+                destination_prefix: "Backup1"
+              }
+            }
+        )", port));
+        env.TestWaitNotification(runtime, txId);
+        TestGetExport(runtime, txId, "/MyRoot");
+
+        TVector<THolder<IEventHandle>> delayed;
+        auto origObserver = runtime.SetObserverFunc([&](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>& ev) {
+            if (ev->GetTypeRewrite() == TEvSchemeShard::EvModifySchemeTransaction) {
+                const auto& record = ev->Get<TEvSchemeShard::TEvModifySchemeTransaction>()->Record;
+                const auto opType = record.GetTransaction(0).GetOperationType();
+                switch (opType) {
+                case NKikimrSchemeOp::ESchemeOpRestore:
+                case NKikimrSchemeOp::ESchemeOpCreateConsistentCopyTables:
+                    delayed.emplace_back(ev.Release());
+                    return TTestActorRuntime::EEventAction::DROP;
+                default:
+                    break;
+                }
+            }
+            return TTestActorRuntime::EEventAction::PROCESS;
+        });
+
+        auto waitForDelayed = [&runtime, &delayed](ui32 size) {
+            if (delayed.size() != size) {
+                TDispatchOptions opts;
+                opts.FinalEvents.emplace_back([&delayed, size](IEventHandle&) -> bool {
+                    return delayed.size() == size;
+                });
+                runtime.DispatchEvents(opts);
+            }
+        };
+
+        const auto importId = ++txId;
+        TestImport(runtime, importId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: "Backup1"
+                destination_path: "/MyRoot/Restored"
+              }
+            }
+        )", port));
+        // wait for restore op
+        waitForDelayed(1);
+
+        const auto exportId = ++txId;
+        TestExport(runtime, exportId, "/MyRoot", Sprintf(R"(
+            ExportToS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_path: "/MyRoot/Restored"
+                destination_prefix: "Backup2"
+              }
+            }
+        )", port));
+        // wait for copy table op
+        waitForDelayed(2);
+
+        runtime.SetObserverFunc(origObserver);
+        for (auto& ev : delayed) {
+            runtime.Send(ev.Release(), 0, true);
+        }
+
+        env.TestWaitNotification(runtime, importId);
+        TestGetImport(runtime, importId, "/MyRoot");
+        env.TestWaitNotification(runtime, exportId);
+        TestGetExport(runtime, exportId, "/MyRoot");
     }
 
     void ShouldCheckQuotas(const TSchemeLimits& limits, Ydb::StatusIds::StatusCode expectedFailStatus) {

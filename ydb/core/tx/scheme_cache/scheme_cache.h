@@ -2,7 +2,7 @@
 
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/events.h>
-#include <ydb/core/base/pathid.h>
+#include <ydb/core/scheme/scheme_pathid.h>
 #include <ydb/core/base/tx_processing.h>
 #include <ydb/core/protos/flat_scheme_op.pb.h>
 #include <ydb/core/protos/flat_tx_scheme.pb.h>
@@ -348,6 +348,7 @@ struct TSchemeCacheRequest {
         EStatus Status = EStatus::Unknown;
         EKind Kind = EKind::KindUnknown;
         TIntrusivePtr<TDomainInfo> DomainInfo;
+        ui64 GeneralVersion = 0;
 
         explicit TEntry(THolder<TKeyDesc> keyDesc)
             : KeyDescription(std::move(keyDesc))

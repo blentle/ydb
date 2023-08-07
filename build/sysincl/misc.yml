@@ -8,12 +8,6 @@
   - sqlcli1.h
 
 
-- includes:
-  - gelf.h: contrib/restricted/libelf/include/libelf/gelf.h
-  - libelf.h: contrib/restricted/libelf/include/libelf/libelf.h
-  - libelf/libelf.h: contrib/restricted/libelf/include/libelf/libelf.h
-  - libelf/sys_elf.h: contrib/restricted/libelf/include/libelf/sys_elf.h
-
 # We have lots of ADDINCLs to contrib/libs/libiconv all around the repo
 # so we need to add it to sysincl for consistent resolving.
 # We can go the other way here and remove iconv.h from all sysincl configs
@@ -32,20 +26,11 @@
 - includes:
   - _cgo_export.h
 
-# Resolve jni.h from swig/Lib/java/javahead.swg when building non-java .swg
-# since they do not peerdir contrib/libs/jdk.
 # Resolve Python.h from swig/Lib/python/pyruntime.swg when building non-python .swg
 # since they do not peerdir contrib/libs/python.
 - source_filter: "[.]swg([.](h|c(c|pp|xx)?))?$"
   includes:
-  - jni.h:           contrib/libs/jdk/include/jni.h
   - Python.h:        contrib/libs/python/Include/Python.h
-- source_filter: "^contrib/libs/jdk/include/jni[.]h$"
-  includes:
-  - jni_md.h:
-    - contrib/libs/jdk/include/darwin/jni_md.h
-    - contrib/libs/jdk/include/linux/jni_md.h
-    - contrib/libs/jdk/include/win32/jni_md.h
 
 # libunistring, libidn and libidn2
 # have its own libc header wrappers that are added to ADDINCL
@@ -156,10 +141,6 @@
     - stdatomic.h:    contrib/libs/ffmpeg-3.4.1/compat/atomics/win32/stdatomic.h
     - atomic.h:       contrib/libs/ffmpeg-3.4.1/libavutil/atomic.h
 
-- source_filter: "^contrib/libs/glog"
-  includes:
-    - port.h:        contrib/libs/glog/missing_includes/port.h
-
 - source_filter: "^contrib/libs/postgresql"
   includes:
     - port.h:        contrib/libs/postgresql/src/include/port.h
@@ -237,12 +218,6 @@
   includes:
     - cuda.h:        contrib/deprecated/tf/tensorflow/core/platform/cuda.h
 
-# unused legacy include in boost
-- source_filter: "^contrib/restricted/boost"
-  includes:
-    - fstream.h
-    - ../include/fenv.h
-
 # windows sdk includes that we do not want to apply for whole arcadia
 - source_filter: "^contrib"
   includes:
@@ -254,26 +229,10 @@
     - sqltypes.h
     - sqlucode.h
 
-- source_filter: "^contrib/libs/libmemcached"
-  includes:
-    - sasl/sasl.h
-    - sasl/saslutil.h
-
 - source_filter: "^contrib/libs/(apache/apr|httpd|llvm)"
   includes:
     - uuid.h
     - uuid/uuid.h
-
-- source_filter: "^contrib/libs/(kenlm|libxml|re2|sqlite3)"
-  includes:
-    - unicode/ucnv.h
-    - unicode/ucol.h
-    - unicode/uniset.h
-    - unicode/unistr.h
-    - unicode/ustring.h
-    - unicode/utf16.h
-    - unicode/utypes.h
-    - unicode/uversion.h
 
 - source_filter: "^contrib/deprecated/glib"
   includes:
@@ -305,24 +264,9 @@
     - ngx_http.h
     - ngx_log.h
 
-- source_filter: "^contrib/libs/leptonica-1.70"
-  includes:
-    - gif_lib.h
-    - webp/decode.h
-    - webp/encode.h
-
 - source_filter: "^contrib/libs/libpcap"
   includes:
     - strerror.h
-
-- source_filter: "^contrib/libs/libxml"
-  includes:
-    - lzma.h
-    - win32config.h
-
-- source_filter: "^contrib/libs/mod_perl2"
-  includes:
-    - config.h
 
 - source_filter: "^contrib/libs/(apache/apr|httpd|openssl)"
   includes:
@@ -332,10 +276,6 @@
   includes:
     - magic.h
     - xmlparse.h
-
-- source_filter: "^contrib/python/scipy"
-  includes:
-    - matrix.h
 
 - source_filter: "^contrib/python/uWSGI"
   includes:
@@ -352,10 +292,6 @@
   includes:
     - hwloc.h
     - hwloc/cudart.h
-
-- source_filter: "^contrib/libs/(aws-sdk-cpp|c-ares|proj)"
-  includes:
-    - jni.h
 
 - source_filter: "^contrib/(libs/(ffmpeg-3|kyotocabinet)|tools/ag)"
   includes:
@@ -378,10 +314,6 @@
     - note.h
     - could_not_find_Perl_patchlevel.h
     - patchlevel.h
-
-- source_filter: "^contrib/libs/(freetype|leptonica-1.70|libtheora|zbar)"
-  includes:
-    - png.h
 
 - source_filter: "^(contrib/restricted/boost/boost/mpi|catboost/cuda/cuda_lib/mpi)"
   includes:
@@ -406,14 +338,6 @@
 - source_filter: "^contrib/restricted/boost/stacktrace/include/boost/stacktrace/detail"
   includes:
     - backtrace.h: contrib/libs/backtrace/backtrace.h
-
-- source_filter: "^contrib/restricted/libelf"
-  includes:
-    - byteswap.h: contrib/restricted/libelf/lib/byteswap.h
-    - gelf.h: contrib/restricted/libelf/lib/gelf.h
-    - libelf.h: contrib/restricted/libelf/lib/libelf.h
-    - nlist.h: contrib/restricted/libelf/lib/nlist.h
-    - sys_elf.h: contrib/restricted/libelf/lib/sys_elf.h
 
 - source_filter: "^contrib/libs/dpdk/"
   includes:
@@ -448,6 +372,7 @@
 - source_filter: "^contrib/libs/h3"
   includes:
     - alloc.h: contrib/libs/h3/h3lib/include/alloc.h
+
 - source_filter: "^cloud/iam/token_agent/daemon"
   includes:
     - contrib/libs/grpc/include/grpcpp/impl/codegen/server_context_impl.h
@@ -599,26 +524,6 @@
     - tls.h: contrib/libs/glibcasm/glibc/sysdeps/x86_64/nptl/tls.h
     - unistd.h: contrib/libs/glibcasm/glibc/include/unistd.h
     - unwind.h: contrib/libs/glibcasm/glibc/sysdeps/generic/unwind.h
-    # includes under ifdef
-    - bits/select2.h: contrib/libs/glibcasm/dummy.h
-    - bits/setjmp2.h: contrib/libs/glibcasm/dummy.h
-    - bits/socket2.h: contrib/libs/glibcasm/dummy.h
-    - bits/socket-constants.h: contrib/libs/glibcasm/dummy.h
-    - bits/stdlib.h: contrib/libs/glibcasm/dummy.h
-    - bits/stdlib-ldbl.h: contrib/libs/glibcasm/dummy.h
-    - bits/string_fortified.h: contrib/libs/glibcasm/dummy.h
-    - bits/strings_fortified.h: contrib/libs/glibcasm/dummy.h
-    - bits/struct_stat_time64_helper.h: contrib/libs/glibcasm/dummy.h
-    - bits/unistd.h: contrib/libs/glibcasm/dummy.h
-    - dl-cet.h: contrib/libs/glibcasm/dummy.h
-    - dl-mman.h: contrib/libs/glibcasm/dummy.h
-    - dl-unistd.h: contrib/libs/glibcasm/dummy.h
-    - elf/dl-tunables.h: contrib/libs/glibcasm/dummy.h
-    - linux/close_range.h: contrib/libs/glibcasm/dummy.h
-    - sysdeps/i386/dl-procinfo.c: contrib/libs/glibcasm/dummy.h
-    - sysdeps/generic/hp-timing.h: contrib/libs/glibcasm/dummy.h
-    - sysdeps/unix/sysv/linux/bits/pthread_stack_min-dynamic.h: contrib/libs/glibcasm/dummy.h
-    - sysdeps/unix/sysv/linux/sys/syscall.h: contrib/libs/glibcasm/dummy.h
 
 - source_filter: "^contrib/libs/libunwind/include/unwind.h"
   includes:
@@ -635,3 +540,7 @@
 - source_filter: "^contrib/tools/bison/bison/data"
   includes:
     - position.hh
+
+- source_filter: "^contrib/libs/fp16/include/fp16/psimd.h"
+  includes:
+    - psimd.h

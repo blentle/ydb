@@ -1,7 +1,6 @@
 #pragma once
 
 #include <ydb/core/kqp/common/kqp_resolve.h>
-#include <ydb/core/kqp/expr_nodes/kqp_expr_nodes.h>
 #include <ydb/core/kqp/gateway/kqp_gateway.h>
 #include <ydb/core/scheme/scheme_tabledefs.h>
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
@@ -87,10 +86,12 @@ struct TStageInfoMeta {
 struct TGraphMeta {
     TKqpTableKeys TableKeys;
     IKqpGateway::TKqpSnapshot Snapshot;
+    TMaybe<ui64> LockTxId;
     std::unordered_map<ui64, TActorId> ResultChannelProxies;
     TActorId ExecuterId;
     bool UseFollowers = false;
     TIntrusivePtr<TProtoArenaHolder> Arena;
+    TString Database;
 
     const TIntrusivePtr<TProtoArenaHolder>& GetArenaIntrusivePtr() const {
         return Arena; 
@@ -104,12 +105,17 @@ struct TGraphMeta {
     void SetSnapshot(ui64 step, ui64 txId) {
         Snapshot = IKqpGateway::TKqpSnapshot(step, txId);
     }
+
+    void SetLockTxId(TMaybe<ui64> lockTxId) {
+        LockTxId = lockTxId;
+    }
 };
 
 struct TTaskInputMeta {
     // these message are allocated using the protubuf arena.
-    NKikimrTxDataShard::TKqpReadRangesSourceSettings* SourceSettings;
-    NKikimrKqp::TKqpStreamLookupSettings* StreamLookupSettings;
+    NKikimrTxDataShard::TKqpReadRangesSourceSettings* SourceSettings = nullptr;
+    NKikimrKqp::TKqpStreamLookupSettings* StreamLookupSettings = nullptr;
+    NKikimrKqp::TKqpSequencerSettings* SequencerSettings = nullptr;
 };
 
 struct TTaskOutputMeta {
@@ -153,9 +159,17 @@ public:
     ui64 NodeId = 0;  // only in case of scans over persistent snapshots
     bool ScanTask = false;
     TActorId ExecuterId;
+    ui32 Type = Unknown;
 
-    THashMap<TString, TString> DqTaskParams; // Params for sources/sinks
-    THashMap<TString, TString> DqSecureParams;
+    THashMap<TString, TString> TaskParams; // Params for sources/sinks
+    THashMap<TString, TString> SecureParams;
+
+    enum TTaskType : ui32 {
+        Unknown = 0,
+        Compute = 1,
+        Scan = 2,
+        DataShard = 3,
+    };
 
     struct TColumn {
         ui32 Id = 0;

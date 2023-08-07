@@ -6,6 +6,7 @@
 #include <ydb/core/kqp/runtime/kqp_compute.h>
 #include <ydb/core/kqp/runtime/kqp_read_table.h>
 #include <ydb/core/kqp/runtime/kqp_read_actor.h>
+#include <ydb/core/kqp/runtime/kqp_sequencer_factory.h>
 #include <ydb/core/kqp/runtime/kqp_stream_lookup_factory.h>
 #include <ydb/library/yql/providers/s3/actors/yql_s3_sink_factory.h>
 #include <ydb/library/yql/providers/s3/actors/yql_s3_source_factory.h>
@@ -54,12 +55,13 @@ TComputationNodeFactory GetKqpActorComputeFactory(TKqpScanComputeContext* comput
 
 namespace NKqp {
 
-NYql::NDq::IDqAsyncIoFactory::TPtr CreateKqpAsyncIoFactory(TIntrusivePtr<TKqpCounters> counters, const NYql::IHTTPGateway::TPtr& httpGateway) {
+NYql::NDq::IDqAsyncIoFactory::TPtr CreateKqpAsyncIoFactory(TIntrusivePtr<TKqpCounters> counters, const NYql::IHTTPGateway::TPtr& httpGateway, const NYql::ISecuredServiceAccountCredentialsFactory::TPtr& credentialsFactory) {
     auto factory = MakeIntrusive<NYql::NDq::TDqAsyncIoFactory>();
     RegisterStreamLookupActorFactory(*factory, counters);
     RegisterKqpReadActor(*factory, counters);
-    RegisterS3ReadActorFactory(*factory, nullptr, httpGateway);
-    RegisterS3WriteActorFactory(*factory, nullptr, httpGateway);
+    RegisterS3ReadActorFactory(*factory, credentialsFactory, httpGateway);
+    RegisterS3WriteActorFactory(*factory, credentialsFactory, httpGateway);
+    RegisterSequencerActorFactory(*factory, counters);
     return factory;
 }
 

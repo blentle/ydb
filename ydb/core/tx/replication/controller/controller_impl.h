@@ -12,7 +12,7 @@
 #include <ydb/core/base/defs.h>
 #include <ydb/core/protos/counters_replication.pb.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
-#include <ydb/core/util/yverify_stream.h>
+#include <ydb/library/yverify_stream/yverify_stream.h>
 
 #include <util/generic/hash.h>
 
@@ -54,9 +54,9 @@ private:
 
     // state functions
     STFUNC(StateInit);
-    STFUNC(StateZombie);
     STFUNC(StateWork);
 
+    void Cleanup(const TActorContext& ctx);
     void SwitchToWork(const TActorContext& ctx);
     void Reset();
 
@@ -74,7 +74,6 @@ private:
     void Handle(TEvPrivate::TEvUpdateTenantNodes::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDiscovery::TEvDiscoveryData::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDiscovery::TEvError::TPtr& ev, const TActorContext& ctx);
-    void Handle(TEvents::TEvPoison::TPtr& ev, const TActorContext& ctx);
 
     // local transactions
     class TTxInitSchema;

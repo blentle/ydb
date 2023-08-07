@@ -163,10 +163,11 @@ private:
             NPQ::NClusterTracker::TEvClusterTracker::TEvClustersUpdate::TPtr& ev,
             const TActorContext& ctx
     ) {
+        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "HandleClustersUpdate");
         if (!LocalCluster.empty()) {
+            LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "HandleClustersUpdate LocalCluster !LocalCluster.empty()");
             return;
         }
-        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "Got clusters update");
         for (const auto& cluster : ev->Get()->ClustersList->Clusters) {
             if (cluster.IsLocal) {
                 LocalCluster = cluster.Name;
@@ -228,15 +229,24 @@ private:
             req->Record.MutableRequest()->SetQuery(VersionQuery);
         } else {
             req->Record.MutableRequest()->SetQuery(TopicsQuery);
-            NClient::TParameters params;
-            params["$Path"] = LastTopicKey.Path;
-            params["$Cluster"] = LastTopicKey.Cluster;
-            req->Record.MutableRequest()->MutableParameters()->Swap(&params);
+
+            NYdb::TParams params = NYdb::TParamsBuilder()
+                .AddParam("$Path")
+                    .Utf8(LastTopicKey.Path)
+                    .Build()
+                .AddParam("$Cluster")
+                    .Utf8(LastTopicKey.Cluster)
+                    .Build()
+                .Build();
+
+            req->Record.MutableRequest()->MutableYdbParameters()->swap(*(NYdb::TProtoAccessor::GetProtoMapPtr(params)));
         }
         Send(NKqp::MakeKqpProxyID(ctx.SelfID.NodeId()), req.Release(), 0, Generation->Val());
     }
 
     void HandleQueryResponse(NKqp::TEvKqp::TEvQueryResponse::TPtr& ev, const TActorContext& ctx) {
+        LOG_TRACE_S(ctx, NKikimrServices::PQ_METACACHE, "HandleQueryResponse TEvQueryResponse");
+
         if (ev->Cookie != (ui64)Generation->Val()) {
             LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "stale response with generation " << ev->Cookie << ", actual is " << Generation->Val());
             return;
@@ -286,6 +296,8 @@ private:
     }
 
     void HandleGetTopicsResult(NKqp::TEvKqp::TEvQueryResponse::TPtr& ev, const TActorContext& ctx) {
+        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "HandleGetTopicsResult");
+
         const auto& record = ev->Get()->Record.GetRef();
 
         Y_VERIFY(record.GetResponse().GetResults().size() == 1);
@@ -453,8 +465,9 @@ private:
     }
 
     void HandleDescribeAllTopics(TEvPqNewMetaCache::TEvDescribeAllTopicsRequest::TPtr& ev, const TActorContext& ctx) {
-        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "Handle describe all topics");
+        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "HandleDescribeAllTopics");
         if (!EverGotTopics) {
+            LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "HandleDescribeAllTopics return due to !EverGotTopics");
             ListTopicsWaiters.push(ev->Sender);
             return;
         }
@@ -467,6 +480,7 @@ private:
     }
 
     void ProcessDescribeAllTopics(const TActorId& waiter, const TActorContext& ctx) {
+        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "ProcessDescribeAllTopics");
         if (EverGotTopics && CurrentTopics.empty()) {
             LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "Describe all topics - send empty response");
             SendDescribeAllTopicsResponse(waiter, {}, ctx, true);
@@ -476,6 +490,8 @@ private:
             LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "Respond from cache");
             return SendDescribeAllTopicsResponse(waiter, CurrentTopicsFullConverters, ctx);
         }
+
+        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "ProcessDescribeAllTopics SendSchemeCacheRequest");
         SendSchemeCacheRequest(
                 std::make_shared<TWaiter>(waiter, DbRoot, false, false, CurrentTopics, EWaiterType::DescribeAllTopics),
                 ctx
@@ -486,9 +502,11 @@ private:
     }
 
     void SendSchemeCacheRequest(std::shared_ptr<TWaiter> waiter, const TActorContext& ctx) {
+        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "SendSchemeCacheRequest");
         if (waiter->Type == EWaiterType::DescribeAllTopics && !waiter->FirstRequestDone) {
             DescribeAllTopicsWaiters.push(waiter);
             if (HaveDescribeAllTopicsInflight) {
+                LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "SendSchemeCacheRequest returns due to HaveDescribeAllTopicsInflight");
                 return;
             } else {
                 HaveDescribeAllTopicsInflight = true;
@@ -499,10 +517,6 @@ private:
 
         auto inserted = DescribeTopicsWaiters.insert(std::make_pair(reqId, waiter)).second;
         Y_VERIFY(inserted);
-
-        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "send request for "
-                            << (waiter->Type == EWaiterType::DescribeAllTopics ? " all " : "") << waiter->GetTopics().size()
-                            << " topics, got " << DescribeTopicsWaiters.size() << " requests infly");
 
         for (const auto& [path, database] : waiter->GetTopics()) {
             auto split = NKikimr::SplitPath(path);
@@ -517,13 +531,14 @@ private:
             schemeCacheRequest->ResultSet.emplace_back(std::move(entry));
         }
 
+        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "send request for " << (waiter->Type == EWaiterType::DescribeAllTopics ? " all " : "") << waiter->GetTopics().size() << " topics, got " << DescribeTopicsWaiters.size() << " requests infly");
+
         ctx.Send(SchemeCacheId, new TEvTxProxySchemeCache::TEvNavigateKeySet(schemeCacheRequest.release()));
     }
 
     void HandleSchemeCacheResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev, const TActorContext& ctx) {
         std::shared_ptr<TSchemeCacheNavigate> result(ev->Get()->Request.Release());
-        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "Handle SchemeCache response"
-            << ": result# " << result->ToString(*AppData()->TypeRegistry));
+        LOG_DEBUG_S(ctx, NKikimrServices::PQ_METACACHE, "Handle SchemeCache response" << ": result# " << result->ToString(*AppData()->TypeRegistry));
         auto waiterIter = DescribeTopicsWaiters.find(result->Instant);
         Y_VERIFY(!waiterIter.IsEnd());
         auto waiter = waiterIter->second; //copy shared ptr

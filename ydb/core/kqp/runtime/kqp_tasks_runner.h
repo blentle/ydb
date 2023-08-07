@@ -9,6 +9,7 @@ namespace NKqp {
 
 NYql::NDq::IDqOutputConsumer::TPtr KqpBuildOutputConsumer(const NYql::NDqProto::TTaskOutput& outputDesc,
     const NMiniKQL::TType* type, NUdf::IApplyContext* applyCtx, const NMiniKQL::TTypeEnvironment& typeEnv,
+    const NKikimr::NMiniKQL::THolderFactory& holderFactory,
     TVector<NYql::NDq::IDqOutput::TPtr>&& outputs);
 
 TIntrusivePtr<NYql::NDq::IDqTaskRunner> CreateKqpTaskRunner(const NYql::NDq::TDqTaskRunnerContext& execCtx,
@@ -54,8 +55,7 @@ public:
 
     ui64 GetAllocatedMemory() const { return Alloc->GetAllocated(); }
 
-    const TMap<ui64, const NYql::NDq::TDqTaskRunnerStats*> GetTasksStats() const { return Stats; };
-
+    const TMap<ui64, const NYql::NDq::TDqTaskRunnerStats*> GetTasksStats() const { return Stats; }
 private:
     TMap<ui64, TIntrusivePtr<NYql::NDq::IDqTaskRunner>> TaskRunners;
     TMap<ui64, NYql::NDq::TDqTaskSettings> Tasks;

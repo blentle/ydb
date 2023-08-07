@@ -98,6 +98,7 @@ public:
         AddHandler(0, &TDqJoin::Match, HNDL(RewritePureJoin));
         AddHandler(0, TOptimizeTransformerBase::Any(), HNDL(BuildWideReadTable));
         AddHandler(0, &TDqPhyLength::Match, HNDL(RewriteLength));
+        AddHandler(0, &TKqpWriteConstraint::Match, HNDL(RewriteKqpWriteConstraint));
 #undef HNDL
     }
 
@@ -141,6 +142,12 @@ protected:
     TMaybeNode<TExprBase> RewriteLength(TExprBase node, TExprContext& ctx) {
         TExprBase output = DqPeepholeRewriteLength(node, ctx, TypesCtx);
         DumpAppliedRule("RewriteLength", node.Ptr(), output.Ptr(), ctx);
+        return output;
+    }
+
+    TMaybeNode<TExprBase> RewriteKqpWriteConstraint(TExprBase node, TExprContext& ctx) {
+        TExprBase output = KqpRewriteWriteConstraint(node, ctx);
+        DumpAppliedRule("RewriteKqpWriteConstraint", node.Ptr(), output.Ptr(), ctx);
         return output;
     }
 
@@ -243,6 +250,7 @@ TMaybeNode<TKqpPhysicalTx> PeepholeOptimize(const TKqpPhysicalTx& tx, TExprConte
             .Inputs(ctx.ReplaceNodes(stage.Inputs().Ptr(), stagesMap))
             .Program(ctx.DeepCopyLambda(TKqpProgram(newProgram).Lambda().Ref()))
             .Settings(stage.Settings())
+            .Outputs(stage.Outputs())
             .Done();
 
         stages.emplace_back(newStage);

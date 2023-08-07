@@ -7,7 +7,8 @@
 #include <ydb/library/yql/minikql/mkql_string_util.h>
 #include <ydb/library/yql/public/udf/udf_data_type.h>
 #include <ydb/library/yql/utils/yql_panic.h>
-#include <ydb/core/util/yverify_stream.h>
+#include <ydb/public/sdk/cpp/client/ydb_params/params.h>
+#include <ydb/library/yverify_stream/yverify_stream.h>
 
 namespace NKikimr::NKqp {
 
@@ -155,6 +156,14 @@ const TQueryData::TParamMap& TQueryData::GetParams() {
     }
 
     return Params;
+}
+
+const TQueryData::TParamProtobufMap& TQueryData::GetParamsProtobuf() {
+    for(auto& [name, _] : UnboxedData) {
+        GetParameterTypedValue(name);
+    }
+
+    return ParamsProtobuf;
 }
 
 NKikimr::NMiniKQL::TType* TQueryData::GetParameterType(const TString& name) {
@@ -309,6 +318,27 @@ const NKikimrMiniKQL::TParams* TQueryData::GetParameterMiniKqlValue(const TStrin
     return &(it->second);
 }
 
+const Ydb::TypedValue* TQueryData::GetParameterTypedValue(const TString& name) {
+    if (UnboxedData.find(name) == UnboxedData.end())
+        return nullptr;
+
+    auto it = ParamsProtobuf.find(name);
+    if (it == ParamsProtobuf.end()) {
+        with_lock(AllocState->Alloc) {
+            const auto& [type, uv] = GetParameterUnboxedValue(name);
+
+            auto& tv = ParamsProtobuf[name];
+
+            ExportTypeToProto(type, *tv.mutable_type());
+            ExportValueToProto(type, uv, *tv.mutable_value());
+
+            return &tv;
+        }
+    }
+
+    return &(it->second);
+}
+
 const NKikimr::NMiniKQL::TTypeEnvironment& TQueryData::TypeEnv() {
     return AllocState->TypeEnv;
 }
@@ -385,7 +415,9 @@ NDqProto::TData TQueryData::GetShardParam(ui64 shardId, const TString& name) {
 
     auto guard = TypeEnv().BindAllocator();
     NDq::TDqDataSerializer dataSerializer{AllocState->TypeEnv, AllocState->HolderFactory, NDqProto::EDataTransportVersion::DATA_TRANSPORT_UV_PICKLE_1_0};
-    return dataSerializer.Serialize(it->second.Values.begin(), it->second.Values.end(), it->second.ItemType);
+    NDq::TDqSerializedBatch batch = dataSerializer.Serialize(it->second.Values.begin(), it->second.Values.end(), it->second.ItemType);
+    YQL_ENSURE(!batch.IsOOB());
+    return batch.Proto;
 }
 
 NDqProto::TData TQueryData::SerializeParamValue(const TString& name) {

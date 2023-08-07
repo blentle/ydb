@@ -2,7 +2,9 @@ LIBRARY()
 
 SRCS(
     coordinator.cpp
+    coordinator_hooks.cpp
     coordinator_impl.cpp
+    coordinator_state.cpp
     coordinator__acquire_read_step.cpp
     coordinator__configure.cpp
     coordinator__check.cpp
@@ -12,7 +14,7 @@ SRCS(
     coordinator__monitoring.cpp
     coordinator__plan_step.cpp
     coordinator__read_step_subscriptions.cpp
-    coordinator__restart_mediator.cpp
+    coordinator__restore_params.cpp
     coordinator__restore_transaction.cpp
     coordinator__schema.cpp
     coordinator__schema_upgrade.cpp
@@ -25,6 +27,7 @@ PEERDIR(
     library/cpp/actors/core
     library/cpp/actors/helpers
     library/cpp/actors/interconnect
+    library/cpp/containers/absl_flat_hash
     ydb/core/actorlib_impl
     ydb/core/base
     ydb/core/engine/minikql
@@ -33,6 +36,7 @@ PEERDIR(
     ydb/core/tablet
     ydb/core/tablet_flat
     ydb/core/tx
+    ydb/core/tx/coordinator/public
     ydb/core/util
 )
 

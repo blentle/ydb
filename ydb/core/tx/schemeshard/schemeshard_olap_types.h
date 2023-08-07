@@ -124,6 +124,7 @@ namespace NKikimr::NSchemeShard {
 
         YDB_READONLY(ui32, NextColumnId, 1);
         YDB_READONLY(ui32, Version, 0);
+        YDB_READONLY_FLAG(CompositeMarks, true);
 
     public:
         const TOlapColumnSchema* GetColumnByName(const TString& name) const noexcept {
@@ -143,7 +144,7 @@ namespace NKikimr::NSchemeShard {
         }
 
         bool Update(const TOlapSchemaUpdate& schemaUpdate, IErrorCollector& errors);
-        
+
         void Parse(const NKikimrSchemeOp::TColumnTableSchema& tableSchema);
         void Serialize(NKikimrSchemeOp::TColumnTableSchema& tableSchema) const;
         bool Validate(const NKikimrSchemeOp::TColumnTableSchema& opSchema, IErrorCollector& errors) const;

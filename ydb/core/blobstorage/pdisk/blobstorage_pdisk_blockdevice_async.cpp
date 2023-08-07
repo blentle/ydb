@@ -12,8 +12,8 @@
 
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/blobstorage/lwtrace_probes/blobstorage_probes.h>
-#include <ydb/core/protos/services.pb.h>
-#include <ydb/core/util/yverify_stream.h>
+#include <ydb/library/services/services.pb.h>
+#include <ydb/library/yverify_stream/yverify_stream.h>
 #include <ydb/library/pdisk_io/aio.h>
 #include <ydb/library/pdisk_io/spdk_state.h>
 #include <ydb/library/pdisk_io/wcache.h>
@@ -1214,18 +1214,19 @@ class TCachedBlockDevice : public TRealBlockDevice {
         for (auto it = ReadsForOffset.begin(); it != ReadsForOffset.end(); it = nextIt) {
             nextIt++;
             TRead &read = it->second;
-            const TLogCache::TCacheRecord* cached = Cache.Find(read.Offset);
-            if (cached) {
-                if (read.Size <= cached->Data.Size()) {
-                    memcpy(read.Data, cached->Data.GetData(), read.Size);
-                    Mon.DeviceReadCacheHits->Inc();
-                    Y_VERIFY(read.CompletionAction);
-                    for (size_t i = 0; i < cached->BadOffsets.size(); ++i) {
-                        read.CompletionAction->RegisterBadOffset(cached->BadOffsets[i]);
-                    }
-                    NoopAsyncHackForLogReader(read.CompletionAction, read.ReqId);
-                    ReadsForOffset.erase(it);
+
+            bool foundInCache = Cache.Find(read.Offset, read.Size, static_cast<char*>(read.Data), [compAction=read.CompletionAction](auto badOffsets) {
+                for (size_t i = 0; i < badOffsets.size(); ++i) {
+                    compAction->RegisterBadOffset(badOffsets[i]);
                 }
+            });
+            
+            if (foundInCache) {
+                Mon.DeviceReadCacheHits->Inc();
+                Y_VERIFY(read.CompletionAction);
+
+                NoopAsyncHackForLogReader(read.CompletionAction, read.ReqId);
+                ReadsForOffset.erase(it);
             }
         }
         if (ReadsInFly >= MaxReadsInFly) {
@@ -1281,11 +1282,8 @@ public:
                         Cache.Pop();
                     }
                     const char* dataPtr = static_cast<const char*>(completion->GetData());
-                    Cache.Insert(
-                        TLogCache::TCacheRecord(
-                            completion->GetOffset(),
-                            TRcBuf(TString(dataPtr, dataPtr + completion->GetSize())),
-                            completion->GetBadOffsets()));
+
+                    Cache.Insert(dataPtr, completion->GetOffset(), completion->GetSize(), completion->GetBadOffsets());
                 }
             }
 

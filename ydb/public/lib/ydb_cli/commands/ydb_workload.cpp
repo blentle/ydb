@@ -5,6 +5,7 @@
 #include "click_bench.h"
 #include "tpch.h"
 #include "topic_workload/topic_workload.h"
+#include "transfer_workload/transfer_workload.h"
 
 #include <ydb/library/workload/workload_factory.h>
 #include <ydb/public/lib/ydb_cli/commands/ydb_common.h>
@@ -41,17 +42,18 @@ TCommandWorkload::TCommandWorkload()
     AddCommand(std::make_unique<TCommandKv>());
     AddCommand(std::make_unique<TCommandClickBench>());
     AddCommand(std::make_unique<TCommandWorkloadTopic>());
+    AddCommand(std::make_unique<TCommandWorkloadTransfer>());
     AddCommand(std::make_unique<TCommandTpch>());
 }
 
 TWorkloadCommand::TWorkloadCommand(const TString& name, const std::initializer_list<TString>& aliases, const TString& description)
     : TYdbCommand(name, aliases, description)
-    , Seconds(0)
+    , TotalSec(0)
     , Threads(0)
     , ClientTimeoutMs(0)
     , OperationTimeoutMs(0)
     , CancelAfterTimeoutMs(0)
-    , WindowDurationSec(0)
+    , WindowSec(0)
     , Quiet(false)
     , PrintTimestamp(false)
     , WindowHist(60000, 2) // highestTrackableValue 60000ms = 60s, precision 2
@@ -66,7 +68,7 @@ void TWorkloadCommand::Config(TConfig& config) {
     TYdbCommand::Config(config);
 
     config.Opts->AddLongOption('s', "seconds", "Seconds to run workload.")
-        .DefaultValue(10).StoreResult(&Seconds);
+        .DefaultValue(10).StoreResult(&TotalSec);
     config.Opts->AddLongOption('t', "threads", "Number of parallel threads in workload.")
         .DefaultValue(10).StoreResult(&Threads);
     config.Opts->AddLongOption("quiet", "Quiet mode. Doesn't print statistics each second.")
@@ -80,7 +82,7 @@ void TWorkloadCommand::Config(TConfig& config) {
     config.Opts->AddLongOption("cancel-after", "Cancel after timeout in ms.")
         .DefaultValue(800).StoreResult(&CancelAfterTimeoutMs);
     config.Opts->AddLongOption("window", "Window duration in seconds.")
-        .DefaultValue(1).StoreResult(&WindowDurationSec);
+        .DefaultValue(1).StoreResult(&WindowSec);
 }
 
 void TWorkloadCommand::PrepareForRun(TConfig& config) {
@@ -183,7 +185,7 @@ int TWorkloadCommand::RunWorkload(TWorkloadQueryGenPtr workloadGen, const int ty
     }, 0, Threads, NPar::TLocalExecutor::MED_PRIORITY);
 
     int windowIt = 1;
-    auto windowDuration = TDuration::Seconds(WindowDurationSec);
+    auto windowDuration = TDuration::Seconds(WindowSec);
     while (Now() < StopTime) {
         if (StartTime + windowIt * windowDuration < Now()) {
             PrintWindowStats(windowIt++);
@@ -199,7 +201,7 @@ int TWorkloadCommand::RunWorkload(TWorkloadQueryGenPtr workloadGen, const int ty
 
     auto stats = GetWorkloadStats(TotalHist);
     std::cout << std::endl << "Txs\tTxs/Sec\tRetries\tErrors\tp50(ms)\tp95(ms)\tp99(ms)\tpMax(ms)" << std::endl
-        << stats.OpsCount << "\t" << std::setw(7) << stats.OpsCount / (Seconds * 1.0) << "\t" << TotalRetries.load() << "\t"
+        << stats.OpsCount << "\t" << std::setw(7) << stats.OpsCount / (TotalSec * 1.0) << "\t" << TotalRetries.load() << "\t"
         << TotalErrors.load() << "\t" << stats.Percentile50 << "\t" << stats.Percentile95 << "\t"
         << stats.Percentile99 << "\t" << stats.Percentile100 << std::endl;
 
@@ -215,7 +217,7 @@ void TWorkloadCommand::PrintWindowStats(int windowIt) {
         WindowHist.Reset();
     }
     if (!Quiet) {
-        std::cout << windowIt << "\t" << std::setw(7) << stats.OpsCount / WindowDurationSec << "\t" << retries << "\t"
+        std::cout << windowIt << "\t" << std::setw(7) << stats.OpsCount / WindowSec << "\t" << retries << "\t"
             << errors << "\t" << stats.Percentile50 << "\t" << stats.Percentile95 << "\t"
             << stats.Percentile99 << "\t" << stats.Percentile100;
         if (PrintTimestamp) {

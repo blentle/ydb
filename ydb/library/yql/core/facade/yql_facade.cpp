@@ -410,6 +410,15 @@ TString TProgram::TakeSessionId() {
     }
 }
 
+void TProgram::AddUserDataTable(const TUserDataTable& userDataTable) {
+    for (const auto& p : userDataTable) {
+        if (!SavedUserDataTable_.emplace(p).second) {
+            ythrow yexception() << "UserDataTable already has user data block with key " << p.first;
+        }
+        UserDataStorage_->AddUserDataBlock(p.first, p.second);
+    }
+}
+
 bool TProgram::ParseYql() {
     YQL_PROFILE_FUNC(TRACE);
     YQL_ENSURE(SourceSyntax_ == ESourceSyntax::Unknown);
@@ -1095,6 +1104,7 @@ TFuture<IGraphTransformer::TStatus> TProgram::AsyncTransformWithFallback(bool ap
             for (auto source : TypeCtx_->DataSources) {
                 source->Reset();
             }
+            TypeCtx_->Reset();
             CleanupLastSession();
 
             std::function<void(const TIssuePtr& issue)> toInfo = [&](const TIssuePtr& issue) {
@@ -1277,6 +1287,7 @@ TMaybe<TString> TProgram::GetStatistics(bool totalOnly, THashMap<TString, TStrin
 
     // Providers
     bool hasStatistics = false;
+    THashSet<TStringBuf> processed;
     for (auto& datasink : TypeCtx_->DataSinks) {
         TStringStream providerOut;
         NYson::TYsonWriter providerWriter(&providerOut);
@@ -1284,6 +1295,18 @@ TMaybe<TString> TProgram::GetStatistics(bool totalOnly, THashMap<TString, TStrin
             writer.OnKeyedItem(datasink->GetName());
             writer.OnRaw(providerOut.Str());
             hasStatistics = true;
+            processed.insert(datasink->GetName());
+        }
+    }
+    for (auto& datasource : TypeCtx_->DataSources) {
+        if (processed.insert(datasource->GetName()).second) {
+            TStringStream providerOut;
+            NYson::TYsonWriter providerWriter(&providerOut);
+            if (datasource->CollectStatistics(providerWriter, totalOnly)) {
+                writer.OnKeyedItem(datasource->GetName());
+                writer.OnRaw(providerOut.Str());
+                hasStatistics = true;
+            }
         }
     }
 

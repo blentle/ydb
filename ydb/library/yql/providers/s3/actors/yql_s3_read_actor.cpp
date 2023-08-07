@@ -37,7 +37,7 @@
 #include "yql_s3_source_factory.h"
 #include "yql_s3_actors_util.h"
 
-#include <ydb/core/protos/services.pb.h>
+#include <ydb/library/services/services.pb.h>
 
 #include <ydb/library/yql/core/yql_expr_type_annotation.h>
 #include <ydb/library/yql/minikql/mkql_string_util.h>
@@ -128,8 +128,6 @@ using ::NYql::NS3Lister::ES3PatternType;
 
 namespace {
 
-constexpr TDuration MEMORY_USAGE_REPORT_PERIOD = TDuration::Seconds(10);
-
 struct TS3ReadAbort : public yexception {
     using yexception::yexception;
 };
@@ -195,7 +193,7 @@ struct TEvPrivate {
     };
 
     struct TEvReadStarted : public TEventLocal<TEvReadStarted, EvReadStarted> {
-        TEvReadStarted(CURLcode curlResponseCode, long httpResponseCode) 
+        TEvReadStarted(CURLcode curlResponseCode, long httpResponseCode)
             : CurlResponseCode(curlResponseCode), HttpResponseCode(httpResponseCode) {}
         const CURLcode CurlResponseCode;
         const long HttpResponseCode;
@@ -417,8 +415,8 @@ public:
 
     bool SaveRetrievedResults(const NS3Lister::TListResult& listingResult) {
         LOG_T("TS3FileQueueActor", "SaveRetrievedResults");
-        if (std::holds_alternative<TIssues>(listingResult)) {
-            MaybeIssues = std::get<TIssues>(listingResult);
+        if (std::holds_alternative<NS3Lister::TListError>(listingResult)) {
+            MaybeIssues = std::get<NS3Lister::TListError>(listingResult).Issues;
             return false;
         }
 
@@ -1289,7 +1287,7 @@ struct TReadBufferCounter {
         DecodedBytes += deltaDecodedBytes;
         DecodedRows += deltaDecodedRows;
     }
- 
+
     ui64 Value = 0;
     const ui64 Limit;
     ui64 CoroCount = 0;
@@ -2282,8 +2280,8 @@ public:
     void Bootstrap() {
         LOG_D("TS3StreamReadActor", "Bootstrap");
         QueueBufferCounter = std::make_shared<TReadBufferCounter>(
-            ReadActorFactoryCfg.DataInflight, 
-            TActivationContext::ActorSystem(), 
+            ReadActorFactoryCfg.DataInflight,
+            TActivationContext::ActorSystem(),
             QueueDataSize,
             TaskQueueDataSize,
             DownloadPaused,
@@ -2448,22 +2446,7 @@ private:
         return ReadSpec->Arrow ? NUdf::GetSizeOfArrowBatchInBytes(*block.Batch) : block.Block.bytes();
     }
 
-    void ReportMemoryUsage() const {
-        const TInstant now = TInstant::Now();
-        if (now - LastMemoryReport < MEMORY_USAGE_REPORT_PERIOD) {
-            return;
-        }
-        LastMemoryReport = now;
-        size_t blocksTotalSize = 0;
-        for (const auto& block : Blocks) {
-            blocksTotalSize += GetBlockSize(block);
-        }
-        LOG_D("TS3StreamReadActor", "Memory usage. Ready blocks: " << Blocks.size() << ". Ready blocks total size: " << blocksTotalSize);
-    }
-
     i64 GetAsyncInputData(TUnboxedValueBatch& output, TMaybe<TInstant>&, bool& finished, i64 free) final {
-        ReportMemoryUsage();
-
         i64 total = 0LL;
         if (!Blocks.empty()) do {
             const i64 s = GetBlockSize(Blocks.front());
@@ -2591,7 +2574,6 @@ private:
         }
         Blocks.emplace_back(next);
         Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvNewAsyncInputDataArrived(InputIndex));
-        ReportMemoryUsage();
     }
 
     void HandleNextRecordBatch(TEvPrivate::TEvNextRecordBatch::TPtr& next) {
@@ -2603,7 +2585,6 @@ private:
         }
         Blocks.emplace_back(next);
         Send(ComputeActorId, new IDqComputeActorAsyncInput::TEvNewAsyncInputDataArrived(InputIndex));
-        ReportMemoryUsage();
     }
 
     void HandleFileFinished(TEvPrivate::TEvFileFinished::TPtr& ev) {

@@ -28,7 +28,7 @@ namespace NActors {
         TAtomic RegisterRevolvingCounter = 0;
         ui64 AllocateID();
     public:
-        TExecutorPoolBaseMailboxed(ui32 poolId, ui32 maxActivityType);
+        explicit TExecutorPoolBaseMailboxed(ui32 poolId);
         ~TExecutorPoolBaseMailboxed();
         void ReclaimMailbox(TMailboxType::EType mailboxType, ui32 hint, TWorkerId workerId, ui64 revolvingWriteCounter) override;
         TMailboxHeader *ResolveMailbox(ui32 hint) override;
@@ -41,14 +41,14 @@ namespace NActors {
 
     class TExecutorPoolBase: public TExecutorPoolBaseMailboxed {
     protected:
-        const ui32 PoolThreads;
+        const i16 PoolThreads;
         TIntrusivePtr<TAffinity> ThreadsAffinity;
         TAtomic Semaphore = 0;
         TUnorderedCache<ui32, 512, 4> Activations;
         TAtomic ActivationsRevolvingCounter = 0;
         volatile bool StopFlag = false;
     public:
-        TExecutorPoolBase(ui32 poolId, ui32 threads, TAffinity* affinity, ui32 maxActivityType);
+        TExecutorPoolBase(ui32 poolId, ui32 threads, TAffinity* affinity);
         ~TExecutorPoolBase();
         void ScheduleActivation(ui32 activation) override;
         void SpecificScheduleActivation(ui32 activation) override;

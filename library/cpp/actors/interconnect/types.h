@@ -41,6 +41,8 @@ namespace NActors {
             return Text;
         }
 
+        friend bool operator ==(const TDisconnectReason& x, const TDisconnectReason& y) { return x.Text == y.Text; }
+
         static TVector<const char*> Reasons;
     };
 
@@ -55,6 +57,7 @@ namespace NActors {
         bool AuthOnly = {};
         bool UseExternalDataChannel = {};
         bool UseXxhash = {};
+        bool UseXdcShuffle = {};
         TString AuthCN;
         NActors::TScopeId PeerScopeId;
     };

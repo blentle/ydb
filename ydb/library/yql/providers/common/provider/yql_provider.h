@@ -37,6 +37,7 @@ struct TWriteTableSettings {
     NNodes::TMaybeNode<NNodes::TExprList> Columns;
     NNodes::TMaybeNode<NNodes::TCoAtomList> PrimaryKey;
     NNodes::TMaybeNode<NNodes::TCoAtomList> NotNullColumns;
+    NNodes::TMaybeNode<NNodes::TCoAtomList> SerialColumns;
     NNodes::TMaybeNode<NNodes::TCoAtomList> PartitionBy;
     NNodes::TMaybeNode<NNodes::TCoNameValueTupleList> OrderBy;
     NNodes::TMaybeNode<NNodes::TCoLambda> Filter;
@@ -48,6 +49,7 @@ struct TWriteTableSettings {
     NNodes::TMaybeNode<NNodes::TCoNameValueTupleList> TableSettings;
     NNodes::TMaybeNode<NNodes::TCoNameValueTupleList> AlterActions;
     NNodes::TMaybeNode<NNodes::TCoAtom> TableType;
+    NNodes::TMaybeNode<NNodes::TCallable> PgDelete;
 
     TWriteTableSettings(const NNodes::TCoNameValueTupleList& other)
         : Other(other) {}

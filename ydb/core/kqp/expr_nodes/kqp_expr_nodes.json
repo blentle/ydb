@@ -102,7 +102,10 @@
         {
             "Name": "TKqlReadTableRanges",
             "Base": "TKqlReadTableRangesBase",
-            "Match": {"Type": "Callable", "Name": "KqlReadTableRanges"}
+            "Match": {"Type": "Callable", "Name": "KqlReadTableRanges"},
+            "Children": [
+                {"Index": 5, "Name": "PrefixPointsExpr", "Type": "TExprBase", "Optional": true}
+            ]
         },
         {
             "Name": "TKqpReadTableRanges",
@@ -127,7 +130,8 @@
             "Base": "TKqlReadTableRangesBase",
             "Match": {"Type": "Callable", "Name": "TKqlReadTableIndexRanges"},
             "Children": [
-                {"Index": 5, "Name": "Index", "Type": "TCoAtom"}
+                {"Index": 5, "Name": "Index", "Type": "TCoAtom"},
+                {"Index": 6, "Name": "PrefixPointsExpr", "Type": "TExprBase", "Optional": true}
             ]
         },
         {
@@ -179,6 +183,18 @@
             "Match": {"Type": "Callable", "Name": "KqlStreamLookupTable"}
         },
         {
+            "Name": "TKqlSequencer",
+            "Base": "TCallable",
+            "Match": {"Type": "Callable", "Name": "KqlSequencer"},
+            "Children": [
+                {"Index": 0, "Name": "Table", "Type": "TKqpTable"},
+                {"Index": 1, "Name": "Input", "Type": "TExprBase"},
+                {"Index": 2, "Name": "Columns", "Type": "TCoAtomList"},
+                {"Index": 3, "Name": "AutoIncrementColumns", "Type": "TCoAtomList"},
+                {"Index": 4, "Name": "InputItemType", "Type": "TExprBase"}
+            ]
+        },
+        {
             "Name": "TKqlLookupIndex",
             "Base": "TKqlLookupIndexBase",
             "Match": {"Type": "Callable", "Name": "KqlLookupIndex"}
@@ -189,8 +205,14 @@
             "Match": {"Type": "Callable", "Name": "KqlStreamLookupIndex"}
         },
         {
-            "Name": "TKqlTableEffect",
+            "Name": "TKqlEffectBase",
             "Base": "TExprBase",
+            "Match": {"Type": "CallableBase"},
+            "Builder": {"Generate": "None"}
+        },
+        {
+            "Name": "TKqlTableEffect",
+            "Base": "TKqlEffectBase",
             "Match": {"Type": "CallableBase"},
             "Builder": {"Generate": "None"},
             "Children": [
@@ -222,6 +244,15 @@
             "Match": {"Type": "Callable", "Name": "KqpUpsertRows"},
             "Children": [
                 {"Index": 3, "Name": "Settings", "Type": "TCoNameValueTupleList"}
+            ]
+        },
+        {
+            "Name": "TKqpWriteConstraint",
+            "Base": "TExprBase",
+            "Match": {"Type": "Callable", "Name": "KqpWriteConstraint"},
+            "Children": [
+                {"Index": 0, "Name": "Input", "Type": "TExprBase"},
+                {"Index": 1, "Name": "Columns", "Type": "TCoAtomList"}
             ]
         },
         {
@@ -262,6 +293,14 @@
             "Name": "TKqlInsertRowsIndex",
             "Base": "TKqlInsertRowsBase",
             "Match": {"Type": "Callable", "Name": "TKqlInsertRowsIndex"}
+        },
+        {
+            "Name": "TKqlExternalEffect",
+            "Base": "TKqlEffectBase",
+            "Match": {"Type": "Callable", "Name": "KqlExternalEffect"},
+            "Children": [
+                {"Index": 0, "Name": "Input", "Type": "TExprBase"}
+            ]
         },
         {
             "Name": "TKqpParamBinding",
@@ -381,6 +420,17 @@
             ]
         },
         {
+            "Name": "TKqpCnSequencer",
+            "Base": "TKqpConnection",
+            "Match": {"Type": "Callable", "Name": "KqpCnSequencer"},
+            "Children": [
+                {"Index": 1, "Name": "Table", "Type": "TKqpTable"},
+                {"Index": 2, "Name": "Columns", "Type": "TCoAtomList"},
+                {"Index": 3, "Name": "AutoIncrementColumns", "Type": "TCoAtomList"},
+                {"Index": 4, "Name": "InputItemType", "Type": "TExprBase"}
+            ]
+        },
+        {
             "Name": "TKqpProgram",
             "Base": "TCallable",
             "Match": {"Type": "Callable", "Name": "KqpProgram"},
@@ -411,6 +461,15 @@
             "Name": "TKqpDeleteRows",
             "Base": "TKqlDeleteRowsBase",
             "Match": {"Type": "Callable", "Name": "KqpDeleteRows"}
+        },
+        {
+            "Name": "TKqpSinkEffect",
+            "Base": "TKqlEffectBase",
+            "Match": {"Type": "Callable", "Name": "KqpSinkEffect"},
+            "Children": [
+                {"Index": 0, "Name": "Stage", "Type": "TExprBase"},
+                {"Index": 1, "Name": "SinkIndex", "Type": "TCoAtom"}
+            ]
         },
         {
             "Name": "TKqpOlapOperationBase",
@@ -475,7 +534,7 @@
             "Match": {"Type": "CallableBase"},
             "Children": [
                 {"Index": 0, "Name": "Column", "Type": "TCoAtom"},
-                {"Index": 1, "Name": "Path", "Type": "TCoAtom"}
+                {"Index": 1, "Name": "Path", "Type": "TCoUtf8"}
             ]
         },
         {

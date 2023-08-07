@@ -40,11 +40,19 @@ bool TTypeAnnotationContext::DoInitialize(TExprContext& ctx) {
     Y_ENSURE(UserDataStorage);
     UserDataStorage->FillUserDataUrls();
 
-    // Disable "in progress" constraints
-    DisableConstraintCheck.emplace(TUniqueConstraintNode::Name());
-    DisableConstraintCheck.emplace(TDistinctConstraintNode::Name());
 
     return true;
+}
+
+void TTypeAnnotationContext::Reset() {
+    UdfImports.clear();
+    UdfModules.clear();
+    UdfTypeCache.clear();
+    NodeToOperationId.clear();
+    EvaluationInProgress = 0;
+    ExpectedTypes.clear();
+    ExpectedConstraints.clear();
+    ExpectedColumnOrders.clear();
 }
 
 TString FormatColumnOrder(const TMaybe<TColumnOrder>& columnOrder) {

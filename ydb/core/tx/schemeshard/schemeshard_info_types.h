@@ -314,10 +314,9 @@ struct TTableInfo : public TSimpleRefCount<TTableInfo> {
         ui64 DeleteVersion;
         ETableColumnDefaultKind DefaultKind = ETableColumnDefaultKind::None;
         TString DefaultValue;
-        bool NotNull = false;
 
-        TColumn(const TString& name, ui32 id, NScheme::TTypeInfo type, const TString& typeMod)
-            : NTable::TScheme::TColumn(name, id, type, typeMod)
+        TColumn(const TString& name, ui32 id, NScheme::TTypeInfo type, const TString& typeMod, bool notNull)
+            : NTable::TScheme::TColumn(name, id, type, typeMod, notNull)
             , CreateVersion(0)
             , DeleteVersion(Max<ui64>())
         {}
@@ -2672,6 +2671,9 @@ struct TExportInfo: public TSimpleRefCount<TExportInfo> {
     TDeque<ui32> PendingDropItems;
 
     TSet<TActorId> Subscribers;
+
+    ui64 SnapshotStep = 0;
+    ui64 SnapshotTxId = 0;
 
     explicit TExportInfo(
             const ui64 id,

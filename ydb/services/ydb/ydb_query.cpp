@@ -9,6 +9,7 @@ namespace NKikimr::NGRpcService {
 
 void TGRpcYdbQueryService::SetupIncomingRequests(NGrpc::TLoggerPtr logger) {
     using namespace Ydb::Query;
+    using namespace NQuery;
 
     auto getCounterBlock = CreateCounterCb(Counters_, ActorSystem_);
 
@@ -26,13 +27,13 @@ void TGRpcYdbQueryService::SetupIncomingRequests(NGrpc::TLoggerPtr logger) {
     ADD_REQUEST(ExecuteQuery, ExecuteQueryRequest, ExecuteQueryResponsePart, {
         ActorSystem_->Send(GRpcRequestProxyId_,
             new TGrpcRequestNoOperationCall<ExecuteQueryRequest, ExecuteQueryResponsePart>
-                (ctx, &DoExecuteQueryRequest, TRequestAuxSettings{RLSWITCH(TRateLimiterMode::Rps), nullptr}));
+                (ctx, &DoExecuteQuery, TRequestAuxSettings{RLSWITCH(TRateLimiterMode::Rps), nullptr}));
     })
 
     ADD_REQUEST(ExecuteScript, ExecuteScriptRequest, Ydb::Operations::Operation, {
         ActorSystem_->Send(GRpcRequestProxyId_,
             new TGrpcRequestNoOperationCall<ExecuteScriptRequest, Ydb::Operations::Operation>
-                (ctx, &DoExecuteScriptRequest, TRequestAuxSettings{RLSWITCH(TRateLimiterMode::Rps), nullptr}));
+                (ctx, &DoExecuteScript, TRequestAuxSettings{RLSWITCH(TRateLimiterMode::Rps), nullptr}));
     })
 
     ADD_REQUEST(FetchScriptResults, FetchScriptResultsRequest, FetchScriptResultsResponse, {
@@ -40,6 +41,25 @@ void TGRpcYdbQueryService::SetupIncomingRequests(NGrpc::TLoggerPtr logger) {
             new TGrpcRequestNoOperationCall<FetchScriptResultsRequest, FetchScriptResultsResponse>
                 (ctx, &DoFetchScriptResults, TRequestAuxSettings{RLSWITCH(TRateLimiterMode::Rps), nullptr}));
     })
+
+    ADD_REQUEST(CreateSession, CreateSessionRequest, CreateSessionResponse, {
+        ActorSystem_->Send(GRpcRequestProxyId_,
+            new TGrpcRequestNoOperationCall<CreateSessionRequest, CreateSessionResponse>
+                (ctx, &DoCreateSession, TRequestAuxSettings{RLSWITCH(TRateLimiterMode::Rps), nullptr}));
+    })
+
+    ADD_REQUEST(DeleteSession, DeleteSessionRequest, DeleteSessionResponse, {
+        ActorSystem_->Send(GRpcRequestProxyId_,
+            new TGrpcRequestNoOperationCall<DeleteSessionRequest, DeleteSessionResponse>
+                (ctx, &DoDeleteSession, TRequestAuxSettings{RLSWITCH(TRateLimiterMode::Rps), nullptr}));
+    })
+
+    ADD_REQUEST(AttachSession, AttachSessionRequest, SessionState, {
+        ActorSystem_->Send(GRpcRequestProxyId_,
+            new TGrpcRequestNoOperationCall<AttachSessionRequest, SessionState>
+                (ctx, &DoAttachSession, TRequestAuxSettings{RLSWITCH(TRateLimiterMode::Rps), nullptr}));
+    })
+
 #undef ADD_REQUEST
 }
 

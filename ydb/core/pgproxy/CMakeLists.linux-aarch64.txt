@@ -15,12 +15,13 @@ target_link_libraries(ydb-core-pgproxy PUBLIC
   yutil
   cpp-actors-core
   cpp-actors-protos
+  cpp-string_utils-base64
   ydb-core-base
   ydb-core-protos
+  ydb-core-raw_socket
 )
 target_sources(ydb-core-pgproxy PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/pgproxy/pg_connection.cpp
-  ${CMAKE_SOURCE_DIR}/ydb/core/pgproxy/pg_listener.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/pgproxy/pg_proxy_types.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/pgproxy/pg_proxy.cpp
 )

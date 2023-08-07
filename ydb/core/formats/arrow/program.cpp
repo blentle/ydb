@@ -40,7 +40,7 @@ struct GroupByOptions : public arrow::compute::ScalarAggregateOptions {
 #include <contrib/libs/apache/arrow/cpp/src/arrow/array/builder_primitive.h>
 #include <contrib/libs/apache/arrow/cpp/src/arrow/datum.h>
 #include <contrib/libs/apache/arrow/cpp/src/arrow/result.h>
-#include <ydb/core/util/yverify_stream.h>
+#include <ydb/library/yverify_stream/yverify_stream.h>
 
 namespace NKikimr::NSsa {
 
@@ -57,7 +57,7 @@ public:
         auto funcNames = GetRegistryFunctionNames(assign.GetOperation());
 
         arrow::Result<arrow::Datum> result = arrow::Status::UnknownError<std::string>("unknown function");
-        for (const auto& funcName : funcNames) {    
+        for (const auto& funcName : funcNames) {
             if (TBase::Ctx && TBase::Ctx->func_registry()->GetFunction(funcName).ok()) {
                 result = arrow::compute::CallFunction(funcName, *arguments, assign.GetOptions(), TBase::Ctx);
             } else {
@@ -131,7 +131,7 @@ template <class TAssignObject>
 class TKernelFunction : public IStepFunction<TAssignObject> {
     using TBase = IStepFunction<TAssignObject>;
     const TFunctionPtr Function;
-    
+
 public:
     TKernelFunction(const TFunctionPtr kernelsFunction, arrow::compute::ExecContext* ctx)
         : TBase(ctx)
@@ -143,7 +143,11 @@ public:
         if (!arguments) {
             return arrow::Status::Invalid("Error parsing args.");
         }
-        return Function->Execute(*arguments, assign.GetOptions(), TBase::Ctx);
+        try {
+            return Function->Execute(*arguments, assign.GetOptions(), TBase::Ctx);
+        } catch (const std::exception& ex) {
+            return arrow::Status::ExecutionError(ex.what());
+        }
     }
 };
 
@@ -453,6 +457,50 @@ CH::GroupByOptions::Assign GetGroupByAssign(const TAggregateAssign& assign) {
     return descr;
 }
 
+class TFilterVisitor : public arrow::ArrayVisitor {
+    std::vector<bool> FiltersMerged;
+public:
+    void BuildColumnFilter(NArrow::TColumnFilter& result) {
+        result = NArrow::TColumnFilter(std::move(FiltersMerged));
+    }
+
+    arrow::Status Visit(const arrow::BooleanArray& array) override {
+        InitAndCheck(array);
+        for (ui32 i = 0; i < FiltersMerged.size(); ++i) {
+            bool columnValue = array.Value(i);
+            FiltersMerged[i] = FiltersMerged[i] && columnValue;
+        }
+        return arrow::Status::OK();
+    }
+
+    arrow::Status Visit(const arrow::Int8Array& array) override {
+        return VisitImpl(array);
+    }
+
+    arrow::Status Visit(const arrow::UInt8Array& array) override {
+        return VisitImpl(array);
+    }
+
+private:
+    template <class TArray>
+    arrow::Status VisitImpl(const TArray& array) {
+        InitAndCheck(array);
+        for (ui32 i = 0; i < FiltersMerged.size(); ++i) {
+            bool columnValue = (bool)array.Value(i);
+            FiltersMerged[i] = FiltersMerged[i] && columnValue;
+        }
+        return arrow::Status::OK();
+    }
+
+    void InitAndCheck(const arrow::Array& array) {
+        if (FiltersMerged.empty()) {
+            FiltersMerged.resize(array.length(), true);
+        } else {
+            Y_VERIFY(FiltersMerged.size() == (size_t)array.length());
+        }
+    }
+};
+
 }
 
 
@@ -629,26 +677,22 @@ arrow::Status TProgramStep::ApplyAggregates(TDatumBatch& batch, arrow::compute::
 }
 
 arrow::Status TProgramStep::MakeCombinedFilter(TDatumBatch& batch, NArrow::TColumnFilter& result) const {
-    std::vector<bool> filtersMerged;
+    TFilterVisitor filterVisitor;
     for (auto& colName : Filters) {
         auto column = batch.GetColumnByName(colName);
         if (!column.ok()) {
             return column.status();
         }
-        if (!column->is_array() || column->type() != arrow::boolean()) {
-            return arrow::Status::Invalid("Column '" + colName + "' is not a boolean array.");
+        if (!column->is_array()) {
+            return arrow::Status::Invalid("Column '" + colName + "' is not an array.");
         }
-
-        auto boolColumn = std::static_pointer_cast<arrow::BooleanArray>(column->make_array());
-        if (filtersMerged.empty()) {
-            filtersMerged.resize(boolColumn->length(), true);
-        }
-        Y_VERIFY(filtersMerged.size() == (size_t)boolColumn->length());
-        for (ui32 i = 0; i < filtersMerged.size(); ++i) {
-            filtersMerged[i] = filtersMerged[i] && boolColumn->Value(i);
+        auto columnArray = column->make_array();
+        auto status = columnArray->Accept(&filterVisitor);
+        if (!status.ok()) {
+            return status;
         }
     }
-    result = NArrow::TColumnFilter(std::move(filtersMerged));
+    filterVisitor.BuildColumnFilter(result);
     return arrow::Status::OK();
 }
 

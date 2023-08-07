@@ -96,13 +96,12 @@ void IndexProtoToMetadata(const TIndexProto& indexes, NYql::TKikimrTableMetadata
     }
 }
 
-TString GetTypeName(const NScheme::TTypeInfoMod& typeInfoMod, bool notNull) {
+TString GetTypeName(const NScheme::TTypeInfoMod& typeInfoMod) {
     TString typeName;
     if (typeInfoMod.TypeInfo.GetTypeId() != NScheme::NTypeIds::Pg) {
         YQL_ENSURE(NScheme::TryGetTypeName(typeInfoMod.TypeInfo.GetTypeId(), typeName));
     } else {
         YQL_ENSURE(typeInfoMod.TypeInfo.GetTypeDesc(), "no pg type descriptor");
-        YQL_ENSURE(!notNull, "pg not null types are not allowed");
         typeName = NPg::PgTypeNameFromTypeDesc(typeInfoMod.TypeInfo.GetTypeDesc(), typeInfoMod.TypeMod);
     }
     return typeName;
@@ -151,11 +150,12 @@ TTableMetadataResult GetTableMetadataResult(const NSchemeCache::TSchemeCacheNavi
     for (auto& pair : entry.Columns) {
         const auto& columnDesc = pair.second;
         auto notNull = entry.NotNullColumns.contains(columnDesc.Name);
-        const TString typeName = GetTypeName(NScheme::TTypeInfoMod{columnDesc.PType, columnDesc.PTypeMod}, notNull);
+        const TString typeName = GetTypeName(NScheme::TTypeInfoMod{columnDesc.PType, columnDesc.PTypeMod});
         tableMeta->Columns.emplace(
             columnDesc.Name,
             NYql::TKikimrColumnMetadata(
-                columnDesc.Name, columnDesc.Id, typeName, notNull, columnDesc.PType, columnDesc.PTypeMod
+                columnDesc.Name, columnDesc.Id, typeName, notNull, columnDesc.PType, columnDesc.PTypeMod,
+                columnDesc.DefaultFromSequence
             )
         );
         if (columnDesc.KeyOrder >= 0) {
@@ -196,11 +196,12 @@ TTableMetadataResult GetExternalTableMetadataResult(const NSchemeCache::TSchemeC
     for (auto& columnDesc : description.GetColumns()) {
         const auto typeInfoMod = NScheme::TypeInfoModFromProtoColumnType(columnDesc.GetTypeId(),
             columnDesc.HasTypeInfo() ? &columnDesc.GetTypeInfo() : nullptr);
-        const TString typeName = GetTypeName(typeInfoMod, columnDesc.GetNotNull());
+        const TString typeName = GetTypeName(typeInfoMod);
         tableMeta->Columns.emplace(
             columnDesc.GetName(),
             NYql::TKikimrColumnMetadata(
-                columnDesc.GetName(), columnDesc.GetId(), typeName, columnDesc.GetNotNull(), typeInfoMod.TypeInfo, typeInfoMod.TypeMod
+                columnDesc.GetName(), columnDesc.GetId(), typeName, columnDesc.GetNotNull(), typeInfoMod.TypeInfo, typeInfoMod.TypeMod,
+                columnDesc.GetDefaultFromSequence()
             )
         );
     }
@@ -298,6 +299,7 @@ TTableMetadataResult EnrichExternalTable(const TTableMetadataResult& externalTab
     tableMeta->ExternalSource.DataSourceLocation = externalDataSource.Metadata->ExternalSource.DataSourceLocation;
     tableMeta->ExternalSource.DataSourceInstallation = externalDataSource.Metadata->ExternalSource.DataSourceInstallation;
     tableMeta->ExternalSource.DataSourceAuth = externalDataSource.Metadata->ExternalSource.DataSourceAuth;
+    tableMeta->ExternalSource.ServiceAccountIdSignature = externalDataSource.Metadata->ExternalSource.ServiceAccountIdSignature;
     return result;
 }
 
@@ -314,6 +316,33 @@ void UpdateMetadataIfSuccess(NYql::TKikimrTableMetadataPtr ptr, size_t idx, cons
         ptr->SecondaryGlobalIndexMetadata[idx] = value.Metadata;
     }
 
+}
+
+void UpdateExternalDataSourceSecretValue(TTableMetadataResult& externalDataSourceMetadata, const TDescribeObjectResponse& objectDescription) {
+    if (objectDescription.Status != Ydb::StatusIds::SUCCESS) {
+        externalDataSourceMetadata.AddIssues(objectDescription.Issues);
+        externalDataSourceMetadata.SetStatus(NYql::YqlStatusFromYdbStatus(objectDescription.Status));
+    } else {
+        externalDataSourceMetadata.Metadata->ExternalSource.ServiceAccountIdSignature = objectDescription.SecretValue;
+    }
+}
+
+NThreading::TFuture<TDescribeObjectResponse> LoadExternalDataSourceSecretValue(const NSchemeCache::TSchemeCacheNavigate::TEntry& entry, const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, TActorSystem* actorSystem) {
+    const auto& authDescription = entry.ExternalDataSourceInfo->Description.GetAuth();
+    switch (authDescription.identity_case()) {
+        case NKikimrSchemeOp::TAuth::kServiceAccount: {
+            const TString& secretId = authDescription.GetServiceAccount().GetSecretName();
+            auto promise = NewPromise<TDescribeObjectResponse>();
+            actorSystem->Register(new TDescribeObjectActor(userToken ? userToken->GetUserSID() : "", secretId, promise));
+            return promise.GetFuture();
+        }
+
+        case NKikimrSchemeOp::TAuth::kNone:
+            return MakeFuture(TDescribeObjectResponse(""));
+
+        case NKikimrSchemeOp::TAuth::IDENTITY_NOT_SET:
+            return MakeFuture(TDescribeObjectResponse(Ydb::StatusIds::BAD_REQUEST, { NYql::TIssue("identity case is not specified") }));
+    }
 }
 
 } // anonymous namespace
@@ -579,7 +608,17 @@ NThreading::TFuture<TTableMetadataResult> TKqpTableMetadataLoader::LoadTableMeta
 
                 switch (entry.Kind) {
                     case EKind::KindExternalDataSource: {
-                        promise.SetValue(GetLoadTableMetadataResult(entry, cluster, table));
+                        auto externalDataSourceMetadata = GetLoadTableMetadataResult(entry, cluster, table);
+                        if (!externalDataSourceMetadata.Success()) {
+                            promise.SetValue(externalDataSourceMetadata);
+                            return;
+                        }
+                        LoadExternalDataSourceSecretValue(entry, userToken, ActorSystem)
+                            .Subscribe([promise, externalDataSourceMetadata](const TFuture<TDescribeObjectResponse>& result) mutable
+                        {
+                            UpdateExternalDataSourceSecretValue(externalDataSourceMetadata, result.GetValue());
+                            promise.SetValue(externalDataSourceMetadata);
+                        });
                     }
                     break;
                     case EKind::KindExternalTable: {

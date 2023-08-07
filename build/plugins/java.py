@@ -88,8 +88,6 @@ def ongenerate_script(unit, *args):
 
 def onjava_module(unit, *args):
     args_delim = unit.get('ARGS_DELIM')
-    if unit.get('ADD_SRCDIR_TO_TEST_DATA') == "yes":
-        unit.ondata_files(common.strip_roots(unit.path()))
 
     if unit.get('YA_IDE_IDEA') != 'yes':
         return
@@ -477,4 +475,5 @@ def on_setup_project_coords_if_needed(unit, *args):
         value = '\\"{}\\"'.format(_maven_coords_for_project(unit, project_dir).rstrip(':'))
     else:
         value = 'project(\\":{}\\")'.format(project_dir.replace('/', ':'))
-    unit.set(['_EXPORT_GRADLE_PROJECT_COORDS', value])
+    unit.set(['EXPORT_GRADLE_PROJECT_COORDS', value])
+    unit.set(['EXPORT_GRADLE_PROJECT_COORDS_GLOBAL', value])

@@ -126,7 +126,8 @@ namespace NActors {
         struct TPerChannelContext {
             struct TPendingEvent {
                 TEventSerializationInfo SerializationInfo;
-                TRope Payload;
+                TRope InternalPayload;
+                TRope ExternalPayload;
                 std::optional<TEventData> EventData;
 
                 // number of bytes remaining through XDC channel
@@ -203,7 +204,7 @@ namespace NActors {
 
     public:
         static constexpr EActivityType ActorActivityType() {
-            return INTERCONNECT_SESSION_TCP;
+            return EActivityType::INTERCONNECT_SESSION_TCP;
         }
 
         TInputSessionTCP(const TActorId& sessionId,
@@ -411,7 +412,7 @@ namespace NActors {
 
     public:
         static constexpr EActivityType ActorActivityType() {
-            return INTERCONNECT_SESSION_TCP;
+            return EActivityType::INTERCONNECT_SESSION_TCP;
         }
 
         TInterconnectSessionTCP(TInterconnectProxyTCP* const proxy, TSessionParams params);
@@ -646,7 +647,7 @@ namespace NActors {
 
     public:
         static constexpr EActivityType ActorActivityType() {
-            return INTERCONNECT_SESSION_KILLER;
+            return EActivityType::INTERCONNECT_SESSION_KILLER;
         }
 
         TInterconnectSessionKiller(TInterconnectProxyCommon::TPtr common)

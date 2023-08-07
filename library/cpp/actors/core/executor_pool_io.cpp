@@ -5,8 +5,8 @@
 #include <library/cpp/actors/util/datetime.h>
 
 namespace NActors {
-    TIOExecutorPool::TIOExecutorPool(ui32 poolId, ui32 threads, const TString& poolName, TAffinity* affinity, ui32 maxActivityType)
-        : TExecutorPoolBase(poolId, threads, affinity, maxActivityType)
+    TIOExecutorPool::TIOExecutorPool(ui32 poolId, ui32 threads, const TString& poolName, TAffinity* affinity)
+        : TExecutorPoolBase(poolId, threads, affinity)
         , Threads(new TThreadCtx[threads])
         , PoolName(poolName)
     {}
@@ -16,8 +16,7 @@ namespace NActors {
             cfg.PoolId,
             cfg.Threads,
             cfg.PoolName,
-            new TAffinity(cfg.Affinity),
-            cfg.MaxActivityType
+            new TAffinity(cfg.Affinity)
         )
     {}
 
@@ -28,7 +27,7 @@ namespace NActors {
     }
 
     ui32 TIOExecutorPool::GetReadyActivation(TWorkerContext& wctx, ui64 revolvingCounter) {
-        ui32 workerId = wctx.WorkerId;
+        i16 workerId = wctx.WorkerId;
         Y_VERIFY_DEBUG(workerId < PoolThreads);
 
         NHPTimer::STime elapsed = 0;
@@ -52,7 +51,7 @@ namespace NActors {
             if (const ui32 activation = Activations.Pop(++revolvingCounter)) {
                 hpnow = GetCycleCountFast();
                 elapsed += hpnow - hpstart;
-                wctx.AddElapsedCycles(IActor::ACTOR_SYSTEM, elapsed);
+                wctx.AddElapsedCycles(ActorSystemIndex, elapsed);
                 if (parked > 0) {
                     wctx.AddParkedCycles(parked);
                 }
@@ -109,7 +108,7 @@ namespace NActors {
 
         ScheduleQueue.Reset(new NSchedulerQueue::TQueueType());
 
-        for (ui32 i = 0; i != PoolThreads; ++i) {
+        for (i16 i = 0; i != PoolThreads; ++i) {
             Threads[i].Thread.Reset(new TExecutorThread(i, 0, actorSystem, this, MailboxTable.Get(), PoolName));
         }
 
@@ -120,18 +119,18 @@ namespace NActors {
     void TIOExecutorPool::Start() {
         TAffinityGuard affinityGuard(Affinity());
 
-        for (ui32 i = 0; i != PoolThreads; ++i)
+        for (i16 i = 0; i != PoolThreads; ++i)
             Threads[i].Thread->Start();
     }
 
     void TIOExecutorPool::PrepareStop() {
         AtomicStore(&StopFlag, true);
-        for (ui32 i = 0; i != PoolThreads; ++i)
+        for (i16 i = 0; i != PoolThreads; ++i)
             Threads[i].Pad.Interrupt();
     }
 
     void TIOExecutorPool::Shutdown() {
-        for (ui32 i = 0; i != PoolThreads; ++i)
+        for (i16 i = 0; i != PoolThreads; ++i)
             Threads[i].Thread->Join();
     }
 
@@ -141,7 +140,7 @@ namespace NActors {
         statsCopy[0] = TExecutorThreadStats();
         statsCopy[0].Aggregate(Stats);
         // Per-thread stats
-        for (size_t i = 0; i < PoolThreads; ++i) {
+        for (i16 i = 0; i < PoolThreads; ++i) {
             Threads[i].Thread->GetCurrentStats(statsCopy[i + 1]);
         }
     }

@@ -405,16 +405,21 @@ struct TShardedTableOptions {
     using TSelf = TShardedTableOptions;
 
     struct TColumn {
-        TColumn(const TString& name, const TString& type, bool isKey, bool notNull)
+        TColumn(const TString& name, const TString& type, bool isKey, bool notNull, TString family = {}, const TString& defaultFromSequence = {})
             : Name(name)
             , Type(type)
             , IsKey(isKey)
-            , NotNull(notNull) {}
+            , NotNull(notNull)
+            , Family(family)
+            , DefaultFromSequence(defaultFromSequence)
+        {}
 
         TString Name;
         TString Type;
         bool IsKey;
         bool NotNull;
+        TString Family;
+        TString DefaultFromSequence;
     };
 
     struct TIndex {
@@ -436,7 +441,18 @@ struct TShardedTableOptions {
         EFormat Format;
         TMaybe<EState> InitialState;
         bool VirtualTimestamps = false;
+        TMaybe<TDuration> ResolvedTimestamps;
         TMaybe<TString> AwsRegion;
+    };
+
+    struct TFamily {
+        TString Name;
+        TString LogPoolKind;
+        TString SysLogPoolKind;
+        TString DataPoolKind;
+        TString ExternalPoolKind;
+        ui64 DataThreshold = 0;
+        ui64 ExternalThreshold = 0;
     };
 
     using TAttributes = THashMap<TString, TString>;
@@ -456,6 +472,7 @@ struct TShardedTableOptions {
     TABLE_OPTION(EShadowDataMode, ShadowData, EShadowDataMode::Default);
     TABLE_OPTION(TVector<TColumn>, Columns, (TVector<TColumn>{{"key", "Uint32", true, false}, {"value", "Uint32", false, false}}));
     TABLE_OPTION(TVector<TIndex>, Indexes, {});
+    TABLE_OPTION(TVector<TFamily>, Families, {});
     TABLE_OPTION(ui64, Followers, 0);
     TABLE_OPTION(bool, FollowerPromotion, false);
     TABLE_OPTION(bool, ExternalStorage, false);
@@ -463,6 +480,7 @@ struct TShardedTableOptions {
     TABLE_OPTION(bool, Replicated, false);
     TABLE_OPTION(std::optional<EReplicationConsistency>, ReplicationConsistency, std::nullopt);
     TABLE_OPTION(TAttributes, Attributes, {});
+    TABLE_OPTION(bool, Sequences, false);
 
 #undef TABLE_OPTION
 #undef TABLE_OPTION_IMPL

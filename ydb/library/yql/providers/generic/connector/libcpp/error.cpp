@@ -5,12 +5,12 @@
 #include <ydb/library/yql/utils/yql_panic.h>
 #include <ydb/public/api/protos/ydb_status_codes.pb.h>
 
-namespace NYql::Connector {
-    bool ErrorIsUnitialized(const API::Error& error) noexcept {
+namespace NYql::NConnector {
+    bool ErrorIsUninitialized(const NApi::TError& error) noexcept {
         return error.status() == Ydb::StatusIds_StatusCode::StatusIds_StatusCode_SUCCESS && error.message().empty();
     }
 
-    bool ErrorIsSuccess(const API::Error& error) {
+    bool ErrorIsSuccess(const NApi::TError& error) {
         YQL_ENSURE(error.status() != Ydb::StatusIds_StatusCode::StatusIds_StatusCode_STATUS_CODE_UNSPECIFIED,
                    "error status code is not initialized");
 
@@ -22,7 +22,7 @@ namespace NYql::Connector {
         return ok;
     }
 
-    TIssues ErrorToIssues(const API::Error& error) {
+    TIssues ErrorToIssues(const NApi::TError& error) {
         TIssues issues;
         issues.Reserve(error.get_arr_issues().size() + 1);
 
@@ -30,12 +30,29 @@ namespace NYql::Connector {
         issues.AddIssue(TIssue(error.message()));
 
         // convert detailed errors
-        IssuesFromMessage(error.get_arr_issues(), issues);
+        for (auto& subIssue : error.get_arr_issues()) {
+            issues.AddIssue(IssueFromMessage(subIssue));
+        }
 
         return issues;
     }
 
-    void ErrorToExprCtx(const API::Error& error, TExprContext& ctx, const TPosition& position, const TString& summary) {
+    NDqProto::StatusIds::StatusCode ErrorToDqStatus(const NApi::TError& error) {
+        switch (error.status()) {
+            case ::Ydb::StatusIds::StatusCode::StatusIds_StatusCode_BAD_REQUEST:
+                return NDqProto::StatusIds::StatusCode::StatusIds_StatusCode_BAD_REQUEST;
+            case ::Ydb::StatusIds::StatusCode::StatusIds_StatusCode_INTERNAL_ERROR:
+                return NDqProto::StatusIds::StatusCode::StatusIds_StatusCode_INTERNAL_ERROR;
+            case ::Ydb::StatusIds::StatusCode::StatusIds_StatusCode_UNSUPPORTED:
+                return NDqProto::StatusIds::StatusCode::StatusIds_StatusCode_UNSUPPORTED;
+            case ::Ydb::StatusIds::StatusCode::StatusIds_StatusCode_NOT_FOUND:
+                return NDqProto::StatusIds::StatusCode::StatusIds_StatusCode_BAD_REQUEST;
+            default:
+                ythrow yexception() << "Unexpected YDB status code: " << ::Ydb::StatusIds::StatusCode_Name(error.status());
+        }
+    }
+
+    void ErrorToExprCtx(const NApi::TError& error, TExprContext& ctx, const TPosition& position, const TString& summary) {
         YQL_ENSURE(!ErrorIsSuccess(error));
 
         // add high-level error
@@ -51,8 +68,8 @@ namespace NYql::Connector {
         }
     }
 
-    API::Error ErrorFromGRPCStatus(const grpc::Status& status) {
-        API::Error result;
+    NApi::TError ErrorFromGRPCStatus(const grpc::Status& status) {
+        NApi::TError result;
 
         if (status.error_code() == grpc::StatusCode::OK) {
             result.set_status(Ydb::StatusIds_StatusCode::StatusIds_StatusCode_SUCCESS);

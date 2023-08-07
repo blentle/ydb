@@ -3,8 +3,8 @@
 #include "defs.h"
 #include "scheme_tablecell.h"
 
-#include <ydb/core/base/pathid.h>
-#include <ydb/core/protos/tx.pb.h>
+#include <ydb/core/scheme/scheme_pathid.h>
+#include <ydb/core/scheme/protos/key_range.pb.h>
 #include <ydb/core/scheme_types/scheme_types.h>
 #include <ydb/library/aclib/aclib.h>
 
@@ -212,8 +212,8 @@ public:
 
     TSerializedTableRange(TConstArrayRef<TCell> fromValues, bool inclusiveFrom, TConstArrayRef<TCell> toValues,
         bool inclusiveTo)
-        : From(TSerializedCellVec::Serialize(fromValues))
-        , To(TSerializedCellVec::Serialize(toValues))
+        : From(fromValues)
+        , To(toValues)
         , FromInclusive(inclusiveFrom)
         , ToInclusive(inclusiveTo) {}
 

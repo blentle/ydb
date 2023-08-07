@@ -74,11 +74,13 @@ SRCS(
     tx__update_tablet_groups.cpp
     tx__update_tablet_metrics.cpp
     tx__update_tablet_status.cpp
+    tx__update_tablets_object.cpp
 )
 
 PEERDIR(
     library/cpp/actors/core
     library/cpp/actors/interconnect
+    library/cpp/containers/ring_buffer
     library/cpp/json
     library/cpp/monlib/dynamic_counters
     ydb/core/base

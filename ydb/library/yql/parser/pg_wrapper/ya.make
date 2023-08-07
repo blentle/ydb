@@ -7,7 +7,6 @@ PROVIDES(
 YQL_LAST_ABI_VERSION()
 
 ADDINCL(
-    contrib/libs/libiconv/include
     contrib/libs/lz4
     ydb/library/yql/parser/pg_wrapper/postgresql/src/backend/bootstrap
     ydb/library/yql/parser/pg_wrapper/postgresql/src/backend/parser
@@ -35,6 +34,7 @@ SRCS(
     pg_kernels.2.cpp
     pg_kernels.3.cpp
     config.cpp
+    cost_mocks.cpp
 )
 
 IF (ARCH_X86_64)
@@ -67,8 +67,7 @@ PEERDIR(
     library/cpp/yson
     ydb/library/yql/core
     ydb/library/yql/minikql/arrow
-    ydb/library/yql/minikql/computation
-    ydb/library/yql/minikql/comp_nodes
+    ydb/library/yql/minikql/computation/llvm
     ydb/library/yql/parser/pg_catalog
     ydb/library/yql/providers/common/codec
     ydb/library/yql/public/issue
@@ -77,7 +76,6 @@ PEERDIR(
 
     contrib/libs/icu
     contrib/libs/libc_compat
-    contrib/libs/libiconv
     contrib/libs/libxml
     contrib/libs/lz4
     contrib/libs/openssl

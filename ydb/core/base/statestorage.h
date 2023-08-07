@@ -27,6 +27,7 @@ struct TEvStateStorage {
         EvUpdateGroupConfig,
         EvListStateStorage,
         EvBoardInfoUpdate,
+        EvPublishActorGone,
 
         // replies (local, from proxy)
         EvInfo = EvLookup + 512,
@@ -382,6 +383,7 @@ struct TEvStateStorage {
     struct TEvListSchemeBoardResult;
     struct TEvListStateStorage;
     struct TEvListStateStorageResult;
+    struct TEvPublishActorGone;
     struct TEvUpdateGroupConfig;
     struct TEvReplicaProbeSubscribe;
     struct TEvReplicaProbeUnsubscribe;
@@ -538,6 +540,11 @@ enum class EBoardLookupMode {
     Subscription,
 };
 
+struct TBoardRetrySettings {
+    TDuration StartDelayMs = TDuration::MilliSeconds(2000);
+    TDuration MaxDelayMs = TDuration::MilliSeconds(5000);
+};
+
 TIntrusivePtr<TStateStorageInfo> BuildStateStorageInfo(char (&namePrefix)[TActorId::MaxServiceIDLength], const NKikimrConfig::TDomainsConfig::TStateStorage& config);
 void BuildStateStorageInfos(const NKikimrConfig::TDomainsConfig::TStateStorage& config,
     TIntrusivePtr<TStateStorageInfo> &stateStorageInfo,
@@ -554,8 +561,12 @@ IActor* CreateStateStorageTabletGuardian(ui64 tabletId, const TActorId &leader, 
 IActor* CreateStateStorageFollowerGuardian(ui64 tabletId, const TActorId &follower); // created as followerCandidate
 IActor* CreateStateStorageBoardReplica(const TIntrusivePtr<TStateStorageInfo> &, ui32);
 IActor* CreateSchemeBoardReplica(const TIntrusivePtr<TStateStorageInfo>&, ui32);
-IActor* CreateBoardLookupActor(const TString &path, const TActorId &owner, ui32 groupId, EBoardLookupMode mode);
-IActor* CreateBoardPublishActor(const TString &path, const TString &payload, const TActorId &owner, ui32 groupId, ui32 ttlMs, bool reg);
+IActor* CreateBoardLookupActor(
+    const TString &path, const TActorId &owner, ui32 groupId, EBoardLookupMode mode,
+    TBoardRetrySettings boardRetrySettings = {});
+IActor* CreateBoardPublishActor(
+    const TString &path, const TString &payload, const TActorId &owner, ui32 groupId, ui32 ttlMs, bool reg,
+    TBoardRetrySettings boardRetrySettings = {});
 
 TString MakeEndpointsBoardPath(const TString &database);
 

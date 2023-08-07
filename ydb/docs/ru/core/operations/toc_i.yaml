@@ -4,4 +4,6 @@ items:
   hidden: true
 - name: Пользовательские атрибуты таблицы
   href: manage-users-attr.md
-  
+- name: Построение планов запросов
+  href: query_plan.md
+  hidden: true

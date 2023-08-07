@@ -865,7 +865,7 @@ struct TEvDataShard {
     struct TEvUploadRowsRequest : public TEventPBWithArena<TEvUploadRowsRequest,
                                                         NKikimrTxDataShard::TEvUploadRowsRequest,
                                                         TEvDataShard::EvUploadRowsRequest,
-                                                        16200, 32500> {
+                                                        16*1024, 32*1024> {
         TEvUploadRowsRequest() = default;
     };
 
@@ -961,11 +961,15 @@ struct TEvDataShard {
         // CellVec (TODO: add schema?)
 
         TConstArrayRef<TCell> GetCells(size_t row) const {
-            if (Rows.empty() && RowsSerialized.empty() && Record.GetRowCount())
+            if (Rows.empty() && Batch.Empty() && RowsSerialized.empty())
                 return {};
 
             if (!Rows.empty()) {
                 return Rows[row];
+            }
+
+            if (!Batch.Empty()) {
+                return Batch[row];
             }
 
             return RowsSerialized[row].GetCells();
@@ -973,6 +977,10 @@ struct TEvDataShard {
 
         void SetRows(TVector<TOwnedCellVec>&& rows) {
             Rows = std::move(rows);
+        }
+
+        void SetBatch(TOwnedCellVecBatch&& batch) {
+            Batch = std::move(batch);
         }
 
         // Arrow
@@ -987,6 +995,9 @@ struct TEvDataShard {
     private:
         // for local events
         TVector<TOwnedCellVec> Rows;
+
+        // batch for local events
+        TOwnedCellVecBatch Batch;
 
         // for remote events to avoid extra copying
         TVector<TSerializedCellVec> RowsSerialized;

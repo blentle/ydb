@@ -34,6 +34,7 @@
 #include <ydb/services/monitoring/grpc_service.h>
 #include <ydb/core/fq/libs/control_plane_proxy/control_plane_proxy.h>
 #include <ydb/core/fq/libs/control_plane_storage/control_plane_storage.h>
+#include <ydb/core/blobstorage/base/blobstorage_events.h>
 #include <ydb/core/client/metadata/types_metadata.h>
 #include <ydb/core/client/metadata/functions_metadata.h>
 #include <ydb/core/client/minikql_compile/mkql_compile_service.h>
@@ -48,7 +49,7 @@
 #include <ydb/core/kqp/rm_service/kqp_rm_service.h>
 #include <ydb/core/kqp/proxy_service/kqp_proxy_service.h>
 #include <ydb/core/metering/metering.h>
-#include <ydb/core/protos/services.pb.h>
+#include <ydb/library/services/services.pb.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
 #include <ydb/core/tx/columnshard/columnshard.h>
 #include <ydb/core/tx/coordinator/coordinator.h>
@@ -76,6 +77,7 @@
 #include <ydb/library/yql/minikql/mkql_function_registry.h>
 #include <ydb/library/yql/minikql/invoke_builtins/mkql_builtins.h>
 #include <ydb/library/yql/public/issue/yql_issue_message.h>
+#include <ydb/library/yql/utils/actor_log/log.h>
 #include <ydb/core/engine/mkql_engine_flat.h>
 #include <ydb/core/driver_lib/run/cert_auth_props.h>
 
@@ -101,6 +103,7 @@
 #include <ydb/library/folder_service/mock/mock_folder_service_adapter.h>
 
 #include <ydb/core/client/server/msgbus_server_tracer.h>
+#include <ydb/core/client/server/ic_nodes_cache_service.h>
 
 #include <library/cpp/actors/interconnect/interconnect.h>
 
@@ -732,12 +735,12 @@ namespace Tests {
         }
         if (Settings->IsEnableMetadataProvider()) {
             auto* actor = NMetadata::NProvider::CreateService(NMetadata::NProvider::TConfig());
-            const auto aid = Runtime->Register(actor, nodeIdx, appData.SystemPoolId, TMailboxType::Revolving, 0);
+            const auto aid = Runtime->Register(actor, nodeIdx, appData.UserPoolId, TMailboxType::Revolving, 0);
             Runtime->RegisterService(NMetadata::NProvider::MakeServiceId(Runtime->GetNodeId(nodeIdx)), aid, nodeIdx);
         }
         if (Settings->IsEnableBackgroundTasks()) {
             auto* actor = NBackgroundTasks::CreateService(NBackgroundTasks::TConfig());
-            const auto aid = Runtime->Register(actor, nodeIdx, appData.SystemPoolId, TMailboxType::Revolving, 0);
+            const auto aid = Runtime->Register(actor, nodeIdx, appData.UserPoolId, TMailboxType::Revolving, 0);
             Runtime->RegisterService(NBackgroundTasks::MakeServiceId(Runtime->GetNodeId(nodeIdx)), aid, nodeIdx);
         }
         if (Settings->IsEnableExternalIndex()) {
@@ -746,9 +749,14 @@ namespace Tests {
             Runtime->RegisterService(NCSIndex::MakeServiceId(Runtime->GetNodeId(nodeIdx)), aid, nodeIdx);
         }
         {
-            auto* actor = NConveyor::CreateService(NConveyor::TConfig(), new ::NMonitoring::TDynamicCounters());
+            auto* actor = NConveyor::TScanServiceOperator::CreateService(NConveyor::TConfig(), new ::NMonitoring::TDynamicCounters());
             const auto aid = Runtime->Register(actor, nodeIdx, appData.UserPoolId, TMailboxType::Revolving, 0);
-            Runtime->RegisterService(NConveyor::MakeServiceId(Runtime->GetNodeId(nodeIdx)), aid, nodeIdx);
+            Runtime->RegisterService(NConveyor::TScanServiceOperator::MakeServiceId(Runtime->GetNodeId(nodeIdx)), aid, nodeIdx);
+        }
+        {
+            auto* actor = NConveyor::TCompServiceOperator::CreateService(NConveyor::TConfig(), new ::NMonitoring::TDynamicCounters());
+            const auto aid = Runtime->Register(actor, nodeIdx, appData.UserPoolId, TMailboxType::Revolving, 0);
+            Runtime->RegisterService(NConveyor::TCompServiceOperator::MakeServiceId(Runtime->GetNodeId(nodeIdx)), aid, nodeIdx);
         }
         Runtime->Register(CreateLabelsMaintainer({}), nodeIdx, appData.SystemPoolId, TMailboxType::Revolving, 0);
 
@@ -787,8 +795,15 @@ namespace Tests {
             TActorId kqpRmServiceId = Runtime->Register(kqpRmService, nodeIdx);
             Runtime->RegisterService(NKqp::MakeKqpRmServiceID(Runtime->GetNodeId(nodeIdx)), kqpRmServiceId, nodeIdx);
 
+            if (!KqpLoggerScope) {
+                // We need to keep YqlLoggerScope alive longer than the actor system
+                KqpLoggerScope = std::make_shared<NYql::NLog::YqlLoggerScope>(
+                    new NYql::NLog::TTlsLogBackend(new TNullLogBackend()));
+            }
+
             IActor* kqpProxyService = NKqp::CreateKqpProxyService(Settings->AppConfig.GetLogConfig(),
                                                                   Settings->AppConfig.GetTableServiceConfig(),
+                                                                  Settings->AppConfig.GetAuthConfig().GetTokenAccessorConfig(),
                                                                   TVector<NKikimrKqp::TKqpSetting>(Settings->KqpSettings),
                                                                   nullptr, std::move(kqpProxySharedResources));
             TActorId kqpProxyServiceId = Runtime->Register(kqpProxyService, nodeIdx);
@@ -836,13 +851,23 @@ namespace Tests {
                 }
             }
         }
-
+        {
+            IActor* icNodeCache = NIcNodeCache::CreateICNodesInfoCacheService(Runtime->GetDynamicCounters());
+            TActorId icCacheId = Runtime->Register(icNodeCache, nodeIdx);
+            Runtime->RegisterService(NIcNodeCache::CreateICNodesInfoCacheServiceId(), icCacheId, nodeIdx);
+        }
         {
             auto driverConfig = NYdb::TDriverConfig().SetEndpoint(TStringBuilder() << "localhost:" << Settings->GrpcPort);
             if (!Driver) {
                 Driver.Reset(new NYdb::TDriver(driverConfig));
             }
             Runtime->GetAppData(nodeIdx).YdbDriver = Driver.Get();
+        }
+
+        {
+            IActor* pqClusterTracker = NPQ::NClusterTracker::CreateClusterTracker();
+            TActorId pqClusterTrackerId = Runtime->Register(pqClusterTracker, nodeIdx);
+            Runtime->RegisterService(NPQ::NClusterTracker::MakeClusterTrackerID(), pqClusterTrackerId, nodeIdx);
         }
 
         {
@@ -876,12 +901,6 @@ namespace Tests {
             IActor* kesusService = NKesus::CreateKesusProxyService();
             TActorId kesusServiceId = Runtime->Register(kesusService, nodeIdx);
             Runtime->RegisterService(NKesus::MakeKesusProxyServiceId(), kesusServiceId, nodeIdx);
-        }
-
-        {
-            IActor* pqClusterTracker = NPQ::NClusterTracker::CreateClusterTracker();
-            TActorId pqClusterTrackerId = Runtime->Register(pqClusterTracker, nodeIdx);
-            Runtime->RegisterService(NPQ::NClusterTracker::MakeClusterTrackerID(), pqClusterTrackerId, nodeIdx);
         }
 
         {
@@ -1026,7 +1045,7 @@ namespace Tests {
         //Runtime->SetLogPriority(NKikimrServices::LOCAL, NActors::NLog::PRI_DEBUG);
 
         Runtime->SetLogPriority(NKikimrServices::BS_CONTROLLER, NLog::PRI_WARN);
-        Runtime->SetLogPriority(NKikimrServices::MSGBUS_REQUEST, NLog::PRI_WARN);
+        Runtime->SetLogPriority(NKikimrServices::RPC_REQUEST, NLog::PRI_WARN);
 
         //Runtime->SetLogPriority(NKikimrServices::TX_COORDINATOR, NLog::PRI_DEBUG);
         //Runtime->SetLogPriority(NKikimrServices::TX_MEDIATOR, NLog::PRI_DEBUG);
@@ -1235,9 +1254,7 @@ namespace Tests {
         TAutoPtr<NBus::TBusMessage> reply;
         SendAndWaitCompletion(request, reply);
 
-#ifndef NDEBUG
         Cout << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
-#endif
         return reply;
     }
 
@@ -1298,9 +1315,7 @@ namespace Tests {
             msg->Record.MutableFlatTxId()->SetSchemeShardTabletId(schemeshard);
             msg->Record.MutableFlatTxId()->SetPathId(pathId);
             msg->Record.MutablePollOptions()->SetTimeout(timeout.MilliSeconds());
-#ifndef NDEBUG
             Cerr << "waiting..." << Endl;
-#endif
             status = SyncCall(msg, reply);
             if (status != NBus::MESSAGE_OK) {
                 const char *description = NBus::MessageStatusDescription(status);
@@ -1352,9 +1367,7 @@ namespace Tests {
         SetApplyIf(*mkDirTx, applyIf);
         TAutoPtr<NBus::TBusMessage> reply;
         NBus::EMessageStatus msgStatus = SendAndWaitCompletion(request, reply);
-#ifndef NDEBUG
         Cout << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
-#endif
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
         const NKikimrClient::TResponse &response = dynamic_cast<NMsgBusProxy::TBusResponse *>(reply.Get())->Record;
         return (NMsgBusProxy::EResponseStatus)response.GetStatus();
@@ -1369,9 +1382,7 @@ namespace Tests {
         SetApplyIf(*mkDirTx, applyIf);
         TAutoPtr<NBus::TBusMessage> reply;
         NBus::EMessageStatus msgStatus = SendAndWaitCompletion(request, reply);
-#ifndef NDEBUG
         Cout << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
-#endif
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
         const NKikimrClient::TResponse &response = dynamic_cast<NMsgBusProxy::TBusResponse *>(reply.Get())->Record;
         return (NMsgBusProxy::EResponseStatus)response.GetStatus();
@@ -1835,9 +1846,7 @@ namespace Tests {
         auto& descr = record.GetPathDescription().GetSelf();
         TAutoPtr<NBus::TBusMessage> reply;
         auto msgStatus = WaitCompletion(descr.GetCreateTxId(), descr.GetSchemeshardId(), descr.GetPathId(), reply, timeout);
-#ifndef NDEBUG
         Cout << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
-#endif
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
         const NKikimrClient::TResponse &response = dynamic_cast<NMsgBusProxy::TBusResponse *>(reply.Get())->Record;
         return (NMsgBusProxy::EResponseStatus)response.GetStatus();
@@ -2007,9 +2016,7 @@ namespace Tests {
         TAutoPtr<NBus::TBusMessage> reply;
         NBus::EMessageStatus msgStatus = SendWhenReady(readRequest, reply);
 
-#ifndef NDEBUG
         Cerr << PrintToString<NMsgBusProxy::TBusResponse>(reply.Get()) << Endl;
-#endif
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
         const NKikimrClient::TResponse &response = dynamic_cast<NMsgBusProxy::TBusResponse *>(reply.Get())->Record;
         UNIT_ASSERT(response.HasBlobStorageConfigResponse() && response.GetBlobStorageConfigResponse().GetSuccess());
@@ -2038,9 +2045,7 @@ namespace Tests {
         TAutoPtr<NBus::TBusMessage> replyDelete;
         NBus::EMessageStatus msgStatus = SendWhenReady(deleteRequest, replyDelete);
 
-#ifndef NDEBUG
         Cout << PrintToString<NMsgBusProxy::TBusResponse>(replyDelete.Get()) << Endl;
-#endif
         UNIT_ASSERT_VALUES_EQUAL(msgStatus, NBus::MESSAGE_OK);
         const NKikimrClient::TResponse &responseDelete = dynamic_cast<NMsgBusProxy::TBusResponse *>(replyDelete.Get())->Record;
         UNIT_ASSERT(responseDelete.HasBlobStorageConfigResponse() && responseDelete.GetBlobStorageConfigResponse().GetSuccess());
@@ -2263,9 +2268,7 @@ namespace Tests {
         // Timeout for DEBUG purposes only
         runtime->GrabEdgeEvent<NMon::TEvRemoteJsonInfoRes>(handle);
         TString res = handle->Get<NMon::TEvRemoteJsonInfoRes>()->Json;
-#ifndef NDEBUG
         Cerr << res << Endl;
-#endif
         return res;
     }
 
@@ -2413,9 +2416,7 @@ namespace Tests {
         TEvHive::TEvGetTabletStorageInfoResult* response = runtime->GrabEdgeEventRethrow<TEvHive::TEvGetTabletStorageInfoResult>(handle);
 
         res.Swap(&response->Record);
-#ifndef NDEBUG
         Cerr << response->Record.DebugString() << "\n";
-#endif
 
         if (res.GetStatus() == NKikimrProto::OK) {
             auto& info = res.GetInfo();
@@ -2567,13 +2568,11 @@ namespace Tests {
 
     bool TTenants::IsActive(const TString &name, ui32 nodeIdx) const {
         const TVector<ui32>& nodes = List(name);
-#ifndef NDEBUG
         Cerr << "IsActive: " << name << " -- " << nodeIdx << Endl;
         for (auto& x: nodes) {
             Cerr << " -- " << x;
         }
         Cerr << Endl;
-#endif
         return std::find(nodes.begin(), nodes.end(), nodeIdx) != nodes.end();
     }
 

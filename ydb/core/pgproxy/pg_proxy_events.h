@@ -2,10 +2,12 @@
 
 #include <library/cpp/actors/core/events.h>
 #include <library/cpp/actors/core/event_local.h>
-#include "pg_proxy_config.h"
+#include <ydb/core/raw_socket/sock_config.h>
 #include "pg_proxy_types.h"
 
 namespace NPG {
+
+using namespace NKikimr::NRawSocket;
 
 struct TEvPGEvents {
     enum EEv {
@@ -35,12 +37,16 @@ struct TEvPGEvents {
         uint32_t TableId = 0;
         uint16_t ColumnId = 0;
         uint32_t DataType;
-        uint16_t DataTypeSize;
-        //uint32_t DataTypeModifier;
-        //uint16_t Format;
+        int16_t DataTypeSize;
+        int32_t DataTypeModifier;
+        int16_t Format = 0; // 0 = text, 1 = binary
     };
 
-    using TDataRow = std::vector<TString>;
+    struct TRowValueField {
+        std::optional<std::variant<TString, std::vector<uint8_t>>> Value;
+    };
+
+    using TDataRow = std::vector<TRowValueField>;
 
     struct TEvConnectionOpened : NActors::TEventLocal<TEvConnectionOpened, EvConnectionOpened> {
         std::shared_ptr<TPGInitial> Message;
@@ -106,6 +112,7 @@ struct TEvPGEvents {
         TString Tag;
         bool EmptyQuery = false;
         bool CommandCompleted = true;
+        bool ReadyForQuery = true;
         char TransactionStatus = 0;
     };
 
@@ -140,6 +147,7 @@ struct TEvPGEvents {
 
     struct TEvParseResponse : NActors::TEventLocal<TEvParseResponse, EvParseResponse> {
         std::unique_ptr<TPGParse> OriginalMessage;
+        std::vector<std::pair<char, TString>> ErrorFields;
 
         TEvParseResponse(std::unique_ptr<TPGParse> originalMessage)
             : OriginalMessage(std::move(originalMessage))
@@ -208,6 +216,7 @@ struct TEvPGEvents {
         TString Tag;
         bool EmptyQuery = false;
         bool CommandCompleted = true;
+        bool ReadyForQuery = true;
         char TransactionStatus = 0;
     };
 

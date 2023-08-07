@@ -7,6 +7,7 @@ IF (PROFILE_MEMORY_ALLOCATIONS)
 ENDIF()
 
 SRCS(
+    auto_config_initializer.cpp
     config.cpp
     config.h
     config_parser.cpp
@@ -80,6 +81,7 @@ PEERDIR(
     ydb/core/kesus/proxy
     ydb/core/kesus/tablet
     ydb/core/keyvalue
+    ydb/core/kafka_proxy
     ydb/core/kqp
     ydb/core/kqp/rm_service
     ydb/core/load_test
@@ -100,6 +102,7 @@ PEERDIR(
     ydb/core/scheme
     ydb/core/scheme_types
     ydb/core/security
+    ydb/core/statistics
     ydb/core/sys_view/processor
     ydb/core/sys_view/service
     ydb/core/tablet
@@ -131,8 +134,7 @@ PEERDIR(
     ydb/library/folder_service/proto
     ydb/library/pdisk_io
     ydb/library/security
-    ydb/library/yql/minikql/comp_nodes
-    ydb/library/yql/minikql/computation
+    ydb/library/yql/minikql/comp_nodes/llvm
     ydb/library/yql/providers/pq/cm_client
     ydb/library/yql/public/udf/service/exception_policy
     ydb/public/lib/base
@@ -144,6 +146,7 @@ PEERDIR(
     ydb/services/discovery
     ydb/services/fq
     ydb/services/kesus
+    ydb/services/keyvalue
     ydb/services/local_discovery
     ydb/services/maintenance
     ydb/services/metadata/ds_table
@@ -162,6 +165,10 @@ PEERDIR(
 YQL_LAST_ABI_VERSION()
 
 END()
+
+RECURSE_FOR_TESTS(
+    ut
+)
 
 RECURSE_ROOT_RELATIVE(
     ydb/core

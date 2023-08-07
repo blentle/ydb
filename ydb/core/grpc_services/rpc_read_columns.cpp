@@ -1,18 +1,19 @@
 #include "service_coordination.h"
 #include <ydb/core/grpc_services/base/base.h>
 
-#include "rpc_common.h"
+#include "rpc_common/rpc_common.h"
 #include "rpc_kh_snapshots.h"
 #include "resolve_local_db_table.h"
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
 #include <ydb/core/tx/datashard/datashard.h>
-#include <ydb/core/base/kikimr_issue.h>
+#include <ydb/library/ydb_issue/issue_helpers.h>
 #include <ydb/core/base/tablet_pipecache.h>
 #include <ydb/core/actorlib_impl/long_timer.h>
 #include <ydb/core/kqp/compute_actor/kqp_compute_events.h>
 #include <ydb/core/sys_view/scan.h>
 #include <ydb/core/formats/factory.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
+#include <ydb/public/api/protos/ydb_clickhouse_internal.pb.h>
 
 #include <util/string/vector.h>
 
@@ -362,7 +363,7 @@ private:
         ev->Record.SetMaxRows(proto->max_rows());
         ev->Record.SetMaxBytes(proto->max_bytes());
 
-        LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Sending request to tablet " << tabletId);
+        LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, "Sending request to tablet " << tabletId);
 
         ctx.Send(LeaderPipeCache, new TEvPipeCache::TEvForward(ev.release(), tabletId, true), IEventHandle::FlagTrackDelivery);
 
@@ -402,7 +403,7 @@ private:
 
                 // Skip rows before MinKey just in case (because currently sys view scan ignores key range)
                 if (cmp > 0 || (cmp == 0 && !MinKeyInclusive)) {
-                    LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Skipped rows by sys view scan");
+                    LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, "Skipped rows by sys view scan");
                     continue;
                 } else {
                     skippedBeforeMinKey = true;
@@ -533,7 +534,7 @@ private:
             MinKeyInclusive = proto->from_key_inclusive();
         } else {
             TVector<TCell> allNulls(KeyColumnTypes.size());
-            MinKey.Parse(TSerializedCellVec::Serialize(allNulls));
+            MinKey = TSerializedCellVec(allNulls);
             MinKeyInclusive = true;
         }
 
@@ -547,7 +548,7 @@ private:
             MaxKeyInclusive = proto->to_key_inclusive();
         } else {
             TVector<TCell> infinity;
-            MaxKey.Parse(TSerializedCellVec::Serialize(infinity));
+            MaxKey = TSerializedCellVec(infinity);
             MaxKeyInclusive = false;
         }
 
@@ -568,7 +569,7 @@ private:
         TTableRange range(MinKey.GetCells(), true, MinKey.GetCells(), true, false);
         KeyRange.Reset(new TKeyDesc(entry.TableId, range, TKeyDesc::ERowOperation::Read, KeyColumnTypes, columns));
 
-        LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Resolving range: "
+        LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, "Resolving range: "
                     << " fromKey: " << PrintKey(MinKey.GetBuffer(), *AppData(ctx)->TypeRegistry)
                     << " fromInclusive: " << true);
 
@@ -617,7 +618,7 @@ private:
             return JoinVectorIntoString(shards, ", ");
         };
 
-        LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Range shards: "
+        LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, "Range shards: "
             << getShardsString(KeyRange->GetPartitions()));
 
         MakeShardRequests(ctx);
@@ -645,7 +646,7 @@ private:
 
         ui64 shardId = KeyRange->GetPartitions()[0].ShardId;
 
-        LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Sending request to shards " << shardId);
+        LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, "Sending request to shards " << shardId);
 
         ctx.Send(LeaderPipeCache, new TEvPipeCache::TEvForward(ev.release(), shardId, true), IEventHandle::FlagTrackDelivery);
 
@@ -717,7 +718,7 @@ private:
         Result.set_last_key_inclusive(shardResponse.GetLastKeyInclusive());
         Result.set_eos(shardResponse.GetLastKey().empty()); // TODO: ??
 
-        LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Got reply from shard: " << shardResponse.GetTabletID()
+        LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, "Got reply from shard: " << shardResponse.GetTabletID()
                     << " lastKey: " << PrintKey(shardResponse.GetLastKey(), *AppData(ctx)->TypeRegistry)
                     << " inclusive: " << shardResponse.GetLastKeyInclusive());
 
@@ -743,7 +744,7 @@ private:
         Result.set_last_key_inclusive(shardResponse.GetLastKeyInclusive());
         Result.set_eos(shardResponse.GetLastKey().empty()); // TODO: ??
 
-        LOG_DEBUG_S(ctx, NKikimrServices::MSGBUS_REQUEST, "Got reply from shard: " << shardResponse.GetTabletID()
+        LOG_DEBUG_S(ctx, NKikimrServices::RPC_REQUEST, "Got reply from shard: " << shardResponse.GetTabletID()
                     << " lastKey: " << PrintKey(shardResponse.GetLastKey(), *AppData(ctx)->TypeRegistry)
                     << " inclusive: " << shardResponse.GetLastKeyInclusive());
 

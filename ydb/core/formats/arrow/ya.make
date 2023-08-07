@@ -14,6 +14,7 @@ PEERDIR(
     ydb/library/arrow_kernels
     ydb/library/binary_json
     ydb/library/dynumber
+    ydb/library/services
 )
 
 IF (OS_WINDOWS)
@@ -34,19 +35,21 @@ YQL_LAST_ABI_VERSION()
 
 SRCS(
     arrow_batch_builder.cpp
-    arrow_helpers.cpp
     arrow_filter.cpp
-    converter.h
+    arrow_helpers.cpp
     converter.cpp
+    converter.h
     custom_registry.cpp
     input_stream.h
     merging_sorted_input_stream.cpp
     merging_sorted_input_stream.h
     one_batch_input_stream.h
-    sort_cursor.h
+    permutations.cpp
     program.cpp
-    ssa_program_optimizer.cpp
+    replace_key.cpp
     size_calcer.cpp
+    sort_cursor.h
+    ssa_program_optimizer.cpp
 )
 
 END()

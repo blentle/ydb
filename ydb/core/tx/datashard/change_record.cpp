@@ -8,7 +8,7 @@
 #include <library/cpp/string_utils/base64/base64.h>
 
 #include <ydb/core/protos/change_exchange.pb.h>
-#include <ydb/core/util/yverify_stream.h>
+#include <ydb/library/yverify_stream/yverify_stream.h>
 #include <ydb/library/binary_json/read.h>
 
 #include <util/stream/str.h>
@@ -33,11 +33,14 @@ void TChangeRecord::SerializeToProto(NKikimrChangeExchange::TChangeRecord& recor
             Y_VERIFY(record.MutableCdcDataChange()->ParseFromArray(Body.data(), Body.size()));
             break;
         }
+        case EKind::CdcHeartbeat: {
+            break;
+        }
     }
 }
 
 static auto ParseBody(const TString& protoBody) {
-    NKikimrChangeExchange::TChangeRecord::TDataChange body;
+    NKikimrChangeExchange::TDataChange body;
     Y_VERIFY(body.ParseFromArray(protoBody.data(), protoBody.size()));
     return body;
 }
@@ -115,7 +118,7 @@ static NJson::TJsonValue ToJson(const TCell& cell, NScheme::TTypeInfo type) {
 }
 
 static void SerializeJsonKey(TUserTable::TCPtr schema, NJson::TJsonValue& key,
-    const NKikimrChangeExchange::TChangeRecord::TDataChange::TSerializedCells& in)
+    const NKikimrChangeExchange::TDataChange::TSerializedCells& in)
 {
     Y_VERIFY(in.TagsSize() == schema->KeyColumnIds.size());
     for (size_t i = 0; i < schema->KeyColumnIds.size(); ++i) {
@@ -134,7 +137,7 @@ static void SerializeJsonKey(TUserTable::TCPtr schema, NJson::TJsonValue& key,
 }
 
 static void SerializeJsonValue(TUserTable::TCPtr schema, NJson::TJsonValue& value,
-    const NKikimrChangeExchange::TChangeRecord::TDataChange::TSerializedCells& in)
+    const NKikimrChangeExchange::TDataChange::TSerializedCells& in)
 {
     TSerializedCellVec cells;
     Y_VERIFY(TSerializedCellVec::TryParse(in.GetData(), cells));
@@ -152,7 +155,17 @@ static void SerializeJsonValue(TUserTable::TCPtr schema, NJson::TJsonValue& valu
     }
 }
 
+static void SerializeVirtualTimestamp(NJson::TJsonValue& value, std::initializer_list<ui64> vt) {
+    for (auto v : vt) {
+        value.AppendValue(v);
+    }
+}
+
 void TChangeRecord::SerializeToYdbJson(NJson::TJsonValue& json, bool virtualTimestamps) const {
+    if (Kind == EKind::CdcHeartbeat) {
+        return SerializeVirtualTimestamp(json["resolved"], {Step, TxId});
+    }
+
     Y_VERIFY(Kind == EKind::CdcDataChange);
     Y_VERIFY(Schema);
 
@@ -169,19 +182,19 @@ void TChangeRecord::SerializeToYdbJson(NJson::TJsonValue& json, bool virtualTime
 
     const auto hasAnyImage = body.HasOldImage() || body.HasNewImage();
     switch (body.GetRowOperationCase()) {
-        case NKikimrChangeExchange::TChangeRecord::TDataChange::kUpsert:
+        case NKikimrChangeExchange::TDataChange::kUpsert:
             json["update"].SetType(NJson::JSON_MAP);
             if (!hasAnyImage) {
                 SerializeJsonValue(Schema, json["update"], body.GetUpsert());
             }
             break;
-        case NKikimrChangeExchange::TChangeRecord::TDataChange::kReset:
+        case NKikimrChangeExchange::TDataChange::kReset:
             json["reset"].SetType(NJson::JSON_MAP);
             if (!hasAnyImage) {
                 SerializeJsonValue(Schema, json["reset"], body.GetReset());
             }
             break;
-        case NKikimrChangeExchange::TChangeRecord::TDataChange::kErase:
+        case NKikimrChangeExchange::TDataChange::kErase:
             json["erase"].SetType(NJson::JSON_MAP);
             break;
         default:
@@ -189,9 +202,7 @@ void TChangeRecord::SerializeToYdbJson(NJson::TJsonValue& json, bool virtualTime
     }
 
     if (virtualTimestamps) {
-        for (auto v : {Step, TxId}) {
-            json["ts"].AppendValue(v);
-        }
+        SerializeVirtualTimestamp(json["ts"], {Step, TxId});
     }
 }
 
@@ -203,7 +214,7 @@ static void ExtendJson(NJson::TJsonValue& value, const NJson::TJsonValue& ext) {
 }
 
 static void ToAttributeValues(TUserTable::TCPtr schema, NJson::TJsonValue& value,
-    const NKikimrChangeExchange::TChangeRecord::TDataChange::TSerializedCells& in)
+    const NKikimrChangeExchange::TDataChange::TSerializedCells& in)
 {
     TSerializedCellVec cells;
     Y_VERIFY(TSerializedCellVec::TryParse(in.GetData(), cells));
@@ -315,15 +326,15 @@ void TChangeRecord::SerializeToDynamoDBStreamsJson(NJson::TJsonValue& json, cons
     }
 
     switch (body.GetRowOperationCase()) {
-        case NKikimrChangeExchange::TChangeRecord::TDataChange::kUpsert:
-        case NKikimrChangeExchange::TChangeRecord::TDataChange::kReset:
+        case NKikimrChangeExchange::TDataChange::kUpsert:
+        case NKikimrChangeExchange::TDataChange::kReset:
             if (newAndOldImages) {
                 json["eventName"] = body.HasOldImage() ? "MODIFY" : "INSERT";
             } else {
                 json["eventName"] = "MODIFY";
             }
             break;
-        case NKikimrChangeExchange::TChangeRecord::TDataChange::kErase:
+        case NKikimrChangeExchange::TDataChange::kErase:
             json["eventName"] = "REMOVE";
             break;
         default:
@@ -346,6 +357,10 @@ TConstArrayRef<TCell> TChangeRecord::GetKey() const {
 
             Key.ConstructInPlace(key.GetCells());
             break;
+        }
+
+        case EKind::CdcHeartbeat: {
+            Y_FAIL("Not supported");
         }
     }
 
@@ -375,6 +390,10 @@ TString TChangeRecord::GetPartitionKey() const {
             break;
         }
 
+        case EKind::CdcHeartbeat: {
+            return {}; // not used
+        }
+
         case EKind::AsyncIndex: {
             Y_FAIL("Not supported");
         }
@@ -388,6 +407,15 @@ TInstant TChangeRecord::GetApproximateCreationDateTime() const {
     return GetGroup()
         ? TInstant::FromValue(GetGroup())
         : TInstant::MilliSeconds(GetStep());
+}
+
+bool TChangeRecord::IsBroadcast() const {
+    switch (Kind) {
+        case EKind::CdcHeartbeat:
+            return true;
+        default:
+            return false;
+    }
 }
 
 TString TChangeRecord::ToString() const {

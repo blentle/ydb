@@ -37,6 +37,7 @@ namespace {
                 }
             }
 
+            Alloc_.Ref().UseRefLocking = true;
             Pattern_ = NKikimr::NMiniKQL::MakeComputationPattern(Explorer_, Pgm_, entryPoints, opts);
             RandomProvider_ = CreateDefaultRandomProvider();
             TimeProvider_ = CreateDefaultTimeProvider();
@@ -81,7 +82,7 @@ std::vector<std::shared_ptr<const arrow::compute::ScalarKernel>> LoadKernels(con
     std::vector<std::shared_ptr<const arrow::compute::ScalarKernel>> ret(loader->GetKernelsCount());
     auto deleter = [loader](const arrow::compute::ScalarKernel*) {};
     for (ui32 i = 0; i < ret.size(); ++i) {
-        ret[i] = std::shared_ptr<const arrow::compute::ScalarKernel>(loader->GetKernel(i), deleter);
+        ret[i] = std::shared_ptr<const arrow::compute::ScalarKernel>(loader->GetKernel(ret.size() - 1 - i), deleter);
     }
 
     return ret;
