@@ -110,6 +110,7 @@
 #include <ydb/core/scheme/scheme_type_registry.h>
 
 #include <ydb/core/security/ticket_parser.h>
+#include <ydb/core/security/ldap_auth_provider.h>
 
 #include <ydb/core/sys_view/processor/processor.h>
 #include <ydb/core/sys_view/service/sysview_service.h>
@@ -624,31 +625,12 @@ void TBasicServicesInitializer::InitializeServices(NActors::TActorSystemSetup* s
         const TActorId resolverId = NDnsResolver::MakeDnsResolverActorId();
         const TActorId nameserviceId = GetNameserviceActorId();
 
-        ui32 numNodes = 0;
+        TIntrusivePtr<TTableNameserverSetup> table = NNodeBroker::BuildNameserverTable(nsConfig);
+
+        const ui32 numNodes = table->StaticNodeTable.size();
         TSet<TString> dataCenters;
-
-        TIntrusivePtr<TTableNameserverSetup> table(new TTableNameserverSetup());
-        for (const auto &node : nsConfig.GetNode()) {
-            const ui32 nodeId = node.GetNodeId();
-            const TString host = node.HasHost() ? node.GetHost() : TString();
-            const ui32 port = node.GetPort();
-
-            const TString resolveHost = node.HasInterconnectHost() ?
-                node.GetInterconnectHost() : host;
-
-            // Use ip address only when dns host not specified
-            const TString addr = resolveHost ? TString() : node.GetAddress();
-
-            TNodeLocation location;
-            if (node.HasWalleLocation()) {
-                location = TNodeLocation(node.GetWalleLocation());
-            } else if (node.HasLocation()) {
-                location = TNodeLocation(node.GetLocation());
-            }
-            table->StaticNodeTable[nodeId] = TTableNameserverSetup::TNodeInfo(addr, host, resolveHost, port, location);
-
-            ++numNodes;
-            dataCenters.insert(location.GetDataCenterId());
+        for (const auto& [nodeId, info] : table->StaticNodeTable) {
+            dataCenters.insert(info.Location.GetDataCenterId());
         }
 
         NDnsResolver::TOnDemandDnsResolverOptions resolverOptions;
@@ -933,7 +915,7 @@ void TBSNodeWardenInitializer::InitializeServices(NActors::TActorSystemSetup* se
         const auto& bsc = Config.GetBlobStorageConfig();
         appData->StaticBlobStorageConfig->MergeFrom(bsc.GetServiceSet());
         nodeWardenConfig->FeatureFlags = Config.GetFeatureFlags();
-        nodeWardenConfig->ServiceSet.MergeFrom(bsc.GetServiceSet());
+        nodeWardenConfig->BlobStorageConfig.CopyFrom(bsc);
         if (Config.HasVDiskConfig()) {
             nodeWardenConfig->AllVDiskKinds->Merge(Config.GetVDiskConfig());
         }
@@ -1608,6 +1590,13 @@ TSecurityServicesInitializer::TSecurityServicesInitializer(const TKikimrRunConfi
 
 void TSecurityServicesInitializer::InitializeServices(NActors::TActorSystemSetup* setup,
                                                       const NKikimr::TAppData* appData) {
+    const auto& authConfig = appData->AuthConfig;
+    if (!IsServiceInitialized(setup, MakeLdapAuthProviderID()) && authConfig.HasLdapAuthentication()) {
+        IActor* ldapAuthProvider = CreateLdapAuthProvider(authConfig.GetLdapAuthentication());
+        if (ldapAuthProvider) {
+            setup->LocalServices.push_back(std::make_pair<TActorId, TActorSetupCmd>(MakeLdapAuthProviderID(), TActorSetupCmd(ldapAuthProvider, TMailboxType::HTSwap, appData->UserPoolId)));
+        }
+    }
     if (!IsServiceInitialized(setup, MakeTicketParserID())) {
         IActor* ticketParser = nullptr;
         if (Factories && Factories->CreateTicketParser) {
@@ -2115,7 +2104,7 @@ void TKqpServiceInitializer::InitializeServices(NActors::TActorSystemSetup* setu
             new NYql::NLog::TTlsLogBackend(new TNullLogBackend())));
 
         auto proxy = NKqp::CreateKqpProxyService(Config.GetLogConfig(), Config.GetTableServiceConfig(), Config.GetAuthConfig().GetTokenAccessorConfig(),
-            std::move(settings), Factories->QueryReplayBackendFactory, std::move(kqpProxySharedResources));
+            Config.GetQueryServiceConfig(), std::move(settings), Factories->QueryReplayBackendFactory, std::move(kqpProxySharedResources));
         setup->LocalServices.push_back(std::make_pair(
             NKqp::MakeKqpProxyID(NodeId),
             TActorSetupCmd(proxy, TMailboxType::HTSwap, appData->UserPoolId)));
@@ -2658,7 +2647,7 @@ TIcNodeCacheServiceInitializer::TIcNodeCacheServiceInitializer(const TKikimrRunC
 void TIcNodeCacheServiceInitializer::InitializeServices(NActors::TActorSystemSetup* setup, const NKikimr::TAppData* appData) {
     if (appData->FeatureFlags.GetEnableIcNodeCache()) {
         setup->LocalServices.emplace_back(
-            TActorId(),
+            NIcNodeCache::CreateICNodesInfoCacheServiceId(),
             TActorSetupCmd(NIcNodeCache::CreateICNodesInfoCacheService(appData->Counters),
                            TMailboxType::HTSwap, appData->UserPoolId)
         );

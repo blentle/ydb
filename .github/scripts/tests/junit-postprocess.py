@@ -1,57 +1,54 @@
 #!/usr/bin/env python3
-import os
-import glob
 import argparse
+import glob
+import os
+import re
 import xml.etree.ElementTree as ET
-from mute_utils import mute_target, update_suite_info, MutedTestCheck
-from junit_utils import add_junit_property
+from mute_utils import MuteTestCheck, mute_target, recalc_suite_info
 
 
-def case_iterator(root):
-    for case in root.findall("testcase"):
-        cls, method = case.attrib["classname"], case.attrib["name"]
-        yield case, cls, method
+shard_suffix_re = re.compile(r"-\d+$")
 
 
-def attach_filename(testcase, filename):
-    shardname = os.path.splitext(filename)[0]
-    add_junit_property(testcase, "shard", shardname)
+def update_testname(fn, testcase):
+    shardname = os.path.splitext(os.path.basename(fn))[0]
+    shardname = shard_suffix_re.sub("", shardname)
+
+    clsname = testcase.get("classname")
+    tstname = testcase.get("name")
+    testcase.set("classname", shardname)
+
+    testcase.set("name", f"{clsname}::{tstname}")
+    testcase.set("id", f"{shardname}_{clsname}_{tstname}")
+
+    return f"{shardname}/{clsname}::{tstname}"
 
 
-def postprocess_junit(is_mute_test, folder, dry_run):
-    for fn in glob.glob(os.path.join(folder, "*.xml")):
+def postprocess_yunit(fn, mute_check: MuteTestCheck, dry_run):
+    try:
         tree = ET.parse(fn)
-        root = tree.getroot()
-        total_err = total_fail = 0
+    except ET.ParseError as e:
+        print(f"Unable to parse {fn}: {e}")
+        return
 
-        for suite in root.findall("testsuite"):
-            fail_cnt = error_cnt = 0
+    root = tree.getroot()
 
-            for case, cls, method in case_iterator(suite):
-                attach_filename(case, os.path.basename(fn))
+    for testsuite in root.findall("testsuite"):
+        need_recalc = False
+        for testcase in testsuite.findall("testcase"):
+            new_name = update_testname(fn, testcase)
 
-                if is_mute_test(cls, method):
-                    if mute_target(case):
-                        print(f"mute {cls}::{method}")
-                        fail_cnt += 1
-                    elif mute_target(case, "error"):
-                        print(f"mute error {cls}::{method}")
-                        error_cnt += 1
+            if mute_check(new_name) and mute_target(testcase):
+                print(f"mute {new_name}")
+                need_recalc = True
 
-            if fail_cnt or error_cnt:
-                update_suite_info(suite, n_remove_failures=fail_cnt, n_remove_errors=error_cnt,
-                                  n_skipped=fail_cnt + error_cnt)
-                total_err += error_cnt
-                total_fail += fail_cnt
+        if need_recalc:
+            recalc_suite_info(testsuite)
 
-        if total_fail or total_err:
-            update_suite_info(root, n_remove_errors=total_err, n_remove_failures=total_fail,
-                              n_skipped=total_err + total_fail)
+    print(f"{'(dry-run) ' if dry_run else ''}save {fn}")
 
-        print(f"{'(dry-run) ' if dry_run else ''}patch {fn}")
-
-        if not dry_run:
-            tree.write(fn, xml_declaration=True, encoding="UTF-8")
+    if not dry_run:
+        tree.write(fn, xml_declaration=True, encoding="UTF-8")
 
 
 def main():
@@ -59,20 +56,17 @@ def main():
     parser.add_argument("--filter-file", required=True)
     parser.add_argument("--dry-run", action="store_true", default=False)
     parser.add_argument("yunit_path")
+
     args = parser.parse_args()
 
     if not os.path.isdir(args.yunit_path):
         print(f"{args.yunit_path} is not a directory, exit")
         raise SystemExit(-1)
 
-    # FIXME: add gtest filter file ?
-    is_mute_test = MutedTestCheck(args.filter_file)
+    mute_check = MuteTestCheck(args.filter_file)
 
-    if not is_mute_test.has_rules:
-        print("nothing to mute")
-        return
-
-    postprocess_junit(is_mute_test, args.yunit_path, args.dry_run)
+    for fn in glob.glob(os.path.join(args.yunit_path, "*.xml")):
+        postprocess_yunit(fn, mute_check, args.dry_run)
 
 
 if __name__ == "__main__":

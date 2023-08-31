@@ -168,12 +168,23 @@ TStreamLoadContext::TStreamLoadContext(IZeroCopyInput* input)
 
 TEntityStreamSaveContext::TEntityStreamSaveContext(
     IZeroCopyOutput* output,
-    TEntityStreamSaveContext* parentContext)
+    const TEntityStreamSaveContext* parentContext)
     : TStreamSaveContext(
         output,
         parentContext->GetVersion())
     , ParentContext_(parentContext)
 { }
+
+////////////////////////////////////////////////////////////////////////////////
+
+TEntityStreamLoadContext::TEntityStreamLoadContext(
+    IZeroCopyInput* input,
+    const TEntityStreamLoadContext* parentContext)
+    : TStreamLoadContext(input)
+    , ParentContext_(parentContext)
+{
+    SetVersion(ParentContext_->GetVersion());
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 

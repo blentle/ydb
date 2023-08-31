@@ -69,12 +69,12 @@ public:
             Y_ASSERT(false);
             LOG_S_WARN("TEvReadBlobRangeResult cannot get blob "
                 << blobId.ToString() << " status " << NKikimrProto::EReplyStatus_Name(event.Status) << " at tablet "
-                << TabletId << " (compaction)");
+                << TabletId << " (" << TxEvent->IndexChanges->TypeString() << ")");
             TxEvent->SetPutStatus(NKikimrProto::ERROR);
         } else {
             LOG_S_ERROR("TEvReadBlobRangeResult cannot get blob "
                         << blobId.ToString() << " status " << NKikimrProto::EReplyStatus_Name(event.Status) << " at tablet "
-                        << TabletId << " (compaction)");
+                        << TabletId << " (" << TxEvent->IndexChanges->TypeString() << ")");
             if (event.Status == NKikimrProto::UNKNOWN) {
                 TxEvent->SetPutStatus(NKikimrProto::ERROR);
             } else {
@@ -131,12 +131,14 @@ private:
     private:
         std::unique_ptr<TEvPrivate::TEvWriteIndex> TxEvent;
         const TIndexationCounters Counters;
+        const ui64 TabletId;
     protected:
         virtual bool DoExecute() override {
+            NActors::TLogContextGuard g(NActors::TLogContextBuilder::Build(NKikimrServices::TX_COLUMNSHARD)("tablet_id", TabletId));
             auto guard = TxEvent->PutResult->StartCpuGuard();
 
             NOlap::TConstructionContext context(TxEvent->IndexInfo, Counters);
-            TxEvent->Blobs = std::move(TxEvent->IndexChanges->ConstructBlobs(context).DetachResult());
+            Y_VERIFY(TxEvent->IndexChanges->ConstructBlobs(context).Ok());
             return true;
         }
     public:
@@ -149,9 +151,10 @@ private:
             return std::move(TxEvent);
         }
 
-        TConveyorTask(std::unique_ptr<TEvPrivate::TEvWriteIndex>&& txEvent, const TIndexationCounters& counters)
+        TConveyorTask(std::unique_ptr<TEvPrivate::TEvWriteIndex>&& txEvent, const TIndexationCounters& counters, const ui64 tabletId)
             : TxEvent(std::move(txEvent))
             , Counters(counters)
+            , TabletId(tabletId)
         {
             Y_VERIFY(TxEvent);
         }
@@ -167,7 +170,7 @@ private:
         LOG_S_DEBUG("Granules compaction started at tablet " << TabletId);
         TxEvent->IndexChanges->SetBlobs(std::move(Blobs));
         {
-            std::shared_ptr<TConveyorTask> task = std::make_shared<TConveyorTask>(std::move(TxEvent), GetCurrentCounters());
+            std::shared_ptr<TConveyorTask> task = std::make_shared<TConveyorTask>(std::move(TxEvent), GetCurrentCounters(), TabletId);
             NConveyor::TCompServiceOperator::SendTaskToExecute(task);
         }
     }
@@ -181,8 +184,8 @@ private:
             txEvent->SetPutStatus(NKikimrProto::ERROR);
             Send(Parent, txEvent.release());
         } else {
-            ACFL_DEBUG("event", "task_finished")("new_blobs", txEvent->Blobs.size());
-            if (txEvent->Blobs.empty()) {
+            ACFL_DEBUG("event", "task_finished")("new_blobs", txEvent->IndexChanges->GetWritePortionsCount());
+            if (!txEvent->IndexChanges->GetWritePortionsCount()) {
                 txEvent->SetPutStatus(NKikimrProto::OK); // nothing to write, commit
             }
             txEvent->Duration = TAppData::TimeProvider->Now() - LastActivationTime;

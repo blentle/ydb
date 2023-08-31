@@ -3,6 +3,7 @@ LIBRARY()
 SRCS(
     pinger.cpp
     run_actor_params.cpp
+    utils.cpp
 )
 
 PEERDIR(
@@ -16,3 +17,7 @@ PEERDIR(
 YQL_LAST_ABI_VERSION()
 
 END()
+
+RECURSE_FOR_TESTS(
+    ut
+)

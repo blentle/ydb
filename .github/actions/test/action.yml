@@ -42,25 +42,26 @@ runs:
     id: init
     shell: bash
     run: |
-      mkdir -p artifacts tmp test_reports
-      rm -rf artifacts/* tmp/* test_reports/*
+      rm -rf artifacts tmp test_reports
+      mkdir -p artifacts tmp/pytest test_reports/pytest
       echo "WORKDIR=$(pwd)" >> $GITHUB_ENV
       echo "TESTREPDIR=$(pwd)/test_reports" >> $GITHUB_ENV
-      echo "PYTESTREPDIR=$(pwd)/ydb/tests/functional/test-results/xml" >> $GITHUB_ENV
+      echo "TMPDIR=$(pwd)/tmp" >> $GITHUB_ENV
+      echo "PYTESTREPDIR=$(pwd)/test_reports/pytest/" >> $GITHUB_ENV
       echo "TESTMO_TOKEN=${{inputs.testman_token}}" >> $GITHUB_ENV
       echo "TESTMO_URL=${{inputs.testman_url}}" >> $GITHUB_ENV
       echo "ARTIFACTS_DIR=$(pwd)/artifacts" >> $GITHUB_ENV
+      echo "SUMMARY_LINKS=$(mktemp)" >> $GITHUB_ENV
       echo "logfilename=${{inputs.log_suffix}}-ctest-stdout.gz" >> $GITHUB_OUTPUT
       echo "testfilterfile=$(pwd)/.github/config/muted_test.txt" >> $GITHUB_OUTPUT
       echo "testshardfilterfile=$(pwd)/.github/config/muted_shard.txt" >> $GITHUB_OUTPUT
       echo "functestfilterfile=$(pwd)/.github/config/muted_functest.txt" >> $GITHUB_OUTPUT
-      echo "logurlprefix=${{inputs.aws_endpoint}}/${{inputs.aws_bucket}}/${{ github.repository }}/${{github.workflow}}/${{github.run_id}}" >> $GITHUB_OUTPUT
-      echo "pytest-logfilename=${{inputs.log_suffix}}-pytest-stdout.gz" >> $GITHUB_OUTPUT
+      echo "pytest-logfilename=${{inputs.log_suffix}}-pytest-stdout.log" >> $GITHUB_OUTPUT
 
   - name: configure s3cmd
     shell: bash
     run: |
-      cat <<EOF > $WORKDIR/tmp/s3cfg
+      cat <<EOF > $TMPDIR/s3cfg
       [default]
       access_key = ${aws_key_id}
       secret_key = ${aws_secret_access_key}
@@ -68,8 +69,9 @@ runs:
       host_base = storage.yandexcloud.net
       host_bucket = %(bucket)s.storage.yandexcloud.net
       EOF
-      echo "S3CMD_CONFIG=$WORKDIR/tmp/s3cfg" >> $GITHUB_ENV
-      echo "S3_BUCKET_PATH=s3://${{ inputs.aws_bucket }}/${{ github.repository }}/${{github.workflow}}/${{ github.run_id }}/" >> $GITHUB_ENV
+      echo "S3CMD_CONFIG=$TMPDIR/s3cfg" >> $GITHUB_ENV
+      echo "S3_BUCKET_PATH=s3://${{ inputs.aws_bucket }}/${{ github.repository }}/${{github.workflow}}/${{ github.run_id }}/${{inputs.log_suffix}}/" >> $GITHUB_ENV
+      echo "S3_URL_PREFIX=${{inputs.aws_endpoint}}/${{inputs.aws_bucket}}/${{ github.repository }}/${{github.workflow}}/${{github.run_id}}/${{inputs.log_suffix}}" >> $GITHUB_ENV
     env:
       aws_key_id: ${{inputs.AWS_KEY_ID }}
       aws_secret_access_key: ${{inputs.AWS_KEY_VALUE}}
@@ -90,6 +92,8 @@ runs:
     run: |
       RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
       BRANCH_TAG="$GITHUB_REF_NAME"
+      TESTMO_SOURCE="${{ inputs.log_suffix }}"
+      TESTMO_SOURCE="${TESTMO_SOURCE/_/-}"
 
       case $GITHUB_EVENT_NAME in
         workflow_dispatch)
@@ -114,14 +118,14 @@ runs:
       testmo automation:resources:add-link --name build --url $RUN_URL --resources testmo.json
       testmo automation:resources:add-field --name git-sha --type string --value ${GITHUB_SHA:0:7} --resources testmo.json
       testmo automation:run:create --instance "$TESTMO_URL" --project-id ${{inputs.testman_project_id}} --name "$TESTMO_RUN_NAME" \
-        --source "${{inputs.log_suffix}}" --resources testmo.json \
+        --source "$TESTMO_SOURCE" --resources testmo.json \
         --tags "$BRANCH_TAG" --tags "$EXTRA_TAG"  | \
         echo "runid=$(cat)" >> $GITHUB_OUTPUT
 
   - name: Print test history link
     shell: bash
     run: |
-      echo "[Test history](${TESTMO_URL}/automation/runs/view/${{steps.th.outputs.runid}})" >> $GITHUB_STEP_SUMMARY
+      echo "10 [Test history](${TESTMO_URL}/automation/runs/view/${{steps.th.outputs.runid}})" >> $SUMMARY_LINKS
 
   - name: Run unit tests
     id: ctest
@@ -130,11 +134,11 @@ runs:
     run: |
       cd $WORKDIR/../build/ydb
 
-      echo "[Stdout unittest/ctest log (gzip archive)](${{steps.init.outputs.logurlprefix}}/${{steps.init.outputs.logfilename}})" >> $GITHUB_STEP_SUMMARY
+      echo "20 [Unittest log]($S3_URL_PREFIX/${{steps.init.outputs.logfilename}})" >> $SUMMARY_LINKS
 
       # Sed removes coloring from the output
       
-      TMPDIR=$WORKDIR/tmp GTEST_OUTPUT="xml:$TESTREPDIR/unittests/" Y_UNITTEST_OUTPUT="xml:$TESTREPDIR/unittests/" \
+      GTEST_OUTPUT="xml:$TESTREPDIR/unittests/" Y_UNITTEST_OUTPUT="xml:$TESTREPDIR/unittests/" \
         ctest -j28 --timeout 1200 --force-new-ctest-process --output-on-failure \
               --output-junit $TESTREPDIR/suites/ctest_report.xml \
               -L '${{inputs.test_label_regexp}}' -E "${CTEST_SKIP_SHARDS:-}" | \
@@ -154,9 +158,7 @@ runs:
     if: inputs.run_unit_tests == 'true'
     shell: bash
     run: |
-      tar -C $TESTREPDIR/ -czf $ARTIFACTS_DIR/reports.tar.gz .
-      ls -la $ARTIFACTS_DIR/reports.tar.gz
-      echo "[Unittest/CTest XML reports archive](${{steps.init.outputs.logurlprefix}}/reports.tar.gz)" >> $GITHUB_STEP_SUMMARY
+      tar -C $TESTREPDIR/ -czf $ARTIFACTS_DIR/xml_orig.tar.gz .
 
   - name: postprocess xml reports
     if: inputs.run_unit_tests == 'true'
@@ -167,9 +169,7 @@ runs:
       mkdir $ARTIFACTS_DIR/logs/
 
       .github/scripts/tests/attach-logs.py \
-        --url-prefix ${{steps.init.outputs.logurlprefix}}/logs/ \
-        --filter-shard-file ${{steps.init.outputs.testshardfilterfile}} \
-        --filter-test-file ${{steps.init.outputs.testfilterfile}} \
+        --url-prefix $S3_URL_PREFIX/logs/ \
         --ctest-report $TESTREPDIR/suites/ctest_report.xml \
         --junit-reports-path $TESTREPDIR/unittests/ \
         --decompress \
@@ -194,15 +194,11 @@ runs:
         $ARTIFACTS_DIR/${{steps.init.outputs.logfilename}} \
         $TESTREPDIR/suites/ctest_report.xml
 
+      tar -C $TESTREPDIR/ -czf $ARTIFACTS_DIR/reports.tar.gz .
+
+      echo "90 [XML reports archive]($S3_URL_PREFIX/reports.tar.gz)" >> $SUMMARY_LINKS
+
       echo "::endgroup::"
-
-  - name: write unittests summary
-    if: inputs.run_unit_tests == 'true'
-    shell: bash
-    run: |
-      .github/scripts/tests/generate-summary.py -t "#### CTest run test shard failures" $TESTREPDIR/suites/ctest_report.xml
-      .github/scripts/tests/generate-summary.py -t "#### Unittest failures" $TESTREPDIR/unittests/
-
 
   - name: sync test results to s3
     if: always() && inputs.run_unit_tests == 'true'
@@ -232,45 +228,59 @@ runs:
       export source_root=$WORKDIR
       export build_root=$WORKDIR/../build/
 
-      echo "[Stdout pytest log (gzip archive)](${{steps.init.outputs.logurlprefix}}/${{steps.init.outputs.pytest-logfilename}})" >> $GITHUB_STEP_SUMMARY
-      cd $WORKDIR/ydb/tests/functional/
-      bad_suites=$(grep -Eo 'ignore=[a-zA-Z_-]*' pytest.ini | sed -e 's/ignore=//g')
-      suites=""
-      for suite in $(echo */ | sed -e 's/\///g'); do
-        if [[ $(echo "$bad_suites" | grep -F -e $suite -) == '' ]]; then
-            suites+=$suite
-            suites+=$'\n'
-        fi
-      done
-      if [[ "${{inputs.test_label_regexp}}" != '' ]]; then
-        suites="${{inputs.test_label_regexp}}"
-      fi
+      echo "30 [Functional test log]($S3_URL_PREFIX/${{steps.init.outputs.pytest-logfilename}})" >> $SUMMARY_LINKS
       source $WORKDIR/ydb/tests/oss/launch/prepare.sh
-      echo -n "$suites" | parallel -j28 "pytest -o junit_logging=log -o junit_log_passing_tests=False \
-        -v --junit-xml=$PYTESTREPDIR/{}.xml {}" | \
-        sed -e 's/\x1b\[[0-9;]*m//g' | \
-        tee >(gzip --stdout > $ARTIFACTS_DIR/${{steps.init.outputs.pytest-logfilename}}) | \
-        grep -E '(FAILED|ERROR)\s*\[.*\]' | \
-        tee $WORKDIR/pytest-short.log
+      
+      rm -rf $ARTIFACTS_DIR/pytest/
+      mkdir $ARTIFACTS_DIR/pytest/
+      
+      cd $WORKDIR/ydb/tests/functional/
+      
+      pytest \
+        -p xdist -n 24 --dist worksteal \
+        --timeout_method signal \
+        -o junit_logging=log -o junit_log_passing_tests=False --junit-xml=$PYTESTREPDIR/pytest.xml \
+        -ra --tb=no --show-capture=no \
+        --github-repo $GITHUB_REPOSITORY --github-ref $GITHUB_SHA \
+        --source-root $source_root \
+        --build-root $build_root \
+        --output-dir $TMPDIR/pytest/ \
+        . | tee $ARTIFACTS_DIR/${{steps.init.outputs.pytest-logfilename}} || {
+          RC=$?
+          if [ $RC == 1 ]; then
+            echo "pytest: tests were collected and run but some of the tests failed"
+          else
+            exit $RC
+          fi;
+        }
+
+#        --artifacts-dir $ARTIFACTS_DIR/pytest/ \
+#        --artifacts-url $S3_URL_PREFIX/pytest/ \
 
   - name: postprocess functional test reports
     if: always() && inputs.run_functional_tests == 'true'
     shell: bash
     run: |
       echo "::group::junit-postprocess"
+  
+      # append orig pytest reports
+      if [ -f "$ARTIFACTS_DIR/xml_orig.tar.gz" ]; then
+        echo "add pytest to xml_orig.tar.gz"
+        gzip -d $ARTIFACTS_DIR/xml_orig.tar.gz
+        tar -C $TESTREPDIR/ -rvf $ARTIFACTS_DIR/xml_orig.tar pytest
+        gzip -v $ARTIFACTS_DIR/xml_orig.tar
+      fi
       
-      .github/scripts/tests/junit-postprocess.py \
+      .github/scripts/tests/pytest-postprocess.py \
         --filter-file ${{ steps.init.outputs.functestfilterfile }} \
         $PYTESTREPDIR/
 
+      # make archive again with pytest reports
+      tar -C $TESTREPDIR/ -czf $ARTIFACTS_DIR/reports.tar.gz .
+      ls -la $ARTIFACTS_DIR/reports.tar.gz
+
       echo "::endgroup::"
 
-
-  - name: write functional tests summary
-    if: always() && inputs.run_functional_tests == 'true'
-    shell: bash
-    run: |
-      .github/scripts/tests/generate-summary.py -t "#### Functional tests failures" $PYTESTREPDIR
 
   - name: Functional tests history upload results
     if: always() && inputs.run_functional_tests == 'true' && inputs.testman_token
@@ -279,7 +289,7 @@ runs:
       testmo automation:run:submit-thread \
         --instance "$TESTMO_URL" --run-id ${{steps.th.outputs.runid}} \
         --results "$PYTESTREPDIR/*.xml" \
-        -- cat $WORKDIR/pytest-short.log
+        -- cat $ARTIFACTS_DIR/${{steps.init.outputs.pytest-logfilename}}
 
   - name: Test history run complete
     if: always() && inputs.testman_token
@@ -287,8 +297,24 @@ runs:
     run: |
       testmo automation:run:complete --instance "$TESTMO_URL" --run-id ${{steps.th.outputs.runid}}
 
+  - name: write tests summary
+    if: always()
+    shell: bash
+    run: |
+      
+      cat $SUMMARY_LINKS | python3 -c 'import sys; print(" | ".join([v for _, v in sorted([l.strip().split(" ", 1) for l in sys.stdin], key=lambda a: (int(a[0]), a))]))' >> $GITHUB_STEP_SUMMARY
+      
+      mkdir $ARTIFACTS_DIR/summary/
+      
+      .github/scripts/tests/generate-summary.py \
+        --summary-out-path $ARTIFACTS_DIR/summary/ \
+        --summary-url-prefix $S3_URL_PREFIX/summary/ \
+        "Unittests" unittest.html $TESTREPDIR/unittests \
+        "Unittest binary runs" ctest.html $TESTREPDIR/suites \
+        "Functional tests" functional.html $PYTESTREPDIR
+
   - name: sync test results to s3
-    if: always() && inputs.run_functional_tests == 'true'
+    if: always()
     shell: bash
     run: |
       echo "::group::s3-sync"
@@ -298,4 +324,4 @@ runs:
   - name: finish
     shell: bash
     run: |
-      .github/scripts/tests/fail-checker.py $TESTREPDIR/unittests/ $TESTREPDIR/suites/
+      .github/scripts/tests/fail-checker.py $TESTREPDIR/unittests/ $TESTREPDIR/suites/ $PYTESTREPDIR/

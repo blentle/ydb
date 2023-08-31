@@ -21,8 +21,8 @@ THashMap<NKikimr::NOlap::TUnifiedBlobId, std::vector<NKikimr::NOlap::TBlobRange>
     return result;
 }
 
-bool TInsertColumnEngineChanges::DoApplyChanges(TColumnEngineForLogs& self, TApplyChangesContext& context, const bool dryRun) {
-    if (!TBase::DoApplyChanges(self, context, dryRun)) {
+bool TInsertColumnEngineChanges::DoApplyChanges(TColumnEngineForLogs& self, TApplyChangesContext& context) {
+    if (!TBase::DoApplyChanges(self, context)) {
         return false;
     }
     return true;
@@ -44,10 +44,9 @@ bool TInsertColumnEngineChanges::AddPathIfNotExists(ui64 pathId) {
         return false;
     }
 
-    Y_VERIFY(FirstGranuleId && ReservedGranuleIds);
+    Y_VERIFY(FirstGranuleId);
     ui64 granule = FirstGranuleId;
     ++FirstGranuleId;
-    --ReservedGranuleIds;
 
     NewGranules.emplace(granule, std::make_pair(pathId, DefaultMark));
     PathToGranule[pathId].emplace_back(DefaultMark, granule);
@@ -56,7 +55,7 @@ bool TInsertColumnEngineChanges::AddPathIfNotExists(ui64 pathId) {
 
 void TInsertColumnEngineChanges::DoStart(NColumnShard::TColumnShard& self) {
     TBase::DoStart(self);
-    self.BackgroundController.StartIndexing();
+    self.BackgroundController.StartIndexing(*this);
 }
 
 void TInsertColumnEngineChanges::DoWriteIndexComplete(NColumnShard::TColumnShard& self, TWriteIndexCompleteContext& context) {
@@ -69,7 +68,7 @@ void TInsertColumnEngineChanges::DoOnFinish(NColumnShard::TColumnShard& self, TC
     self.BackgroundController.FinishIndexing();
 }
 
-NKikimr::TConclusion<std::vector<TString>> TInsertColumnEngineChanges::DoConstructBlobs(TConstructionContext& context) noexcept {
+TConclusionStatus TInsertColumnEngineChanges::DoConstructBlobs(TConstructionContext& context) noexcept {
     Y_VERIFY(!DataToIndex.empty());
     Y_VERIFY(AppendedPortions.empty());
 
@@ -117,7 +116,6 @@ NKikimr::TConclusion<std::vector<TString>> TInsertColumnEngineChanges::DoConstru
         pathBatches[inserted.PathId].push_back(batch);
         Y_VERIFY_DEBUG(NArrow::IsSorted(pathBatches[inserted.PathId].back(), resultSchema->GetIndexInfo().GetReplaceKey()));
     }
-    std::vector<TString> blobs;
 
     for (auto& [pathId, batches] : pathBatches) {
         AddPathIfNotExists(pathId);
@@ -129,7 +127,7 @@ NKikimr::TConclusion<std::vector<TString>> TInsertColumnEngineChanges::DoConstru
 
         auto granuleBatches = TMarksGranules::SliceIntoGranules(merged, PathToGranule[pathId], resultSchema->GetIndexInfo());
         for (auto& [granule, batch] : granuleBatches) {
-            auto portions = MakeAppendedPortions(pathId, batch, granule, maxSnapshot, blobs, nullptr, context);
+            auto portions = MakeAppendedPortions(pathId, batch, granule, maxSnapshot, nullptr, context);
             Y_VERIFY(portions.size() > 0);
             for (auto& portion : portions) {
                 AppendedPortions.emplace_back(std::move(portion));
@@ -138,7 +136,7 @@ NKikimr::TConclusion<std::vector<TString>> TInsertColumnEngineChanges::DoConstru
     }
 
     Y_VERIFY(PathToGranule.size() == pathBatches.size());
-    return blobs;
+    return TConclusionStatus::Success();
 }
 
 std::shared_ptr<arrow::RecordBatch> TInsertColumnEngineChanges::AddSpecials(const std::shared_ptr<arrow::RecordBatch>& srcBatch,

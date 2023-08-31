@@ -1151,7 +1151,7 @@ THive::TBestNodeResult THive::FindBestNode(const TTabletInfo& tablet) {
             dataCentersGroups = GetDefaultDataCentersPreference(leader.Type);
         }
         if (dataCentersGroups.empty()) {
-            if (leader.Category) {
+            if (leader.Category && leader.Category->StickTogetherInDC) {
                 std::unordered_map<TDataCenterId, ui32> dcTablets;
                 for (TLeaderTabletInfo* tab : leader.Category->Tablets) {
                     if (tab->IsAlive()) {
@@ -1215,6 +1215,7 @@ THive::TBestNodeResult THive::FindBestNode(const TTabletInfo& tablet) {
     }
 
     TVector<TSelectedNode> selectedNodes;
+    bool thereAreNodesWithManyStarts = false;
 
     for (auto itCandidateNodes = candidateGroups.begin(); itCandidateNodes != candidateGroups.end(); ++itCandidateNodes) {
         const std::vector<TNodeInfo*>& candidateNodes(*itCandidateNodes);
@@ -1240,8 +1241,11 @@ THive::TBestNodeResult THive::FindBestNode(const TTabletInfo& tablet) {
                     }
                 } else {
                     BLOG_TRACE("[FBN] Tablet " << tablet.ToString() << " node " << nodeInfo.Id << " is not able to schedule the tablet");
-                    tablet.BootState = BootStateTooManyStarting;
-                    return TBestNodeResult(false);
+                    thereAreNodesWithManyStarts = true;
+                    if (GetBootStrategy() == NKikimrConfig::THiveConfig::HIVE_BOOT_STRATEGY_BALANCED) {
+                        tablet.BootState = BootStateTooManyStarting;
+                        return TBestNodeResult(false);
+                    }
                 }
             } else {
                 BLOG_TRACE("[FBN] Node " << nodeInfo.Id << " is not allowed"
@@ -1256,6 +1260,10 @@ THive::TBestNodeResult THive::FindBestNode(const TTabletInfo& tablet) {
         }
     }
     BLOG_TRACE("[FBN] Tablet " << tablet.ToString() << " selected nodes count " << selectedNodes.size());
+    if (selectedNodes.empty() && thereAreNodesWithManyStarts) {
+        BLOG_TRACE("[FBN] Tablet " << tablet.ToString() << " all available nodes are booting too many tablets");
+        return TBestNodeResult(false);
+    }
 
     TNodeInfo* selectedNode = nullptr;
     if (!selectedNodes.empty()) {
@@ -2077,23 +2085,17 @@ void THive::ProcessTabletBalancer() {
 }
 
 THive::THiveStats THive::GetStats() const {
-    struct TNodeStat {
-        TNodeId NodeId;
-        double Usage;
-    };
-
     THiveStats stats = {};
-    TVector<TNodeStat> values;
-    values.reserve(Nodes.size());
+    stats.Values.reserve(Nodes.size());
     for (const auto& ni : Nodes) {
         if (ni.second.IsAlive() && !ni.second.Down) {
-            values.push_back({ni.first, ni.second.GetNodeUsage()});
+            stats.Values.push_back({ni.first, ni.second.GetNodeUsage()});
         }
     }
-    if (values.empty()) {
+    if (stats.Values.empty()) {
         return stats;
     }
-    auto it = std::minmax_element(values.begin(), values.end(), [](const TNodeStat& a, const TNodeStat& b) -> bool {
+    auto it = std::minmax_element(stats.Values.begin(), stats.Values.end(), [](const THiveStats::TNodeStat& a, const THiveStats::TNodeStat& b) -> bool {
         return a.Usage < b.Usage;
     });
     stats.MaxUsage = it.second->Usage;
@@ -2105,6 +2107,8 @@ THive::THiveStats THive::GetStats() const {
         double minUsage = std::max(stats.MinUsage, minUsageToBalance);
         double maxUsage = std::max(stats.MaxUsage, minUsageToBalance);
         stats.Scatter = (maxUsage - minUsage) / maxUsage;
+    } else {
+        stats.Scatter = 0;
     }
     return stats;
 }
@@ -2136,6 +2140,12 @@ void THive::Handle(TEvPrivate::TEvProcessTabletBalancer::TPtr&) {
     TabletCounters->Simple()[NHive::COUNTER_BALANCE_SCATTER].Set(stats.Scatter * 100);
     TabletCounters->Simple()[NHive::COUNTER_BALANCE_USAGE_MIN].Set(stats.MinUsage * 100);
     TabletCounters->Simple()[NHive::COUNTER_BALANCE_USAGE_MAX].Set(stats.MaxUsage * 100);
+
+    auto& nodeUsageHistogram = TabletCounters->Percentile()[NHive::COUNTER_NODE_USAGE];
+    nodeUsageHistogram.Clear();
+    for (const auto& record : stats.Values) {
+        nodeUsageHistogram.IncrementFor(record.Usage * 100);
+    }
 
     if (stats.MaxUsage >= GetMaxNodeUsageToKick()) {
         std::vector<TNodeId> overloadedNodes;

@@ -34,7 +34,7 @@ TIntrusivePtr<NKqp::IKqpGateway> GetIcGateway(Tests::TServer& server) {
     auto counters = MakeIntrusive<TKqpRequestCounters>();
     counters->Counters = new TKqpCounters(server.GetRuntime()->GetAppData(0).Counters);
     counters->TxProxyMon = new NTxProxy::TTxProxyMon(server.GetRuntime()->GetAppData(0).Counters);
-    std::shared_ptr<NYql::IKikimrGateway::IKqpTableMetadataLoader> loader = std::make_shared<TKqpTableMetadataLoader>(server.GetRuntime()->GetAnyNodeActorSystem(), false);
+    std::shared_ptr<NYql::IKikimrGateway::IKqpTableMetadataLoader> loader = std::make_shared<TKqpTableMetadataLoader>(server.GetRuntime()->GetAnyNodeActorSystem(),TIntrusivePtr<NYql::TKikimrConfiguration>(nullptr),false);
     return NKqp::CreateKikimrIcGateway(TestCluster, "/Root", std::move(loader), server.GetRuntime()->GetAnyNodeActorSystem(),
         server.GetRuntime()->GetNodeId(0), counters);
 }
@@ -60,7 +60,7 @@ NYql::NNodes::TExprBase GetExpr(const TString& ast, NYql::TExprContext& ctx, NYq
     NYql::TAstParseResult astRes = NYql::ParseAst(ast);
     YQL_ENSURE(astRes.IsOk());
     NYql::TExprNode::TPtr result;
-    YQL_ENSURE(CompileExpr(*astRes.Root, result, ctx, moduleResolver));
+    YQL_ENSURE(CompileExpr(*astRes.Root, result, ctx, moduleResolver, nullptr));
     return NYql::NNodes::TExprBase(result);
 }
 
@@ -986,7 +986,18 @@ Y_UNIT_TEST_SUITE(KqpIndexes) {
 
         {
             auto result = session.DescribeTable("/Root/TestTable/Index/indexImplTable").ExtractValueSync();
-            UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), NYdb::EStatus::SCHEME_ERROR);
+            UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), NYdb::EStatus::SUCCESS);
+
+            const THashMap<std::string_view, std::string_view> columnTypes = {
+                {"Key", "String?"},
+                {"Index2", "String?"}
+            };
+
+            const auto& columns = result.GetTableDescription().GetTableColumns();
+            UNIT_ASSERT_VALUES_EQUAL(columns.size(), columnTypes.size());
+            for (const auto& column : columns) {
+                UNIT_ASSERT_VALUES_EQUAL_C(column.Type.ToString(), columnTypes.at(column.Name), column.Name);
+            }
         }
 
         {

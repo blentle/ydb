@@ -2792,6 +2792,32 @@ bool EnsureWideStreamType(TPositionHandle position, const TTypeAnnotationNode& t
     return true;
 }
 
+bool IsWideBlockType(const TTypeAnnotationNode& type) {
+    if (type.GetKind() != ETypeAnnotationKind::Multi) {
+        return false;
+    }
+
+    const auto& items = type.Cast<TMultiExprType>()->GetItems();
+    if (items.empty()) {
+        return false;
+    }
+
+    if (!AllOf(items, [](const auto& item){ return item->IsBlockOrScalar(); })) {
+        return false;
+    }
+
+    if (items.back()->GetKind() != ETypeAnnotationKind::Scalar) {
+        return false;
+    }
+
+    auto blockLenType = items.back()->Cast<TScalarExprType>()->GetItemType();
+    if (blockLenType->GetKind() != ETypeAnnotationKind::Data) {
+        return false;
+    }
+
+    return blockLenType->Cast<TDataExprType>()->GetSlot() == EDataSlot::Uint64;
+}
+
 bool EnsureWideBlockType(TPositionHandle position, const TTypeAnnotationNode& type, TTypeAnnotationNode::TListType& blockItemTypes, TExprContext& ctx, bool allowScalar) {
     if (HasError(&type, ctx)) {
         return false;
@@ -4397,7 +4423,7 @@ IGraphTransformer::TStatus ConvertChildrenToType(const TExprNode::TPtr& input, c
         }
 
         status = status.Combine(TryConvertTo(input->ChildRef(i), *targetType, ctx));
-        if (IGraphTransformer::TStatus::Error == status)
+        if (status == IGraphTransformer::TStatus::Error)
             break;
     }
 
@@ -4945,6 +4971,18 @@ bool IsFlowOrStream(const TExprNode& node) {
     return IsFlowOrStream(*node.GetTypeAnn());
 }
 
+bool IsBoolLike(const TTypeAnnotationNode& type) {
+    if (IsNull(type)) {
+        return true;
+    }
+    const auto itemType = RemoveOptionalType(&type);
+    return (itemType->GetKind() == ETypeAnnotationKind::Data) and (itemType->Cast<TDataExprType>()->GetSlot() == EDataSlot::Bool);
+}
+
+bool IsBoolLike(const TExprNode& node) {
+    return node.GetTypeAnn() && IsBoolLike(*node.GetTypeAnn());
+}
+
 namespace {
 
 using TIndentPrinter = std::function<void(TStringBuilder& res, size_t)>;
@@ -5347,10 +5385,10 @@ IGraphTransformer::TStatus NormalizeTupleOfAtoms(const TExprNode::TPtr& input, u
                 if (1U == item->ChildrenSize() && item->Head().IsAtom()) {
                     needRestart = true;
                     children[i] = item->HeadPtr();
-                } else if (const auto status = NormalizeTupleOfAtoms<Deduplicte, 1U>(input->ChildPtr(index), i, children[i], ctx); IGraphTransformer::TStatus::Error == status)
+                } else if (const auto status = NormalizeTupleOfAtoms<Deduplicte, 1U>(input->ChildPtr(index), i, children[i], ctx); status == IGraphTransformer::TStatus::Error)
                     return status;
                 else
-                    needRestart = needRestart || IGraphTransformer::TStatus::Repeat == status;
+                    needRestart = needRestart || (status == IGraphTransformer::TStatus::Repeat);
             } else if (!EnsureAtom(*item, ctx))
                 return IGraphTransformer::TStatus::Error;
         }
@@ -5925,6 +5963,9 @@ TExprNode::TPtr ExpandPgAggregationTraits(TPositionHandle pos, const NPg::TAggre
                     .Callable(3, "PgClone")
                         .Add(0, initValue)
                         .Callable(1, "DependsOn")
+                            .Arg(0, "row")
+                        .Seal()
+                        .Callable(2, "DependsOn")
                             .Arg(0, "parent")
                         .Seal()
                     .Seal()
@@ -5951,6 +5992,9 @@ TExprNode::TPtr ExpandPgAggregationTraits(TPositionHandle pos, const NPg::TAggre
                             .Callable(1, "PgClone")
                                 .Add(0, initValue)
                                 .Callable(1, "DependsOn")
+                                    .Arg(0, "row")
+                                .Seal()
+                                .Callable(2, "DependsOn")
                                     .Arg(0, "parent")
                                 .Seal()
                             .Seal()

@@ -128,7 +128,7 @@ void TBlobStorageController::OnActivateExecutor(const TActorContext&) {
     }
 
     // request node list
-    Send(GetNameserviceActorId(), new TEvInterconnect::TEvListNodes);
+    Send(GetNameserviceActorId(), new TEvInterconnect::TEvListNodes(true));
 
     // create storage pool stats monitor
     StoragePoolStat = std::make_unique<TStoragePoolStat>(GetServiceCounters(AppData()->Counters, "storage_pool_stat"));
@@ -148,17 +148,12 @@ void TBlobStorageController::Handle(TEvInterconnect::TEvNodesInfo::TPtr &ev) {
     STLOG(PRI_DEBUG, BS_CONTROLLER, BSC01, "Handle TEvInterconnect::TEvNodesInfo");
     const bool initial = !HostRecords;
     HostRecords = std::make_shared<THostRecordMap::element_type>(ev->Get());
-    Schedule(TDuration::Minutes(5), new TEvPrivate::TEvHostRecordsTimeToLiveExceeded);
     if (initial) {
         // create self-heal actor
         SelfHealId = Register(CreateSelfHealActor());
         Execute(CreateTxInitScheme());
     }
     Send(SelfHealId, new TEvPrivate::TEvUpdateHostRecords(HostRecords));
-}
-
-void TBlobStorageController::HandleHostRecordsTimeToLiveExceeded() {
-    Send(GetNameserviceActorId(), new TEvInterconnect::TEvListNodes);
 }
 
 void TBlobStorageController::IssueInitialGroupContent() {
@@ -334,6 +329,7 @@ ui32 TBlobStorageController::GetEventPriority(IEventHandle *ev) {
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kWipeVDisk:
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kSanitizeGroup:
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kCancelVirtualGroup:
+                    case NKikimrBlobStorage::TConfigRequest::TCommand::kSetVDiskReadOnly:
                         return 2; // read-write commands go with higher priority as they are needed to keep cluster intact
 
                     case NKikimrBlobStorage::TConfigRequest::TCommand::kReadHostConfig:

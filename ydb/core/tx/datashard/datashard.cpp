@@ -494,6 +494,57 @@ void TDataShard::SendDelayedAcks(const TActorContext& ctx, TVector<THolder<IEven
     delayedAcks.clear();
 }
 
+void TDataShard::GetCleanupReplies(const TOperation::TPtr& op, std::vector<std::unique_ptr<IEventHandle>>& cleanupReplies) {
+    if (!op->HasOutputData()) {
+        // There are no replies
+        return;
+    }
+
+    auto& delayedAcks = op->DelayedAcks();
+    for (auto& x : delayedAcks) {
+        LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+            "Cleanup TxId# " << op->GetTxId() << " at " << TabletID() << " Ack RS " << x->ToString());
+        cleanupReplies.emplace_back(x.Release());
+        IncCounter(COUNTER_ACK_SENT_DELAYED);
+    }
+    delayedAcks.clear();
+
+    auto& expectedReadSets = op->ExpectedReadSets();
+    for (auto& x : expectedReadSets) {
+        for (const auto& recipient : x.second) {
+            cleanupReplies.push_back(GenerateReadSetNoData(recipient, op->GetStep(), op->GetTxId(), x.first.first, x.first.second));
+        }
+    }
+    expectedReadSets.clear();
+}
+
+void TDataShard::SendConfirmedReplies(TMonotonic ts, std::vector<std::unique_ptr<IEventHandle>>&& replies) {
+    if (replies.empty()) {
+        return;
+    }
+
+    struct TState : public TThrRefBase {
+        std::vector<std::unique_ptr<IEventHandle>> Replies;
+
+        TState(std::vector<std::unique_ptr<IEventHandle>>&& replies)
+            : Replies(std::move(replies))
+        {}
+    };
+
+    Executor()->ConfirmReadOnlyLease(ts,
+        [state = MakeIntrusive<TState>(std::move(replies))] {
+            for (auto& ev : state->Replies) {
+                TActivationContext::Send(std::move(ev));
+            }
+        });
+}
+
+void TDataShard::SendCommittedReplies(std::vector<std::unique_ptr<IEventHandle>>&& replies) {
+    for (auto& ev : replies) {
+        TActivationContext::Send(std::move(ev));
+    }
+}
+
 class TDataShard::TWaitVolatileDependencies final : public IVolatileTxCallback {
 public:
     TWaitVolatileDependencies(
@@ -865,6 +916,8 @@ void TDataShard::RemoveChangeRecord(NIceDb::TNiceDb& db, ui64 order) {
 
     IncCounter(COUNTER_CHANGE_RECORDS_REMOVED);
     SetCounter(COUNTER_CHANGE_QUEUE_SIZE, ChangesQueue.size());
+
+    CheckChangesQueueNoOverflow();
 }
 
 void TDataShard::EnqueueChangeRecords(TVector<IDataShardChangeCollector::TChange>&& records) {
@@ -2349,6 +2402,7 @@ Ydb::StatusIds::StatusCode ConvertToYdbStatusCode(NKikimrTxDataShard::TError::EK
         case NKikimrTxDataShard::TError::UNKNOWN:
         case NKikimrTxDataShard::TError::REPLY_SIZE_EXCEEDED:
         case NKikimrTxDataShard::TError::EXECUTION_CANCELLED:
+        case NKikimrTxDataShard::TError::DISK_SPACE_EXHAUSTED:
             return Ydb::StatusIds::INTERNAL_ERROR;
         case NKikimrTxDataShard::TError::BAD_ARGUMENT:
         case NKikimrTxDataShard::TError::READONLY:
@@ -2393,11 +2447,13 @@ void TDataShard::Handle(TEvDataShard::TEvStateChangedResult::TPtr& ev, const TAc
 bool TDataShard::CheckDataTxReject(const TString& opDescr,
                                           const TActorContext &ctx,
                                           NKikimrTxDataShard::TEvProposeTransactionResult::EStatus &rejectStatus,
-                                          TString &reason)
+                                          ERejectReasons &rejectReasons,
+                                          TString &rejectDescription)
 {
     bool reject = false;
     rejectStatus = NKikimrTxDataShard::TEvProposeTransactionResult::OVERLOADED;
-    TVector<TString> rejectReasons;
+    rejectReasons = ERejectReasons::None;
+    TVector<TString> rejectDescriptions;
 
     // In v0.5 reject all transactions on split Src after receiving EvSplit
     if (State == TShardState::SplitSrcWaitForNoTxInFlight ||
@@ -2405,37 +2461,43 @@ bool TDataShard::CheckDataTxReject(const TString& opDescr,
         State == TShardState::SplitSrcSendingSnapshot ||
         State == TShardState::SplitSrcWaitForPartitioningChanged) {
         reject = true;
-        rejectReasons.push_back(TStringBuilder()
+        rejectReasons |= ERejectReasons::WrongState;
+        rejectDescriptions.push_back(TStringBuilder()
             << "is in process of split opId " << SrcSplitOpId
             << " state " << DatashardStateName(State)
             << " (wrong shard state)");
     } else if (State == TShardState::SplitDstReceivingSnapshot) {
         reject = true;
-        rejectReasons.push_back(TStringBuilder()
+        rejectReasons |= ERejectReasons::WrongState;
+        rejectDescriptions.push_back(TStringBuilder()
             << "is in process of split opId " << DstSplitOpId
             << " state " << DatashardStateName(State));
     } else if (State == TShardState::PreOffline || State == TShardState::Offline) {
         reject = true;
         rejectStatus = NKikimrTxDataShard::TEvProposeTransactionResult::ERROR;
-        rejectReasons.push_back("is in a pre/offline state assuming this is due to a finished split (wrong shard state)");
+        rejectReasons |= ERejectReasons::WrongState;
+        rejectDescriptions.push_back("is in a pre/offline state assuming this is due to a finished split (wrong shard state)");
     } else if (MvccSwitchState == TSwitchState::SWITCHING) {
         reject = true;
-        rejectReasons.push_back(TStringBuilder()
+        rejectReasons |= ERejectReasons::WrongState;
+        rejectDescriptions.push_back(TStringBuilder()
             << "is in process of mvcc state change"
             << " state " << DatashardStateName(State));
     }
 
     if (Pipeline.HasDrop()) {
         reject = true;
-        rejectReasons.push_back("is in process of drop");
         rejectStatus = NKikimrTxDataShard::TEvProposeTransactionResult::ERROR;
+        rejectReasons |= ERejectReasons::Dropping;
+        rejectDescriptions.push_back("is in process of drop");
     }
 
     ui64 txInfly = TxInFly();
     TDuration lag = GetDataTxCompleteLag();
     if (txInfly > 1 && lag > TDuration::MilliSeconds(MaxTxLagMilliseconds)) {
         reject = true;
-        rejectReasons.push_back(TStringBuilder()
+        rejectReasons |= ERejectReasons::OverloadByLag;
+        rejectDescriptions.push_back(TStringBuilder()
             << "lags behind, lag: " << lag
             << " in-flight tx count: " << txInfly);
     }
@@ -2444,8 +2506,10 @@ bool TDataShard::CheckDataTxReject(const TString& opDescr,
     if (!reject && rejectProbabilty > 0) {
         float rnd = AppData(ctx)->RandomProvider->GenRandReal2();
         reject |= (rnd < rejectProbabilty);
-        if (reject)
-            rejectReasons.push_back("decided to reject due to given RejectProbability");
+        if (reject) {
+            rejectReasons |= ERejectReasons::OverloadByProbability;
+            rejectDescriptions.push_back("decided to reject due to given RejectProbability");
+        }
     }
 
     size_t totalInFly =
@@ -2453,30 +2517,33 @@ bool TDataShard::CheckDataTxReject(const TString& opDescr,
             + ProposeQueue.Size() + TxWaiting();
     if (totalInFly > GetMaxTxInFly()) {
         reject = true;
-        rejectReasons.push_back("MaxTxInFly was exceeded");
+        rejectReasons |= ERejectReasons::OverloadByTxInFly;
+        rejectDescriptions.push_back("MaxTxInFly was exceeded");
     }
 
     if (!reject && Stopping) {
         reject = true;
-        rejectReasons.push_back("is restarting");
+        rejectReasons |= ERejectReasons::WrongState;
+        rejectDescriptions.push_back("is restarting");
     }
 
     if (!reject) {
         for (auto& it : TableInfos) {
             if (it.second->IsBackup) {
                 reject = true;
-                rejectReasons.push_back("is a backup table");
                 rejectStatus = NKikimrTxDataShard::TEvProposeTransactionResult::ERROR;
+                rejectReasons |= ERejectReasons::WrongState;
+                rejectDescriptions.push_back("is a backup table");
                 break;
             }
         }
     }
 
     if (reject) {
-        reason = TStringBuilder()
+        rejectDescription = TStringBuilder()
             << "Rejecting " << opDescr
             << " because datashard " << TabletID() << ": "
-            << JoinSeq("; ", rejectReasons);
+            << JoinSeq("; ", rejectDescriptions);
     }
 
     return reject;
@@ -2498,8 +2565,9 @@ bool TDataShard::CheckDataTxRejectAndReply(TEvDataShard::TEvProposeTransaction* 
     TString txDescr = TStringBuilder() << "data TxId " << msg->GetTxId();
 
     NKikimrTxDataShard::TEvProposeTransactionResult::EStatus rejectStatus;
-    TString rejectReason;
-    bool reject = CheckDataTxReject(txDescr, ctx, rejectStatus, rejectReason);
+    ERejectReasons rejectReasons;
+    TString rejectDescription;
+    bool reject = CheckDataTxReject(txDescr, ctx, rejectStatus, rejectReasons, rejectDescription);
 
     if (reject) {
         LWTRACK(ProposeTransactionReject, msg->Orbit);
@@ -2509,8 +2577,8 @@ bool TDataShard::CheckDataTxRejectAndReply(TEvDataShard::TEvProposeTransaction* 
                                                             msg->GetTxId(),
                                                             rejectStatus));
 
-        result->AddError(NKikimrTxDataShard::TError::WRONG_SHARD_STATE, rejectReason);
-        LOG_NOTICE_S(ctx, NKikimrServices::TX_DATASHARD, rejectReason);
+        result->AddError(NKikimrTxDataShard::TError::WRONG_SHARD_STATE, rejectDescription);
+        LOG_NOTICE_S(ctx, NKikimrServices::TX_DATASHARD, rejectDescription);
 
         ctx.Send(msg->GetSource(), result.Release());
         IncCounter(COUNTER_PREPARE_OVERLOADED);
@@ -2979,23 +3047,38 @@ void TDataShard::AbortExpectationsFromDeletedTablet(ui64 tabletId, THashMap<ui64
 }
 
 void TDataShard::Handle(TEvTabletPipe::TEvServerConnected::TPtr &ev, const TActorContext &ctx) {
-    Y_UNUSED(ev); Y_UNUSED(ctx);
     LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, "Server connected at "
         << (Executor()->GetStats().IsFollower ? "follower " : "leader ")
         << "tablet# " << ev->Get()->TabletId
         << ", clientId# " << ev->Get()->ClientId
         << ", serverId# " << ev->Get()->ServerId
         << ", sessionId# " << ev->InterconnectSession);
+
+    auto res = PipeServers.emplace(
+        std::piecewise_construct,
+        std::forward_as_tuple(ev->Get()->ServerId),
+        std::forward_as_tuple());
+    Y_VERIFY_DEBUG_S(res.second,
+        "Unexpected TEvServerConnected for " << ev->Get()->ServerId);
+
+    res.first->second.InterconnectSession = ev->Get()->InterconnectSession;
 }
 
 void TDataShard::Handle(TEvTabletPipe::TEvServerDisconnected::TPtr &ev, const TActorContext &ctx) {
-    Y_UNUSED(ev); Y_UNUSED(ctx);
     LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, "Server disconnected at "
         << (Executor()->GetStats().IsFollower ? "follower " : "leader ")
         << "tablet# " << ev->Get()->TabletId
         << ", clientId# " << ev->Get()->ClientId
         << ", serverId# " << ev->Get()->ServerId
         << ", sessionId# " << ev->InterconnectSession);
+
+    auto it = PipeServers.find(ev->Get()->ServerId);
+    Y_VERIFY_DEBUG_S(it != PipeServers.end(),
+        "Unexpected TEvServerDisconnected for " << ev->Get()->ServerId);
+
+    DiscardOverloadSubscribers(it->second);
+
+    PipeServers.erase(it);
 }
 
 void TDataShard::Handle(TEvMediatorTimecast::TEvRegisterTabletResult::TPtr& ev, const TActorContext& ctx) {
@@ -3109,16 +3192,15 @@ bool TDataShard::CheckChangesQueueOverflow() const {
     return ChangesQueue.size() >= sizeLimit || ChangesQueueBytes >= bytesLimit;
 }
 
-void TDataShard::Handle(TEvDataShard::TEvCancelTransactionProposal::TPtr &ev, const TActorContext &ctx) {
-    ui64 txId = ev->Get()->Record.GetTxId();
-    LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, "Got TEvDataShard::TEvCancelTransactionProposal " << TabletID()
-                << " txId " <<  txId);
-
-    // Mark any queued proposals as cancelled
-    ProposeQueue.Cancel(txId);
-
-    // Cancel transactions that have already been proposed
-    Execute(new TTxCancelTransactionProposal(this, txId), ctx);
+void TDataShard::CheckChangesQueueNoOverflow() {
+    if (OverloadSubscribersByReason[RejectReasonIndex(ERejectReason::ChangesQueueOverflow)]) {
+        const auto* appData = AppData();
+        const auto sizeLimit = appData->DataShardConfig.GetChangesQueueItemsLimit();
+        const auto bytesLimit = appData->DataShardConfig.GetChangesQueueBytesLimit();
+        if (ChangesQueue.size() < sizeLimit && ChangesQueueBytes < bytesLimit) {
+            NotifyOverloadSubscribers(ERejectReason::ChangesQueueOverflow);
+        }
+    }
 }
 
 void TDataShard::DoPeriodicTasks(const TActorContext &ctx) {
@@ -3250,33 +3332,36 @@ void TDataShard::SendReadSetExpectation(const TActorContext& ctx, ui64 step, ui6
     PipeClientCache->Send(ctx, target, ev.Release());
 }
 
-void TDataShard::SendReadSetNoData(const TActorContext& ctx, const TActorId& recipient, ui64 step, ui64 txId, ui64 source, ui64 target)
+std::unique_ptr<IEventHandle> TDataShard::GenerateReadSetNoData(const TActorId& recipient, ui64 step, ui64 txId, ui64 source, ui64 target)
 {
-    Y_UNUSED(ctx);
-    auto ev = MakeHolder<TEvTxProcessing::TEvReadSet>(step, txId, source, target, TabletID());
-    ev->Record.SetFlags(
+    auto msg = std::make_unique<TEvTxProcessing::TEvReadSet>(step, txId, source, target, TabletID());
+    msg->Record.SetFlags(
         NKikimrTx::TEvReadSet::FLAG_NO_DATA |
         NKikimrTx::TEvReadSet::FLAG_NO_ACK);
     if (source != TabletID()) {
-        FillSplitTrajectory(source, *ev->Record.MutableBalanceTrackList());
+        FillSplitTrajectory(source, *msg->Record.MutableBalanceTrackList());
     }
 
-    struct TSendState : public TThrRefBase {
-        TDataShard* Self;
-        TActorId Recipient;
-        THolder<TEvTxProcessing::TEvReadSet> Event;
+    return std::make_unique<IEventHandle>(recipient, SelfId(), msg.release());
+}
 
-        TSendState(TDataShard* self, const TActorId& recipient, THolder<TEvTxProcessing::TEvReadSet>&& event)
-            : Self(self)
-            , Recipient(recipient)
-            , Event(std::move(event))
+void TDataShard::SendReadSetNoData(const TActorContext& ctx, const TActorId& recipient, ui64 step, ui64 txId, ui64 source, ui64 target)
+{
+    Y_UNUSED(ctx);
+    auto ev = GenerateReadSetNoData(recipient, step, txId, source, target);
+
+    struct TSendState : public TThrRefBase {
+        std::unique_ptr<IEventHandle> Event;
+
+        TSendState(std::unique_ptr<IEventHandle>&& event)
+            : Event(std::move(event))
         { }
     };
 
     // FIXME: we can probably avoid lease confirmation here
     Executor()->ConfirmReadOnlyLease(
-        [state = MakeIntrusive<TSendState>(this, recipient, std::move(ev))] {
-            state->Self->Send(state->Recipient, state->Event.Release());
+        [state = MakeIntrusive<TSendState>(std::move(ev))] {
+            TActivationContext::Send(std::move(state->Event));
         });
 }
 

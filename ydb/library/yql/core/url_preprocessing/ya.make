@@ -7,6 +7,7 @@ SRCS(
 )
 
 PEERDIR(
+    ydb/library/yql/core/url_preprocessing/interface
     ydb/library/yql/providers/common/proto
     ydb/library/yql/utils/log
     library/cpp/regex/pcre
@@ -14,3 +15,6 @@ PEERDIR(
 
 END()
 
+RECURSE(
+    interface
+)

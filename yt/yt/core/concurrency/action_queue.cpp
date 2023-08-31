@@ -649,41 +649,6 @@ ISuspendableInvokerPtr CreateSuspendableInvoker(IInvokerPtr underlyingInvoker)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-class TMemoryTaggingInvoker
-    : public TInvokerWrapper
-{
-public:
-    TMemoryTaggingInvoker(IInvokerPtr invoker, TMemoryTag memoryTag)
-        : TInvokerWrapper(std::move(invoker))
-        , MemoryTag_(memoryTag)
-    { }
-
-    void Invoke(TClosure callback) override
-    {
-        UnderlyingInvoker_->Invoke(BIND_NO_PROPAGATE(
-            &TMemoryTaggingInvoker::RunCallback,
-            MakeStrong(this),
-            Passed(std::move(callback))));
-    }
-
-private:
-    TMemoryTag MemoryTag_;
-
-    void RunCallback(TClosure callback)
-    {
-        TCurrentInvokerGuard currentInvokerGuard(this);
-        TMemoryTagGuard memoryTagGuard(MemoryTag_);
-        callback();
-    }
-};
-
-IInvokerPtr CreateMemoryTaggingInvoker(IInvokerPtr underlyingInvoker, TMemoryTag tag)
-{
-    return New<TMemoryTaggingInvoker>(std::move(underlyingInvoker), tag);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
 class TCodicilGuardedInvoker
     : public TInvokerWrapper
 {

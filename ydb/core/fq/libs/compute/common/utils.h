@@ -13,7 +13,7 @@ inline std::shared_ptr<NYdb::NTable::TTableClient> CreateNewTableClient(const TS
                                                                  const TYqSharedResources::TPtr& yqSharedResources,
                                                                  const NKikimr::TYdbCredentialsProviderFactory& credentialsProviderFactory) {
     
-    NFq::NConfig::TYdbStorageConfig computeConnection = computeConfig.GetConnection(scope);
+    NFq::NConfig::TYdbStorageConfig computeConnection = computeConfig.GetExecutionConnection(scope);
     computeConnection.set_endpoint(connection.endpoint());
     computeConnection.set_database(connection.database());
     computeConnection.set_usessl(connection.usessl());
@@ -23,5 +23,7 @@ inline std::shared_ptr<NYdb::NTable::TTableClient> CreateNewTableClient(const TS
     return std::make_shared<NYdb::NTable::TTableClient>(yqSharedResources->UserSpaceYdbDriver,
                                                         tableSettings);
 }
+
+TString GetV1StatFromV2Plan(const TString& plan);
 
 } // namespace NFq

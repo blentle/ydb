@@ -74,12 +74,18 @@ private:
     ui64 InsertedBlobsSize = 0;
     ui64 InsertedRecordsCount = 0;
 public:
-    void AddData(const bool isInserted, const ui64 bytes, const ui64 records) {
+    void AddRecordsData(const bool isInserted, const ui64 records) {
         if (isInserted) {
             InsertedRecordsCount += records;
-            InsertedBlobsSize += bytes;
         } else {
             PackedRecordsCount += records;
+        }
+    }
+
+    void AddBlobsData(const bool isInserted, const ui64 bytes) {
+        if (isInserted) {
+            InsertedBlobsSize += bytes;
+        } else {
             PackedBlobsSize += bytes;
         }
     }
@@ -143,7 +149,7 @@ public:
             return ECompactionClass::NoCompaction;
         }
         if (GetMaxColumnsSize() >= limits.GranuleBlobSplitSize ||
-            GetGranuleSize() >= limits.GranuleSizeForOverloadPrevent)
+            (i64)GetGranuleSize() >= limits.GranuleSizeForOverloadPrevent)
         {
             return ECompactionClass::Split;
         }
@@ -276,7 +282,7 @@ public:
 
 private:
     TMonotonic ModificationLastTime = TMonotonic::Now();
-    THashMap<ui64, TPortionInfo> Portions;
+    THashMap<ui64, std::shared_ptr<TPortionInfo>> Portions;
     mutable std::optional<TGranuleAdditiveSummary> AdditiveSummaryCache;
     mutable std::optional<TGranuleHardSummary> HardSummaryCache;
 
@@ -290,10 +296,20 @@ private:
     const NColumnShard::TGranuleDataCounters Counters;
     NColumnShard::TEngineLogsCounters::TPortionsInfoGuard PortionInfoGuard;
 
-    void OnBeforeChangePortion(const TPortionInfo* portionBefore, const TPortionInfo* portionAfter);
-    void OnAfterChangePortion();
+    void OnBeforeChangePortion(const std::shared_ptr<TPortionInfo> portionBefore);
+    void OnAfterChangePortion(const std::shared_ptr<TPortionInfo> portionAfter);
     void OnAdditiveSummaryChange() const;
 public:
+    NOlap::TSerializationStats BuildSerializationStats(ISnapshotSchema::TPtr schema) const {
+        NOlap::TSerializationStats result;
+        for (auto&& i : GetHardSummary().GetColumnIdsSortedBySizeDescending()) {
+            auto field = schema->GetFieldByColumnId(i.GetColumnId());
+            AFL_VERIFY(field)("column_id", i.GetColumnId())("schema", schema->DebugString());
+            result.AddStat(i.GetColumnId(), field->name(), NOlap::TColumnSerializationStat(i.GetBlobsSize(), i.GetRecordsCount()));
+        }
+        return result;
+    }
+
     TGranuleAdditiveSummary::ECompactionClass GetCompactionType(const TCompactionLimits& limits) const;
     const TGranuleHardSummary& GetHardSummary() const {
         if (!HardSummaryCache) {
@@ -340,18 +356,19 @@ public:
     void UpsertPortion(const TPortionInfo& info);
 
     TString DebugString() const {
-        return TStringBuilder() << "granule:" << GetGranuleId() << ";"
+        return TStringBuilder() << "(granule:" << GetGranuleId() << ";"
             << "path_id:" << Record.PathId << ";"
             << "size:" << GetAdditiveSummary().GetGranuleSize() << ";"
             << "portions_count:" << Portions.size() << ";"
+            << ")"
             ;
     }
 
     const TGranuleRecord Record;
 
-    void AddColumnRecord(const TIndexInfo& indexInfo, const TPortionInfo& portion, const TColumnRecord& rec);
+    void AddColumnRecord(const TIndexInfo& indexInfo, const TPortionInfo& portion, const TColumnRecord& rec, const NKikimrTxColumnShard::TIndexPortionMeta* portionMeta);
 
-    const THashMap<ui64, TPortionInfo>& GetPortions() const {
+    const THashMap<ui64, std::shared_ptr<TPortionInfo>>& GetPortions() const {
         return Portions;
     }
 
@@ -362,7 +379,7 @@ public:
     const TPortionInfo& GetPortionVerified(const ui64 portion) const {
         auto it = Portions.find(portion);
         Y_VERIFY(it != Portions.end());
-        return it->second;
+        return *it->second;
     }
 
     const TPortionInfo* GetPortionPointer(const ui64 portion) const {
@@ -370,7 +387,7 @@ public:
         if (it == Portions.end()) {
             return nullptr;
         }
-        return &it->second;
+        return it->second.get();
     }
 
     bool ErasePortion(const ui64 portion);
@@ -385,7 +402,7 @@ public:
 
     ui64 Size() const;
     bool IsOverloaded(const TCompactionLimits& limits) const {
-        return Size() >= limits.GranuleOverloadSize;
+        return (i64)Size() >= limits.GranuleOverloadSize;
     }
 };
 

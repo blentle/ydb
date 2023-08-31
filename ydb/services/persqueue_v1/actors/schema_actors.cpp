@@ -460,6 +460,7 @@ TDescribeTopicActor::TDescribeTopicActor(NKikimr::NGRpcService::TEvDescribeTopic
             request->GetProtoRequest()->include_stats(),
             request->GetProtoRequest()->include_location()))
 {
+    ALOG_DEBUG(NKikimrServices::PQ_READ_PROXY, "TDescribeTopicActor for request " << request->GetProtoRequest()->DebugString());
 }
 
 TDescribeTopicActor::TDescribeTopicActor(NKikimr::NGRpcService::IRequestOpCtx * ctx)
@@ -470,8 +471,6 @@ TDescribeTopicActor::TDescribeTopicActor(NKikimr::NGRpcService::IRequestOpCtx * 
 {
 }
 
-
-
 TDescribeConsumerActor::TDescribeConsumerActor(NKikimr::NGRpcService::TEvDescribeConsumerRequest* request)
     : TBase(request, request->GetProtoRequest()->path())
     , TDescribeTopicActorImpl(TDescribeTopicActorSettings::DescribeConsumer(
@@ -479,6 +478,7 @@ TDescribeConsumerActor::TDescribeConsumerActor(NKikimr::NGRpcService::TEvDescrib
             request->GetProtoRequest()->include_stats(),
             request->GetProtoRequest()->include_location()))
 {
+    ALOG_DEBUG(NKikimrServices::PQ_READ_PROXY, "TDescribeConsumerActor for request " << request->GetProtoRequest()->DebugString());
 }
 
 TDescribeConsumerActor::TDescribeConsumerActor(NKikimr::NGRpcService::IRequestOpCtx * ctx)
@@ -489,7 +489,6 @@ TDescribeConsumerActor::TDescribeConsumerActor(NKikimr::NGRpcService::IRequestOp
             dynamic_cast<const Ydb::Topic::DescribeTopicRequest*>(ctx->GetRequest())->include_location()))
 {
 }
-
 
 TDescribeTopicActorImpl::TDescribeTopicActorImpl(const TDescribeTopicActorSettings& settings)
     : Settings(settings)
@@ -615,21 +614,13 @@ void TDescribeTopicActorImpl::RequestBalancer(const TActorContext& ctx) {
     if (Settings.RequireLocation && !PendingLocation && !GotLocation) {
         return RequestPartitionsLocationIfRequired(ctx);
     }
-    switch (Settings.Mode) {
-        case TDescribeTopicActorSettings::EMode::DescribeConsumer:
-        case TDescribeTopicActorSettings::EMode::DescribeTopic:
-            if (Settings.RequireStats) { 
-                NTabletPipe::SendData(
-                        ctx, *BalancerPipe,
-                        new TEvPersQueue::TEvGetReadSessionsInfo(NPersQueue::ConvertNewConsumerName(Settings.Consumer, ctx))
-                );
-                LOG_DEBUG_S(ctx, NKikimrServices::PQ_READ_PROXY, "DescribeTopicImpl " << ctx.SelfID.ToString() << ": Request sessions");
-                ++RequestsInfly;
-            }
-            break;
-        case TDescribeTopicActorSettings::EMode::DescribePartitions: {
-            break;
-        }
+    if (Settings.Mode == TDescribeTopicActorSettings::EMode::DescribeConsumer && Settings.RequireStats) { 
+        NTabletPipe::SendData(
+                ctx, *BalancerPipe,
+                new TEvPersQueue::TEvGetReadSessionsInfo(NPersQueue::ConvertNewConsumerName(Settings.Consumer, ctx))
+        );
+        LOG_DEBUG_S(ctx, NKikimrServices::PQ_READ_PROXY, "DescribeTopicImpl " << ctx.SelfID.ToString() << ": Request sessions");
+        ++RequestsInfly;
     }
 }
 
@@ -727,7 +718,7 @@ void TDescribeTopicActorImpl::Handle(TEvPersQueue::TEvGetPartitionsLocationRespo
             return;
         }
     }
-    LOG_DEBUG_S(ctx, NKikimrServices::PQ_READ_PROXY, "DescribeTopicImpl " << ctx.SelfID.ToString() << ": Something wrong on location, retry");
+    LOG_DEBUG_S(ctx, NKikimrServices::PQ_READ_PROXY, "DescribeTopicImpl " << ctx.SelfID.ToString() << ": Something wrong on location, retry. Response: " << record.DebugString());
     //Something gone wrong, retry
     ctx.Schedule(TDuration::MilliSeconds(200), new TEvents::TEvWakeup());
 }
@@ -747,16 +738,11 @@ void TDescribeTopicActorImpl::RequestAdditionalInfo(const TActorContext& ctx) {
 }
 
 void TDescribeTopicActorImpl::CheckCloseBalancerPipe(const TActorContext& ctx) {
-    switch (Settings.Mode) {
-        case TDescribeTopicActorSettings::EMode::DescribePartitions:
-            if (RequestsInfly || PendingLocation)
-                return;
-        // no break;
-        default:
-            NTabletPipe::CloseClient(ctx, *BalancerPipe);
-            *BalancerPipe = TActorId{};
-            BalancerTabletId = 0;
-    }
+    if (RequestsInfly || PendingLocation)
+        return;
+    NTabletPipe::CloseClient(ctx, *BalancerPipe);
+    *BalancerPipe = TActorId{};
+    BalancerTabletId = 0;
 }
 
 
@@ -1288,6 +1274,7 @@ TDescribePartitionActor::TDescribePartitionActor(NKikimr::NGRpcService::TEvDescr
     : TBase(request, request->GetProtoRequest()->path())
     , TDescribeTopicActorImpl(SettingsFromDescribePartRequest(request->GetProtoRequest()))
 {
+    ALOG_DEBUG(NKikimrServices::PQ_READ_PROXY, "TDescribePartitionActor for request " << request->GetProtoRequest()->DebugString());
 }
 
 TDescribePartitionActor::TDescribePartitionActor(NKikimr::NGRpcService::IRequestOpCtx* ctx)
@@ -1415,7 +1402,11 @@ void TPartitionsLocationActor::HandleCacheNavigateResponse(
     if (!TBase::HandleCacheNavigateResponseBase(ev)) {
         return;
     }
-    ProcessTablets(PQGroupInfo->Description, this->ActorContext());
+
+    if (ProcessTablets(PQGroupInfo->Description, this->ActorContext())) {
+        Response->PathId = Self->Info.GetPathId();
+        Response->SchemeShardId = Self->Info.GetSchemeshardId();
+    }
 }
 
 bool TPartitionsLocationActor::ApplyResponse(

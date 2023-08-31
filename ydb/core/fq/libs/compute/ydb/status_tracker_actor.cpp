@@ -4,6 +4,7 @@
 #include <ydb/core/fq/libs/compute/common/metrics.h>
 #include <ydb/core/fq/libs/compute/common/retry_actor.h>
 #include <ydb/core/fq/libs/compute/common/run_actor_params.h>
+#include <ydb/core/fq/libs/compute/common/utils.h>
 #include <ydb/core/fq/libs/compute/ydb/events/events.h>
 #include <ydb/core/fq/libs/ydb/ydb.h>
 #include <ydb/library/services/services.pb.h>
@@ -126,12 +127,14 @@ public:
                 Issues = response.Issues;
                 Status = response.Status;
                 ExecStatus = response.ExecStatus;
+                QueryStats = response.QueryStats;
                 Failed();
                 break;
             case NYdb::NQuery::EExecStatus::Completed:
                 Issues = response.Issues;
                 Status = response.Status;
                 ExecStatus = response.ExecStatus;
+                QueryStats = response.QueryStats;
                 Complete();
                 break;
         }
@@ -148,6 +151,8 @@ public:
         Fq::Private::PingTaskRequest pingTaskRequest;
         NYql::IssuesToMessage(Issues, pingTaskRequest.mutable_issues());
         pingTaskRequest.set_status(::FederatedQuery::QueryMeta::FAILING);
+        pingTaskRequest.set_ast(QueryStats.query_ast());
+        pingTaskRequest.set_plan(QueryStats.query_plan());
         Send(Pinger, new TEvents::TEvForwardPingRequest(pingTaskRequest));
     }
 
@@ -158,6 +163,13 @@ public:
         Fq::Private::PingTaskRequest pingTaskRequest;
         NYql::IssuesToMessage(Issues, pingTaskRequest.mutable_issues());
         pingTaskRequest.set_status(::FederatedQuery::QueryMeta::COMPLETING);
+        pingTaskRequest.set_ast(QueryStats.query_ast());
+        pingTaskRequest.set_plan(QueryStats.query_plan());
+        try {
+            pingTaskRequest.set_statistics(GetV1StatFromV2Plan(QueryStats.query_plan()));
+        } catch(const NJson::TJsonException& ex) {
+            LOG_E("Error statistics conversion: " << ex.what());
+        }
         Send(Pinger, new TEvents::TEvForwardPingRequest(pingTaskRequest));
     }
 
@@ -172,6 +184,7 @@ private:
     NYql::TIssues Issues;
     NYdb::EStatus Status = NYdb::EStatus::SUCCESS;
     NYdb::NQuery::EExecStatus ExecStatus = NYdb::NQuery::EExecStatus::Unspecified;
+    Ydb::TableStats::QueryStats QueryStats;
 };
 
 std::unique_ptr<NActors::IActor> CreateStatusTrackerActor(const TRunActorParams& params,

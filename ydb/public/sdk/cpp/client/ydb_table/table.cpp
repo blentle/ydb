@@ -4,6 +4,7 @@
 #include <ydb/public/sdk/cpp/client/impl/ydb_internal/scheme_helpers/helpers.h>
 #include <ydb/public/sdk/cpp/client/impl/ydb_internal/table_helpers/helpers.h>
 #include <ydb/public/sdk/cpp/client/impl/ydb_internal/make_request/make.h>
+#include <ydb/public/sdk/cpp/client/impl/ydb_internal/retry/retry.h>
 #undef INCLUDE_YDB_INTERNAL_H
 
 #include <ydb/public/api/grpc/ydb_table_v1.grpc.pb.h>
@@ -305,6 +306,10 @@ class TTableDescription::TImpl {
             Tiering_ = proto.tiering();
         }
 
+        if (proto.store_type()) {
+            StoreType_ = (proto.store_type() == Ydb::Table::STORE_TYPE_COLUMN) ? EStoreType::Column : EStoreType::Row;
+        }
+
         // column families
         ColumnFamilies_.reserve(proto.column_families_size());
         for (const auto& family : proto.column_families()) {
@@ -501,6 +506,10 @@ public:
         ReadReplicasSettings_ = TReadReplicasSettings(mode, readReplicasCount);
     }
 
+    void SetStoreType(EStoreType type) {
+        StoreType_ = type;
+    }
+
     const TVector<TString>& GetPrimaryKeyColumns() const {
         return PrimaryKey_;
     }
@@ -523,6 +532,10 @@ public:
 
     const TMaybe<TString>& GetTiering() const {
         return Tiering_;
+    }
+
+    EStoreType GetStoreType() const {
+        return StoreType_;
     }
 
     const TString& GetOwner() const {
@@ -618,6 +631,7 @@ private:
     TMaybe<TReadReplicasSettings> ReadReplicasSettings_;
     bool HasStorageSettings_ = false;
     bool HasPartitioningSettings_ = false;
+    EStoreType StoreType_ = EStoreType::Row;
 };
 
 TTableDescription::TTableDescription()
@@ -668,6 +682,10 @@ TMaybe<TTtlSettings> TTableDescription::GetTtlSettings() const {
 
 TMaybe<TString> TTableDescription::GetTiering() const {
     return Impl_->GetTiering();
+}
+
+EStoreType TTableDescription::GetStoreType() const {
+    return Impl_->GetStoreType();
 }
 
 const TString& TTableDescription::GetOwner() const {
@@ -778,6 +796,10 @@ void TTableDescription::SetReadReplicasSettings(TReadReplicasSettings::EMode mod
     Impl_->SetReadReplicasSettings(mode, readReplicasCount);
 }
 
+void TTableDescription::SetStoreType(EStoreType type) {
+    Impl_->SetStoreType(type);
+}
+
 const TVector<TPartitionStats>& TTableDescription::GetPartitionStats() const {
     return Impl_->GetPartitionStats();
 }
@@ -855,6 +877,10 @@ void TTableDescription::SerializeTo(Ydb::Table::CreateTableRequest& request) con
 
     if (const auto& tiering = Impl_->GetTiering()) {
         request.set_tiering(*tiering);
+    }
+
+    if (Impl_->GetStoreType() == EStoreType::Column) {
+        request.set_store_type(Ydb::Table::StoreType::STORE_TYPE_COLUMN);
     }
 
     if (Impl_->HasStorageSettings()) {
@@ -1034,6 +1060,11 @@ TColumnFamilyDescription TColumnFamilyBuilder::Build() const {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+TTableBuilder& TTableBuilder::SetStoreType(EStoreType type) {
+    TableDescription_.SetStoreType(type);
+    return *this;
+}
 
 TTableBuilder& TTableBuilder::AddNullableColumn(const TString& name, const EPrimitiveType& type, const TString& family) {
     auto columnType = TTypeBuilder()
@@ -1352,11 +1383,6 @@ struct TRetryState {
     THandleStatusFunc HandleStatusFunc;
 };
 
-static void Backoff(const TBackoffSettings& settings, ui32 retryNumber) {
-    auto durationMs = CalcBackoffTime(settings, retryNumber);
-    Sleep(TDuration::MilliSeconds(durationMs));
-}
-
 class TRetryOperationContext : public TThrRefBase, TNonCopyable {
 public:
     using TRetryContextPtr = TIntrusivePtr<TRetryOperationContext>;
@@ -1390,12 +1416,12 @@ protected:
     virtual void Reset() {}
 
     static void DoRetry(TRetryContextPtr self, bool fast) {
-        self->TableClient.Impl_->AsyncBackoff(
-                    fast ? self->Settings.FastBackoffSettings_ : self->Settings.SlowBackoffSettings_,
-                    self->RetryNumber,
-                    [self]() {
-                        RunOp(self);
-                    }
+        AsyncBackoff(self->TableClient.Impl_,
+            fast ? self->Settings.FastBackoffSettings_ : self->Settings.SlowBackoffSettings_,
+            self->RetryNumber,
+            [self]() {
+                RunOp(self);
+            }
         );
     }
 

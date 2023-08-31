@@ -703,6 +703,7 @@ namespace NKikimr {
         NMonGroup::TReplGroup ReplMonGroup;
         NMonGroup::TSyncerGroup SyncerMonGroup;
         NMonGroup::TVDiskStateGroup VDiskMonGroup;
+        NMonGroup::TDskOutOfSpaceGroup DskOutOfSpaceGroup;
         TVDiskIncarnationGuid VDiskIncarnationGuid;
         bool HasUnreadableBlobs = false;
         TInstant LastSanitizeTime = TInstant::Zero();
@@ -1113,6 +1114,15 @@ namespace NKikimr {
             ctx.Send(ev->Sender, new NMon::TEvHttpInfoRes("NOT_READY"));
         }
 
+        template <class TEventPtr>
+        void DatabaseReadOnlyHandle(TEventPtr &ev, const TActorContext &ctx) {
+            LOG_ERROR_S(ctx, NKikimrServices::BS_SKELETON, VCtx->VDiskLogPrefix
+                << "Unavailable in read-only"
+                << " Sender# " << ev->Sender.ToString());
+           TInstant now = TAppData::TimeProvider->Now();
+           Reply(ev, ctx, NKikimrProto::ERROR, "VDisk is in read-only mode", now);
+        }
+
         ////////////////////////////////////////////////////////////////////////////
         // HANDLE SECTOR
         ////////////////////////////////////////////////////////////////////////////
@@ -1183,6 +1193,7 @@ namespace NKikimr {
                    VCtx->VDiskLogPrefix.data(), msgName, NKikimrBlobStorage::EVDiskInternalQueueId_Name(intQueueId).data(),
                    NKikimrBlobStorage::EVDiskQueueId_Name(extQueueId).data());
 
+            DskOutOfSpaceGroup.EstimatedDiskTimeConsumptionNs() += cost;
             TExtQueueClass &extQueue = GetExtQueue(extQueueId);
             NBackpressure::TQueueClientId clientId(msgQoS);
             std::unique_ptr<IEventHandle> event = extQueue.Enqueue(ctx, std::unique_ptr<IEventHandle>(
@@ -1862,6 +1873,20 @@ namespace NKikimr {
                 || std::is_same_v<TEv, TEvBlobStorage::TEvVGet>
                 || std::is_same_v<TEv, TEvBlobStorage::TEvVPut>;
 
+        template <typename TEv>
+        static constexpr bool IsReadOnlyCompatible = (
+            std::is_same_v<TEv, TEvBlobStorage::TEvVCheckReadiness> ||
+            std::is_same_v<TEv, TEvBlobStorage::TEvVDbStat> ||
+            std::is_same_v<TEv, TEvBlobStorage::TEvVGet> ||
+            std::is_same_v<TEv, TEvBlobStorage::TEvVGetBarrier> ||
+            std::is_same_v<TEv, TEvBlobStorage::TEvVGetBlock> ||
+            std::is_same_v<TEv, TEvGetLogoBlobIndexStatRequest> ||
+            std::is_same_v<TEv, TEvBlobStorage::TEvVStatus> ||
+            std::is_same_v<TEv, TEvBlobStorage::TEvVAssimilate> ||
+            std::is_same_v<TEv, TEvBlobStorage::TEvVSync> ||
+            std::is_same_v<TEv, TEvBlobStorage::TEvVSyncFull>
+        );
+
         template<typename TEventType>
         void CheckExecute(TAutoPtr<TEventHandle<TEventType>>& ev, const TActorContext& ctx) {
             if constexpr (IsPatchEvent<TEventType>) {
@@ -1895,6 +1920,9 @@ namespace NKikimr {
                 return Reply(ev, ctx, NKikimrProto::RACE, "group generation mismatch", TAppData::TimeProvider->Now());
             } else if (!GInfo->CheckScope(TKikimrScopeId(ev->OriginScopeId), ctx, true)) {
                 DatabaseAccessDeniedHandle(ev, ctx);
+            } else if (Config->BaseInfo.ReadOnly && !IsReadOnlyCompatible<TEventType>) {
+                LOG_INFO_S(ctx, BS_SKELETON, VCtx->VDiskLogPrefix << "Blocking request incompatible with read-only: " << TypeName<TEventType>());
+                DatabaseReadOnlyHandle(ev, ctx);
             } else {
                 SetReceivedTime(ev);
                 CheckExecute(ev, ctx);
@@ -2091,6 +2119,7 @@ namespace NKikimr {
             , ReplMonGroup(VDiskCounters, "subsystem", "repl")
             , SyncerMonGroup(VDiskCounters, "subsystem", "syncer")
             , VDiskMonGroup(VDiskCounters, "subsystem", "state")
+            , DskOutOfSpaceGroup(VDiskCounters, "subsystem", "outofspace")
         {
             ReplMonGroup.ReplUnreplicatedVDisks() = 1;
             VDiskMonGroup.VDiskState(NKikimrWhiteboard::EVDiskState::Initial);

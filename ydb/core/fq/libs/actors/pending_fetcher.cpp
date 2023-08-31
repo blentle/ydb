@@ -41,7 +41,6 @@
 #include <ydb/public/sdk/cpp/client/ydb_driver/driver.h>
 #include <ydb/public/sdk/cpp/client/ydb_value/value.h>
 #include <ydb/public/sdk/cpp/client/ydb_result/result.h>
-#include <ydb/public/lib/fq/scope.h>
 
 #include <ydb/core/fq/libs/common/compression.h>
 #include <ydb/core/fq/libs/common/entity_id.h>
@@ -350,7 +349,7 @@ private:
             *resources.mutable_topic_consumers() = task.created_topic_consumers();
         }
 
-        NFq::NConfig::TYdbStorageConfig computeConnection = ComputeConfig.GetConnection(task.scope());
+        NFq::NConfig::TYdbStorageConfig computeConnection = ComputeConfig.GetExecutionConnection(task.scope());
         computeConnection.set_endpoint(task.compute_connection().endpoint());
         computeConnection.set_database(task.compute_connection().database());
         computeConnection.set_usessl(task.compute_connection().usessl());
@@ -398,7 +397,7 @@ private:
             );
 
         auto runActorId =
-            ComputeConfig.GetComputeType(task) == NConfig::EComputeType::YDB
+            ComputeConfig.GetComputeType(task.query_type(), task.scope()) == NConfig::EComputeType::YDB
                 ? Register(CreateYdbRunActor(std::move(params), queryCounters))
                 : Register(CreateRunActor(SelfId(), queryCounters, std::move(params)));
 

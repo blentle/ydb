@@ -167,6 +167,10 @@ public:
         return Runner->GetTaskParams();
     }
 
+    const TVector<TString>& GetReadRanges() const override {
+        return Runner->GetReadRanges();
+    }
+
     const THashMap<TString,TString>& GetSecureParams() const override {
         return Runner->GetSecureParams();
     }
@@ -261,14 +265,27 @@ public:
         NDq::TDqTaskRunnerSettings settings;
         settings.TerminateOnError = TerminateOnError;
         settings.CollectBasicStats = true;
-        settings.CollectProfileStats = true;
+        settings.CollectProfileStats = false;
 
         Yql::DqsProto::TTaskMeta taskMeta;
         task.GetMeta().UnpackTo(&taskMeta);
 
         for (const auto& s : taskMeta.GetSettings()) {
-            if ("OptLLVM" == s.GetName())
+            if ("OptLLVM" == s.GetName()) {
                 settings.OptLLVM = s.GetValue();
+            }
+            if ("TaskRunnerStats" == s.GetName()) {
+                if ("Disable" == s.GetValue()) {
+                    settings.CollectBasicStats = false;
+                    settings.CollectProfileStats = false;
+                } else if ("Profile" == s.GetValue()) {
+                    settings.CollectBasicStats = true;
+                    settings.CollectProfileStats = true;
+                } else if ("Basic" == s.GetValue()) {
+                    settings.CollectBasicStats = true;
+                    settings.CollectProfileStats = false;
+                }
+            }
         }
         for (const auto& x : taskMeta.GetSecureParams()) {
             settings.SecureParams[x.first] = x.second;
@@ -276,6 +293,10 @@ public:
 
         for (const auto& x : taskMeta.GetTaskParams()) {
             settings.TaskParams[x.first] = x.second;
+        }
+
+        for (const auto& readRange : taskMeta.GetReadRanges()) {
+            settings.ReadRanges.push_back(readRange);
         }
         auto ctx = ExecutionContext;
         ctx.FuncProvider = TaskTransformFactory(settings.TaskParams, ctx.FuncRegistry);

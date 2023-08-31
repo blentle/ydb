@@ -6,6 +6,7 @@
 #include <ydb/core/base/tx_processing.h>
 #include <ydb/core/persqueue/config/config.h>
 #include <ydb/core/persqueue/partition_key_range/partition_key_range.h>
+#include <ydb/core/persqueue/writer/source_id_encoding.h>
 #include <ydb/core/protos/pqconfig.pb.h>
 #include <ydb/core/protos/counters_keyvalue.pb.h>
 #include <ydb/core/metering/metering.h>
@@ -28,7 +29,7 @@ static constexpr TDuration TOTAL_TIMEOUT = TDuration::Seconds(120);
 static constexpr char TMP_REQUEST_MARKER[] = "__TMP__REQUEST__MARKER__";
 static constexpr ui32 CACHE_SIZE = 100_MB;
 static constexpr ui32 MAX_BYTES = 25_MB;
-static constexpr ui32 MAX_SOURCE_ID_LENGTH = 10_KB;
+static constexpr ui32 MAX_SOURCE_ID_LENGTH = 2048;
 
 struct TPartitionInfo {
     TPartitionInfo(const TActorId& actor, TMaybe<TPartitionKeyRange>&& keyRange,
@@ -1724,6 +1725,14 @@ void TPersQueue::HandleWriteRequest(const ui64 responseCookie, const TActorId& p
         return;
     }
 
+    if (req.HasWriteId()) {
+        LOG_DEBUG_S(ctx, NKikimrServices::PERSQUEUE,
+                    "Tablet " << TabletID() <<
+                    " Write in transaction." <<
+                    " Partition: " << req.GetPartition() <<
+                    ", WriteId: " << req.GetWriteId());
+    }
+
     for (ui32 i = 0; i < req.CmdWriteSize(); ++i) {
         const auto& cmd = req.GetCmdWrite(i);
 
@@ -1766,7 +1775,7 @@ void TPersQueue::HandleWriteRequest(const ui64 responseCookie, const TActorId& p
             errorStr = "TotalSize must be filled for first part";
         } else if (cmd.HasTotalSize() && static_cast<size_t>(cmd.GetTotalSize()) <= cmd.GetData().size()) { // TotalSize must be > size of each part
             errorStr = "TotalSize is incorrect";
-        } else if (cmd.GetSourceId().size() > MAX_SOURCE_ID_LENGTH) {
+        } else if (cmd.HasSourceId() && !cmd.GetSourceId().empty() && NPQ::NSourceIdEncoding::Decode(cmd.GetSourceId()).length() > MAX_SOURCE_ID_LENGTH) {
             errorStr = "Too big SourceId";
         } else if (mirroredPartition && !cmd.GetDisableDeduplication()) {
             errorStr = "Write to mirrored topic is forbiden";
@@ -1879,6 +1888,14 @@ void TPersQueue::HandleReserveBytesRequest(const ui64 responseCookie, const TAct
     if (!req.HasOwnerCookie()) {
         ReplyError(ctx, responseCookie, NPersQueue::NErrorCode::BAD_REQUEST, "OwnerCookie must be set for ReserveBytes request");
         return;
+    }
+
+    if (req.HasWriteId()) {
+        LOG_DEBUG_S(ctx, NKikimrServices::PERSQUEUE,
+                    "Tablet " << TabletID() <<
+                    " Reserve bytes in transaction." <<
+                    " Partition: " << req.GetPartition() <<
+                    ", WriteId: " << req.GetWriteId());
     }
 
     InitResponseBuilder(responseCookie, 1, COUNTER_LATENCY_PQ_RESERVE_BYTES);
@@ -2127,7 +2144,7 @@ void TPersQueue::Handle(TEvPersQueue::TEvRequest::TPtr& ev, const TActorContext&
     ui32 partition = req.GetPartition();
     auto it = Partitions.find(partition);
 
-    LOG_DEBUG_S(ctx, NKikimrServices::PERSQUEUE, "Tablet " << TabletID() << " got client message batch for topic " << TopicConverter->GetClientsideName() << " partition " << partition << "\n");
+    LOG_DEBUG_S(ctx, NKikimrServices::PERSQUEUE, "Tablet " << TabletID() << " got client message batch for topic " << TopicConverter->GetClientsideName() << " partition " << partition);
 
     if (it == Partitions.end()) {
         ReplyError(ctx, responseCookie, NPersQueue::NErrorCode::WRONG_PARTITION_NUMBER,
@@ -2416,7 +2433,7 @@ void TPersQueue::HandleDataTransaction(TAutoPtr<TEvPersQueue::TEvProposeTransact
         LOG_DEBUG_S(ctx, NKikimrServices::PERSQUEUE,
                     "Tablet " << TabletID() <<
                     " tx=" << event.GetTxId() <<
-                    ", lock_tx_id=" << txBody.GetLockTxId() <<
+                    ", write_id=" << txBody.GetWriteId() <<
                     ", path=" << operation.GetPath() <<
                     ", partition=" << operation.GetPartitionId() <<
                     ", consumer=" << operation.GetConsumer() <<
@@ -2425,7 +2442,7 @@ void TPersQueue::HandleDataTransaction(TAutoPtr<TEvPersQueue::TEvProposeTransact
                     ", is_write=" << isWriteOperation);
     }
 
-    if (TabletState != NKikimrPQ::ENormal) {
+    if ((TabletState != NKikimrPQ::ENormal) || txBody.HasWriteId()) {
         SendProposeTransactionAbort(ActorIdFromProto(event.GetSourceActor()),
                                     event.GetTxId(),
                                     ctx);

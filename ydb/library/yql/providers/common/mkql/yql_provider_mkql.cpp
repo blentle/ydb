@@ -2,6 +2,7 @@
 #include "yql_type_mkql.h"
 
 #include <ydb/library/yql/providers/common/schema/expr/yql_expr_schema.h>
+#include <ydb/library/yql/core/yql_expr_type_annotation.h>
 #include <ydb/library/yql/core/expr_nodes/yql_expr_nodes.h>
 #include <ydb/library/yql/core/yql_expr_type_annotation.h>
 #include <ydb/library/yql/core/yql_join.h>
@@ -599,6 +600,7 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
 
         {"Extend", &TProgramBuilder::Extend},
         {"OrderedExtend", &TProgramBuilder::Extend},
+        {"BlockExtend", &TProgramBuilder::BlockExtend},
 
         {"Zip", &TProgramBuilder::Zip},
         {"ZipAll", &TProgramBuilder::ZipAll},
@@ -674,7 +676,11 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
     AddCallable("WideMap", [](const TExprNode& node, TMkqlBuildContext& ctx) {
         const auto arg = MkqlBuildExpr(node.Head(), ctx);
         const auto lambda = [&](TRuntimeNode::TList items) { return MkqlBuildWideLambda(node.Tail(), ctx, items); };
-        return ctx.ProgramBuilder.WideMap(arg, lambda);
+        TRuntimeNode result = ctx.ProgramBuilder.WideMap(arg, lambda);
+        if (IsWideBlockType(*node.GetTypeAnn()->Cast<TFlowExprType>()->GetItemType())) {
+            result = ctx.ProgramBuilder.BlockExpandChunked(result);
+        }
+        return result;
     });
 
     AddCallable("WideChain1Map", [](const TExprNode& node, TMkqlBuildContext& ctx) {
@@ -844,6 +850,47 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
         const auto tupleObj = MkqlBuildExpr(node.Head(), ctx);
         const auto index = FromString<ui32>(node.Tail().Content());
         return ctx.ProgramBuilder.Nth(tupleObj, index);
+    });
+
+    AddCallable("MatchRecognizeCore", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        const auto& inputStream = node.Child(0);
+        const auto& partitionKeySelector = node.Child(1);
+        const auto& partitionColumns = node.Child(2);
+        const auto& params = node.Child(3);
+
+        //explore params
+        const auto& measures = params->ChildRef(0);
+
+        //explore measures
+        const auto measureNames = measures->ChildRef(2);
+        constexpr size_t FirstMeasureLambdaIndex = 3;
+
+        TVector<TStringBuf> partitionColumnNames;
+        for (const auto& n: partitionColumns->Children()) {
+            partitionColumnNames.push_back(n->Content());
+        }
+
+        TProgramBuilder::TUnaryLambda getPartitionKeySelector = [partitionKeySelector, &ctx](TRuntimeNode inputRowArg){
+            return MkqlBuildLambda(*partitionKeySelector, ctx, {inputRowArg});
+        };
+
+        TVector<std::pair<TStringBuf, TProgramBuilder::TBinaryLambda>> getMeasures(measureNames->ChildrenSize());
+        for (size_t i = 0; i != measureNames->ChildrenSize(); ++i) {
+            getMeasures[i] = std::pair{
+                    measureNames->ChildRef(i)->Content(),
+                    [i, measures, &ctx](TRuntimeNode data, TRuntimeNode matchedVars) {
+                        return MkqlBuildLambda(*measures->ChildRef(FirstMeasureLambdaIndex + i), ctx,
+                                               {data, matchedVars});
+                    }
+            };
+        }
+
+        return ctx.ProgramBuilder.MatchRecognizeCore(
+                MkqlBuildExpr(*inputStream, ctx),
+                getPartitionKeySelector,
+                partitionColumnNames,
+                getMeasures
+                );
     });
 
     AddCallable("Guess", [](const TExprNode& node, TMkqlBuildContext& ctx) {
@@ -2193,6 +2240,23 @@ TMkqlCommonCallableCompiler::TShared::TShared() {
             str = ctx.ProgramBuilder.NewDataLiteral<NUdf::EDataSlot::String>(FormatType(node.Head().GetTypeAnn()->Cast<TTypeExprType>()->GetType()));
         }
         return str;
+    });
+
+    AddCallable("FormatTypeDiff", [](const TExprNode& node, TMkqlBuildContext& ctx) {
+        if (node.Child(0)->GetTypeAnn()->GetKind() == ETypeAnnotationKind::Resource) { // if we got resource + resource
+            YQL_ENSURE(node.Child(1)->GetTypeAnn()->GetKind() == ETypeAnnotationKind::Resource);
+            TCallableBuilder call(ctx.ProgramBuilder.GetTypeEnvironment(), node.Content(), ctx.ProgramBuilder.NewDataType(NUdf::TDataType<char*>::Id));
+            call.Add(MkqlBuildExpr(*node.Child(0), ctx));
+            call.Add(MkqlBuildExpr(*node.Child(1), ctx));
+            call.Add(ctx.ProgramBuilder.NewDataLiteral(FromString<bool>(*node.Child(2), NUdf::EDataSlot::Bool)));
+            return TRuntimeNode(call.Build(), false);
+        } else { // if we got type + type 
+            bool pretty = FromString<bool>(*node.Child(2), NUdf::EDataSlot::Bool);
+            const auto type_left = node.Child(0)->GetTypeAnn()->Cast<TTypeExprType>()->GetType();
+            const auto type_right = node.Child(1)->GetTypeAnn()->Cast<TTypeExprType>()->GetType();
+            return pretty ? ctx.ProgramBuilder.NewDataLiteral<NUdf::EDataSlot::String>(NYql::GetTypePrettyDiff(*type_left, *type_right)) :
+                ctx.ProgramBuilder.NewDataLiteral<NUdf::EDataSlot::String>(NYql::GetTypeDiff(*type_left, *type_right));
+        }
     });
 
     AddCallable("Void", [](const TExprNode&, TMkqlBuildContext& ctx) {

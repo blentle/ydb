@@ -1,69 +1,8 @@
-#include <contrib/libs/fmt/include/fmt/format.h>
-
-#include <ydb/library/yql/ast/yql_expr.h>
-#include <ydb/library/yql/providers/common/provider/yql_provider_names.h>
-#include <ydb/library/yql/sql/sql.h>
-#include <ydb/library/yql/parser/pg_catalog/catalog.h>
-#include <ydb/library/yql/parser/pg_wrapper/interface/config.h>
+#include "ut/util.h"
 
 #include <library/cpp/testing/unittest/registar.h>
 
-
 using namespace NSQLTranslation;
-
-enum class EDebugOutput {
-    None,
-    ToCerr,
-};
-
-TString Err2Str(NYql::TAstParseResult& res, EDebugOutput debug = EDebugOutput::None) {
-    TStringStream s;
-    res.Issues.PrintTo(s);
-
-    if (debug == EDebugOutput::ToCerr) {
-        Cerr << s.Str() << Endl;
-    }
-    return s.Str();
-}
-
-NYql::TAstParseResult SqlToYqlWithMode(const TString& query, NSQLTranslation::ESqlMode mode = NSQLTranslation::ESqlMode::QUERY, size_t maxErrors = 10, const TString& provider = {},
-    EDebugOutput debug = EDebugOutput::None, bool ansiLexer = false, NSQLTranslation::TTranslationSettings settings = {})
-{
-    google::protobuf::Arena arena;
-    const auto service = provider ? provider : TString(NYql::YtProviderName);
-    const TString cluster = "plato";
-    settings.ClusterMapping[cluster] = service;
-    settings.ClusterMapping["hahn"] = NYql::YtProviderName;
-    settings.ClusterMapping["mon"] = NYql::SolomonProviderName;
-    settings.ClusterMapping[""] = NYql::KikimrProviderName;
-    settings.MaxErrors = maxErrors;
-    settings.Mode = mode;
-    settings.Arena = &arena;
-    settings.AnsiLexer = ansiLexer;
-    settings.SyntaxVersion = 1;
-    settings.PgParser = true;
-    auto res = SqlToYql(query, settings);
-    if (debug == EDebugOutput::ToCerr) {
-        Err2Str(res, debug);
-    }
-    return res;
-}
-
-NYql::TAstParseResult PgSqlToYql(const TString& query, size_t maxErrors = 10, const TString& provider = {}, EDebugOutput debug = EDebugOutput::None) {
-    return SqlToYqlWithMode(query, NSQLTranslation::ESqlMode::QUERY, maxErrors, provider, debug);
-}
-
-using TAstNodeVisitFunc = std::function<void(const NYql::TAstNode& root)>;
-
-void VisitAstNodes(const NYql::TAstNode& root, const TAstNodeVisitFunc& visitFunc) {
-    visitFunc(root);
-    if (!root.IsList()) {
-        return;
-    }
-    for (size_t childIdx = 0; childIdx < root.GetChildrenCount(); ++childIdx) {
-        VisitAstNodes(*root.GetChild(childIdx), visitFunc);
-    }
-}
 
 Y_UNIT_TEST_SUITE(PgSqlParsingOnly) {
     Y_UNIT_TEST(InsertStmt) {
@@ -408,17 +347,27 @@ Y_UNIT_TEST_SUITE(PgSqlParsingOnly) {
 
     Y_UNIT_TEST(UpdateStmt) {
         auto res = PgSqlToYql("UPDATE plato.Input SET kind = 'test' where kind = 'testtest'");
+        Cerr << res.Root->ToString();
         TString updateStmtProg = R"(
             (
                 (let world (Configure! world (DataSource 'config) 'OrderedColumns))
                 (let read0 (Read! world (DataSource '"yt" '"plato") (Key '('table (String '"input"))) (Void) '()))
                 (let world (Left! read0))
-                (let world (block '(
-                  (let update_select (PgSelect '('('set_items '((PgSetItem '('('result '((PgResultItem '"kind" (Void) (lambda '() (PgConst '"test" (PgType 'text)))))) '('from '('((Right! read0) '"input" '()))) '('join_ops '('())) '('where (PgWhere (Void) (lambda '() (PgOp '"=" (PgColumnRef '"kind") (PgConst '"testtest" (PgType 'text)))))))))) '('set_ops '('push)))))
-                  (let sink (DataSink '"yt" '"plato"))
-                  (let key (Key '('table (String '"input"))))
-                  (return (Write! world sink key (Void) '('('pg_update update_select) '('mode 'update))))
-                )))
+                (let world (block '((let update_select
+                (PgSelect '(
+                    '('set_items '((PgSetItem
+                        '('('emit_pg_star)
+                        '('result '((PgResultItem '"" (Void) (lambda '() (PgStar)))
+                            (PgResultItem '"kind" (Void) (lambda '() (PgConst '"test" (PgType 'text))))))
+                        '('from '('((Right! read0) '"input" '())))
+                        '('join_ops '('()))
+                        '('where (PgWhere (Void) (lambda '() (PgOp '"=" (PgColumnRef '"kind") (PgConst '"testtest" (PgType 'text))))))))))
+                        '('set_ops '('push)))
+                    )
+                )
+                (let sink (DataSink '"yt" '"plato"))
+                (let key (Key '('table (String '"input"))))
+                (return (Write! world sink key (Void) '('('pg_update update_select) '('mode 'update)))))))
                 (let world (CommitAll! world))
                 (return world)
             )

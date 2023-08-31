@@ -120,7 +120,9 @@
                 {"Index": 10, "Name": "Changefeeds", "Type": "TCoChangefeedList"},
                 {"Index": 11, "Name": "TableType", "Type": "TCoAtom"},
                 {"Index": 12, "Name": "NotNullColumns", "Type": "TCoAtomList"},
-                {"Index": 13, "Name": "SerialColumns", "Type": "TCoAtomList"}
+                {"Index": 13, "Name": "SerialColumns", "Type": "TCoAtomList"},
+                {"Index": 14, "Name": "ColumnsDefaultValues", "Type": "TCoNameValueTupleList"},
+                {"Index": 15, "Name": "Temporary", "Type": "TCoAtom"}
             ]
         },
         {
@@ -144,7 +146,8 @@
                 {"Index": 1, "Name": "DataSink", "Type": "TKiDataSink"},
                 {"Index": 2, "Name": "Table", "Type": "TCoAtom"},
                 {"Index": 3, "Name": "Settings", "Type": "TCoNameValueTupleList"},
-                {"Index": 4, "Name": "TableType", "Type": "TCoAtom"}
+                {"Index": 4, "Name": "TableType", "Type": "TCoAtom"},
+                {"Index": 5, "Name": "MissingOk", "Type": "TCoAtom"}
             ]
         },
         {

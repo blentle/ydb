@@ -4,12 +4,15 @@
 #include "kv_workload.h"
 #include "click_bench.h"
 #include "tpch.h"
+#include "tpcc_workload.h"
 #include "topic_workload/topic_workload.h"
 #include "transfer_workload/transfer_workload.h"
+#include "ydb/library/yverify_stream/yverify_stream.h"
 
 #include <ydb/library/workload/workload_factory.h>
 #include <ydb/public/lib/ydb_cli/commands/ydb_common.h>
 
+#include <util/random/random.h>
 #include <library/cpp/threading/local_executor/local_executor.h>
 
 #include <atomic>
@@ -44,6 +47,7 @@ TCommandWorkload::TCommandWorkload()
     AddCommand(std::make_unique<TCommandWorkloadTopic>());
     AddCommand(std::make_unique<TCommandWorkloadTransfer>());
     AddCommand(std::make_unique<TCommandTpch>());
+    AddCommand(std::make_unique<TCommandTPCCWorkload>());
 }
 
 TWorkloadCommand::TWorkloadCommand(const TString& name, const std::initializer_list<TString>& aliases, const TString& description)
@@ -86,6 +90,8 @@ void TWorkloadCommand::Config(TConfig& config) {
 }
 
 void TWorkloadCommand::PrepareForRun(TConfig& config) {
+    SetRandomSeed(Now().MicroSeconds());
+
     auto driverConfig = TDriverConfig()
         .SetEndpoint(config.Address)
         .SetDatabase(config.Database)
@@ -114,17 +120,28 @@ void TWorkloadCommand::WorkerFn(int taskId, TWorkloadQueryGenPtr workloadGen, co
     NYdbWorkload::TQueryInfo queryInfo;
     auto runQuery = [this, &queryInfo, &querySettings, &retryCount] (NYdb::NTable::TSession session) -> NYdb::TStatus {
         ++retryCount;
-        TStatus result(EStatus::SUCCESS, NYql::TIssues());
-        if (queryInfo.UseReadRows) {
-            result = TableClient->ReadRows(queryInfo.TablePath, std::move(*queryInfo.KeyToRead))
+        if (queryInfo.AlterTable) {
+            auto result = TableClient->RetryOperationSync([&queryInfo](NTable::TSession session) {
+                return session.AlterTable(queryInfo.TablePath, queryInfo.AlterTable.value()).GetValueSync();
+            });
+            return result;
+        } else if (queryInfo.UseReadRows) {
+            auto result = TableClient->ReadRows(queryInfo.TablePath, std::move(*queryInfo.KeyToRead))
                 .GetValueSync();
+            if (queryInfo.ReadRowsResultCallback) {
+                queryInfo.ReadRowsResultCallback.value()(result);
+            }
+            return result;
         } else {
-            result = session.ExecuteDataQuery(queryInfo.Query.c_str(),
+            auto result = session.ExecuteDataQuery(queryInfo.Query.c_str(),
                 NYdb::NTable::TTxControl::BeginTx(NYdb::NTable::TTxSettings::SerializableRW()).CommitTx(),
                 queryInfo.Params, querySettings
             ).GetValueSync();
+            if (queryInfo.DataQueryResultCallback) {
+                queryInfo.DataQueryResultCallback.value()(result);
+            }
+            return result;
         }
-        return result;
     };
 
     while (Now() < StopTime) {
@@ -177,11 +194,15 @@ int TWorkloadCommand::RunWorkload(TWorkloadQueryGenPtr workloadGen, const int ty
     }
 
     StartTime = Now();
-    StopTime = StartTime + TDuration::Seconds(Seconds);
+    StopTime = StartTime + TDuration::Seconds(TotalSec);
 
     NPar::LocalExecutor().RunAdditionalThreads(Threads);
     auto futures = NPar::LocalExecutor().ExecRangeWithFutures([this, &workloadGen, type](int id) {
-        WorkerFn(id, workloadGen, type);
+        try {
+            WorkerFn(id, workloadGen, type);
+        } catch (std::exception& error) {
+            Y_FAIL_S(error.what());
+        }
     }, 0, Threads, NPar::TLocalExecutor::MED_PRIORITY);
 
     int windowIt = 1;

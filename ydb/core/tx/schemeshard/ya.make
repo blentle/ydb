@@ -1,5 +1,4 @@
 RECURSE_FOR_TESTS(
-    ut_async_index
     ut_backup
     ut_base
     ut_base_reboots
@@ -17,6 +16,7 @@ RECURSE_FOR_TESTS(
     ut_extsubdomain
     ut_extsubdomain_reboots
     ut_filestore_reboots
+    ut_index
     ut_index_build
     ut_index_build_reboots
     ut_login
@@ -24,7 +24,6 @@ RECURSE_FOR_TESTS(
     ut_move_reboots
     ut_olap
     ut_olap_reboots
-    ut_pq
     ut_pq_reboots
     ut_reboots
     ut_replication
@@ -214,6 +213,7 @@ SRCS(
     schemeshard_import_flow_proposals.cpp
     schemeshard_import.cpp
     schemeshard_build_index.cpp
+    schemeshard_build_index_tx_base.cpp
     schemeshard_build_index__cancel.cpp
     schemeshard_build_index__forget.cpp
     schemeshard_build_index__list.cpp

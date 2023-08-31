@@ -5,13 +5,13 @@ PEERDIR(
     library/cpp/enumbitset
     library/cpp/yson/node
     library/cpp/json
-    ydb/library/yql/core/sql_types
     ydb/library/yql/minikql
     ydb/library/yql/public/udf
     ydb/library/yql/sql/settings
     ydb/library/yql/core
     ydb/library/yql/core/issue
     ydb/library/yql/core/issue/protos
+    ydb/library/yql/core/sql_types
     ydb/library/yql/parser/lexer_common
     ydb/library/yql/parser/proto_ast
     ydb/library/yql/parser/proto_ast/collect_issues
@@ -30,6 +30,7 @@ SRCS(
     join.cpp
     insert.cpp
     list_builtin.cpp
+    match_recognize.cpp
     node.cpp
     select.cpp
     source.cpp
@@ -37,6 +38,7 @@ SRCS(
     sql_call_expr.cpp
     sql_expression.cpp
     sql_group_by.cpp
+    sql_match_recognize.cpp
     sql_into_tables.cpp
     sql_query.cpp
     sql_select.cpp
@@ -48,11 +50,18 @@ SRCS(
 
 YQL_LAST_ABI_VERSION()
 
+GENERATE_ENUM_SERIALIZATION(match_recognize.h)
 GENERATE_ENUM_SERIALIZATION(node.h)
-
 GENERATE_ENUM_SERIALIZATION(sql_call_param.h)
 
 END()
+
+RECURSE(
+    format
+    lexer
+    perf
+    proto_parser
+)
 
 RECURSE_FOR_TESTS(
     ut

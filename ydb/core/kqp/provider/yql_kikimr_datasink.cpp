@@ -190,7 +190,7 @@ private:
                 }
                 auto mode = settings.Mode.Cast();
 
-                if (mode == "drop") {
+                if (mode == "drop" || mode == "drop_if_exists") {
                     HandleDropTable(SessionCtx, settings, key, cluster);
                     return TStatus::Ok;
                 } else if (
@@ -208,18 +208,20 @@ private:
                         << "INSERT OR IGNORE is not yet supported for Kikimr."));
                     return TStatus::Error;
                 } else if (mode == "update") {
-                    if (!settings.Filter) {
-                        ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), "Filter option is required for table update."));
-                        return TStatus::Error;
-                    }
-                    if (!settings.Update) {
-                        ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), "Update option is required for table update."));
-                        return TStatus::Error;
+                    if (!settings.PgFilter) {
+                        if (!settings.Filter) {
+                            ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), "Filter option is required for table update."));
+                            return TStatus::Error;
+                        }
+                        if (!settings.Update) {
+                            ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), "Update option is required for table update."));
+                            return TStatus::Error;
+                        }
                     }
                     SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath());
                     return TStatus::Ok;
                 } else if (mode == "delete") {
-                    if (!settings.PgDelete && !settings.Filter) {
+                    if (!settings.Filter && !settings.PgFilter) {
                         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()), "Filter option is required for table delete."));
                         return TStatus::Error;
                     }
@@ -265,7 +267,7 @@ private:
 
                     SessionCtx->Tables().GetOrAddTable(TString(cluster), SessionCtx->GetDatabase(), key.GetTablePath(), tableType);
                     return TStatus::Ok;
-                } else if (mode == "drop") {
+                } else if (mode == "drop" || mode == "drop_if_exists") {
                     HandleDropTable(SessionCtx, settings, key, cluster);
                     return TStatus::Ok;
                 }
@@ -490,12 +492,17 @@ public:
         auto tableType = settings.TableType.IsValid()
             ? settings.TableType.Cast()
             : Build<TCoAtom>(ctx, node->Pos()).Value("table").Done(); // v0, pg support
+        bool missingOk = (settings.Mode.Cast().Value() == "drop_if_exists");
+
         return Build<TKiDropTable>(ctx, node->Pos())
             .World(node->Child(0))
             .DataSink(node->Child(1))
             .Table().Build(key.GetTablePath())
             .Settings(settings.Other)
             .TableType(tableType)
+            .MissingOk<TCoAtom>()
+                .Value(missingOk)
+            .Build()
             .Done()
             .Ptr();
     }
@@ -511,7 +518,7 @@ public:
             YQL_CVLOG(NLog::ELevel::ERROR, NLog::EComponent::ProviderKikimr) << "Skip RewriteIO for external entity: unknown entity type: " << (int)tableDesc.Metadata->ExternalSource.SourceType;
             return nullptr;
         }
-
+        
         ctx.Step.Repeat(TExprStep::DiscoveryIO)
                 .Repeat(TExprStep::Epochs)
                 .Repeat(TExprStep::Intents)
@@ -566,21 +573,35 @@ public:
                 NCommon::TWriteTableSettings settings = NCommon::ParseWriteTableSettings(TExprList(node->Child(4)), ctx);
                 YQL_ENSURE(settings.Mode);
                 auto mode = settings.Mode.Cast();
-                if (mode == "drop") {
+                if (mode == "drop" || mode == "drop_if_exists") {
                     return MakeKiDropTable(node, settings, key, ctx);
                 } else if (mode == "update") {
-                    YQL_ENSURE(settings.Filter);
-                    YQL_ENSURE(settings.Update);
-                    return Build<TKiUpdateTable>(ctx, node->Pos())
-                        .World(node->Child(0))
-                        .DataSink(node->Child(1))
-                        .Table().Build(key.GetTablePath())
-                        .Filter(settings.Filter.Cast())
-                        .Update(settings.Update.Cast())
-                        .Done()
-                        .Ptr();
+                    if (settings.Filter) {
+                        YQL_ENSURE(settings.Update);
+                        return Build<TKiUpdateTable>(ctx, node->Pos())
+                            .World(node->Child(0))
+                            .DataSink(node->Child(1))
+                            .Table().Build(key.GetTablePath())
+                            .Filter(settings.Filter.Cast())
+                            .Update(settings.Update.Cast())
+                            .Done()
+                            .Ptr();
+                    } else {
+                        YQL_ENSURE(settings.PgFilter);
+                        return Build<TKiWriteTable>(ctx, node->Pos())
+                            .World(node->Child(0))
+                            .DataSink(node->Child(1))
+                            .Table().Build(key.GetTablePath())
+                            .Input(settings.PgFilter.Cast())
+                            .Mode()
+                                .Value("update_on")
+                            .Build()
+                            .Settings(settings.Other)
+                            .Done()
+                            .Ptr();
+                    }
                 } else if (mode == "delete") {
-                    YQL_ENSURE(settings.Filter || settings.PgDelete);
+                    YQL_ENSURE(settings.Filter || settings.PgFilter);
                     if (settings.Filter) {
                         return Build<TKiDeleteTable>(ctx, node->Pos())
                             .World(node->Child(0))
@@ -594,7 +615,7 @@ public:
                             .World(node->Child(0))
                             .DataSink(node->Child(1))
                             .Table().Build(key.GetTablePath())
-                            .Input(settings.PgDelete.Cast())
+                            .Input(settings.PgFilter.Cast())
                             .Mode()
                                 .Value("delete_on")
                             .Build()
@@ -648,10 +669,15 @@ public:
                         settings.SerialColumns = Build<TCoAtomList>(ctx, node->Pos()).Done();
                     }
 
+                    auto temporary = settings.Temporary.IsValid()
+                        ? settings.Temporary.Cast()
+                        : Build<TCoAtom>(ctx, node->Pos()).Value("false").Done();
+
                     return Build<TKiCreateTable>(ctx, node->Pos())
                         .World(node->Child(0))
                         .DataSink(node->Child(1))
                         .Table().Build(key.GetTablePath())
+                        .Temporary(temporary)
                         .Columns(settings.Columns.Cast())
                         .PrimaryKey(settings.PrimaryKey.Cast())
                         .NotNullColumns(settings.NotNullColumns.Cast())
@@ -661,6 +687,7 @@ public:
                         .Changefeeds(settings.Changefeeds.Cast())
                         .PartitionBy(settings.PartitionBy.Cast())
                         .ColumnFamilies(settings.ColumnFamilies.Cast())
+                        .ColumnsDefaultValues(settings.ColumnsDefaultValues.Cast())
                         .TableSettings(settings.TableSettings.Cast())
                         .TableType(tableType)
                         .Done()
@@ -685,7 +712,7 @@ public:
                         .Done()
                         .Ptr();
 
-                 } else if (mode == "drop") {
+                 } else if (mode == "drop" || mode == "drop_if_exists") {
                     return MakeKiDropTable(node, settings, key, ctx);
                 } else {
                     YQL_ENSURE(false, "unknown TableScheme mode \"" << TString(mode) << "\"");

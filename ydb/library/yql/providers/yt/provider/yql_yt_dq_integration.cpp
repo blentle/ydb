@@ -42,37 +42,42 @@ public:
     {
     }
 
-    TVector<TMaybe<TVector<ui64>>> EstimateColumnStats(TExprContext& ctx, const TString& cluster, const TVector<TVector<TYtPathInfo::TPtr>>& groupIdPathInfos, ui64& sumAllTableSizes) {
-        TVector<TMaybe<TVector<ui64>>> groupIdColumnarStats;
+    TVector<TVector<ui64>> EstimateColumnStats(TExprContext& ctx, const TString& cluster, const TVector<TVector<TYtPathInfo::TPtr>>& groupIdPathInfos, ui64& sumAllTableSizes) {
+        TVector<TVector<ui64>> groupIdColumnarStats;
+        groupIdColumnarStats.reserve(groupIdPathInfos.size());
+        TVector<bool> lookupsInfo;
+        TVector<TYtPathInfo::TPtr> flattenPaths;
         for (const auto& pathInfos: groupIdPathInfos) {
-            TVector<TString> columns;
-            bool hasLookups = false;
             for (const auto& pathInfo: pathInfos) {
-                if (const auto cols = pathInfo->Columns) {
-                    if (columns.empty() && cols->GetColumns()) {
-                        for (auto& column : *cols->GetColumns()) {
-                            columns.push_back(column.Name);
-                        }
-                    }
-
-                    if (pathInfo->Table->Meta && pathInfo->Table->Meta->Attrs.Value("optimize_for", "scan") == "lookup") {
-                        hasLookups = true;
-                    }
+                auto hasLookup = pathInfo->Table->Meta && pathInfo->Table->Meta->Attrs.Value("optimize_for", "scan") == "lookup";
+                lookupsInfo.push_back(hasLookup);
+                if (!pathInfo->Table->Stat) {
+                    continue;
                 }
+                if (hasLookup) {
+                    continue;
+                }
+                flattenPaths.push_back(pathInfo);
             }
-
-            TMaybe<TVector<ui64>> columnarStat;
-
-            if (!columns.empty() && !hasLookups) {
-                columnarStat = EstimateDataSize(cluster, pathInfos, {columns}, *State_, ctx);
-            }
-
-            groupIdColumnarStats.push_back(columnarStat);
-            for (const auto& [pathId, path] : Enumerate(pathInfos)){
+        }
+        auto result = EstimateDataSize(cluster, flattenPaths, Nothing(), *State_, ctx);
+        size_t statIdx = 0;
+        size_t pathIdx = 0;
+        for (const auto& [idx, pathInfos]: Enumerate(groupIdPathInfos)) {
+            TVector<ui64> columnarStatInner;
+            columnarStatInner.reserve(pathInfos.size());
+            for (auto& path: pathInfos) {
                 const auto& tableInfo = *path->Table;
-                ui64 dataSize = columnarStat ? (*columnarStat)[pathId] : tableInfo.Stat->DataSize;
-                sumAllTableSizes += dataSize;
+                if (lookupsInfo[pathIdx++] || !tableInfo.Stat) {
+                    columnarStatInner.push_back(tableInfo.Stat ? tableInfo.Stat->DataSize : 0);
+                    sumAllTableSizes += columnarStatInner.back();
+                    continue;
+                }
+                columnarStatInner.push_back(result ? result->at(statIdx) : tableInfo.Stat->DataSize);
+                sumAllTableSizes += columnarStatInner.back();
+                ++statIdx;
             }
+            groupIdColumnarStats.emplace_back(std::move(columnarStatInner));
         }
         return groupIdColumnarStats;
     }
@@ -180,11 +185,8 @@ public:
             }
         } else {
             TVector<TVector<std::tuple<ui64, ui64, NYT::TRichYPath>>> partitionTuplesArr;
-
             ui64 sumAllTableSizes = 0;
-
-            TVector<TMaybe<TVector<ui64>>> groupIdColumnarStats = EstimateColumnStats(ctx, cluster, groupIdPathInfos, sumAllTableSizes);
-
+            TVector<TVector<ui64>> groupIdColumnarStats = EstimateColumnStats(ctx, cluster, {groupIdPathInfos}, sumAllTableSizes);
             ui64 parts = (sumAllTableSizes + dataSizePerJob - 1) / dataSizePerJob;
             if (canFallback && hasErasure && parts > maxTasks) {
                 std::string_view message = "DQ cannot execute the query. Cause: too big table with erasure codec";
@@ -202,11 +204,11 @@ public:
                 if (sampleSetting) {
                     sample = FromString<double>(sampleSetting->Child(1)->Child(1)->Content());
                 }
+                auto& groupStats = groupIdColumnarStats[groupId];
                 for (const auto& [pathId, path] : Enumerate(groupIdPathInfos[groupId])) {
                     const auto& tableInfo = *path->Table;
                     YQL_ENSURE(tableInfo.Stat, "Table has no stat.");
-                    auto columnarStat = groupIdColumnarStats[groupId];
-                    ui64 dataSize = columnarStat ? (*columnarStat)[pathId] : tableInfo.Stat->DataSize;
+                    ui64 dataSize = groupStats[pathId];
                     if (sample) {
                         dataSize *=* sample;
                     }
@@ -278,6 +280,7 @@ public:
                 AddInfo(ctx, TStringBuilder() << "disabled for cluster " << cluster, skipIssues);
                 return false;
             }
+            const auto canUseYtPartitioningApi = State_->Configuration->_EnableYtPartitioning.Get(cluster).GetOrElse(false);
             ui64 chunksCount = 0ull;
             for (auto section: maybeRead.Cast().Input()) {
                 if (HasSettingsExcept(maybeRead.Cast().Input().Item(0).Settings().Ref(), DqReadSupportedSettings)) {
@@ -319,7 +322,14 @@ public:
                         } else if (NYql::HasSetting(tableInfo->Settings.Ref(), EYtSettingType::WithQB)) {
                             AddInfo(ctx, "table with QB2 premapper", skipIssues);
                             return false;
+                        } else if (pathInfo.Ranges && !canUseYtPartitioningApi) {
+                            AddInfo(ctx, "table with ranges", skipIssues);
+                            return false;
+                        } else if (tableInfo->Meta->IsDynamic && !canUseYtPartitioningApi) {
+                            AddInfo(ctx, "dynamic table", skipIssues);
+                            return false;
                         }
+
                         chunksCount += tableInfo->Stat->ChunkCount;
                     }
                 }
@@ -334,60 +344,107 @@ public:
         return false;
     }
 
-    TMaybe<ui64> EstimateReadSize(ui64 dataSizePerJob, ui32 maxTasksPerStage, const TExprNode& node, TExprContext& ctx) override {
-        if (auto maybeRead = TMaybeNode<TYtReadTable>(&node)) {
-
-            ui64 dataSize = 0;
-            bool hasErasure = false;
-            auto cluster = maybeRead.Cast().DataSource().Cluster().StringValue();
-
-            const auto canUseYtPartitioningApi = State_->Configuration->_EnableYtPartitioning.Get(cluster).GetOrElse(false);
-
-            TVector<TVector<TYtPathInfo::TPtr>> groupIdPathInfos;
-
-            for (auto section: maybeRead.Cast().Input()) {
-                groupIdPathInfos.emplace_back();
+    TMaybe<TOptimizerStatistics> ReadStatistics(const TExprNode::TPtr& read, TExprContext& ctx) override {
+        Y_UNUSED(ctx);
+        TOptimizerStatistics stat(0, 0);
+        if (auto maybeRead = TMaybeNode<TYtReadTable>(read)) {
+            auto input = maybeRead.Cast().Input();
+            for (auto section: input) {
                 for (const auto& path: section.Paths()) {
                     auto pathInfo = MakeIntrusive<TYtPathInfo>(path);
                     auto tableInfo = pathInfo->Table;
-
                     YQL_ENSURE(tableInfo);
-                    if (!tableInfo->Stat) {
-                        continue;
+
+                    if (tableInfo->Stat) {
+                        stat.Nrows += tableInfo->Stat->RecordsCount;
                     }
-
-                    if (pathInfo->Ranges && !canUseYtPartitioningApi) {
-                        AddErrorWrap(ctx, node.Pos(), "table with ranges");
-                        return Nothing();
-                    } else if (tableInfo->Meta->IsDynamic && !canUseYtPartitioningApi) {
-                        AddErrorWrap(ctx, node.Pos(), "dynamic table");
-                        return Nothing();
-                    } else { //
-                        if (tableInfo->Meta->Attrs.Value("erasure_codec", "none") != "none") {
-                            hasErasure = true;
-                        }
-                    }
-                    groupIdPathInfos.back().emplace_back(pathInfo);
-                }
-            }
-
-            EstimateColumnStats(ctx, cluster, groupIdPathInfos, dataSize);
-
-            if (hasErasure) { //
-                if (auto codecCpu = State_->Configuration->ErasureCodecCpuForDq.Get(cluster)) {
-                    dataSizePerJob = Max(ui64(dataSizePerJob / *codecCpu), 10_KB);
-                    const ui64 parts = (dataSize + dataSizePerJob - 1) / dataSizePerJob;
-                    if (parts > maxTasksPerStage) {
-                        AddErrorWrap(ctx, node.Pos(), "too big table with erasure codec");
-                        return Nothing();
+                    if (pathInfo->Columns && pathInfo->Columns->GetColumns()) {
+                        stat.Ncols += pathInfo->Columns->GetColumns()->size();
                     }
                 }
             }
-
-            return dataSize;
         }
-        AddErrorWrap(ctx, node.Pos(), TStringBuilder() << "unsupported callable: " << node.Content());
-        return Nothing();
+        return stat;
+    }
+
+    TMaybe<ui64> EstimateReadSize(ui64 dataSizePerJob, ui32 maxTasksPerStage, const TVector<const TExprNode*>& nodes, TExprContext& ctx) override {
+        TVector<bool> hasErasurePerNode;
+        hasErasurePerNode.reserve(nodes.size());
+        TVector<ui64> dataSizes(nodes.size());
+        THashMap<TString, TVector<std::pair<const TExprNode*, bool>>> clusterToNodesAndErasure;
+        THashMap<TString, TVector<TVector<TYtPathInfo::TPtr>>> clusterToGroups;
+        const auto maxChunks = State_->Configuration->MaxChunksForDqRead.Get().GetOrElse(DEFAULT_MAX_CHUNKS_FOR_DQ_READ);
+        ui64 chunksCount = 0u;
+
+        for (const auto &node_: nodes) {
+            if (auto maybeRead = TMaybeNode<TYtReadTable>(node_)) {
+
+                bool hasErasure = false;
+                auto cluster = maybeRead.Cast().DataSource().Cluster().StringValue();
+                auto& groupIdPathInfo = clusterToGroups[cluster];
+
+                const auto canUseYtPartitioningApi = State_->Configuration->_EnableYtPartitioning.Get(cluster).GetOrElse(false);
+
+                auto input = maybeRead.Cast().Input();
+                for (auto section: input) {
+                    groupIdPathInfo.emplace_back();
+                    for (const auto& path: section.Paths()) {
+                        auto pathInfo = MakeIntrusive<TYtPathInfo>(path);
+                        auto tableInfo = pathInfo->Table;
+
+                        YQL_ENSURE(tableInfo);
+
+                        if (pathInfo->Ranges && !canUseYtPartitioningApi) {
+                            AddErrorWrap(ctx, node_->Pos(), "table with ranges");
+                            return Nothing();
+                        } else if (tableInfo->Meta->IsDynamic && !canUseYtPartitioningApi) {
+                            AddErrorWrap(ctx, node_->Pos(), "dynamic table");
+                            return Nothing();
+                        } else { //
+                            if (tableInfo->Meta->Attrs.Value("erasure_codec", "none") != "none") {
+                                hasErasure = true;
+                            }
+                            if (tableInfo->Stat) {
+                                chunksCount += tableInfo->Stat->ChunkCount;
+                            }
+                        }
+                        groupIdPathInfo.back().emplace_back(pathInfo);
+                    }
+                }
+                if (chunksCount > maxChunks) {
+                    AddErrorWrap(ctx, node_->Pos(), "table with too many chunks");
+                    return Nothing();
+                }
+                clusterToNodesAndErasure[cluster].push_back({node_, hasErasure});
+            } else {
+                AddErrorWrap(ctx, node_->Pos(), TStringBuilder() << "unsupported callable: " << node_->Content());
+                return Nothing();
+            }
+        }
+        ui64 dataSize = 0;
+        for (auto& [cluster, info]: clusterToNodesAndErasure) {
+            auto res = EstimateColumnStats(ctx, cluster, clusterToGroups[cluster], dataSize);
+            auto codecCpu = State_->Configuration->ErasureCodecCpuForDq.Get(cluster);
+            if (!codecCpu) {
+                continue;
+            }
+            size_t idx = 0;
+            for (auto& [node, hasErasure]: info) {
+                if (!hasErasure) {
+                    ++idx;
+                    continue;
+                }
+                ui64 readSize = std::accumulate(res[idx].begin(), res[idx].end(), 0);
+                ++idx;
+                dataSizePerJob = Max(ui64(dataSizePerJob / *codecCpu), 10_KB);
+                const ui64 parts = (readSize + dataSizePerJob - 1) / dataSizePerJob;
+                if (parts > maxTasksPerStage) {
+                    AddErrorWrap(ctx, node->Pos(), "too big table with erasure codec");
+                    return Nothing();
+                }
+            }
+        }
+        return dataSize;
     }
 
     void AddErrorWrap(TExprContext& ctx, const NYql::TPositionHandle& where, const TString& cause) {

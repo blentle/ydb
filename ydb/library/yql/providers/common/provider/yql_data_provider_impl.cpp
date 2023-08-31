@@ -165,6 +165,7 @@ void TDataProviderBase::Reset() {
         }
     }
     GetRecaptureOptProposalTransformer().Rewind();
+    GetStatisticsProposalTransformer().Rewind();
     GetLogicalOptProposalTransformer().Rewind();
     GetPhysicalOptProposalTransformer().Rewind();
     GetPhysicalFinalizingTransformer().Rewind();
@@ -176,6 +177,10 @@ void TDataProviderBase::Reset() {
 }
 
 IGraphTransformer& TDataProviderBase::GetRecaptureOptProposalTransformer() {
+    return NullTransformer_;
+}
+
+IGraphTransformer& TDataProviderBase::GetStatisticsProposalTransformer() {
     return NullTransformer_;
 }
 
@@ -268,7 +273,7 @@ bool TDataProviderBase::ValidateExecution(const TExprNode& node, TExprContext& c
 }
 
 void TDataProviderBase::GetRequiredChildren(const TExprNode& node, TExprNode::TListType& children) {
-    TPlanFormatterBase::GetDependencies(node, children, false);
+    GetDependencies(node, children, false);
 }
 
 IGraphTransformer& TDataProviderBase::GetCallableExecutionTransformer() {

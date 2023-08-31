@@ -71,10 +71,14 @@ enum EQueryReplyFlags {
     QUERY_REPLY_FLAG_AST = 4;
 };
 
-message TTopicOperations {
+message TTopicOperationsRequest {
     optional string Consumer = 1;
     repeated Ydb.Topic.UpdateOffsetsInTransactionRequest.TopicOffsets Topics = 2;
 }
+
+message TTopicOperationsResponse {
+    optional int64 WriteId = 1;
+};
 
 message TQueryRequest {
     optional bytes SessionId = 1;
@@ -98,7 +102,7 @@ message TQueryRequest {
     reserved 19; // (deprecated) StatsMode
     optional NYql.NDqProto.EDqStatsMode StatsMode = 20; // deprecated
     optional Ydb.Table.QueryStatsCollection.Mode CollectStats = 21;
-    optional TTopicOperations TopicOperations = 22;
+    optional TTopicOperationsRequest TopicOperations = 22;
     optional bool UsePublicResponseDataFormat = 23;
     map<string, Ydb.TypedValue> YdbParameters = 24;
     optional bool IsInternalCall = 25;
@@ -122,6 +126,13 @@ message TIndexDescriptionProto {
 };
 
 message TKqpColumnMetadataProto {
+    enum EDefaultKind {
+        DEFAULT_KIND_UNSPECIFIED = 0;
+        DEFAULT_KIND_NULL = 1;
+        DEFAULT_KIND_SEQUENCE = 2;
+        DEFAULT_KIND_LITERAL = 3;
+    };
+
     optional string Name = 1;
     optional uint32 Id = 2;
     optional string Type = 3;
@@ -130,6 +141,8 @@ message TKqpColumnMetadataProto {
     repeated string Family = 5;
     optional bool NotNull = 6 [default = false];
     optional string DefaultFromSequence = 8;
+    optional EDefaultKind DefaultKind = 9;
+    optional NKikimrMiniKQL.TResult DefaultFromLiteral = 10;
 };
 
 message TKqpTableMetadataProto {
@@ -247,6 +260,7 @@ message TQueryResponse {
     optional Ydb.Table.TransactionMeta TxMeta = 11;
     optional NKqpProto.TKqpStatsQuery QueryStats = 12;
     repeated Ydb.ResultSet YdbResults = 13;
+    optional TTopicOperationsResponse TopicOperations = 14;
 }
 
 message TEvQueryResponse {
@@ -326,7 +340,8 @@ message TEvCreateSessionResponse {
 message TPingSessionRequest {
     optional bytes SessionId = 1;
     optional uint32 TimeoutMs = 2 [default = 5000];
-    optional bool ExtIdleCheck = 3; //It disables kqp proxy idle check
+    optional bool deprecated = 3;
+    optional NActorsProto.TActorId ExtSessionCtrlActorId = 4;
 }
 
 message TEvPingSessionRequest {
@@ -664,6 +679,13 @@ message TEvCancelScriptExecutionRequest {
 message TEvCancelScriptExecutionResponse {
     optional Ydb.StatusIds.StatusCode Status = 1;
     repeated Ydb.Issue.IssueMessage Issues = 2;
+}
+
+// Request that is sent to run script actor to check his existence.
+message TEvCheckAliveRequest {
+}
+
+message TEvCheckAliveResponse {
 }
 
 // stored in column "meta" of .metadata/script_executions table

@@ -1,6 +1,4 @@
 #include "allocation_tags.h"
-
-#include "allocation_tags.h"
 #include "trace_context.h"
 
 #include <library/cpp/yt/memory/leaky_singleton.h>
@@ -21,34 +19,44 @@ void* CreateAllocationTagsData()
     if (!traceContext) {
         return nullptr;
     }
-    auto allocationTagsPtr = traceContext->GetAllocationTags();
-    return static_cast<void*>(allocationTagsPtr.Release());
+
+    // Need to avoid deadlock from TTraceContext->SetAllocationTags due another allocation.
+    auto allocationTags = traceContext->GetAllocationTagsPtr();
+
+    return static_cast<void*>(allocationTags.Release());
 }
 
-void* CopyAllocationTagsData(void* ptr)
+void* CopyAllocationTagsData(void* userData)
 {
-    if (ptr) {
-        auto* allocationTagsPtr = static_cast<TAllocationTags*>(ptr);
+    if (userData) {
+        auto* allocationTagsPtr = static_cast<TAllocationTags*>(userData);
         allocationTagsPtr->Ref();
     }
-    return ptr;
+    return userData;
 }
 
-void DestroyAllocationTagsData(void* ptr)
+void DestroyAllocationTagsData(void* userData)
 {
-    auto* allocationTagsPtr = static_cast<TAllocationTags*>(ptr);
-    // NB. No need to check for nullptr here, because ScheduleFree already does that
+    auto* allocationTagsPtr = static_cast<TAllocationTags*>(userData);
+    // NB. No need to check for nullptr here, because ScheduleFree already does that.
     FreeList->ScheduleFree(allocationTagsPtr);
 }
 
-const std::vector<std::pair<TString, TString>>& ReadAllocationTagsData(void* ptr)
+const TAllocationTags::TTags& ReadAllocationTagsData(void* userData)
 {
-    auto* allocationTagsPtr = static_cast<TAllocationTags*>(ptr);
+    auto* allocationTagsPtr = static_cast<TAllocationTags*>(userData);
     if (!allocationTagsPtr) {
-        static std::vector<std::pair<TString, TString>> emptyTags;
+        static TAllocationTags::TTags emptyTags;
         return emptyTags;
     }
     return allocationTagsPtr->GetTags();
+}
+
+std::optional<TString> FindTagValue(
+    const TAllocationTags::TTags& tags,
+    const TString& key)
+{
+    return TAllocationTags::FindTagValue(tags, key);
 }
 
 void StartAllocationTagsCleanupThread(TDuration cleanupInterval)

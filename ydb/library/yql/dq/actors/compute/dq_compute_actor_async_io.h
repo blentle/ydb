@@ -31,6 +31,15 @@ class TProgramBuilder;
 
 namespace NYql::NDq {
 
+struct IMemoryQuotaManager {
+    using TPtr = std::shared_ptr<IMemoryQuotaManager>;
+    using TWeakPtr = std::weak_ptr<IMemoryQuotaManager>;
+    virtual ~IMemoryQuotaManager() = default;
+    virtual bool AllocateQuota(ui64 memorySize) = 0;
+    virtual void FreeQuota(ui64 memorySize) = 0;
+    virtual ui64 GetCurrentQuota() const = 0;
+};
+
 // Source/transform.
 // Must be IActor.
 //
@@ -176,11 +185,13 @@ public:
         ui64 TaskId;
         const THashMap<TString, TString>& SecureParams;
         const THashMap<TString, TString>& TaskParams;
+        const TVector<TString>& ReadRanges;
         const NActors::TActorId& ComputeActorId;
         const NKikimr::NMiniKQL::TTypeEnvironment& TypeEnv;
         const NKikimr::NMiniKQL::THolderFactory& HolderFactory;
         ::NMonitoring::TDynamicCounterPtr TaskCounters;
         std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> Alloc;
+        IMemoryQuotaManager::TPtr MemoryQuotaManager;
     };
 
     struct TSinkArguments {

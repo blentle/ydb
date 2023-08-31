@@ -2126,15 +2126,15 @@ namespace {
         if (stepType && IsDataTypeFloat(stepItemType->GetSlot())) {
             commonType = ((beginIsOpt || endIsOpt) && !stepIsOpt)
                 ? ctx.Expr.MakeType<TOptionalExprType>(stepType) : stepType;
-            if (const auto status = TrySilentConvertTo(input->ChildRef(0U), *commonType, ctx.Expr); IGraphTransformer::TStatus::Ok != status) {
-                if (IGraphTransformer::TStatus::Error == status) {
+            if (const auto status = TrySilentConvertTo(input->ChildRef(0U), *commonType, ctx.Expr); status != IGraphTransformer::TStatus::Ok) {
+                if (status == IGraphTransformer::TStatus::Error) {
                     ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Child(0U)->Pos()), TStringBuilder() << "Impossible silent convert bound of type " <<
                         *input->Child(0U)->GetTypeAnn() << " into " << *commonType));
                 }
                 return status;
             }
-            if (const auto status = TrySilentConvertTo(input->ChildRef(1U), *commonType, ctx.Expr); IGraphTransformer::TStatus::Ok != status) {
-                if (IGraphTransformer::TStatus::Error == status) {
+            if (const auto status = TrySilentConvertTo(input->ChildRef(1U), *commonType, ctx.Expr); status != IGraphTransformer::TStatus::Ok) {
+                if (status == IGraphTransformer::TStatus::Error) {
                     ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Child(1U)->Pos()), TStringBuilder() << "Impossible silent convert bound of type " <<
                         *input->Child(1U)->GetTypeAnn() << " into " << *commonType));
                 }
@@ -2164,9 +2164,9 @@ namespace {
 
         if (const auto stepSlot = IsDataTypeDateOrTzDateOrInterval(slot) ? EDataSlot::Interval : MakeSigned(slot); stepItemType) {
             if (const auto requredStepType = slot == stepSlot ? commonItemType : ctx.Expr.MakeType<TDataExprType>(stepSlot); !IsSameAnnotation(*stepItemType, *requredStepType)) {
-                if (const auto status = TrySilentConvertTo(input->ChildRef(2U), *requredStepType, ctx.Expr); IGraphTransformer::TStatus::Repeat == status)
+                if (const auto status = TrySilentConvertTo(input->ChildRef(2U), *requredStepType, ctx.Expr); status == IGraphTransformer::TStatus::Repeat)
                     return status;
-                else if (IGraphTransformer::TStatus::Error == status && !EnsureSpecificDataType(input->Tail().Pos(), *stepItemType, stepSlot, ctx.Expr))
+                else if (status == IGraphTransformer::TStatus::Error && !EnsureSpecificDataType(input->Tail().Pos(), *stepItemType, stepSlot, ctx.Expr))
                     return status;
             }
         } else {
@@ -2508,6 +2508,21 @@ namespace {
                     << "Mismatch type of sequences being extended: "
                     << GetTypeDiff(*listType, *input->Child(i)->GetTypeAnn())));
                 return IGraphTransformer::TStatus::Error;
+            }
+        }
+
+        if (listType->GetKind() == ETypeAnnotationKind::Flow) {
+            auto flowItem = listType->Cast<TFlowExprType>()->GetItemType();
+            if (flowItem->GetKind() == ETypeAnnotationKind::Multi) {
+                auto items = flowItem->Cast<TMultiExprType>()->GetItems();
+                if (!items.empty()) {
+                    items.pop_back();
+                    if (AnyOf(items, [](const auto& item) { return item->GetKind() == ETypeAnnotationKind::Scalar; })) {
+                        ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()), TStringBuilder()
+                            << "Scalars are not supported in Extend inputs:  " << *listType));
+                        return IGraphTransformer::TStatus::Error;
+                    }
+                }
             }
         }
 
@@ -4292,6 +4307,11 @@ namespace {
             return IGraphTransformer::TStatus::Error;
         }
 
+        if (IsSameAnnotation(*resItemType, *structType)) {
+            output = input->HeadPtr();
+            return IGraphTransformer::TStatus::Repeat;
+        }
+
         input->SetTypeAnn(MakeSequenceType(input->Head().GetTypeAnn()->GetKind(), *resItemType, ctx.Expr));
         return IGraphTransformer::TStatus::Ok;
     }
@@ -4663,10 +4683,16 @@ namespace {
             return IGraphTransformer::TStatus::Repeat;
         }
 
-        if (isMany && ctx.Types.UseBlocks && !inputStructType->FindItem("_yql_group_stream_index")) {
-            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
-                TStringBuilder() << "Missing service column: _yql_group_stream_index"));
-            return IGraphTransformer::TStatus::Error;
+        if (isMany && ctx.Types.UseBlocks) {
+            auto streamIndex = inputStructType->FindItem("_yql_group_stream_index");
+            if (streamIndex) {
+                const TTypeAnnotationNode* streamIndexType = inputStructType->GetItems()[*streamIndex]->GetItemType();
+                if (streamIndexType->GetKind() != ETypeAnnotationKind::Data || streamIndexType->Cast<TDataExprType>()->GetSlot() != EDataSlot::Uint32) {
+                    ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
+                        TStringBuilder() << "Invalid type for service column _yql_group_stream_index: expecting Uint32, got: " << *streamIndexType));
+                    return IGraphTransformer::TStatus::Error;
+                }
+            }
         }
 
         auto status = NormalizeTupleOfAtoms(input, 1, output, ctx.Expr);
@@ -4697,7 +4723,6 @@ namespace {
         }
 
         bool isHopping = false;
-        bool hasManyStreams = false;
         const auto settings = input->Child(3);
         if (!EnsureTuple(*settings, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
@@ -4827,19 +4852,11 @@ namespace {
                 if (!ValidateAggManyStreams(*value, input->Child(2)->ChildrenSize(), ctx.Expr)) {
                     return IGraphTransformer::TStatus::Error;
                 }
-
-                hasManyStreams = true;
             } else {
                 ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(setting->Head().Pos()),
                     TStringBuilder() << "Unexpected setting: " << settingName));
                 return IGraphTransformer::TStatus::Error;
             }
-        }
-
-        if (isMany && !hasManyStreams && ctx.Types.UseBlocks) {
-            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(settings->Head().Pos()),
-                "Missing setting: many_streams"));
-            return IGraphTransformer::TStatus::Error;
         }
 
         for (auto& child : input->Child(1)->Children()) {
@@ -7078,6 +7095,48 @@ namespace {
             .Seal()
             .Build();
         return IGraphTransformer::TStatus::Repeat;
+    }
+
+    IGraphTransformer::TStatus ListUniqWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+        if (!EnsureArgsCount(*input, 1, ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (!EnsureComputable(input->Head(), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (IsNull(input->Head())) {
+            output = input->HeadPtr();
+            return IGraphTransformer::TStatus::Repeat;
+        }
+
+        auto type = input->Head().GetTypeAnn();
+        if (type->GetKind() == ETypeAnnotationKind::Optional) {
+            type = type->Cast<TOptionalExprType>()->GetItemType();
+        }
+
+        if (type->GetKind() != ETypeAnnotationKind::List && type->GetKind() != ETypeAnnotationKind::EmptyList) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Head().Pos()), TStringBuilder()
+                << "Expected (empty) list or optional of (empty) list, but got: " << *input->Head().GetTypeAnn()));
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        if (type->GetKind() == ETypeAnnotationKind::EmptyList) {
+            output = input->HeadPtr();
+            return IGraphTransformer::TStatus::Repeat;
+        }
+
+        auto itemType = type->Cast<TListExprType>()->GetItemType();
+
+        if (!itemType->IsHashable() || !itemType->IsEquatable()) {
+            ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()), TStringBuilder() << "Expected hashable and equatable type, but got: " << *itemType));
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        input->SetTypeAnn(input->Head().GetTypeAnn());
+        
+        return IGraphTransformer::TStatus::Ok;
     }
 
     IGraphTransformer::TStatus ListFlattenWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ydb/core/kqp/common/simple/temp_tables.h>
 #include <ydb/core/kqp/provider/yql_kikimr_gateway.h>
 #include <ydb/core/scheme/scheme_tabledefs.h>
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
@@ -14,9 +15,14 @@ namespace NKikimr::NKqp {
 class TKqpTableMetadataLoader : public NYql::IKikimrGateway::IKqpTableMetadataLoader {
 public:
 
-    explicit TKqpTableMetadataLoader(TActorSystem* actorSystem, bool needCollectSchemeData = false)
+    explicit TKqpTableMetadataLoader(TActorSystem* actorSystem, 
+        NYql::TKikimrConfiguration::TPtr config, 
+        bool needCollectSchemeData = false, 
+        TKqpTempTablesState::TConstPtr tempTablesState = nullptr)
         : NeedCollectSchemeData(needCollectSchemeData)
         , ActorSystem(actorSystem)
+        , Config(config)
+        , TempTablesState(std::move(tempTablesState))
     {};
 
     NThreading::TFuture<NYql::IKikimrGateway::TTableMetadataResult> LoadTableMetadata(
@@ -53,6 +59,9 @@ private:
     TMutex Lock;
     bool NeedCollectSchemeData;
     TActorSystem* ActorSystem;
+    NYql::TKikimrConfiguration::TPtr Config;
+    TKqpTempTablesState::TConstPtr TempTablesState;
+
 };
 
 } // namespace NKikimr::NKqp

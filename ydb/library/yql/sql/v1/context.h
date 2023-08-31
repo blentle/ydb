@@ -256,6 +256,7 @@ namespace NSQLTranslationV1 {
         bool EnableSystemColumns = true;
         bool DqEngineEnable = false;
         bool DqEngineForce = false;
+        TString CostBasedOptimizer;
         TMaybe<bool> JsonQueryReturnsJsonDocument;
         TMaybe<bool> AnsiInForEmptyOrNullableItemsCollections;
         TMaybe<bool> AnsiRankForNullableKeys = true;
@@ -281,6 +282,16 @@ namespace NSQLTranslationV1 {
         using TLiteralWithPosition = std::pair<TString, TPosition>;
         using TLibraryStuff = std::tuple<TPosition, std::optional<TLiteralWithPosition>, std::optional<TLiteralWithPosition>>;
         std::unordered_map<TString, TLibraryStuff> Libraries; // alias -> optional file with token
+        using TPackageStuff = std::tuple<
+            TPosition, TLiteralWithPosition,
+            std::optional<TLiteralWithPosition>
+        >;
+
+        std::unordered_map<TString, TPackageStuff> Packages; // alias -> url with optional token
+
+        using TOverrideLibraryStuff = std::tuple<TPosition>;
+        std::unordered_map<TString, TOverrideLibraryStuff> OverrideLibraries; // alias -> position
+
         THashMap<TString, ui32> PackageVersions;
         NYql::TWarningPolicy WarningPolicy;
         TString PqReadByRtmrCluster;
@@ -288,6 +299,8 @@ namespace NSQLTranslationV1 {
         bool EmitAggApply = false;
         bool UseBlocks = false;
         bool AnsiLike = false;
+        bool FeatureR010 = false; //Row pattern recognition: FROM clause
+        TMaybe<bool> CompactGroupBy;
     };
 
     class TColumnRefScope {

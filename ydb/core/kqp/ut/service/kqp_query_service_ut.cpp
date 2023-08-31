@@ -1,5 +1,6 @@
 #include <ydb/core/kqp/counters/kqp_counters.h>
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
+#include <ydb/public/lib/ut_helpers/ut_helpers_query.h>
 #include <ydb/public/sdk/cpp/client/ydb_operation/operation.h>
 #include <ydb/public/sdk/cpp/client/ydb_proto/accessor.h>
 #include <ydb/public/sdk/cpp/client/ydb_types/operation/operation.h>
@@ -40,6 +41,42 @@ Y_UNIT_TEST_SUITE(KqpQueryService) {
                 auto result = db.GetSession().GetValueSync();
                 UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
                 UNIT_ASSERT_VALUES_EQUAL(result.GetSession().GetId(), id);
+            }
+        }
+        WaitForZeroSessions(counters);
+    }
+
+    Y_UNIT_TEST(QueryOnClosedSession) {
+        auto kikimr = DefaultKikimrRunner();
+        auto clientConfig = NGRpcProxy::TGRpcClientConfig(kikimr.GetEndpoint());
+        NKqp::TKqpCounters counters(kikimr.GetTestServer().GetRuntime()->GetAppData().Counters);
+
+        {
+            auto db = kikimr.GetQueryClient();
+
+            TString id;
+            {
+                auto result = db.GetSession().GetValueSync();
+                UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+                UNIT_ASSERT(result.GetSession().GetId());
+                auto session = result.GetSession();
+                id = session.GetId();
+
+                bool allDoneOk = true;
+                NTestHelpers::CheckDelete(clientConfig, id, Ydb::StatusIds::SUCCESS, allDoneOk);
+
+                UNIT_ASSERT(allDoneOk);
+
+                auto execResult = session.ExecuteQuery("SELECT 1;",
+                    NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+
+                UNIT_ASSERT_VALUES_EQUAL(execResult.GetStatus(), EStatus::BAD_SESSION);
+            }
+            // closed session must be removed from session pool
+            {
+                auto result = db.GetSession().GetValueSync();
+                UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+                UNIT_ASSERT(result.GetSession().GetId() != id);
             }
         }
         WaitForZeroSessions(counters);
@@ -392,6 +429,54 @@ Y_UNIT_TEST_SUITE(KqpQueryService) {
         CompareYson(R"([[[1u];["One"]]])", FormatResultSetYson(result.GetResultSet(0)));
     }
 
+    Y_UNIT_TEST(QueryDdlCache) {
+        NKikimrConfig::TAppConfig appConfig;
+        appConfig.MutableTableServiceConfig()->SetEnablePreparedDdl(true);
+        auto setting = NKikimrKqp::TKqpSetting();
+        auto serverSettings = TKikimrSettings()
+            .SetAppConfig(appConfig)
+            .SetKqpSettings({setting});
+
+        TKikimrRunner kikimr(serverSettings);
+        auto db = kikimr.GetQueryClient();
+
+        auto settings = TExecuteQuerySettings()
+            .StatsMode(EStatsMode::Basic);
+
+        auto result = db.ExecuteQuery(R"(
+            CREATE TABLE TestDdl (
+                Key Uint64,
+                Value String,
+                PRIMARY KEY (Key)
+            );
+        )", TTxControl::NoTx(), settings).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        auto stats = NYdb::TProtoAccessor::GetProto(*result.GetStats());
+        UNIT_ASSERT_VALUES_EQUAL(stats.compilation().from_cache(), false);
+
+        {
+            // TODO: Switch to query service.
+            auto session = kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+
+            UNIT_ASSERT(session.ExecuteSchemeQuery(R"(
+                DROP TABLE TestDdl;
+            )").GetValueSync().IsSuccess());
+        }
+
+        result = db.ExecuteQuery(R"(
+            CREATE TABLE TestDdl (
+                Key Uint64,
+                Value String,
+                PRIMARY KEY (Key)
+            );
+        )", TTxControl::NoTx(), settings).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        stats = NYdb::TProtoAccessor::GetProto(*result.GetStats());
+        UNIT_ASSERT_VALUES_EQUAL(stats.compilation().from_cache(), false);
+    }
+
     Y_UNIT_TEST(MaterializeTxResults) {
         auto kikimr = DefaultKikimrRunner();
         auto db = kikimr.GetQueryClient();
@@ -442,7 +527,6 @@ Y_UNIT_TEST_SUITE(KqpQueryService) {
         UNIT_ASSERT_STRING_CONTAINS(readyOp.Metadata().ScriptContent.Text, "SELECT 42");
         UNIT_ASSERT_VALUES_EQUAL(readyOp.Metadata().ResultSetsMeta.size(), 1);
         UNIT_ASSERT_VALUES_EQUAL(readyOp.Metadata().ResultSetsMeta.front().columns_size(), 1);
-        UNIT_ASSERT_VALUES_EQUAL(readyOp.Metadata().ResultSetsMeta.front().truncated(), false);
         UNIT_ASSERT_VALUES_EQUAL(readyOp.Metadata().ResultSetsMeta.front().columns(0).name(), "column0");
         UNIT_ASSERT_EQUAL(readyOp.Metadata().ResultSetsMeta.front().columns(0).type().type_id(), Ydb::Type::PrimitiveTypeId::Type_PrimitiveTypeId_INT32);
 
@@ -517,6 +601,7 @@ Y_UNIT_TEST_SUITE(KqpQueryService) {
         UNIT_ASSERT_STRING_CONTAINS(readyOp.Metadata().ScriptContent.Text, "SELECT 42");
 
         ValidatePlan(readyOp.Metadata().ExecStats.query_plan());
+        UNIT_ASSERT(readyOp.Metadata().ExecStats.query_ast());
     }
 
     Y_UNIT_TEST(ParseScript) {
@@ -631,6 +716,7 @@ Y_UNIT_TEST_SUITE(KqpQueryService) {
         }
 
         ValidatePlan(readyOp.Metadata().ExecStats.query_plan());
+        UNIT_ASSERT(readyOp.Metadata().ExecStats.query_ast());
     }
 
     Y_UNIT_TEST(ExecuteScriptStatsBasic) {
@@ -1090,6 +1176,38 @@ Y_UNIT_TEST_SUITE(KqpQueryService) {
 
             settings.FetchToken(results.GetNextFetchToken());
         }
+    }
+
+    Y_UNIT_TEST(QueryDropDdl) {
+        NKikimrConfig::TAppConfig appConfig;
+        appConfig.MutableTableServiceConfig()->SetEnablePreparedDdl(true);
+        auto setting = NKikimrKqp::TKqpSetting();
+        auto serverSettings = TKikimrSettings()
+            .SetAppConfig(appConfig)
+            .SetKqpSettings({setting});
+
+        TKikimrRunner kikimr(serverSettings);
+        auto db = kikimr.GetQueryClient();
+
+        auto result = db.ExecuteQuery(R"(
+            CREATE TABLE TestDropDdl (
+                Key Uint64,
+                Value String,
+                PRIMARY KEY (Key)
+            );
+        )", TTxControl::NoTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        UNIT_ASSERT(result.GetResultSets().empty());
+
+        result = db.ExecuteQuery(R"(
+            DROP TABLE TestDropDdl;
+        )", TTxControl::NoTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+
+        result = db.ExecuteQuery(R"(
+            SELECT * FROM TestDropDdl;
+        )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+        UNIT_ASSERT(!result.IsSuccess());
     }
 }
 

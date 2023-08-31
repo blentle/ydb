@@ -441,7 +441,7 @@ static void SetupServices(TTestActorRuntime &runtime,
             new TNodeWardenConfig(STRAND_PDISK && !runtime.IsRealThreads()
                                   ? static_cast<IPDiskServiceFactory*>(new TStrandedPDiskServiceFactory(runtime))
                                   : static_cast<IPDiskServiceFactory*>(new TRealPDiskServiceFactory()));
-        google::protobuf::TextFormat::ParseFromString(staticConfig, &nodeWardenConfig->ServiceSet);
+        google::protobuf::TextFormat::ParseFromString(staticConfig, nodeWardenConfig->BlobStorageConfig.MutableServiceSet());
 
         if (nodeIndex == 0) {
             TString pDiskPath;
@@ -461,7 +461,7 @@ static void SetupServices(TTestActorRuntime &runtime,
                 static TTempDir tempDir;
                 pDiskPath = tempDir() + "/pdisk0.dat";
             }
-            nodeWardenConfig->ServiceSet.MutablePDisks(0)->SetPath(pDiskPath);
+            nodeWardenConfig->BlobStorageConfig.MutableServiceSet()->MutablePDisks(0)->SetPath(pDiskPath);
             ui64 pDiskGuid = 1;
             static ui64 iteration = 0;
             ++iteration;
@@ -505,6 +505,7 @@ static void SetupServices(TTestActorRuntime &runtime,
     runtime.Initialize(app.Unwrap());
     auto dnsConfig = new TDynamicNameserviceConfig();
     dnsConfig->MaxStaticNodeId = 1000;
+    dnsConfig->MinDynamicNodeId = 1001;
     dnsConfig->MaxDynamicNodeId = 2000;
     runtime.GetAppData().DynamicNameserviceConfig = dnsConfig;
     runtime.GetAppData().DisableCheckingSysNodesCms = true;

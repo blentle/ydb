@@ -50,11 +50,16 @@ TExprNode::TPtr BuildExternalTableSettings(TPositionHandle pos, TExprContext& ct
     auto userSchema = ctx.NewAtom(pos, "userschema"sv);
     items.emplace_back(ctx.NewList(pos, {userSchema, type, order}));
 
-    for (const auto& [key, value]: source->GetParameters(content)) {
-        auto keyAtom = ctx.NewAtom(pos, NormalizeName(key));
-        auto valueAtom = ctx.NewAtom(pos, value);
-        items.emplace_back(ctx.NewList(pos, {keyAtom, valueAtom}));
+    for (const auto& [key, values]: source->GetParameters(content)) {
+        TExprNode::TListType children = {ctx.NewAtom(pos, NormalizeName(key))};
+        children.reserve(values.size() + 1);
+        for (const TString& value : values) {
+            children.emplace_back(ctx.NewAtom(pos, value));
+        }
+
+        items.emplace_back(ctx.NewList(pos, std::move(children)));
     }
+
     return ctx.NewList(pos, std::move(items));
 }
 
@@ -183,7 +188,8 @@ public:
                 IKikimrGateway::TLoadTableMetadataSettings()
                             .WithTableStats(table.GetNeedsStats())
                             .WithPrivateTables(IsInternalCall)
-                            .WithExternalDatasources(SessionCtx->Config().FeatureFlags.GetEnableExternalDataSources()));
+                            .WithExternalDatasources(SessionCtx->Config().FeatureFlags.GetEnableExternalDataSources())
+            );
 
             futures.push_back(future.Apply([result, queryType]
                 (const NThreading::TFuture<IKikimrGateway::TTableMetadataResult>& future) {
@@ -247,12 +253,40 @@ public:
 
         switch (metadata.ExternalSource.DataSourceAuth.identity_case()) {
             case NKikimrSchemeOp::TAuth::kServiceAccount:
+                properties["authMethod"] = "SERVICE_ACCOUNT";
                 properties["serviceAccountId"] = metadata.ExternalSource.DataSourceAuth.GetServiceAccount().GetId();
                 properties["serviceAccountIdSignature"] = metadata.ExternalSource.ServiceAccountIdSignature;
                 properties["serviceAccountIdSignatureReference"] = metadata.ExternalSource.DataSourceAuth.GetServiceAccount().GetSecretName();
                 break;
 
             case NKikimrSchemeOp::TAuth::kNone:
+                properties["authMethod"] = "SERVICE_ACCOUNT";
+                break;
+            
+            case NKikimrSchemeOp::TAuth::kBasic:
+                properties["authMethod"] = "BASIC";
+                properties["login"] = metadata.ExternalSource.DataSourceAuth.GetBasic().GetLogin();
+                properties["password"] = metadata.ExternalSource.Password;
+                properties["passwordReference"] = metadata.ExternalSource.DataSourceAuth.GetBasic().GetPasswordSecretName();
+                break;
+
+            case NKikimrSchemeOp::TAuth::kMdbBasic:
+                properties["authMethod"] = "MDB_BASIC";
+                properties["serviceAccountId"] = metadata.ExternalSource.DataSourceAuth.GetMdbBasic().GetServiceAccountId();
+                properties["serviceAccountIdSignature"] = metadata.ExternalSource.ServiceAccountIdSignature;
+                properties["serviceAccountIdSignatureReference"] = metadata.ExternalSource.DataSourceAuth.GetMdbBasic().GetServiceAccountSecretName();
+
+                properties["login"] = metadata.ExternalSource.DataSourceAuth.GetMdbBasic().GetLogin();
+                properties["password"] = metadata.ExternalSource.Password;
+                properties["passwordReference"] = metadata.ExternalSource.DataSourceAuth.GetMdbBasic().GetPasswordSecretName();
+                break;
+
+            case NKikimrSchemeOp::TAuth::kAws:
+                properties["authMethod"] = "AWS";
+                properties["awsAccessKeyId"] = metadata.ExternalSource.AwsAccessKeyId;
+                properties["awsAccessKeyIdReference"] = metadata.ExternalSource.DataSourceAuth.GetAws().GetAwsAccessKeyIdSecretName();
+                properties["awsSecretAccessKey"] = metadata.ExternalSource.AwsSecretAccessKey;
+                properties["awsSecretAccessKeyReference"] = metadata.ExternalSource.DataSourceAuth.GetAws().GetAwsSecretAccessKeySecretName();
                 break;
 
             case NKikimrSchemeOp::TAuth::IDENTITY_NOT_SET:
@@ -275,10 +309,15 @@ public:
 
             if (res.Success()) {
                 res.ReportIssues(ctx.IssueManager);
-                auto& tableDesc = SessionCtx->Tables().GetTable(it.first.first, it.first.second);
+                TKikimrTableDescription* tableDesc;
+                if (res.Metadata->Temporary) {
+                    tableDesc = &SessionCtx->Tables().GetTable(it.first.first, *res.Metadata->QueryName);
+                } else {
+                    tableDesc = &SessionCtx->Tables().GetTable(it.first.first, it.first.second);
+                }
 
                 YQL_ENSURE(res.Metadata);
-                tableDesc.Metadata = res.Metadata;
+                tableDesc->Metadata = res.Metadata;
 
                 bool sysColumnsEnabled = SessionCtx->Config().SystemColumnsEnabled();
                 YQL_ENSURE(res.Metadata->Indexes.size() == res.Metadata->SecondaryGlobalIndexMetadata.size());
@@ -289,7 +328,7 @@ public:
                     desc.Load(ctx, sysColumnsEnabled);
                 }
 
-                if (!tableDesc.Load(ctx, sysColumnsEnabled)) {
+                if (!tableDesc->Load(ctx, sysColumnsEnabled)) {
                     LoadResults.clear();
                     return TStatus::Error;
                 }
@@ -651,7 +690,7 @@ public:
                     .Repeat(TExprStep::RewriteIO);
             TExprNode::TPtr path = ctx.NewCallable(node->Pos(), "String", { ctx.NewAtom(node->Pos(), tableDesc.Metadata->ExternalSource.TableLocation) });
             auto table = ctx.NewList(node->Pos(), {ctx.NewAtom(node->Pos(), "table"), path});
-            auto key = ctx.NewCallable(node->Pos(), "Key", {table});
+            auto newKey = ctx.NewCallable(node->Pos(), "Key", {table});
             auto newRead = Build<TCoRead>(ctx, node->Pos())
                                     .World(read->Child(0))
                                     .DataSource(
@@ -663,9 +702,10 @@ public:
                                         .Done().Ptr()
                                     )
                                     .FreeArgs()
-                                        .Add(ctx.NewCallable(node->Pos(), "MrTableConcat", {key}))
+                                        .Add(ctx.NewCallable(node->Pos(), "MrTableConcat", {newKey}))
                                         .Add(ctx.NewCallable(node->Pos(), "Void", {}))
                                         .Add(BuildExternalTableSettings(node->Pos(), ctx, tableDesc.Metadata->Columns, source, tableDesc.Metadata->ExternalSource.TableContent))
+
                                     .Build()
                                     .Done().Ptr();
             auto retChildren = node->ChildrenList();

@@ -89,7 +89,7 @@ inline TIntrusivePtr<NYql::TKikimrConfiguration> CreateConfig(const TKqpSettings
         cfg->_KqpTablePathPrefix = workerSettings.Database;
     }
 
-    ApplyServiceConfig(*cfg, workerSettings.Service);
+    ApplyServiceConfig(*cfg, workerSettings.TableService);
 
     cfg->FreezeDefaults();
     return cfg;
@@ -126,6 +126,8 @@ inline ETableReadType ExtractMostHeavyReadType(const TString& queryPlan) {
 
     return maxReadType;
 }
+
+bool CanCacheQuery(const NKqpProto::TKqpPhyQuery& query);
 
 void SlowLogQuery(const TActorContext &ctx, const NYql::TKikimrConfiguration* config, const TKqpRequestInfo& requestInfo,
     const TDuration& duration, Ydb::StatusIds::StatusCode status, const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, ui64 parametersSize,

@@ -6,7 +6,6 @@
 # original buildsystem will not be accepted.
 
 
-add_subdirectory(ut_async_index)
 add_subdirectory(ut_backup)
 add_subdirectory(ut_base)
 add_subdirectory(ut_base_reboots)
@@ -25,6 +24,7 @@ add_subdirectory(ut_extsubdomain)
 add_subdirectory(ut_extsubdomain_reboots)
 add_subdirectory(ut_filestore_reboots)
 add_subdirectory(ut_helpers)
+add_subdirectory(ut_index)
 add_subdirectory(ut_index_build)
 add_subdirectory(ut_index_build_reboots)
 add_subdirectory(ut_login)
@@ -32,7 +32,6 @@ add_subdirectory(ut_move)
 add_subdirectory(ut_move_reboots)
 add_subdirectory(ut_olap)
 add_subdirectory(ut_olap_reboots)
-add_subdirectory(ut_pq)
 add_subdirectory(ut_pq_reboots)
 add_subdirectory(ut_reboots)
 add_subdirectory(ut_replication)
@@ -260,6 +259,7 @@ target_sources(core-tx-schemeshard PRIVATE
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_import_flow_proposals.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_import.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_build_index.cpp
+  ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_build_index_tx_base.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_build_index__cancel.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_build_index__forget.cpp
   ${CMAKE_SOURCE_DIR}/ydb/core/tx/schemeshard/schemeshard_build_index__list.cpp

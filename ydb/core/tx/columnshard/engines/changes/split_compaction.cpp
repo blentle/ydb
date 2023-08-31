@@ -4,9 +4,10 @@
 
 namespace NKikimr::NOlap {
 
-TConclusion<std::vector<TString>> TSplitCompactColumnEngineChanges::DoConstructBlobs(TConstructionContext& context) noexcept {
+TConclusionStatus TSplitCompactColumnEngineChanges::DoConstructBlobs(TConstructionContext& context) noexcept {
+    Y_VERIFY(SrcGranule);
     const ui64 pathId = GranuleMeta->GetPathId();
-    const TMark ts0 = SrcGranule.Mark;
+    const TMark ts0 = SrcGranule->Mark;
     std::vector<TPortionInfo>& portions = SwitchedPortions;
 
     std::vector<std::pair<TMark, ui64>> tsIds;
@@ -14,7 +15,6 @@ TConclusion<std::vector<TString>> TSplitCompactColumnEngineChanges::DoConstructB
     auto [srcBatches, maxSnapshot] = PortionsToBatches(portions, Blobs, movedRows != 0, context);
     Y_VERIFY(srcBatches.size() == portions.size());
 
-    std::vector<TString> blobs;
     auto resultSchema = context.SchemaVersions.GetLastSchema();
     if (movedRows) {
         Y_VERIFY(PortionsToMove.size() >= 2);
@@ -102,7 +102,7 @@ TConclusion<std::vector<TString>> TSplitCompactColumnEngineChanges::DoConstructB
             ui64 tmpGranule = SetTmpGranule(pathId, mark);
             for (const auto& batch : idBatches[id]) {
                 // Cannot set snapshot here. It would be set in committing transaction in ApplyChanges().
-                auto newPortions = MakeAppendedPortions(pathId, batch, tmpGranule, maxSnapshot, blobs, GranuleMeta.get(), context);
+                auto newPortions = MakeAppendedPortions(pathId, batch, tmpGranule, maxSnapshot, GranuleMeta.get(), context);
                 Y_VERIFY(newPortions.size() > 0);
                 for (auto& portion : newPortions) {
                     AppendedPortions.emplace_back(std::move(portion));
@@ -118,7 +118,7 @@ TConclusion<std::vector<TString>> TSplitCompactColumnEngineChanges::DoConstructB
             ui64 tmpGranule = SetTmpGranule(pathId, ts);
 
             // Cannot set snapshot here. It would be set in committing transaction in ApplyChanges().
-            auto portions = MakeAppendedPortions(pathId, batch, tmpGranule, maxSnapshot, blobs, GranuleMeta.get(), context);
+            auto portions = MakeAppendedPortions(pathId, batch, tmpGranule, maxSnapshot, GranuleMeta.get(), context);
             Y_VERIFY(portions.size() > 0);
             for (auto& portion : portions) {
                 AppendedPortions.emplace_back(std::move(portion));
@@ -126,7 +126,7 @@ TConclusion<std::vector<TString>> TSplitCompactColumnEngineChanges::DoConstructB
         }
     }
 
-    return blobs;
+    return TConclusionStatus::Success();
 }
 
 std::pair<std::vector<std::shared_ptr<arrow::RecordBatch>>, NKikimr::NOlap::TSnapshot> TSplitCompactColumnEngineChanges::PortionsToBatches(

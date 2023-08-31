@@ -191,6 +191,7 @@ enum EDecommitStatus {
     DECOMMIT_NONE = 1; // no decomission
     DECOMMIT_PENDING = 2; // drive is going to be removed soon, but SelfHeal logic would not remove it automatically
     DECOMMIT_IMMINENT = 3; // drive is going to be settled automatically
+    DECOMMIT_REJECTED = 4; // drive is working as usual, but decommitted slots are not placed here
 }
 
 message TGroupStatus {
@@ -479,6 +480,12 @@ message TCancelVirtualGroup {
     uint32 GroupId = 1; // id of a group we are going to cancel
 }
 
+message TSetVDiskReadOnly {
+    NKikimrBlobStorage.TVSlotId VSlotId = 1;
+    NKikimrBlobStorage.TVDiskID VDiskId = 2;
+    bool Value = 3;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // INTERFACE PART
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -521,6 +528,7 @@ message TConfigRequest {
             TSanitizeGroup SanitizeGroup = 42;
             TReadSettings ReadSettings = 43;
             TCancelVirtualGroup CancelVirtualGroup = 44;
+            TSetVDiskReadOnly SetVDiskReadOnly = 47;
 
             // commands intended for internal use
             TReassignGroupDisk ReassignGroupDisk = 19;
@@ -561,6 +569,9 @@ message TConfigRequest {
 
     // execute this request ASAP
     bool Cito = 10;
+
+    // is this command originated by self-heal decommission?
+    bool IsSelfHealReasonDecommit = 12;
 }
 
 enum ETriStateBool {
@@ -615,6 +626,7 @@ message TBaseConfig {
         string Status = 10; // textual representation of EVDiskStatus or empty string if status is not known/reported
         repeated TDonorDisk Donors = 11;
         bool Ready = 12; // is disk READY in terms of BSC (stable READY status for some period of time)
+        bool ReadOnly = 13;
     }
     message TVirtualGroupInfo {
         NKikimrBlobStorage.EVirtualGroupState State = 1;

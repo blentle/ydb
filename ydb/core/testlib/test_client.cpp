@@ -43,8 +43,10 @@
 #include <ydb/core/cms/console/immediate_controls_configurator.h>
 #include <ydb/core/formats/clickhouse_block.h>
 #include <ydb/core/security/ticket_parser.h>
+#include <ydb/core/security/ldap_auth_provider.h>
 #include <ydb/core/base/user_registry.h>
 #include <ydb/core/health_check/health_check.h>
+#include <ydb/core/kafka_proxy/kafka_listener.h>
 #include <ydb/core/kqp/common/kqp.h>
 #include <ydb/core/kqp/rm_service/kqp_rm_service.h>
 #include <ydb/core/kqp/proxy_service/kqp_proxy_service.h>
@@ -237,6 +239,7 @@ namespace Tests {
             appData.DynamicNameserviceConfig = new TDynamicNameserviceConfig;
             auto dnConfig = appData.DynamicNameserviceConfig;
             dnConfig->MaxStaticNodeId = 1023;
+            dnConfig->MinDynamicNodeId = 1024;
             dnConfig->MaxDynamicNodeId = 1024 + 100;
         });
 
@@ -260,10 +263,12 @@ namespace Tests {
         //
         for (ui32 nodeIdx = 0; nodeIdx < StaticNodes(); ++nodeIdx) {
             SetupDomainLocalService(nodeIdx);
-        }
-        for (ui32 nodeIdx = 0; nodeIdx < StaticNodes() + DynamicNodes(); ++nodeIdx) {
             SetupConfigurators(nodeIdx);
             SetupProxies(nodeIdx);
+        }
+
+        for (ui32 nodeIdx = StaticNodes(); nodeIdx < StaticNodes() + DynamicNodes(); ++nodeIdx) {
+            SetupConfigurators(nodeIdx);
         }
 
         CreateBootstrapTablets();
@@ -766,6 +771,10 @@ namespace Tests {
 
         auto tenantPublisher = CreateTenantNodeEnumerationPublisher();
         Runtime->Register(tenantPublisher, nodeIdx);
+
+        if (nodeIdx >= StaticNodes()) {
+            SetupProxies(nodeIdx);
+        }
     }
 
     void TServer::SetupConfigurators(ui32 nodeIdx) {
@@ -777,6 +786,11 @@ namespace Tests {
     void TServer::SetupProxies(ui32 nodeIdx) {
         Runtime->SetTxAllocatorTabletIds({ChangeStateStorage(TxAllocator, Settings->Domain)});
         {
+            if (Settings->AuthConfig.HasLdapAuthentication()) {
+                IActor* ldapAuthProvider = NKikimr::CreateLdapAuthProvider(Settings->AuthConfig.GetLdapAuthentication());
+                TActorId ldapAuthProviderId = Runtime->Register(ldapAuthProvider, nodeIdx);
+                Runtime->RegisterService(MakeLdapAuthProviderID(), ldapAuthProviderId, nodeIdx);
+            }
             IActor* ticketParser = Settings->CreateTicketParser(Settings->AuthConfig);
             TActorId ticketParserId = Runtime->Register(ticketParser, nodeIdx);
             Runtime->RegisterService(MakeTicketParserID(), ticketParserId, nodeIdx);
@@ -804,6 +818,7 @@ namespace Tests {
             IActor* kqpProxyService = NKqp::CreateKqpProxyService(Settings->AppConfig.GetLogConfig(),
                                                                   Settings->AppConfig.GetTableServiceConfig(),
                                                                   Settings->AppConfig.GetAuthConfig().GetTokenAccessorConfig(),
+                                                                  Settings->AppConfig.GetQueryServiceConfig(),
                                                                   TVector<NKikimrKqp::TKqpSetting>(Settings->KqpSettings),
                                                                   nullptr, std::move(kqpProxySharedResources));
             TActorId kqpProxyServiceId = Runtime->Register(kqpProxyService, nodeIdx);
@@ -907,6 +922,24 @@ namespace Tests {
             IActor* netClassifier = NNetClassifier::CreateNetClassifier();
             TActorId netClassifierId = Runtime->Register(netClassifier, nodeIdx);
             Runtime->RegisterService(NNetClassifier::MakeNetClassifierID(), netClassifierId, nodeIdx);
+        }
+
+        {
+            IActor* actor = CreatePollerActor();
+            TActorId actorId = Runtime->Register(actor, nodeIdx);
+            Runtime->RegisterService(MakePollerActorId(), actorId, nodeIdx);
+        }
+
+        {
+            NKafka::TListenerSettings settings;
+            settings.Port = Settings->AppConfig.GetKafkaProxyConfig().GetListeningPort();
+            if (Settings->AppConfig.GetKafkaProxyConfig().HasSslCertificate()) {
+                settings.SslCertificatePem = Settings->AppConfig.GetKafkaProxyConfig().GetSslCertificate();
+            }
+
+            IActor* actor = NKafka::CreateKafkaListener(MakePollerActorId(), settings, Settings->AppConfig.GetKafkaProxyConfig());
+            TActorId actorId = Runtime->Register(actor, nodeIdx);
+            Runtime->RegisterService(TActorId{}, actorId, nodeIdx);
         }
 
         if (Settings->EnableYq) {

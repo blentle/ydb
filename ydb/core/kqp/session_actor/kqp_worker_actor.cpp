@@ -119,7 +119,7 @@ public:
             Config->_KqpTablePathPrefix = Settings.Database;
         }
 
-        ApplyServiceConfig(*Config, Settings.Service);
+        ApplyServiceConfig(*Config, Settings.TableService);
 
         Config->FreezeDefaults();
 
@@ -133,7 +133,8 @@ public:
         LOG_D("Worker bootstrapped");
         Counters->ReportWorkerCreated(Settings.DbCounters);
 
-        std::shared_ptr<NYql::IKikimrGateway::IKqpTableMetadataLoader> loader = std::make_shared<TKqpTableMetadataLoader>(TlsActivationContext->ActorSystem(), false);
+        std::shared_ptr<NYql::IKikimrGateway::IKqpTableMetadataLoader> loader = std::make_shared<TKqpTableMetadataLoader>(
+            TlsActivationContext->ActorSystem(), Config, false);
         Gateway = CreateKikimrIcGateway(Settings.Cluster, Settings.Database, std::move(loader),
             ctx.ExecutorThread.ActorSystem, ctx.SelfID.NodeId(), RequestCounters);
 
@@ -202,7 +203,7 @@ public:
             QueryState->QueryDeadlines.CancelAt = now + QueryState->RequestEv->GetCancelAfter();
         }
 
-        auto timeoutMs = GetQueryTimeout(QueryState->RequestEv->GetType(), QueryState->RequestEv->GetOperationTimeout().MilliSeconds(), Settings.Service);
+        auto timeoutMs = GetQueryTimeout(QueryState->RequestEv->GetType(), QueryState->RequestEv->GetOperationTimeout().MilliSeconds(), Settings.TableService, Settings.QueryService);
         QueryState->QueryDeadlines.TimeoutAt = now + timeoutMs;
 
         auto onError = [this, &ctx] (Ydb::StatusIds::StatusCode status, const TString& message) {
@@ -328,7 +329,7 @@ public:
         if (CleanupState->Final) {
             ReplyProcessError(ev->Sender, proxyRequestId, Ydb::StatusIds::BAD_SESSION, "Session is being closed");
         } else {
-            auto busyStatus = Settings.Service.GetUseSessionBusyStatus()
+            auto busyStatus = Settings.TableService.GetUseSessionBusyStatus()
                 ? Ydb::StatusIds::SESSION_BUSY
                 : Ydb::StatusIds::PRECONDITION_FAILED;
 
@@ -873,7 +874,7 @@ private:
             return;
         }
 
-        auto busyStatus = Settings.Service.GetUseSessionBusyStatus()
+        auto busyStatus = Settings.TableService.GetUseSessionBusyStatus()
             ? Ydb::StatusIds::SESSION_BUSY
             : Ydb::StatusIds::PRECONDITION_FAILED;
 
@@ -1013,7 +1014,7 @@ private:
     }
 
     static TKikimrQueryLimits GetQueryLimits(const TKqpWorkerSettings& settings) {
-        const auto& queryLimitsProto = settings.Service.GetQueryLimits();
+        const auto& queryLimitsProto = settings.TableService.GetQueryLimits();
         const auto& phaseLimitsProto = queryLimitsProto.GetPhaseLimits();
 
         TKikimrQueryLimits queryLimits;

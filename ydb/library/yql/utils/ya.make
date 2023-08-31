@@ -38,6 +38,7 @@ SRCS(
 )
 
 PEERDIR(
+    library/cpp/actors/util
     library/cpp/digest/md5
     library/cpp/messagebus
     library/cpp/string_utils/quote
@@ -51,11 +52,13 @@ END()
 RECURSE(
     actor_log
     actors
+    actor_system
     backtrace
     bindings
     failure_injector
     fetch
     log
+    test_http_server
     threading
 )
 

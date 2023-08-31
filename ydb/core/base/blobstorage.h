@@ -543,6 +543,7 @@ struct TEvBlobStorage {
         EvRegisterPDiskLoadActor,
         EvStatusUpdate,
         EvDropDonor,
+        EvPutVDiskToReadOnly,
 
         EvCntReply = EvPut + 7 * 512,                           /// 268 635 648
         EvVGenerationChangeResult,
@@ -697,6 +698,8 @@ struct TEvBlobStorage {
         EvFormatReencryptionFinish,
         EvDetectedPhantomBlobCommitted,
         EvGetLogoBlobIndexStatRequest,
+        EvReadMetadata,
+        EvWriteMetadata,
 
         EvYardInitResult = EvPut + 9 * 512,                     /// 268 636 672
         EvLogResult,
@@ -745,6 +748,8 @@ struct TEvBlobStorage {
         EvGetLogoBlobResponse,
         EvChunkForgetResult,
         EvGetLogoBlobIndexStatResponse,
+        EvReadMetadataResult,
+        EvWriteMetadataResult,
 
         // internal proxy interface
         EvUnusedLocal1 = EvPut + 10 * 512, // Not used.    /// 268 637 184
@@ -846,6 +851,11 @@ struct TEvBlobStorage {
         EvRestartPDiskResult,
         EvNodeWardenQueryGroupInfo,
         EvNodeWardenGroupInfo,
+        EvNodeConfigPush,
+        EvNodeConfigReversePush,
+        EvNodeConfigUnbind,
+        EvNodeConfigScatter,
+        EvNodeConfigGather,
 
         // Other
         EvRunActor = EvPut + 15 * 512,
@@ -2329,6 +2339,7 @@ struct TEvBlobStorage {
     struct TEvControllerGroupDecommittedNotify;
     struct TEvControllerGroupDecommittedResponse;
     struct TEvControllerGroupMetricsExchange;
+    struct TEvPutVDiskToReadOnly;
 
     struct TEvMonStreamQuery;
     struct TEvMonStreamActorDeathNote;

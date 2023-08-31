@@ -22,6 +22,7 @@
 #include "read_iterator.h"
 #include "volatile_tx.h"
 #include "conflicts_cache.h"
+#include "reject_reason.h"
 
 #include <ydb/core/tx/time_cast/time_cast.h>
 #include <ydb/core/tx/tx_processing.h>
@@ -234,6 +235,9 @@ class TDataShard
 
     class TTxReadViaPipeline;
     class TReadOperation;
+
+    class TTxHandleSafeKqpScan;
+    class TTxHandleSafeBuildIndexScan;
 
     ITransaction *CreateTxMonitoring(TDataShard *self,
                                      NMon::TEvRemoteHttpInfo::TPtr ev);
@@ -1210,8 +1214,10 @@ class TDataShard
     void Handle(TEvDataShard::TEvGetTableStats::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvAsyncTableStats::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvKqpScan::TPtr& ev, const TActorContext& ctx);
+    void HandleSafe(TEvDataShard::TEvKqpScan::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvUploadRowsRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvEraseRowsRequest::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvDataShard::TEvOverloadUnsubscribe::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvConditionalEraseRowsRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvConditionalEraseRowsRegistered::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ctx);
@@ -1238,6 +1244,7 @@ class TDataShard
     void Handle(TEvDataShard::TEvStoreS3DownloadInfo::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvS3UploadRowsRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvBuildIndexCreateRequest::TPtr& ev, const TActorContext& ctx);
+    void HandleSafe(TEvDataShard::TEvBuildIndexCreateRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvCdcStreamScanRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvCdcStreamScanRegistered::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvCdcStreamScanProgress::TPtr& ev, const TActorContext& ctx);
@@ -1389,12 +1396,16 @@ public:
     bool AddExpectation(ui64 target, ui64 step, ui64 txId);
     bool RemoveExpectation(ui64 target, ui64 txId);
     void SendReadSetExpectation(const TActorContext& ctx, ui64 step, ui64 txId, ui64 source, ui64 target);
+    std::unique_ptr<IEventHandle> GenerateReadSetNoData(const TActorId& recipient, ui64 step, ui64 txId, ui64 source, ui64 target);
     void SendReadSetNoData(const TActorContext& ctx, const TActorId& recipient, ui64 step, ui64 txId, ui64 source, ui64 target);
     bool ProcessReadSetExpectation(TEvTxProcessing::TEvReadSet::TPtr& ev);
     void SendReadSets(const TActorContext& ctx,
                       TVector<THolder<TEvTxProcessing::TEvReadSet>> &&readsets);
     void ResendReadSet(const TActorContext& ctx, ui64 step, ui64 txId, ui64 source, ui64 target, const TString& body, ui64 seqno);
     void SendDelayedAcks(const TActorContext& ctx, TVector<THolder<IEventHandle>>& delayedAcks) const;
+    void GetCleanupReplies(const TOperation::TPtr& op, std::vector<std::unique_ptr<IEventHandle>>& cleanupReplies);
+    void SendConfirmedReplies(TMonotonic ts, std::vector<std::unique_ptr<IEventHandle>>&& replies);
+    void SendCommittedReplies(std::vector<std::unique_ptr<IEventHandle>>&& replies);
 
     void WaitVolatileDependenciesThenSend(
             const absl::flat_hash_set<ui64>& dependencies,
@@ -1490,6 +1501,7 @@ public:
 
     bool CanDrop() const {
         Y_VERIFY(State != TShardState::Offline, "Unexpexted repeated drop");
+        // FIXME: why are we waiting for OutReadSets.Empty()?
         return (TxInFly() == 1) && OutReadSets.Empty() && (State != TShardState::PreOffline);
     }
 
@@ -1500,7 +1512,8 @@ public:
     bool CheckDataTxReject(const TString& opDescr,
                            const TActorContext &ctx,
                            NKikimrTxDataShard::TEvProposeTransactionResult::EStatus& rejectStatus,
-                           TString &reason);
+                           ERejectReasons& rejectReasons,
+                           TString& rejectDescription);
     bool CheckDataTxRejectAndReply(TEvDataShard::TEvProposeTransaction* msg, const TActorContext& ctx);
 
     TSysLocks& SysLocksTable() { return SysLocks; }
@@ -1655,7 +1668,13 @@ public:
 
     void ScanComplete(NTable::EAbort status, TAutoPtr<IDestructable> prod, ui64 cookie, const TActorContext &ctx) override;
     bool ReassignChannelsEnabled() const override;
+    void OnYellowChannelsChanged() override;
+    void OnRejectProbabilityRelaxed() override;
     ui64 GetMemoryUsage() const override;
+
+    bool HasPipeServer(const TActorId& pipeServerId);
+    bool AddOverloadSubscriber(const TActorId& pipeServerId, const TActorId& actorId, ui64 seqNo, ERejectReasons reasons);
+    void NotifyOverloadSubscribers(ERejectReason reason);
 
     bool HasSharedBlobs() const;
     void CheckInitiateBorrowedPartsReturn(const TActorContext& ctx);
@@ -1911,6 +1930,7 @@ public:
     bool CheckTxNeedWait(const TEvDataShard::TEvProposeTransaction::TPtr& ev) const;
 
     bool CheckChangesQueueOverflow() const;
+    void CheckChangesQueueNoOverflow();
 
     void DeleteReadIterator(TReadIteratorsMap::iterator it);
     void CancelReadIterators(Ydb::StatusIds::StatusCode code, const TString& issue, const TActorContext& ctx);
@@ -2291,6 +2311,31 @@ private:
     TTxProgressIdempotentScalarQueue<TEvPrivate::TEvProgressTransaction> PlanQueue;
     TTxProgressIdempotentScalarScheduleQueue<TEvPrivate::TEvCleanupTransaction> CleanupQueue;
     TTxProgressQueue<ui64, TNoOpDestroy, TEvPrivate::TEvProgressResendReadSet> ResendReadSetQueue;
+
+    struct TPipeServerInfoOverloadSubscribersTag {};
+
+    struct TOverloadSubscriber {
+        ui64 SeqNo = 0;
+        ERejectReasons Reasons = ERejectReasons::None;
+    };
+
+    struct TPipeServerInfo
+        : public TIntrusiveListItem<TPipeServerInfo, TPipeServerInfoOverloadSubscribersTag>
+    {
+        TPipeServerInfo() = default;
+
+        TActorId InterconnectSession;
+        THashMap<TActorId, TOverloadSubscriber> OverloadSubscribers;
+    };
+
+    using TPipeServers = THashMap<TActorId, TPipeServerInfo>;
+    using TPipeServersWithOverloadSubscribers = TIntrusiveList<TPipeServerInfo, TPipeServerInfoOverloadSubscribersTag>;
+
+    TPipeServers PipeServers;
+    TPipeServersWithOverloadSubscribers PipeServersWithOverloadSubscribers;
+    size_t OverloadSubscribersByReason[RejectReasonCount] = { 0 };
+
+    void DiscardOverloadSubscribers(TPipeServerInfo& pipeServer);
 
     class TProposeQueue : private TTxProgressIdempotentScalarQueue<TEvPrivate::TEvDelayedProposeTransaction> {
     public:
@@ -2821,6 +2866,7 @@ protected:
             HFunc(TEvDataShard::TEvKqpScan, Handle);
             HFunc(TEvDataShard::TEvUploadRowsRequest, Handle);
             HFunc(TEvDataShard::TEvEraseRowsRequest, Handle);
+            HFunc(TEvDataShard::TEvOverloadUnsubscribe, Handle);
             HFunc(TEvDataShard::TEvConditionalEraseRowsRequest, Handle);
             HFunc(TEvPrivate::TEvConditionalEraseRowsRegistered, Handle);
             HFunc(TEvDataShard::TEvRead, Handle);

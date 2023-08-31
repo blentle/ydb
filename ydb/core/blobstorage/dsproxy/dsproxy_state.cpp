@@ -109,7 +109,7 @@ namespace NKikimr {
             LifeCyclePhase = Info->GetLifeCyclePhase();
             GroupKeyNonce = Info->GetGroupKeyNonce();
             CypherKey = *Info->GetCypherKey();
-            Send(GetNameserviceActorId(), new TEvInterconnect::TEvListNodes);
+            Send(GetNameserviceActorId(), new TEvInterconnect::TEvListNodes(true));
         }
         if (counters) {
             StoragePoolCounters = std::move(counters);
@@ -206,7 +206,7 @@ namespace NKikimr {
         auto *msg = ev->Get();
         Y_VERIFY(Topology);
         Sessions->QueueConnectUpdate(Topology->GetOrderNumber(msg->VDiskId), msg->QueueId, msg->IsConnected,
-            msg->ExtraBlockChecksSupport, msg->MinREALHugeBlobInBytes, *Topology);
+            msg->ExtraBlockChecksSupport, msg->CostModel, *Topology);
         MinREALHugeBlobInBytes = Sessions->GetMinREALHugeBlobInBytes();
         if (msg->IsConnected && (CurrentStateFunc() == &TThis::StateEstablishingSessions ||
                 CurrentStateFunc() == &TThis::StateEstablishingSessionsTimeout)) {
@@ -272,6 +272,9 @@ namespace NKikimr {
         if (NumUnconnectedDisks != Max<ui32>()) {
             NodeMon->DecNumUnconnected(NumUnconnectedDisks);
         }
+
+        TActivationContext::Send(new IEventHandle(TEvents::TSystem::Unsubscribe, 0, GetNameserviceActorId(), SelfId(),
+            nullptr, 0));
 
         TActorBootstrapped::PassAway();
         // TODO: Unsubscribe

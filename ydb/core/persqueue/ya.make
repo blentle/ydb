@@ -20,6 +20,7 @@ SRCS(
     pq_database.cpp
     pq_impl.cpp
     pq_l2_cache.cpp
+    pq_rl_helpers.cpp
     quota_tracker.cpp
     read_balancer.cpp
     account_read_quoter.cpp
@@ -31,6 +32,7 @@ SRCS(
     user_info.cpp
     utils.cpp
     write_meta.cpp
+    microseconds_sliding_window.cpp
 )
 
 GENERATE_ENUM_SERIALIZATION(sourceid.h)

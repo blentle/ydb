@@ -92,7 +92,7 @@ namespace {
 
         auto label = part.Index.Label();
 
-        const auto items = (part.Index->End() - part.Index->Begin());
+        const auto items = (part.Index->End() - part.Index->Begin() + 1);
 
         Out
             << " + Index{" << (ui16)label.Type << " rev "
@@ -110,7 +110,7 @@ namespace {
 
         ssize_t seen = 0;
 
-        for (auto iter = part.Index->Begin(); iter; ++iter) {
+        for (ssize_t i = 0; i < items; i++) {
             Key.clear();
 
             if (depth < 2 && (seen += 1) > 10) {
@@ -121,14 +121,15 @@ namespace {
                 break;
             }
 
+            auto record = part.Index.At(i);
             for (const auto &info: part.Scheme->Groups[0].ColsKeyIdx)
-                Key.push_back(iter->Cell(info));
+                Key.push_back(record->Cell(info));
 
             Out
-                << " | " << (Printf(Out, " %4u", iter->GetPageId()), " ")
-                << (Printf(Out, " %6lu", iter->GetRowId()), " ");
+                << " | " << (Printf(Out, " %4u", record->GetPageId()), " ")
+                << (Printf(Out, " %6lu", record->GetRowId()), " ");
 
-            if (auto *page = Env->TryGetPage(&part, iter->GetPageId())) {
+            if (auto *page = Env->TryGetPage(&part, record->GetPageId())) {
                 Printf(Out, " %6zub  ", page->size());
             } else {
                 Out << "~none~  ";

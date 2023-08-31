@@ -1,7 +1,7 @@
 #include <library/cpp/testing/unittest/registar.h>
 #include <ydb/public/sdk/cpp/client/ydb_persqueue_core/ut/ut_utils/test_server.h>
 #include <ydb/core/kafka_proxy/kafka_events.h>
-#include <ydb/core/kafka_proxy/kafka_metadata_actor.h>
+#include <ydb/core/kafka_proxy/actors/kafka_metadata_actor.h>
 
 
 namespace NKafka::NTests {
@@ -18,9 +18,16 @@ Y_UNIT_TEST_SUITE(TMetadataActorTests) {
     }
 
     auto GetEvent(NPersQueue::TTestServer& server, const TActorId& edgeActor, const TVector<TString>& topics) {
+        NKikimrConfig::TKafkaProxyConfig Config;
+
         auto* runtime = server.CleverServer->GetRuntime();
         auto request = GetMetadataRequest(topics);
-        auto actorId = runtime->Register(new TKafkaMetadataActor(1, request.Get(), edgeActor));
+
+        auto context = std::make_shared<TContext>(Config);
+        context->ConnectionId = edgeActor;
+        context->UserToken = new NACLib::TUserToken("root@builtin", {});
+
+        auto actorId = runtime->Register(new TKafkaMetadataActor(context, 1, request.Get()));
         runtime->EnableScheduleForActor(actorId);
         runtime->DispatchEvents();
         Cerr << "Wait for response for topics: '";
@@ -48,6 +55,7 @@ Y_UNIT_TEST_SUITE(TMetadataActorTests) {
         UNIT_ASSERT(response->Topics[0].ErrorCode == EKafkaErrors::NONE_ERROR);
         UNIT_ASSERT_VALUES_EQUAL(response->Topics[0].Partitions.size(), 5);
         UNIT_ASSERT_VALUES_EQUAL(response->Topics[0].Partitions[0].ReplicaNodes.size(), 1);
+        UNIT_ASSERT(response->Topics[0].TopicId > 0);
 
         event = GetEvent(server, edgeId, {topicPath, topicPath2});
         response = dynamic_cast<TMetadataResponseData*>(event->Response.get());

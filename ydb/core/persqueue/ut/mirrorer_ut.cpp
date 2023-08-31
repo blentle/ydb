@@ -94,15 +94,15 @@ Y_UNIT_TEST_SUITE(TPersQueueMirrorer) {
             {
                 auto* meta = msg->add_metadata_items();
                 meta->set_key("meta-key");
-       	        meta->set_value("meta-value");
+                meta->set_value("meta-value");
             };
             {
                 auto* meta = msg->add_metadata_items();
                 meta->set_key("meta-key2");
-       	        meta->set_value("meta-value2");
+                meta->set_value("meta-value2");
             };
 
-	    if (!writeSession->Write(req)) {
+            if (!writeSession->Write(req)) {
                 UNIT_FAIL("Grpc write fail");
             }
             UNIT_ASSERT(writeSession->Read(&resp));
@@ -177,6 +177,7 @@ Y_UNIT_TEST_SUITE(TPersQueueMirrorer) {
         }
         {
             TVector<TString> base64sourceIds = {"base64:ZHNmc2Rm", "MTIzNDU=", "cXdlcnR5", "base64:bG9nYnJva2Vy", "base64:aa"};
+
             ui32 partition = 0;
             for (auto& sourceId : base64sourceIds) {
                 auto writer = CreateSimpleWriter(*driver, srcTopic, sourceId, partition + 1);
@@ -233,6 +234,7 @@ Y_UNIT_TEST_SUITE(TPersQueueMirrorer) {
                     UNIT_ASSERT_EQUAL(dstMessages[i].GetData(), srcMessages[i].GetData());
                     UNIT_ASSERT_EQUAL(dstMessages[i].GetCodec(), srcMessages[i].GetCodec());
                     UNIT_ASSERT_EQUAL(dstMessages[i].GetOffset(0), srcMessages[i].GetOffset(0));
+                    Cerr << "SRC " << srcMessages[i].GetMessageGroupId(0) << " DST " << dstMessages[i].GetMessageGroupId(0) << "\n";
                     UNIT_ASSERT_EQUAL(dstMessages[i].GetMessageGroupId(0), srcMessages[i].GetMessageGroupId(0));
                     UNIT_ASSERT_EQUAL(dstMessages[i].GetSeqNo(0), srcMessages[i].GetSeqNo(0));
                     UNIT_ASSERT_EQUAL(dstMessages[i].GetCreateTime(0), srcMessages[i].GetCreateTime(0));
@@ -250,6 +252,77 @@ Y_UNIT_TEST_SUITE(TPersQueueMirrorer) {
             }
         }
 
+    }
+
+    Y_UNIT_TEST(ValidStartStream) {
+        using namespace NYdb::NTopic;
+
+        NPersQueue::TTestServer server;
+        TString topic = "topic1";
+        TString topicFullName = "rt3.dc1--" + topic;
+
+        server.AnnoyingClient->CreateTopic(topicFullName, 1);
+
+        auto driver = server.AnnoyingClient->GetDriver();
+        auto writer = CreateSimpleWriter(*driver, topic, "src-id-test"); 
+        for (auto i = 0u; i < 5; i++) {
+            auto res = writer->Write(TString(10, 'a'));
+            UNIT_ASSERT(res);
+        }
+
+        auto createTopicReader = [&](const TString& topic) {
+            auto settings = TReadSessionSettings()
+                    .AppendTopics(TTopicReadSettings(topic))
+                    .ConsumerName("shared/user")
+                    .Decompress(false);
+
+            return TTopicClient(*driver).CreateReadSession(settings);
+        };
+        auto reader = createTopicReader(topic);
+        ui64 messagesGot = 0;
+        while(true) {
+            auto event = reader->GetEvent(true);
+            UNIT_ASSERT(event);
+            if (auto* dataEvent = std::get_if<TReadSessionEvent::TDataReceivedEvent>(&*event)) {
+                for (auto msg : dataEvent->GetCompressedMessages()) {
+                    msg.Commit();
+                    messagesGot++;
+                }
+                if (messagesGot == 5) {
+                    reader->Close();
+                }
+            } else if (auto* lockEv = std::get_if<TReadSessionEvent::TStartPartitionSessionEvent>(&*event)) {
+                    lockEv->Confirm();
+            } else if (auto* releaseEv = std::get_if<TReadSessionEvent::TStopPartitionSessionEvent>(&*event)) {
+                releaseEv->Confirm();
+            } else if (auto* closeSessionEvent = std::get_if<TSessionClosedEvent>(&*event)) {
+                UNIT_ASSERT_VALUES_EQUAL(messagesGot, 5);
+                break;
+            }
+        }
+        
+        for (auto i = 0u; i < 5; i++) {
+            auto res = writer->Write(TString(10, 'b'));
+            UNIT_ASSERT(res);
+        }
+
+        auto res = writer->Close(TDuration::Seconds(10));
+        UNIT_ASSERT(res);
+
+        reader = createTopicReader(topic);
+        bool gotData = false;
+        while(!gotData) {
+            auto event = reader->GetEvent(true);
+            UNIT_ASSERT(event);
+            if (auto dataEvent = std::get_if<TReadSessionEvent::TDataReceivedEvent>(&*event)) {
+                gotData = true;
+            } else if (auto* lockEv = std::get_if<TReadSessionEvent::TStartPartitionSessionEvent>(&*event)) {
+                    lockEv->Confirm(5);
+            } else if (auto* closeSessionEvent = std::get_if<TSessionClosedEvent>(&*event)) {
+                UNIT_FAIL(closeSessionEvent->DebugString());
+                break;
+            }
+        }
     }
 }
 } // NKikimr::NPersQueueTests

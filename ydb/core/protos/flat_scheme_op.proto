@@ -83,6 +83,7 @@ message TColumnDescription {
     optional string FamilyName = 6; // set Family by name (0 - "default")
     oneof DefaultValue {
         string DefaultFromSequence = 7; // Path to sequence for default values
+        NKikimrMiniKQL.TResult DefaultFromLiteral = 10; // Literal default value
     }
     optional bool NotNull = 8;
 }
@@ -382,6 +383,7 @@ message TTableDescription {
     repeated TSequenceDescription Sequences = 39;
 
     optional TTableReplicationConfig ReplicationConfig = 40;
+    optional bool Temporary = 41;
 }
 
 message TDictionaryEncodingSettings {
@@ -785,6 +787,7 @@ enum EIndexType {
     EIndexTypeInvalid = 0;
     EIndexTypeGlobal = 1;
     EIndexTypeGlobalAsync = 2;
+    EIndexTypeGlobalUnique = 3;
 }
 
 enum EIndexState {
@@ -1160,6 +1163,10 @@ message TBlockStoreAssignOp {
     optional uint64 TokenVersion = 3;
 }
 
+message TDropBlockStoreVolume { 
+    optional uint64 FillGeneration = 1;
+}
+
 message TModifyACL {
     optional string Name = 1;
     optional bytes DiffACL = 2; // NACLibProto.TDiffACL
@@ -1476,6 +1483,8 @@ message TModifyScheme {
     optional TExternalTableDescription CreateExternalTable = 58;
 
     optional TExternalDataSourceDescription CreateExternalDataSource = 59;
+
+    optional TDropBlockStoreVolume DropBlockStoreVolume = 60;
 }
 
 // "Script", used by client to parse text files with multiple DDL commands
@@ -1729,18 +1738,38 @@ message TExternalTableDescription {
 }
 
 // Access without authorization
-message NoneAuth {
+message TNoneAuth {
 }
 
-message ServiceAccountAuth {
+message TServiceAccountAuth {
     optional string Id = 1;
     optional string SecretName = 2;
 }
 
+message TMdbBasic {
+    optional string ServiceAccountId = 1;
+    optional string ServiceAccountSecretName = 2;
+    optional string Login = 3;
+    optional string PasswordSecretName = 4;
+}
+
+message TAws {
+    optional string AwsAccessKeyIdSecretName = 1;
+    optional string AwsSecretAccessKeySecretName = 2;
+}
+
+message TBasic {
+    optional string Login = 1;
+    optional string PasswordSecretName = 2;
+}
+
 message TAuth {
     oneof identity {
-        NoneAuth None = 3;
-        ServiceAccountAuth ServiceAccount = 4;
+        TNoneAuth None = 3;
+        TServiceAccountAuth ServiceAccount = 4;
+        TBasic Basic = 5;
+        TMdbBasic MdbBasic = 6;
+        TAws Aws = 7;
     }
 }
 

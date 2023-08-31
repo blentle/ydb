@@ -31,7 +31,7 @@
 #include <yt/yt/core/rpc/service_detail.h>
 #include <yt/yt/core/rpc/stream.h>
 
-#include <yt/yt/core/rpc/unittests/lib/my_service.h>
+#include <yt/yt/core/rpc/unittests/lib/test_service.h>
 #include <yt/yt/core/rpc/unittests/lib/no_baggage_service.h>
 
 #include <yt/yt/core/rpc/grpc/config.h>
@@ -58,35 +58,79 @@ namespace NYT::NRpc {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-template <class TImpl>
-class TTestBase
-    : public ::testing::Test
+class TTestServerHost
 {
 public:
-    void SetUp() final
+    void InitilizeAddress()
     {
         Port_ = NTesting::GetFreePort();
         Address_ = Format("localhost:%v", Port_);
+    }
 
-        Server_ = CreateServer(Port_);
-        WorkerPool_ = NConcurrency::CreateThreadPool(4, "Worker");
-        bool secure = TImpl::Secure;
-        MyService_ = CreateMyService(WorkerPool_->GetInvoker(), secure);
-        NoBaggageService_ = CreateNoBaggageService(WorkerPool_->GetInvoker());
-        Server_->RegisterService(MyService_);
+    void InitializeServer(
+        IServerPtr server,
+        const IInvokerPtr& invoker,
+        bool secure,
+        TTestCreateChannelCallback createChannel)
+    {
+        Server_ = server;
+        TestService_ = CreateTestService(invoker, secure, createChannel);
+        NoBaggageService_ = CreateNoBaggageService(invoker);
+        Server_->RegisterService(TestService_);
         Server_->RegisterService(NoBaggageService_);
         Server_->Start();
     }
 
-    void TearDown() final
+    void TearDown()
     {
         Server_->Stop().Get().ThrowOnError();
         Server_.Reset();
     }
 
-    IServerPtr CreateServer(ui16 port)
+    const NTesting::TPortHolder& GetPort() const
     {
-        return TImpl::CreateServer(port);
+        return Port_;
+    }
+
+    TString GetAddress() const
+    {
+        return Address_;
+    }
+
+protected:
+    NTesting::TPortHolder Port_;
+    TString Address_;
+
+    ITestServicePtr TestService_;
+    IServicePtr NoBaggageService_;
+    IServerPtr Server_;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+template <class TImpl>
+class TTestBase
+    : public ::testing::Test
+    , public TTestServerHost
+{
+public:
+    void SetUp() final
+    {
+        TTestServerHost::InitilizeAddress();
+
+        WorkerPool_ = NConcurrency::CreateThreadPool(4, "Worker");
+        bool secure = TImpl::Secure;
+
+        TTestServerHost::InitializeServer(
+            TImpl::CreateServer(Port_),
+            WorkerPool_->GetInvoker(),
+            secure,
+            /*createChannel*/ {});
+    }
+
+    void TearDown() final
+    {
+        TTestServerHost::TearDown();
     }
 
     IChannelPtr CreateChannel(
@@ -122,14 +166,8 @@ public:
         return false;
     }
 
-protected:
-    NTesting::TPortHolder Port_;
-    TString Address_;
-
+private:
     NConcurrency::IThreadPoolPtr WorkerPool_;
-    IMyServicePtr MyService_;
-    IServicePtr NoBaggageService_;
-    IServerPtr Server_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////

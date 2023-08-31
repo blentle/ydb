@@ -23,8 +23,8 @@ void RegisterS3ReadActorFactory(
         [credentialsFactory, gateway, retryPolicy, cfg, counters](NS3::TSource&& settings, IDqAsyncIoFactory::TSourceArguments&& args) {
             return CreateS3ReadActor(args.TypeEnv, args.HolderFactory, gateway,
                 std::move(settings), args.InputIndex, args.TxId, args.SecureParams,
-                args.TaskParams, args.ComputeActorId, credentialsFactory, retryPolicy, cfg,
-                counters, args.TaskCounters);
+                args.TaskParams, args.ReadRanges, args.ComputeActorId, credentialsFactory, retryPolicy, cfg,
+                counters, args.TaskCounters, args.MemoryQuotaManager);
         });
 #else
     Y_UNUSED(factory);

@@ -83,12 +83,15 @@ class TRealBlockDevice : public IBlockDevice {
                             if (!stateError && action->CanHandleResult()) {
                                 action->Exec(Device.ActorSystem);
                             } else {
+                                TString errorReason = action->ErrorReason;
+
+                                action->Release(Device.ActorSystem);
+
                                 if (!stateError) {
                                     stateError = true;
                                     Device.BecomeErrorState(TStringBuilder()
-                                            << " CompletionAction error, operation info# " << action->ErrorReason);
+                                            << " CompletionAction error, operation info# " << errorReason);
                                 }
-                                action->Release(Device.ActorSystem);
                             }
                         }
                     }
@@ -1071,7 +1074,7 @@ protected:
     }
 
     void BecomeErrorState(const TString& info) {
-        // Block only B flag so device will not working but when Stop() will be called AFlag will be toggled
+        // Block only B flag so device will not be working but when Stop() will be called AFlag will be toggled
         QuitCounter.BlockB();
         TString fullInfo = TStringBuilder() << IoContext->GetPDiskInfo() << info;
         if (ActorSystem) {
@@ -1214,19 +1217,18 @@ class TCachedBlockDevice : public TRealBlockDevice {
         for (auto it = ReadsForOffset.begin(); it != ReadsForOffset.end(); it = nextIt) {
             nextIt++;
             TRead &read = it->second;
-
-            bool foundInCache = Cache.Find(read.Offset, read.Size, static_cast<char*>(read.Data), [compAction=read.CompletionAction](auto badOffsets) {
-                for (size_t i = 0; i < badOffsets.size(); ++i) {
-                    compAction->RegisterBadOffset(badOffsets[i]);
+            const TLogCache::TCacheRecord* cached = Cache.Find(read.Offset);
+            if (cached) {
+                if (read.Size <= cached->Data.Size()) {
+                    memcpy(read.Data, cached->Data.GetData(), read.Size);
+                    Mon.DeviceReadCacheHits->Inc();
+                    Y_VERIFY(read.CompletionAction);
+                    for (size_t i = 0; i < cached->BadOffsets.size(); ++i) {
+                        read.CompletionAction->RegisterBadOffset(cached->BadOffsets[i]);
+                    }
+                    NoopAsyncHackForLogReader(read.CompletionAction, read.ReqId);
+                    ReadsForOffset.erase(it);
                 }
-            });
-            
-            if (foundInCache) {
-                Mon.DeviceReadCacheHits->Inc();
-                Y_VERIFY(read.CompletionAction);
-
-                NoopAsyncHackForLogReader(read.CompletionAction, read.ReqId);
-                ReadsForOffset.erase(it);
             }
         }
         if (ReadsInFly >= MaxReadsInFly) {
@@ -1282,8 +1284,11 @@ public:
                         Cache.Pop();
                     }
                     const char* dataPtr = static_cast<const char*>(completion->GetData());
-
-                    Cache.Insert(dataPtr, completion->GetOffset(), completion->GetSize(), completion->GetBadOffsets());
+                    Cache.Insert(
+                        TLogCache::TCacheRecord(
+                            completion->GetOffset(),
+                            TRcBuf(TString(dataPtr, dataPtr + completion->GetSize())),
+                            completion->GetBadOffsets()));
                 }
             }
 
@@ -1327,6 +1332,24 @@ public:
     void ReleaseRead(TCachedReadCompletion *completion, TActorSystem *actorSystem) {
         TGuard<TMutex> guard(CacheMutex);
         Y_UNUSED(actorSystem);
+
+        if (!completion->CanHandleResult()) {
+            // If error, notify all underlying reads of that error.
+            // Notice that reads' CompletionActions are not released here.
+            // This should happen on device stop.
+            ui64 offset = completion->GetOffset();
+            auto range = ReadsForOffset.equal_range(offset);
+
+            for (auto it = range.first; it != range.second; ++it) {
+                TRead &read = it->second;
+                
+                Y_VERIFY(read.CompletionAction);
+
+                read.CompletionAction->SetResult(completion->Result);
+                read.CompletionAction->SetErrorReason(completion->ErrorReason);
+            }
+        }
+
         auto it = CurrentReads.find(completion->GetOffset());
         Y_VERIFY(it != CurrentReads.end());
         delete it->second;

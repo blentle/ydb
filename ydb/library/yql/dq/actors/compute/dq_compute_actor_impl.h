@@ -1536,14 +1536,16 @@ protected:
             TaskRunner->GetHolderFactory(),
             TaskRunner->GetTypeEnv(),
             TaskRunner->GetSecureParams(),
-            TaskRunner->GetTaskParams());
+            TaskRunner->GetTaskParams(),
+            TaskRunner->GetReadRanges());
     }
 
     void FillIoMaps(
         const NKikimr::NMiniKQL::THolderFactory& holderFactory,
         const NKikimr::NMiniKQL::TTypeEnvironment& typeEnv,
         const THashMap<TString, TString>& secureParams,
-        const THashMap<TString, TString>& taskParams)
+        const THashMap<TString, TString>& taskParams,
+        const TVector<TString>& readRanges)
     {
         if (TaskRunner) {
             for (auto& [channelId, channel] : InputChannelsMap) {
@@ -1566,11 +1568,13 @@ protected:
                         .TxId = TxId,
                         .SecureParams = secureParams,
                         .TaskParams = taskParams,
+                        .ReadRanges = readRanges,
                         .ComputeActorId = this->SelfId(),
                         .TypeEnv = typeEnv,
                         .HolderFactory = holderFactory,
                         .TaskCounters = TaskCounters,
-                        .Alloc = TaskRunner ? TaskRunner->GetAllocatorPtr() : nullptr
+                        .Alloc = TaskRunner ? TaskRunner->GetAllocatorPtr() : nullptr,
+                        .MemoryQuotaManager = MemoryLimits.MemoryQuotaManager
                     });
             } catch (const std::exception& ex) {
                 throw yexception() << "Failed to create source " << inputDesc.GetSource().GetType() << ": " << ex.what();

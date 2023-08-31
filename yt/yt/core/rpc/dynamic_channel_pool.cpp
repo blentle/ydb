@@ -45,7 +45,7 @@ public:
         IChannelFactoryPtr channelFactory,
         TString endpointDescription,
         IAttributeDictionaryPtr endpointAttributes,
-        TString serviceName,
+        std::string serviceName,
         TDiscoverRequestHook discoverRequestHook)
         : Config_(std::move(config))
         , ChannelFactory_(std::move(channelFactory))
@@ -62,7 +62,10 @@ public:
             TGuid::Create(),
             EndpointDescription_,
             ServiceName_))
-       , ViablePeerRegistry_(CreateViablePeerRegistry(Config_, BIND(&TImpl::CreateChannel, Unretained(this)), Logger))
+       , ViablePeerRegistry_(CreateViablePeerRegistry(
+            Config_,
+            BIND(&TImpl::CreateChannel, Unretained(this)),
+            Logger))
        , RandomPeerRotationExecutor_(New<TPeriodicExecutor>(
            TDispatcher::Get()->GetLightInvoker(),
            BIND(&TDynamicChannelPool::TImpl::MaybeEvictRandomPeer, MakeWeak(this)),
@@ -187,7 +190,7 @@ private:
     const IChannelFactoryPtr ChannelFactory_;
     const TString EndpointDescription_;
     const IAttributeDictionaryPtr EndpointAttributes_;
-    const TString ServiceName_;
+    const std::string ServiceName_;
     const TDiscoverRequestHook DiscoverRequestHook_;
 
     const NLogging::TLogger Logger;
@@ -834,8 +837,17 @@ private:
         ViablePeerRegistry_->UnregisterPeer(address);
     }
 
-    void OnChannelFailed(const TString& address, const IChannelPtr& channel, const TError& error)
+    void OnChannelFailed(
+        const TString& address,
+        const IChannelPtr& channel,
+        const TError& error)
     {
+        if (IsChannelFailureErrorHandled(error)) {
+            YT_LOG_DEBUG(error, "Encountered already handled channel failure error (Address: %v)",
+                address);
+            return;
+        }
+
         bool evicted = ViablePeerRegistry_->UnregisterChannel(address, channel);
 
         YT_LOG_DEBUG(
@@ -868,7 +880,7 @@ TDynamicChannelPool::TDynamicChannelPool(
     IChannelFactoryPtr channelFactory,
     TString endpointDescription,
     IAttributeDictionaryPtr endpointAttributes,
-    TString serviceName,
+    std::string serviceName,
     TDiscoverRequestHook discoverRequestHook)
     : Impl_(New<TImpl>(
         std::move(config),

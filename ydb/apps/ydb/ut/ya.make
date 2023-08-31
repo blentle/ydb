@@ -1,10 +1,14 @@
 UNITTEST()
 
+TIMEOUT(600)
+SIZE(MEDIUM)
+
 DEPENDS(
     ydb/apps/ydb
 )
 
 ENV(YDB_CLI_BINARY="ydb/apps/ydb/ydb")
+ENV(YDB_FEATURE_FLAGS="enable_topic_service_tx")
 
 SRCS(
     workload-topic.cpp
@@ -18,7 +22,5 @@ PEERDIR(
 )
 
 INCLUDE(${ARCADIA_ROOT}/ydb/public/tools/ydb_recipe/recipe.inc)
-
-REQUIREMENTS(ram:16)
 
 END()

@@ -25,7 +25,7 @@ void TCommandWorkloadTopicRunFull::Config(TConfig& config)
         .DefaultValue(1)
         .StoreResult(&Scenario.WindowSec);
     config.Opts->AddLongOption('q', "quiet", "Quiet mode. Doesn't print statistics each second.")
-        .StoreTrue(&Quiet);
+        .StoreTrue(&Scenario.Quiet);
     config.Opts->AddLongOption("print-timestamp", "Print timestamp each second with statistics.")
         .StoreTrue(&Scenario.PrintTimestamp);
     config.Opts->AddLongOption("percentile", "Percentile for output statistics.")
@@ -64,6 +64,9 @@ void TCommandWorkloadTopicRunFull::Config(TConfig& config)
         .Optional()
         .DefaultValue((TStringBuilder() << NTopic::ECodec::RAW))
         .StoreMappedResultT<TString>(&Scenario.Codec, &TCommandWorkloadTopicParams::StrToCodec);
+    config.Opts->AddLongOption("direct", "Direct write to a partition node.")
+        .Hidden()
+        .StoreTrue(&Scenario.Direct);
 
     config.Opts->MutuallyExclusive("message-rate", "byte-rate");
 
@@ -80,5 +83,7 @@ void TCommandWorkloadTopicRunFull::Parse(TConfig& config)
 
 int TCommandWorkloadTopicRunFull::Run(TConfig& config)
 {
+    Scenario.UseTransactions = false;
+
     return Scenario.Run(config);
 }

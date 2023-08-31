@@ -1,5 +1,7 @@
 #!/usr/bin/env sh
 
+# Please keep this script in sync with arcadia/devtools/ya/opensource/ya
+
 # Shell commands follow
 # Next line is bilingual: it starts a comment in Python, but do nothing in shell
 """:"
@@ -23,11 +25,11 @@ import sys
 import platform
 import json
 
-URLS = ['https://proxy.sandbox.yandex-team.ru/4846700967', 'https://storage.yandex-team.ru/get-devtools/212715/c74ccb22bdd831b131f1d8d17d3cac12/by_platform.json']
-MD5 = 'c74ccb22bdd831b131f1d8d17d3cac12'
+URLS = ['https://proxy.sandbox.yandex-team.ru/4998225790', 'https://storage.yandex-team.ru/get-devtools/937458/c08dfa5e8009267743627835c6428822/by_platform.json']
+MD5 = 'c08dfa5e8009267743627835c6428822'
 
-URLS3 = ['https://proxy.sandbox.yandex-team.ru/4846691177', 'https://storage.yandex-team.ru/get-devtools/1942278/3f3a78b334369aee46990c44113186c3/by_platform.json']
-MD53 = '3f3a78b334369aee46990c44113186c3'
+URLS3 = ['https://proxy.sandbox.yandex-team.ru/4998233416', 'https://storage.yandex-team.ru/get-devtools/1937492/484da9be1cd832b240eedc4513f03146/by_platform.json']
+MD53 = '484da9be1cd832b240eedc4513f03146'
 
 DEFAULT_PY_VER = 2
 

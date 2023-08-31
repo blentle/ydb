@@ -13,6 +13,9 @@
 #include <ydb/library/yql/providers/common/mkql/yql_type_mkql.h>
 #include <ydb/library/yql/providers/result/expr_nodes/yql_res_expr_nodes.h>
 
+#include <ydb/library/ydb_issue/proto/issue_id.pb.h>
+#include <ydb/library/yql/public/issue/yql_issue.h>
+
 #include <ydb/core/ydb_convert/ydb_convert.h>
 
 #include <ydb/public/sdk/cpp/client/ydb_proto/accessor.h>
@@ -961,10 +964,6 @@ public:
         }
 
         if (auto maybeDrop = TMaybeNode<TKiDropTable>(input)) {
-            if (!EnsureNotPrepare("DROP TABLE", input->Pos(), SessionCtx->Query(), ctx)) {
-                return SyncError();
-            }
-
             auto requireStatus = RequireChild(*input, 0);
             if (requireStatus.Level != TStatus::Ok) {
                 return SyncStatus(requireStatus);
@@ -994,26 +993,35 @@ public:
                 return SyncError();
             }
 
-            bool prepareOnly = SessionCtx->Query().PrepareOnly;
+            bool missingOk = (maybeDrop.MissingOk().Cast().Value() == "1");
 
             NThreading::TFuture<IKikimrGateway::TGenericResult> future;
-            if (prepareOnly) {
-                future = CreateDummySuccess();
-            } else {
-                switch (tableTypeItem) {
-                    case ETableType::Table:
-                        future = Gateway->DropTable(table.Metadata->Cluster, table.Metadata->Name);
-                        break;
-                    case ETableType::TableStore:
-                        future = Gateway->DropTableStore(cluster, ParseDropTableStoreSettings(maybeDrop.Cast()));
-                        break;
-                    case ETableType::ExternalTable:
-                        future = Gateway->DropExternalTable(cluster, ParseDropExternalTableSettings(maybeDrop.Cast()));
-                        break;
-                    case ETableType::Unknown:
-                        ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TStringBuilder() << "Unsupported table type " << tableTypeString));
-                        return SyncError();
-                }
+            switch (tableTypeItem) {
+                case ETableType::Table:
+                    future = Gateway->DropTable(table.Metadata->Cluster, table.Metadata->Name);
+                    if (missingOk) {
+                        future = future.Apply([](const NThreading::TFuture<IKikimrGateway::TGenericResult>& res) {
+                            auto operationResult = res.GetValue();
+                            bool pathNotExist = false;
+                            for (const auto& issue : operationResult.Issues()) {
+                                WalkThroughIssues(issue, false, [&pathNotExist](const NYql::TIssue& issue, int level) {
+                                    Y_UNUSED(level);
+                                    pathNotExist |= (issue.GetCode() == NKikimrIssues::TIssuesIds::PATH_NOT_EXIST);
+                                });
+                            }
+                            return pathNotExist ? CreateDummySuccess() : res;
+                        });
+                    }
+                    break;
+                case ETableType::TableStore:
+                    future = Gateway->DropTableStore(cluster, ParseDropTableStoreSettings(maybeDrop.Cast()));
+                    break;
+                case ETableType::ExternalTable:
+                    future = Gateway->DropExternalTable(cluster, ParseDropExternalTableSettings(maybeDrop.Cast()));
+                    break;
+                case ETableType::Unknown:
+                    ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TStringBuilder() << "Unsupported table type " << tableTypeString));
+                    return SyncError();
             }
 
             return WrapFuture(future,
@@ -1959,6 +1967,7 @@ private:
 
         if (!SessionCtx->HasTx()) {
             TKikimrTransactionContextBase emptyCtx(SessionCtx->Config().EnableKqpImmediateEffects);
+            emptyCtx.SetTempTables(SessionCtx->GetTempTablesState());
             return emptyCtx.ApplyTableOperations(tableOps, tableInfo, queryType);
         }
 

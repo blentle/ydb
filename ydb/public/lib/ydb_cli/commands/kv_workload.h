@@ -20,9 +20,12 @@ public:
 private:
     ui64 InitRowCount;
     ui64 MinPartitions;
+    ui64 PartitionSize;
     ui64 MaxFirstKey;
     ui64 StringLen;
     ui64 ColumnsCnt;
+    ui64 IntColumnsCnt;
+    ui64 KeyColumnsCnt;
     ui64 RowsCnt;
     bool PartitionsByLoad;
 };
@@ -51,6 +54,8 @@ private:
     ui64 MaxFirstKey;
     ui64 StringLen;
     ui64 ColumnsCnt;
+    ui64 IntColumnsCnt;
+    ui64 KeyColumnsCnt;
     ui64 RowsCnt;
 
 };
@@ -66,6 +71,8 @@ private:
     ui64 MaxFirstKey;
     ui64 StringLen;
     ui64 ColumnsCnt;
+    ui64 IntColumnsCnt;
+    ui64 KeyColumnsCnt;
     ui64 RowsCnt;
 
 };
@@ -80,6 +87,8 @@ public:
 private:
     ui64 MaxFirstKey;
     ui64 ColumnsCnt;
+    ui64 IntColumnsCnt;
+    ui64 KeyColumnsCnt;
     ui64 RowsCnt;
 
 };
@@ -94,7 +103,28 @@ public:
 private:
     ui64 MaxFirstKey;
     ui64 ColumnsCnt;
+    ui64 IntColumnsCnt;
+    ui64 KeyColumnsCnt;
     ui64 RowsCnt;
+
+};
+
+class TCommandKvRunMixed : public TWorkloadCommand {
+public:
+    TCommandKvRunMixed();
+    virtual void Config(TConfig& config) override;
+    virtual void Parse(TConfig& config) override;
+    virtual int Run(TConfig& config) override;
+
+private:
+    ui64 MaxFirstKey;
+    ui64 StringLen;
+    ui64 ColumnsCnt;
+    ui64 IntColumnsCnt;
+    ui64 KeyColumnsCnt;
+    bool ChangePartitionsSize;
+    bool DoReadRows;
+    bool DoSelect;
 
 };
 

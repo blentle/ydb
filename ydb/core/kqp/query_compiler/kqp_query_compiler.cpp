@@ -107,6 +107,8 @@ NKqpProto::EKqpPhyTableKind GetPhyTableKind(EKikimrTableKind kind) {
             return NKqpProto::TABLE_KIND_OLAP;
         case EKikimrTableKind::SysView:
             return NKqpProto::TABLE_KIND_SYS_VIEW;
+        case EKikimrTableKind::External:
+            return NKqpProto::TABLE_KIND_EXTERNAL; 
         default:
             return NKqpProto::TABLE_KIND_UNSPECIFIED;
     }
@@ -155,7 +157,11 @@ void FillTable(const TKikimrTableMetadata& tableMeta, THashSet<TStringBuf>&& col
         phyColumn.MutableId()->SetId(column->Id);
         phyColumn.MutableId()->SetName(column->Name);
         phyColumn.SetTypeId(column->TypeInfo.GetTypeId());
-        phyColumn.SetDefaultFromSequence(column->DefaultFromSequence);
+        if (column->IsDefaultFromSequence()) {
+            phyColumn.SetDefaultFromSequence(column->DefaultFromSequence);
+        } else if (column->IsDefaultFromLiteral()) {
+            phyColumn.MutableDefaultFromLiteral()->CopyFrom(column->DefaultFromLiteral);
+        }
 
         if (column->TypeInfo.GetTypeId() == NScheme::NTypeIds::Pg) {
             phyColumn.SetPgTypeName(NPg::PgTypeNameFromTypeDesc(column->TypeInfo.GetTypeDesc()));
@@ -187,71 +193,6 @@ void FillColumns(const TContainer& columns, const TKikimrTableMetadata& tableMet
     }
 }
 
-void FillLiteralKeyBound(const TCoDataCtor& literal, NKqpProto::TKqpPhyLiteralValue& proto) {
-    auto type = literal.Ref().GetTypeAnn();
-
-    // TODO: support pg types
-    YQL_ENSURE(type->GetKind() != ETypeAnnotationKind::Pg, "pg types are not supported");
-
-    auto slot = type->Cast<TDataExprType>()->GetSlot();
-    auto typeId = NKikimr::NUdf::GetDataTypeInfo(slot).TypeId;
-
-    YQL_ENSURE(NScheme::NTypeIds::IsYqlType(typeId) && NSchemeShard::IsAllowedKeyType(NScheme::TTypeInfo(typeId)));
-
-    auto& protoType = *proto.MutableType();
-    auto& protoValue = *proto.MutableValue();
-
-    protoType.SetKind(NKikimrMiniKQL::ETypeKind::Data);
-    protoType.MutableData()->SetScheme(typeId);
-
-    auto value = literal.Literal().Value();
-
-    switch (slot) {
-        case EDataSlot::Bool:
-            protoValue.SetBool(FromString<bool>(value));
-            break;
-        case EDataSlot::Uint8:
-        case EDataSlot::Uint32:
-        case EDataSlot::Date:
-        case EDataSlot::Datetime:
-            protoValue.SetUint32(FromString<ui32>(value));
-            break;
-        case EDataSlot::Int32:
-            protoValue.SetInt32(FromString<i32>(value));
-            break;
-        case EDataSlot::Int64:
-        case EDataSlot::Interval:
-            protoValue.SetInt64(FromString<i64>(value));
-            break;
-        case EDataSlot::Uint64:
-        case EDataSlot::Timestamp:
-            protoValue.SetUint64(FromString<ui64>(value));
-            break;
-        case EDataSlot::String:
-        case EDataSlot::DyNumber:
-            protoValue.SetBytes(value.Data(), value.Size());
-            break;
-        case EDataSlot::Utf8:
-            protoValue.SetText(ToString(value));
-            break;
-        case EDataSlot::Decimal: {
-            const auto paramsDataType = type->Cast<TDataExprParamsType>();
-            auto precision = FromString<ui8>(paramsDataType->GetParamOne());
-            auto scale = FromString<ui8>(paramsDataType->GetParamTwo());
-            protoType.MutableData()->MutableDecimalParams()->SetPrecision(precision);
-            protoType.MutableData()->MutableDecimalParams()->SetScale(scale);
-
-            auto v = NDecimal::FromString(literal.Cast<TCoDecimal>().Literal().Value(), precision, scale);
-            const auto p = reinterpret_cast<ui8*>(&v);
-            protoValue.SetLow128(*reinterpret_cast<ui64*>(p));
-            protoValue.SetHi128(*reinterpret_cast<ui64*>(p + 8));
-            break;
-        }
-
-        default:
-            YQL_ENSURE(false, "Unexpected type slot " << slot);
-    }
-}
 
 void FillKeyBound(const TVarArgCallable<TExprBase>& bound, NKqpProto::TKqpPhyKeyBound& boundProto) {
     if (bound.Maybe<TKqlKeyInc>()) {
@@ -275,7 +216,7 @@ void FillKeyBound(const TVarArgCallable<TExprBase>& bound, NKqpProto::TKqpPhyKey
             paramElementProto.SetParamName(TString(maybeParam.Cast().Name()));
             paramElementProto.SetElementIndex(FromString<ui32>(key.Cast<TCoNth>().Index().Value()));
         } else if (auto maybeLiteral = key.Maybe<TCoDataCtor>()) {
-            FillLiteralKeyBound(maybeLiteral.Cast(), *protoValue.MutableLiteralValue());
+            FillLiteralProto(maybeLiteral.Cast(), *protoValue.MutableLiteralValue());
         } else {
             YQL_ENSURE(false, "Unexpected key bound: " << key.Ref().Content());
         }
@@ -404,7 +345,7 @@ void FillLookup(const TKqpLookupTable& lookup, NKqpProto::TKqpPhyOpLookup& looku
                     protoColumn.MutableParamValue()->SetParamName(maybeParam.Cast().Name().StringValue());
                 } else {
                     YQL_ENSURE(tuple.Value().Maybe<TCoDataCtor>(), "" << tuple.Value().Ref().Dump());
-                    FillLiteralKeyBound(tuple.Value().Cast<TCoDataCtor>(), *protoColumn.MutableLiteralValue());
+                    FillLiteralProto(tuple.Value().Cast<TCoDataCtor>(), *protoColumn.MutableLiteralValue());
                 }
             }
         }
@@ -847,6 +788,18 @@ private:
             FillTable(*tableMeta, std::move(tableColumns), *txProto.AddTables());
         }
 
+        for (const auto& [a, desc] : TablesData->GetTables()) {
+            auto tableMeta = desc.Metadata;
+            YQL_ENSURE(tableMeta);
+            if (desc.Metadata->Kind == NYql::EKikimrTableKind::External) {
+                THashSet<TStringBuf> columns;
+                for (const auto& [col, _]: tableMeta->Columns){
+                    columns.emplace(col);
+                }
+                FillTable(*tableMeta, std::move(columns), *txProto.AddTables());
+            }
+        }
+
         for (const auto& secretName : SecretNames) {
             txProto.AddSecretNames(secretName);
         }
@@ -941,7 +894,14 @@ private:
             // Partitioning
             TVector<TString> partitionParams;
             TString clusterName;
-            dqIntegration->Partition(NYql::TDqSettings(), NYql::TDqSettings::TDefault::MaxTasksPerStage, source.Ref(), partitionParams, &clusterName, ctx, false);
+            // In runtime, number of tasks with Sources is limited by 2x of node count
+            // We prepare a lot of partitions and distribute them between these tasks
+            // Constraint of 1 task per partition is NOT valid anymore
+            // We choose 120 as number with a lot of divisors for even final distribution
+            //
+            // TODO: Replace with ydb.MaxTasksPerStage when implemented
+            //
+            dqIntegration->Partition(NYql::TDqSettings(), 120, source.Ref(), partitionParams, &clusterName, ctx, false);
             externalSource.SetTaskParamKey(TString(dataSourceCategory));
             for (const TString& partitionParam : partitionParams) {
                 externalSource.AddPartitionedTaskParams(partitionParam);
@@ -974,6 +934,17 @@ private:
         dqIntegration->FillSinkSettings(sink.Ref(), settings, sinkType);
         YQL_ENSURE(!settings.type_url().empty(), "Data sink provider \"" << dataSinkCategory << "\" did't fill dq sink settings for its dq sink node");
         YQL_ENSURE(sinkType, "Data sink provider \"" << dataSinkCategory << "\" did't fill dq sink settings type for its dq sink node");
+
+        THashMap<TString, TString> secureParams;
+        NYql::NCommon::FillSecureParams(sink.Ptr(), TypesCtx, secureParams);
+        if (!secureParams.empty()) {
+            YQL_ENSURE(secureParams.size() == 1, "Only one SecureParams per sink allowed");
+            auto it = secureParams.begin();
+            externalSink.SetSinkName(it->first);
+            auto token = it->second;
+            externalSink.SetAuthInfo(CreateStructuredTokenParser(token).ToBuilder().RemoveSecrets().ToJson());
+            CreateStructuredTokenParser(token).ListReferences(SecretNames);
+        }
     }
 
     void FillConnection(const TDqConnection& connection, const TMap<ui64, ui32>& stagesMap,

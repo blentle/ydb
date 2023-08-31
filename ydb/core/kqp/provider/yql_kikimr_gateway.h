@@ -49,7 +49,7 @@ struct TIndexDescription {
     enum class EType : ui32 {
         GlobalSync = 0,
         GlobalAsync = 1,
-
+        GlobalSyncUnique = 2,
     };
 
     // Index states here must be in sync with NKikimrSchemeOp::EIndexState protobuf
@@ -107,6 +107,8 @@ struct TIndexDescription {
         auto type = NYql::TIndexDescription::EType::GlobalSync;
         if (index.GetType() == NKikimrSchemeOp::EIndexType::EIndexTypeGlobalAsync) {
             type = NYql::TIndexDescription::EType::GlobalAsync;
+        } else if (index.GetType() == NKikimrSchemeOp::EIndexType::EIndexTypeGlobalUnique) {
+            type = NYql::TIndexDescription::EType::GlobalSyncUnique;
         }
 
         return type;
@@ -139,6 +141,8 @@ struct TIndexDescription {
     bool ItUsedForWrite() const {
         switch (Type) {
             case EType::GlobalSync:
+                return true;
+            case EType::GlobalSyncUnique:
                 return true;
             case EType::GlobalAsync:
                 return false;
@@ -192,6 +196,7 @@ struct TTableSettings {
 };
 
 struct TKikimrColumnMetadata {
+
     TString Name;
     ui32 Id = 0;
     TString Type;
@@ -199,19 +204,25 @@ struct TKikimrColumnMetadata {
     NKikimr::NScheme::TTypeInfo TypeInfo;
     TString TypeMod;
     TVector<TString> Families;
+    NKikimrKqp::TKqpColumnMetadataProto::EDefaultKind DefaultKind = NKikimrKqp::TKqpColumnMetadataProto::DEFAULT_KIND_UNSPECIFIED;
     TString DefaultFromSequence;
+    NKikimrMiniKQL::TResult DefaultFromLiteral;
 
     TKikimrColumnMetadata() = default;
 
     TKikimrColumnMetadata(const TString& name, ui32 id, const TString& type, bool notNull,
-        NKikimr::NScheme::TTypeInfo typeInfo = {}, const TString& typeMod = {}, const TString& defaultFromSequence = {})
+        NKikimr::NScheme::TTypeInfo typeInfo = {}, const TString& typeMod = {}, const TString& defaultFromSequence = {},
+        NKikimrKqp::TKqpColumnMetadataProto::EDefaultKind defaultKind = NKikimrKqp::TKqpColumnMetadataProto::DEFAULT_KIND_UNSPECIFIED,
+        const NKikimrMiniKQL::TResult& defaultFromLiteral = {})
         : Name(name)
         , Id(id)
         , Type(type)
         , NotNull(notNull)
         , TypeInfo(typeInfo)
         , TypeMod(typeMod)
+        , DefaultKind(defaultKind)
         , DefaultFromSequence(defaultFromSequence)
+        , DefaultFromLiteral(defaultFromLiteral)
     {}
 
     explicit TKikimrColumnMetadata(const NKikimrKqp::TKqpColumnMetadataProto* message)
@@ -220,7 +231,9 @@ struct TKikimrColumnMetadata {
         , Type(message->GetType())
         , NotNull(message->GetNotNull())
         , Families(message->GetFamily().begin(), message->GetFamily().end())
+        , DefaultKind(message->GetDefaultKind())
         , DefaultFromSequence(message->GetDefaultFromSequence())
+        , DefaultFromLiteral(message->GetDefaultFromLiteral())
     {
         auto typeInfoMod = NKikimr::NScheme::TypeInfoModFromProtoColumnType(message->GetTypeId(),
             message->HasTypeInfo() ? &message->GetTypeInfo() : nullptr);
@@ -228,8 +241,24 @@ struct TKikimrColumnMetadata {
         TypeMod = typeInfoMod.TypeMod;
     }
 
-    bool IsAutoIncrement() const {
-        return !DefaultFromSequence.empty();
+    void SetDefaultFromSequence() {
+        DefaultKind = NKikimrKqp::TKqpColumnMetadataProto::DEFAULT_KIND_SEQUENCE;
+    }
+
+    void SetDefaultFromLiteral() {
+        DefaultKind = NKikimrKqp::TKqpColumnMetadataProto::DEFAULT_KIND_LITERAL;
+    }
+
+    bool IsDefaultFromSequence() const {
+        return DefaultKind == NKikimrKqp::TKqpColumnMetadataProto::DEFAULT_KIND_SEQUENCE;
+    }
+
+    bool IsDefaultFromLiteral() const {
+        return DefaultKind == NKikimrKqp::TKqpColumnMetadataProto::DEFAULT_KIND_LITERAL;
+    }
+
+    bool IsDefaultKindDefined() const {
+        return DefaultKind != NKikimrKqp::TKqpColumnMetadataProto::DEFAULT_KIND_UNSPECIFIED;
     }
 
     void ToMessage(NKikimrKqp::TKqpColumnMetadataProto* message) const {
@@ -240,6 +269,8 @@ struct TKikimrColumnMetadata {
         auto columnType = NKikimr::NScheme::ProtoColumnTypeFromTypeInfoMod(TypeInfo, TypeMod);
         message->SetTypeId(columnType.TypeId);
         message->SetDefaultFromSequence(DefaultFromSequence);
+        message->SetDefaultKind(DefaultKind);
+        message->MutableDefaultFromLiteral()->CopyFrom(DefaultFromLiteral);
         if (columnType.TypeInfo) {
             *message->MutableTypeInfo() = *columnType.TypeInfo;
         }
@@ -338,6 +369,9 @@ struct TExternalSource {
     TString DataSourceLocation;
     TString DataSourceInstallation;
     TString ServiceAccountIdSignature;
+    TString Password;
+    TString AwsAccessKeyId;
+    TString AwsSecretAccessKey;
     NKikimrSchemeOp::TAuth DataSourceAuth;
 };
 
@@ -345,6 +379,8 @@ struct TKikimrTableMetadata : public TThrRefBase {
     bool DoesExist = false;
     TString Cluster;
     TString Name;
+    std::optional<TString> QueryName = std::nullopt;
+    bool Temporary = false;
     TKikimrPathId PathId;
     TString SysView;
     ui64 SchemaVersion = 0;

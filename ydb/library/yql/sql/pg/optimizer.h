@@ -7,6 +7,7 @@ struct RelOptInfo;
 struct List;
 struct EquivalenceClass;
 struct Path;
+struct RestrictInfo;
 
 namespace NYql {
 
@@ -21,7 +22,11 @@ private:
     TInput Input;
     std::function<void(const TString&)> Log;
     std::map<TVarId, Var*> Vars;
+    std::vector<std::vector<RestrictInfo*>> RestrictInfos;
+    std::vector<RestrictInfo*> LeftRestriction;
+    std::vector<RestrictInfo*> RightRestriction;
 
+    void MakeLeftOrRightRestrictions(std::vector<RestrictInfo*>& dst, const std::vector<TEq>& src);
     void LogNode(const TString& prefix, void* node);
     RelOptInfo* JoinSearchInternal();
     List* MakeEqClasses();
@@ -34,7 +39,7 @@ private:
 };
 
 // export for tests
-Var* MakeVar(int varno, int relno);
+Var* MakeVar(int relno, int varno);
 RelOptInfo* MakeRelOptInfo(const IOptimizer::TRel& r, int relno);
 List* MakeRelOptInfoList(const IOptimizer::TInput& input);
 

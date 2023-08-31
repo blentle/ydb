@@ -893,7 +893,7 @@ public:
         TKikimrConfiguration::TPtr config, IModuleResolver::TPtr moduleResolver,
         NYql::IHTTPGateway::TPtr httpGateway,
         const NKikimr::NMiniKQL::IFunctionRegistry* funcRegistry, bool keepConfigChanges,
-        bool isInternalCall, NYql::ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory)
+        bool isInternalCall, NYql::ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory, TKqpTempTablesState::TConstPtr tempTablesState = nullptr)
         : Gateway(gateway)
         , Cluster(cluster)
         , ExprCtx(new TExprContext())
@@ -917,6 +917,7 @@ public:
         }
 
         SessionCtx->SetDatabase(database);
+        SessionCtx->SetTempTables(std::move(tempTablesState));
     }
 
     IAsyncQueryResultPtr ExecuteSchemeQuery(const TKqpQueryRef& query, bool isSql, const TExecSettings& settings) override {
@@ -1144,7 +1145,7 @@ private:
         }
 
         TExprNode::TPtr result;
-        if (!CompileExpr(*astRes.Root, result, ctx, ModuleResolver.get())) {
+        if (!CompileExpr(*astRes.Root, result, ctx, ModuleResolver.get(), nullptr)) {
             return nullptr;
         }
 
@@ -1496,7 +1497,16 @@ private:
         state->FunctionRegistry = FuncRegistry;
         state->CredentialsFactory = CredentialsFactory;
 
+        //
+        // TODO: Use TS3GatewayConfig from Kikimr Config when added
+        //
         NYql::TS3GatewayConfig cfg;
+        cfg.SetMaxReadSizePerQuery(100_GB);
+        {
+            auto& setting = *cfg.AddDefaultSettings();
+            setting.SetName("UseBlocksSource");
+            setting.SetValue("true");
+        }
         state->Configuration->Init(cfg, TypesCtx);
 
         auto dataSource = NYql::CreateS3DataSource(state, HttpGateway);
@@ -1652,6 +1662,8 @@ private:
     TIntrusivePtr<TExecuteContext> ExecuteCtx;
     TIntrusivePtr<IKqpRunner> KqpRunner;
     NExternalSource::IExternalSourceFactory::TPtr ExternalSourceFactory{NExternalSource::CreateExternalSourceFactory()};
+
+    TKqpTempTablesState::TConstPtr TempTablesState;
 };
 
 } // namespace
@@ -1672,10 +1684,10 @@ Ydb::Table::QueryStatsCollection::Mode GetStatsMode(NYql::EKikimrStatsMode stats
 TIntrusivePtr<IKqpHost> CreateKqpHost(TIntrusivePtr<IKqpGateway> gateway,
     const TString& cluster, const TString& database, TKikimrConfiguration::TPtr config, IModuleResolver::TPtr moduleResolver,
     NYql::IHTTPGateway::TPtr httpGateway, const NKikimr::NMiniKQL::IFunctionRegistry* funcRegistry, bool keepConfigChanges, bool isInternalCall,
-    NYql::ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory)
+    NYql::ISecuredServiceAccountCredentialsFactory::TPtr credentialsFactory, TKqpTempTablesState::TConstPtr tempTablesState)
 {
     return MakeIntrusive<TKqpHost>(gateway, cluster, database, config, moduleResolver, std::move(httpGateway), funcRegistry,
-        keepConfigChanges, isInternalCall, std::move(credentialsFactory));
+        keepConfigChanges, isInternalCall, std::move(credentialsFactory), std::move(tempTablesState));
 }
 
 } // namespace NKqp

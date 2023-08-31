@@ -6,6 +6,7 @@
 # original buildsystem will not be accepted.
 
 
+add_subdirectory(base32)
 add_subdirectory(base64)
 add_subdirectory(csv)
 add_subdirectory(indent_text)

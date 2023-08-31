@@ -791,6 +791,9 @@ public:
         auto notNullColumns = Y();
         auto columns = Y();
         THashSet<TString> serialColumnsSet;
+        THashSet<TString> columnsWithDefaultValue;
+        auto columnsDefaultValueSettings = Y();
+
         auto serialColumns = Y();
         for (auto& col : Params.Columns) {
             auto columnDesc = Y();
@@ -806,6 +809,20 @@ public:
                 if (notNullColumnsSet.insert(col.Name).second)
                     notNullColumns = L(notNullColumns, BuildQuotedAtom(Pos, col.Name));
             }
+            if (col.DefaultExpr) {
+                if (!col.DefaultExpr->Init(ctx, src)) {
+                    return false;
+                }
+
+                if (!columnsWithDefaultValue.insert(col.Name).second)
+                    continue;
+
+                columnsDefaultValueSettings = L(
+                    columnsDefaultValueSettings,
+                    Q(Y(Q(col.Name), col.DefaultExpr))
+                );
+            }
+
             columnDesc = L(columnDesc, type);
             if (col.Families) {
                 auto familiesDesc = Y();
@@ -821,6 +838,10 @@ public:
             columns = L(columns, Q(columnDesc));
         }
         opts = L(opts, Q(Y(Q("columns"), Q(columns))));
+
+        if (!columnsWithDefaultValue.empty()) {
+            opts = L(opts, Q(Y(Q("columnsDefaultValues"), Q(columnsDefaultValueSettings))));
+        }
 
         if (Table.Service == RtmrProviderName) {
             if (!Params.PkColumns.empty() && !Params.PartitionByColumns.empty()) {
@@ -2345,6 +2366,37 @@ public:
                 Add(Y("declare", var.first, var.second));
             }
 
+            for (const auto& overrideLibrary: ctx.OverrideLibraries) {
+                auto node = Y(
+                    "override_library",
+                    new TAstAtomNodeImpl(
+                        std::get<TPosition>(overrideLibrary.second),
+                        overrideLibrary.first, TNodeFlags::ArbitraryContent
+                    ));
+
+                Add(node);
+            }
+
+            for (const auto& package: ctx.Packages) {
+                const auto& [url, urlPosition] = std::get<1U>(package.second);
+
+                auto node = Y(
+                    "package",
+                    new TAstAtomNodeImpl(
+                        std::get<TPosition>(package.second), package.first,
+                        TNodeFlags::ArbitraryContent
+                    ),
+                    new TAstAtomNodeImpl(urlPosition, url, TNodeFlags::ArbitraryContent));
+
+                if (const auto& tokenWithPosition = std::get<2U>(package.second)) {
+                    const auto& [token, tokenPosition] = *tokenWithPosition;
+
+                    node = L(node, new TAstAtomNodeImpl(tokenPosition, token, TNodeFlags::ArbitraryContent));
+                }
+
+                Add(node);
+            }
+
             for (const auto& lib : ctx.Libraries) {
                 auto node = Y("library", new TAstAtomNodeImpl(std::get<TPosition>(lib.second), lib.first, TNodeFlags::ArbitraryContent));
                 if (const auto& first = std::get<1U>(lib.second)) {
@@ -2425,6 +2477,11 @@ public:
                     }
                     Add(Y("let", "world", Y(TString(ConfigureName), "world", configSource,
                         BuildQuotedAtom(Pos, "DqEngine"), BuildQuotedAtom(Pos, mode))));
+                }
+
+                if (ctx.CostBasedOptimizer) {
+                    Add(Y("let", "world", Y(TString(ConfigureName), "world", configSource,
+                        BuildQuotedAtom(Pos, "CostBasedOptimizer"), BuildQuotedAtom(Pos, ctx.CostBasedOptimizer))));
                 }
 
                 if (ctx.JsonQueryReturnsJsonDocument.Defined()) {

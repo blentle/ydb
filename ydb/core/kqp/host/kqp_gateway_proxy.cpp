@@ -256,6 +256,8 @@ bool ConvertCreateTableSettingsToProto(NYql::TKikimrTableMetadataPtr metadata, Y
         }
     }
 
+    proto.set_temporary(metadata->Temporary);
+
     return true;
 }
 
@@ -279,6 +281,7 @@ void FillCreateTableColumnDesc(NKikimrSchemeOp::TTableDescription& tableDesc, co
     for (const auto& name : metadata->ColumnOrder) {
         auto columnIt = metadata->Columns.find(name);
         Y_ENSURE(columnIt != metadata->Columns.end());
+        const auto& cMeta = columnIt->second;
 
         auto& columnDesc = *tableDesc.AddColumns();
         columnDesc.SetName(columnIt->second.Name);
@@ -288,9 +291,14 @@ void FillCreateTableColumnDesc(NKikimrSchemeOp::TTableDescription& tableDesc, co
             columnDesc.SetFamilyName(*columnIt->second.Families.begin());
         }
 
-        const auto& seq = columnIt->second.DefaultFromSequence;
-        if (!seq.empty()) {
-            columnDesc.SetDefaultFromSequence(seq);
+        if (cMeta.IsDefaultFromSequence()) {
+            columnDesc.SetDefaultFromSequence(
+                cMeta.DefaultFromSequence);
+        }
+
+        if (cMeta.IsDefaultFromLiteral()) {
+            columnDesc.MutableDefaultFromLiteral()->CopyFrom(
+                cMeta.DefaultFromLiteral);
         }
     }
 
@@ -424,7 +432,8 @@ public:
         auto sessionCtx = SessionCtx;
         auto profilesFuture = Gateway->GetTableProfiles();
         auto tablePromise = NewPromise<TGenericResult>();
-        profilesFuture.Subscribe([gateway, sessionCtx, metadata, tablePromise, pathPair, isPrepare]
+        auto temporary = metadata->Temporary;
+        profilesFuture.Subscribe([gateway, sessionCtx, metadata, tablePromise, pathPair, isPrepare, temporary]
             (const TFuture<IKqpGateway::TKqpTableProfilesResult>& future) mutable {
                 auto profilesResult = future.GetValue();
                 if (!profilesResult.Success()) {
@@ -450,6 +459,9 @@ public:
                                 break;
                             case NYql::TIndexDescription::EType::GlobalAsync:
                                 indexDesc->SetType(NKikimrSchemeOp::EIndexType::EIndexTypeGlobalAsync);
+                                break;
+                            case NYql::TIndexDescription::EType::GlobalSyncUnique:
+                                indexDesc->SetType(NKikimrSchemeOp::EIndexType::EIndexTypeGlobalUnique);
                                 break;
                         }
 
@@ -504,6 +516,14 @@ public:
                     result.SetSuccess();
                     tablePromise.SetValue(result);
                 } else {
+                    if (temporary) {
+                        auto code = Ydb::StatusIds::BAD_REQUEST;
+                        auto error = TStringBuilder() << "Not allowed to create temp table";
+                        IKqpGateway::TGenericResult errResult;
+                        errResult.AddIssue(NYql::TIssue(error));
+                        errResult.SetStatus(NYql::YqlStatusFromYdbStatus(code));
+                        tablePromise.SetValue(errResult);
+                    }
                     gateway->ModifyScheme(std::move(schemeTx)).Subscribe([tablePromise, warnings]
                         (const TFuture<TGenericResult>& future) mutable {
                             auto result = future.GetValue();
@@ -533,7 +553,48 @@ public:
     }
 
     TFuture<TGenericResult> DropTable(const TString& cluster, const TString& table) override {
-        FORWARD_ENSURE_NO_PREPARE(DropTable, cluster, table);
+        CHECK_PREPARED_DDL(DropTable);
+
+        auto metadata = SessionCtx->Tables().GetTable(cluster, table).Metadata;
+
+        std::pair<TString, TString> pathPair;
+        TString error;
+        if (!SplitTablePath(metadata->Name, GetDatabase(), pathPair, error, false)) {
+            return MakeFuture(ResultFromError<TGenericResult>(error));
+        }
+
+        auto temporary = metadata->Temporary;
+        auto dropPromise = NewPromise<TGenericResult>();
+
+        NKikimrSchemeOp::TModifyScheme schemeTx;
+        schemeTx.SetOperationType(NKikimrSchemeOp::ESchemeOpDropTable);
+        schemeTx.SetWorkingDir(pathPair.first);
+
+        auto* drop = schemeTx.MutableDrop();
+        drop->SetName(pathPair.second);
+
+        if (IsPrepare()) {
+            auto& phyQuery = *SessionCtx->Query().PreparingQuery->MutablePhysicalQuery();
+            auto& phyTx = *phyQuery.AddTransactions();
+            phyTx.SetType(NKqpProto::TKqpPhyTx::TYPE_SCHEME);
+            phyTx.MutableSchemeOperation()->MutableDropTable()->Swap(&schemeTx);
+
+            TGenericResult result;
+            result.SetSuccess();
+            dropPromise.SetValue(result);
+        } else {
+            if (temporary) {
+                auto code = Ydb::StatusIds::BAD_REQUEST;
+                auto error = TStringBuilder() << "Not allowed to drop temp table";
+                IKqpGateway::TGenericResult errResult;
+                errResult.AddIssue(NYql::TIssue(error));
+                errResult.SetStatus(NYql::YqlStatusFromYdbStatus(code));
+                dropPromise.SetValue(errResult);
+            }
+            return Gateway->DropTable(cluster, table);
+        }
+
+        return dropPromise.GetFuture();
     }
 
     TFuture<TGenericResult> CreateTopic(const TString& cluster, Ydb::Topic::CreateTopicRequest&& request) override {

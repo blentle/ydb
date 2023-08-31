@@ -174,14 +174,18 @@ private:
         TMaybe<ECodec> Codec;
         ui32 OriginalSize; // only for coded messages
         TVector<std::pair<TString, TString>> MessageMeta;
+        const NTable::TTransaction* Tx;
+
         TMessage(ui64 seqNo, const TInstant& createdAt, TStringBuf data, TMaybe<ECodec> codec = {},
-                 ui32 originalSize = 0, const TVector<std::pair<TString, TString>>& messageMeta = {})
+                 ui32 originalSize = 0, const TVector<std::pair<TString, TString>>& messageMeta = {},
+                 const NTable::TTransaction* tx = nullptr)
             : SeqNo(seqNo)
             , CreatedAt(createdAt)
             , DataRef(data)
             , Codec(codec)
             , OriginalSize(originalSize)
             , MessageMeta(messageMeta)
+            , Tx(tx)
         {}
     };
 
@@ -192,12 +196,14 @@ private:
         TInstant StartedAt = TInstant::Zero();
         bool Acquired = false;
         bool FlushRequested = false;
+
         void Add(ui64 seqNo, const TInstant& createdAt, TStringBuf data, TMaybe<ECodec> codec, ui32 originalSize,
-                 const TVector<std::pair<TString, TString>>& messageMeta) {
+                 const TVector<std::pair<TString, TString>>& messageMeta,
+                 const NTable::TTransaction* tx) {
             if (StartedAt == TInstant::Zero())
                 StartedAt = TInstant::Now();
             CurrentSize += codec ? originalSize : data.size();
-            Messages.emplace_back(seqNo, createdAt, data, codec, originalSize, messageMeta);
+            Messages.emplace_back(seqNo, createdAt, data, codec, originalSize, messageMeta, tx);
             Acquired = false;
         }
 
@@ -267,17 +273,24 @@ private:
         TInstant CreatedAt;
         size_t Size;
         TVector<std::pair<TString, TString>> MessageMeta;
-        TOriginalMessage(const ui64 sequenceNumber, const TInstant createdAt, const size_t size)
+        const NTable::TTransaction* Tx;
+
+        TOriginalMessage(const ui64 sequenceNumber, const TInstant createdAt, const size_t size,
+                         const NTable::TTransaction* tx)
             : SeqNo(sequenceNumber)
             , CreatedAt(createdAt)
             , Size(size)
+            , Tx(tx)
         {}
+
         TOriginalMessage(const ui64 sequenceNumber, const TInstant createdAt, const size_t size,
-                         TVector<std::pair<TString, TString>>&& messageMeta)
+                         TVector<std::pair<TString, TString>>&& messageMeta,
+                         const NTable::TTransaction* tx)
             : SeqNo(sequenceNumber)
             , CreatedAt(createdAt)
             , Size(size)
             , MessageMeta(std::move(messageMeta))
+            , Tx(tx)
         {}
     };
 
@@ -299,6 +312,11 @@ private:
         TMaybe<ui64> InitSeqNo;
         TVector<TWriteSessionEvent::TEvent> Events;
         bool Ok = true;
+    };
+
+    struct TPartitionLocation {
+        TEndpointKey Endpoint;
+        i64 Generation;
     };
 
     THandleResult OnErrorImpl(NYdb::TPlainStatus&& status); // true - should Start(), false - should Close(), empty - no action
@@ -323,6 +341,8 @@ public:
         Y_UNUSED(createTimestamp);
         Y_FAIL("Do not use this method");
     };
+
+    void WriteEncoded(TContinuationToken&& continuationToken, TWriteMessage&& message) override;
 
     void WriteEncoded(TContinuationToken&&, TStringBuf, ECodec, ui32,
                       TMaybe<ui64> seqNo = Nothing(), TMaybe<TInstant> createTimestamp = Nothing()) override {
@@ -355,11 +375,11 @@ private:
     void InitWriter();
 
     void OnConnect(TPlainStatus&& st, typename IProcessor::TPtr&& processor,
-            const NGrpc::IQueueClientContextPtr& connectContext);
+                const NGrpc::IQueueClientContextPtr& connectContext);
     void OnConnectTimeout(const NGrpc::IQueueClientContextPtr& connectTimeoutContext);
     void ResetForRetryImpl();
     THandleResult RestartImpl(const TPlainStatus& status);
-    void DoConnect(const TDuration& delay, const TString& endpoint);
+    void Connect(const TDuration& delay);
     void InitImpl();
     void ReadFromProcessor(); // Assumes that we're under lock.
     void WriteToProcessorImpl(TClientMessage&& req); // Assumes that we're under lock.
@@ -390,6 +410,11 @@ private:
     void HandleWakeUpImpl();
     void UpdateTimedCountersImpl();
 
+    void ConnectToPreferredPartitionLocation(const TDuration& delay);
+    void OnDescribePartition(const TStatus& status, const Ydb::Topic::DescribePartitionResult& proto, const NGrpc::IQueueClientContextPtr& describePartitionContext);
+
+    TMaybe<TEndpointKey> GetPreferredEndpointImpl(ui32 partitionId, ui64 partitionNodeId);
+
 private:
     TWriteSessionSettings Settings;
     std::shared_ptr<TTopicClient::TImpl> Client;
@@ -410,6 +435,7 @@ private:
     NGrpc::IQueueClientContextPtr ConnectContext;
     NGrpc::IQueueClientContextPtr ConnectTimeoutContext;
     NGrpc::IQueueClientContextPtr ConnectDelayContext;
+    NGrpc::IQueueClientContextPtr DescribePartitionContext;
     size_t ConnectionGeneration = 0;
     size_t ConnectionAttemptsDone = 0;
     TAdaptiveLock Lock;
@@ -438,6 +464,7 @@ private:
     TAtomic Aborting = 0;
     bool SessionEstablished = false;
     ui32 PartitionId = 0;
+    TPartitionLocation PreferredPartitionLocation = {};
     ui64 LastSeqNo = 0;
     ui64 MinUnsentSeqNo = 0;
     ui64 SeqNoShift = 0;
@@ -451,7 +478,6 @@ private:
     TInstant LastCountersLogTs;
     TWriterCounters::TPtr Counters;
     TDuration WakeupInterval;
-
 protected:
     ui64 MessagesAcquired = 0;
 };

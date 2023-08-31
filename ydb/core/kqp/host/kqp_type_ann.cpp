@@ -454,13 +454,18 @@ TStatus AnnotateLookupTable(const TExprNode::TPtr& node, TExprContext& ctx, cons
         }
     }
 
+    auto tableDbg = [&]() {
+        return TStringBuilder() << "Lookup: " << structType->ToString()
+           << ", for table: " << table.second->Metadata->Name;
+    };
+
     if (!keyColumnsCount) {
-        ctx.AddError(TIssue(ctx.GetPosition(node->Pos()), "Table lookup has no key columns."));
+        ctx.AddError(TIssue(ctx.GetPosition(node->Pos()), "Table lookup has no key columns. " + tableDbg()));
         return TStatus::Error;
     }
 
     if (structType->GetSize() != keyColumnsCount) {
-        ctx.AddError(TIssue(ctx.GetPosition(node->Pos()), "Table lookup contains non-key columns."));
+        ctx.AddError(TIssue(ctx.GetPosition(node->Pos()), "Table lookup contains non-key columns. " + tableDbg()));
         return TStatus::Error;
     }
 
@@ -542,7 +547,7 @@ TStatus AnnotateUpsertRows(const TExprNode::TPtr& node, TExprContext& ctx, const
 
     for (auto& keyColumnName : table.second->Metadata->KeyColumnNames) {
         const auto& columnInfo = table.second->Metadata->Columns.at(keyColumnName);
-        if (!rowType->FindItem(keyColumnName) && !columnInfo.IsAutoIncrement()) {
+        if (!rowType->FindItem(keyColumnName) && !columnInfo.IsDefaultKindDefined()) {
             ctx.AddError(YqlIssue(ctx.GetPosition(node->Pos()), TIssuesIds::KIKIMR_PRECONDITION_FAILED, TStringBuilder()
                 << "Missing key column in input type: " << keyColumnName));
             return TStatus::Error;
@@ -1253,7 +1258,7 @@ TStatus AnnotateSequencer(const TExprNode::TPtr& node, TExprContext& ctx, const 
         const auto& infoIt = table->Metadata->Columns.find(key);
         YQL_ENSURE(infoIt != table->Metadata->Columns.end());
         const auto& info = infoIt->second;
-        if (info.IsAutoIncrement()) {
+        if (info.IsDefaultKindDefined()) {
             auto [_, inserted] = missingKeyColumns.emplace(key);
             YQL_ENSURE(inserted, "unexpected duplicates in key columns.");
         }

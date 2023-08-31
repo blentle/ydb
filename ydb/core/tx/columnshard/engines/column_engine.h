@@ -1,10 +1,10 @@
 #pragma once
-#include "changes/abstract.h"
+#include "changes/abstract/abstract.h"
 #include "granules_table.h"
 #include "portions/portion_info.h"
 #include "scheme/snapshot_scheme.h"
 #include "predicate/filter.h"
-#include "changes/compaction_info.h"
+#include "changes/abstract/compaction_info.h"
 #include <ydb/core/tx/columnshard/common/reverse_accessor.h>
 
 namespace NKikimr::NColumnShard {
@@ -306,6 +306,7 @@ class TVersionedIndex {
     std::map<TSnapshot, ISnapshotSchema::TPtr> Snapshots;
     std::shared_ptr<arrow::Schema> IndexKey;
     std::map<ui64, ISnapshotSchema::TPtr> SnapshotByVersion;
+    ui64 LastSchemaVersion = 0;
 public:
     ISnapshotSchema::TPtr GetSchema(const ui64 version) const {
         auto it = SnapshotByVersion.find(version);
@@ -345,9 +346,16 @@ public:
             Y_VERIFY(IndexKey->Equals(indexInfo.GetIndexKey()));
         }
         auto it = Snapshots.emplace(version, std::make_shared<TSnapshotSchema>(std::move(indexInfo), version));
-        if (!SnapshotByVersion.emplace(it.first->second->GetVersion(), it.first->second).second) {
-            Y_VERIFY(GetLastSchema()->GetVersion() == it.first->second->GetVersion());
+        Y_VERIFY(it.second);
+        auto newVersion = it.first->second->GetVersion();
+
+        if (SnapshotByVersion.contains(newVersion)) {
+            Y_VERIFY_S(LastSchemaVersion != 0, TStringBuilder() << "Last: " << LastSchemaVersion);
+            Y_VERIFY_S(LastSchemaVersion == newVersion, TStringBuilder() << "Last: " << LastSchemaVersion << ";New: " << newVersion);
         }
+
+        SnapshotByVersion[newVersion] = it.first->second;
+        LastSchemaVersion = newVersion;
     }
 };
 
@@ -379,7 +387,7 @@ public:
                                                                   const TCompactionLimits& limits) noexcept = 0;
     virtual std::shared_ptr<TCleanupColumnEngineChanges> StartCleanup(const TSnapshot& snapshot, THashSet<ui64>& pathsToDrop,
                                                                ui32 maxRecords) noexcept = 0;
-    virtual std::shared_ptr<TTTLColumnEngineChanges> StartTtl(const THashMap<ui64, TTiering>& pathEviction,
+    virtual std::shared_ptr<TTTLColumnEngineChanges> StartTtl(const THashMap<ui64, TTiering>& pathEviction, const THashSet<ui64>& busyGranules,
                                                            ui64 maxBytesToEvict = TCompactionLimits::DEFAULT_EVICTION_BYTES) noexcept = 0;
     virtual bool ApplyChanges(IDbWrapper& db, std::shared_ptr<TColumnEngineChanges> changes, const TSnapshot& snapshot) noexcept = 0;
     virtual void UpdateDefaultSchema(const TSnapshot& snapshot, TIndexInfo&& info) = 0;

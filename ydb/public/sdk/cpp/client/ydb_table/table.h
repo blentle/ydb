@@ -8,6 +8,7 @@
 #include <ydb/public/sdk/cpp/client/ydb_scheme/scheme.h>
 #include <ydb/public/sdk/cpp/client/ydb_table/query_stats/stats.h>
 #include <ydb/public/sdk/cpp/client/ydb_types/operation/operation.h>
+#include <ydb/public/sdk/cpp/client/ydb_retry/retry.h>
 
 #include <util/generic/hash.h>
 #include <util/generic/maybe.h>
@@ -454,6 +455,11 @@ private:
 struct TExplicitPartitions;
 struct TDescribeTableSettings;
 
+enum class EStoreType {
+    Row = 0,
+    Column = 1
+};
+
 //! Represents table description
 class TTableDescription {
     friend class TTableBuilder;
@@ -472,6 +478,7 @@ public:
     TVector<TChangefeedDescription> GetChangefeedDescriptions() const;
     TMaybe<TTtlSettings> GetTtlSettings() const;
     TMaybe<TString> GetTiering() const;
+    EStoreType GetStoreType() const;
 
     // Deprecated. Use GetEntry() of TDescribeTableResult instead
     const TString& GetOwner() const;
@@ -553,6 +560,7 @@ private:
     void SetPartitioningSettings(const TPartitioningSettings& settings);
     void SetKeyBloomFilter(bool enabled);
     void SetReadReplicasSettings(TReadReplicasSettings::EMode mode, ui64 readReplicasCount);
+    void SetStoreType(EStoreType type);
     const Ydb::Table::DescribeTableResult& GetProto() const;
 
     class TImpl;
@@ -722,6 +730,8 @@ class TTableBuilder {
 public:
     TTableBuilder() = default;
 
+    TTableBuilder& SetStoreType(EStoreType type);
+
     TTableBuilder& AddNullableColumn(const TString& name, const EPrimitiveType& type, const TString& family = TString());
     TTableBuilder& AddNullableColumn(const TString& name, const TDecimalType& type, const TString& family = TString());
     TTableBuilder& AddNullableColumn(const TString& name, const TPgType& type, const TString& family = TString());
@@ -872,39 +882,8 @@ using TAsyncScanQueryPartIterator = NThreading::TFuture<TScanQueryPartIterator>;
 
 struct TCreateSessionSettings : public TOperationRequestSettings<TCreateSessionSettings> {};
 
-struct TBackoffSettings {
-    using TSelf = TBackoffSettings;
-
-    FLUENT_SETTING_DEFAULT(TDuration, SlotDuration, TDuration::Seconds(1));
-    FLUENT_SETTING_DEFAULT(ui32, Ceiling, 6);
-    FLUENT_SETTING_DEFAULT(double, UncertainRatio, 0.5);
-};
-
-struct TRetryOperationSettings {
-    using TSelf = TRetryOperationSettings;
-
-    FLUENT_SETTING_DEFAULT(ui32, MaxRetries, 10);
-    FLUENT_SETTING_DEFAULT(bool, RetryNotFound, true);
-    FLUENT_SETTING_DEFAULT(TDuration, GetSessionClientTimeout, TDuration::Seconds(5));
-    FLUENT_SETTING_DEFAULT(TBackoffSettings, FastBackoffSettings, DefaultFastBackoffSettings());
-    FLUENT_SETTING_DEFAULT(TBackoffSettings, SlowBackoffSettings, DefaultSlowBackoffSettings());
-    FLUENT_SETTING_FLAG(Idempotent);
-    FLUENT_SETTING_FLAG(Verbose);
-
-    static TBackoffSettings DefaultFastBackoffSettings() {
-        return TBackoffSettings()
-            .Ceiling(10)
-            .SlotDuration(TDuration::MilliSeconds(5))
-            .UncertainRatio(0.5);
-    }
-
-    static TBackoffSettings DefaultSlowBackoffSettings() {
-        return TBackoffSettings()
-            .Ceiling(6)
-            .SlotDuration(TDuration::Seconds(1))
-            .UncertainRatio(0.5);
-    }
-};
+using TBackoffSettings = NYdb::NRetry::TBackoffSettings;
+using TRetryOperationSettings = NYdb::NRetry::TRetryOperationSettings;
 
 struct TSessionPoolSettings {
     using TSelf = TSessionPoolSettings;
@@ -1576,6 +1555,10 @@ struct TReadTableSettings : public TRequestSettings<TReadTableSettings> {
     FLUENT_SETTING_OPTIONAL(ui64, RowLimit);
 
     FLUENT_SETTING_OPTIONAL(bool, UseSnapshot);
+
+    FLUENT_SETTING_OPTIONAL(ui64, BatchLimitBytes);
+
+    FLUENT_SETTING_OPTIONAL(ui64, BatchLimitRows);
 };
 
 //! Represents all session operations

@@ -420,6 +420,12 @@ public:
 
         auto result = MakeHolder<TProposeResponse>(NKikimrScheme::StatusAccepted, ui64(OperationId.GetTxId()), ui64(ssId));
 
+        if (AppData()->DataShardConfig.GetDisabledOnSchemeShard()) {
+            result->SetError(NKikimrScheme::StatusPreconditionFailed,
+                "OLTP schema operations are not supported");
+            return result;
+        }
+
         NSchemeShard::TPath parentPath = NSchemeShard::TPath::Resolve(parentPathStr, context.SS);
         {
             NSchemeShard::TPath::TChecker checks = parentPath.Check();
@@ -523,6 +529,12 @@ public:
         PrepareScheme(schema);
 
         TString errStr;
+
+        if ((schema.HasTemporary() && schema.GetTemporary()) && !AppData()->FeatureFlags.GetEnableTempTables()) {
+            result->SetError(NKikimrScheme::StatusPreconditionFailed,
+                TStringBuilder() << "It is not allowed to create temp table: " << schema.GetName());
+            return result;
+        }
 
         if (!CheckColumnTypesConstraints(schema, errStr)) {
             result->SetError(NKikimrScheme::StatusPreconditionFailed, errStr);

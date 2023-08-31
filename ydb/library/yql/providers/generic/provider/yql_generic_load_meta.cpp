@@ -42,9 +42,8 @@ namespace NYql {
         using TMapType = std::unordered_map<TGenericState::TTableAddress, TGenericTableDescription, THash<TGenericState::TTableAddress>>;
 
     public:
-        TGenericLoadTableMetadataTransformer(TGenericState::TPtr state, NConnector::IClient::TPtr client)
+        TGenericLoadTableMetadataTransformer(TGenericState::TPtr state)
             : State_(std::move(state))
-            , Client_(std::move(client))
         {
         }
 
@@ -124,8 +123,10 @@ namespace NYql {
                 dsi->set_database(TString(db));
                 request.set_table(TString(dbTable));
 
+                dsi->set_use_tls(clusterConfig.GetUseSsl());
+
                 // NOTE: errors will be checked further in DoApplyAsyncChanges
-                Results_.emplace(item, TGenericTableDescription(request.data_source_instance(), Client_->DescribeTable(request)));
+                Results_.emplace(item, TGenericTableDescription(request.data_source_instance(), State_->GenericClient->DescribeTable(request)));
 
                 // FIXME: for the sake of simplicity, asynchronous workflow is broken now. Fix it some day.
                 auto promise = NThreading::NewPromise();
@@ -175,9 +176,8 @@ namespace NYql {
 
                         const auto& parse = ParseTableMeta(tableMeta.Schema, clusterName, tableName, ctx, tableMeta.ColumnOrder);
 
-                        if (parse.first) {
-                            tableMeta.ItemType = parse.first;
-                            State_->Timezones[read.DataSource().Cluster().Value()] = ctx.AppendString(parse.second);
+                        if (parse) {
+                            tableMeta.ItemType = parse;
                             if (const auto ins = replaces.emplace(read.Raw(), TExprNode::TPtr()); ins.second) {
                                 // clang-format off
                                 ins.first->second = Build<TGenReadTable>(ctx, read.Pos())
@@ -185,7 +185,6 @@ namespace NYql {
                                     .DataSource(read.DataSource())
                                     .Table().Value(tableName).Build()
                                     .Columns<TCoVoid>().Build()
-                                    .Timezone().Value(parse.second).Build()
                                 .Done().Ptr();
                                 // clang-format on
                             }
@@ -222,16 +221,16 @@ namespace NYql {
         }
 
     private:
-        std::pair<const TStructExprType*, TString> ParseTableMeta(const NConnector::NApi::TSchema& schema,
-                                                                  const std::string_view& cluster,
-                                                                  const std::string_view& table, TExprContext& ctx,
-                                                                  TVector<TString>& columnOrder) try {
+        const TStructExprType* ParseTableMeta(const NConnector::NApi::TSchema& schema,
+                                              const std::string_view& cluster,
+                                              const std::string_view& table, TExprContext& ctx,
+                                              TVector<TString>& columnOrder) try {
             TVector<const TItemExprType*> items;
 
             auto columns = schema.columns();
             if (columns.empty()) {
                 ctx.AddError(TIssue({}, TStringBuilder() << "Table " << cluster << '.' << table << " doesn't exist."));
-                return {nullptr, {}};
+                return nullptr;
             }
 
             for (auto i = 0; i < columns.size(); i++) {
@@ -243,24 +242,22 @@ namespace NYql {
                 items.emplace_back(ctx.MakeType<TItemExprType>(columns.Get(i).name(), typeAnnotation));
                 columnOrder.emplace_back(columns.Get(i).name());
             }
-            // FIXME: handle on Generic's side?
-            return std::make_pair(ctx.MakeType<TStructExprType>(items), TString("Europe/Moscow"));
+            // FIXME: handle on Connector's side?
+            return ctx.MakeType<TStructExprType>(items);
         } catch (std::exception&) {
             ctx.AddError(TIssue({}, TStringBuilder() << "Failed to parse table metadata: " << CurrentExceptionMessage()));
-            return {nullptr, {}};
+            return nullptr;
         }
 
     private:
         const TGenericState::TPtr State_;
-        const NConnector::IClient::TPtr Client_;
 
         TMapType Results_;
         NThreading::TFuture<void> AsyncFuture_;
     };
 
-    THolder<IGraphTransformer> CreateGenericLoadTableMetadataTransformer(TGenericState::TPtr state,
-                                                                         NConnector::IClient::TPtr client) {
-        return MakeHolder<TGenericLoadTableMetadataTransformer>(std::move(state), std::move(client));
+    THolder<IGraphTransformer> CreateGenericLoadTableMetadataTransformer(TGenericState::TPtr state) {
+        return MakeHolder<TGenericLoadTableMetadataTransformer>(std::move(state));
     }
 
 } // namespace NYql

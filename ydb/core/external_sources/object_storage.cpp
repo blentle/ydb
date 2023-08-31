@@ -40,7 +40,7 @@ struct TObjectStorageExternalSource : public IExternalSource {
         }
 
         if (auto issues = Validate(schema, objectStorage)) {
-            ythrow TExternalSourceException() << issues.ToString() << Endl;
+            ythrow TExternalSourceException() << issues.ToString();
         }
 
         return objectStorage.SerializeAsString();
@@ -50,17 +50,29 @@ struct TObjectStorageExternalSource : public IExternalSource {
         return TString{NYql::S3ProviderName};
     }
 
-    virtual TMap<TString, TString> GetParameters(const TString& content) const override {
+    virtual bool HasExternalTable() const override {
+        return true;
+    }
+
+    virtual TVector<TString> GetAuthMethods() const override {
+        return {"NONE", "SERVICE_ACCOUNT", "AWS"};
+    }
+
+    virtual TMap<TString, TVector<TString>> GetParameters(const TString& content) const override {
         NKikimrExternalSources::TObjectStorage objectStorage;
         objectStorage.ParseFromStringOrThrow(content);
 
-        TMap<TString, TString> parameters{objectStorage.format_setting().begin(), objectStorage.format_setting().end()};
+        TMap<TString, TVector<TString>> parameters;
+        for (const auto& [key, value] : objectStorage.format_setting()) {
+            parameters[key] = {value};
+        }
+
         if (objectStorage.format()) {
-            parameters["format"] = objectStorage.format();
+            parameters["format"] = {objectStorage.format()};
         }
 
         if (objectStorage.compression()) {
-            parameters["compression"] = objectStorage.compression();
+            parameters["compression"] = {objectStorage.compression()};
         }
 
         NSc::TValue projection;
@@ -69,13 +81,14 @@ struct TObjectStorageExternalSource : public IExternalSource {
         }
 
         if (!projection.DictEmpty()) {
-            parameters["projection"] = projection.ToJson();
+            parameters["projection"] = {projection.ToJson()};
         }
 
-        NSc::TValue partitionedBy;
-        partitionedBy.AppendAll(objectStorage.partitioned_by());
-        if (!partitionedBy.ArrayEmpty()) {
-            parameters["partitioned_by"] = partitionedBy.ToJson();
+        if (!objectStorage.partitioned_by().empty()) {
+            parameters["partitioned_by"].reserve(objectStorage.partitioned_by().size());
+            for (const TString& column : objectStorage.partitioned_by()) {
+                parameters["partitioned_by"].emplace_back(column);
+            }
         }
 
         return parameters;

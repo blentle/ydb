@@ -76,45 +76,45 @@ inline bool IsDebugLogEnabled() {
 TActorId ReportToRl(ui64 ru, const TString& database, const TString& userToken,
     const NKikimrKqp::TRlPath& path);
 
-template <class TDerived, EExecType ExecType>
-class TKqpExecuterBase : public TActorBootstrapped<TDerived> {
-protected:
-    struct TEvPrivate {
-        enum EEv {
-            EvRetry = EventSpaceBegin(TEvents::ES_PRIVATE),
-            EvResourcesSnapshot,
-            EvReattachToShard,
-        };
-
-        struct TEvRetry : public TEventLocal<TEvRetry, EEv::EvRetry> {
-            ui32 RequestId;
-            TActorId Target;
-
-            TEvRetry(ui64 requestId, const TActorId& target)
-                : RequestId(requestId)
-                , Target(target) {}
-        };
-
-        struct TEvResourcesSnapshot : public TEventLocal<TEvResourcesSnapshot, EEv::EvResourcesSnapshot> {
-            TVector<NKikimrKqp::TKqpNodeResources> Snapshot;
-
-            TEvResourcesSnapshot(TVector<NKikimrKqp::TKqpNodeResources>&& snapshot)
-                : Snapshot(std::move(snapshot)) {}
-        };
-
-        struct TEvReattachToShard : public TEventLocal<TEvReattachToShard, EvReattachToShard> {
-            const ui64 TabletId;
-
-            explicit TEvReattachToShard(ui64 tabletId)
-                : TabletId(tabletId) {}
-        };
+struct TEvPrivate {
+    enum EEv {
+        EvRetry = EventSpaceBegin(TEvents::ES_PRIVATE),
+        EvResourcesSnapshot,
+        EvReattachToShard,
     };
 
+    struct TEvRetry : public TEventLocal<TEvRetry, EEv::EvRetry> {
+        ui32 RequestId;
+        TActorId Target;
+
+        TEvRetry(ui64 requestId, const TActorId& target)
+            : RequestId(requestId)
+            , Target(target) {}
+    };
+
+    struct TEvResourcesSnapshot : public TEventLocal<TEvResourcesSnapshot, EEv::EvResourcesSnapshot> {
+        TVector<NKikimrKqp::TKqpNodeResources> Snapshot;
+
+        TEvResourcesSnapshot(TVector<NKikimrKqp::TKqpNodeResources>&& snapshot)
+            : Snapshot(std::move(snapshot)) {}
+    };
+
+    struct TEvReattachToShard : public TEventLocal<TEvReattachToShard, EvReattachToShard> {
+        const ui64 TabletId;
+
+        explicit TEvReattachToShard(ui64 tabletId)
+            : TabletId(tabletId) {}
+    };
+};
+
+template <class TDerived, EExecType ExecType>
+class TKqpExecuterBase : public TActorBootstrapped<TDerived> {
 public:
     TKqpExecuterBase(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
         const TIntrusiveConstPtr<NACLib::TUserToken>& userToken,
         TKqpRequestCounters::TPtr counters,
         const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig,
+        const NKikimrConfig::TTableServiceConfig::EChannelTransportVersion chanTransportVersion,
         ui64 spanVerbosity = 0, TString spanName = "no_name")
         : Request(std::move(request))
         , Database(database)
@@ -127,6 +127,7 @@ public:
         TasksGraph.GetMeta().Snapshot = IKqpGateway::TKqpSnapshot(Request.Snapshot.Step, Request.Snapshot.TxId);
         TasksGraph.GetMeta().Arena = MakeIntrusive<NActors::TProtoArenaHolder>();
         TasksGraph.GetMeta().Database = Database;
+        TasksGraph.GetMeta().ChannelTransportVersion = chanTransportVersion;
         ResponseEv = std::make_unique<TEvKqpExecuter::TEvTxResponse>(Request.TxAlloc);
         ResponseEv->Orbit = std::move(Request.Orbit);
         Stats = std::make_unique<TQueryExecutionStats>(Request.StatsMode, &TasksGraph,
@@ -344,7 +345,7 @@ protected:
         }
 
         auto kqpTableResolver = CreateKqpTableResolver(this->SelfId(), TxId, UserToken, Request.Transactions,
-            GetTableKeysRef(), TasksGraph);
+            TasksGraph);
         KqpTableResolverId = this->RegisterWithSameMailbox(kqpTableResolver);
 
         LOG_T("Got request, become WaitResolveState");
@@ -394,7 +395,8 @@ protected:
 
     virtual void OnSecretsFetched() {}
 
-    void ResolveSecretNames(const google::protobuf::RepeatedPtrField<TProtoStringType>& secretNames, TMap<TString, TString>& secureParams) {
+    TMap<TString, TString> ResolveSecretNames(const google::protobuf::RepeatedPtrField<TProtoStringType>& secretNames) {
+        TMap<TString, TString> secureParams;
         for (const auto& secretName : secretNames) {
             auto secretId = NMetadata::NSecret::TSecretId(UserToken->GetUserSID(), secretName);
 
@@ -403,6 +405,16 @@ protected:
 
             secureParams[secretName] = secretValue;
         }
+
+        return secureParams;
+    }
+
+    void GetResourcesSnapshot() {
+        GetKqpResourceManager()->RequestClusterResourcesInfo(
+            [as = TlsActivationContext->ActorSystem(), self = SelfId()](TVector<NKikimrKqp::TKqpNodeResources>&& resources) {
+                TAutoPtr<IEventHandle> eh = new IEventHandle(self, self, new TEvPrivate::TEvResourcesSnapshot(std::move(resources)));
+                as->Send(eh);
+            });
     }
 
 protected:
@@ -627,7 +639,7 @@ protected:
             auto& record = channelsInfoEv->Record;
 
             for (auto& channelId : channelIds) {
-                FillChannelDesc(TasksGraph, *record.AddUpdate(), TasksGraph.GetChannel(channelId));
+                FillChannelDesc(TasksGraph, *record.AddUpdate(), TasksGraph.GetChannel(channelId), TasksGraph.GetMeta().ChannelTransportVersion);
             }
 
             LOG_T("Sending channels info to compute actor: " << computeActorId << ", channels: " << channelIds.size());
@@ -689,13 +701,13 @@ protected:
 
 
 protected:
-    void BuildSysViewScanTasks(TStageInfo& stageInfo) {
+    void BuildSysViewScanTasks(TStageInfo& stageInfo, const TMap<TString, TString>& secureParams) {
         Y_VERIFY_DEBUG(stageInfo.Meta.IsSysView());
 
         auto& stage = stageInfo.Meta.GetStage(stageInfo.Id);
 
-        const auto& table = GetTableKeys().GetTable(stageInfo.Meta.TableId);
-        const auto& keyTypes = table.KeyColumnTypes;
+        const auto& tableInfo = stageInfo.Meta.TableConstInfo;
+        const auto& keyTypes = tableInfo->KeyColumnTypes;
 
         for (auto& op : stage.GetTableOps()) {
             Y_VERIFY_DEBUG(stageInfo.Meta.TablePath == op.GetTable().GetPath());
@@ -724,7 +736,7 @@ protected:
 
             TTaskMeta::TShardReadInfo readInfo = {
                 .Ranges = std::move(keyRanges),
-                .Columns = BuildKqpColumns(op, table),
+                .Columns = BuildKqpColumns(op, tableInfo),
             };
 
             task.Meta.Reads.ConstructInPlace();
@@ -732,19 +744,26 @@ protected:
             task.Meta.ReadInfo.Reverse = op.GetReadRange().GetReverse();
             task.Meta.Type = TTaskMeta::TTaskType::Compute;
 
-            BuildSinks(stage, task);
+            BuildSinks(stage, task, secureParams);
 
             LOG_D("Stage " << stageInfo.Id << " create sysview scan task: " << task.Id);
         }
     }
 
-    void BuildSinks(const NKqpProto::TKqpPhyStage& stage, TKqpTasksGraph::TTaskType& task) {
+    void BuildSinks(const NKqpProto::TKqpPhyStage& stage, TKqpTasksGraph::TTaskType& task, const TMap<TString, TString>& secureParams) {
         if (stage.SinksSize() > 0) {
             YQL_ENSURE(stage.SinksSize() == 1, "multiple sinks are not supported");
             const auto& sink = stage.GetSinks(0);
             YQL_ENSURE(sink.HasExternalSink(), "only external sinks are supported");
             const auto& extSink = sink.GetExternalSink();
             YQL_ENSURE(sink.GetOutputIndex() < task.Outputs.size());
+
+            auto sinkName = extSink.GetSinkName();
+            if (sinkName) {
+                auto structuredToken = NYql::CreateStructuredTokenParser(extSink.GetAuthInfo()).ToBuilder().ReplaceReferences(secureParams).ToJson();
+                task.Meta.SecureParams.emplace(sinkName, structuredToken);
+            }
+
             auto& output = task.Outputs[sink.GetOutputIndex()];
             output.Type = TTaskOutputType::Sink;
             output.SinkType = extSink.GetType();
@@ -752,16 +771,34 @@ protected:
         }
     }
 
-    void BuildReadTasksFromSource(TStageInfo& stageInfo, TMap<TString, TString> secureParams) {
+    void BuildReadTasksFromSource(TStageInfo& stageInfo, const TMap<TString, TString>& secureParams, const TVector<NKikimrKqp::TKqpNodeResources>& resourceSnapshot) {
         const auto& stage = stageInfo.Meta.GetStage(stageInfo.Id);
 
         YQL_ENSURE(stage.GetSources(0).HasExternalSource());
-        YQL_ENSURE(stage.InputsSize() == 0 && stage.SourcesSize() == 1,
-            "multiple sources or sources mixed with connections");
+        YQL_ENSURE(stage.SourcesSize() == 1, "multiple sources in one task are not supported");
 
         const auto& stageSource = stage.GetSources(0);
         const auto& externalSource = stageSource.GetExternalSource();
-        for (const TString& partitionParam : externalSource.GetPartitionedTaskParams()) {
+
+        ui32 taskCount = externalSource.GetPartitionedTaskParams().size();
+
+        if (!resourceSnapshot.empty()) {
+            ui32 maxTaskcount = resourceSnapshot.size() * 2;
+            if (taskCount > maxTaskcount) {
+                taskCount = maxTaskcount;
+            }
+        }
+
+        auto sourceName = externalSource.GetSourceName();
+        TString structuredToken;
+        if (sourceName) {
+            structuredToken = NYql::CreateStructuredTokenParser(externalSource.GetAuthInfo()).ToBuilder().ReplaceReferences(secureParams).ToJson();   
+        }
+
+        TVector<ui64> tasksIds;
+
+        // generate all tasks
+        for (ui32 i = 0; i < taskCount; i++) {
             auto& task = TasksGraph.AddTask(stageInfo);
 
             auto& input = task.Inputs[stageSource.GetInputIndex()];
@@ -769,21 +806,36 @@ protected:
             input.SourceSettings = externalSource.GetSettings();
             input.SourceType = externalSource.GetType();
 
-            task.Meta.TaskParams.emplace(externalSource.GetTaskParamKey(), partitionParam);
-
-            auto sourceName = externalSource.GetSourceName();
-            if (sourceName) {
-                auto structuredToken = NYql::CreateStructuredTokenParser(externalSource.GetAuthInfo()).ToBuilder().ReplaceReferences(secureParams).ToJson();
+            if (structuredToken) {
                 task.Meta.SecureParams.emplace(sourceName, structuredToken);
             }
 
-            task.Meta.Type = TTaskMeta::TTaskType::Compute;
+            if (resourceSnapshot.empty()) {
+                task.Meta.Type = TTaskMeta::TTaskType::Compute;
+            } else {
+                task.Meta.NodeId = resourceSnapshot[i % resourceSnapshot.size()].GetNodeId();
+                task.Meta.Type = TTaskMeta::TTaskType::Scan;
+            }
 
-            BuildSinks(stage, task);
+            tasksIds.push_back(task.Id);
+        }
+
+        // distribute read ranges between them
+        ui32 currentTaskIndex = 0;
+        for (const TString& partitionParam : externalSource.GetPartitionedTaskParams()) {
+            TasksGraph.GetTask(tasksIds[currentTaskIndex]).Meta.ReadRanges.push_back(partitionParam);
+            if (++currentTaskIndex >= tasksIds.size()) {
+                currentTaskIndex = 0;
+            }
+        }
+
+        // finish building
+        for (auto taskId : tasksIds) {
+            BuildSinks(stage, TasksGraph.GetTask(taskId), secureParams);
         }
     }
 
-    TMaybe<size_t> BuildScanTasksFromSource(TStageInfo& stageInfo) {
+    TMaybe<size_t> BuildScanTasksFromSource(TStageInfo& stageInfo, const TMap<TString, TString>& secureParams) {
         THashMap<ui64, std::vector<ui64>> nodeTasks;
         THashMap<ui64, ui64> assignedShardsCount;
 
@@ -797,12 +849,12 @@ protected:
 
         auto& source = stage.GetSources(0).GetReadRangesSource();
 
-        const auto& table = GetTableKeys().GetTable(MakeTableId(source.GetTable()));
-        const auto& keyTypes = table.KeyColumnTypes;
+        const auto& tableInfo = stageInfo.Meta.TableConstInfo;
+        const auto& keyTypes = tableInfo->KeyColumnTypes;
 
-        YQL_ENSURE(table.TableKind != NKikimr::NKqp::ETableKind::Olap);
+        YQL_ENSURE(tableInfo->TableKind != NKikimr::NKqp::ETableKind::Olap);
 
-        auto columns = BuildKqpColumns(source, table);
+        auto columns = BuildKqpColumns(source, tableInfo);
 
         const auto& snapshot = GetSnapshot();
 
@@ -892,13 +944,13 @@ protected:
                 settings->SetLockNodeId(self.NodeId());
             }
 
-            BuildSinks(stage, task);
+            BuildSinks(stage, task, secureParams);
         };
 
-        if (source.GetSequentialInFlightShards()) {
-            auto [startShard, shardInfo] = MakeVirtualTablePartition(GetTableKeys(), source, stageInfo, HolderFactory(), TypeEnv());
+        THashMap<ui64, TShardInfo> partitions = PrunePartitions(source, stageInfo, HolderFactory(), TypeEnv());
+        if (partitions.size() > 0 && source.GetSequentialInFlightShards() > 0 && partitions.size() > source.GetSequentialInFlightShards()) {
+            auto [startShard, shardInfo] = MakeVirtualTablePartition(source, stageInfo, HolderFactory(), TypeEnv());
             if (Stats) {
-                THashMap<ui64, TShardInfo> partitions = PrunePartitions(GetTableKeys(), source, stageInfo, HolderFactory(), TypeEnv());
                 for (auto& [shardId, _] : partitions) {
                     Stats->AffectedShards.insert(shardId);
                 }
@@ -910,7 +962,6 @@ protected:
                 return 0;
             }
         } else {
-            THashMap<ui64, TShardInfo> partitions = PrunePartitions(GetTableKeys(), source, stageInfo, HolderFactory(), TypeEnv());
             for (auto& [shardId, shardInfo] : partitions) {
                 addPartiton(shardId, shardId, shardInfo, {});
             }
@@ -940,7 +991,7 @@ protected:
 protected:
     void UnexpectedEvent(const TString& state, ui32 eventType) {
         LOG_C("TKqpExecuter, unexpected event: " << eventType << ", at state:" << state << ", selfID: " << this->SelfId());
-        InternalError(TStringBuilder() << "Unexpected event at TKqpScanExecuter, state: " << state
+        InternalError(TStringBuilder() << "Unexpected event at TKqpExecuter, state: " << state
             << ", event: " << eventType);
     }
 
@@ -1141,14 +1192,6 @@ protected:
         }
     }
 
-    const TKqpTableKeys& GetTableKeys() const {
-        return TasksGraph.GetMeta().TableKeys;
-    }
-
-    TKqpTableKeys& GetTableKeysRef() {
-        return TasksGraph.GetMeta().TableKeys;
-    }
-
     std::unordered_map<ui64, IActor*>& GetResultChannelProxies() {
         return ResultChannelProxies;
     }
@@ -1212,12 +1255,14 @@ private:
 
 IActor* CreateKqpDataExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
     const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, TKqpRequestCounters::TPtr counters, bool streamResult,
-    const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig, NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory, const TActorId& creator);
+    const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig, NYql::NDq::IDqAsyncIoFactory::TPtr asyncIoFactory,
+    const NKikimrConfig::TTableServiceConfig::EChannelTransportVersion chanTransportVersion, const TActorId& creator);
 
 IActor* CreateKqpScanExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
     const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, TKqpRequestCounters::TPtr counters,
     const NKikimrConfig::TTableServiceConfig::TAggregationConfig& aggregation,
-    const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig, TPreparedQueryHolder::TConstPtr preparedQuery);
+    const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig,
+    TPreparedQueryHolder::TConstPtr preparedQuery, const NKikimrConfig::TTableServiceConfig::EChannelTransportVersion chanTransportVersion);
 
 } // namespace NKqp
 } // namespace NKikimr

@@ -309,6 +309,7 @@ public:
         auto &dnConfig = Config.GetDynamicNameserviceConfig();
         TIntrusivePtr<TDynamicNameserviceConfig> config = new TDynamicNameserviceConfig;
         config->MaxStaticNodeId = dnConfig.GetMaxStaticNodeId();
+        config->MinDynamicNodeId = dnConfig.GetMinDynamicNodeId();
         config->MaxDynamicNodeId = dnConfig.GetMaxDynamicNodeId();
         appData->DynamicNameserviceConfig = config;
     }
@@ -972,7 +973,7 @@ void TKikimrRunner::InitializeAllocator(const TKikimrRunConfig& runConfig) {
 void TKikimrRunner::InitializeAppData(const TKikimrRunConfig& runConfig)
 {
     const auto& cfg = runConfig.AppConfig;
-    
+
     bool useAutoConfig = !cfg.HasActorSystemConfig() || (cfg.GetActorSystemConfig().HasUseAutoConfig() && cfg.GetActorSystemConfig().GetUseAutoConfig());
     NAutoConfigInitializer::TASPools pools = NAutoConfigInitializer::GetASPools(cfg.GetActorSystemConfig(), useAutoConfig);
     TMap<TString, ui32> servicePools = NAutoConfigInitializer::GetServicePools(cfg.GetActorSystemConfig(), useAutoConfig);
@@ -1216,6 +1217,12 @@ void TKikimrRunner::InitializeActorSystem(
     if (Monitoring) {
         setup->LocalServices.emplace_back(NCrossRef::MakeCrossRefActorId(), TActorSetupCmd(NCrossRef::CreateCrossRefActor(),
             TMailboxType::HTSwap, AppData->SystemPoolId));
+        setup->LocalServices.emplace_back(MakeMonVDiskStreamId(), TActorSetupCmd(CreateMonVDiskStreamActor(),
+            TMailboxType::HTSwap, AppData->SystemPoolId));
+        setup->LocalServices.emplace_back(MakeMonGetBlobId(), TActorSetupCmd(CreateMonGetBlobActor(),
+            TMailboxType::HTSwap, AppData->SystemPoolId));
+        setup->LocalServices.emplace_back(MakeMonBlobRangeId(), TActorSetupCmd(CreateMonBlobRangeActor(),
+            TMailboxType::HTSwap, AppData->SystemPoolId));
     }
 
     ApplyLogSettings(runConfig);
@@ -1263,9 +1270,29 @@ void TKikimrRunner::InitializeActorSystem(
                 MakeBlobStorageFailureInjectionID(runConfig.NodeId));
         }
 
-        Monitoring->Register(CreateMonGetBlobPage("get_blob", ActorSystem.Get()));
-        Monitoring->Register(CreateMonBlobRangePage("blob_range", ActorSystem.Get()));
-        Monitoring->Register(CreateMonVDiskStreamPage("vdisk_stream", ActorSystem.Get()));
+        Monitoring->RegisterActorPage(
+                nullptr,
+                "get_blob",
+                TString(),
+                false,
+                ActorSystem.Get(),
+                MakeMonGetBlobId());
+
+        Monitoring->RegisterActorPage(
+                nullptr,
+                "blob_range",
+                TString(),
+                false,
+                ActorSystem.Get(),
+                MakeMonBlobRangeId());
+
+        Monitoring->RegisterActorPage(
+                nullptr,
+                "vdisk_stream",
+                TString(),
+                false,
+                ActorSystem.Get(),
+                MakeMonVDiskStreamId());
 
         Monitoring->RegisterActorPage(
                 ActorsMonPage->RegisterIndexPage("interconnect", "Interconnect"),
@@ -1452,7 +1479,9 @@ TIntrusivePtr<TServiceInitializersList> TKikimrRunner::CreateServiceInitializers
     sil->AddServiceInitializer(new TMemProfMonitorInitializer(runConfig, MemObserver));
 
 #if defined(ENABLE_MEMORY_TRACKING)
-    sil->AddServiceInitializer(new TMemoryTrackerInitializer(runConfig));
+    if (serviceMask.EnableMemoryTracker) {
+        sil->AddServiceInitializer(new TMemoryTrackerInitializer(runConfig));
+    }
 #endif
 
     if (serviceMask.EnableKqp) {

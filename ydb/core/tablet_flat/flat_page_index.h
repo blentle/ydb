@@ -190,7 +190,7 @@ namespace NPage {
          * Lookup a page that may contain key with specified seek mode
          *
          * Returns end iterator when there is definitely no such page,
-         * otherwise the result is exact given such a key exists.
+         * otherwise the result is approximate and may be off by one page.
          */
         TIter LookupKeyReverse(
                 TCells key, const TPartScheme::TGroupInfo &group,
@@ -268,6 +268,15 @@ namespace NPage {
         const TRecord* GetLastKeyRecord() const noexcept
         {
             return LastKey;
+        }
+
+        const TRecord* At(TRecIdx index) const noexcept
+        {
+            Y_VERIFY(index <= Page.Count);
+            auto it = Page.Begin() + index;
+            return it
+                ? it.GetRecord()
+                : GetLastKeyRecord();
         }
 
         TRowId GetEndRowId() const noexcept

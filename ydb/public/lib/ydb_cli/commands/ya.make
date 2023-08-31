@@ -2,9 +2,7 @@ LIBRARY(clicommands)
 
 SRCS(
     interactive/interactive_cli.cpp
-    interactive/interactive_cli.h
-    interactive/term_io.cpp
-    interactive/term_io.h
+    interactive/line_reader.cpp
     benchmark_utils.cpp
     click_bench.cpp
     kv_workload.cpp
@@ -14,6 +12,7 @@ SRCS(
     topic_write_scenario.cpp
     topic_readwrite_scenario.cpp
     tpch.cpp
+    tpcc_workload.cpp
     ydb_sdk_core_access.cpp
     ydb_command.cpp
     ydb_profile.cpp
@@ -34,6 +33,7 @@ SRCS(
 )
 
 PEERDIR(
+    contrib/restricted/patched/replxx
     library/cpp/histogram/hdr
     library/cpp/protobuf/json
     library/cpp/regex/pcre

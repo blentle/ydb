@@ -5,9 +5,11 @@
 #include "yql_udf_resolver.h"
 #include "yql_user_data_storage.h"
 #include "yql_arrow_resolver.h"
+#include "yql_statistics.h"
 
 #include <ydb/library/yql/public/udf/udf_validate.h>
 #include <ydb/library/yql/core/credentials/yql_credentials.h>
+#include <ydb/library/yql/core/url_lister/interface/url_lister_manager.h>
 #include <ydb/library/yql/ast/yql_expr.h>
 
 #include <library/cpp/yson/node/node.h>
@@ -183,6 +185,7 @@ struct TUdfCachedInfo {
 };
 
 struct TTypeAnnotationContext: public TThrRefBase {
+    THashMap<const TExprNode*, std::shared_ptr<TOptimizerStatistics>> StatisticsMap;
     TIntrusivePtr<ITimeProvider> TimeProvider;
     TIntrusivePtr<IRandomProvider> RandomProvider;
     THashMap<TString, TIntrusivePtr<IDataProvider>> DataSourceMap;
@@ -202,6 +205,7 @@ struct TTypeAnnotationContext: public TThrRefBase {
     TYqlOperationOptions OperationOptions;
     TCredentials::TPtr Credentials = MakeIntrusive<TCredentials>();
     IModuleResolver::TPtr Modules;
+    IUrlListerManagerPtr UrlListerManager;
     NUdf::EValidateMode ValidateMode = NUdf::EValidateMode::None;
     bool DisableNativeUdfSupport = false;
     TMaybe<TString> OptLLVM;
@@ -232,6 +236,8 @@ struct TTypeAnnotationContext: public TThrRefBase {
     bool UseBlocks = false;
     bool PgEmitAggApply = false;
     IArrowResolver::TPtr ArrowResolver;
+    TString CostBasedOptimizerType;
+    bool MatchRecognize = false;
 
     // compatibility with v0 or raw s-expression code
     bool OrderedColumns = false;
@@ -310,6 +316,35 @@ struct TTypeAnnotationContext: public TThrRefBase {
     }
 
     void Reset();
+
+    /**
+     * Helper method to fetch statistics from type annotation context
+     */
+    std::shared_ptr<TOptimizerStatistics> GetStats(const TExprNode* input) {
+        return StatisticsMap.Value(input, std::shared_ptr<TOptimizerStatistics>(nullptr));
+    }
+
+    /**
+     * Helper method to set statistics in type annotation context
+     */
+    void SetStats(const TExprNode* input, std::shared_ptr<TOptimizerStatistics> stats) {
+        StatisticsMap[input] = stats;
+    }
+
+    /**
+     * Helper method to get cost from type annotation context
+     * Doesn't check if the cost is in the mapping
+     */
+    std::optional<double> GetCost(const TExprNode* input) {
+        return StatisticsMap[input]->Cost;
+    }
+
+    /**
+     * Helper method to set the cost in type annotation context
+     */
+    void SetCost(const TExprNode* input, std::optional<double> cost) {
+        StatisticsMap[input]->Cost = cost;
+    }
 };
 
 template <> inline

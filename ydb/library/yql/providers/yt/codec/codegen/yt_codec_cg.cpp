@@ -107,7 +107,7 @@ public:
             static_cast<Value*>(new AllocaInst(valueType, 0U, "elemPtr", Block_));
 
         if constexpr (!Flat) {
-            CallBoxedValueVirtualMethod<NUdf::TBoxedValueAccessor::EMethod::GetElement>(elemPtr, value, Codegen_, Block_, index);
+            CallBoxedValueVirtualMethod<NUdf::TBoxedValueAccessor::EMethod::GetElement>(elemPtr, value, *Codegen_, Block_, index);
         }
 
         bool isOptional;
@@ -188,7 +188,7 @@ public:
             const auto funcPtr = CastInst::Create(Instruction::IntToPtr, funcAddr, PointerType::getUnqual(funType), "ptr", Block_);
             CallInst::Create(funType, funcPtr, { typeConst, elemPtr, buf }, "", Block_);
         }
-        TCodegenContext ctx(Codegen_);
+        TCodegenContext ctx(*Codegen_);
         ctx.Func = Func_;
         if constexpr (Flat)
             ValueCleanup(EValueRepresentation::Any, elemPtr, ctx, Block_);
@@ -366,7 +366,7 @@ public:
                     CallInst::Create(module.getFunction("WriteString"), { buf, bytePtr, size }, "", Block_);
                 }
 
-                TCodegenContext ctx(Codegen_);
+                TCodegenContext ctx(*Codegen_);
                 ctx.Func = Func_;
                 if constexpr (Flat)
                     ValueCleanup(EValueRepresentation::String, elemPtr, ctx, Block_);
@@ -430,7 +430,7 @@ public:
 
         const auto funcPtr = CastInst::Create(Instruction::IntToPtr, funcAddr, PointerType::getUnqual(funType), "ptr", Block_);
         CallInst::Create(funType, funcPtr, { typeConst, elemPtr, buf }, "", Block_);
-        TCodegenContext ctx(Codegen_);
+        TCodegenContext ctx(*Codegen_);
         ctx.Func = Func_;
         if constexpr (Flat)
             ValueCleanup(EValueRepresentation::Any, elemPtr, ctx, Block_);
@@ -529,7 +529,7 @@ public:
                 APInt defInt(128, bits);
                 const auto defValData = ConstantInt::get(valueType, defInt);
                 new StoreInst(defValData, elemPtr, Block_);
-                TCodegenContext ctx(Codegen_);
+                TCodegenContext ctx(*Codegen_);
                 ctx.Func = Func_;
                 ValueAddRef(EValueRepresentation::Any, elemPtr, ctx, Block_);
                 BranchInst::Create(done, Block_);
@@ -832,9 +832,154 @@ private:
             default:
                 YQL_ENSURE(false, "Unknown data type: " << schemeType);
             }
-        } else {
-            ythrow yexception() << "Skip of complex types is not supported";
+            return;
         }
+
+        if (type->IsStruct()) {
+            auto structType = static_cast<TStructType*>(type);
+            const std::vector<size_t>* reorder = nullptr;
+            if (auto cookie = structType->GetCookie()) {
+                reorder = ((const std::vector<size_t>*)cookie);
+            }
+            for (ui32 i = 0; i < structType->GetMembersCount(); ++i) {
+                GenerateSkip(buf, structType->GetMemberType(reorder ? reorder->at(i) : i), nativeYtTypeFlags);
+            }
+            return;
+        }
+
+        if (type->IsTuple()) {
+            auto tupleType = static_cast<TTupleType*>(type);
+            for (ui32 i = 0; i < tupleType->GetElementsCount(); ++i) {
+                GenerateSkip(buf, tupleType->GetElementType(i), nativeYtTypeFlags);
+            }
+            return;
+        }
+
+        if (type->IsList()) {
+            auto itemType = static_cast<TListType*>(type)->GetItemType();
+            const auto done = BasicBlock::Create(context, "done", Func_);
+            const auto listEndMarker = ConstantInt::get(Type::getInt8Ty(context), 0xFF);
+            const auto innerSkip = BasicBlock::Create(context, "innerSkip", Func_);
+            const auto listContinue = BasicBlock::Create(context, "listContinue", Func_);
+            BranchInst::Create(listContinue, Block_);
+
+            {
+                Block_ = innerSkip;
+                GenerateSkip(buf, itemType, nativeYtTypeFlags);
+                BranchInst::Create(listContinue, Block_);
+            }
+            {
+                Block_ = listContinue;
+                const auto marker = CallInst::Create(module.getFunction("ReadOptional"), { buf }, "optMarker", Block_);
+                const auto check = CmpInst::Create(Instruction::ICmp, ICmpInst::ICMP_EQ, marker, listEndMarker, "exists", Block_);
+                BranchInst::Create(done, innerSkip, check, Block_);
+            }
+
+            Block_ = done;
+            return;
+        }
+
+        if (type->IsVariant()) {
+            auto varType = static_cast<TVariantType*>(type);
+            const auto isOneByte = ConstantInt::get(Type::getInt8Ty(context), varType->GetAlternativesCount() < 256);
+            const auto data = CallInst::Create(module.getFunction("ReadVariantData"), { buf, isOneByte }, "data", Block_);
+
+            std::function<TType*(size_t)> getType;
+            std::function<void(size_t, size_t)> genLR = [&] (size_t l, size_t r){
+                size_t m = (l + r) >> 1;
+                if (l == r) {
+                    GenerateSkip(buf, getType(m), nativeYtTypeFlags);
+                    return;
+                }
+                auto fn = std::to_string(l) + "_" + std::to_string(r);
+                const auto currIdx = ConstantInt::get(Type::getInt16Ty(context), m);
+                const auto isCurrent = CmpInst::Create(Instruction::ICmp, ICmpInst::ICMP_ULE, data, currIdx, "isUs" + fn, Block_);
+                auto lessEq = BasicBlock::Create(context, "le" + fn, Func_);
+                auto greater = BasicBlock::Create(context, "g" + fn, Func_);
+                auto out = BasicBlock::Create(context, "o" + fn, Func_);
+                BranchInst::Create(lessEq, greater, isCurrent, Block_);
+                {
+                    Block_ = lessEq;
+                    genLR(l, m);
+                    BranchInst::Create(out, Block_);
+                }
+                {
+                    Block_ = greater;
+                    genLR(m + 1, r);
+                    BranchInst::Create(out, Block_);
+                }
+                Block_ = out;
+            };
+
+            size_t elemCount = 0;
+            if (varType->GetUnderlyingType()->IsTuple()) {
+                auto tupleType = static_cast<TTupleType*>(varType->GetUnderlyingType());
+                elemCount = tupleType->GetElementsCount();
+                getType = [tupleType=tupleType] (size_t i) {
+                    return tupleType->GetElementType(i);
+                };
+            } else {
+                auto structType = static_cast<TStructType*>(varType->GetUnderlyingType());
+
+                const std::vector<size_t>* reorder = nullptr;
+                if (auto cookie = structType->GetCookie()) {
+                    reorder = ((const std::vector<size_t>*)cookie);
+                }
+
+                elemCount = structType->GetMembersCount();
+
+                getType = [reorder = reorder, structType=structType] (size_t i) {
+                    return structType->GetMemberType(reorder ? reorder->at(i) : i);
+                };
+            }
+            genLR(0, elemCount - 1);
+            return;
+        }
+
+        if (type->IsVoid()) {
+            return;
+        }
+
+        if (type->IsNull()) {
+            return;
+        }
+
+        if (type->IsEmptyList() || type->IsEmptyDict()) {
+            return;
+        }
+
+        if (type->IsDict()) {
+            auto dictType = static_cast<TDictType*>(type);
+            auto keyType = dictType->GetKeyType();
+            auto payloadType = dictType->GetPayloadType();
+            const auto done = BasicBlock::Create(context, "done", Func_);
+
+            const auto innerSkip = BasicBlock::Create(context, "innerSkip", Func_);
+
+            const auto listContinue = BasicBlock::Create(context, "listContinue", Func_);
+
+            const auto listEndMarker = ConstantInt::get(Type::getInt8Ty(context), 0xFF);
+
+            BranchInst::Create(listContinue, Block_);
+
+            {
+                Block_ = innerSkip;
+                GenerateSkip(buf, keyType, nativeYtTypeFlags);
+                GenerateSkip(buf, payloadType, nativeYtTypeFlags);
+                BranchInst::Create(listContinue, Block_);
+            }
+            {
+                Block_ = listContinue;
+                const auto marker = CallInst::Create(module.getFunction("ReadOptional"), { buf }, "optMarker", Block_);
+                const auto check = CmpInst::Create(Instruction::ICmp, ICmpInst::ICMP_EQ, marker, listEndMarker, "exists", Block_);
+                BranchInst::Create(done, innerSkip, check, Block_);
+            }
+
+            Block_ = done;
+            return;
+        }
+
+        YQL_ENSURE(false, "Unsupported type for skip: " << type->GetKindAsStr());
     }
 
 private:

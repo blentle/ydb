@@ -17,6 +17,7 @@ SRCS(
     blobstorage_base3.proto
     blobstorage_disk.proto
     blobstorage_disk_color.proto
+    blobstorage_distributed_config.proto
     blobstorage_pdisk_config.proto
     blobstorage_vdisk_config.proto
     blobstorage_vdisk_internal.proto
@@ -147,6 +148,7 @@ PEERDIR(
     ydb/library/yql/core/issue/protos
     ydb/library/yql/dq/actors/protos
     ydb/library/yql/dq/proto
+    ydb/library/yql/providers/common/proto
     ydb/library/yql/public/issue/protos
     ydb/library/yql/public/types
     ydb/library/services

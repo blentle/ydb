@@ -44,9 +44,21 @@ inline void ToProto(TString* serialized, TString original)
     *serialized = std::move(original);
 }
 
+inline void ToProto(TString* serialized, std::string original)
+{
+    *serialized = std::move(original);
+}
+
 inline void FromProto(TString* original, TString serialized)
 {
     *original = std::move(serialized);
+}
+
+// NB: ToProto works in O(1) time if TSTRING_IS_STD_STRING is used and
+// may work in O(n) time otherwise due to CoW.
+inline void FromProto(std::string* original, TString serialized)
+{
+    *original = std::move(serialized.MutRef());
 }
 
 // These conversions work in case if the original protobuf that uses
@@ -58,9 +70,46 @@ inline void ToProto(std::string* serialized, TString original)
     *serialized = std::move(original.MutRef());
 }
 
+inline void ToProto(std::string* serialized, std::string original)
+{
+    *serialized = std::move(original);
+}
+
 inline void FromProto(TString* original, std::string serialized)
 {
     *original = std::move(serialized);
+}
+
+inline void FromProto(std::string* original, std::string serialized)
+{
+    *original = std::move(serialized);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+// These conversions work in case if the patched protobuf that uses
+// TString is used.
+inline void ToProto(TString* serialized, TStringBuf original)
+{
+    *serialized = original;
+}
+
+inline void FromProto(TStringBuf* original, const TString& serialized)
+{
+    *original = serialized;
+}
+
+// These conversions work in case if the original protobuf that uses
+// std::string is used.
+inline void ToProto(std::string* serialized, TStringBuf original)
+{
+    serialized->resize(original.size());
+    memcpy(serialized->data(), original.data(), original.size());
+}
+
+inline void FromProto(TStringBuf* original, const std::string& serialized)
+{
+    *original = serialized;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

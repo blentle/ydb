@@ -7,6 +7,7 @@
 
 
 add_subdirectory(benchmark)
+add_subdirectory(ut)
 get_built_tool_path(
   TOOL_enum_parser_bin
   TOOL_enum_parser_dependency
@@ -34,6 +35,7 @@ target_link_libraries(yql-minikql-jsonpath PUBLIC
   yql-minikql-dom
   yql-public-issue
   yql-public-udf
+  library-yql-ast
   library-yql-utils
   core-issue-protos
   yql-parser-proto_ast

@@ -124,6 +124,7 @@ bool EnsureWideFlowType(const TExprNode& node, TExprContext& ctx);
 bool EnsureWideFlowType(TPositionHandle position, const TTypeAnnotationNode& type, TExprContext& ctx);
 bool EnsureWideStreamType(const TExprNode& node, TExprContext& ctx);
 bool EnsureWideStreamType(TPositionHandle position, const TTypeAnnotationNode& type, TExprContext& ctx);
+bool IsWideBlockType(const TTypeAnnotationNode& type);
 bool EnsureWideBlockType(TPositionHandle position, const TTypeAnnotationNode& type, TTypeAnnotationNode::TListType& blockItemTypes, TExprContext& ctx, bool allowScalar = true);
 bool EnsureWideFlowBlockType(const TExprNode& node, TTypeAnnotationNode::TListType& blockItemTypes, TExprContext& ctx, bool allowScalar = true);
 bool EnsureWideStreamBlockType(const TExprNode& node, TTypeAnnotationNode::TListType& blockItemTypes, TExprContext& ctx, bool allowScalar = true);
@@ -291,6 +292,9 @@ bool IsEmptyList(const TTypeAnnotationNode& type);
 bool IsInstantEqual(const TTypeAnnotationNode& type);
 bool IsFlowOrStream(const TTypeAnnotationNode& type);
 bool IsFlowOrStream(const TExprNode& node);
+
+bool IsBoolLike(const TTypeAnnotationNode& type);
+bool IsBoolLike(const TExprNode& node);
 
 TString GetTypeDiff(const TTypeAnnotationNode& left, const TTypeAnnotationNode& right);
 TString GetTypePrettyDiff(const TTypeAnnotationNode& left, const TTypeAnnotationNode& right);

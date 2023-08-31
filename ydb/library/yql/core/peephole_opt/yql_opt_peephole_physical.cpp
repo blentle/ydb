@@ -8,6 +8,7 @@
 #include <ydb/library/yql/core/yql_opt_range.h>
 #include <ydb/library/yql/core/yql_opt_utils.h>
 #include <ydb/library/yql/core/yql_opt_window.h>
+#include <ydb/library/yql/core/yql_opt_match_recognize.h>
 #include <ydb/library/yql/core/yql_join.h>
 #include <ydb/library/yql/core/expr_nodes/yql_expr_nodes.h>
 #include <ydb/library/yql/core/common_opt/yql_co_transformer.h>
@@ -92,7 +93,19 @@ bool IsArgumentsOnlyLambda(const TExprNode& lambda, TVector<ui32>& argIndices) {
     return true;
 }
 
-TExprNode::TPtr RebuildArgumentsOnlyLambdaForBlocks(const TExprNode& lambda, TExprContext& ctx) {
+TExprNode::TPtr RebuildArgumentsOnlyLambdaForBlocks(const TExprNode& lambda, TExprContext& ctx, TTypeAnnotationContext& types) {
+    TVector<const TTypeAnnotationNode*> argTypes;
+    for (auto arg : lambda.Head().ChildrenList()) {
+        argTypes.emplace_back(arg->GetTypeAnn());
+    }
+
+    YQL_ENSURE(types.ArrowResolver);
+    auto resolveStatus = types.ArrowResolver->AreTypesSupported(ctx.GetPosition(lambda.Pos()), argTypes, ctx);
+    YQL_ENSURE(resolveStatus != IArrowResolver::ERROR);
+    if (resolveStatus != IArrowResolver::OK) {
+        return {};
+    }
+
     TVector<ui32> argIndicies;
     if (!IsArgumentsOnlyLambda(lambda, argIndicies)) {
         return {};
@@ -112,17 +125,6 @@ TExprNode::TPtr RebuildArgumentsOnlyLambdaForBlocks(const TExprNode& lambda, TEx
     return ctx.NewLambda(lambda.Pos(), ctx.NewArguments(lambda.Pos(), std::move(newArgs)), std::move(newRoots));
 }
 
-TExprNode::TPtr OptimizeWideFromBlocks(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& types) {
-    Y_UNUSED(types);
-    if (node->Head().IsCallable("BlockExpandChunked")) {
-        // WideFromBlocks accepts chunked input
-        YQL_CLOG(DEBUG, Core) << "Drop " << node->Head().Content() << " under " << node->Content();
-        return ctx.ChangeChild(*node, 0, node->Head().HeadPtr());
-    }
-
-    return node;
-}
-
 TExprNode::TPtr OptimizeWideToBlocks(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& types) {
     Y_UNUSED(types);
     if (node->Head().IsCallable("WideFromBlocks")) {
@@ -133,7 +135,7 @@ TExprNode::TPtr OptimizeWideToBlocks(const TExprNode::TPtr& node, TExprContext& 
     if (node->Head().IsCallable("WideMap")) {
         // swap if all outputs are arguments
         const auto& lambda = node->Head().Tail();
-        if (auto newLambda = RebuildArgumentsOnlyLambdaForBlocks(lambda, ctx)) {
+        if (auto newLambda = RebuildArgumentsOnlyLambdaForBlocks(lambda, ctx, types)) {
             YQL_CLOG(DEBUG, Core) << "Swap " << node->Head().Content() << " with " << node->Content();
             return ctx.Builder(node->Pos())
                 .Callable("WideMap")
@@ -144,6 +146,16 @@ TExprNode::TPtr OptimizeWideToBlocks(const TExprNode::TPtr& node, TExprContext& 
                 .Seal()
                 .Build();
         }
+    }
+
+    if (const auto& input = node->Head(); input.IsCallable("Extend")) {
+        YQL_CLOG(DEBUG, CorePeepHole) << "Swap " << node->Content() << " with " << input.Content();
+        TExprNodeList newChildren;
+        newChildren.reserve(input.ChildrenSize());
+        for (auto& child : input.ChildrenList()) {
+            newChildren.emplace_back(ctx.ChangeChild(*node, 0, std::move(child)));
+        }
+        return ctx.NewCallable(input.Pos(), "BlockExtend", std::move(newChildren));
     }
 
     return node;
@@ -3752,6 +3764,19 @@ TExprNode::TPtr OptimizeExpandMap(const TExprNode::TPtr& node, TExprContext& ctx
             }
         }
     }
+
+    if (const auto& input = node->Head(); input.IsCallable("Extend")) {
+        bool isWideBlockFlow = AllOf(node->GetTypeAnn()->Cast<TFlowExprType>()->GetItemType()->Cast<TMultiExprType>()->GetItems(),
+            [](const auto& itemType) { return itemType->IsBlockOrScalar(); });
+        YQL_CLOG(DEBUG, CorePeepHole) << "Swap " << node->Content() << " with " << input.Content();
+        TExprNodeList newChildren;
+        newChildren.reserve(input.ChildrenSize());
+        for (auto& child : input.ChildrenList()) {
+            newChildren.emplace_back(ctx.ChangeChildren(*node, { child, ctx.DeepCopyLambda(node->Tail())}));
+        }
+        return ctx.NewCallable(input.Pos(), isWideBlockFlow ? "BlockExtend" : "Extend", std::move(newChildren));
+    }
+
 /* TODO
     if (const auto& input = node->Head(); input.IsCallable("WithContext")) {
         YQL_CLOG(DEBUG, CorePeepHole) << "Swap " << node->Content() << " with " << input.Content();
@@ -5199,7 +5224,7 @@ bool CollectBlockRewrites(const TMultiExprType* multiInputType, bool keepInputCo
 TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& types) {
     const auto lambda = node->TailPtr();
     if (node->Head().IsCallable("WideFromBlocks")) {
-        if (auto newLambda = RebuildArgumentsOnlyLambdaForBlocks(*lambda, ctx)) {
+        if (auto newLambda = RebuildArgumentsOnlyLambdaForBlocks(*lambda, ctx, types)) {
             YQL_CLOG(DEBUG, Core) << "Swap " << node->Head().Content() << " with " << node->Content();
             return ctx.Builder(node->Pos())
                 .Callable("WideFromBlocks")
@@ -5231,13 +5256,11 @@ TExprNode::TPtr OptimizeWideMapBlocks(const TExprNode::TPtr& node, TExprContext&
 
     auto ret = ctx.Builder(node->Pos())
         .Callable("WideFromBlocks")
-            .Callable(0, "BlockExpandChunked")
-                .Callable(0, "WideMap")
-                    .Callable(0, "WideToBlocks")
-                        .Add(0, node->HeadPtr())
-                    .Seal()
-                    .Add(1, blockLambda)
+            .Callable(0, "WideMap")
+                .Callable(0, "WideToBlocks")
+                    .Add(0, node->HeadPtr())
                 .Seal()
+                .Add(1, blockLambda)
             .Seal()
         .Seal()
         .Build();
@@ -5265,13 +5288,11 @@ TExprNode::TPtr OptimizeWideFilterBlocks(const TExprNode::TPtr& node, TExprConte
     }
 
     auto blockMapped = ctx.Builder(node->Pos())
-        .Callable("BlockExpandChunked")
-            .Callable(0, "WideMap")
-                .Callable(0, "WideToBlocks")
-                    .Add(0, node->HeadPtr())
-                .Seal()
-                .Add(1, blockLambda)
+        .Callable("WideMap")
+            .Callable(0, "WideToBlocks")
+                .Add(0, node->HeadPtr())
             .Seal()
+            .Add(1, blockLambda)
         .Seal()
         .Build();
 
@@ -5650,6 +5671,67 @@ TExprNode::TPtr ExpandConstraintsOf(const TExprNode::TPtr& node, TExprContext& c
     NJson::TJsonWriter jsonWriter(&out, true);
     node->Head().GetConstraintSet().ToJson(jsonWriter);
     jsonWriter.Flush();
+
+    return ctx.Builder(node->Pos())
+        .Callable("Json")
+            .Atom(0, json, TNodeFlags::MultilineContent)
+        .Seal()
+        .Build();
+}
+
+TExprNode::TPtr ExpandCostsOf(const TExprNode::TPtr& node, TExprContext& ctx, TTypeAnnotationContext& typesCtx) {
+    YQL_CLOG(DEBUG, CorePeepHole) << "Expand " << node->Content();
+
+    TNodeMap<TString> visitedNodes;
+    std::function<TString(const TExprNode::TPtr& node)> printNode = [&](const TExprNode::TPtr& node) -> TString {
+        auto [it, emplaced] = visitedNodes.emplace(node.Get(), "");
+        if (!emplaced) {
+            return it->second;
+        }
+
+        std::vector<TString> chInfo;
+        for (const auto& child : node->ChildrenList()) {
+            auto res = printNode(child);
+            if (res) {
+                chInfo.emplace_back(std::move(res));
+            }
+        }
+
+        auto stat = typesCtx.GetStats(node.Get());
+        if (!chInfo.empty() || stat) {
+            TStringOutput out(it->second);
+            NJson::TJsonWriter jsonWriter(&out, false);
+            jsonWriter.OpenMap();
+            if (node->Content()) {
+                jsonWriter.Write("Name", node->Content());
+            }
+            if (stat) {
+                if (stat->Cost) {
+                    jsonWriter.Write("Cost", *stat->Cost);
+                }
+                jsonWriter.Write("Cols", stat->Ncols);
+                jsonWriter.Write("Rows", stat->Nrows);
+            }
+            if (!chInfo.empty()) {
+                jsonWriter.WriteKey("Children");
+                jsonWriter.OpenArray();
+                for (const auto& info : chInfo) {
+                    jsonWriter.UnsafeWrite(info);
+                }
+                jsonWriter.CloseArray();
+            }
+            jsonWriter.CloseMap();
+            jsonWriter.Flush();
+        }
+
+        return it->second;
+    };
+
+    TString json = printNode(node);
+
+    if (!json) {
+        json = "{}";
+    }
 
     return ctx.Builder(node->Pos())
         .Callable("Json")
@@ -7105,7 +7187,7 @@ TExprNode::TPtr ExpandCheckedMinus(const TExprNode::TPtr& node, TExprContext& ct
         .Build();
 }
 
-TExprNode::TPtr DropUnordered(const TExprNode::TPtr& node, TExprContext&) {
+TExprNode::TPtr DropAssume(const TExprNode::TPtr& node, TExprContext&) {
     YQL_CLOG(DEBUG, CorePeepHole) << "Drop " << node->Content();
     return node->HeadPtr();
 }
@@ -7181,7 +7263,8 @@ struct TPeepHoleRules {
         {"CheckedMod", &ExpandCheckedMod},
         {"CheckedMinus", &ExpandCheckedMinus},
         {"JsonValue", &ExpandJsonValue},
-        {"JsonExists", &ExpandJsonExists}
+        {"JsonExists", &ExpandJsonExists},
+        {"MatchRecognize", &ExpandMatchRecognize}
     };
 
     static constexpr std::initializer_list<TExtPeepHoleOptimizerMap::value_type> CommonStageExtRulesInit = {
@@ -7192,6 +7275,7 @@ struct TPeepHoleRules {
         {"AggregateMergeFinalize", &ExpandAggregatePeephole},
         {"AggregateMergeManyFinalize", &ExpandAggregatePeephole},
         {"AggregateFinalize", &ExpandAggregatePeephole},
+        {"CostsOf", &ExpandCostsOf},
         {"JsonQuery", &ExpandJsonQuery},
     };
 
@@ -7256,7 +7340,10 @@ struct TPeepHoleRules {
         {"NarrowMultiMap", &OptimizeWideMaps},
         {"WideMap", &OptimizeWideMaps},
         {"NarrowMap", &OptimizeWideMaps},
-        {"Unordered", &DropUnordered},
+        {"Unordered", &DropAssume},
+        {"AssumeUnique", &DropAssume},
+        {"AssumeDistinct", &DropAssume},
+        {"AssumeChopped", &DropAssume},
         {"Top", &OptimizeTopOrSort<false, true>},
         {"TopSort", &OptimizeTopOrSort<true, true>},
         {"Sort", &OptimizeTopOrSort<true, false>},
@@ -7286,7 +7373,6 @@ struct TPeepHoleRules {
         {"WideMap", &OptimizeWideMapBlocks},
         {"NarrowMap", &OptimizeWideMapBlocks},
         {"WideFilter", &OptimizeWideFilterBlocks},
-        {"WideFromBlocks", &OptimizeWideFromBlocks},
         {"WideToBlocks", &OptimizeWideToBlocks},
         {"Skip", &OptimizeSkipTakeToBlocks},
         {"Take", &OptimizeSkipTakeToBlocks},

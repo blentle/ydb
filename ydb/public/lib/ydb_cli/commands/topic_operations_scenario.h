@@ -44,14 +44,15 @@ public:
     TDuration TotalSec;
     TDuration WindowSec;
     TDuration WarmupSec;
-    bool Quiet;
+    bool Quiet = false;
     bool PrintTimestamp;
     double Percentile;
     TString TopicName;
     ui32 TopicPartitionCount = 1;
-    ui32 ProducerThreadCount;
-    ui32 ConsumerThreadCount;
-    ui32 ConsumerCount;
+    ui32 ProducerThreadCount = 0;
+    ui32 ConsumerThreadCount = 0;
+    ui32 ConsumerCount = 0;
+    bool Direct = false;
     TString ConsumerPrefix;
     size_t MessageSize;
     size_t MessageRate;
@@ -59,6 +60,9 @@ public:
     ui32 Codec;
     TString TableName;
     ui32 TablePartitionCount = 1;
+    bool UseTransactions = false;
+    size_t CommitPeriod = 15;
+    bool UseTopicApiCommit = false;
 
 protected:
     void CreateTopic(const TString& database,

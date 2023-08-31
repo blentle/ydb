@@ -12,6 +12,7 @@
 #include "mkql_block_just.h"
 #include "mkql_block_logical.h"
 #include "mkql_block_compress.h"
+#include "mkql_block_extend.h"
 #include "mkql_block_skiptake.h"
 #include "mkql_block_top.h"
 #include "mkql_block_tuple.h"
@@ -62,6 +63,7 @@
 #include "mkql_map.h"
 #include "mkql_mapnext.h"
 #include "mkql_map_join.h"
+#include "mkql_match_recognize.h"
 #include "mkql_multimap.h"
 #include "mkql_next_value.h"
 #include "mkql_nop.h"
@@ -290,6 +292,7 @@ struct TCallableComputationNodeBuilderFuncMapFiller {
         {"BlockNot", &WrapBlockNot},
         {"BlockJust", &WrapBlockJust},
         {"BlockCompress", &WrapBlockCompress},
+        {"BlockExtend", &WrapBlockExtend},
         {"BlockAsTuple", &WrapBlockAsTuple},
         {"BlockNth", &WrapBlockNth},
         {"BlockExpandChunked", &WrapBlockExpandChunked},
@@ -340,6 +343,7 @@ struct TCallableComputationNodeBuilderFuncMapFiller {
         {"RoundDown", &WrapRound},
         {"NextValue", &WrapNextValue},
         {"Nop", &WrapNop},
+        {"MatchRecognizeCore", &WrapMatchRecognizeCore},
     };
 };
 

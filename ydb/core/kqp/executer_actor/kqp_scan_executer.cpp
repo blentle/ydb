@@ -59,8 +59,10 @@ public:
     TKqpScanExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
         const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, TKqpRequestCounters::TPtr counters,
         const NKikimrConfig::TTableServiceConfig::TAggregationConfig& aggregation,
-        const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig, TPreparedQueryHolder::TConstPtr preparedQuery)
-        : TBase(std::move(request), database, userToken, counters, executerRetriesConfig, TWilsonKqp::ScanExecuter, "ScanExecuter")
+        const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig,
+        TPreparedQueryHolder::TConstPtr preparedQuery,
+        const NKikimrConfig::TTableServiceConfig::EChannelTransportVersion chanTransportVersion)
+        : TBase(std::move(request), database, userToken, counters, executerRetriesConfig, chanTransportVersion, TWilsonKqp::ScanExecuter, "ScanExecuter")
         , PreparedQuery(preparedQuery)
         , AggregationSettings(aggregation)
     {
@@ -335,14 +337,14 @@ private:
         THashMap<ui64, ui64> assignedShardsCount;
         auto& stage = stageInfo.Meta.GetStage(stageInfo.Id);
 
-        const auto& table = GetTableKeys().GetTable(stageInfo.Meta.TableId);
-        const auto& keyTypes = table.KeyColumnTypes;
+        const auto& tableInfo = stageInfo.Meta.TableConstInfo;
+        const auto& keyTypes = tableInfo->KeyColumnTypes;
         ui32 metaId = 0;
         for (auto& op : stage.GetTableOps()) {
             Y_VERIFY_DEBUG(stageInfo.Meta.TablePath == op.GetTable().GetPath());
 
-            auto columns = BuildKqpColumns(op, table);
-            auto partitions = PrunePartitions(GetTableKeys(), op, stageInfo, HolderFactory(), TypeEnv());
+            auto columns = BuildKqpColumns(op, tableInfo);
+            auto partitions = PrunePartitions(op, stageInfo, HolderFactory(), TypeEnv());
             const bool isOlapScan = (op.GetTypeCase() == NKqpProto::TKqpPhyTableOperation::kReadOlapRange);
             auto readSettings = ExtractReadSettings(op, stageInfo, HolderFactory(), TypeEnv());
 
@@ -407,7 +409,7 @@ private:
                     }
                 }
             }
-                
+
         }
 
         LOG_D("Stage " << stageInfo.Id << " will be executed on " << nodeTasks.size() << " nodes.");
@@ -473,14 +475,6 @@ private:
         }
     }
 
-    void GetResourcesSnapshot() {
-        GetKqpResourceManager()->RequestClusterResourcesInfo(
-            [as = TlsActivationContext->ActorSystem(), self = SelfId()](TVector<NKikimrKqp::TKqpNodeResources>&& resources) {
-                TAutoPtr<IEventHandle> eh = new IEventHandle(self, self, new TEvPrivate::TEvResourcesSnapshot(std::move(resources)));
-                as->Send(eh);
-            });
-    }
-
     void HandleResolve(TEvKqpExecuter::TEvTableResolveStatus::TPtr& ev) {
         if (!TBase::HandleResolve(ev)) return;
         TSet<ui64> shardIds;
@@ -530,7 +524,7 @@ private:
             if (stage.SourcesSize() > 0) {
                 switch (stage.GetSources(0).GetTypeCase()) {
                     case NKqpProto::TKqpSource::kReadRangesSource:
-                        BuildScanTasksFromSource(stageInfo);
+                        BuildScanTasksFromSource(stageInfo, {});
                         break;
                     default:
                         YQL_ENSURE(false, "unknown source type");
@@ -538,7 +532,7 @@ private:
             } else if (stageInfo.Meta.ShardOperations.empty()) {
                 BuildComputeTasks(stageInfo);
             } else if (stageInfo.Meta.IsSysView()) {
-                BuildSysViewScanTasks(stageInfo);
+                BuildSysViewScanTasks(stageInfo, {});
             } else if (stageInfo.Meta.IsOlap() || stageInfo.Meta.IsDatashard()) {
                 BuildScanTasks(stageInfo);
             } else {
@@ -562,7 +556,7 @@ private:
                 YQL_ENSURE(stageInfo.Tasks.size() == 1, "Unexpected multiple tasks in single-partition stage");
             }
 
-            BuildKqpStageChannels(TasksGraph, GetTableKeys(), stageInfo, TxId, AppData()->EnableKqpSpilling);
+            BuildKqpStageChannels(TasksGraph, stageInfo, TxId, AppData()->EnableKqpSpilling);
         }
 
         ResponseEv->InitTxResult(tx.Body);
@@ -582,7 +576,7 @@ private:
         // calc stats
         for (auto& task : TasksGraph.GetTasks()) {
             auto& stageInfo = TasksGraph.GetStageInfo(task.StageId);
-            
+
             if (task.Meta.NodeId || stageInfo.Meta.IsSysView()) {
                 // Task with source
                 if (!task.Meta.Reads) {
@@ -655,12 +649,11 @@ public:
 
 private:
     void ExecuteScanTx(TVector<NKikimrKqp::TKqpNodeResources>&& snapshot) {
-        
-        Planner = CreateKqpPlanner(TasksGraph, TxId, SelfId(), {},
-            {}, GetSnapshot(),
+
+        Planner = CreateKqpPlanner(TasksGraph, TxId, SelfId(), GetSnapshot(),
             Database, UserToken, Deadline.GetOrElse(TInstant::Zero()), Request.StatsMode, AppData()->EnableKqpSpilling,
             Request.RlPath, ExecuterSpan, std::move(snapshot), ExecuterRetriesConfig, false /* isDataQuery */, Request.MkqlMemoryLimit, nullptr, false);
-        
+
         LOG_D("Execute scan tx, PendingComputeTasks: " << TasksGraph.GetTasks().size());
         auto err = Planner->PlanExecution();
         if (err) {
@@ -716,9 +709,11 @@ private:
 IActor* CreateKqpScanExecuter(IKqpGateway::TExecPhysicalRequest&& request, const TString& database,
     const TIntrusiveConstPtr<NACLib::TUserToken>& userToken, TKqpRequestCounters::TPtr counters,
     const NKikimrConfig::TTableServiceConfig::TAggregationConfig& aggregation,
-    const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig, TPreparedQueryHolder::TConstPtr preparedQuery)
+    const NKikimrConfig::TTableServiceConfig::TExecuterRetriesConfig& executerRetriesConfig,
+    TPreparedQueryHolder::TConstPtr preparedQuery, const NKikimrConfig::TTableServiceConfig::EChannelTransportVersion chanTransportVersion)
 {
-    return new TKqpScanExecuter(std::move(request), database, userToken, counters, aggregation, executerRetriesConfig, preparedQuery);
+    return new TKqpScanExecuter(std::move(request), database, userToken, counters, aggregation, executerRetriesConfig,
+        preparedQuery, chanTransportVersion);
 }
 
 } // namespace NKqp

@@ -3,11 +3,29 @@ LIBRARY()
 SRCS(
     login_page.cpp
     login_page.h
+    login_shared_func.cpp
     secure_request.h
     ticket_parser_impl.h
     ticket_parser.cpp
     ticket_parser.h
+    ldap_auth_provider.cpp
 )
+
+IF(OS_LINUX OR OS_DARWIN)
+    PEERDIR(
+        contrib/libs/openldap
+    )
+
+    SRCS(
+        ldap_auth_provider_linux.cpp
+    )
+ELSEIF(OS_WINDOWS)
+    EXTRALIBS_STATIC(wldap32.lib)
+
+    SRCS(
+        ldap_auth_provider_win.cpp
+    )
+ENDIF()
 
 PEERDIR(
     library/cpp/actors/core

@@ -53,7 +53,7 @@ namespace NTest {
 
             TRawTypeValue Raw() const
             {
-                return { Cell.Data(), Cell.Size(), Type };
+                return { Cell.Data(), Cell.Size(), NScheme::TTypeInfo(Type) };
             }
 
             NTable::TTag Tag = Max<TTag>();
@@ -118,6 +118,11 @@ namespace NTest {
         TRow& Do(NTable::TTag tag, const TString &buf)
         {
             return Put(tag, TTypeFor<TString>::Type, buf.data(), buf.size());
+        }
+
+        TRow& Do(NTable::TTag tag, const TString &buf, TType type)
+        {
+            return Put(tag, type, buf.data(), buf.size());
         }
 
         TRow& Do(NTable::TTag tag, const NPageCollection::TGlobId &glob)

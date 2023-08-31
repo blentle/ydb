@@ -28,8 +28,8 @@ public:
 public:
     NRpc::TRequestId GetRequestId() const override;
     NRpc::TRealmId GetRealmId() const override;
-    const TString& GetMethod() const override;
-    const TString& GetService() const override;
+    std::string GetMethod() const override;
+    std::string GetService() const override;
 
     using NRpc::IClientRequest::DeclareClientFeature;
     using NRpc::IClientRequest::RequireServerFeature;
@@ -75,8 +75,8 @@ protected:
     explicit TYPathRequest(const NRpc::NProto::TRequestHeader& header);
 
     TYPathRequest(
-        TString service,
-        TString method,
+        std::string service,
+        std::string method,
         NYPath::TYPath path,
         bool mutating);
 
@@ -96,20 +96,20 @@ class TTypedYPathRequest
     , public TRequestMessage
 {
 public:
-    typedef TTypedYPathResponse<TRequestMessage, TResponseMessage> TTypedResponse;
+    using TTypedResponse = TTypedYPathResponse<TRequestMessage, TResponseMessage>;
 
     explicit TTypedYPathRequest(const NRpc::NProto::TRequestHeader& header)
         : TYPathRequest(header)
     { }
 
     TTypedYPathRequest(
-        const TString& service,
-        const TString& method,
+        std::string service,
+        std::string method,
         const NYPath::TYPath& path,
         bool mutating)
         : TYPathRequest(
-            service,
-            method,
+            std::move(service),
+            std::move(method),
             path,
             mutating)
     { }
@@ -168,11 +168,11 @@ protected:
     static_assert(true)
 
 #define DEFINE_YPATH_PROXY_METHOD_IMPL(ns, method, isMutating) \
-    typedef ::NYT::NYTree::TTypedYPathRequest<ns::TReq##method, ns::TRsp##method> TReq##method; \
-    typedef ::NYT::NYTree::TTypedYPathResponse<ns::TReq##method, ns::TRsp##method> TRsp##method; \
-    typedef ::NYT::TIntrusivePtr<TReq##method> TReq##method##Ptr; \
-    typedef ::NYT::TIntrusivePtr<TRsp##method> TRsp##method##Ptr; \
-    typedef ::NYT::TErrorOr<TRsp##method##Ptr> TErrorOrRsp##method##Ptr; \
+    using TReq##method = ::NYT::NYTree::TTypedYPathRequest<ns::TReq##method, ns::TRsp##method>; \
+    using TRsp##method = ::NYT::NYTree::TTypedYPathResponse<ns::TReq##method, ns::TRsp##method>; \
+    using TReq##method##Ptr = ::NYT::TIntrusivePtr<TReq##method>; \
+    using TRsp##method##Ptr = ::NYT::TIntrusivePtr<TRsp##method>; \
+    using TErrorOrRsp##method##Ptr = ::NYT::TErrorOr<TRsp##method##Ptr>; \
     \
     static TReq##method##Ptr method(const NYT::NYPath::TYPath& path = NYT::NYPath::TYPath()) \
     { \
@@ -188,8 +188,23 @@ protected:
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// TODO(gritukan): It's not easy to find a proper return type for these functions
+// that is suitable both for vanilla and patched protobufs. In an ideal world,
+// it would be TYPathBuf, but for now it breaks the advantages for CoW of the
+// TString. Rethink it if and when YT will try to use std::string or non-CoW
+// TString everywhere.
+#ifdef YT_USE_VANILLA_PROTOBUF
+
+TYPath GetRequestTargetYPath(const NRpc::NProto::TRequestHeader& header);
+TYPath GetOriginalRequestTargetYPath(const NRpc::NProto::TRequestHeader& header);
+
+#else
+
 const TYPath& GetRequestTargetYPath(const NRpc::NProto::TRequestHeader& header);
 const TYPath& GetOriginalRequestTargetYPath(const NRpc::NProto::TRequestHeader& header);
+
+#endif
+
 void SetRequestTargetYPath(NRpc::NProto::TRequestHeader* header, TYPath path);
 
 bool IsRequestMutating(const NRpc::NProto::TRequestHeader& header);

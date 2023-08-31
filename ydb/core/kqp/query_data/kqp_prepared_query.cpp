@@ -52,11 +52,12 @@ public:
 };
 
 TKqpPhyTxHolder::TKqpPhyTxHolder(const std::shared_ptr<const NKikimrKqp::TPreparedQuery>& pq,
-    const NKqpProto::TKqpPhyTx* proto, const std::shared_ptr<TPreparedQueryAllocHolder>& alloc)
+    const NKqpProto::TKqpPhyTx* proto, const std::shared_ptr<TPreparedQueryAllocHolder>& alloc, TIntrusivePtr<TTableConstInfoMap> tableConstInfoById)
     : PreparedQuery(pq)
     , Proto(proto)
     , LiteralTx(CalcIsLiteralTx(proto))
     , Alloc(alloc)
+    , TableConstInfoById(tableConstInfoById)
 {
     TxResultsMeta.resize(Proto->GetResults().size());
     for (auto&& i : Proto->GetStages()) {
@@ -74,6 +75,9 @@ TKqpPhyTxHolder::TKqpPhyTxHolder(const std::shared_ptr<const NKikimrKqp::TPrepar
         auto& result = TxResultsMeta[i];
 
         result.MkqlItemType = ImportTypeFromProto(txResult.GetItemType(), Alloc->TypeEnv);
+        //Hack to prevent data race. Side effect of IsPresortSupported - fill cached value.
+        //So no more concurent write subsequently
+        result.MkqlItemType->IsPresortSupported();
         if (txResult.ColumnHintsSize() > 0) {
             result.ColumnOrder.reserve(txResult.GetColumnHints().size());
             auto* structType = static_cast<NKikimr::NMiniKQL::TStructType*>(result.MkqlItemType);
@@ -104,13 +108,23 @@ TPreparedQueryHolder::TPreparedQueryHolder(NKikimrKqp::TPreparedQuery* proto,
     const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry)
     : Proto(proto)
     , Alloc(std::move(std::make_shared<TPreparedQueryAllocHolder>(functionRegistry)))
+    , TableConstInfoById(MakeIntrusive<TTableConstInfoMap>())
 {
     THashSet<TString> tablesSet;
     const auto& phyQuery = Proto->GetPhysicalQuery();
     Transactions.reserve(phyQuery.TransactionsSize());
+
+    // Init TableConstInfoById
+    for (const auto& phyTx: phyQuery.GetTransactions()) {
+        for (const auto& phyTable : phyTx.GetTables()) {
+            FillTable(phyTable);
+        }
+        FillTables(phyTx.GetStages());
+    }
+
     for (const auto& phyTx: phyQuery.GetTransactions()) {
         TKqpPhyTxHolder::TConstPtr txHolder = std::make_shared<const TKqpPhyTxHolder>(
-            Proto, &phyTx, Alloc);
+            Proto, &phyTx, Alloc, TableConstInfoById);
         Transactions.emplace_back(std::move(txHolder));
         for (const auto& stage: phyTx.GetStages()) {
 
@@ -137,6 +151,57 @@ TPreparedQueryHolder::TPreparedQueryHolder(NKikimrKqp::TPreparedQuery* proto,
     }
 
     QueryTables = TVector<TString>(tablesSet.begin(), tablesSet.end());
+}
+
+void TPreparedQueryHolder::FillTable(const NKqpProto::TKqpPhyTable& phyTable) {
+    auto tableId = MakeTableId(phyTable.GetId());
+
+    auto infoPtr = TableConstInfoById->Map.FindPtr(tableId);
+    if (!infoPtr) {
+        auto infoPtr = MakeIntrusive<TTableConstInfo>(phyTable.GetId().GetPath());
+        TableConstInfoById->Map[tableId] = infoPtr;
+        infoPtr->FillTable(phyTable);
+    } else {
+        for (const auto& [_, phyColumn] : phyTable.GetColumns()) {
+            (*infoPtr)->FillColumn(phyColumn);
+        }
+    }
+}
+
+void TPreparedQueryHolder::FillTables(const google::protobuf::RepeatedPtrField< ::NKqpProto::TKqpPhyStage>& stages) {
+    for (auto& stage : stages) {
+        for (auto& op : stage.GetTableOps()) {
+            auto& info = GetInfo(MakeTableId(op.GetTable()));
+            for (auto& column : op.GetColumns()) {
+                info->AddColumn(column.GetName());
+            }
+        }
+
+        for (auto& source : stage.GetSources()) {
+            if (source.HasReadRangesSource()) {
+                auto& info = GetInfo(MakeTableId(source.GetReadRangesSource().GetTable()));
+                for (auto& column : source.GetReadRangesSource().GetColumns()) {
+                    info->AddColumn(column.GetName());
+                }
+            }
+        }
+
+        for (const auto& input : stage.GetInputs()) {
+            if (input.GetTypeCase() == NKqpProto::TKqpPhyConnection::kStreamLookup) {
+                auto& info = GetInfo(MakeTableId(input.GetStreamLookup().GetTable()));
+                for (auto& column : input.GetStreamLookup().GetColumns()) {
+                    info->AddColumn(column);
+                }
+            }
+
+            if (input.GetTypeCase() == NKqpProto::TKqpPhyConnection::kSequencer) {
+                auto& info = GetInfo(MakeTableId(input.GetSequencer().GetTable()));
+                for(auto& column: input.GetSequencer().GetColumns()) {
+                    info->AddColumn(column);
+                }
+            }
+        }
+    }
 }
 
 const TKqpPhyTxHolder::TConstPtr& TPreparedQueryHolder::GetPhyTx(ui32 txId) const {

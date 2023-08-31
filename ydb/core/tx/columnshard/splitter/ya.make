@@ -2,6 +2,11 @@ LIBRARY()
 
 SRCS(
     splitter.cpp
+    batch_slice.cpp
+    chunks.cpp
+    simple.cpp
+    rb_splitter.cpp
+    stats.cpp
 )
 
 PEERDIR(
@@ -11,3 +16,7 @@ PEERDIR(
 )
 
 END()
+
+RECURSE_FOR_TESTS(
+    ut
+)

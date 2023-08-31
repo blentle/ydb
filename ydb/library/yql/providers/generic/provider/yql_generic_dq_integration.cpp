@@ -11,6 +11,7 @@
 #include <ydb/library/yql/providers/dq/common/yql_dq_settings.h>
 #include <ydb/library/yql/providers/dq/expr_nodes/dqs_expr_nodes.h>
 #include <ydb/library/yql/providers/generic/connector/libcpp/utils.h>
+#include <ydb/library/yql/utils/log/log.h>
 
 namespace NYql {
 
@@ -29,9 +30,9 @@ namespace NYql {
                 return TGenReadTable::Match(&read);
             }
 
-            TMaybe<ui64> EstimateReadSize(ui64 /*dataSizePerJob*/, ui32 /*maxTasksPerStage*/, const TExprNode& read,
+            TMaybe<ui64> EstimateReadSize(ui64 /*dataSizePerJob*/, ui32 /*maxTasksPerStage*/, const TVector<const TExprNode*>& read,
                                           TExprContext&) override {
-                if (TGenReadTable::Match(&read)) {
+                if (AllOf(read, [](const auto val) { return TGenReadTable::Match(val); })) {
                     return 0ul; // TODO: return real size
                 }
                 return Nothing();
@@ -41,8 +42,6 @@ namespace NYql {
                 if (const auto maybeGenReadTable = TMaybeNode<TGenReadTable>(read)) {
                     const auto genReadTable = maybeGenReadTable.Cast();
                     const auto token = TString("cluster:default_") += genReadTable.DataSource().Cluster().StringValue();
-                    YQL_CLOG(INFO, ProviderGeneric) << "Wrap " << read->Content() << " with token: " << token;
-
                     const auto rowType = genReadTable.Ref()
                                              .GetTypeAnn()
                                              ->Cast<TTupleExprType>()
@@ -131,11 +130,11 @@ namespace NYql {
                     for (size_t i = 0; i < columns.Size(); i++) {
                         // assign column name
                         auto column = items->Add()->mutable_column();
-                        auto column_name = columns.Item(i).StringValue();
-                        column->mutable_name()->assign(column_name);
+                        auto columnName = columns.Item(i).StringValue();
+                        column->mutable_name()->assign(columnName);
 
                         // assign column type
-                        auto type = NConnector::GetColumnTypeByName(tableMeta.value()->Schema, column_name);
+                        auto type = NConnector::GetColumnTypeByName(tableMeta.value()->Schema, columnName);
                         column->mutable_type()->CopyFrom(type);
                     }
 

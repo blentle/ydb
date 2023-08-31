@@ -56,8 +56,10 @@ def fix_sanitize_flag(cmd):
         if flag.startswith('--target') and 'linux' not in flag.lower():
             # use toolchained sanitize libraries
             return cmd
-
-    CLANG_RT = 'contrib/libs/clang14-rt/lib/'
+    if 'CLANG16_YES_PLEASE' in str(cmd):
+        CLANG_RT = 'contrib/libs/clang16-rt/lib/'
+    else:
+        CLANG_RT = 'contrib/libs/clang14-rt/lib/'
     sanitize_flags = {
         '-fsanitize=address': CLANG_RT + 'asan',
         '-fsanitize=memory': CLANG_RT + 'msan',
@@ -165,6 +167,13 @@ if __name__ == '__main__':
         cmd = fix_cmd_for_musl(cmd)
 
     cmd = fix_sanitize_flag(cmd)
+
+    if 'ld.lld' in str(cmd):
+        if '-fPIE' in str(cmd) or '-fPIC' in str(cmd):
+            # support explicit PIE
+            pass
+        else:
+            cmd.append('-Wl,-no-pie')
 
     if opts.dynamic_cuda:
         cmd = fix_cmd_for_dynamic_cuda(cmd)

@@ -27,6 +27,7 @@ protected:
     std::unordered_map<TString, TString> ConnectionParams_;
     TConnectionState Connection_;
     TString Tag_;
+    NKikimrKqp::EQueryAction QueryAction_ = {};
 
     TPgwireKqpProxy(const TActorId owner, std::unordered_map<TString, TString> params, const TConnectionState& connection)
         : Owner_(owner)
@@ -73,15 +74,16 @@ protected:
         }
         request.SetKeepSession(true);
         // HACK
-        TString q(ToUpperASCII(query.substr(0, 10)));
+        TString q(ToUpperASCII(query.substr(0, 20)));
         if (q.StartsWith("BEGIN")) {
             Tag_ = "BEGIN";
             request.SetAction(NKikimrKqp::QUERY_ACTION_BEGIN_TX);
             request.MutableTxControl()->mutable_begin_tx()->mutable_serializable_read_write();
-        } else if (q.StartsWith("COMMIT")) {
+        } else if (q.StartsWith("COMMIT") || q.StartsWith("END")) {
             Tag_ = "COMMIT";
             request.SetAction(NKikimrKqp::QUERY_ACTION_COMMIT_TX);
             request.MutableTxControl()->set_tx_id(Connection_.Transaction.Id);
+            request.MutableTxControl()->set_commit_tx(true);
         } else if (q.StartsWith("ROLLBACK")) {
             Tag_ = "ROLLBACK";
             if (Connection_.Transaction.Status == 'T') {
@@ -99,11 +101,14 @@ protected:
                 Tag_ = "SELECT";
             }
             if (q.StartsWith("CREATE") || q.StartsWith("ALTER") || q.StartsWith("DROP")) {
+                TStringBuf tag(q);
+                Tag_ = TStringBuilder() << tag.NextTok(' ') << " " << tag.NextTok(' ');
                 request.SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
                 request.SetType(NKikimrKqp::QUERY_TYPE_SQL_DDL);
             } else {
                 request.SetAction(NKikimrKqp::QUERY_ACTION_EXECUTE);
                 request.SetType(NKikimrKqp::QUERY_TYPE_SQL_GENERIC_QUERY);
+                request.MutableQueryCachePolicy()->set_keep_in_cache(true);
                 if (Connection_.Transaction.Status == 'I') {
                     request.MutableTxControl()->mutable_begin_tx()->mutable_serializable_read_write();
                     request.MutableTxControl()->set_commit_tx(true);
@@ -115,6 +120,7 @@ protected:
             request.SetSyntax(Ydb::Query::SYNTAX_PG);
             request.SetQuery(TString(query));
         }
+        QueryAction_ = request.GetAction();
     }
 
     void ProcessKqpResponseReleaseProxy(const NKikimrKqp::TEvQueryResponse& record) {
@@ -122,7 +128,7 @@ protected:
 
         if (record.GetYdbStatus() == Ydb::StatusIds::SUCCESS) {
             Connection_.Transaction.Id = record.GetResponse().GetTxMeta().id();
-            if (Connection_.Transaction.Id) {
+            if (Connection_.Transaction.Id && QueryAction_ != NKikimrKqp::QUERY_ACTION_COMMIT_TX && QueryAction_ != NKikimrKqp::QUERY_ACTION_ROLLBACK_TX) {
                 Connection_.Transaction.Status = 'T';
             } else {
                 Connection_.Transaction.Status = 'I';
@@ -176,6 +182,7 @@ public:
 
         // HACK
         ConvertQueryToRequest(query, request);
+        request.SetUsePublicResponseDataFormat(true);
         if (request.HasAction()) {
             ActorIdToProto(SelfId(), event->Record.MutableRequestActorId());
             BLOG_D("Sent event to kqpProxy " << request.ShortDebugString());
@@ -243,7 +250,7 @@ public:
         try {
             if (record.HasYdbStatus()) {
                 if (record.GetYdbStatus() == Ydb::StatusIds::SUCCESS) {
-                    BLOG_ENSURE(record.GetResponse().GetResults().empty());
+                    BLOG_ENSURE(record.GetResponse().GetYdbResults().empty());
 
                     // HACK
                     if (response->Tag == "SELECT") {
@@ -295,13 +302,24 @@ public:
         // HACK
         ConvertQueryToRequest(QueryData_.Query, request);
         if (request.HasAction()) {
-            request.SetAction(NKikimrKqp::QUERY_ACTION_EXPLAIN);
+            if (request.GetType() == NKikimrKqp::QUERY_TYPE_SQL_GENERIC_QUERY) {
+                request.SetAction(QueryAction_ = NKikimrKqp::QUERY_ACTION_EXPLAIN);
+                request.SetUsePublicResponseDataFormat(true);
 
-            request.SetUsePublicResponseDataFormat(true);
-
-            ActorIdToProto(SelfId(), event->Record.MutableRequestActorId());
-            BLOG_D("Sent event to kqpProxy " << request.ShortDebugString());
-            Send(NKqp::MakeKqpProxyID(SelfId().NodeId()), event.Release());
+                ActorIdToProto(SelfId(), event->Record.MutableRequestActorId());
+                BLOG_D("Sent event to kqpProxy " << request.ShortDebugString());
+                Send(NKqp::MakeKqpProxyID(SelfId().NodeId()), event.Release());
+            } else { // for DDL and TCL
+                BLOG_D("Skipping parse of DDL/TCL");
+                auto response = EventParse_->Get()->Reply();
+                TParsedStatement statement;
+                statement.QueryData = std::move(QueryData_);
+                Send(Owner_, new TEvEvents::TEvProxyCompleted(statement));
+                BLOG_D("Finally replying to " << EventParse_->Sender);
+                Send(EventParse_->Sender, response.release(), 0, EventParse_->Cookie);
+                PassAway();
+                return;
+            }
         }
         // TODO(xenoxeno): timeout
         Become(&TPgwireKqpProxyParse::StateWork);
@@ -387,6 +405,7 @@ public:
 
         // HACK
         ConvertQueryToRequest(Statement_.QueryData.Query, request);
+        request.SetUsePublicResponseDataFormat(true);
         if (request.HasAction()) {
             for (unsigned int paramNum = 0; paramNum < Statement_.BindData.ParametersValue.size(); ++paramNum) {
                 if (paramNum >= Statement_.ParameterTypes.size()) {
@@ -445,7 +464,7 @@ public:
         try {
             if (record.HasYdbStatus()) {
                 if (record.GetYdbStatus() == Ydb::StatusIds::SUCCESS) {
-                    BLOG_ENSURE(record.GetResponse().GetResults().empty());
+                    BLOG_ENSURE(record.GetResponse().GetYdbResults().empty());
 
                     // HACK
                     if (response->Tag == "SELECT") {

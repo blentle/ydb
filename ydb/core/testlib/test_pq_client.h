@@ -23,8 +23,9 @@ namespace NPersQueueTests {
 using namespace NNetClassifier;
 using namespace NKikimr::Tests;
 
+const static ui32 PQ_DEFAULT_NODE_COUNT = 2;
 
-inline Tests::TServerSettings PQSettings(ui16 port, ui32 nodesCount = 2, bool roundrobin = true, const TString& yql_timeout = "10", const THolder<TTempFileHandle>& netDataFile = nullptr) {
+inline Tests::TServerSettings PQSettings(ui16 port = 0, ui32 nodesCount = PQ_DEFAULT_NODE_COUNT, bool roundrobin = true, const TString& yql_timeout = "10", const THolder<TTempFileHandle>& netDataFile = nullptr) {
     NKikimrPQ::TPQConfig pqConfig;
     NKikimrProto::TAuthConfig authConfig;
     authConfig.SetUseBlackBox(false);
@@ -806,7 +807,7 @@ public:
     ui32 GetTopicVersionFromPath(const TString& name) {
         TAutoPtr<NMsgBusProxy::TBusResponse> res = Ls("/Root/PQ/" + name);
         ui32 version = res->Record.GetPathDescription().GetPersQueueGroup().GetAlterVersion();
-        Cerr << "GetTopicVersionFromPath: " << " record " <<  res->Record  << " name " << name << " version" << version << "\n";
+        Cerr << "GetTopicVersionFromPath: " << " record " <<  res->Record.DebugString()  << "\n name " << name << " version" << version << "\n";
         return version;
     }
 

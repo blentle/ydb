@@ -7,6 +7,7 @@
 #include "type_ann_wide.h"
 #include "type_ann_types.h"
 #include "type_ann_pg.h"
+#include "type_ann_match_recognize.h"
 
 #include <ydb/library/yql/core/yql_atom_enums.h>
 #include <ydb/library/yql/core/yql_expr_optimize.h>
@@ -6229,6 +6230,16 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         return IGraphTransformer::TStatus::Ok;
     }
 
+    IGraphTransformer::TStatus CostsOfWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
+        Y_UNUSED(output);
+        if (!EnsureArgsCount(*input, 1, ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        input->SetTypeAnn(ctx.Expr.MakeType<TDataExprType>(EDataSlot::Json));
+        return IGraphTransformer::TStatus::Ok;
+    }
+
     IGraphTransformer::TStatus InstanceOfWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
         Y_UNUSED(output);
         if (!EnsureArgsCount(*input, 1, ctx.Expr)) {
@@ -6586,37 +6597,35 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
             return IGraphTransformer::TStatus::Repeat;
         }
 
-        const TListExprType* listType;
-        bool isOptional;
-        if (input->Head().GetTypeAnn() && input->Head().GetTypeAnn()->GetKind() == ETypeAnnotationKind::Optional) {
-            auto itemType = input->Head().GetTypeAnn()->Cast<TOptionalExprType>()->GetItemType();
-            if (IsEmptyList(*itemType)) {
-                output = ctx.Expr.NewCallable(input->Pos(), "EmptyDict", {});
-                output = MakeConstMap(input->Pos(), input->HeadPtr(), output, ctx.Expr);
-                return IGraphTransformer::TStatus::Repeat;
-            }
-
-            if (!EnsureListType(input->Head().Pos(), *itemType, ctx.Expr)) {
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            listType = itemType->Cast<TListExprType>();
-            isOptional = true;
-        } else {
-            if (IsEmptyList(input->Head())) {
-                output = ctx.Expr.NewCallable(input->Pos(), "EmptyDict", {});
-                return IGraphTransformer::TStatus::Repeat;
-            }
-
-            if (!EnsureListType(input->Head(), ctx.Expr)) {
-                return IGraphTransformer::TStatus::Error;
-            }
-
-            listType = input->Head().GetTypeAnn()->Cast<TListExprType>();
-            isOptional = false;
+        if (const auto inputType = input->Head().GetTypeAnn(); inputType && inputType->GetKind() == ETypeAnnotationKind::Optional
+            && inputType->Cast<TOptionalExprType>()->GetItemType()->GetKind() != ETypeAnnotationKind::Optional) {
+            output = ctx.Expr.Builder(input->Pos())
+                .Callable("Map")
+                    .Add(0, input->HeadPtr())
+                    .Lambda(1)
+                        .Param("list")
+                        .Callable(input->Content())
+                            .Arg(0, "list")
+                            .Add(1, input->ChildPtr(1))
+                            .Add(2, input->ChildPtr(2))
+                            .Add(3, input->ChildPtr(3))
+                        .Seal()
+                    .Seal()
+                .Seal().Build();
+            return IGraphTransformer::TStatus::Repeat;
         }
 
-        const TTypeAnnotationNode* itemType = listType->Cast<TListExprType>()->GetItemType();
+        if (IsEmptyList(input->Head())) {
+            output = ctx.Expr.NewCallable(input->Pos(), "EmptyDict", {});
+            return IGraphTransformer::TStatus::Repeat;
+        }
+
+        if (!EnsureListType(input->Head(), ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        const auto listType = input->Head().GetTypeAnn()->Cast<TListExprType>();
+        const auto itemType = listType->Cast<TListExprType>()->GetItemType();
         auto status = ConvertToLambda(input->ChildRef(1), ctx.Expr, 1);
         if (status.Level != IGraphTransformer::TStatus::Ok) {
             return status;
@@ -6690,10 +6699,6 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         }
 
         input->SetTypeAnn(dictType);
-        if (isOptional) {
-            input->SetTypeAnn(ctx.Expr.MakeType<TOptionalExprType>(input->GetTypeAnn()));
-        }
-
         return IGraphTransformer::TStatus::Ok;
     }
 
@@ -9147,7 +9152,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
                 if (item->ChildrenSize() == 4 && HasSetting(*item->Child(3), "autoName")) {
                     autoNameIndexes.push_back(i);
                 } else {
-                    addedInProjectionFields.emplace(fieldName);                    
+                    addedInProjectionFields.emplace(fieldName);
                     allItems.push_back(ctx.Expr.MakeType<TItemExprType>(fieldName, item->GetTypeAnn()));
                 }
             }
@@ -11776,6 +11781,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["HasNull"] = &HasNullWrapper;
         Functions["TypeOf"] = &TypeOfWrapper;
         Functions["ConstraintsOf"] = &ConstraintsOfWrapper;
+        Functions["CostsOf"] = &CostsOfWrapper;
         Functions["InstanceOf"] = &InstanceOfWrapper;
         Functions["SourceOf"] = &SourceOfWrapper;
         Functions["MatchType"] = &MatchTypeWrapper;
@@ -11834,6 +11840,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["NewMTRand"] = &NewMTRandWrapper;
         Functions["NextMTRand"] = &NextMTRandWrapper;
         Functions["FormatType"] = &FormatTypeWrapper;
+        Functions["FormatTypeDiff"] = &FormatTypeDiffWrapper;
         Functions["CastStruct"] = &CastStructWrapper;
         Functions["AggregationTraits"] = &AggregationTraitsWrapper;
         Functions["MultiAggregate"] = &MultiAggregateWrapper;
@@ -12024,6 +12031,8 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["ListAny"] = &ListAllAnyWrapper<false>;
         Functions["ListNotNull"] = &ListNotNullWrapper;
         Functions["ListFlatten"] = &ListFlattenWrapper;
+        Functions["ListUniq"] = &ListUniqWrapper;
+        Functions["ListUniqStable"] = &ListUniqWrapper;
 
         Functions["ExpandMap"] = &ExpandMapWrapper;
         Functions["WideMap"] = &WideMapWrapper;
@@ -12043,7 +12052,6 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["NarrowFlatMap"] = &NarrowFlatMapWrapper;
         Functions["NarrowMultiMap"] = &NarrowMultiMapWrapper;
 
-        Functions["WideToBlocks"] = &WideToBlocksWrapper;
         Functions["WideFromBlocks"] = &WideFromBlocksWrapper;
         Functions["WideSkipBlocks"] = &WideSkipTakeBlocksWrapper;
         Functions["WideTakeBlocks"] = &WideSkipTakeBlocksWrapper;
@@ -12052,6 +12060,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["WideTopBlocks"] = &WideTopBlocksWrapper;
         Functions["WideTopSortBlocks"] = &WideTopBlocksWrapper;
         Functions["WideSortBlocks"] = &WideSortBlocksWrapper;
+        Functions["BlockExtend"] = &BlockExtendWrapper;
 
         Functions["AsScalar"] = &AsScalarWrapper;
         Functions["BlockCoalesce"] = &BlockCoalesceWrapper;
@@ -12070,6 +12079,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         ExtFunctions["BlockFunc"] = &BlockFuncWrapper;
         ExtFunctions["BlockBitCast"] = &BlockBitCastWrapper;
 
+        ExtFunctions["WideToBlocks"] = &WideToBlocksWrapper;
         ExtFunctions["BlockCombineAll"] = &BlockCombineAllWrapper;
         ExtFunctions["BlockCombineHashed"] = &BlockCombineHashedWrapper;
         ExtFunctions["BlockMergeFinalizeHashed"] = &BlockMergeFinalizeHashedWrapper;
@@ -12091,6 +12101,13 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["RoundUp"] = &RoundWrapper;
         Functions["RoundDown"] = &RoundWrapper;
         Functions["NextValue"] = &NextValueWrapper;
+
+        Functions["MatchRecognize"] = &MatchRecognizeWrapper;
+        Functions["MatchRecognizeParams"] = &MatchRecognizeParamsWrapper;
+        Functions["MatchRecognizeMeasures"] = &MatchRecognizeMeasuresWrapper;
+        Functions["MatchRecognizePattern"] = &MatchRecognizePatternWrapper;
+        Functions["MatchRecognizeDefines"] = &MatchRecognizeDefinesWrapper;
+        ExtFunctions["MatchRecognizeCore"] = &MatchRecognizeCoreWrapper;
 
         Functions["FromPg"] = &FromPgWrapper;
         Functions["ToPg"] = &ToPgWrapper;

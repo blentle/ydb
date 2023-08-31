@@ -67,6 +67,16 @@ bool IsChannelFailureError(const TError& error)
         code == TErrorCode(2100);
 }
 
+bool IsChannelFailureErrorHandled(const TError& error)
+{
+    return error.Attributes().Get<bool>("channel_failure_error_handled", false);
+}
+
+void LabelHandledChannelFailureError(TError* error)
+{
+    error->MutableAttributes()->Set("channel_failure_error_handled", true);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 class TDefaultTimeoutChannel
@@ -413,16 +423,20 @@ TTraceContextPtr GetOrCreateHandlerTraceContext(
         forceTracing);
 }
 
-TTraceContextPtr CreateCallTraceContext(const TString& service, const TString& method)
+TTraceContextPtr CreateCallTraceContext(std::string service, std::string method)
 {
-    auto context = TryGetCurrentTraceContext();
-    if (!context) {
+    auto oldTraceContext = TryGetCurrentTraceContext();
+    if (!oldTraceContext) {
         return nullptr;
     }
-    if (!context->IsRecorded()) {
-        return context;
+    if (!oldTraceContext->IsRecorded()) {
+        return oldTraceContext;
     }
-    return context->CreateChild(ConcatToString(TStringBuf("RpcClient:"), service, TStringBuf("."), method));
+
+    auto traceContext = oldTraceContext->CreateChild(Format("RpcClient:%v.%v", service, method));
+    traceContext->SetAllocationTagsPtr(oldTraceContext->GetAllocationTagsPtr());
+
+    return traceContext;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -583,24 +597,34 @@ std::vector<TSharedRef> DecompressAttachments(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-std::optional<TError> TryEnrichClientRequestErrorWithFeatureName(
+std::optional<TError> TryEnrichClientRequestError(
     const TError& error,
     TFeatureIdFormatter featureIdFormatter)
 {
+    std::optional<TError> result;
+
+    // Try to enrich error with feature name.
     if (error.GetCode() == NRpc::EErrorCode::UnsupportedServerFeature &&
         error.Attributes().Contains(FeatureIdAttributeKey) &&
         !error.Attributes().Contains(FeatureNameAttributeKey) &&
         featureIdFormatter)
     {
         auto featureId = error.Attributes().Get<int>(FeatureIdAttributeKey);
-        auto featureName = (*featureIdFormatter)(featureId);
-        if (featureName) {
-            auto enrichedError = error;
-            enrichedError.MutableAttributes()->Set(FeatureNameAttributeKey, featureName);
-            return enrichedError;
+        if (auto featureName = (*featureIdFormatter)(featureId)) {
+            result = error;
+            result->MutableAttributes()->Set(FeatureNameAttributeKey, featureName);
         }
     }
-    return std::nullopt;
+
+    // Try to enrich error with handled channel failure label.
+    if (IsChannelFailureError(error) && !IsChannelFailureErrorHandled(error)) {
+        if (!result) {
+            result = error;
+        }
+        LabelHandledChannelFailureError(&*result);
+    }
+
+    return result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

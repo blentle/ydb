@@ -170,21 +170,24 @@ public:
     TKqpProxyService(const NKikimrConfig::TLogConfig& logConfig,
         const NKikimrConfig::TTableServiceConfig& tableServiceConfig,
         const NKikimrProto::TTokenAccessorConfig& tokenAccessorConfig,
+        const NKikimrConfig::TQueryServiceConfig& queryServiceConfig,
         TVector<NKikimrKqp::TKqpSetting>&& settings,
         std::shared_ptr<IQueryReplayBackendFactory> queryReplayFactory,
         std::shared_ptr<TKqpProxySharedResources>&& kqpProxySharedResources)
-        : LogConfig(logConfig)
+        : HttpGatewayConfig(CreateHttpGatewayConfig())
+        , LogConfig(logConfig)
         , TableServiceConfig(tableServiceConfig)
         , TokenAccessorConfig(tokenAccessorConfig)
+        , QueryServiceConfig(queryServiceConfig)
         , KqpSettings(std::make_shared<const TKqpSettings>(std::move(settings)))
         , QueryReplayFactory(std::move(queryReplayFactory))
-        , HttpGateway(NYql::IHTTPGateway::Make()) // TODO: pass config and counters
+        , HttpGateway(NYql::IHTTPGateway::Make(&HttpGatewayConfig)) // TODO: pass config and counters
         , PendingRequests()
         , ModuleResolverState()
         , KqpProxySharedResources(std::move(kqpProxySharedResources))
     {}
 
-    void Bootstrap() {
+    void Bootstrap(const TActorContext &ctx) {
         if (TokenAccessorConfig.GetEnabled()) {
             TString caContent;
             if (const auto& path = TokenAccessorConfig.GetSslCaCert()) {
@@ -239,6 +242,14 @@ public:
             KqpSettings, ModuleResolverState, Counters, std::move(QueryReplayFactory), CredentialsFactory, HttpGateway));
         TlsActivationContext->ExecutorThread.ActorSystem->RegisterLocalService(
             MakeKqpCompileServiceID(SelfId().NodeId()), CompileService);
+
+        if (TableServiceConfig.GetEnableAsyncComputationPatternCompilation()) {
+            IActor* ComputationPatternServiceActor = CreateKqpCompileComputationPatternService(TableServiceConfig, Counters);
+            ui32 batchPoolId = AppData(ctx)->BatchPoolId;
+            CompileComputationPatternService = ctx.Register(ComputationPatternServiceActor, TMailboxType::HTSwap, batchPoolId);
+            TlsActivationContext->ExecutorThread.ActorSystem->RegisterLocalService(
+                MakeKqpCompileComputationPatternServiceID(SelfId().NodeId()), CompileComputationPatternService);
+        }
 
         KqpNodeService = TlsActivationContext->ExecutorThread.RegisterActor(CreateKqpNodeService(TableServiceConfig, Counters, nullptr, AsyncIoFactory));
         TlsActivationContext->ExecutorThread.ActorSystem->RegisterLocalService(
@@ -422,6 +433,11 @@ public:
 
     void PassAway() override {
         Send(CompileService, new TEvents::TEvPoisonPill());
+
+        if (TableServiceConfig.GetEnableAsyncComputationPatternCompilation()) {
+            Send(CompileComputationPatternService, new TEvents::TEvPoisonPill());
+        }
+
         Send(SpillingService, new TEvents::TEvPoison);
         Send(KqpNodeService, new TEvents::TEvPoison);
         if (BoardPublishActor) {
@@ -631,7 +647,7 @@ public:
 
         auto cancelAfter = ev->Get()->GetCancelAfter();
         auto timeout = ev->Get()->GetOperationTimeout();
-        auto timerDuration = GetQueryTimeout(queryType, timeout.MilliSeconds(), TableServiceConfig);
+        auto timerDuration = GetQueryTimeout(queryType, timeout.MilliSeconds(), TableServiceConfig, QueryServiceConfig);
         if (cancelAfter) {
             timerDuration = Min(timerDuration, cancelAfter);
         }
@@ -645,7 +661,13 @@ public:
 
     void Handle(TEvKqp::TEvScriptRequest::TPtr& ev) {
         if (CheckScriptExecutionsTablesReady<TEvKqp::TEvScriptResponse>(ev)) {
-            Register(CreateScriptExecutionCreatorActor(std::move(ev)));
+            auto req = ev->Get()->Record.MutableRequest();
+            auto maxRunTime = GetQueryTimeout(req->GetType(), req->GetTimeoutMs(), TableServiceConfig, QueryServiceConfig);
+            req->SetTimeoutMs(maxRunTime.MilliSeconds());
+            if (req->GetCancelAfterMs()) {
+                maxRunTime = TDuration::MilliSeconds(Min(req->GetCancelAfterMs(), maxRunTime.MilliSeconds()));
+            }
+            Register(CreateScriptExecutionCreatorActor(std::move(ev), QueryServiceConfig, maxRunTime), TMailboxType::HTSwap, AppData()->SystemPoolId);
         }
     }
 
@@ -684,7 +706,10 @@ public:
         const auto traceId = event.GetTraceId();
         TKqpRequestInfo requestInfo(traceId);
         const auto sessionId = request.GetSessionId();
-        const bool extIdleCheck = request.GetExtIdleCheck();
+        // If set rpc layer will controll session lifetime
+        const TActorId ctrlActor = request.HasExtSessionCtrlActorId()
+            ? ActorIdFromProto(request.GetExtSessionCtrlActorId())
+            : TActorId();
         const TKqpSessionInfo* sessionInfo = LocalSessions->FindPtr(sessionId);
         auto dbCounters = sessionInfo ? sessionInfo->DbCounters : nullptr;
         Counters->ReportPingSession(dbCounters, request.ByteSize());
@@ -693,14 +718,14 @@ public:
         if (sessionInfo) {
             const bool sameNode = ev->Sender.NodeId() == SelfId().NodeId();
             KQP_PROXY_LOG_D("Received ping session request, has local session: " << sessionId
-                << ", extIdleCheck: " << extIdleCheck
+                << ", rpc ctrl: " << ctrlActor
                 << ", sameNode: " << sameNode
                 << ", trace_id: " << traceId);
 
             const bool isIdle = LocalSessions->IsSessionIdle(sessionInfo);
             if (isIdle) {
                 LocalSessions->StopIdleCheck(sessionInfo);
-                if (!extIdleCheck) {
+                if (!ctrlActor) {
                     LocalSessions->StartIdleCheck(sessionInfo, GetSessionIdleDuration());
                 }
             }
@@ -712,15 +737,20 @@ public:
                 ? Ydb::Table::KeepAliveResult::SESSION_STATUS_READY
                 : Ydb::Table::KeepAliveResult::SESSION_STATUS_BUSY;
             record.MutableResponse()->SetSessionStatus(sessionStatus);
-            if (extIdleCheck && isIdle) {
+            if (ctrlActor && isIdle) {
                 //TODO: fix
                 ui32 flags = IEventHandle::FlagTrackDelivery;
-                if (!sameNode) {
+                if (sameNode) {
+                    KQP_PROXY_LOG_T("Attach local session: " << sessionInfo->WorkerId
+                        << " to rpc: " << ctrlActor << " on same node");
+
+                    LocalSessions->AttachSession(sessionInfo, 0, ctrlActor);
+                } else {
                     const TNodeId nodeId = ev->Sender.NodeId();
                     KQP_PROXY_LOG_T("Subscribe local session: " << sessionInfo->WorkerId
-                        << " to remote: " << ev->Sender << " , nodeId: " << nodeId);
+                        << " to remote: " << ev->Sender << " , nodeId: " << nodeId << ", with rpc: " << ctrlActor);
 
-                    LocalSessions->AttachSession(sessionInfo, nodeId);
+                    LocalSessions->AttachSession(sessionInfo, nodeId, ctrlActor);
 
                     flags |= IEventHandle::FlagSubscribeOnSession;
                 }
@@ -1328,7 +1358,7 @@ private:
 
         auto dbCounters = Counters->GetDbCounters(database);
 
-        TKqpWorkerSettings workerSettings(cluster, database, TableServiceConfig, dbCounters);
+        TKqpWorkerSettings workerSettings(cluster, database, TableServiceConfig, QueryServiceConfig, dbCounters);
         workerSettings.LongSession = longSession;
 
         auto config = CreateConfig(KqpSettings, workerSettings);
@@ -1380,7 +1410,7 @@ private:
 
     void RemoveSession(const TString& sessionId, const TActorId& workerId) {
         if (!sessionId.empty()) {
-            auto nodeId = LocalSessions->Erase(sessionId);
+            auto [nodeId, rpcActor] = LocalSessions->Erase(sessionId);
             KqpProxySharedResources->AtomicLocalSessionCount.store(LocalSessions->size());
             PublishResourceUsage();
             if (ShutdownRequested) {
@@ -1390,6 +1420,14 @@ private:
             // No more session with kqp proxy on this node
             if (nodeId) {
                 Send(TActivationContext::InterconnectProxy(nodeId), new TEvents::TEvUnsubscribe);
+            }
+
+            if (rpcActor) {
+                auto closeEv = MakeHolder<TEvKqp::TEvCloseSessionResponse>();
+                closeEv->Record.SetStatus(Ydb::StatusIds::SUCCESS);
+                closeEv->Record.MutableResponse()->SetSessionId(sessionId);
+                closeEv->Record.MutableResponse()->SetClosed(true);
+                Send(rpcActor, closeEv.Release());
             }
 
             return;
@@ -1434,7 +1472,7 @@ private:
         switch (ScriptExecutionsCreationStatus) {
             case EScriptExecutionsCreationStatus::NotStarted:
                 ScriptExecutionsCreationStatus = EScriptExecutionsCreationStatus::Pending;
-                Register(CreateScriptExecutionsTablesCreator(MakeHolder<TEvPrivate::TEvScriptExecutionsTablesCreationFinished>()));
+                Register(CreateScriptExecutionsTablesCreator(MakeHolder<TEvPrivate::TEvScriptExecutionsTablesCreationFinished>()), TMailboxType::HTSwap, AppData()->SystemPoolId);
                 [[fallthrough]];
             case EScriptExecutionsCreationStatus::Pending:
                 if (DelayedEventsQueue.size() < 10000) {
@@ -1460,25 +1498,25 @@ private:
 
     void Handle(NKqp::TEvForgetScriptExecutionOperation::TPtr& ev) {
         if (CheckScriptExecutionsTablesReady<TEvForgetScriptExecutionOperationResponse>(ev)) {
-            Register(CreateForgetScriptExecutionOperationActor(std::move(ev)));
+            Register(CreateForgetScriptExecutionOperationActor(std::move(ev)), TMailboxType::HTSwap, AppData()->SystemPoolId);
         }
     }
 
     void Handle(NKqp::TEvGetScriptExecutionOperation::TPtr& ev) {
         if (CheckScriptExecutionsTablesReady<TEvGetScriptExecutionOperationResponse>(ev)) {
-            Register(CreateGetScriptExecutionOperationActor(std::move(ev)));
+            Register(CreateGetScriptExecutionOperationActor(std::move(ev)), TMailboxType::HTSwap, AppData()->SystemPoolId);
         }
     }
 
     void Handle(NKqp::TEvListScriptExecutionOperations::TPtr& ev) {
         if (CheckScriptExecutionsTablesReady<TEvListScriptExecutionOperationsResponse>(ev)) {
-            Register(CreateListScriptExecutionOperationsActor(std::move(ev)));
+            Register(CreateListScriptExecutionOperationsActor(std::move(ev)), TMailboxType::HTSwap, AppData()->SystemPoolId);
         }
     }
 
     void Handle(NKqp::TEvCancelScriptExecutionOperation::TPtr& ev) {
         if (CheckScriptExecutionsTablesReady<TEvCancelScriptExecutionOperationResponse>(ev)) {
-            Register(CreateCancelScriptExecutionOperationActor(std::move(ev)));
+            Register(CreateCancelScriptExecutionOperationActor(std::move(ev)), TMailboxType::HTSwap, AppData()->SystemPoolId);
         }
     }
 
@@ -1505,10 +1543,22 @@ private:
         }
     }
 
+    static NYql::THttpGatewayConfig CreateHttpGatewayConfig() {
+        NYql::THttpGatewayConfig config;
+        config.SetMaxInFlightCount(2000);
+        config.SetMaxSimulatenousDownloadsSize(2000000000);
+        config.SetBuffersSizePerStream(5000000);
+        config.SetConnectionTimeoutSeconds(15);
+        config.SetRequestTimeoutSeconds(0);
+        return config;
+    }
+
 private:
+    NYql::THttpGatewayConfig HttpGatewayConfig;
     NKikimrConfig::TLogConfig LogConfig;
     NKikimrConfig::TTableServiceConfig TableServiceConfig;
     NKikimrProto::TTokenAccessorConfig TokenAccessorConfig;
+    NKikimrConfig::TQueryServiceConfig QueryServiceConfig;
     TKqpSettings::TConstPtr KqpSettings;
     NYql::ISecuredServiceAccountCredentialsFactory::TPtr CredentialsFactory;
     std::shared_ptr<IQueryReplayBackendFactory> QueryReplayFactory;
@@ -1540,6 +1590,7 @@ private:
     TActorId BoardLookupActor;
     TActorId BoardPublishActor;
     TActorId CompileService;
+    TActorId CompileComputationPatternService;
     TActorId KqpNodeService;
     TActorId SpillingService;
     TActorId WhiteBoardService;
@@ -1561,11 +1612,12 @@ private:
 IActor* CreateKqpProxyService(const NKikimrConfig::TLogConfig& logConfig,
     const NKikimrConfig::TTableServiceConfig& tableServiceConfig,
     const NKikimrProto::TTokenAccessorConfig& tokenAccessorConfig,
+    const NKikimrConfig::TQueryServiceConfig& queryServiceConfig, 
     TVector<NKikimrKqp::TKqpSetting>&& settings,
     std::shared_ptr<IQueryReplayBackendFactory> queryReplayFactory,
     std::shared_ptr<TKqpProxySharedResources> kqpProxySharedResources)
 {
-    return new TKqpProxyService(logConfig, tableServiceConfig, tokenAccessorConfig, std::move(settings),
+    return new TKqpProxyService(logConfig, tableServiceConfig, tokenAccessorConfig, queryServiceConfig, std::move(settings),
         std::move(queryReplayFactory),std::move(kqpProxySharedResources));
 }
 

@@ -204,6 +204,7 @@ NYson::EYsonFormat GetYsonFormat(const IDataProvider::TFillSettings& fillSetting
 
 TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
     TMaybeNode<TCoAtom> mode;
+    TMaybeNode<TCoAtom> temporary;
     TMaybeNode<TExprList> columns;
     TMaybeNode<TCoAtomList> primaryKey;
     TMaybeNode<TCoAtomList> notNullColumns;
@@ -216,10 +217,11 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
     TVector<TCoIndex> indexes;
     TVector<TCoChangefeed> changefeeds;
     TMaybeNode<TExprList> columnFamilies;
+    TVector<TCoNameValueTuple> columnsDefaults;
     TVector<TCoNameValueTuple> tableSettings;
     TVector<TCoNameValueTuple> alterActions;
     TMaybeNode<TCoAtom> tableType;
-    TMaybeNode<TCallable> pgDelete;
+    TMaybeNode<TCallable> pgFilter;
     for (auto child : node) {
         if (auto maybeTuple = child.Maybe<TCoNameValueTuple>()) {
             auto tuple = maybeTuple.Cast();
@@ -289,6 +291,11 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
                 for (const auto& item : tuple.Value().Cast<TCoNameValueTupleList>()) {
                     tableSettings.push_back(item);
                 }
+            } else if (name == "columnsDefaultValues") {
+                YQL_ENSURE(tuple.Value().Maybe<TCoNameValueTupleList>());
+                for(const auto& item: tuple.Value().Cast<TCoNameValueTupleList>()) {
+                    columnsDefaults.push_back(item);
+                }
             } else if (name == "actions") {
                 YQL_ENSURE(tuple.Value().Maybe<TCoNameValueTupleList>());
                 for (const auto& item : tuple.Value().Cast<TCoNameValueTupleList>()) {
@@ -303,9 +310,11 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
             } else if (name == "serialColumns") {
                 YQL_ENSURE(tuple.Value().Maybe<TCoAtomList>());
                 serialColumns = tuple.Value().Cast<TCoAtomList>();
-            } else if (name == "pg_delete") {
+            } else if (name == "pg_delete" || name == "pg_update") {
                 YQL_ENSURE(tuple.Value().Maybe<TCallable>());
-                pgDelete = tuple.Value().Cast<TCallable>();
+                pgFilter = tuple.Value().Cast<TCallable>();
+            } else if (name == "temporary") {
+                temporary = Build<TCoAtom>(ctx, node.Pos()).Value("true").Done();
             } else {
                 other.push_back(tuple);
             }
@@ -332,12 +341,17 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
         .Add(alterActions)
         .Done();
 
+    const auto& columnsDefaultValues = Build<TCoNameValueTupleList>(ctx, node.Pos())
+        .Add(columnsDefaults)
+        .Done();
+
     if (!columnFamilies.IsValid()) {
         columnFamilies = Build<TExprList>(ctx, node.Pos()).Done();
     }
 
     TWriteTableSettings ret(otherSettings);
     ret.Mode = mode;
+    ret.Temporary = temporary;
     ret.Columns = columns;
     ret.PrimaryKey = primaryKey;
     ret.NotNullColumns = notNullColumns;
@@ -349,10 +363,11 @@ TWriteTableSettings ParseWriteTableSettings(TExprList node, TExprContext& ctx) {
     ret.Indexes = idx;
     ret.Changefeeds = cfs;
     ret.ColumnFamilies = columnFamilies;
+    ret.ColumnsDefaultValues = columnsDefaultValues;
     ret.TableSettings = tableProfileSettings;
     ret.AlterActions = alterTableActions;
     ret.TableType = tableType;
-    ret.PgDelete = pgDelete;
+    ret.PgFilter = pgFilter;
     return ret;
 }
 

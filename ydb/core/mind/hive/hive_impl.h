@@ -146,6 +146,7 @@ TString GetLocationString(const NActors::TNodeLocation& location);
 void MakeTabletTypeSet(std::vector<TTabletTypes::EType>& list);
 bool IsValidTabletType(TTabletTypes::EType type);
 TString GetBalancerProgressText(i32 balancerProgress, EBalancerType balancerType);
+TString GetRunningTabletsText(ui64 runningTablets, ui64 totalTablets, bool warmUp);
 
 class THive : public TActor<THive>, public TTabletExecutedFlat, public THiveSharedSettings {
 public:
@@ -768,8 +769,11 @@ public:
         return TDuration::MilliSeconds(CurrentConfig.GetTabletRestartsPeriod());
     }
 
-    ui64 GetTabletRestarsMaxCount() const {
-        return CurrentConfig.GetTabletRestarsMaxCount();
+    ui64 GetTabletRestartsMaxCount() const {
+        if (CurrentConfig.HasTabletRestarsMaxCount() && !CurrentConfig.HasTabletRestartsMaxCount()) {
+            return CurrentConfig.GetTabletRestarsMaxCount();
+        }
+        return CurrentConfig.GetTabletRestartsMaxCount();
     }
 
     TDuration GetPostponeStartPeriod() const {
@@ -829,6 +833,10 @@ public:
         return CurrentConfig.GetNodeRestartsToIgnoreInWarmup();
     }
 
+    NKikimrConfig::THiveConfig::EHiveBootStrategy GetBootStrategy() const {
+        return CurrentConfig.GetBootStrategy();
+    }
+
     static void ActualizeRestartStatistics(google::protobuf::RepeatedField<google::protobuf::uint64>& restartTimestamps, ui64 barrier);
     static bool IsSystemTablet(TTabletTypes::EType type);
 
@@ -845,11 +853,17 @@ protected:
     double GetUsage() const;
 
     struct THiveStats {
+        struct TNodeStat {
+            TNodeId NodeId;
+            double Usage;
+        };
+
         double MinUsage;
         TNodeId MinUsageNodeId;
         double MaxUsage;
         TNodeId MaxUsageNodeId;
         double Scatter;
+        std::vector<TNodeStat> Values;
     };
 
     THiveStats GetStats() const;

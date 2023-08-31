@@ -123,12 +123,41 @@ public:
         return TS3ReadObject::Match(&read);
     }
 
-    TMaybe<ui64> EstimateReadSize(ui64 /*dataSizePerJob*/, ui32 /*maxTasksPerStage*/, const TExprNode& read, TExprContext&) override {
-        if (TS3ReadObject::Match(&read)) {
+    TMaybe<ui64> EstimateReadSize(ui64 /*dataSizePerJob*/, ui32 /*maxTasksPerStage*/, const TVector<const TExprNode*>& read, TExprContext&) override {
+        if (AllOf(read, [](const auto val) { return TS3ReadObject::Match(val); })) {
             return 0ul; // TODO: return real size
         }
-
         return Nothing();
+    }
+
+    TMaybe<TOptimizerStatistics> ReadStatistics(const TExprNode::TPtr& sourceWrap, TExprContext& ctx) override {
+        Y_UNUSED(ctx);
+        double size = 0;
+        double cols = 0;
+        double rows = 0;
+        if (const auto& maybeArrowSettings = TMaybeNode<TS3ArrowSettings>(sourceWrap->Child(0))) {
+            const auto& arrowSettings = maybeArrowSettings.Cast();
+            for (size_t i = 0; i < arrowSettings.Paths().Size(); ++i) {
+                auto batch = arrowSettings.Paths().Item(i);
+                TStringBuf packed = batch.Data().Literal().Value();
+                bool isTextEncoded = FromString<bool>(batch.IsText().Literal().Value());
+                TPathList paths;
+                UnpackPathsList(packed, isTextEncoded, paths);
+
+                for (const auto& path : paths) {
+                    size += path.Size;
+                }
+            }
+
+            if (arrowSettings.RowType().Maybe<TCoStructType>()) {
+                cols = arrowSettings.RowType().Ptr()->ChildrenSize();
+            }
+
+            rows = size / 1024; // magic estimate
+            return TOptimizerStatistics(rows, cols);
+        } else {
+            return Nothing();
+        }
     }
 
     TExprNode::TPtr WrapRead(const TDqSettings&, const TExprNode::TPtr& read, TExprContext& ctx) override {

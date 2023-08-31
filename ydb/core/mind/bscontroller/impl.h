@@ -451,6 +451,17 @@ public:
                 || DecommitStatus == NKikimrBlobStorage::EDecommitStatus::DECOMMIT_IMMINENT;
         }
 
+        bool IsSelfHealReasonDecommit() const {
+            return DecommitStatus == NKikimrBlobStorage::EDecommitStatus::DECOMMIT_IMMINENT &&
+                Status != NKikimrBlobStorage::EDriveStatus::FAULTY &&
+                Status != NKikimrBlobStorage::EDriveStatus::TO_BE_REMOVED;
+        }
+
+        bool UsableInTermsOfDecommission(bool isSelfHealReasonDecommit) const {
+            return DecommitStatus == NKikimrBlobStorage::EDecommitStatus::DECOMMIT_NONE // acceptable in any case
+                || DecommitStatus == NKikimrBlobStorage::EDecommitStatus::DECOMMIT_REJECTED && !isSelfHealReasonDecommit;
+        }
+
         bool BadInTermsOfSelfHeal() const {
             return Status == NKikimrBlobStorage::EDriveStatus::FAULTY
                 || Status == NKikimrBlobStorage::EDriveStatus::INACTIVE;
@@ -470,6 +481,7 @@ public:
                     return false;
                 case NKikimrBlobStorage::EDecommitStatus::DECOMMIT_PENDING:
                 case NKikimrBlobStorage::EDecommitStatus::DECOMMIT_IMMINENT:
+                case NKikimrBlobStorage::EDecommitStatus::DECOMMIT_REJECTED:
                     return true;
                 case NKikimrBlobStorage::EDecommitStatus::DECOMMIT_UNSET:
                 case NKikimrBlobStorage::EDecommitStatus::EDecommitStatus_INT_MIN_SENTINEL_DO_NOT_USE_:
@@ -1481,7 +1493,6 @@ private:
         enum EEv {
             EvUpdateSystemViews = EventSpaceBegin(TEvents::ES_PRIVATE),
             EvUpdateSelfHealCounters,
-            EvHostRecordsTimeToLiveExceeded,
             EvDropDonor,
             EvScrub,
             EvVSlotReadyUpdate,
@@ -1492,7 +1503,6 @@ private:
 
         struct TEvUpdateSystemViews : public TEventLocal<TEvUpdateSystemViews, EvUpdateSystemViews> {};
         struct TEvUpdateSelfHealCounters : TEventLocal<TEvUpdateSelfHealCounters, EvUpdateSelfHealCounters> {};
-        struct TEvHostRecordsTimeToLiveExceeded : TEventLocal<TEvHostRecordsTimeToLiveExceeded, EvHostRecordsTimeToLiveExceeded> {};
 
         struct TEvDropDonor : TEventLocal<TEvDropDonor, EvDropDonor> {
             std::vector<TVSlotId> VSlotIds;
@@ -1669,6 +1679,8 @@ private:
                 TActivationContext::Send(new IEventHandle(TEvents::TSystem::Poison, 0, actorId, SelfId(), nullptr, 0));
             }
         }
+        TActivationContext::Send(new IEventHandle(TEvents::TSystem::Unsubscribe, 0, GetNameserviceActorId(), SelfId(),
+            nullptr, 0));
         return TActor::PassAway();
     }
 
@@ -1716,7 +1728,6 @@ private:
 
     THostRecordMap HostRecords;
     void Handle(TEvInterconnect::TEvNodesInfo::TPtr &ev);
-    void HandleHostRecordsTimeToLiveExceeded();
 
 public:
     // Self-heal actor's main purpose is to monitor FAULTY pdisks and to slightly move groups out of them; every move
@@ -1984,7 +1995,6 @@ public:
             hFunc(TEvTabletPipe::TEvServerConnected, Handle);
             hFunc(TEvTabletPipe::TEvServerDisconnected, Handle);
             fFunc(TEvPrivate::EvUpdateSelfHealCounters, EnqueueIncomingEvent);
-            cFunc(TEvPrivate::EvHostRecordsTimeToLiveExceeded, HandleHostRecordsTimeToLiveExceeded);
             fFunc(TEvPrivate::EvDropDonor, EnqueueIncomingEvent);
             fFunc(TEvBlobStorage::EvControllerScrubQueryStartQuantum, EnqueueIncomingEvent);
             fFunc(TEvBlobStorage::EvControllerScrubQuantumFinished, EnqueueIncomingEvent);

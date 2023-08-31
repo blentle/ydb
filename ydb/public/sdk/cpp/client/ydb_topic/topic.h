@@ -1272,6 +1272,11 @@ struct TWriteSessionSettings : public TRequestSettings<TWriteSessionSettings> {
     //! Using this option is not recommended unless you know for sure why you need it.
     FLUENT_SETTING_OPTIONAL(ui32, PartitionId);
 
+    //! Direct write to the partition host
+    //! If both PartitionId and DirectWriteToPartition are set, write session goes directly to the partition host
+    //! DirectWriteToPartition without PartitionId will be ignored.
+    FLUENT_SETTING_DEFAULT(bool, DirectWriteToPartition, false);
+
     //! codec and level to use for data compression prior to write.
     FLUENT_SETTING_DEFAULT(ECodec, Codec, ECodec::GZIP);
     FLUENT_SETTING_DEFAULT(i32, CompressionLevel, 4);
@@ -1471,8 +1476,22 @@ struct TReadSessionSettings: public TRequestSettings<TReadSessionSettings> {
         FLUENT_SETTING(IExecutor::TPtr, HandlersExecutor);
     };
 
+    
+    TString ConsumerName_ = "";
     //! Consumer.
-    FLUENT_SETTING(TString, ConsumerName);
+    TSelf& ConsumerName(const TString& name) {
+        ConsumerName_ = name;
+        WithoutConsumer_ = false;
+        return static_cast<TSelf&>(*this);
+    }
+    
+    bool WithoutConsumer_ = false;
+    //! Read without consumer.
+    TSelf& WithoutConsumer() {
+        WithoutConsumer_ = true;
+        ConsumerName_ = "";
+        return static_cast<TSelf&>(*this);
+    }
 
     //! Topics.
     FLUENT_SETTING_VECTOR(TTopicReadSettings, Topics);
@@ -1554,6 +1573,13 @@ public:
     //! Message metadata. Limited to 4096 characters overall (all keys and values combined).
     FLUENT_SETTING(TMessageMeta, MessageMeta);
 
+    //! Transaction id
+    FLUENT_SETTING_OPTIONAL(std::reference_wrapper<NTable::TTransaction>, Tx);
+
+    const NTable::TTransaction* GetTxPtr() const
+    {
+        return Tx_ ? &Tx_->get() : nullptr;
+    }
 };
 
 //! Simple write session. Does not need event handlers. Does not provide Events, ContinuationTokens, write Acks.
@@ -1612,6 +1638,10 @@ public:
     //! Write single message. Old method with only basic message options.
     virtual void Write(TContinuationToken&& continuationToken, TStringBuf data, TMaybe<ui64> seqNo = Nothing(),
                        TMaybe<TInstant> createTimestamp = Nothing()) = 0;
+
+    //! Write single message that is already coded by codec.
+    //! continuationToken - a token earlier provided to client with ReadyToAccept event.
+    virtual void WriteEncoded(TContinuationToken&& continuationToken, TWriteMessage&& params) = 0;
 
     //! Write single message that is already compressed by codec. Old method with only basic message options.
     virtual void WriteEncoded(TContinuationToken&& continuationToken, TStringBuf data, ECodec codec, ui32 originalSize,

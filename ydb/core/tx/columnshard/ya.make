@@ -1,6 +1,7 @@
 LIBRARY()
 
 SRCS(
+    background_controller.cpp
     blob.cpp
     blob_cache.cpp
     blob_manager.cpp
@@ -26,6 +27,7 @@ SRCS(
     columnshard_impl.cpp
     columnshard_common.cpp
     columnshard_private_events.cpp
+    columnshard_schema.cpp
     counters.cpp
     compaction_actor.cpp
     defs.cpp

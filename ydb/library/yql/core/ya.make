@@ -27,6 +27,8 @@ SRCS(
     yql_join.cpp
     yql_join.h
     yql_library_compiler.cpp
+    yql_opt_match_recognize.cpp
+    yql_opt_match_recognize.h
     yql_opt_proposed_by_data.cpp
     yql_opt_proposed_by_data.h
     yql_opt_range.cpp
@@ -37,6 +39,7 @@ SRCS(
     yql_opt_utils.h
     yql_opt_window.cpp
     yql_opt_window.h
+    yql_statistics.cpp
     yql_type_annotation.cpp
     yql_type_annotation.h
     yql_type_helpers.cpp
@@ -64,6 +67,8 @@ PEERDIR(
     ydb/library/yql/core/file_storage
     ydb/library/yql/core/sql_types
     ydb/library/yql/core/credentials
+    ydb/library/yql/core/url_lister/interface
+    ydb/library/yql/core/url_preprocessing/interface
     ydb/library/yql/minikql
     ydb/library/yql/protos
     ydb/library/yql/public/udf
@@ -86,5 +91,26 @@ GENERATE_ENUM_SERIALIZATION(yql_type_annotation.h)
 YQL_LAST_ABI_VERSION()
 
 END()
+
+RECURSE(
+    arrow_kernels
+    cbo
+    common_opt
+    credentials
+    expr_nodes
+    expr_nodes_gen
+    extract_predicate
+    facade
+    file_storage
+    issue
+    peephole_opt
+    services
+    spilling
+    sql_types
+    type_ann
+    url_lister
+    url_preprocessing
+    user_data
+)
 
 RECURSE_FOR_TESTS(ut)

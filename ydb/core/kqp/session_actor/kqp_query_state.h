@@ -9,6 +9,7 @@
 #include <ydb/core/base/cputime.h>
 #include <ydb/library/wilson_ids/wilson.h>
 #include <ydb/core/kqp/common/kqp.h>
+#include <ydb/core/kqp/common/simple/temp_tables.h>
 #include <ydb/core/kqp/common/kqp_resolve.h>
 #include <ydb/core/kqp/common/kqp_timeouts.h>
 #include <ydb/core/kqp/session_actor/kqp_tx.h>
@@ -30,7 +31,8 @@ class TKqpQueryState : public TNonCopyable {
 public:
     TKqpQueryState(TEvKqp::TEvQueryRequest::TPtr& ev, ui64 queryId, const TString& database,
         const TString& cluster, TKqpDbCountersPtr dbCounters, bool longSession,
-        const NKikimrConfig::TTableServiceConfig& config, NWilson::TTraceId&& traceId)
+        const NKikimrConfig::TTableServiceConfig& tableServiceConfig, const NKikimrConfig::TQueryServiceConfig& queryServiceConfig,
+        NWilson::TTraceId&& traceId)
         : QueryId(queryId)
         , Database(database)
         , Cluster(cluster)
@@ -54,7 +56,7 @@ public:
             }
         }
 
-        SetQueryDeadlines(config);
+        SetQueryDeadlines(tableServiceConfig, queryServiceConfig);
         auto action = GetAction();
         KqpSessionSpan = NWilson::TSpan(
             TWilsonKqp::KqpSession, std::move(traceId),
@@ -108,6 +110,8 @@ public:
 
     std::shared_ptr<std::map<TString, Ydb::Type>> QueryParameterTypes;
 
+    TKqpTempTablesState::TConstPtr TempTablesState;
+
     NKikimrKqp::EQueryAction GetAction() const {
         return RequestEv->GetAction();
     }
@@ -144,7 +148,11 @@ public:
         return RequestEv->GetUsePublicResponseDataFormat();
     }
 
-    void SetQueryDeadlines(const NKikimrConfig::TTableServiceConfig& service) {
+    void UpdateTempTablesState(const TKqpTempTablesState& tempTablesState) {
+        TempTablesState = std::make_shared<const TKqpTempTablesState>(tempTablesState);
+    }
+
+    void SetQueryDeadlines(const NKikimrConfig::TTableServiceConfig& tableService, const NKikimrConfig::TQueryServiceConfig& queryService) {
         auto now = TAppData::TimeProvider->Now();
         auto cancelAfter = RequestEv->GetCancelAfter();
         auto timeout = RequestEv->GetOperationTimeout();
@@ -152,7 +160,7 @@ public:
             QueryDeadlines.CancelAt = now + cancelAfter;
         }
 
-        auto timeoutMs = GetQueryTimeout(GetType(), timeout.MilliSeconds(), service);
+        auto timeoutMs = GetQueryTimeout(GetType(), timeout.MilliSeconds(), tableService, queryService);
         QueryDeadlines.TimeoutAt = now + timeoutMs;
     }
 
@@ -171,17 +179,16 @@ public:
     // todo: gvit
     // fill this hash set only once on query compilation.
     void FillTables(const NKqpProto::TKqpPhyTx& phyTx) {
+        auto addTable = [&](const NKqpProto::TKqpPhyTableId& table) {
+            NKikimr::TTableId tableId(table.GetOwnerId(), table.GetTableId());
+            auto it = TableVersions.find(tableId);
+            if (it != TableVersions.end()) {
+                Y_ENSURE(it->second == table.GetVersion());
+            } else {
+                TableVersions.emplace(tableId, table.GetVersion());
+            }
+        };
         for (const auto& stage : phyTx.GetStages()) {
-
-            auto addTable = [&](const NKqpProto::TKqpPhyTableId& table) {
-                NKikimr::TTableId tableId(table.GetOwnerId(), table.GetTableId());
-                auto it = TableVersions.find(tableId);
-                if (it != TableVersions.end()) {
-                    Y_ENSURE(it->second == table.GetVersion());
-                } else {
-                    TableVersions.emplace(tableId, table.GetVersion());
-                }
-            };
             for (const auto& tableOp : stage.GetTableOps()) {
                 addTable(tableOp.GetTable());
             }
@@ -202,6 +209,12 @@ public:
                 }
             }
         }
+
+        for (const auto& table : phyTx.GetTables()) {
+            if (table.GetKind() == NKqpProto::EKqpPhyTableKind::TABLE_KIND_EXTERNAL) {
+                addTable(table.GetId());
+            }
+        }
     }
 
     bool NeedCheckTableVersions() const {
@@ -218,7 +231,7 @@ public:
         return RequestEv->GetQuery();
     }
 
-    const ::NKikimrKqp::TTopicOperations& GetTopicOperations() const {
+    const ::NKikimrKqp::TTopicOperationsRequest& GetTopicOperations() const {
         return RequestEv->GetTopicOperations();
     }
 

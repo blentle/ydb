@@ -4,6 +4,8 @@
 #include <ydb/core/base/events.h>
 
 #include "kafka_messages.h"
+#include "ydb/library/aclib/aclib.h"
+#include "actors/actors.h"
 
 using namespace NActors;
 
@@ -13,6 +15,8 @@ struct TEvKafka {
     enum EEv {
         EvRequest = EventSpaceBegin(NKikimr::TKikimrEvents::TKikimrEvents::ES_KAFKA),
         EvProduceRequest,
+        EvAuthResult,
+        EvHandshakeResult,
         EvWakeup,
         EvResponse = EvRequest + 256,
         EvInternalEvents = EvResponse + 256,
@@ -25,23 +29,72 @@ struct TEvKafka {
 
 
     struct TEvProduceRequest : public TEventLocal<TEvProduceRequest, EvProduceRequest> {
-        TEvProduceRequest(const ui64 cookie, const TProduceRequestData* request)
-        : Cookie(cookie)
+        TEvProduceRequest(const ui64 correlationId, const TProduceRequestData* request)
+        : CorrelationId(correlationId)
         , Request(request)
         {}
 
-        ui64 Cookie;
+        ui64 CorrelationId;
         const TProduceRequestData* Request;
     };
 
     struct TEvResponse : public TEventLocal<TEvResponse, EvResponse> {
-        TEvResponse(const ui64 cookie, const TApiMessage::TPtr response)
-            : Cookie(cookie)
+        TEvResponse(const ui64 correlationId, const TApiMessage::TPtr response)
+            : CorrelationId(correlationId)
             , Response(std::move(response)) {
         }
 
-        ui64 Cookie;
+        const ui64 CorrelationId;
         const TApiMessage::TPtr Response;
+    };
+
+    struct TEvAuthResult : public TEventLocal<TEvAuthResult, EvAuthResult> {
+        TEvAuthResult(EAuthSteps authStep, std::shared_ptr<TEvKafka::TEvResponse> clientResponse, TString error = "")
+            : AuthStep(authStep)
+            , Error(error)
+            , ClientResponse(clientResponse) {
+        }
+
+        TEvAuthResult(EAuthSteps authStep, std::shared_ptr<TEvKafka::TEvResponse> clientResponse, TIntrusiveConstPtr<NACLib::TUserToken> token, TString database,
+                      TString folderId, TString serviceAccountId, TString databaseId, TString coordinator, TString resourcePath, TString error = "")
+            : AuthStep(authStep)
+            , UserToken(token)
+            , Database(database)
+            , FolderId(folderId)
+            , ServiceAccountId(serviceAccountId)
+            , DatabaseId(databaseId)
+            , Coordinator(coordinator)
+            , ResourcePath(resourcePath)
+            , Error(error)
+            , ClientResponse(std::move(clientResponse)) {
+        }
+
+        EAuthSteps AuthStep;
+        TIntrusiveConstPtr<NACLib::TUserToken> UserToken;
+        TString Database;
+        TString FolderId;
+        TString ServiceAccountId;
+        TString DatabaseId;
+        TString Coordinator;
+        TString ResourcePath;
+
+        TString Error;
+        TString SaslMechanism;
+        std::shared_ptr<TEvKafka::TEvResponse> ClientResponse;
+    };
+
+    struct TEvHandshakeResult : public TEventLocal<TEvHandshakeResult, EvHandshakeResult> {
+        TEvHandshakeResult(EAuthSteps authStep, std::shared_ptr<TEvKafka::TEvResponse> clientResponse, TString saslMechanism, TString error = "")
+        : AuthStep(authStep),
+          Error(error),
+          SaslMechanism(saslMechanism),
+          ClientResponse(std::move(clientResponse))
+        {}
+        
+        EAuthSteps AuthStep;
+        TString Error;
+        TString SaslMechanism;
+        std::shared_ptr<TEvKafka::TEvResponse> ClientResponse;
     };
 
     struct TEvWakeup : public TEventLocal<TEvWakeup, EvWakeup> {

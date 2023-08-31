@@ -264,22 +264,75 @@ void TTraceContext::SetLoggingTag(const TString& loggingTag)
     LoggingTag_ = loggingTag;
 }
 
-void TTraceContext::SetAllocationTags(TAllocationTagsPtr tags)
+void TTraceContext::ClearAllocationTagsPtr() noexcept
 {
-    AllocationTags_ = std::move(tags);
+    auto writerGuard = WriterGuard(AllocationTagsLock_);
+    auto guard = Guard(AllocationTagsAsRefCountedLock_);
+    AllocationTags_ = nullptr;
 }
 
-TAllocationTagsPtr TTraceContext::GetAllocationTags() const
+TAllocationTags::TTags TTraceContext::DoGetAllocationTags() const
 {
+    VERIFY_SPINLOCK_AFFINITY(AllocationTagsLock_);
+
+    TAllocationTagsPtr tags;
+
+    {
+        // Local guard for copy RefCounted AllocationTags_.
+        auto guard = Guard(AllocationTagsAsRefCountedLock_);
+        tags = AllocationTags_;
+    }
+
+    if (!tags) {
+        return {};
+    }
+
+    return tags->GetTags();
+}
+
+TAllocationTags::TTags TTraceContext::GetAllocationTags() const
+{
+    auto readerGuard = ReaderGuard(AllocationTagsLock_);
+    return DoGetAllocationTags();
+}
+
+TAllocationTagsPtr TTraceContext::GetAllocationTagsPtr() const noexcept
+{
+    // Local guard for copy RefCounted AllocationTags_ for allocator callback CreateAllocationTagsData().
+    auto guard = Guard(AllocationTagsAsRefCountedLock_);
+
     return AllocationTags_;
 }
 
-std::vector<std::pair<TString, TString>> TTraceContext::ExtractAllocationTags() const
+void TTraceContext::SetAllocationTagsPtr(TAllocationTagsPtr allocationTags) noexcept
 {
-    if (AllocationTags_ != nullptr) {
-        return AllocationTags_->GetTags();
+    auto writerGuard = WriterGuard(AllocationTagsLock_);
+
+    // Local guard for setting RefCounted AllocationTags_.
+    auto guard = Guard(AllocationTagsAsRefCountedLock_);
+
+    AllocationTags_ = std::move(allocationTags);
+}
+
+void TTraceContext::DoSetAllocationTags(TAllocationTags::TTags&& tags)
+{
+    VERIFY_SPINLOCK_AFFINITY(AllocationTagsLock_);
+
+    TAllocationTagsPtr allocationTagsPtr;
+    if (!tags.empty()) {
+        // Allocation MUST be done BEFORE Guard(AllocationTagsAsRefCountedSpinlock_) to avoid deadlock with CreateAllocationTagsData().
+        allocationTagsPtr = New<TAllocationTags>(std::move(tags));
     }
-    return {};
+
+    auto guard = Guard(AllocationTagsAsRefCountedLock_);
+    AllocationTags_ = std::move(allocationTagsPtr);
+}
+
+void TTraceContext::SetAllocationTags(TAllocationTags::TTags&& tags)
+{
+    auto writerGuard = WriterGuard(AllocationTagsLock_);
+
+    return DoSetAllocationTags(std::move(tags));
 }
 
 void TTraceContext::SetRecorded()

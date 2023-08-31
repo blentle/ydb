@@ -378,6 +378,8 @@ void TCommandExecuteQuery::Config(TConfig& config) {
         EOutputFormat::JsonUnicode,
         EOutputFormat::JsonBase64,
         EOutputFormat::Raw,
+        EOutputFormat::Csv,
+        EOutputFormat::Tsv,
     }, {
         EOutputFormat::NoFraming,
         EOutputFormat::NewlineDelimited
@@ -449,7 +451,7 @@ int TCommandExecuteQuery::ExecuteDataQuery(TConfig& config) {
         ValidateResult = MakeHolder<NScripting::TExplainYqlResult>(
             ExplainQuery(config, Query, NScripting::ExplainYqlRequestMode::Validate));
         THolder<TParamsBuilder> paramBuilder;
-        while (GetNextParams(ValidateResult->GetParameterTypes(), InputFormat, StdinFormat, FramingFormat, paramBuilder)) {
+        while (GetNextParams(paramBuilder)) {
             TParams params = paramBuilder->Build();
             auto operation = [this, &txSettings, &params, &settings, &asyncResult](NTable::TSession session) {
                 auto promise = NThreading::NewPromise<NTable::TDataQueryResult>();
@@ -533,7 +535,7 @@ int TCommandExecuteQuery::ExecuteScanQuery(TConfig& config) {
         ValidateResult = MakeHolder<NScripting::TExplainYqlResult>(
             ExplainQuery(config, Query, NScripting::ExplainYqlRequestMode::Validate));
         THolder<TParamsBuilder> paramBuilder;
-        while (GetNextParams(ValidateResult->GetParameterTypes(), InputFormat, StdinFormat, FramingFormat, paramBuilder)) {
+        while (GetNextParams(paramBuilder)) {
             auto operation = [this, &paramBuilder, &settings, &asyncResult](NTable::TTableClient client) {
                 auto promise = NThreading::NewPromise<NTable::TScanQueryPartIterator>();
                 asyncResult = promise.GetFuture();
@@ -629,6 +631,14 @@ TCommandExplain::TCommandExplain()
     : TTableCommand("explain", {}, "Explain query")
 {}
 
+TCommandExplain::TCommandExplain(TString query, TString queryType, bool printAst)
+    : TTableCommand("explain", {}, "Explain query")
+{
+    Query = std::move(query);
+    QueryType = std::move(queryType);
+    PrintAst = printAst;
+}
+
 void TCommandExplain::Config(TConfig& config) {
     TTableCommand::Config(config);
 
@@ -685,7 +695,7 @@ int TCommandExplain::Run(TConfig& config) {
                 }
                 ThrowOnError(tablePart);
             }
-            if (tablePart.HasQueryStats() ) {
+            if (tablePart.HasQueryStats()) {
                 auto proto = NYdb::TProtoAccessor::GetProto(tablePart.GetQueryStats());
                 planJson = proto.query_plan();
                 ast = proto.query_ast();

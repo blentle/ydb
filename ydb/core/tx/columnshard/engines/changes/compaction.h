@@ -1,6 +1,6 @@
 #pragma once
 #include "indexation.h"
-#include "compaction_info.h"
+#include "abstract/compaction_info.h"
 #include "mark_granules.h"
 
 namespace NKikimr::NOlap {
@@ -15,7 +15,7 @@ private:
 protected:
     const TCompactionLimits Limits;
     std::shared_ptr<TGranuleMeta> GranuleMeta;
-    TCompactionSrcGranule SrcGranule;
+    std::optional<TCompactionSrcGranule> SrcGranule;
 
     virtual void DoStart(NColumnShard::TColumnShard& self) override;
     virtual void DoWriteIndexComplete(NColumnShard::TColumnShard& self, TWriteIndexCompleteContext& context) override;
@@ -23,7 +23,7 @@ protected:
     virtual void DoWriteIndex(NColumnShard::TColumnShard& self, TWriteIndexContext& /*context*/) override;
     virtual void DoDebugString(TStringOutput& out) const override;
     virtual void DoCompile(TFinalizationContext& context) override;
-    virtual bool DoApplyChanges(TColumnEngineForLogs& self, TApplyChangesContext& context, const bool dryRun) override;
+    virtual bool DoApplyChanges(TColumnEngineForLogs& self, TApplyChangesContext& context) override;
     virtual TPortionMeta::EProduced GetResultProducedClass() const = 0;
     virtual void OnAbortEmergency() override {
         NeedGranuleStatusProvide = false;
@@ -40,8 +40,9 @@ public:
     std::vector<std::pair<TPortionInfo, ui64>> PortionsToMove; // {portion, new granule}
     std::vector<TPortionInfo> SwitchedPortions; // Portions that would be replaced by new ones
 
-    virtual void FillTouchedGranules(THashSet<ui64>& granules) const override;
+    virtual THashSet<ui64> GetTouchedGranules() const override;
 
+    TCompactColumnEngineChanges(const TCompactionLimits& limits, std::shared_ptr<TGranuleMeta> granule, const std::map<ui64, std::shared_ptr<TPortionInfo>>& portions);
     TCompactColumnEngineChanges(const TCompactionLimits& limits, std::shared_ptr<TGranuleMeta> granule, const TCompactionSrcGranule& srcGranule);
     ~TCompactColumnEngineChanges();
 

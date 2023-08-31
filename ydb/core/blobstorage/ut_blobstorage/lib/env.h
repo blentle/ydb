@@ -5,6 +5,7 @@
 #include "node_warden_mock.h"
 
 #include <ydb/core/driver_lib/version/version.h>
+
 #include <library/cpp/testing/unittest/registar.h>
 
 struct TEnvironmentSetup {
@@ -96,6 +97,10 @@ struct TEnvironmentSetup {
         SetRandomSeed(seed);
         TAppData::RandomProvider = CreateDeterministicRandomProvider(RandomNumber<ui64>());
         Cerr << "RandomSeed# " << seed << Endl;
+    }
+
+    TInstant Now() {
+        return TAppData::TimeProvider->Now();
     }
 
     TString GenerateRandomString(ui32 len) {
@@ -259,6 +264,12 @@ struct TEnvironmentSetup {
         for (const auto& comp : debug) {
             Runtime->SetLogPriority(comp, NLog::PRI_DEBUG);
         }
+
+        // toggle the flag to enable logging of actor names and events
+        bool printActorNamesAndEvents = false;
+        if (printActorNamesAndEvents) {
+            Runtime->SetOwnLogPriority(NActors::NLog::EPrio::Info);
+        }
     }
 
     void SetupStaticStorage() {
@@ -280,7 +291,7 @@ struct TEnvironmentSetup {
                 warden.reset(new TNodeWardenMockActor(Settings.NodeWardenMockSetup));
             } else {
                 auto config = MakeIntrusive<TNodeWardenConfig>(new TMockPDiskServiceFactory(*this));
-                config->ServiceSet.AddAvailabilityDomains(DomainId);
+                config->BlobStorageConfig.MutableServiceSet()->AddAvailabilityDomains(DomainId);
                 config->VDiskReplPausedAtStart = Settings.VDiskReplPausedAtStart;
                 if (Settings.ConfigPreprocessor) {
                     Settings.ConfigPreprocessor(nodeId, *config);
@@ -667,6 +678,24 @@ struct TEnvironmentSetup {
         request.AddCommand()->MutableEnableDonorMode()->SetEnable(true);
         auto response = Invoke(request);
         UNIT_ASSERT(response.GetSuccess());
+    }
+
+    void FillVSlotId(ui32 nodeId, ui32 pdiskId, ui32 vslotId, NKikimrBlobStorage::TVSlotId* vslot) {
+        vslot->SetNodeId(nodeId);
+        vslot->SetPDiskId(pdiskId);
+        vslot->SetVSlotId(vslotId);
+    }
+
+    void SetVDiskReadOnly(ui32 nodeId, ui32 pdiskId, ui32 vslotId, const TVDiskID& vdiskId, bool value) {
+        NKikimrBlobStorage::TConfigRequest request;
+        auto *roCmd = request.AddCommand()->MutableSetVDiskReadOnly();
+        FillVSlotId(nodeId, pdiskId, vslotId, roCmd->MutableVSlotId());
+        VDiskIDFromVDiskID(vdiskId, roCmd->MutableVDiskId());
+        roCmd->SetValue(value);
+        Cerr << "Invoking SetVDiskReadOnly for vdisk " << vdiskId.ToString() << Endl;
+        auto response = Invoke(request);
+        UNIT_ASSERT_C(response.GetSuccess(), response.GetErrorDescription());
+
     }
 
     void UpdateDriveStatus(ui32 nodeId, ui32 pdiskId, NKikimrBlobStorage::EDriveStatus status,

@@ -5,6 +5,7 @@
 #include <ydb/core/kqp/common/kqp.h>
 #include <ydb/core/kqp/executer_actor/kqp_executer.h>
 #include <ydb/core/kqp/proxy_service/kqp_script_executions.h>
+#include <ydb/core/kqp/proxy_service/proto/result_set_meta.pb.h>
 #include <ydb/library/ydb_issue/proto/issue_id.pb.h>
 #include <ydb/public/api/protos/ydb_status_codes.pb.h>
 
@@ -29,8 +30,6 @@ namespace NKikimr::NKqp {
 
 namespace {
 
-constexpr ui64 RESULT_SIZE_LIMIT = 10_MB;
-constexpr int RESULT_ROWS_LIMIT = 1000;
 constexpr ui32 LEASE_UPDATE_FREQUENCY = 2;
 
 class TRunScriptActor : public NActors::TActorBootstrapped<TRunScriptActor> {
@@ -49,12 +48,13 @@ class TRunScriptActor : public NActors::TActorBootstrapped<TRunScriptActor> {
     };
 
 public:
-    TRunScriptActor(const TString& executionId, const NKikimrKqp::TEvQueryRequest& request, const TString& database, ui64 leaseGeneration, TDuration leaseDuration)
+    TRunScriptActor(const TString& executionId, const NKikimrKqp::TEvQueryRequest& request, const TString& database, ui64 leaseGeneration, TDuration leaseDuration, NKikimrConfig::TQueryServiceConfig&& queryServiceConfig)
         : ExecutionId(executionId)
         , Request(request)
         , Database(database)
         , LeaseGeneration(leaseGeneration)
         , LeaseDuration(leaseDuration)
+        , QueryServiceConfig(queryServiceConfig)
     {}
 
     static constexpr char ActorName[] = "KQP_RUN_SCRIPT_ACTOR";
@@ -77,6 +77,7 @@ private:
         hFunc(TEvScriptLeaseUpdateResponse, Handle);
         hFunc(TEvSaveScriptResultMetaFinished, Handle);
         hFunc(TEvSaveScriptResultFinished, Handle);
+        hFunc(TEvCheckAliveRequest, Handle);
     )
 
     void SendToKqpProxy(THolder<NActors::IEventBase> ev) {
@@ -132,6 +133,15 @@ private:
         SendToKqpProxy(std::move(ev));
     }
 
+    void Handle(TEvCheckAliveRequest::TPtr& ev) {
+        Send(ev->Sender, new TEvCheckAliveResponse());
+    }
+
+    void RunLeaseUpdater() {
+        Register(CreateScriptLeaseUpdateActor(SelfId(), Database, ExecutionId, LeaseDuration));
+        LeaseUpdateQueryRunning = true;
+    }
+
     // TODO: remove this after there will be a normal way to store results and generate execution id
     void Handle(NActors::TEvents::TEvWakeup::TPtr& ev) {
         switch (ev->Get()->Tag) {
@@ -142,15 +152,9 @@ private:
             break;
 
         case EWakeUp::UpdateLeaseEvent:
-            if (RunState == ERunState::Cancelled || RunState == ERunState::Cancelling || RunState == ERunState::Finished || RunState == ERunState::Finishing) {
-                break;
+            if (IsExecuting() && !FinalStatusIsSaved) {
+                RunLeaseUpdater();
             }
-
-            if (!LeaseUpdateQueryRunning && !FinalStatusIsSaved) {
-                Register(CreateScriptLeaseUpdateActor(SelfId(), Database, ExecutionId, LeaseDuration));
-                LeaseUpdateQueryRunning = true;
-            }
-            Schedule(LeaseDuration / LEASE_UPDATE_FREQUENCY, new NActors::TEvents::TEvWakeup(EWakeUp::UpdateLeaseEvent));
             break;
         }
     }
@@ -169,7 +173,7 @@ private:
                                                      Issues, std::move(QueryStats), std::move(QueryPlan), std::move(QueryAst)));
             return;
         }
-        
+
         if (RunState != ERunState::Cancelled && RunState != ERunState::Finished) {
             RunState = ERunState::Finished;
             TerminateActorExecution(Ydb::StatusIds::PRECONDITION_FAILED, { NYql::TIssue("Already finished") });
@@ -191,6 +195,15 @@ private:
         } else if (IsExecuting() && ev->Get()->Status != Ydb::StatusIds::SUCCESS) {
             Finish(ev->Get()->Status);
         }
+
+        if (IsExecuting()) {
+            TInstant leaseUpdateTime = ev->Get()->CurrentDeadline - LeaseDuration / LEASE_UPDATE_FREQUENCY;
+            if (TInstant::Now() >= leaseUpdateTime) {
+                RunLeaseUpdater();
+            } else {
+                Schedule(leaseUpdateTime, new NActors::TEvents::TEvWakeup(EWakeUp::UpdateLeaseEvent));
+            }
+        }
     }
 
     // Event in case of error in registering script in database
@@ -206,7 +219,9 @@ private:
         }
         auto resp = MakeHolder<TEvKqpExecuter::TEvStreamDataAck>();
         resp->Record.SetSeqNo(ev->Get()->Record.GetSeqNo());
-        resp->Record.SetFreeSpace(RESULT_SIZE_LIMIT);
+        resp->Record.SetFreeSpace(QueryServiceConfig.GetScriptResultSizeLimit()
+                                 ? QueryServiceConfig.GetScriptResultSizeLimit()
+                                 : std::numeric_limits<ui64>::max());
 
         LOG_D("Send stream data ack"
             << ", seqNo: " << ev->Get()->Record.GetSeqNo()
@@ -220,7 +235,7 @@ private:
         if (resultSetIndex >= ExpireAt.size()) {
             // we don't know result set count, so just accept all of them
             // it's possible to have several result sets per script
-            // they can arrive in any order and may be missed for some indices 
+            // they can arrive in any order and may be missed for some indices
             ResultSetRowCount.resize(resultSetIndex + 1);
             ResultSetByteCount.resize(resultSetIndex + 1);
             Truncated.resize(resultSetIndex + 1);
@@ -238,13 +253,13 @@ private:
             std::vector<TString> serializedRows;
 
             for (const auto& row : ev->Get()->Record.GetResultSet().rows()) {
-                if (rowCount > RESULT_ROWS_LIMIT) {
+                if (QueryServiceConfig.GetScriptResultRowsLimit() && rowCount > QueryServiceConfig.GetScriptResultRowsLimit()) {
                     Truncated[resultSetIndex] = true;
                     break;
                 }
 
                 auto serializedSize = row.ByteSizeLong();
-                if (byteCount + serializedSize > RESULT_SIZE_LIMIT) {
+                if (QueryServiceConfig.GetScriptResultSizeLimit() && byteCount + serializedSize > QueryServiceConfig.GetScriptResultSizeLimit()) {
                     Truncated[resultSetIndex] = true;
                     break;
                 }
@@ -255,7 +270,7 @@ private:
             }
 
             if (firstRow == 0 || Truncated[resultSetIndex]) {
-                Ydb::Query::ResultSetMeta meta;
+                Ydb::Query::Internal::ResultSetMeta meta;
                 *meta.mutable_columns() = ev->Get()->Record.GetResultSet().columns();
                 meta.set_truncated(Truncated[resultSetIndex]);
 
@@ -299,10 +314,10 @@ private:
             return;
         }
         auto& record = ev->Get()->Record.GetRef();
-        
+
         const auto& issueMessage = record.GetResponse().GetQueryIssues();
         NYql::IssuesFromMessage(issueMessage, Issues);
-        
+
         if (record.GetResponse().HasQueryPlan()) {
             QueryPlan = record.GetResponse().GetQueryPlan();
         }
@@ -462,6 +477,7 @@ private:
     const TString Database;
     const ui64 LeaseGeneration;
     const TDuration LeaseDuration;
+    const NKikimrConfig::TQueryServiceConfig QueryServiceConfig;
     TString SessionId;
     bool LeaseUpdateQueryRunning = false;
     bool FinalStatusIsSaved = false;
@@ -490,8 +506,8 @@ private:
 
 } // namespace
 
-NActors::IActor* CreateRunScriptActor(const TString& executionId, const NKikimrKqp::TEvQueryRequest& request, const TString& database, ui64 leaseGeneration, TDuration leaseDuration) {
-    return new TRunScriptActor(executionId, request, database, leaseGeneration, leaseDuration);
+NActors::IActor* CreateRunScriptActor(const TString& executionId, const NKikimrKqp::TEvQueryRequest& request, const TString& database, ui64 leaseGeneration, TDuration leaseDuration, NKikimrConfig::TQueryServiceConfig queryServiceConfig) {
+    return new TRunScriptActor(executionId, request, database, leaseGeneration, leaseDuration, std::move(queryServiceConfig));
 }
 
 } // namespace NKikimr::NKqp

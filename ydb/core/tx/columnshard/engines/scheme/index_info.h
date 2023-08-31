@@ -6,7 +6,6 @@
 #include <ydb/core/tx/columnshard/common/snapshot.h>
 
 #include <ydb/core/sys_view/common/schema.h>
-#include <ydb/core/tablet_flat/flat_dbase_scheme.h>
 #include <ydb/core/tx/columnshard/common/scalars.h>
 #include <ydb/core/formats/arrow/dictionary/object.h>
 #include <ydb/core/formats/arrow/serializer/abstract.h>
@@ -48,6 +47,15 @@ public:
         PLAN_STEP = 0xffffff00,
         TX_ID,
     };
+
+    TString DebugString() const {
+        return TStringBuilder() << "("
+            << "id=" << Id << ";"
+            << "version=" << Version << ";"
+            << "name=" << Name << ";"
+            << "composite=" << CompositeIndexKey << "/" << CompositeMarks << ";"
+            << ")";
+    }
 
     /// Appends the special columns to the batch.
     static std::shared_ptr<arrow::RecordBatch> AddSpecialColumns(
@@ -158,6 +166,7 @@ public:
 
     /// Returns whether the sorting keys defined.
     bool IsSorted() const { return SortingKey.get(); }
+    bool IsSortedColumn(const ui32 columnId) const { return GetPKFirstColumnId() == columnId; }
 
      /// Returns whether the replace keys defined.
     bool IsReplacing() const { return ReplaceKey.get(); }

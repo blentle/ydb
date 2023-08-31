@@ -12,6 +12,7 @@ SRCS(
     mkql_block_agg_some.cpp
     mkql_block_agg_sum.cpp
     mkql_block_coalesce.cpp
+    mkql_block_extend.cpp
     mkql_block_if.cpp
     mkql_block_just.cpp
     mkql_block_logical.cpp
@@ -72,6 +73,7 @@ SRCS(
     mkql_map.cpp
     mkql_mapnext.cpp
     mkql_map_join.cpp
+    mkql_match_recognize.cpp
     mkql_multihopping.cpp
     mkql_multimap.cpp
     mkql_next_value.cpp
@@ -135,6 +137,10 @@ PEERDIR(
     ydb/library/yql/parser/pg_wrapper/interface
     ydb/library/yql/utils
     library/cpp/actors/core
+)
+
+CFLAGS(
+    -mprfchw
 )
 
 YQL_LAST_ABI_VERSION()

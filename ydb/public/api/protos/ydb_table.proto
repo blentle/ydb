@@ -477,6 +477,12 @@ message ReadReplicasSettings {
     reserved 3; // cluster_replicas_settings (part of oneof settings)
 }
 
+enum StoreType {
+    STORE_TYPE_UNSPECIFIED = 0;
+    STORE_TYPE_ROW = 1;
+    STORE_TYPE_COLUMN = 2;
+}
+
 message CreateTableRequest {
     // Session identifier
     string session_id = 1;
@@ -517,6 +523,10 @@ message CreateTableRequest {
     ReadReplicasSettings read_replicas_settings = 17;
     // Tiering rules name. It specifies how data migrates from one tier (logical storage) to another.
     string tiering = 18;
+    // Is temporary table
+    bool temporary = 19;
+    // Is table column or row oriented
+    StoreType store_type = 20;
 }
 
 message CreateTableResponse {
@@ -714,6 +724,10 @@ message DescribeTableResult {
     repeated ChangefeedDescription changefeeds = 15;
     // Tiering rules name
     string tiering = 16;
+    // Is temporary table
+    bool temporary = 17;
+    // Is table column or row oriented
+    StoreType store_type = 18;
 }
 
 message Query {
@@ -1038,6 +1052,9 @@ message ReadTableRequest {
     uint64 row_limit = 6;
     // Use a server-side snapshot
     Ydb.FeatureFlag.Status use_snapshot = 7;
+    // Per-batch limits
+    uint64 batch_limit_bytes = 8;
+    uint64 batch_limit_rows = 9;
 }
 
 // ReadTable doesn't use Operation, returns result directly

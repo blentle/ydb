@@ -3,19 +3,19 @@
 #include "private.h"
 #include "fiber.h"
 
-#include <yt/yt/core/misc/finally.h>
-#include <yt/yt/core/misc/shutdown.h>
-#include <yt/yt/core/misc/singleton.h>
-
 #include <yt/yt/library/profiling/producer.h>
 
 #include <yt/yt/core/actions/invoker_util.h>
 
+#include <yt/yt/core/misc/finally.h>
+#include <yt/yt/core/misc/shutdown.h>
+#include <yt/yt/core/misc/singleton.h>
+
+#include <yt/yt/core/tracing/trace_context.h>
+
 #include <library/cpp/yt/memory/memory_tag.h>
 
 #include <library/cpp/yt/threading/fork_aware_spin_lock.h>
-
-#include <library/cpp/yt/memory/memory_tag.h>
 
 #include <util/thread/lfstack.h>
 
@@ -461,7 +461,7 @@ void ResumeFiber(TFiberPtr targetFiber)
     auto currentFiber = MakeStrong(GetCurrentFiber());
 
     SetResumerFiber(currentFiber);
-    SetAfterSwitch(BIND([currentFiber = std::move(currentFiber)] {
+    SetAfterSwitch(BIND_NO_PROPAGATE([currentFiber = std::move(currentFiber)] {
         currentFiber->SetWaiting();
     }));
 

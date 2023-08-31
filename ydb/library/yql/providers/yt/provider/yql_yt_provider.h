@@ -11,6 +11,7 @@
 #include <ydb/library/yql/core/yql_execution.h>
 #include <ydb/library/yql/ast/yql_constraint.h>
 
+#include <library/cpp/time_provider/monotonic.h>
 #include <library/cpp/yson/writer.h>
 
 #include <util/generic/string.h>
@@ -43,12 +44,16 @@ struct TYtTableDescription: public TYtTableDescriptionBase {
     size_t WriteValidateCount = 0;
     TMaybe<TString> Hash;
 
-    bool Fill(const TString& cluster, const TString& table, TExprContext& ctx, IModuleResolver* moduleResolver, IRandomProvider& randomProvider);
+    bool Fill(
+        const TString& cluster, const TString& table, TExprContext& ctx,
+        IModuleResolver* moduleResolver, IUrlListerManager* urlListerManager, IRandomProvider& randomProvider);
     void ToYson(NYson::TYsonWriter& writer, const TString& cluster, const TString& table, const TString& view) const;
     bool Validate(TPosition pos, TStringBuf cluster, TStringBuf tableName, bool withQB,
         const THashMap<std::pair<TString, TString>, TString>& anonymousLabels, TExprContext& ctx) const;
     void SetConstraintsReady();
-    bool FillViews(const TString& cluster, const TString& table, TExprContext& ctx, IModuleResolver* moduleResolver, IRandomProvider& randomProvider);
+    bool FillViews(
+        const TString& cluster, const TString& table, TExprContext& ctx,
+        IModuleResolver* moduleResolver, IUrlListerManager* urlListerManager, IRandomProvider& randomProvider);
 };
 
 // Anonymous tables are kept by labels
@@ -94,6 +99,9 @@ struct TYtState : public TThrRefBase {
     THolder<IDqIntegration> DqIntegration_;
     ui32 NextEpochId = 1;
     bool OnlyNativeExecution = false;
+    TDuration TimeSpentInHybrid;
+    NMonotonic::TMonotonic HybridStartTime;
+    std::unordered_set<ui32> HybridInFlightOprations;
 private:
     std::unordered_map<ui64, TYtVersionedConfiguration::TState> ConfigurationEvalStates_;
     std::unordered_map<ui64, ui32> EpochEvalStates_;

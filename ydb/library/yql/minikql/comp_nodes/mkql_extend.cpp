@@ -11,6 +11,79 @@ namespace NMiniKQL {
 
 namespace {
 
+class TExtendWideFlowWrapper : public TStatefulWideFlowComputationNode<TExtendWideFlowWrapper> {
+    typedef TStatefulWideFlowComputationNode<TExtendWideFlowWrapper> TBaseComputation;
+public:
+    TExtendWideFlowWrapper(TComputationMutables& mutables, TComputationWideFlowNodePtrVector&& flows)
+        : TBaseComputation(mutables, this, EValueRepresentation::Any)
+        , Flows_(std::move(flows))
+    {}
+
+    EFetchResult DoCalculate(NUdf::TUnboxedValue& state, TComputationContext& ctx, NUdf::TUnboxedValue*const* output) const {
+        auto& s = GetState(state, ctx);
+
+        size_t yieldCount = 0;
+        while (s.LiveInputs) {
+            Y_VERIFY_DEBUG(s.InputIndex < s.LiveInputs);
+            EFetchResult result = s.Inputs[s.InputIndex]->FetchValues(ctx, output);
+            yieldCount = (result == EFetchResult::Yield) ? (yieldCount + 1) : 0;
+            if (result == EFetchResult::Finish) {
+                std::swap(s.Inputs[s.InputIndex], s.Inputs[--s.LiveInputs]);
+                s.NextInput();
+                continue;
+            }
+
+            if (result == EFetchResult::Yield) {
+                s.NextInput();
+                if (yieldCount == s.LiveInputs) {
+                    return result;
+                }
+                continue;
+            }
+
+            s.NextInput();
+            return result;
+        }
+        return EFetchResult::Finish;
+    }
+
+    void RegisterDependencies() const final {
+        for (auto& flow : Flows_) {
+            FlowDependsOn(flow);
+        }
+    }
+
+private:
+    struct TState : public TComputationValue<TState> {
+        TComputationWideFlowNodePtrVector Inputs;
+        size_t LiveInputs;
+        size_t InputIndex = 0;
+
+        TState(TMemoryUsageInfo* memInfo, const TComputationWideFlowNodePtrVector& inputs)
+            : TComputationValue(memInfo)
+            , Inputs(inputs)
+            , LiveInputs(Inputs.size())
+        {
+        }
+
+        void NextInput() {
+            if (++InputIndex >= LiveInputs) {
+                InputIndex = 0;
+            }
+        }
+    };
+
+
+    TState& GetState(NUdf::TUnboxedValue& state, TComputationContext& ctx) const {
+        if (!state.HasValue()) {
+            state = ctx.HolderFactory.Create<TState>(Flows_);
+        }
+        return *static_cast<TState*>(state.AsBoxed().Get());
+    }
+
+    const TComputationWideFlowNodePtrVector Flows_;
+};
+
 class TExtendFlowWrapper : public TStatefulFlowCodegeneratorNode<TExtendFlowWrapper> {
     typedef TStatefulFlowCodegeneratorNode<TExtendFlowWrapper> TBaseComputation;
 public:
@@ -32,7 +105,7 @@ public:
     }
 #ifndef MKQL_DISABLE_CODEGEN
     Value* DoGenerateGetValue(const TCodegenContext& ctx, Value* statePtr, BasicBlock*& block) const {
-        auto& context = ctx.Codegen->GetContext();
+        auto& context = ctx.Codegen.GetContext();
 
         const auto valueType = Type::getInt128Ty(context);
         const auto indexType = Type::getInt64Ty(context);
@@ -106,7 +179,7 @@ public:
     }
 #ifndef MKQL_DISABLE_CODEGEN
     Value* DoGenerateGetValue(const TCodegenContext& ctx, BasicBlock*& block) const {
-        auto& context = ctx.Codegen->GetContext();
+        auto& context = ctx.Codegen.GetContext();
 
         const auto valueType = Type::getInt128Ty(context);
         const auto sizeType = Type::getInt64Ty(context);
@@ -125,7 +198,7 @@ public:
         const auto factory = ctx.GetFactory();
         const auto func = ConstantInt::get(Type::getInt64Ty(context), GetMethodPtr(IsStream ? &THolderFactory::ExtendStream : &THolderFactory::ExtendList<false>));
 
-        if (NYql::NCodegen::ETarget::Windows != ctx.Codegen->GetEffectiveTarget()) {
+        if (NYql::NCodegen::ETarget::Windows != ctx.Codegen.GetEffectiveTarget()) {
             const auto funType = FunctionType::get(valueType, {factory->getType(), array->getType(), size->getType()}, false);
             const auto funcPtr = CastInst::Create(Instruction::IntToPtr, func, PointerType::getUnqual(funType), "function", block);
             const auto res = CallInst::Create(funType, funcPtr, {factory, array, size}, "res", block);
@@ -161,6 +234,15 @@ IComputationNode* WrapExtend(TCallable& callable, const TComputationNodeFactoryC
     }
 
     if (type->IsFlow()) {
+        if (dynamic_cast<IComputationWideFlowNode*>(flows.front())) {
+            TComputationWideFlowNodePtrVector wideFlows;
+            wideFlows.reserve(callable.GetInputsCount());
+            for (ui32 i = 0; i < callable.GetInputsCount(); ++i) {
+                wideFlows.emplace_back(dynamic_cast<IComputationWideFlowNode*>(flows[i]));
+                MKQL_ENSURE_S(wideFlows.back());
+            }
+            return new TExtendWideFlowWrapper(ctx.Mutables, std::move(wideFlows));
+        }
         return new TExtendFlowWrapper(ctx.Mutables, GetValueRepresentation(AS_TYPE(TFlowType, type)->GetItemType()), std::move(flows));
     } else if (type->IsStream()) {
         return new TExtendWrapper<true>(ctx.Mutables, std::move(flows));

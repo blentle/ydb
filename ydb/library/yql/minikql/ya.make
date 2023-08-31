@@ -69,6 +69,7 @@ PEERDIR(
     ydb/library/yql/public/udf
     ydb/library/yql/public/udf/tz
     ydb/library/yql/utils
+    ydb/library/yql/core/sql_types
     ydb/library/uuid
     ydb/public/lib/scheme_types
 )
@@ -82,6 +83,19 @@ ENDIF()
 YQL_LAST_ABI_VERSION()
 
 END()
+
+RECURSE(
+    arrow
+    benchmark
+    codegen
+    comp_nodes
+    computation
+    datetime
+    dom
+    invoke_builtins
+    jsonpath
+    perf
+)
 
 RECURSE_FOR_TESTS(
     ut

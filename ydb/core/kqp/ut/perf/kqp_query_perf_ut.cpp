@@ -272,7 +272,7 @@ Y_UNIT_TEST_SUITE(KqpQueryPerf) {
         for (const auto& stage : stages) {
             totalTasks += stage.GetMapSafe().at("Stats").GetMapSafe().at("TotalTasks").GetIntegerSafe();
         }
-        UNIT_ASSERT_VALUES_EQUAL(totalTasks, 3);
+        UNIT_ASSERT_VALUES_EQUAL(totalTasks, EnableSourceRead ? 2 : 3);
     }
 
     Y_UNIT_TEST(Upsert) {
@@ -776,6 +776,34 @@ Y_UNIT_TEST_SUITE(KqpQueryPerf) {
             .ExpectedReads = 3,
             .ExpectedDeletes = 3,
         });
+    }
+
+    Y_UNIT_TEST_TWIN(MultiRead, SourceRead) {
+        TKikimrSettings settings;
+        NKikimrConfig::TAppConfig appConfig;
+        appConfig.MutableTableServiceConfig()->SetEnableKqpDataQuerySourceRead(SourceRead);
+        settings.SetAppConfig(appConfig);
+
+        TKikimrRunner kikimr(settings);
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        {
+            auto settings = NYdb::NTable::TExecDataQuerySettings().CollectQueryStats(ECollectQueryStatsMode::Full);
+            auto result = session.ExecuteDataQuery(R"(
+                SELECT * FROM `/Root/KeyValueLargePartition` WHERE Key > 101;
+                SELECT * FROM `/Root/KeyValueLargePartition` Where Key < 201;
+            )", TTxControl::BeginTx().CommitTx(), settings).GetValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+            size_t partitionsCount = 0;
+            auto& stats = NYdb::TProtoAccessor::GetProto(*result.GetStats());
+            for (auto& phase : stats.query_phases()) {
+                for (auto& read : phase.table_access()) {
+                    partitionsCount += read.partitions_count();
+                }
+            }
+            UNIT_ASSERT_VALUES_EQUAL(partitionsCount, SourceRead ? 2 : 1);
+        }
     }
 }
 

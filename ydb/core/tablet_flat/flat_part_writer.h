@@ -40,6 +40,7 @@ namespace NTable {
         TPartWriter(TIntrusiveConstPtr<TPartScheme> scheme, TTagsRef tags, IPageWriter& pager,
                         const NPage::TConf &conf, TEpoch epoch)
             : Final(conf.Final)
+            , CutIndexKeys(conf.CutIndexKeys)
             , SmallEdge(conf.SmallEdge)
             , LargeEdge(conf.LargeEdge)
             , MaxLargeBlob(conf.MaxLargeBlob)
@@ -557,6 +558,9 @@ namespace NTable {
 
                 Phase = 0;
                 Current = { };
+
+                Y_VERIFY(!PrevPageLastKey);
+                Y_VERIFY(!PrevPageData);
             }
         }
 
@@ -697,15 +701,29 @@ namespace NTable {
                  */
 
                 Y_VERIFY(dataPage->Count, "Invalid EPage::DataPage blob");
+                TPgSize keySize = g.FirstKeyIndexSize;
 
                 if (groupId.IsMain()) {
                     Y_VERIFY_DEBUG(NextSliceFirstRowId != Max<TRowId>());
 
-                    InitKey(dataPage->Record(0), groupId);
+                    InitKey(Key, dataPage->Record(0), groupId);
+
+                    if (CutIndexKeys) {
+                        CutKey(groupId);
+                        keySize = g.Index.CalcSize(Key);
+                    }
                 } else if (groupId.Index == 0) {
-                    InitKey(dataPage->Record(0), groupId);
+                    // TODO: Call CutKey here too, but don't touch MVCC columns
+
+                    InitKey(Key, dataPage->Record(0), groupId);
                 } else {
                     Key.clear();
+                }
+
+                if (CutIndexKeys && groupId.IsMain()) {
+                    InitKey(PrevPageLastKey, dataPage->Record(dataPage->Count - 1), groupId);
+                    // Note: keep page alive while we need PrevPageLastKey bytes
+                    PrevPageData = raw;
                 }
 
                 Current.Bytes += raw.size(); /* before encoding */
@@ -721,8 +739,9 @@ namespace NTable {
                 auto page = WritePage(raw, EPage::DataPage, groupId.Index);
 
                 // N.B. non-main groups have no key
-                Y_VERIFY_DEBUG(g.Index.CalcSize(Key) == g.FirstKeyIndexSize);
-                g.Index.Add(g.FirstKeyIndexSize, Key, dataPage.BaseRow(), page);
+                Y_VERIFY_DEBUG(g.Index.CalcSize(Key) == keySize);
+
+                g.Index.Add(keySize, Key, dataPage.BaseRow(), page);
 
                 // N.B. hack to save the last row/key for the main group
                 // SliceSize is wrong, but it's a hack for tests right now
@@ -730,14 +749,16 @@ namespace NTable {
                     NextSliceForce = false;
 
                     TRowId lastRowId = dataPage.BaseRow() + dataPage->Count - 1;
-                    InitKey(dataPage->Record(dataPage->Count - 1), groupId);
+                    InitKey(Key, dataPage->Record(dataPage->Count - 1), groupId);
 
                     SaveSlice(lastRowId, TSerializedCellVec(Key));
 
                     if (Phase == 1) {
                         Y_VERIFY_DEBUG(g.Index.CalcSize(Key) == g.LastKeyIndexSize);
                         g.Index.Add(g.LastKeyIndexSize, Key, lastRowId, page);
-                        ++Phase;
+                        Y_VERIFY(std::exchange(Phase, 2) == 1);
+                        PrevPageLastKey.clear(); // new index will be started
+                        PrevPageData = { };
                     }
                 }
 
@@ -846,13 +867,77 @@ namespace NTable {
             }
         }
 
-        void InitKey(const NPage::TDataPage::TRecord* record, NPage::TGroupId groupId) noexcept
+        void InitKey(TStackVec<TCell, 16>& key, const NPage::TDataPage::TRecord* record, NPage::TGroupId groupId) noexcept
         {
             const auto& layout = Scheme->GetLayout(groupId);
-            Key.resize(layout.ColsKeyData.size());
+            key.resize(layout.ColsKeyData.size());
             for (const auto &info: layout.ColsKeyData) {
-                Key[info.Key] = record->Cell(info);
+                key[info.Key] = record->Cell(info);
             }
+        }
+
+        void CutKey(NPage::TGroupId groupId) noexcept
+        {
+            if (!PrevPageLastKey) {
+                return;
+            }
+
+            Y_VERIFY(PrevPageLastKey.size() == Key.size());
+
+            const auto& layout = Scheme->GetLayout(groupId);
+            
+            TPos it;
+            for (it = 0; it < Key.size(); it++) {
+                if (int cmp = CompareTypedCells(PrevPageLastKey[it], Key[it], layout.KeyTypes[it])) {
+                    break;
+                }
+            }
+
+            Y_VERIFY(it < Key.size(), "All keys should be different");
+
+            if (!layout.Columns[it].IsFixed && IsCharPointerType(layout.KeyTypes[it].GetTypeId())) {
+                auto &prevCell = PrevPageLastKey[it];
+                auto &cell = Key[it];
+
+                Y_VERIFY(!cell.IsNull(), "Keys should be in ascendic order");
+
+                size_t index;
+                for (index = 0; index < Min(prevCell.Size(), cell.Size()); index++) {
+                    if (prevCell.AsBuf()[index] != cell.AsBuf()[index]) {
+                        break;
+                    }
+                }
+
+                index++; // last taken symbol
+
+                if (layout.KeyTypes[it].GetTypeId() == NKikimr::NScheme::NTypeIds::Utf8) {
+                    while (index < cell.Size() && ((u_char)cell.AsBuf()[index] >> 6) == 2) {
+                        // skip tail character bits
+                        index++;
+                    }
+                }
+
+                if (index < cell.Size()) {
+                    Key[it] = TCell(cell.Data(), index);
+                }
+            }
+
+            for (it++; it < Key.size(); it++) {
+                Key[it] = TCell();
+            }
+        }
+
+        constexpr bool IsCharPointerType(NKikimr::NScheme::TTypeId typeId) {
+            // Note: we don't cut Json/Yson/JsonDocument/DyNumber as will lead to invalid shard bounds
+            switch (typeId) {
+                case NKikimr::NScheme::NTypeIds::String:
+                case NKikimr::NScheme::NTypeIds::String4k:
+                case NKikimr::NScheme::NTypeIds::String2m:
+                case NKikimr::NScheme::NTypeIds::Utf8:
+                    return true;
+            }
+
+            return false;
         }
 
         void SaveSlice(TRowId lastRowId, TSerializedCellVec lastKey) noexcept
@@ -875,6 +960,7 @@ namespace NTable {
 
     private:
         const bool Final = false;
+        const bool CutIndexKeys;
         const ui32 SmallEdge;
         const ui32 LargeEdge;
         const ui32 MaxLargeBlob;
@@ -895,7 +981,9 @@ namespace NTable {
         THolder<NBloom::IWriter> ByKey;
         TWriteStats WriteStats;
         TStackVec<TCell, 16> Key;
-        ui32 Phase = 0;
+        TStackVec<TCell, 16> PrevPageLastKey;
+        TSharedData PrevPageData;
+        ui32 Phase = 0; // 0 - writing rows, 1 - flushing current page collection, 2 - flushed current page collection
 
         struct TRegisteredGlob {
             TRowId Row;

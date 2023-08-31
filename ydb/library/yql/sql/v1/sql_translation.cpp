@@ -1195,15 +1195,54 @@ TMaybe<TSourcePtr> TSqlTranslation::AsTableImpl(const TRule_table_ref& node) {
     return Nothing();
 }
 
+TMaybe<TColumnConstraints> ColumnConstraints(const TRule_column_schema& node, TTranslation& ctx) {
+    TNodePtr defaultExpr = nullptr;
+    bool nullable = true;
+    bool isNullableConstraintDefined = false;
+    for (size_t idx = 0; idx < node.Block4Size(); idx++) {
+        const auto &constraint = node.GetBlock4(idx).GetRule_column_constraint1();
+        if (constraint.Alt_case() == TRule_column_constraint::kAltColumnConstraint1) {
+            const bool override = !constraint.GetAlt_column_constraint1().HasBlock1();
+            if (isNullableConstraintDefined && nullable != override) {
+                ctx.Error() << "not null constraint is ambiguous";
+                return {};
+            }
+
+            nullable = override;
+            isNullableConstraintDefined = true;
+
+        } else if (constraint.Alt_case() == TRule_column_constraint::kAltColumnConstraint2) {
+            if (defaultExpr) {
+                ctx.Error() << "multiple default values are not allowed";
+                return {};
+            }
+
+            TSqlExpression expr(ctx.Context(), ctx.Context().Settings.Mode);
+            defaultExpr = expr.Build(constraint.GetAlt_column_constraint2().GetRule_expr2());
+            if (!defaultExpr) {
+                return {};
+            }
+        }
+    }
+
+    return TColumnConstraints(defaultExpr, nullable);
+}
+
 TMaybe<TColumnSchema> TSqlTranslation::ColumnSchemaImpl(const TRule_column_schema& node) {
-    const bool nullable = !node.HasBlock4() || !node.GetBlock4().HasBlock1();
     const TString name(Id(node.GetRule_an_id_schema1(), *this));
     const TPosition pos(Context().Pos());
     TNodePtr type = SerialTypeNode(node.GetRule_type_name_or_bind2());
     const bool serial = (type != nullptr);
+
+    const auto constraints = ColumnConstraints(node, *this);
+    if (!constraints){
+        return {};
+    }
+
     if (!type) {
         type = TypeNodeOrBind(node.GetRule_type_name_or_bind2());
     }
+
     if (!type) {
         return {};
     }
@@ -1212,7 +1251,7 @@ TMaybe<TColumnSchema> TSqlTranslation::ColumnSchemaImpl(const TRule_column_schem
         const auto& familyRelation = node.GetBlock3().GetRule_family_relation1();
         families.push_back(IdEx(familyRelation.GetRule_an_id2(), *this));
     }
-    return TColumnSchema(pos, name, type, nullable, families, serial);
+    return TColumnSchema(pos, name, type, constraints->Nullable, families, serial, constraints->DefaultExpr);
 }
 
 TNodePtr TSqlTranslation::SerialTypeNode(const TRule_type_name_or_bind& node) {
@@ -4159,7 +4198,8 @@ bool TSqlTranslation::StoreDataSourceSettingsEntry(const TIdentifier& id, const 
     }
 
     if (IsIn({"source_type", "installation", "location",
-              "auth_method", "service_account_id", "service_account_secret_name"}, key)) {
+             "auth_method", "service_account_id", "service_account_secret_name",
+             "login", "password_secret_name", "aws_access_key_id_secret_name", "aws_secret_access_key_secret_name"}, key)) {
         if (!StoreString(*value, result[key], Ctx, to_upper(key))) {
             return false;
         }
@@ -4199,11 +4239,18 @@ bool TSqlTranslation::ParseExternalDataSourceSettings(std::map<TString, TDeferre
 bool TSqlTranslation::ValidateAuthMethod(const std::map<TString, TDeferredAtom>& result) {
     const static TSet<TStringBuf> allAuthFields{
         "service_account_id",
-        "service_account_secret_name"
+        "service_account_secret_name",
+        "login",
+        "password_secret_name",
+        "aws_access_key_id_secret_name",
+        "aws_secret_access_key_secret_name"
     };
     const static TMap<TStringBuf, TSet<TStringBuf>> authMethodFields{
         {"NONE", {}},
-        {"SERVICE_ACCOUNT", {"service_account_id", "service_account_secret_name"}}
+        {"SERVICE_ACCOUNT", {"service_account_id", "service_account_secret_name"}},
+        {"BASIC", {"login", "password_secret_name"}},
+        {"AWS", {"aws_access_key_id_secret_name", "aws_secret_access_key_secret_name"}},
+        {"MDB_BASIC", {"service_account_id", "service_account_secret_name", "login", "password_secret_name"}}
     };
     auto authMethodIt = result.find("auth_method");
     if (authMethodIt == result.end() || authMethodIt->second.GetLiteral() == nullptr) {

@@ -251,6 +251,11 @@ namespace {
                         }
 
                         TStringBuf command = node->Child(2)->Content();
+                        if (command.length() && '_' == command[0]) {
+                            ctx.AddError(TIssue(ctx.GetPosition(node->Child(2)->Pos()), "Flags started with underscore are not allowed"));
+                            return {};
+                        }
+
                         TVector<TStringBuf> args;
                         for (size_t i = 3; i < node->ChildrenSize(); ++i) {
                             if (node->Child(i)->IsCallable("EvaluateAtom")) {
@@ -809,6 +814,27 @@ namespace {
                 }
 
                 Types.PgEmitAggApply = (name == "PgEmitAggApply");
+            }
+            else if (name == "CostBasedOptimizer") {
+                if (args.size() != 1) {
+                    ctx.AddError(TIssue(pos, TStringBuilder() << "Expected at most 1 argument, but got " << args.size()));
+                    return false;
+                }
+                auto arg = TString{args[0]};
+
+                if (!(arg == "pg" || arg == "native" || arg == "disable")) {
+                    ctx.AddError(TIssue(pos, TStringBuilder() << "Expected `disable|pg|native', but got: " << args[0]));
+                    return false;
+                }
+
+                Types.CostBasedOptimizerType = arg;
+            }
+            else if (name == "_EnableMatchRecognize" || name == "DisableMatchRecognize") {
+                if (args.size() != 0) {
+                    ctx.AddError(TIssue(pos, TStringBuilder() << "Expected no arguments, but got " << args.size()));
+                    return false;
+                }
+                Types.MatchRecognize = name == "_EnableMatchRecognize";
             }
             else {
                 ctx.AddError(TIssue(pos, TStringBuilder() << "Unsupported command: " << name));

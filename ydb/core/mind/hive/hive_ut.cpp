@@ -159,7 +159,7 @@ namespace {
                     STRAND_PDISK && !runtime.IsRealThreads() ? static_cast<IPDiskServiceFactory*>(new TStrandedPDiskServiceFactory(runtime)) :
                     static_cast<IPDiskServiceFactory*>(new TRealPDiskServiceFactory()));
                 //nodeWardenConfig->Monitoring = monitoring;
-            google::protobuf::TextFormat::ParseFromString(staticConfig, &nodeWardenConfig->ServiceSet);
+            google::protobuf::TextFormat::ParseFromString(staticConfig, nodeWardenConfig->BlobStorageConfig.MutableServiceSet());
 
             TIntrusivePtr<TNodeWardenConfig> existingNodeWardenConfig = NodeWardenConfigs[nodeIndex];
             if (existingNodeWardenConfig != nullptr) {
@@ -193,7 +193,7 @@ namespace {
             static TTempDir tempDir;
             pDiskPath = tempDir() + "/pdisk.dat";
         }
-        nodeWardenConfig->ServiceSet.MutablePDisks(0)->SetPath(pDiskPath);
+        nodeWardenConfig->BlobStorageConfig.MutableServiceSet()->MutablePDisks(0)->SetPath(pDiskPath);
         ui64 pDiskGuid = 1;
         static ui64 iteration = 0;
         ++iteration;
@@ -283,7 +283,7 @@ namespace {
         for (ui32 nodeIndex = 0; nodeIndex < runtime.GetNodeCount(); ++nodeIndex) {
             auto it = NodeWardenConfigs.find(nodeIndex);
             if (it != NodeWardenConfigs.end()) {
-                runtime.GetAppData(nodeIndex).StaticBlobStorageConfig = MakeHolder<NKikimrBlobStorage::TNodeWardenServiceSet>(it->second->ServiceSet);
+                runtime.GetAppData(nodeIndex).StaticBlobStorageConfig = MakeHolder<NKikimrBlobStorage::TNodeWardenServiceSet>(it->second->BlobStorageConfig.GetServiceSet());
             }
         }
 
@@ -5531,6 +5531,33 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         UNIT_ASSERT_VALUES_EQUAL(nodeTablets[3], 0);
         UNIT_ASSERT_VALUES_EQUAL(nodeTablets[4], 0);
         UNIT_ASSERT_VALUES_EQUAL(nodeTablets[5], NUM_TABLETS);
+    }
+
+    Y_UNIT_TEST(TestProgressWithMaxTabletsScheduled) {
+        TTestBasicRuntime runtime(2, false);
+
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.HiveConfig.SetMaxTabletsScheduled(1);
+            app.HiveConfig.SetBootStrategy(NKikimrConfig::THiveConfig::HIVE_BOOT_STRATEGY_FAST);
+        });
+
+        const ui64 hiveTablet = MakeDefaultHiveID(0);
+        const ui64 testerTablet = MakeDefaultHiveID(1);
+
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+
+        TTabletTypes::EType tabletType = TTabletTypes::Dummy;
+        TVector<ui64> tablets;
+        for (int i = 0; i < 10; ++i) {
+            THolder<TEvHive::TEvCreateTablet> ev(new TEvHive::TEvCreateTablet(testerTablet, 100500 + i, tabletType, BINDED_CHANNELS));
+            ui64 tabletId = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(ev), 0, true);
+            tablets.emplace_back(tabletId);
+        };
+
+        SendKillLocal(runtime, 0);
+        for (auto tablet : tablets) {
+            WaitForTabletIsUp(runtime, tablet, 1);
+        }
     }
 }
 

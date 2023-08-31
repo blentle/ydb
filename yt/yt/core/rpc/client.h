@@ -55,8 +55,8 @@ struct IClientRequest
 
     virtual TRequestId GetRequestId() const = 0;
     virtual TRealmId GetRealmId() const = 0;
-    virtual const TString& GetService() const = 0;
-    virtual const TString& GetMethod() const = 0;
+    virtual std::string GetService() const = 0;
+    virtual std::string GetMethod() const = 0;
 
     virtual void DeclareClientFeature(int featureId) = 0;
     virtual void RequireServerFeature(int featureId) = 0;
@@ -98,25 +98,23 @@ class TClientContext
 public:
     DEFINE_BYVAL_RO_PROPERTY(TRequestId, RequestId);
     DEFINE_BYVAL_RO_PROPERTY(NTracing::TTraceContextPtr, TraceContext);
-    DEFINE_BYVAL_RO_PROPERTY(TString, Service);
-    DEFINE_BYVAL_RO_PROPERTY(TString, Method);
+    DEFINE_BYVAL_RO_PROPERTY(std::string, Service);
+    DEFINE_BYVAL_RO_PROPERTY(std::string, Method);
     DEFINE_BYVAL_RO_PROPERTY(TFeatureIdFormatter, FeatureIdFormatter);
     DEFINE_BYVAL_RO_PROPERTY(bool, ResponseHeavy);
     DEFINE_BYVAL_RO_PROPERTY(TAttachmentsOutputStreamPtr, RequestAttachmentsStream);
     DEFINE_BYVAL_RO_PROPERTY(TAttachmentsInputStreamPtr, ResponseAttachmentsStream);
-    DEFINE_BYVAL_RO_PROPERTY(TMemoryTag, ResponseMemoryTag);
 
 public:
     TClientContext(
         TRequestId requestId,
         NTracing::TTraceContextPtr traceContext,
-        const TString& service,
-        const TString& method,
+        std::string service,
+        std::string method,
         TFeatureIdFormatter featureIdFormatter,
         bool heavy,
         TAttachmentsOutputStreamPtr requestAttachmentsStream,
-        TAttachmentsInputStreamPtr responseAttachmentsStream,
-        TMemoryTag responseMemoryTag);
+        TAttachmentsInputStreamPtr responseAttachmentsStream);
 };
 
 DEFINE_REFCOUNTED_TYPE(TClientContext)
@@ -139,7 +137,6 @@ public:
     DEFINE_BYVAL_RW_PROPERTY(NCompression::ECodec, ResponseCodec, NCompression::ECodec::None);
     DEFINE_BYVAL_RW_PROPERTY(bool, EnableLegacyRpcCodecs, true);
     DEFINE_BYVAL_RW_PROPERTY(bool, GenerateAttachmentChecksums, true);
-    DEFINE_BYVAL_RW_PROPERTY(std::optional<TMemoryTag>, ResponseMemoryTag);
     DEFINE_BYVAL_RW_PROPERTY(IMemoryReferenceTrackerPtr, MemoryReferenceTracker);
     // For testing purposes only.
     DEFINE_BYVAL_RW_PROPERTY(std::optional<TDuration>, SendDelay);
@@ -163,8 +160,8 @@ public:
 
     TRequestId GetRequestId() const override;
     TRealmId GetRealmId() const override;
-    const TString& GetService() const override;
-    const TString& GetMethod() const override;
+    std::string GetService() const override;
+    std::string GetMethod() const override;
 
     using NRpc::IClientRequest::DeclareClientFeature;
     using NRpc::IClientRequest::RequireServerFeature;
@@ -402,22 +399,21 @@ private:
 
 struct TServiceDescriptor
 {
-    TString ServiceName;
-    TString Namespace;
+    std::string ServiceName;
+    std::string FullServiceName;
+    std::string Namespace;
     TProtocolVersion ProtocolVersion = DefaultProtocolVersion;
     TFeatureIdFormatter FeatureIdFormatter = nullptr;
     bool AcceptsBaggage = true;
 
-    explicit TServiceDescriptor(const TString& serviceName);
+    explicit TServiceDescriptor(std::string serviceName);
 
     TServiceDescriptor& SetProtocolVersion(int majorVersion);
     TServiceDescriptor& SetProtocolVersion(TProtocolVersion version);
-    TServiceDescriptor& SetNamespace(const TString& value);
+    TServiceDescriptor& SetNamespace(std::string value);
     TServiceDescriptor& SetAcceptsBaggage(bool value);
     template <class E>
     TServiceDescriptor& SetFeaturesType();
-
-    TString GetFullServiceName() const;
 };
 
 #define DEFINE_RPC_PROXY(type, name, ...) \
@@ -453,7 +449,7 @@ struct TMethodDescriptor
     using TReq##method##Ptr = ::NYT::TIntrusivePtr<TReq##method>; \
     using TErrorOrRsp##method##Ptr = ::NYT::TErrorOr<TRsp##method##Ptr>; \
     \
-    TReq##method##Ptr method() \
+    TReq##method##Ptr method() const \
     { \
         static const auto Descriptor = ::NYT::NRpc::TMethodDescriptor(#method) __VA_ARGS__; \
         return CreateRequest<TReq##method>(Descriptor); \
@@ -486,7 +482,7 @@ protected:
         const TServiceDescriptor& descriptor);
 
     template <class T>
-    TIntrusivePtr<T> CreateRequest(const TMethodDescriptor& methodDescriptor);
+    TIntrusivePtr<T> CreateRequest(const TMethodDescriptor& methodDescriptor) const;
 };
 
 ////////////////////////////////////////////////////////////////////////////////

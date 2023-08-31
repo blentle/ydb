@@ -707,6 +707,8 @@ TExprNode::TPtr SimplifyLogical(const TExprNode::TPtr& node, TExprContext& ctx) 
         YQL_CLOG(DEBUG, Core) << node->Content() <<  " over Nothing";
         return node->HeadPtr();
     }
+
+    Y_UNUSED(negations);
 /*TODO Move to peephole
     if (size == negations) {
         YQL_CLOG(DEBUG, Core) << node->Content() <<  " over negations";
@@ -981,8 +983,8 @@ TExprNode::TPtr OptimizeFlatContainerIf(const TExprNode::TPtr& node, TExprContex
     if (1U == nodeToCheck.ChildrenSize() && nodeToCheck.IsCallable(IsList ? "AsList" : "Just")) {
         YQL_CLOG(DEBUG, Core) << node->Content() << " with " << nodeToCheck.Content();
         auto res = ctx.NewCallable(node->Pos(), IsList ? "ListIf" : "OptionalIf", {node->HeadPtr(), nodeToCheck.HeadPtr()});
-        if (IsList) {
-            res = KeepSortedConstraint(res, node->GetConstraint<TSortedConstraintNode>(), ctx);
+        if constexpr (IsList) {
+            res = KeepConstraints(std::move(res), *node, ctx);
         }
         return res;
     }
@@ -3105,10 +3107,10 @@ std::unordered_set<ui32> GetUselessSortedJoinInputs(const TCoEquiJoin& equiJoin)
             joinTreeNodes.emplace_back(joinTree->Child(2));
 
         if (!joinTree->Head().IsAtom("Cross")) {
-            std::unordered_map<std::string_view, TConstraintNode::TSetType> tableJoinKeys;
+            std::unordered_map<std::string_view, TPartOfConstraintBase::TSetType> tableJoinKeys;
             for (const auto keys : {joinTree->Child(3), joinTree->Child(4)})
                 for (ui32 i = 0U; i < keys->ChildrenSize(); ++i)
-                    tableJoinKeys[keys->Child(i)->Content()].insert_unique(TConstraintNode::TPathType(1U, keys->Child(++i)->Content()));
+                    tableJoinKeys[keys->Child(i)->Content()].insert_unique(TPartOfConstraintBase::TPathType(1U, keys->Child(++i)->Content()));
 
             for (const auto& [label, joinKeys]: tableJoinKeys) {
                 if (const auto it = sorteds.find(label); sorteds.cend() != it) {
@@ -3691,9 +3693,171 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
         return node;
     };
 
+    map["FormatTypeDiff"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext&) {
+        auto left = node->ChildPtr(0);
+        auto right = node->ChildPtr(1);
+        if (left->GetTypeAnn()->GetKind() != ETypeAnnotationKind::Resource && right->GetTypeAnn()->GetKind() == ETypeAnnotationKind::Resource) {
+            return ctx.ChangeChild(*node, 0, ctx.NewCallable(node->Pos(), "TypeHandle", {left}));
+        } 
+        if (left->GetTypeAnn()->GetKind() == ETypeAnnotationKind::Resource && right->GetTypeAnn()->GetKind() != ETypeAnnotationKind::Resource) {
+            return ctx.ChangeChild(*node, 1, ctx.NewCallable(node->Pos(), "TypeHandle", {right}));
+        }
+        return node;
+    };
+
     map["Lookup"] = std::bind(&OptimizeContains<false, true>, _1, _2);
     map["Contains"] = std::bind(&OptimizeContains<false>, _1, _2);
     map["ListHas"] = std::bind(&OptimizeContains<true>, _1, _2);
+    map["ListUniq"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext&) {
+        return ctx.Builder(node->Pos())
+            .Callable("DictKeys")
+                .Callable(0, "ToDict")
+                    .Add(0, node->HeadPtr())
+                    .Lambda(1)
+                        .Param("item")
+                        .Arg("item")
+                    .Seal()
+                    .Lambda(2)
+                        .Param("item")
+                        .Callable("Void")
+                        .Seal()
+                    .Seal()
+                    .List(3)
+                        .Atom(0, "Hashed")
+                        .Atom(1, "One")
+                    .Seal()
+                .Seal()
+            .Seal()
+            .Build();
+    };
+    map["ListUniqStable"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext&) {
+        const TTypeAnnotationNode* itemType = node->Head().GetTypeAnn()->Cast<TListExprType>()->GetItemType();
+        auto expandedItemType = ExpandType(node->Pos(), *itemType, ctx);
+        auto setCreate = ctx.Builder(node->Pos())
+            .Callable("Udf")
+                .Atom(0, "Set.Create")
+                .Callable(1, "Void").Seal()
+                .Callable(2, "TupleType")
+                    .Callable(0, "TupleType")
+                        .Add(0, expandedItemType)
+                        .Callable(1, "DataType")
+                            .Atom(0, "Uint32", TNodeFlags::Default)
+                        .Seal()
+                    .Seal()
+                    .Callable(1, "StructType").Seal()
+                    .Add(2, expandedItemType)
+                .Seal()
+            .Seal()
+            .Build();
+
+        auto resourceType = ctx.Builder(node->Pos())
+            .Callable("TypeOf")
+                .Callable(0, "Apply")
+                    .Add(0, setCreate)
+                    .Callable(1, "InstanceOf")
+                        .Add(0, expandedItemType)
+                    .Seal()
+                    .Callable(2, "Uint32")
+                        .Atom(0, 0u)
+                    .Seal()
+                .Seal()
+            .Seal()
+            .Build();
+        auto setAddValue = ctx.Builder(node->Pos())
+            .Callable("Udf")
+                .Atom(0, "Set.AddValue")
+                .Callable(1, "Void").Seal()
+                .Callable(2, "TupleType")
+                    .Callable(0, "TupleType")
+                        .Add(0, resourceType)
+                        .Add(1, expandedItemType)
+                    .Seal()
+                    .Callable(1, "StructType").Seal()
+                    .Add(2, expandedItemType)
+                .Seal()
+            .Seal()
+            .Build();
+
+        auto setWasChanged = ctx.Builder(node->Pos())
+            .Callable("Udf")
+                .Atom(0, "Set.WasChanged")
+                .Callable(1, "Void").Seal()
+                .Callable(2, "TupleType")
+                    .Callable(0, "TupleType")
+                        .Add(0, resourceType)
+                    .Seal()
+                    .Callable(1, "StructType").Seal()
+                    .Add(2, expandedItemType)
+                .Seal()
+            .Seal()
+            .Build();
+
+        auto handlerLambda = ctx.Builder(node->Pos())
+            .Lambda()
+                .Param("updatedSet")
+                .Param("value")
+                .List(0)
+                    .Callable(0, "If")
+                        .Callable(0, "Apply")
+                            .Add(0, setWasChanged)
+                            .Arg(1, "updatedSet")
+                        .Seal()
+                        .Callable(1, "Just")
+                            .Arg(0, "value")
+                        .Seal()
+                        .Callable(2, "Nothing")
+                            .Callable(0, "OptionalType")
+                                .Add(0, expandedItemType)
+                            .Seal()
+                        .Seal()
+                    .Seal()
+                    .Arg(1, "updatedSet")
+                .Seal()
+            .Seal()
+            .Build();
+
+        return ctx.Builder(node->Pos())
+            .Callable("FlatMap")
+                .Callable(0, "Fold1Map")
+                    .Add(0, node->HeadPtr())
+                    .Lambda(1)
+                        .Param("item")
+                        .List(0)
+                            .Callable(0, "Just")
+                                .Arg(0, "item")
+                            .Seal()
+                            .Callable(1, "Apply")
+                                .Add(0, setCreate)
+                                .Arg(1, "item")
+                                .Callable(2, "Uint32")
+                                    .Atom(0, 0u)
+                                .Seal()
+                            .Seal()
+                        .Seal()
+                    .Seal()
+                    .Lambda(2)
+                        .Param("item")
+                        .Param("cur_set")
+                        .Apply(0, handlerLambda)
+                            .With(0)
+                                .Callable("Apply")
+                                    .Add(0, setAddValue)
+                                    .Arg(1, "cur_set")
+                                    .Arg(2, "item")
+                                .Seal()
+                            .Done()
+                            .With(1, "item")
+                        .Seal()
+                    .Seal()
+                .Seal()
+                .Lambda(1)
+                    .Param("item")
+                    .Arg(0, "item")
+                .Seal()
+            .Seal()
+            .Build();
+    };
+
     map["SqlIn"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext&) {
         auto collection = node->HeadPtr();
         auto lookup = node->ChildPtr(1);
@@ -6098,7 +6262,16 @@ void RegisterCoSimpleCallables1(TCallableOptimizerMap& map) {
     map["ShuffleByKeys"] = map["PartitionsByKeys"] = [](const TExprNode::TPtr& node, TExprContext& ctx, TOptimizeContext& optCtx) {
         if (IsEmpty(node->Head(), *optCtx.Types)) {
             YQL_CLOG(DEBUG, Core) << node->Content() << " over empty input.";
-            return ctx.Builder(node->Pos()).Apply(node->Tail()).With(0, KeepConstraints(node->HeadPtr(), node->Tail().Head().Head(), ctx)).Seal().Build();
+            auto lambdaResult = ctx.Builder(node->Pos()).Apply(node->Tail()).With(0, KeepConstraints(node->HeadPtr(), node->Tail().Head().Head(), ctx)).Seal().Build();
+            if (node->IsCallable("ShuffleByKeys")) {
+                auto lambdaType = node->Tail().GetTypeAnn();
+                if (lambdaType->GetKind() == ETypeAnnotationKind::Optional) {
+                    lambdaResult = ctx.NewCallable(lambdaResult->Pos(), "ToList", { lambdaResult });
+                } else if (lambdaType->GetKind() == ETypeAnnotationKind::Stream) {
+                    lambdaResult = ctx.NewCallable(lambdaResult->Pos(), "ForwardList", { lambdaResult });
+                }
+            }
+            return lambdaResult;
         }
         return node;
     };

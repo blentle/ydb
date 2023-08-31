@@ -53,6 +53,7 @@ void TTypeAnnotationContext::Reset() {
     ExpectedTypes.clear();
     ExpectedConstraints.clear();
     ExpectedColumnOrders.clear();
+    StatisticsMap.clear();
 }
 
 TString FormatColumnOrder(const TMaybe<TColumnOrder>& columnOrder) {
@@ -214,6 +215,7 @@ bool TModuleResolver::AddFromUrl(const std::string_view& file, const std::string
         }
         block.UrlToken = cred->Content;
     }
+
     UserData->AddUserDataBlock(file, block);
 
     return AddFromFile(file, ctx, syntaxVersion, packageVersion, pos);

@@ -223,10 +223,12 @@ def create_embed_config(args):
         'Files': {},
     }
     for info in args.embed:
-        pattern = info[0]
+        embed_dir = os.path.normpath(info[0])
+        assert embed_dir == args.source_module_dir[:-1] or embed_dir.startswith((args.source_module_dir, args.build_root))
+        pattern = info[1]
         if pattern.endswith('/**/*'):
             pattern = pattern[:-3]
-        files = {os.path.relpath(f, args.source_module_dir).replace('\\', '/'): f for f in info[1:]}
+        files = {os.path.relpath(f, embed_dir).replace('\\', '/'): f for f in info[2:]}
         data['Patterns'][pattern] = list(files.keys())
         data['Files'].update(files)
     # sys.stderr.write('{}\n'.format(json.dumps(data, indent=4)))
@@ -489,17 +491,20 @@ def do_link_exe(args):
     if args.link_flags:
         cmd += args.link_flags
 
+    extldflags = []
+
     if args.buildmode:
         cmd.append('-buildmode={}'.format(args.buildmode))
     elif args.mode in ('exe', 'test'):
         cmd.append('-buildmode=exe')
+        if 'ld.lld' in str(args):
+            extldflags.append('-Wl,-no-pie')
     elif args.mode == 'dll':
         cmd.append('-buildmode=c-shared')
     else:
         assert False, 'Unexpected mode: {}'.format(args.mode)
     cmd.append('-extld={}'.format(args.extld))
 
-    extldflags = []
     if args.extldflags is not None:
         filter_musl = bool
         if args.musl:
@@ -664,6 +669,7 @@ def gen_test_main(args, test_lib_args, xtest_lib_args):
     if test_main_package is None:
         lines.append('    "os"')
     lines.extend(['    "testing"', '    "testing/internal/testdeps"'])
+    lines.extend(['    _ "a.yandex-team.ru/library/go/test/yatest"'])
 
     if len(tests) > 0:
         lines.append('    _test "{}"'.format(test_module_path))
